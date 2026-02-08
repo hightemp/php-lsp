@@ -1,0 +1,33 @@
+# Rust
+/server/target/
+**/*.rs.bk
+*.pdb
+
+# Node / VS Code extension
+client/node_modules/
+client/out/
+client/*.vsix
+client/.vscode-test/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+
+# Cache
+.cache/

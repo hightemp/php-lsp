@@ -1,0 +1,15 @@
+[package]
+name = "php-lsp-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PHP parser for php-lsp (tree-sitter wrapper)"
+
+[dependencies]
+php-lsp-types = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-php = { workspace = true }
+ropey = { workspace = true }
+lsp-types = { workspace = true }
+tracing = { workspace = true }

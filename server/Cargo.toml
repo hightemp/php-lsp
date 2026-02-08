@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/php-lsp-server",
+    "crates/php-lsp-parser",
+    "crates/php-lsp-index",
+    "crates/php-lsp-completion",
+    "crates/php-lsp-types",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/TODO/php-lsp"
+
+[workspace.dependencies]
+# LSP
+tower-lsp = { package = "tower-lsp-server", version = "0.23" }
+lsp-types = "0.97"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Parsing
+tree-sitter = "0.24"
+tree-sitter-php = "0.23"
+
+# Data structures
+dashmap = "6"
+ropey = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Internal crates
+php-lsp-types = { path = "crates/php-lsp-types" }
+php-lsp-parser = { path = "crates/php-lsp-parser" }
+php-lsp-index = { path = "crates/php-lsp-index" }
+php-lsp-completion = { path = "crates/php-lsp-completion" }
