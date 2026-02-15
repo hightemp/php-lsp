@@ -293,6 +293,96 @@ $g->greet("World");
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_local_variable_with_inline_phpdoc_var() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Baz {
+    public function test(): void {}
+}
+
+function makeBaz() {}
+
+function run(): void {
+    /**
+     * Local baz variable.
+     * @var Baz $baz2
+     */
+    $baz2 = makeBaz();
+    $baz2->test();
+}
+"#;
+    let uri = "file:///test/hover-var-phpdoc.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    // Hover on "$baz2" in "$baz2->test();"
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, 15, 6))
+        .await
+        .unwrap();
+
+    let result = extract_result(resp);
+    assert!(
+        !result.is_null(),
+        "hover should return content for local variable"
+    );
+
+    let contents = result
+        .get("contents")
+        .and_then(|c| c.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        contents.contains("$baz2") && contents.contains("Baz"),
+        "hover should include variable name and inferred type, got: {}",
+        contents
+    );
+    assert!(
+        contents.contains("Local baz variable.") || contents.contains("@var"),
+        "hover should include PHPDoc context, got: {}",
+        contents
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_goto_definition() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

@@ -23,6 +23,34 @@ pub struct SymbolAtPosition {
     pub range: (u32, u32, u32, u32),
 }
 
+/// Hover-related information for a local variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariableHoverInfo {
+    /// Variable name as written in code (`$name`).
+    pub variable_name: String,
+    /// Display type to show in hover (`Baz`, `?Foo`, `int`, etc.).
+    pub type_display: Option<String>,
+    /// Resolved class-like FQN when available (`App\\Baz`).
+    pub resolved_type_fqn: Option<String>,
+    /// Raw PHPDoc comment that produced this info, when available.
+    pub phpdoc_comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VariableInference {
+    type_display: Option<String>,
+    resolved_type_fqn: Option<String>,
+    phpdoc_comment: Option<String>,
+}
+
+impl VariableInference {
+    fn has_data(&self) -> bool {
+        self.type_display.is_some()
+            || self.resolved_type_fqn.is_some()
+            || self.phpdoc_comment.is_some()
+    }
+}
+
 /// What kind of reference is this?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefKind {
@@ -116,6 +144,42 @@ pub fn infer_variable_type_at_position(
     let normalized = normalize_var_name(var_name);
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
     infer_variable_type_in_scope(scope, &normalized, usage_start, source, file_symbols)
+}
+
+/// Infer hover info for a variable under cursor at a given position.
+pub fn variable_hover_info_at_position(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    line: u32,
+    character: u32,
+) -> Option<VariableHoverInfo> {
+    let root = tree.root_node();
+    let point = Point::new(line as usize, character as usize);
+    let mut node = find_node_at_point(root, point)?;
+
+    loop {
+        let text = &source[node.byte_range()];
+        if node.kind() == "variable_name" || text.starts_with('$') {
+            break;
+        }
+        node = node.parent()?;
+    }
+
+    let var_name = normalize_var_name(&source[node.byte_range()]);
+    let usage_start = node.start_byte();
+    let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
+    let inference = infer_variable_in_scope(scope, &var_name, usage_start, source, file_symbols);
+    if !inference.has_data() {
+        return None;
+    }
+
+    Some(VariableHoverInfo {
+        variable_name: var_name,
+        type_display: inference.type_display,
+        resolved_type_fqn: inference.resolved_type_fqn,
+        phpdoc_comment: inference.phpdoc_comment,
+    })
 }
 
 /// Find the deepest (most specific) named node at the given point.
@@ -623,31 +687,8 @@ fn infer_variable_type_in_scope(
     source: &str,
     file_symbols: &FileSymbols,
 ) -> Option<String> {
-    // 1. Check function parameters for typed variables
-    if let Some(params) = scope_node.child_by_field_name("parameters") {
-        for i in 0..params.named_child_count() {
-            if let Some(param) = params.named_child(i) {
-                if param.kind() == "simple_parameter"
-                    || param.kind() == "property_promotion_parameter"
-                {
-                    if let Some(name_node) = param.child_by_field_name("name") {
-                        let param_name = normalize_var_name(&source[name_node.byte_range()]);
-                        if param_name == var_name {
-                            if let Some(type_node) = param.child_by_field_name("type") {
-                                if let Some(class_name) = extract_type_name(type_node, source) {
-                                    return Some(resolve_class_name(&class_name, file_symbols));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Scan statements before usage for assignments and inline @var docs.
-    let statements = scope_node.child_by_field_name("body").unwrap_or(scope_node);
-    find_variable_type_before_usage(statements, var_name, usage_start, source, file_symbols)
+    infer_variable_in_scope(scope_node, var_name, usage_start, source, file_symbols)
+        .resolved_type_fqn
 }
 
 /// Extract a type name from a type node (named_type, optional_type, etc.).
@@ -681,14 +722,14 @@ fn extract_type_name(type_node: Node, source: &str) -> Option<String> {
 }
 
 /// Scan a compound_statement for `$var = new ClassName()` before the usage point.
-fn find_variable_type_before_usage(
+fn find_variable_inference_before_usage(
     body: Node,
     var_name: &str,
     usage_start: usize,
     source: &str,
     file_symbols: &FileSymbols,
-) -> Option<String> {
-    let mut inferred: Option<(usize, String)> = None;
+) -> Option<VariableInference> {
+    let mut inferred: Option<(usize, VariableInference)> = None;
 
     for i in 0..body.named_child_count() {
         let stmt = match body.named_child(i) {
@@ -706,26 +747,33 @@ fn find_variable_type_before_usage(
         // Inline PHPDoc immediately before statement:
         //  - apply named @var always when variable matches
         //  - unnamed @var only for direct assignment to target variable
-        if let Some(doc_type) = extract_preceding_phpdoc_var_type(
+        if let Some(doc_info) = extract_preceding_phpdoc_var_inference(
             stmt,
             var_name,
             assignment_rhs.is_some(),
             source,
             file_symbols,
         ) {
-            inferred = Some((stmt.start_byte(), doc_type));
+            inferred = Some((stmt.start_byte(), doc_info));
             continue;
         }
 
         // Assignment inference: $var = <expr>;
         if let Some(right) = assignment_rhs {
             if let Some(resolved) = try_resolve_object_type(right, source, file_symbols) {
-                inferred = Some((stmt.start_byte(), resolved));
+                inferred = Some((
+                    stmt.start_byte(),
+                    VariableInference {
+                        type_display: Some(resolved.clone()),
+                        resolved_type_fqn: Some(resolved),
+                        phpdoc_comment: None,
+                    },
+                ));
             }
         }
     }
 
-    inferred.map(|(_, ty)| ty)
+    inferred.map(|(_, info)| info)
 }
 
 fn assignment_rhs_for_var<'a>(stmt: Node<'a>, var_name: &str, source: &str) -> Option<Node<'a>> {
@@ -748,13 +796,13 @@ fn assignment_rhs_for_var<'a>(stmt: Node<'a>, var_name: &str, source: &str) -> O
     }
 }
 
-fn extract_preceding_phpdoc_var_type(
+fn extract_preceding_phpdoc_var_inference(
     stmt: Node,
     var_name: &str,
     allow_unnamed_var_tag: bool,
     source: &str,
     file_symbols: &FileSymbols,
-) -> Option<String> {
+) -> Option<VariableInference> {
     let comment = find_preceding_phpdoc_comment(stmt, source)?;
     let phpdoc = parse_phpdoc(comment);
     let type_info = phpdoc.var_type?;
@@ -768,7 +816,63 @@ fn extract_preceding_phpdoc_var_type(
         return None;
     }
 
-    resolve_phpdoc_var_type(&type_info, stmt, source, file_symbols)
+    let type_display = Some(type_info.to_string());
+    let resolved_type_fqn = resolve_phpdoc_var_type(&type_info, stmt, source, file_symbols);
+    Some(VariableInference {
+        type_display,
+        resolved_type_fqn,
+        phpdoc_comment: Some(comment.to_string()),
+    })
+}
+
+fn infer_variable_in_scope(
+    scope_node: Node,
+    var_name: &str,
+    usage_start: usize,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> VariableInference {
+    let mut inferred = VariableInference::default();
+
+    // 1. Check function parameters for typed variables.
+    if let Some(params) = scope_node.child_by_field_name("parameters") {
+        for i in 0..params.named_child_count() {
+            if let Some(param) = params.named_child(i) {
+                if param.kind() == "simple_parameter"
+                    || param.kind() == "property_promotion_parameter"
+                {
+                    if let Some(name_node) = param.child_by_field_name("name") {
+                        let param_name = normalize_var_name(&source[name_node.byte_range()]);
+                        if param_name == var_name {
+                            if let Some(type_node) = param.child_by_field_name("type") {
+                                inferred.type_display =
+                                    Some(source[type_node.byte_range()].trim().to_string());
+                                if let Some(class_name) = extract_type_name(type_node, source) {
+                                    inferred.resolved_type_fqn =
+                                        Some(resolve_class_name(&class_name, file_symbols));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Scan statements before usage for assignments and inline @var docs.
+    let statements = scope_node.child_by_field_name("body").unwrap_or(scope_node);
+    if let Some(stmt_info) = find_variable_inference_before_usage(
+        statements,
+        var_name,
+        usage_start,
+        source,
+        file_symbols,
+    ) {
+        inferred = stmt_info;
+    }
+
+    inferred
 }
 
 fn find_preceding_phpdoc_comment<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str> {
@@ -1240,6 +1344,14 @@ mod tests {
         infer_variable_type_at_position(tree, code, &file_symbols, line, col, var_name)
     }
 
+    fn parse_and_variable_hover_info(code: &str, line: u32, col: u32) -> Option<VariableHoverInfo> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        variable_hover_info_at_position(tree, code, &file_symbols, line, col)
+    }
+
     fn find_line_col(code: &str, needle: &str) -> (u32, u32) {
         for (line, row) in code.lines().enumerate() {
             if let Some(col) = row.find(needle) {
@@ -1424,6 +1536,20 @@ mod tests {
         let inferred =
             parse_and_infer_var_type_at(code, 7, 11, "$baz2").expect("type should be inferred");
         assert_eq!(inferred, "App\\Test\\Baz");
+    }
+
+    #[test]
+    fn test_variable_hover_info_from_inline_phpdoc_var() {
+        let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nfunction run(): void {\n    /**\n     * Local baz variable.\n     * @var Baz $baz2\n     */\n    $baz2 = makeBaz();\n    $baz2->test();\n}\n";
+        let info = parse_and_variable_hover_info(code, 10, 7).expect("hover info should exist");
+        assert_eq!(info.variable_name, "$baz2");
+        assert_eq!(info.type_display.as_deref(), Some("Baz"));
+        assert_eq!(info.resolved_type_fqn.as_deref(), Some("App\\Test\\Baz"));
+        assert!(info
+            .phpdoc_comment
+            .as_deref()
+            .unwrap_or("")
+            .contains("@var Baz $baz2"));
     }
 
     #[test]

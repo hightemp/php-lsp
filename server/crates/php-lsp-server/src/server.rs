@@ -11,7 +11,8 @@ use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::references::{find_references_in_file, find_variable_references_at_position};
 use php_lsp_parser::resolve::{
-    infer_variable_type_at_position, symbol_at_position, variable_definition_at_position, RefKind,
+    infer_variable_type_at_position, symbol_at_position, variable_definition_at_position,
+    variable_hover_info_at_position, RefKind,
 };
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::symbols::extract_file_symbols;
@@ -906,8 +907,8 @@ impl LanguageServer for PhpLspBackend {
         let pos = params.text_document_position_params.position;
         tracing::debug!("hover: {}:{}:{}", uri_str, pos.line, pos.character);
 
-        // Extract symbol-at-position inside a block so DashMap guard is dropped
-        let sym_at_pos = {
+        // Extract symbol-at-position and local variable hover info inside a block so DashMap guard is dropped.
+        let (sym_at_pos, var_hover_info) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -929,10 +930,24 @@ impl LanguageServer for PhpLspBackend {
                 .unwrap_or_default();
 
             // Find symbol at cursor position
-            match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
-                Some(s) => s,
-                None => return Ok(None),
-            }
+            let sym_at_pos =
+                match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+            let var_hover_info = if sym_at_pos.ref_kind == RefKind::Variable {
+                variable_hover_info_at_position(
+                    tree,
+                    &source,
+                    &file_symbols,
+                    pos.line,
+                    pos.character,
+                )
+            } else {
+                None
+            };
+
+            (sym_at_pos, var_hover_info)
         };
 
         // Look up symbol in index (with lazy vendor fallback)
@@ -1056,6 +1071,48 @@ impl LanguageServer for PhpLspBackend {
                 end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
             };
 
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: content,
+                }),
+                range: Some(range),
+            })
+        } else if let Some(var_info) = var_hover_info {
+            let mut content = String::new();
+            content.push_str("```php\n");
+            if let Some(ref t) = var_info.type_display {
+                content.push_str(t);
+                content.push(' ');
+                content.push_str(&var_info.variable_name);
+            } else if let Some(ref fqn) = var_info.resolved_type_fqn {
+                content.push_str(fqn);
+                content.push(' ');
+                content.push_str(&var_info.variable_name);
+            } else {
+                content.push_str("variable ");
+                content.push_str(&var_info.variable_name);
+            }
+            content.push_str("\n```\n");
+
+            if let Some(ref doc) = var_info.phpdoc_comment {
+                let phpdoc = parse_phpdoc(doc);
+                if let Some(ref summary) = phpdoc.summary {
+                    content.push_str("\n---\n\n");
+                    content.push_str(summary);
+                    content.push('\n');
+                }
+                if let Some(ref var_type) = phpdoc.var_type {
+                    content.push_str("\n**@var** `");
+                    content.push_str(&var_type.to_string());
+                    content.push_str("`\n");
+                }
+            }
+
+            let range = Range {
+                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
+                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
+            };
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
