@@ -210,6 +210,27 @@
   - Исправить резолв `A\\B\\fn()` (без потери префикса и без двойного namespace в сообщениях)
   - Синхронизировать поведение в `resolve`, `semantic`, `references`
 
+- [ ] **H-006** Реально применить `phpVersion` из VS Code в сервере
+  - Проблема: клиент отправляет `phpVersion`, но сервер его не использует; stubs загружаются по `DEFAULT_EXTENSIONS` без учета версии PHP.
+  - Что сделать:
+    - Расширить `initializationOptions`/runtime config на стороне сервера: читать `phpVersion`, валидировать формат (например `8.1`, `8.2`, `8.3`).
+    - Добавить обработку `workspace/didChangeConfiguration` и перезагрузку конфигурации без рестарта сервера.
+    - Связать `phpVersion` с набором доступных built-in символов/стабов (фильтрация version-gated API).
+  - Критерии готовности:
+    - При смене `phpVersion` в VS Code меняются diagnostics/definition/completion для version-specific API.
+    - Есть e2e-тест(ы) минимум для двух версий (например, API доступен в 8.2 и недоступен в 8.1).
+    - В README/документации явно описано текущее поведение `phpVersion`.
+
+- [x] **H-007** Убрать ложную semantic-ошибку для `self`/`static` в type hints *(done 2026-02-15)*
+  - Проблема: корректный код вида `public function withSelf(self $arg): static` помечается как ошибка (ложный unknown-type).
+  - Что сделать:
+    - Пройти `semantic`-проверку type-reference и учесть все CST-варианты, где `self|static|parent` могут появляться (параметры, return type, nullable/union/intersection).
+    - Убедиться, что built-in type list корректно применяется не только к `named_type`, но и к оберткам типов.
+  - Критерии готовности:
+    - На кейсе `withSelf(self $arg): static` нет diagnostic warning/error.
+    - Добавлены regression-тесты для `self`, `static`, `parent` в аргументах и return type (включая nullable/union при допустимом синтаксисе).
+    - Не сломаны текущие проверки unknown-class/unknown-type.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

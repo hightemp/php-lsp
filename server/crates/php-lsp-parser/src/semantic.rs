@@ -79,7 +79,7 @@ fn check_use_statements<F>(
         let fqn = &use_stmt.fqn;
 
         // Skip PHP built-in names
-        if BUILTIN_TYPE_NAMES.contains(&fqn.as_str()) {
+        if is_builtin_type_name(fqn) {
             continue;
         }
 
@@ -231,34 +231,48 @@ fn check_type_reference<F>(
 ) where
     F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
-    // For optional_type (?Type), drill into the child
+    // For optional_type (?Type), drill into the inner node.
     let target = if node.kind() == "optional_type" {
         node.named_child(0)
     } else {
         Some(node)
     };
 
-    if let Some(target) = target {
-        if target.kind() == "named_type" {
-            // Get the name/qualified_name child
+    let Some(target) = target else {
+        return;
+    };
+
+    let name_node = match target.kind() {
+        "name" | "qualified_name" | "primitive_type" => Some(target),
+        "named_type" => {
+            let mut found = None;
             for i in 0..target.named_child_count() {
                 if let Some(child) = target.named_child(i) {
                     let ck = child.kind();
-                    if ck == "name" || ck == "qualified_name" {
-                        let name = &source[child.byte_range()];
-                        let fqn = resolve_class_name(name, file_symbols);
-
-                        if should_check_class(&fqn) && resolver(&fqn).is_none() {
-                            diagnostics.push(SemanticDiagnostic {
-                                range: node_range(&child),
-                                message: format!("Unknown class: {}", fqn),
-                                kind: SemanticDiagnosticKind::UnknownClass,
-                            });
-                        }
+                    if ck == "name" || ck == "qualified_name" || ck == "primitive_type" {
+                        found = Some(child);
                         break;
                     }
                 }
             }
+            found
+        }
+        _ => None,
+    };
+
+    if let Some(name_node) = name_node {
+        let name = &source[name_node.byte_range()];
+        if is_builtin_type_name(name) {
+            return;
+        }
+
+        let fqn = resolve_class_name(name, file_symbols);
+        if should_check_class(&fqn) && resolver(&fqn).is_none() {
+            diagnostics.push(SemanticDiagnostic {
+                range: node_range(&name_node),
+                message: format!("Unknown class: {}", fqn),
+                kind: SemanticDiagnosticKind::UnknownClass,
+            });
         }
     }
 }
@@ -382,8 +396,7 @@ fn check_function_call<F>(
 /// Whether we should check a class name against the index.
 fn should_check_class(fqn: &str) -> bool {
     // Skip built-in type names
-    let lower = fqn.to_lowercase();
-    if BUILTIN_TYPE_NAMES.contains(&lower.as_str()) {
+    if is_builtin_type_name(fqn) {
         return false;
     }
 
@@ -404,7 +417,7 @@ fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
     }
 
     // Special names
-    if BUILTIN_TYPE_NAMES.contains(&name) {
+    if is_builtin_type_name(name) {
         return name.to_string();
     }
 
@@ -438,6 +451,11 @@ fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
     } else {
         name.to_string()
     }
+}
+
+fn is_builtin_type_name(name: &str) -> bool {
+    let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+    BUILTIN_TYPE_NAMES.contains(&lower.as_str())
 }
 
 /// Resolve a function name to FQN.
@@ -759,6 +777,80 @@ helper("x", "y");
                 .any(|d| d.message.contains("Too many arguments to App\\helper()")),
             "Expected too-many-arguments diagnostic, got: {:?}",
             arg_diags
+        );
+    }
+
+    #[test]
+    fn test_no_unknown_class_for_self_static_parent_type_hints() {
+        let code = r#"<?php
+namespace App;
+
+class Base {}
+
+class Child extends Base {
+    public function withSelf(self $arg): static {
+        return $this;
+    }
+
+    public function withParent(parent $arg): parent {
+        return $arg;
+    }
+}
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "App\\Base" {
+                Some(dummy_symbol())
+            } else {
+                None
+            }
+        });
+
+        let unknown: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::UnknownClass)
+            .collect();
+
+        assert!(
+            unknown.is_empty(),
+            "Expected no unknown-class diagnostics for self/static/parent, got: {:?}",
+            unknown
+        );
+    }
+
+    #[test]
+    fn test_no_unknown_class_for_case_insensitive_special_type_hints() {
+        let code = r#"<?php
+namespace App;
+
+class Base {}
+
+class Child extends Base {
+    public function withSelf(Self $arg): STATIC {
+        return $this;
+    }
+
+    public function withParent(PARENT $arg): PARENT {
+        return $arg;
+    }
+}
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "App\\Base" {
+                Some(dummy_symbol())
+            } else {
+                None
+            }
+        });
+
+        let unknown: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::UnknownClass)
+            .collect();
+
+        assert!(
+            unknown.is_empty(),
+            "Expected no unknown-class diagnostics for case-insensitive self/static/parent, got: {:?}",
+            unknown
         );
     }
 }

@@ -190,4 +190,18 @@ mod tests {
         // Mixed PHP/HTML should parse without errors
         assert!(!tree.root_node().has_error());
     }
+
+    #[test]
+    fn test_parse_self_param_and_static_return_type() {
+        let mut parser = FileParser::new();
+        parser.parse_full(
+            "<?php\nclass Demo {\n    public function withSelf(self $arg): static\n    {\n        return $this;\n    }\n}\n",
+        );
+
+        let tree = parser.tree().expect("Should have a tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "Valid self/static type-hint syntax should parse without errors"
+        );
+    }
 }
