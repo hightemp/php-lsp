@@ -1,0 +1,9 @@
+{
+  "name": "test/lsp-cases",
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  }
+}
+
