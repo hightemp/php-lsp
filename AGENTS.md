@@ -43,3 +43,8 @@
 - CI uses Node.js 20 for `client/` and Rust stable with `clippy` + `rustfmt`.
 - Initialize submodules before packaging work:
   - `git submodule update --init --recursive`
+
+## Важно
+
+1. Перед тем как сделать задачу помечай что будешь делать в TASKS.md.
+2. После выполнения задачи отмечай в TASKS.md.
