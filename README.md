@@ -43,6 +43,33 @@ npm install
 npm run build
 ```
 
+### Packaging VSIX (with bundled server)
+
+Build the server, bundle stubs, and package into a platform-specific `.vsix`:
+
+```bash
+# 1. Build server binary → copies to client/bin/
+./scripts/build-server.sh
+
+# 2. Bundle phpstorm-stubs → copies to client/stubs/
+./scripts/bundle-stubs.sh
+
+# 3. Package VSIX for current platform
+cd client
+npm install
+npx @vscode/vsce package --target linux-x64
+```
+
+For cross-compilation, pass the Rust target triple:
+
+```bash
+./scripts/build-server.sh aarch64-unknown-linux-gnu
+```
+
+Supported targets: `linux-x64`, `linux-arm64`, `alpine-x64`, `darwin-x64`, `darwin-arm64`, `win32-x64`, `win32-arm64`.
+
+CI produces platform-specific VSIX files automatically on git tag push (see `.github/workflows/release.yml`).
+
 ## Project Structure
 
 ```

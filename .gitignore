@@ -6,8 +6,11 @@
 # Node / VS Code extension
 client/node_modules/
 client/out/
+client/bin/
+client/stubs/
 client/*.vsix
 client/.vscode-test/
+*.vsix
 
 # IDE
 .idea/

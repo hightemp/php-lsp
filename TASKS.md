@@ -264,7 +264,15 @@
 - [ ] **VN-007** Интеграция Psalm — subprocess + маппинг output → Diagnostics
 - [ ] **VN-008** Code Lens — количество ссылок на класс/метод
 - [ ] **VN-009** Folding Range — складывание функций, классов, PHPDoc
-- [ ] **VN-010** Release pipeline — cross-platform VSIX сборка + публикация в Marketplace
+- [x] **VN-010** Release pipeline — cross-platform VSIX сборка + публикация в Marketplace *(done 2026-02-15)*
+  - `scripts/build-server.sh` — сборка Rust бинарника, копирование в `client/bin/`
+  - `scripts/bundle-stubs.sh` — копирование phpstorm-stubs в `client/stubs/`
+  - `.github/workflows/release.yml` — matrix build (7 платформ) + `vsce package --target`
+  - `client/.vscodeignore` — включает только `bin/`, `stubs/`, `out/`, `package.json`
+  - `extension.ts` — передаёт `stubsPath` в initializationOptions
+  - `server.rs` — принимает `stubsPath` из initializationOptions для поиска стабов
+  - Поддержанные платформы: linux-x64, linux-arm64, alpine-x64, darwin-x64, darwin-arm64, win32-x64, win32-arm64
+  - Локальная сборка VSIX: 2.56 MB (бинарник + стабы + клиент)
 
 ---
 

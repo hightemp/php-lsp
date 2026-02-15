@@ -26,10 +26,22 @@ function getServerPath(context: ExtensionContext): string {
     return customPath;
   }
 
-  // Use bundled binary
+  // Use bundled binary from extension's bin/ folder
   const platform = os.platform();
   const binaryName = platform === "win32" ? "php-lsp.exe" : "php-lsp";
   return context.asAbsolutePath(path.join("bin", binaryName));
+}
+
+/**
+ * Determine the path to bundled phpstorm-stubs.
+ */
+function getStubsPath(context: ExtensionContext): string | undefined {
+  const stubsPath = context.asAbsolutePath("stubs");
+  const fs = require("fs");
+  if (fs.existsSync(stubsPath)) {
+    return stubsPath;
+  }
+  return undefined;
 }
 
 export function activate(context: ExtensionContext): void {
@@ -39,6 +51,7 @@ export function activate(context: ExtensionContext): void {
   }
 
   const serverPath = getServerPath(context);
+  const stubsPath = getStubsPath(context);
 
   const serverOptions: ServerOptions = {
     run: {
@@ -67,6 +80,7 @@ export function activate(context: ExtensionContext): void {
       indexVendor: config.get<boolean>("indexVendor", true),
       stubExtensions: config.get<string[]>("stubs.extensions", []),
       logLevel: config.get<string>("logLevel", "info"),
+      stubsPath: stubsPath,
     },
   };
 

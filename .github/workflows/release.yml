@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-server:
+    name: Build Server (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            vscode-target: linux-x64
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            vscode-target: linux-arm64
+            cross: true
+
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            vscode-target: alpine-x64
+            cross: true
+
+          - target: x86_64-apple-darwin
+            os: macos-13
+            vscode-target: darwin-x64
+
+          - target: aarch64-apple-darwin
+            os: macos-14
+            vscode-target: darwin-arm64
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            vscode-target: win32-x64
+
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            vscode-target: win32-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        working-directory: server
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        working-directory: server
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Determine binary name
+        id: binary
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            echo "name=php-lsp.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=php-lsp" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Strip binary (Unix)
+        if: "!contains(matrix.target, 'windows')"
+        run: |
+          strip "server/target/${{ matrix.target }}/release/${{ steps.binary.outputs.name }}" 2>/dev/null || true
+
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.vscode-target }}
+          path: server/target/${{ matrix.target }}/release/${{ steps.binary.outputs.name }}
+          if-no-files-found: error
+
+  package-vsix:
+    name: Package VSIX (${{ matrix.vscode-target }})
+    needs: build-server
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        vscode-target:
+          - linux-x64
+          - linux-arm64
+          - alpine-x64
+          - darwin-x64
+          - darwin-arm64
+          - win32-x64
+          - win32-arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: server-${{ matrix.vscode-target }}
+          path: client/bin/
+
+      - name: Make binary executable
+        if: "!contains(matrix.vscode-target, 'win32')"
+        run: chmod +x client/bin/php-lsp
+
+      - name: Bundle phpstorm-stubs
+        run: bash scripts/bundle-stubs.sh
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Build client
+        working-directory: client
+        run: npm run build
+
+      - name: Install vsce
+        run: npm install -g @vscode/vsce
+
+      - name: Package VSIX
+        working-directory: client
+        run: vsce package --target ${{ matrix.vscode-target }} -o ../php-lsp-${{ matrix.vscode-target }}.vsix
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix-${{ matrix.vscode-target }}
+          path: php-lsp-${{ matrix.vscode-target }}.vsix
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: package-vsix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all VSIX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vsix-*
+          merge-multiple: true
+          path: vsix/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vsix/*.vsix
+          generate_release_notes: true
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Uncomment when you have a VS Code Marketplace publisher token
+  # publish:
+  #   name: Publish to Marketplace
+  #   needs: package-vsix
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Download all VSIX artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         pattern: vsix-*
+  #         merge-multiple: true
+  #         path: vsix/
+  #
+  #     - name: Install vsce
+  #       run: npm install -g @vscode/vsce
+  #
+  #     - name: Publish
+  #       run: |
+  #         for vsix in vsix/*.vsix; do
+  #           vsce publish --packagePath "$vsix"
+  #         done
+  #       env:
+  #         VSCE_PAT: ${{ secrets.VSCE_PAT }}

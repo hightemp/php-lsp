@@ -4,6 +4,10 @@
   "description": "PHP language support powered by php-lsp (Rust)",
   "version": "0.1.0",
   "publisher": "php-lsp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hightemp/php-lsp"
+  },
   "license": "MIT",
   "engines": {
     "vscode": "^1.75.0"
@@ -112,7 +116,14 @@
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.mjs --production",
     "watch": "node esbuild.mjs --watch",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "package": "vsce package",
+    "package:linux-x64": "vsce package --target linux-x64",
+    "package:linux-arm64": "vsce package --target linux-arm64",
+    "package:darwin-x64": "vsce package --target darwin-x64",
+    "package:darwin-arm64": "vsce package --target darwin-arm64",
+    "package:win32-x64": "vsce package --target win32-x64",
+    "package:alpine-x64": "vsce package --target alpine-x64"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"

@@ -1,0 +1,20 @@
+# Include only what's needed in the VSIX
+**
+!out/extension.js
+!bin/
+!stubs/
+!package.json
+!package-lock.json
+!README.md
+!LICENSE
+!CHANGELOG.md
+!images/
+
+# Exclude dev/build files
+src/**
+node_modules/**
+esbuild.mjs
+tsconfig.json
+.gitignore
+*.map
+*.ts

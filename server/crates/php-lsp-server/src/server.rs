@@ -34,6 +34,8 @@ pub struct PhpLspBackend {
     namespace_map: Mutex<Option<NamespaceMap>>,
     /// Trace level from InitializeParams (off/messages/verbose).
     trace_level: Mutex<TraceValue>,
+    /// Path to bundled phpstorm-stubs (from client initializationOptions).
+    stubs_path: Mutex<Option<PathBuf>>,
 }
 
 impl PhpLspBackend {
@@ -45,6 +47,7 @@ impl PhpLspBackend {
             workspace_root: Mutex::new(None),
             namespace_map: Mutex::new(None),
             trace_level: Mutex::new(TraceValue::Off),
+            stubs_path: Mutex::new(None),
         }
     }
 
@@ -521,6 +524,15 @@ impl LanguageServer for PhpLspBackend {
                 params.root_path.as_ref().map(PathBuf::from)
             });
 
+        // Extract stubsPath from client initializationOptions
+        if let Some(ref opts) = params.initialization_options {
+            if let Some(sp) = opts.get("stubsPath").and_then(|v| v.as_str()) {
+                let p = PathBuf::from(sp);
+                tracing::info!("Client provided stubsPath: {}", p.display());
+                *self.stubs_path.lock().await = Some(p);
+            }
+        }
+
         if let Some(ref root) = root_path {
             tracing::info!("Workspace root: {}", root.display());
             *self.workspace_root.lock().await = Some(root.clone());
@@ -603,21 +615,32 @@ impl LanguageServer for PhpLspBackend {
             // Load phpstorm-stubs for built-in PHP functions/classes
             let stubs_index = self.index.clone();
             let stubs_root = root.clone();
+            let client_stubs_path = self.stubs_path.lock().await.clone();
             tokio::task::spawn_blocking(move || {
-                // Try to find stubs relative to the server binary or workspace
-                let possible_stubs_paths = [
-                    // Relative to workspace (development)
-                    stubs_root.join("server/data/stubs"),
-                    // Relative to binary location
-                    std::env::current_exe()
-                        .ok()
-                        .and_then(|p| p.parent().map(|p| p.join("data/stubs")))
-                        .unwrap_or_default(),
-                    // Common install paths
-                    PathBuf::from("/usr/share/php-lsp/stubs"),
-                ];
+                // Build list of candidate paths, client-provided path first
+                let mut candidate_paths: Vec<PathBuf> = Vec::new();
 
-                for stubs_path in &possible_stubs_paths {
+                // 1. Path from client initializationOptions (bundled with extension)
+                if let Some(ref p) = client_stubs_path {
+                    candidate_paths.push(p.clone());
+                }
+
+                // 2. Relative to workspace (development)
+                candidate_paths.push(stubs_root.join("server/data/stubs"));
+
+                // 3. Relative to binary location
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(dir) = exe.parent() {
+                        candidate_paths.push(dir.join("data/stubs"));
+                        // Also check sibling stubs/ dir (for extension layout: bin/php-lsp + stubs/)
+                        candidate_paths.push(dir.join("../stubs").canonicalize().unwrap_or_else(|_| dir.join("../stubs")));
+                    }
+                }
+
+                // 4. Common install paths
+                candidate_paths.push(PathBuf::from("/usr/share/php-lsp/stubs"));
+
+                for stubs_path in &candidate_paths {
                     if stubs_path.is_dir() {
                         tracing::info!("Loading phpstorm-stubs from {}", stubs_path.display());
                         let loaded = stubs::load_stubs(
