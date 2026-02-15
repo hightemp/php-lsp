@@ -33,10 +33,8 @@ pub enum SemanticDiagnosticKind {
 
 /// Names that should not be reported as unknown (PHP built-in types, special names).
 const BUILTIN_TYPE_NAMES: &[&str] = &[
-    "self", "static", "parent", "$this",
-    "int", "float", "string", "bool", "array", "object", "null",
-    "void", "never", "mixed", "callable", "iterable", "true", "false",
-    "resource",
+    "self", "static", "parent", "$this", "int", "float", "string", "bool", "array", "object",
+    "null", "void", "never", "mixed", "callable", "iterable", "true", "false", "resource",
 ];
 
 /// Extract semantic diagnostics from a file.
@@ -198,9 +196,7 @@ fn check_class_in_new<F>(
 
                 if actual < required {
                     // Find the arguments node for better range
-                    let args_node = node
-                        .child_by_field_name("arguments")
-                        .unwrap_or(node);
+                    let args_node = node.child_by_field_name("arguments").unwrap_or(node);
                     diagnostics.push(SemanticDiagnostic {
                         range: node_range(&args_node),
                         message: format!(
@@ -210,9 +206,7 @@ fn check_class_in_new<F>(
                         kind: SemanticDiagnosticKind::ArgumentCountMismatch,
                     });
                 } else if actual > max {
-                    let args_node = node
-                        .child_by_field_name("arguments")
-                        .unwrap_or(node);
+                    let args_node = node.child_by_field_name("arguments").unwrap_or(node);
                     diagnostics.push(SemanticDiagnostic {
                         range: node_range(&args_node),
                         message: format!(
@@ -311,12 +305,62 @@ fn check_function_call<F>(
     // The function name is the first named child (name or qualified_name)
     if let Some(name_node) = node.named_child(0) {
         let nk = name_node.kind();
-        if nk == "name" || nk == "qualified_name" {
+        if nk == "name" || nk == "qualified_name" || nk == "namespace_name" {
             let name = &source[name_node.byte_range()];
 
             // Skip PHP built-in functions by checking if name is simple and common
             // We only check namespaced function calls or functions that aren't in the index
             let fqn = resolve_function_name(name, file_symbols);
+
+            // Resolve function symbol for argument count checks.
+            // For simple names, try namespace-qualified fallback as well.
+            let mut resolved: Option<(String, Arc<SymbolInfo>)> =
+                resolver(&fqn).map(|sym| (fqn.clone(), sym));
+
+            if resolved.is_none() && !fqn.contains('\\') {
+                if let Some(ref ns) = file_symbols.namespace {
+                    let ns_fqn = format!("{}\\{}", ns, fqn);
+                    resolved = resolver(&ns_fqn).map(|sym| (ns_fqn, sym));
+                }
+            }
+
+            if let Some((resolved_fqn, func_sym)) = resolved {
+                if let Some(ref sig) = func_sym.signature {
+                    let required = sig
+                        .params
+                        .iter()
+                        .filter(|p| p.default_value.is_none() && !p.is_variadic)
+                        .count();
+                    let max = if sig.params.iter().any(|p| p.is_variadic) {
+                        usize::MAX
+                    } else {
+                        sig.params.len()
+                    };
+                    let actual = count_arguments(node);
+
+                    if actual < required {
+                        let args_node = node.child_by_field_name("arguments").unwrap_or(node);
+                        diagnostics.push(SemanticDiagnostic {
+                            range: node_range(&args_node),
+                            message: format!(
+                                "Too few arguments to {}(): expected at least {}, got {}",
+                                resolved_fqn, required, actual
+                            ),
+                            kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+                        });
+                    } else if actual > max {
+                        let args_node = node.child_by_field_name("arguments").unwrap_or(node);
+                        diagnostics.push(SemanticDiagnostic {
+                            range: node_range(&args_node),
+                            message: format!(
+                                "Too many arguments to {}(): expected at most {}, got {}",
+                                resolved_fqn, max, actual
+                            ),
+                            kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+                        });
+                    }
+                }
+            }
 
             // Don't flag simple function names — too many PHP built-ins
             // Only flag namespaced function calls that can't be resolved
@@ -472,7 +516,7 @@ mod tests {
     use super::*;
     use crate::parser::FileParser;
     use crate::symbols::extract_file_symbols;
-    use php_lsp_types::PhpSymbolKind;
+    use php_lsp_types::{ParamInfo, PhpSymbolKind, Signature};
 
     fn dummy_symbol() -> Arc<SymbolInfo> {
         Arc::new(SymbolInfo {
@@ -490,7 +534,29 @@ mod tests {
         })
     }
 
-    fn parse_and_check(code: &str, resolver: impl Fn(&str) -> Option<Arc<SymbolInfo>>) -> Vec<SemanticDiagnostic> {
+    fn function_symbol(fqn: &str, params: Vec<ParamInfo>) -> Arc<SymbolInfo> {
+        Arc::new(SymbolInfo {
+            name: fqn.rsplit('\\').next().unwrap_or(fqn).to_string(),
+            kind: PhpSymbolKind::Function,
+            fqn: fqn.to_string(),
+            range: (0, 0, 0, 0),
+            selection_range: (0, 0, 0, 0),
+            uri: String::new(),
+            visibility: php_lsp_types::Visibility::Public,
+            modifiers: Default::default(),
+            doc_comment: None,
+            signature: Some(Signature {
+                params,
+                return_type: None,
+            }),
+            parent_fqn: None,
+        })
+    }
+
+    fn parse_and_check(
+        code: &str,
+        resolver: impl Fn(&str) -> Option<Arc<SymbolInfo>>,
+    ) -> Vec<SemanticDiagnostic> {
         let mut parser = FileParser::new();
         parser.parse_full(code);
         let tree = parser.tree().unwrap();
@@ -510,7 +576,11 @@ $y = new UnknownClass();
 "#;
         // UserService is known, UnknownClass is unknown
         let diags = parse_and_check(code, |fqn| {
-            if fqn == "App\\Service\\UserService" { Some(dummy_symbol()) } else { None }
+            if fqn == "App\\Service\\UserService" {
+                Some(dummy_symbol())
+            } else {
+                None
+            }
         });
 
         let unknown: Vec<_> = diags
@@ -541,7 +611,11 @@ use App\Service\UserService;
 use App\Missing\SomeClass;
 "#;
         let diags = parse_and_check(code, |fqn| {
-            if fqn == "App\\Service\\UserService" { Some(dummy_symbol()) } else { None }
+            if fqn == "App\\Service\\UserService" {
+                Some(dummy_symbol())
+            } else {
+                None
+            }
         });
 
         let unresolved: Vec<_> = diags
@@ -549,7 +623,12 @@ use App\Missing\SomeClass;
             .filter(|d| d.kind == SemanticDiagnosticKind::UnresolvedUse)
             .collect();
 
-        assert_eq!(unresolved.len(), 1, "Expected 1 unresolved use, got: {:?}", unresolved);
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "Expected 1 unresolved use, got: {:?}",
+            unresolved
+        );
         assert!(unresolved[0].message.contains("App\\Missing\\SomeClass"));
     }
 
@@ -588,6 +667,96 @@ array_map(fn($x) => $x, []);
             diags.is_empty(),
             "Should have no diagnostics for built-in usage, got: {:?}",
             diags
+        );
+    }
+
+    #[test]
+    fn test_function_argument_count_mismatch_too_few() {
+        let code = r#"<?php
+namespace App;
+
+function helper(string $a, string $b): void {}
+helper();
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "App\\helper" {
+                Some(function_symbol(
+                    fqn,
+                    vec![
+                        ParamInfo {
+                            name: "a".to_string(),
+                            type_info: None,
+                            default_value: None,
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "b".to_string(),
+                            type_info: None,
+                            default_value: None,
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                    ],
+                ))
+            } else {
+                None
+            }
+        });
+
+        let arg_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::ArgumentCountMismatch)
+            .collect();
+
+        assert!(
+            arg_diags
+                .iter()
+                .any(|d| d.message.contains("Too few arguments to App\\helper()")),
+            "Expected too-few-arguments diagnostic, got: {:?}",
+            arg_diags
+        );
+    }
+
+    #[test]
+    fn test_function_argument_count_mismatch_too_many() {
+        let code = r#"<?php
+namespace App;
+
+function helper(string $a): void {}
+helper("x", "y");
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "App\\helper" {
+                Some(function_symbol(
+                    fqn,
+                    vec![ParamInfo {
+                        name: "a".to_string(),
+                        type_info: None,
+                        default_value: None,
+                        is_variadic: false,
+                        is_by_ref: false,
+                        is_promoted: false,
+                    }],
+                ))
+            } else {
+                None
+            }
+        });
+
+        let arg_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::ArgumentCountMismatch)
+            .collect();
+
+        assert!(
+            arg_diags
+                .iter()
+                .any(|d| d.message.contains("Too many arguments to App\\helper()")),
+            "Expected too-many-arguments diagnostic, got: {:?}",
+            arg_diags
         );
     }
 }

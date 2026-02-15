@@ -89,30 +89,20 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
             if name_field.map(|n| n.id()) == Some(node.id()) {
                 // Cursor is on the member name
                 let object_text = object_field.map(|o| source[o.byte_range()].to_string());
-
-                // Check if grandparent is a function call
-                let is_call = parent
-                    .parent()
-                    .map(|gp| gp.kind() == "member_call_expression" || gp.kind() == "function_call_expression")
-                    .unwrap_or(false)
-                    || parent.kind() == "member_call_expression";
-
-                // Re-check: might actually be member_call_expression itself
-                let grandparent_kind = parent.parent().map(|gp| gp.kind()).unwrap_or("");
-
-                let ref_kind = if is_call || grandparent_kind == "member_call_expression" {
-                    RefKind::MethodCall
-                } else {
-                    RefKind::PropertyAccess
-                };
+                let ref_kind = RefKind::PropertyAccess;
 
                 // Try to resolve object type to build a proper FQN
-                let class_fqn = object_field
-                    .and_then(|o| try_resolve_object_type(o, source, file_symbols));
-                let fqn = if let Some(ref cls) = class_fqn {
-                    format!("{}::{}", cls, node_text)
-                } else {
+                let property_name = if node_text.starts_with('$') {
                     node_text.to_string()
+                } else {
+                    format!("${}", node_text)
+                };
+                let class_fqn =
+                    object_field.and_then(|o| try_resolve_object_type(o, source, file_symbols));
+                let fqn = if let Some(ref cls) = class_fqn {
+                    format!("{}::{}", cls, property_name)
+                } else {
+                    property_name
                 };
 
                 return Some(SymbolAtPosition {
@@ -136,8 +126,8 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
             if name_field.map(|n| n.id()) == Some(node.id()) {
                 let object_text = object_field.map(|o| source[o.byte_range()].to_string());
                 // Try to resolve object type to build a proper FQN
-                let class_fqn = object_field
-                    .and_then(|o| try_resolve_object_type(o, source, file_symbols));
+                let class_fqn =
+                    object_field.and_then(|o| try_resolve_object_type(o, source, file_symbols));
                 let fqn = if let Some(ref cls) = class_fqn {
                     format!("{}::{}", cls, node_text)
                 } else {
@@ -236,7 +226,9 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
         "function_call_expression" => {
             let func_field = parent.child_by_field_name("function");
             if func_field.map(|n| n.id()) == Some(node.id())
-                || (node.kind() == "name" || node.kind() == "qualified_name" || node.kind() == "namespace_name")
+                || (node.kind() == "name"
+                    || node.kind() == "qualified_name"
+                    || node.kind() == "namespace_name")
             {
                 let resolved = resolve_function_name(node_text, file_symbols);
                 return Some(SymbolAtPosition {
@@ -264,7 +256,10 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
         }
 
         // Class declaration, interface, trait, enum — hovering on name
-        "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration" => {
+        "class_declaration"
+        | "interface_declaration"
+        | "trait_declaration"
+        | "enum_declaration" => {
             let name_field = parent.child_by_field_name("name");
             if name_field.map(|n| n.id()) == Some(node.id()) {
                 let fqn = resolve_class_name(node_text, file_symbols);
@@ -337,7 +332,9 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
         }
 
         // Variable
-        _ if node.kind() == "variable_name" || (node.kind() == "name" && node_text.starts_with('$')) => {
+        _ if node.kind() == "variable_name"
+            || (node.kind() == "name" && node_text.starts_with('$')) =>
+        {
             Some(SymbolAtPosition {
                 fqn: node_text.to_string(),
                 name: node_text.to_string(),
@@ -354,7 +351,10 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
 
         _ => {
             // Try to resolve as a generic name
-            if node.kind() == "name" || node.kind() == "qualified_name" || node.kind() == "namespace_name" {
+            if node.kind() == "name"
+                || node.kind() == "qualified_name"
+                || node.kind() == "namespace_name"
+            {
                 resolve_name_node(node, source, file_symbols)
             } else {
                 None
@@ -370,7 +370,11 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
 /// - `$this` → looks up parent class
 /// - `Foo::create()` (static call returning self/static) → `Foo`
 /// - `ClassName` (as scope in scoped expressions) → `ClassName`
-fn try_resolve_object_type<'a>(object_node: Node<'a>, source: &str, file_symbols: &FileSymbols) -> Option<String> {
+fn try_resolve_object_type<'a>(
+    object_node: Node<'a>,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
     let kind = object_node.kind();
     match kind {
         // Direct: new Foo()
@@ -429,7 +433,12 @@ fn try_resolve_object_type<'a>(object_node: Node<'a>, source: &str, file_symbols
 /// Handles:
 /// - `$var = new ClassName()` → ClassName
 /// - `function foo(ClassName $var)` → ClassName (typed parameter)
-fn infer_variable_type(var_node: Node, var_name: &str, source: &str, file_symbols: &FileSymbols) -> Option<String> {
+fn infer_variable_type(
+    var_node: Node,
+    var_name: &str,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
     // 1. Find enclosing function/method body
     let func_node = find_enclosing_function(var_node)?;
 
@@ -437,7 +446,9 @@ fn infer_variable_type(var_node: Node, var_name: &str, source: &str, file_symbol
     if let Some(params) = func_node.child_by_field_name("parameters") {
         for i in 0..params.named_child_count() {
             if let Some(param) = params.named_child(i) {
-                if param.kind() == "simple_parameter" || param.kind() == "property_promotion_parameter" {
+                if param.kind() == "simple_parameter"
+                    || param.kind() == "property_promotion_parameter"
+                {
                     // Check if parameter name matches
                     if let Some(name_node) = param.child_by_field_name("name") {
                         let param_name = &source[name_node.byte_range()];
@@ -457,7 +468,8 @@ fn infer_variable_type(var_node: Node, var_name: &str, source: &str, file_symbol
 
     // 3. Scan function body for assignment: $var = new ClassName()
     if let Some(body) = func_node.child_by_field_name("body") {
-        if let Some(resolved) = find_assignment_type(body, var_name, var_node, source, file_symbols) {
+        if let Some(resolved) = find_assignment_type(body, var_name, var_node, source, file_symbols)
+        {
             return Some(resolved);
         }
     }
@@ -470,7 +482,10 @@ fn find_enclosing_function(node: Node) -> Option<Node> {
     let mut current = node.parent();
     while let Some(n) = current {
         match n.kind() {
-            "method_declaration" | "function_definition" | "arrow_function" | "anonymous_function_creation_expression" => {
+            "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function_creation_expression" => {
                 return Some(n);
             }
             _ => current = n.parent(),
@@ -504,9 +519,7 @@ fn extract_type_name(type_node: Node, source: &str) -> Option<String> {
             }
             None
         }
-        "name" | "qualified_name" => {
-            Some(source[type_node.byte_range()].to_string())
-        }
+        "name" | "qualified_name" => Some(source[type_node.byte_range()].to_string()),
         _ => None,
     }
 }
@@ -543,7 +556,9 @@ fn find_assignment_type(
                         let left_text = &source[left.byte_range()];
                         if left_text == var_name {
                             // Check if right side is `new ClassName()`
-                            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols) {
+                            if let Some(resolved) =
+                                try_resolve_object_type(right, source, file_symbols)
+                            {
                                 return Some(resolved);
                             }
                         }
@@ -557,7 +572,11 @@ fn find_assignment_type(
 }
 
 /// Resolve a simple name node to a SymbolAtPosition.
-fn resolve_name_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<SymbolAtPosition> {
+fn resolve_name_node(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<SymbolAtPosition> {
     let text = &source[node.byte_range()];
 
     if text.starts_with('$') {
@@ -611,9 +630,7 @@ fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
         let alias = use_stmt
             .alias
             .as_deref()
-            .unwrap_or_else(|| {
-                use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn)
-            });
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
 
         if alias == first_part {
             if parts.len() == 1 {
@@ -650,9 +667,7 @@ fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
         let alias = use_stmt
             .alias
             .as_deref()
-            .unwrap_or_else(|| {
-                use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn)
-            });
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
 
         if alias == name {
             return use_stmt.fqn.clone();
@@ -668,11 +683,18 @@ fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
 }
 
 /// Try to find the FQN of the class containing a method node.
-fn find_parent_class_fqn(method_node: Node, source: &str, file_symbols: &FileSymbols) -> Option<String> {
+fn find_parent_class_fqn(
+    method_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
     let mut current = method_node.parent();
     while let Some(node) = current {
         match node.kind() {
-            "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration" => {
+            "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration" => {
                 let name_node = node.child_by_field_name("name")?;
                 let name = &source[name_node.byte_range()];
                 return Some(resolve_class_name(name, file_symbols));
@@ -747,7 +769,10 @@ mod tests {
         let code = "<?php\nnamespace App;\nuse App\\Foo;\n\n(new Foo())->increment(5);\n";
         // "increment" is at line 4, col 13
         let result = parse_and_resolve(code, 4, 13);
-        assert!(result.is_some(), "Should resolve method call on new expression");
+        assert!(
+            result.is_some(),
+            "Should resolve method call on new expression"
+        );
         let sym = result.unwrap();
         assert_eq!(sym.name, "increment");
         assert_eq!(sym.ref_kind, RefKind::MethodCall);
@@ -774,7 +799,8 @@ mod tests {
         assert!(result.is_some(), "Should resolve property access on $this");
         let sym = result.unwrap();
         assert_eq!(sym.name, "name");
-        assert_eq!(sym.fqn, "App\\Foo::name");
+        assert_eq!(sym.fqn, "App\\Foo::$name");
+        assert_eq!(sym.ref_kind, RefKind::PropertyAccess);
     }
 
     #[test]
@@ -790,7 +816,10 @@ mod tests {
         let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nclass Bar {\n    public function greet(): void {\n        $baz = new Baz();\n        $baz->test();\n    }\n}\n";
         // "test" in "$baz->test()" at line 7, col 15
         let result = parse_and_resolve(code, 7, 15);
-        assert!(result.is_some(), "Should resolve method on variable assigned via new");
+        assert!(
+            result.is_some(),
+            "Should resolve method on variable assigned via new"
+        );
         let sym = result.unwrap();
         assert_eq!(sym.name, "test");
         assert_eq!(sym.ref_kind, RefKind::MethodCall);
@@ -814,9 +843,28 @@ mod tests {
         let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nclass Bar {\n    public function greet(Baz $baz2): void {\n        echo $baz2->name;\n    }\n}\n";
         // "name" in "$baz2->name" at line 6, col 20
         let result = parse_and_resolve(code, 6, 20);
-        assert!(result.is_some(), "Should resolve property on typed parameter");
+        assert!(
+            result.is_some(),
+            "Should resolve property on typed parameter"
+        );
         let sym = result.unwrap();
         assert_eq!(sym.name, "name");
-        assert_eq!(sym.fqn, "App\\Test\\Baz::name");
+        assert_eq!(sym.fqn, "App\\Test\\Baz::$name");
+        assert_eq!(sym.ref_kind, RefKind::PropertyAccess);
+    }
+
+    #[test]
+    fn test_resolve_property_vs_method_same_name() {
+        let code = "<?php\nnamespace App\\Test;\n\nclass Baz {\n    public string $test = 'x';\n    public function test(): string { return 'ok'; }\n}\n\nfunction go(Baz $baz2): void {\n    echo $baz2->test;\n    $baz2->test();\n}\n";
+
+        // Property access should resolve to Baz::$test
+        let prop = parse_and_resolve(code, 9, 17).expect("property should resolve");
+        assert_eq!(prop.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(prop.fqn, "App\\Test\\Baz::$test");
+
+        // Method call should resolve to Baz::test
+        let method = parse_and_resolve(code, 10, 12).expect("method should resolve");
+        assert_eq!(method.ref_kind, RefKind::MethodCall);
+        assert_eq!(method.fqn, "App\\Test\\Baz::test");
     }
 }

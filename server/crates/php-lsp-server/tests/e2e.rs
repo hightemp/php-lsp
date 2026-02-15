@@ -22,9 +22,7 @@ fn initialize_request(id: i64) -> Request {
 }
 
 fn initialized_notification() -> Request {
-    Request::build("initialized")
-        .params(json!({}))
-        .finish()
+    Request::build("initialized").params(json!({})).finish()
 }
 
 fn shutdown_request(id: i64) -> Request {
@@ -108,7 +106,9 @@ async fn test_initialize_and_shutdown() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
 
     // Spawn a task to drain server→client messages so client.log_message() etc. don't block.
-    tokio::spawn(async move { socket.collect::<Vec<_>>().await; });
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
 
     // Send initialize
     let resp = service
@@ -120,7 +120,10 @@ async fn test_initialize_and_shutdown() {
         .unwrap();
 
     let result = extract_result(resp);
-    assert!(result.get("capabilities").is_some(), "expected capabilities in init result");
+    assert!(
+        result.get("capabilities").is_some(),
+        "expected capabilities in init result"
+    );
     assert!(
         result
             .get("serverInfo")
@@ -138,7 +141,10 @@ async fn test_initialize_and_shutdown() {
         .call(initialized_notification())
         .await
         .unwrap();
-    assert!(resp.is_none(), "initialized is a notification, no response expected");
+    assert!(
+        resp.is_none(),
+        "initialized is a notification, no response expected"
+    );
 
     // Shutdown
     let resp = service
@@ -154,7 +160,9 @@ async fn test_initialize_and_shutdown() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_open_file_and_hover() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
-    tokio::spawn(async move { socket.collect::<Vec<_>>().await; });
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
 
     // Initialize
     service
@@ -233,7 +241,9 @@ $g->greet("World");
 #[tokio::test(flavor = "current_thread")]
 async fn test_goto_definition() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
-    tokio::spawn(async move { socket.collect::<Vec<_>>().await; });
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
 
     // Initialize
     service
@@ -283,10 +293,7 @@ $f->bar();
     let result = extract_result(resp);
     // Should return a location pointing to the class definition
     if !result.is_null() {
-        let target_uri = result
-            .get("uri")
-            .and_then(|u| u.as_str())
-            .unwrap_or("");
+        let target_uri = result.get("uri").and_then(|u| u.as_str()).unwrap_or("");
         assert_eq!(target_uri, uri, "definition should point to the same file");
     }
 
@@ -303,7 +310,9 @@ $f->bar();
 #[tokio::test(flavor = "current_thread")]
 async fn test_completion() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
-    tokio::spawn(async move { socket.collect::<Vec<_>>().await; });
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
 
     // Initialize
     service
@@ -366,7 +375,9 @@ echo $
 #[tokio::test(flavor = "current_thread")]
 async fn test_document_symbols() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
-    tokio::spawn(async move { socket.collect::<Vec<_>>().await; });
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
 
     // Initialize
     service
@@ -435,7 +446,9 @@ class UserService {
 #[tokio::test(flavor = "current_thread")]
 async fn test_rename() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
-    tokio::spawn(async move { socket.collect::<Vec<_>>().await; });
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
 
     // Initialize
     service

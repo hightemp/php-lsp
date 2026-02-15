@@ -157,7 +157,10 @@ fn check_static_access(
 
     if let Some(colon_pos) = trimmed.rfind("::") {
         let after_colons = &trimmed[colon_pos + 2..];
-        if after_colons.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+        if after_colons
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        {
             let before_colons = trimmed[..colon_pos].trim_end();
             let class_expr = extract_object_expr(before_colons);
             let class_fqn = resolve_class_for_completion(&class_expr, file_symbols);
@@ -179,7 +182,10 @@ fn check_variable_access(text_before: &str) -> Option<CompletionContext> {
     // Check if we're typing a variable: $par...
     if let Some(dollar_pos) = trimmed.rfind('$') {
         let after_dollar = &trimmed[dollar_pos + 1..];
-        if after_dollar.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if after_dollar
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_')
+        {
             // Make sure $ is not part of a string or something else
             let before_dollar = &trimmed[..dollar_pos];
             let before_char = before_dollar.chars().last();
@@ -303,8 +309,12 @@ fn is_type_hint_position(node: &Node, _source: &str, _cursor_offset: usize) -> b
     let mut current = Some(*node);
     while let Some(n) = current {
         match n.kind() {
-            "named_type" | "optional_type" | "union_type" | "intersection_type"
-            | "simple_parameter" | "property_declaration" => return true,
+            "named_type"
+            | "optional_type"
+            | "union_type"
+            | "intersection_type"
+            | "simple_parameter"
+            | "property_declaration" => return true,
             _ => {}
         }
         current = n.parent();

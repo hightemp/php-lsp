@@ -400,13 +400,35 @@ fn walk_for_member_refs(
     results: &mut Vec<ReferenceLocation>,
 ) {
     let kind = node.kind();
+    let is_property_target = member_name.starts_with('$');
+    let normalized_member_name = member_name.strip_prefix('$').unwrap_or(member_name);
 
     match kind {
-        // $obj->method() or $obj->property
-        "member_access_expression" | "member_call_expression" => {
+        // $obj->property (and callable-like member access without invocation)
+        "member_access_expression" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let text = &source[name_node.byte_range()];
-                // Simple name match (without type resolution for now)
+                if text == normalized_member_name {
+                    let start = name_node.start_position();
+                    let end = name_node.end_position();
+                    results.push(ReferenceLocation {
+                        range: (
+                            start.row as u32,
+                            start.column as u32,
+                            end.row as u32,
+                            end.column as u32,
+                        ),
+                    });
+                }
+            }
+        }
+
+        // $obj->method()
+        "member_call_expression" => {
+            if is_property_target {
+                // Property target should not match method calls with the same short name.
+            } else if let Some(name_node) = node.child_by_field_name("name") {
+                let text = &source[name_node.byte_range()];
                 if text == member_name {
                     let start = name_node.start_position();
                     let end = name_node.end_position();
@@ -422,11 +444,47 @@ fn walk_for_member_refs(
             }
         }
 
-        // ClassName::method() or ClassName::$prop or ClassName::CONST
-        "scoped_call_expression" | "scoped_property_access_expression" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
+        // ClassName::method()
+        "scoped_call_expression" => {
+            if is_property_target {
+                // Property target should not match scoped method calls.
+            } else if let Some(name_node) = node.child_by_field_name("name") {
                 let text = &source[name_node.byte_range()];
                 if text == member_name {
+                    // For scoped access, also check that the scope resolves to the right class
+                    if let Some(scope_node) = node.child_by_field_name("scope") {
+                        let scope_text = &source[scope_node.byte_range()];
+                        let scope_fqn = resolve_name_to_fqn(scope_text, _file_symbols);
+                        let expected_class = &target_fqn[..target_fqn.rfind("::").unwrap_or(0)];
+
+                        if scope_fqn == expected_class
+                            || scope_text == "self"
+                            || scope_text == "static"
+                            || scope_text == "parent"
+                        {
+                            let start = name_node.start_position();
+                            let end = name_node.end_position();
+                            results.push(ReferenceLocation {
+                                range: (
+                                    start.row as u32,
+                                    start.column as u32,
+                                    end.row as u32,
+                                    end.column as u32,
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // ClassName::$prop or ClassName::CONST
+        "scoped_property_access_expression" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let text = &source[name_node.byte_range()];
+                let matches_member =
+                    text == member_name || (!is_property_target && text == normalized_member_name);
+                if matches_member {
                     // For scoped access, also check that the scope resolves to the right class
                     if let Some(scope_node) = node.child_by_field_name("scope") {
                         let scope_text = &source[scope_node.byte_range()];
@@ -459,7 +517,14 @@ fn walk_for_member_refs(
 
     let cursor = &mut node.walk();
     for child in node.named_children(cursor) {
-        walk_for_member_refs(child, source, _file_symbols, target_fqn, member_name, results);
+        walk_for_member_refs(
+            child,
+            source,
+            _file_symbols,
+            target_fqn,
+            member_name,
+            results,
+        );
     }
 }
 
@@ -578,7 +643,11 @@ class Controller {
 "#;
         let refs = find_refs(code, "App\\Model\\User", PhpSymbolKind::Class);
         // Should find type hint in param + return type = 2
-        assert!(refs.len() >= 2, "Should find at least 2 type hint references, found {}", refs.len());
+        assert!(
+            refs.len() >= 2,
+            "Should find at least 2 type hint references, found {}",
+            refs.len()
+        );
     }
 
     #[test]
@@ -610,5 +679,30 @@ Foo::bar();
         let refs = find_refs(code, "App\\Foo::bar", PhpSymbolKind::Method);
         // declaration + 1 call = 2
         assert!(!refs.is_empty(), "Should find at least 1 reference");
+    }
+
+    #[test]
+    fn test_find_property_references_not_method_with_same_name() {
+        let code = r#"<?php
+namespace App;
+
+class Baz {
+    public string $test = '';
+    public function test(): string { return 'ok'; }
+}
+
+function run(Baz $baz): void {
+    echo $baz->test;
+    $baz->test();
+}
+"#;
+
+        let refs = find_refs(code, "App\\Baz::$test", PhpSymbolKind::Property);
+        // declaration + one property usage
+        assert_eq!(
+            refs.len(),
+            2,
+            "Property references should not include method calls with the same name"
+        );
     }
 }

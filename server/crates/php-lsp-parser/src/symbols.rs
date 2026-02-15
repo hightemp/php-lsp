@@ -149,10 +149,18 @@ fn extract_single_use_clause(clause: Node, source: &str, result: &mut FileSymbol
     if let Some(fqn) = fqn {
         let sp = clause.start_position();
         let ep = clause.end_position();
-        let range = (sp.row as u32, sp.column as u32, ep.row as u32, ep.column as u32);
-        result
-            .use_statements
-            .push(UseStatement { fqn, alias, kind, range });
+        let range = (
+            sp.row as u32,
+            sp.column as u32,
+            ep.row as u32,
+            ep.column as u32,
+        );
+        result.use_statements.push(UseStatement {
+            fqn,
+            alias,
+            kind,
+            range,
+        });
     }
 }
 
@@ -185,10 +193,18 @@ fn extract_use_group(
 
                 let sp = child.start_position();
                 let ep = child.end_position();
-                let range = (sp.row as u32, sp.column as u32, ep.row as u32, ep.column as u32);
-                result
-                    .use_statements
-                    .push(UseStatement { fqn, alias, kind, range });
+                let range = (
+                    sp.row as u32,
+                    sp.column as u32,
+                    ep.row as u32,
+                    ep.column as u32,
+                );
+                result.use_statements.push(UseStatement {
+                    fqn,
+                    alias,
+                    kind,
+                    range,
+                });
             }
         }
     }

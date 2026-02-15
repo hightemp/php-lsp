@@ -47,11 +47,7 @@ pub const DEFAULT_EXTENSIONS: &[&str] = &[
 /// `extensions` is a list of extension directory names to load.
 ///
 /// Returns the number of files loaded.
-pub fn load_stubs(
-    index: &WorkspaceIndex,
-    stubs_path: &Path,
-    extensions: &[&str],
-) -> usize {
+pub fn load_stubs(index: &WorkspaceIndex, stubs_path: &Path, extensions: &[&str]) -> usize {
     let mut loaded_files = 0;
 
     for ext_name in extensions {
@@ -69,7 +65,11 @@ pub fn load_stubs(
                     parser.parse_full(&source);
 
                     if let Some(tree) = parser.tree() {
-                        let uri = format!("phpstub://{}/{}", ext_name, file_path.file_name().unwrap_or_default().to_string_lossy());
+                        let uri = format!(
+                            "phpstub://{}/{}",
+                            ext_name,
+                            file_path.file_name().unwrap_or_default().to_string_lossy()
+                        );
                         let mut file_symbols = extract_file_symbols(tree, &source, &uri);
 
                         // Mark all symbols as built-in
@@ -134,12 +134,14 @@ mod tests {
     #[test]
     fn test_load_stubs_with_real_data() {
         // This test uses actual phpstorm-stubs if available
-        let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../data/stubs");
+        let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
 
         if !stubs_path.is_dir() {
             // Skip if stubs are not available (e.g., in CI without submodule)
-            eprintln!("Skipping stubs test: stubs directory not found at {}", stubs_path.display());
+            eprintln!(
+                "Skipping stubs test: stubs directory not found at {}",
+                stubs_path.display()
+            );
             return;
         }
 
@@ -150,14 +152,16 @@ mod tests {
 
         // Core should define basic PHP classes like stdClass, Exception, etc.
         // Check that some known built-in class exists
-        let has_builtin = index.types.iter().any(|entry| entry.value().modifiers.is_builtin);
+        let has_builtin = index
+            .types
+            .iter()
+            .any(|entry| entry.value().modifiers.is_builtin);
         assert!(has_builtin, "Should have at least one built-in type");
     }
 
     #[test]
     fn test_load_stubs_nonexistent_extension() {
-        let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../data/stubs");
+        let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
 
         if !stubs_path.is_dir() {
             return;
@@ -170,8 +174,7 @@ mod tests {
 
     #[test]
     fn test_load_multiple_extensions() {
-        let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../data/stubs");
+        let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
 
         if !stubs_path.is_dir() {
             return;
@@ -180,6 +183,10 @@ mod tests {
         let index = WorkspaceIndex::new();
         let loaded = load_stubs(&index, &stubs_path, &["Core", "standard", "date"]);
 
-        assert!(loaded >= 3, "Should have loaded files from multiple extensions, got {}", loaded);
+        assert!(
+            loaded >= 3,
+            "Should have loaded files from multiple extensions, got {}",
+            loaded
+        );
     }
 }

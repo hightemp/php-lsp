@@ -84,9 +84,7 @@ pub fn provide_completions(
             provide_variable_completions(prefix, file_symbols)
         }
         CompletionContext::Namespace { prefix } => provide_namespace_completions(prefix, index),
-        CompletionContext::UseStatement { prefix } => {
-            provide_namespace_completions(prefix, index)
-        }
+        CompletionContext::UseStatement { prefix } => provide_namespace_completions(prefix, index),
         CompletionContext::Free { prefix } => provide_free_completions(prefix, index),
         CompletionContext::None => vec![],
     }
@@ -176,11 +174,7 @@ fn provide_variable_completions(prefix: &str, file_symbols: &FileSymbols) -> Vec
         if let Some(ref sig) = sym.signature {
             for param in &sig.params {
                 let var_name = format!("${}", param.name);
-                if !seen.contains(&var_name)
-                    && param
-                        .name
-                        .to_lowercase()
-                        .starts_with(&prefix_lower)
+                if !seen.contains(&var_name) && param.name.to_lowercase().starts_with(&prefix_lower)
                 {
                     let detail = param.type_info.as_ref().map(|t| t.to_string());
                     items.push(CompletionItem {
@@ -207,10 +201,7 @@ fn provide_namespace_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Co
 
     for entry in index.types.iter() {
         let sym = entry.value();
-        if sym
-            .fqn
-            .to_lowercase()
-            .contains(&prefix_lower)
+        if sym.fqn.to_lowercase().contains(&prefix_lower)
             || sym.name.to_lowercase().starts_with(&prefix_lower)
         {
             items.push(CompletionItem {
@@ -273,10 +264,7 @@ fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Complet
 }
 
 /// Convert a SymbolInfo to a CompletionItem.
-fn symbol_to_completion_item(
-    sym: &php_lsp_types::SymbolInfo,
-    _is_static: bool,
-) -> CompletionItem {
+fn symbol_to_completion_item(sym: &php_lsp_types::SymbolInfo, _is_static: bool) -> CompletionItem {
     let kind = symbol_kind_to_completion_kind(sym.kind);
 
     let detail = sym.signature.as_ref().map(|sig| {

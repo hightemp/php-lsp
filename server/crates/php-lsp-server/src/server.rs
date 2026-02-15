@@ -1,17 +1,17 @@
 //! LSP server implementation — LanguageServer trait.
 
 use dashmap::DashMap;
+use php_lsp_completion::context::detect_context;
+use php_lsp_completion::provider::provide_completions;
 use php_lsp_index::composer::{parse_composer_json, NamespaceMap};
 use php_lsp_index::stubs;
 use php_lsp_index::workspace::WorkspaceIndex;
-use php_lsp_completion::context::detect_context;
-use php_lsp_completion::provider::provide_completions;
 use php_lsp_parser::diagnostics::extract_syntax_errors;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::references::find_references_in_file;
-use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::resolve::{symbol_at_position, RefKind};
+use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::symbols::extract_file_symbols;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,9 +56,7 @@ impl PhpLspBackend {
         let level = *self.trace_level.lock().await;
         if level == TraceValue::Verbose {
             tracing::trace!("{}", message);
-            self.client
-                .log_message(MessageType::LOG, message)
-                .await;
+            self.client.log_message(MessageType::LOG, message).await;
         }
     }
 
@@ -91,9 +89,7 @@ impl PhpLspBackend {
                 let vendor_autoload = root.join("vendor/composer/autoload_psr4.php");
                 if vendor_autoload.exists() && all_paths.is_empty() {
                     // Parse vendor PSR-4 mappings from installed packages
-                    if let Some(vendor_paths) =
-                        resolve_vendor_paths(fqn, &vendor_dir)
-                    {
+                    if let Some(vendor_paths) = resolve_vendor_paths(fqn, &vendor_dir) {
                         all_paths.extend(vendor_paths);
                     }
                 }
@@ -186,9 +182,8 @@ fn compute_diagnostics(
         .map(|entry| entry.value().clone())
         .unwrap_or_default();
 
-    let sem_diags = extract_semantic_diagnostics(tree, &source, &file_symbols, |fqn| {
-        index.resolve_fqn(fqn)
-    });
+    let sem_diags =
+        extract_semantic_diagnostics(tree, &source, &file_symbols, |fqn| index.resolve_fqn(fqn));
 
     for sd in sem_diags {
         diagnostics.push(Diagnostic {
@@ -461,11 +456,7 @@ async fn index_workspace(
                     index.update_file(&uri, file_symbols);
 
                     if sym_count > 0 {
-                        tracing::debug!(
-                            "Indexed {}: {} symbols",
-                            file_path.display(),
-                            sym_count
-                        );
+                        tracing::debug!("Indexed {}: {} symbols", file_path.display(), sym_count);
                     }
                 }
             }
@@ -529,9 +520,7 @@ impl LanguageServer for PhpLspBackend {
             .root_uri
             .as_ref()
             .and_then(|uri| uri_to_path(uri.as_str()))
-            .or_else(|| {
-                params.root_path.as_ref().map(PathBuf::from)
-            });
+            .or_else(|| params.root_path.as_ref().map(PathBuf::from));
 
         // Extract stubsPath from client initializationOptions
         if let Some(ref opts) = params.initialization_options {
@@ -604,7 +593,10 @@ impl LanguageServer for PhpLspBackend {
                 if composer_path.exists() {
                     match parse_composer_json(&composer_path) {
                         Ok(ns_map) => {
-                            tracing::info!("Parsed composer.json with {} PSR-4 entries", ns_map.psr4.len());
+                            tracing::info!(
+                                "Parsed composer.json with {} PSR-4 entries",
+                                ns_map.psr4.len()
+                            );
                             Some(ns_map)
                         }
                         Err(e) => {
@@ -642,7 +634,11 @@ impl LanguageServer for PhpLspBackend {
                     if let Some(dir) = exe.parent() {
                         candidate_paths.push(dir.join("data/stubs"));
                         // Also check sibling stubs/ dir (for extension layout: bin/php-lsp + stubs/)
-                        candidate_paths.push(dir.join("../stubs").canonicalize().unwrap_or_else(|_| dir.join("../stubs")));
+                        candidate_paths.push(
+                            dir.join("../stubs")
+                                .canonicalize()
+                                .unwrap_or_else(|_| dir.join("../stubs")),
+                        );
                     }
                 }
 
@@ -652,11 +648,8 @@ impl LanguageServer for PhpLspBackend {
                 for stubs_path in &candidate_paths {
                     if stubs_path.is_dir() {
                         tracing::info!("Loading phpstorm-stubs from {}", stubs_path.display());
-                        let loaded = stubs::load_stubs(
-                            &stubs_index,
-                            stubs_path,
-                            stubs::DEFAULT_EXTENSIONS,
-                        );
+                        let loaded =
+                            stubs::load_stubs(&stubs_index, stubs_path, stubs::DEFAULT_EXTENSIONS);
                         tracing::info!("Loaded {} stub files", loaded);
                         return;
                     }
@@ -670,7 +663,9 @@ impl LanguageServer for PhpLspBackend {
             let reindex_index = self.index.clone();
             let reindex_client = self.client.clone();
             tokio::spawn(async move {
-                if let Err(e) = index_workspace(&client, &index, &root, ns_map_storage.as_ref()).await {
+                if let Err(e) =
+                    index_workspace(&client, &index, &root, ns_map_storage.as_ref()).await
+                {
                     tracing::error!("Background indexing failed: {}", e);
                     client
                         .log_message(MessageType::ERROR, format!("Indexing failed: {}", e))
@@ -683,9 +678,7 @@ impl LanguageServer for PhpLspBackend {
                     let uri_str = entry.key().clone();
                     if let Ok(uri) = uri_str.parse::<Uri>() {
                         let diags = compute_diagnostics(&uri_str, &entry, &reindex_index);
-                        reindex_client
-                            .publish_diagnostics(uri, diags, None)
-                            .await;
+                        reindex_client.publish_diagnostics(uri, diags, None).await;
                     }
                 }
             });
@@ -717,7 +710,8 @@ impl LanguageServer for PhpLspBackend {
             let file_symbols = extract_file_symbols(tree, text, &uri_str);
             let sym_count = file_symbols.symbols.len();
             self.index.update_file(&uri_str, file_symbols);
-            self.log_trace(&format!("Indexed {} symbols from {}", sym_count, uri_str)).await;
+            self.log_trace(&format!("Indexed {} symbols from {}", sym_count, uri_str))
+                .await;
         }
 
         self.open_files.insert(uri_str, parser);
@@ -815,127 +809,127 @@ impl LanguageServer for PhpLspBackend {
         };
 
         let result = if let Some(sym) = symbol_info {
-                // Build hover content
-                let mut content = String::new();
+            // Build hover content
+            let mut content = String::new();
 
-                // Symbol kind label
-                let kind_label = match sym.kind {
-                    php_lsp_types::PhpSymbolKind::Class => "class",
-                    php_lsp_types::PhpSymbolKind::Interface => "interface",
-                    php_lsp_types::PhpSymbolKind::Trait => "trait",
-                    php_lsp_types::PhpSymbolKind::Enum => "enum",
-                    php_lsp_types::PhpSymbolKind::Function => "function",
-                    php_lsp_types::PhpSymbolKind::Method => "method",
-                    php_lsp_types::PhpSymbolKind::Property => "property",
-                    php_lsp_types::PhpSymbolKind::ClassConstant => "const",
-                    php_lsp_types::PhpSymbolKind::GlobalConstant => "const",
-                    php_lsp_types::PhpSymbolKind::EnumCase => "case",
-                    php_lsp_types::PhpSymbolKind::Namespace => "namespace",
-                };
-
-                // PHP code block with signature
-                content.push_str("```php\n");
-                if let Some(ref sig) = sym.signature {
-                    // Function/method signature
-                    content.push_str(kind_label);
-                    content.push(' ');
-                    content.push_str(&sym.fqn);
-                    content.push('(');
-                    for (i, param) in sig.params.iter().enumerate() {
-                        if i > 0 {
-                            content.push_str(", ");
-                        }
-                        if let Some(ref t) = param.type_info {
-                            content.push_str(&t.to_string());
-                            content.push(' ');
-                        }
-                        if param.is_variadic {
-                            content.push_str("...");
-                        }
-                        if param.is_by_ref {
-                            content.push('&');
-                        }
-                        content.push('$');
-                        content.push_str(&param.name);
-                        if let Some(ref def) = param.default_value {
-                            content.push_str(" = ");
-                            content.push_str(def);
-                        }
-                    }
-                    content.push(')');
-                    if let Some(ref ret) = sig.return_type {
-                        content.push_str(": ");
-                        content.push_str(&ret.to_string());
-                    }
-                } else {
-                    content.push_str(kind_label);
-                    content.push(' ');
-                    content.push_str(&sym.fqn);
-                }
-                content.push_str("\n```\n");
-
-                // PHPDoc summary
-                if let Some(ref doc) = sym.doc_comment {
-                    let phpdoc = parse_phpdoc(doc);
-                    if let Some(ref summary) = phpdoc.summary {
-                        content.push_str("\n---\n\n");
-                        content.push_str(summary);
-                        content.push('\n');
-                    }
-
-                    // @param descriptions
-                    if !phpdoc.params.is_empty() {
-                        content.push_str("\n**Parameters:**\n\n");
-                        for p in &phpdoc.params {
-                            content.push_str("- `$");
-                            content.push_str(&p.name);
-                            content.push('`');
-                            if let Some(ref t) = p.type_info {
-                                content.push_str(" — `");
-                                content.push_str(&t.to_string());
-                                content.push('`');
-                            }
-                            if let Some(ref desc) = p.description {
-                                content.push_str(" — ");
-                                content.push_str(desc);
-                            }
-                            content.push('\n');
-                        }
-                    }
-
-                    // @return
-                    if let Some(ref ret) = phpdoc.return_type {
-                        content.push_str("\n**Returns:** `");
-                        content.push_str(&ret.to_string());
-                        content.push_str("`\n");
-                    }
-
-                    // @deprecated
-                    if let Some(ref dep) = phpdoc.deprecated {
-                        content.push_str("\n⚠️ **Deprecated**");
-                        if !dep.is_empty() {
-                            content.push_str(": ");
-                            content.push_str(dep);
-                        }
-                        content.push('\n');
-                    }
-                }
-
-                let range = Range {
-                    start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
-                    end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
-                };
-
-                Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: content,
-                    }),
-                    range: Some(range),
-                })
-            } else {
-                None
+            // Symbol kind label
+            let kind_label = match sym.kind {
+                php_lsp_types::PhpSymbolKind::Class => "class",
+                php_lsp_types::PhpSymbolKind::Interface => "interface",
+                php_lsp_types::PhpSymbolKind::Trait => "trait",
+                php_lsp_types::PhpSymbolKind::Enum => "enum",
+                php_lsp_types::PhpSymbolKind::Function => "function",
+                php_lsp_types::PhpSymbolKind::Method => "method",
+                php_lsp_types::PhpSymbolKind::Property => "property",
+                php_lsp_types::PhpSymbolKind::ClassConstant => "const",
+                php_lsp_types::PhpSymbolKind::GlobalConstant => "const",
+                php_lsp_types::PhpSymbolKind::EnumCase => "case",
+                php_lsp_types::PhpSymbolKind::Namespace => "namespace",
             };
+
+            // PHP code block with signature
+            content.push_str("```php\n");
+            if let Some(ref sig) = sym.signature {
+                // Function/method signature
+                content.push_str(kind_label);
+                content.push(' ');
+                content.push_str(&sym.fqn);
+                content.push('(');
+                for (i, param) in sig.params.iter().enumerate() {
+                    if i > 0 {
+                        content.push_str(", ");
+                    }
+                    if let Some(ref t) = param.type_info {
+                        content.push_str(&t.to_string());
+                        content.push(' ');
+                    }
+                    if param.is_variadic {
+                        content.push_str("...");
+                    }
+                    if param.is_by_ref {
+                        content.push('&');
+                    }
+                    content.push('$');
+                    content.push_str(&param.name);
+                    if let Some(ref def) = param.default_value {
+                        content.push_str(" = ");
+                        content.push_str(def);
+                    }
+                }
+                content.push(')');
+                if let Some(ref ret) = sig.return_type {
+                    content.push_str(": ");
+                    content.push_str(&ret.to_string());
+                }
+            } else {
+                content.push_str(kind_label);
+                content.push(' ');
+                content.push_str(&sym.fqn);
+            }
+            content.push_str("\n```\n");
+
+            // PHPDoc summary
+            if let Some(ref doc) = sym.doc_comment {
+                let phpdoc = parse_phpdoc(doc);
+                if let Some(ref summary) = phpdoc.summary {
+                    content.push_str("\n---\n\n");
+                    content.push_str(summary);
+                    content.push('\n');
+                }
+
+                // @param descriptions
+                if !phpdoc.params.is_empty() {
+                    content.push_str("\n**Parameters:**\n\n");
+                    for p in &phpdoc.params {
+                        content.push_str("- `$");
+                        content.push_str(&p.name);
+                        content.push('`');
+                        if let Some(ref t) = p.type_info {
+                            content.push_str(" — `");
+                            content.push_str(&t.to_string());
+                            content.push('`');
+                        }
+                        if let Some(ref desc) = p.description {
+                            content.push_str(" — ");
+                            content.push_str(desc);
+                        }
+                        content.push('\n');
+                    }
+                }
+
+                // @return
+                if let Some(ref ret) = phpdoc.return_type {
+                    content.push_str("\n**Returns:** `");
+                    content.push_str(&ret.to_string());
+                    content.push_str("`\n");
+                }
+
+                // @deprecated
+                if let Some(ref dep) = phpdoc.deprecated {
+                    content.push_str("\n⚠️ **Deprecated**");
+                    if !dep.is_empty() {
+                        content.push_str(": ");
+                        content.push_str(dep);
+                    }
+                    content.push('\n');
+                }
+            }
+
+            let range = Range {
+                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
+                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
+            };
+
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: content,
+                }),
+                range: Some(range),
+            })
+        } else {
+            None
+        };
 
         Ok(result)
     }
@@ -1644,10 +1638,8 @@ impl LanguageServer for PhpLspBackend {
                                     .as_ref()
                                     .map(|d| format!(" — {}", d))
                                     .unwrap_or_default();
-                                doc_parts.push(format!(
-                                    "@param{} `${}`{}",
-                                    type_str, param.name, desc
-                                ));
+                                doc_parts
+                                    .push(format!("@param{} `${}`{}", type_str, param.name, desc));
                             }
                         }
 
