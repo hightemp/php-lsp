@@ -105,9 +105,18 @@ impl WorkspaceIndex {
     }
 
     /// Resolve a `Class::member` FQN to the member symbol.
+    ///
+    /// First tries exact FQN match (e.g. `App\Foo::test`), then falls back
+    /// to matching by name for cases like property access where the FQN has `$`
+    /// prefix in the symbol but not in the query.
     pub fn resolve_member(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
         let (class_fqn, member_name) = fqn.rsplit_once("::")?;
         let members = self.get_members(class_fqn);
+        // Prefer exact FQN match first
+        if let Some(sym) = members.iter().find(|m| m.fqn == fqn) {
+            return Some(sym.clone());
+        }
+        // Fallback: match by name (for cases where caller doesn't know exact FQN form)
         members.into_iter().find(|m| m.name == member_name)
     }
 

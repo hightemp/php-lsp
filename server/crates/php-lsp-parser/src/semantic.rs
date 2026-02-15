@@ -3,7 +3,8 @@
 //! Walks the CST and checks class/function/use references
 //! against a resolver function (typically backed by the workspace index).
 
-use php_lsp_types::{FileSymbols, UseKind};
+use php_lsp_types::{FileSymbols, SymbolInfo, UseKind};
+use std::sync::Arc;
 use tree_sitter::Tree;
 
 /// A semantic diagnostic found in a file.
@@ -26,6 +27,8 @@ pub enum SemanticDiagnosticKind {
     UnknownFunction,
     /// Use statement references a symbol not found in index.
     UnresolvedUse,
+    /// Wrong number of arguments in a call.
+    ArgumentCountMismatch,
 }
 
 /// Names that should not be reported as unknown (PHP built-in types, special names).
@@ -38,8 +41,8 @@ const BUILTIN_TYPE_NAMES: &[&str] = &[
 
 /// Extract semantic diagnostics from a file.
 ///
-/// `resolver` is called with a FQN to check if it exists in the index.
-/// Returns `true` if the symbol is known, `false` if unknown.
+/// `resolver` is called with a FQN to look up a symbol in the index.
+/// Returns `Some(SymbolInfo)` if the symbol is known, `None` if unknown.
 pub fn extract_semantic_diagnostics<F>(
     tree: &Tree,
     source: &str,
@@ -47,7 +50,7 @@ pub fn extract_semantic_diagnostics<F>(
     resolver: F,
 ) -> Vec<SemanticDiagnostic>
 where
-    F: Fn(&str) -> bool,
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
     let mut diagnostics = Vec::new();
     let root = tree.root_node();
@@ -67,7 +70,7 @@ fn check_use_statements<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> bool,
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
     for use_stmt in &file_symbols.use_statements {
         // Only check class-type use statements
@@ -87,7 +90,7 @@ fn check_use_statements<F>(
             continue;
         }
 
-        if !resolver(fqn) {
+        if resolver(fqn).is_none() {
             diagnostics.push(SemanticDiagnostic {
                 range: use_stmt.range,
                 message: format!("Unresolved use statement: {}", fqn),
@@ -105,7 +108,7 @@ fn walk_node_for_diagnostics<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> bool,
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
     let kind = node.kind();
 
@@ -146,9 +149,12 @@ fn check_class_in_new<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> bool,
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
     // Find the class name child
+    let mut class_fqn: Option<String> = None;
+    let mut class_name_node: Option<tree_sitter::Node> = None;
+
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
             let ck = child.kind();
@@ -156,14 +162,66 @@ fn check_class_in_new<F>(
                 let name = &source[child.byte_range()];
                 let fqn = resolve_class_name(name, file_symbols);
 
-                if should_check_class(&fqn) && !resolver(&fqn) {
+                if should_check_class(&fqn) && resolver(&fqn).is_none() {
                     diagnostics.push(SemanticDiagnostic {
                         range: node_range(&child),
                         message: format!("Unknown class: {}", fqn),
                         kind: SemanticDiagnosticKind::UnknownClass,
                     });
                 }
+
+                class_fqn = Some(fqn);
+                class_name_node = Some(child);
                 break;
+            }
+        }
+    }
+
+    // Check constructor argument count
+    if let (Some(fqn), Some(_name_node)) = (class_fqn, class_name_node) {
+        let ctor_fqn = format!("{}::__construct", fqn);
+        if let Some(ctor_sym) = resolver(&ctor_fqn) {
+            if let Some(ref sig) = ctor_sym.signature {
+                let required = sig
+                    .params
+                    .iter()
+                    .filter(|p| p.default_value.is_none() && !p.is_variadic)
+                    .count();
+                let max = if sig.params.iter().any(|p| p.is_variadic) {
+                    usize::MAX
+                } else {
+                    sig.params.len()
+                };
+
+                // Count actual arguments
+                let actual = count_arguments(node);
+
+                if actual < required {
+                    // Find the arguments node for better range
+                    let args_node = node
+                        .child_by_field_name("arguments")
+                        .unwrap_or(node);
+                    diagnostics.push(SemanticDiagnostic {
+                        range: node_range(&args_node),
+                        message: format!(
+                            "Too few arguments to {}::__construct(): expected at least {}, got {}",
+                            fqn, required, actual
+                        ),
+                        kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+                    });
+                } else if actual > max {
+                    let args_node = node
+                        .child_by_field_name("arguments")
+                        .unwrap_or(node);
+                    diagnostics.push(SemanticDiagnostic {
+                        range: node_range(&args_node),
+                        message: format!(
+                            "Too many arguments to {}::__construct(): expected at most {}, got {}",
+                            fqn, max, actual
+                        ),
+                        kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+                    });
+                }
             }
         }
     }
@@ -177,7 +235,7 @@ fn check_type_reference<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> bool,
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
     // For optional_type (?Type), drill into the child
     let target = if node.kind() == "optional_type" {
@@ -196,7 +254,7 @@ fn check_type_reference<F>(
                         let name = &source[child.byte_range()];
                         let fqn = resolve_class_name(name, file_symbols);
 
-                        if should_check_class(&fqn) && !resolver(&fqn) {
+                        if should_check_class(&fqn) && resolver(&fqn).is_none() {
                             diagnostics.push(SemanticDiagnostic {
                                 range: node_range(&child),
                                 message: format!("Unknown class: {}", fqn),
@@ -219,7 +277,7 @@ fn check_inheritance_clause<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> bool,
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
@@ -228,7 +286,7 @@ fn check_inheritance_clause<F>(
                 let name = &source[child.byte_range()];
                 let fqn = resolve_class_name(name, file_symbols);
 
-                if should_check_class(&fqn) && !resolver(&fqn) {
+                if should_check_class(&fqn) && resolver(&fqn).is_none() {
                     diagnostics.push(SemanticDiagnostic {
                         range: node_range(&child),
                         message: format!("Unknown class: {}", fqn),
@@ -248,7 +306,7 @@ fn check_function_call<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> bool,
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
     // The function name is the first named child (name or qualified_name)
     if let Some(name_node) = node.named_child(0) {
@@ -262,7 +320,7 @@ fn check_function_call<F>(
 
             // Don't flag simple function names — too many PHP built-ins
             // Only flag namespaced function calls that can't be resolved
-            if fqn.contains('\\') && !resolver(&fqn) {
+            if fqn.contains('\\') && resolver(&fqn).is_none() {
                 diagnostics.push(SemanticDiagnostic {
                     range: node_range(&name_node),
                     message: format!("Unknown function: {}", fqn),
@@ -376,6 +434,27 @@ fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
     name.to_string()
 }
 
+/// Count the number of actual arguments in an `object_creation_expression` or similar call node.
+fn count_arguments(node: tree_sitter::Node) -> usize {
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.kind() == "arguments" {
+                // Count direct named children that are "argument"
+                let mut count = 0;
+                for j in 0..child.named_child_count() {
+                    if let Some(arg) = child.named_child(j) {
+                        if arg.kind() == "argument" {
+                            count += 1;
+                        }
+                    }
+                }
+                return count;
+            }
+        }
+    }
+    0
+}
+
 /// Get range tuple from a node.
 fn node_range(node: &tree_sitter::Node) -> (u32, u32, u32, u32) {
     let sp = node.start_position();
@@ -393,8 +472,25 @@ mod tests {
     use super::*;
     use crate::parser::FileParser;
     use crate::symbols::extract_file_symbols;
+    use php_lsp_types::PhpSymbolKind;
 
-    fn parse_and_check(code: &str, resolver: impl Fn(&str) -> bool) -> Vec<SemanticDiagnostic> {
+    fn dummy_symbol() -> Arc<SymbolInfo> {
+        Arc::new(SymbolInfo {
+            name: String::new(),
+            kind: PhpSymbolKind::Class,
+            fqn: String::new(),
+            range: (0, 0, 0, 0),
+            selection_range: (0, 0, 0, 0),
+            uri: String::new(),
+            visibility: php_lsp_types::Visibility::Public,
+            modifiers: Default::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: None,
+        })
+    }
+
+    fn parse_and_check(code: &str, resolver: impl Fn(&str) -> Option<Arc<SymbolInfo>>) -> Vec<SemanticDiagnostic> {
         let mut parser = FileParser::new();
         parser.parse_full(code);
         let tree = parser.tree().unwrap();
@@ -413,10 +509,10 @@ $x = new UserService();
 $y = new UnknownClass();
 "#;
         // UserService is known, UnknownClass is unknown
-        let diags = parse_and_check(code, |fqn| fqn == "App\\Service\\UserService");
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "App\\Service\\UserService" { Some(dummy_symbol()) } else { None }
+        });
 
-        // UnknownClass → App\UnknownClass (namespace prepended)
-        // But we only check namespaced classes, and both are namespaced via "App" prefix
         let unknown: Vec<_> = diags
             .iter()
             .filter(|d| d.kind == SemanticDiagnosticKind::UnknownClass)
@@ -444,7 +540,9 @@ namespace App;
 use App\Service\UserService;
 use App\Missing\SomeClass;
 "#;
-        let diags = parse_and_check(code, |fqn| fqn == "App\\Service\\UserService");
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "App\\Service\\UserService" { Some(dummy_symbol()) } else { None }
+        });
 
         let unresolved: Vec<_> = diags
             .iter()
@@ -462,7 +560,7 @@ namespace App;
 
 App\Utils\helper();
 "#;
-        let diags = parse_and_check(code, |_fqn| false);
+        let diags = parse_and_check(code, |_fqn| None);
 
         let unknown_funcs: Vec<_> = diags
             .iter()
@@ -484,7 +582,7 @@ strlen("hello");
 array_map(fn($x) => $x, []);
 "#;
         // All symbols are known (built-in)
-        let diags = parse_and_check(code, |_fqn| true);
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
 
         assert!(
             diags.is_empty(),

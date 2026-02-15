@@ -15,6 +15,8 @@ class Bar
     {
         (new Foo())->increment(5);
 
+        helper();
+
         $baz = new Baz();
         $baz->test();
 
@@ -24,4 +26,9 @@ class Bar
 
         return "Hello, {$name}!";
     }
+}
+
+function helper(string $s1, string $s2): void
+{
+    echo "This is a helper function.";
 }

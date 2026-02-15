@@ -187,7 +187,7 @@ fn compute_diagnostics(
         .unwrap_or_default();
 
     let sem_diags = extract_semantic_diagnostics(tree, &source, &file_symbols, |fqn| {
-        index.resolve_fqn(fqn).is_some()
+        index.resolve_fqn(fqn)
     });
 
     for sd in sem_diags {
