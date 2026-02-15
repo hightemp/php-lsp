@@ -231,6 +231,68 @@
     - Добавлены regression-тесты для `self`, `static`, `parent` в аргументах и return type (включая nullable/union при допустимом синтаксисе).
     - Не сломаны текущие проверки unknown-class/unknown-type.
 
+- [ ] **H-008** PHPDoc parser: корректный разбор сложных типов и тегов
+  - Проблема: текущий разбор `@param/@return/@var` обрезает тип до первого слова и неустойчив для `array<int, User>`, `(A&B)|null`, `callable(...)`, и похожих форм.
+  - Что сделать:
+    - Переписать извлечение type-expression из строки тега без `first_word` (учесть generic-скобки `<...>`, круглые скобки, `|`, `&`, `?`).
+    - Сохранить текущую совместимость для простых случаев и malformed-тегов (не падать, игнорировать невалидное безопасно).
+    - Расширить `parse_method_tag`: извлекать параметры и описание, а не только имя/return/static.
+  - Критерии готовности:
+    - Добавлены unit-тесты на сложные типы (включая пробелы внутри generic).
+    - `@method` содержит распарсенные params (минимум имя + type если указан).
+    - Все существующие тесты `phpdoc` проходят + новые regression-тесты.
+
+- [ ] **H-009** PHPDoc model: разделить `@property`, `@property-read`, `@property-write`
+  - Проблема: в модели нет различия read/write семантики virtual property; сейчас все варианты обрабатываются одинаково.
+  - Что сделать:
+    - Расширить структуру `PhpDocProperty` флагами доступа (`readable`/`writable`) или enum-kind.
+    - Обновить parser и сериализацию типов.
+    - Добавить миграционные правки по месту использования (hover/completion).
+  - Критерии готовности:
+    - Для трех тегов (`@property`, `@property-read`, `@property-write`) в тестах получаются разные значения access-mode.
+    - Обратная совместимость: старые кейсы не ломаются.
+
+- [ ] **H-010** UI для PHPDoc в LSP: показывать `@throws`, `@var`, `@property*`, `@method`
+  - Проблема: hover/completion сейчас показывают только summary + `@param` + `@return` + `@deprecated`; остальные полезные теги теряются.
+  - Что сделать:
+    - Расширить markdown-рендер в `textDocument/hover` и `completionItem/resolve`.
+    - Для class-symbol в hover добавить virtual members (`@property*`, `@method`) и `@throws`/`@var`, где применимо.
+    - Согласовать формат вывода (чтобы не было дубликатов между signature и phpdoc-блоком).
+  - Критерии готовности:
+    - На `test-fixtures/lsp-cases/src/PhpDoc/SupportedTags.php` в hover видны `@throws` и virtual members.
+    - В completion resolve видны doc-блоки с расширенными тегами без поломки markdown.
+
+- [ ] **H-011** Type inference из inline/local PHPDoc `@var`
+  - Проблема: локальные аннотации `/** @var Type $x */` не участвуют в резолве типа, поэтому страдает completion/definition после присваивания.
+  - Что сделать:
+    - Добавить extraction inline-`@var` рядом с assignment/variable nodes.
+    - Встроить это в `resolve` (best-effort) как fallback к нативным type hints.
+    - Покрыть кейсы: одиночная переменная, reassignment, scope boundaries.
+  - Критерии готовности:
+    - На фикстуре с inline `@var` (`lsp-cases/src/PhpDoc/EdgeCases.php`) улучшается member completion.
+    - Нет cross-scope false positives в references/definition.
+
+- [ ] **H-012** PHPDoc virtual members в completion/definition
+  - Проблема: class-level `@property` и `@method` сейчас не участвуют в навигации/автодополнении как виртуальные члены.
+  - Что сделать:
+    - Подмешивать virtual members из PHPDoc класса в completion для `$obj->`.
+    - Добавить go-to-definition/references на doc-объявление virtual member (минимальный MVP: definition на строку в doc-комментарии).
+    - Для rename явно зафиксировать поведение (поддерживается/не поддерживается) и добавить guard.
+  - Критерии готовности:
+    - На `SupportedTags.php` видны `findById`/`label` в completion.
+    - `Ctrl+Click` по virtual member возвращает definition в doc-comment.
+    - Есть e2e/интеграционные тесты на completion + definition для virtual members.
+
+- [ ] **H-013** E2E покрытие PHPDoc (fixture-driven)
+  - Проблема: есть unit-тесты parser-а, но не хватает сквозных e2e-тестов LSP на PHPDoc-поведение.
+  - Что сделать:
+    - Добавить e2e сценарии на `hover`, `completionItem/resolve`, `definition` по кейсам из `test-fixtures/lsp-cases/src/PhpDoc/*`.
+    - Зафиксировать ожидаемое поведение по каждому тегу (что поддерживается, что игнорируется).
+    - Обновить `test-fixtures/lsp-cases/README.md` и `README.md` статусами поддержки.
+  - Критерии готовности:
+    - E2E тесты падают на регрессиях по PHPDoc UI/навигации.
+    - Документация соответствует фактическому поведению и тестам.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)
