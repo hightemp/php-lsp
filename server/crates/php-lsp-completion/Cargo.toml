@@ -9,5 +9,8 @@ description = "Completion engine for php-lsp"
 [dependencies]
 php-lsp-types = { workspace = true }
 php-lsp-index = { workspace = true }
+php-lsp-parser = { workspace = true }
 lsp-types = { workspace = true }
+serde_json = { workspace = true }
+tree-sitter = { workspace = true }
 tracing = { workspace = true }

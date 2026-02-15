@@ -2,8 +2,7 @@
 //!
 //! Starts the LSP server on stdio using tower-lsp-server.
 
-mod server;
-
+use php_lsp_server::PhpLspBackend;
 use tower_lsp::{LspService, Server};
 use tracing_subscriber::EnvFilter;
 
@@ -23,7 +22,7 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(server::PhpLspBackend::new);
+    let (service, socket) = LspService::new(PhpLspBackend::new);
 
     Server::new(stdin, stdout, socket).serve(service).await;
 }

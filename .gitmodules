@@ -1,0 +1,3 @@
+[submodule "server/data/stubs"]
+	path = server/data/stubs
+	url = https://github.com/JetBrains/phpstorm-stubs.git

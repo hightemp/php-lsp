@@ -1,0 +1,495 @@
+//! Semantic diagnostics for PHP files.
+//!
+//! Walks the CST and checks class/function/use references
+//! against a resolver function (typically backed by the workspace index).
+
+use php_lsp_types::{FileSymbols, UseKind};
+use tree_sitter::Tree;
+
+/// A semantic diagnostic found in a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticDiagnostic {
+    /// Line/column range: (start_line, start_col, end_line, end_col).
+    pub range: (u32, u32, u32, u32),
+    /// Diagnostic message.
+    pub message: String,
+    /// Severity kind.
+    pub kind: SemanticDiagnosticKind,
+}
+
+/// Kind of semantic diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticDiagnosticKind {
+    /// Class/interface/trait/enum not found in index.
+    UnknownClass,
+    /// Function not found in index.
+    UnknownFunction,
+    /// Use statement references a symbol not found in index.
+    UnresolvedUse,
+}
+
+/// Names that should not be reported as unknown (PHP built-in types, special names).
+const BUILTIN_TYPE_NAMES: &[&str] = &[
+    "self", "static", "parent", "$this",
+    "int", "float", "string", "bool", "array", "object", "null",
+    "void", "never", "mixed", "callable", "iterable", "true", "false",
+    "resource",
+];
+
+/// Extract semantic diagnostics from a file.
+///
+/// `resolver` is called with a FQN to check if it exists in the index.
+/// Returns `true` if the symbol is known, `false` if unknown.
+pub fn extract_semantic_diagnostics<F>(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: F,
+) -> Vec<SemanticDiagnostic>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut diagnostics = Vec::new();
+    let root = tree.root_node();
+
+    // Check use statements
+    check_use_statements(file_symbols, &resolver, &mut diagnostics);
+
+    // Walk CST for class and function references
+    walk_node_for_diagnostics(root, source, file_symbols, &resolver, &mut diagnostics);
+
+    diagnostics
+}
+
+/// Check if use statements can be resolved.
+fn check_use_statements<F>(
+    file_symbols: &FileSymbols,
+    resolver: &F,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) where
+    F: Fn(&str) -> bool,
+{
+    for use_stmt in &file_symbols.use_statements {
+        // Only check class-type use statements
+        if use_stmt.kind != UseKind::Class {
+            continue;
+        }
+
+        let fqn = &use_stmt.fqn;
+
+        // Skip PHP built-in names
+        if BUILTIN_TYPE_NAMES.contains(&fqn.as_str()) {
+            continue;
+        }
+
+        // Skip single-segment names (could be PHP built-in extensions)
+        if !fqn.contains('\\') {
+            continue;
+        }
+
+        if !resolver(fqn) {
+            diagnostics.push(SemanticDiagnostic {
+                range: use_stmt.range,
+                message: format!("Unresolved use statement: {}", fqn),
+                kind: SemanticDiagnosticKind::UnresolvedUse,
+            });
+        }
+    }
+}
+
+/// Recursively walk CST nodes to find class/function references.
+fn walk_node_for_diagnostics<F>(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) where
+    F: Fn(&str) -> bool,
+{
+    let kind = node.kind();
+
+    match kind {
+        // new ClassName()
+        "object_creation_expression" => {
+            check_class_in_new(node, source, file_symbols, resolver, diagnostics);
+        }
+        // Type hints in function parameters, return types, property types
+        "named_type" | "optional_type" => {
+            check_type_reference(node, source, file_symbols, resolver, diagnostics);
+        }
+        // extends / implements clauses
+        "base_clause" | "class_interface_clause" => {
+            check_inheritance_clause(node, source, file_symbols, resolver, diagnostics);
+        }
+        // function_call_expression (free function calls)
+        "function_call_expression" => {
+            check_function_call(node, source, file_symbols, resolver, diagnostics);
+        }
+        _ => {}
+    }
+
+    // Recurse into children
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i) {
+            walk_node_for_diagnostics(child, source, file_symbols, resolver, diagnostics);
+        }
+    }
+}
+
+/// Check a class name in `new ClassName(...)`.
+fn check_class_in_new<F>(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) where
+    F: Fn(&str) -> bool,
+{
+    // Find the class name child
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            let ck = child.kind();
+            if ck == "name" || ck == "qualified_name" {
+                let name = &source[child.byte_range()];
+                let fqn = resolve_class_name(name, file_symbols);
+
+                if should_check_class(&fqn) && !resolver(&fqn) {
+                    diagnostics.push(SemanticDiagnostic {
+                        range: node_range(&child),
+                        message: format!("Unknown class: {}", fqn),
+                        kind: SemanticDiagnosticKind::UnknownClass,
+                    });
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Check type references in type hints.
+fn check_type_reference<F>(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) where
+    F: Fn(&str) -> bool,
+{
+    // For optional_type (?Type), drill into the child
+    let target = if node.kind() == "optional_type" {
+        node.named_child(0)
+    } else {
+        Some(node)
+    };
+
+    if let Some(target) = target {
+        if target.kind() == "named_type" {
+            // Get the name/qualified_name child
+            for i in 0..target.named_child_count() {
+                if let Some(child) = target.named_child(i) {
+                    let ck = child.kind();
+                    if ck == "name" || ck == "qualified_name" {
+                        let name = &source[child.byte_range()];
+                        let fqn = resolve_class_name(name, file_symbols);
+
+                        if should_check_class(&fqn) && !resolver(&fqn) {
+                            diagnostics.push(SemanticDiagnostic {
+                                range: node_range(&child),
+                                message: format!("Unknown class: {}", fqn),
+                                kind: SemanticDiagnosticKind::UnknownClass,
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Check class names in extends/implements clauses.
+fn check_inheritance_clause<F>(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) where
+    F: Fn(&str) -> bool,
+{
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            let ck = child.kind();
+            if ck == "name" || ck == "qualified_name" {
+                let name = &source[child.byte_range()];
+                let fqn = resolve_class_name(name, file_symbols);
+
+                if should_check_class(&fqn) && !resolver(&fqn) {
+                    diagnostics.push(SemanticDiagnostic {
+                        range: node_range(&child),
+                        message: format!("Unknown class: {}", fqn),
+                        kind: SemanticDiagnosticKind::UnknownClass,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Check a free function call.
+fn check_function_call<F>(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) where
+    F: Fn(&str) -> bool,
+{
+    // The function name is the first named child (name or qualified_name)
+    if let Some(name_node) = node.named_child(0) {
+        let nk = name_node.kind();
+        if nk == "name" || nk == "qualified_name" {
+            let name = &source[name_node.byte_range()];
+
+            // Skip PHP built-in functions by checking if name is simple and common
+            // We only check namespaced function calls or functions that aren't in the index
+            let fqn = resolve_function_name(name, file_symbols);
+
+            // Don't flag simple function names — too many PHP built-ins
+            // Only flag namespaced function calls that can't be resolved
+            if fqn.contains('\\') && !resolver(&fqn) {
+                diagnostics.push(SemanticDiagnostic {
+                    range: node_range(&name_node),
+                    message: format!("Unknown function: {}", fqn),
+                    kind: SemanticDiagnosticKind::UnknownFunction,
+                });
+            }
+        }
+    }
+}
+
+/// Whether we should check a class name against the index.
+fn should_check_class(fqn: &str) -> bool {
+    // Skip built-in type names
+    let lower = fqn.to_lowercase();
+    if BUILTIN_TYPE_NAMES.contains(&lower.as_str()) {
+        return false;
+    }
+
+    // Skip single-word names that look like PHP built-in types
+    if !fqn.contains('\\') {
+        // Common PHP built-in classes we skip (too many false positives)
+        return false;
+    }
+
+    true
+}
+
+/// Resolve a class name to FQN using use statements and namespace.
+fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
+    // Already fully qualified
+    if name.starts_with('\\') {
+        return name.trim_start_matches('\\').to_string();
+    }
+
+    // Special names
+    if BUILTIN_TYPE_NAMES.contains(&name) {
+        return name.to_string();
+    }
+
+    // Try to resolve via use statements
+    let parts: Vec<&str> = name.split('\\').collect();
+    let first_part = parts[0];
+
+    for use_stmt in &file_symbols.use_statements {
+        if use_stmt.kind != UseKind::Class {
+            continue;
+        }
+
+        let alias = use_stmt
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+
+        if alias == first_part {
+            if parts.len() == 1 {
+                return use_stmt.fqn.clone();
+            } else {
+                let rest = parts[1..].join("\\");
+                return format!("{}\\{}", use_stmt.fqn, rest);
+            }
+        }
+    }
+
+    // Prepend current namespace
+    if let Some(ref ns) = file_symbols.namespace {
+        format!("{}\\{}", ns, name)
+    } else {
+        name.to_string()
+    }
+}
+
+/// Resolve a function name to FQN.
+fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
+    // Fully qualified
+    if name.starts_with('\\') {
+        return name.trim_start_matches('\\').to_string();
+    }
+
+    // Try use statements for functions
+    let parts: Vec<&str> = name.split('\\').collect();
+    let first_part = parts[0];
+
+    for use_stmt in &file_symbols.use_statements {
+        if use_stmt.kind != UseKind::Function {
+            continue;
+        }
+
+        let alias = use_stmt
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+
+        if alias == first_part {
+            if parts.len() == 1 {
+                return use_stmt.fqn.clone();
+            } else {
+                let rest = parts[1..].join("\\");
+                return format!("{}\\{}", use_stmt.fqn, rest);
+            }
+        }
+    }
+
+    // If name is qualified (has \), prepend namespace
+    if name.contains('\\') {
+        if let Some(ref ns) = file_symbols.namespace {
+            return format!("{}\\{}", ns, name);
+        }
+    }
+
+    // Simple name — could be a global PHP function, don't resolve
+    name.to_string()
+}
+
+/// Get range tuple from a node.
+fn node_range(node: &tree_sitter::Node) -> (u32, u32, u32, u32) {
+    let sp = node.start_position();
+    let ep = node.end_position();
+    (
+        sp.row as u32,
+        sp.column as u32,
+        ep.row as u32,
+        ep.column as u32,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::FileParser;
+    use crate::symbols::extract_file_symbols;
+
+    fn parse_and_check(code: &str, resolver: impl Fn(&str) -> bool) -> Vec<SemanticDiagnostic> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        extract_semantic_diagnostics(tree, code, &file_symbols, resolver)
+    }
+
+    #[test]
+    fn test_unknown_class_in_new() {
+        let code = r#"<?php
+namespace App;
+
+use App\Service\UserService;
+
+$x = new UserService();
+$y = new UnknownClass();
+"#;
+        // UserService is known, UnknownClass is unknown
+        let diags = parse_and_check(code, |fqn| fqn == "App\\Service\\UserService");
+
+        // UnknownClass → App\UnknownClass (namespace prepended)
+        // But we only check namespaced classes, and both are namespaced via "App" prefix
+        let unknown: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::UnknownClass)
+            .collect();
+
+        assert!(
+            unknown.iter().any(|d| d.message.contains("UnknownClass")),
+            "Expected unknown class diagnostic for UnknownClass, got: {:?}",
+            unknown
+        );
+
+        // UserService should not be flagged
+        assert!(
+            !unknown.iter().any(|d| d.message.contains("UserService")),
+            "UserService should be resolved, got: {:?}",
+            unknown
+        );
+    }
+
+    #[test]
+    fn test_unresolved_use() {
+        let code = r#"<?php
+namespace App;
+
+use App\Service\UserService;
+use App\Missing\SomeClass;
+"#;
+        let diags = parse_and_check(code, |fqn| fqn == "App\\Service\\UserService");
+
+        let unresolved: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::UnresolvedUse)
+            .collect();
+
+        assert_eq!(unresolved.len(), 1, "Expected 1 unresolved use, got: {:?}", unresolved);
+        assert!(unresolved[0].message.contains("App\\Missing\\SomeClass"));
+    }
+
+    #[test]
+    fn test_unknown_namespaced_function() {
+        let code = r#"<?php
+namespace App;
+
+App\Utils\helper();
+"#;
+        let diags = parse_and_check(code, |_fqn| false);
+
+        let unknown_funcs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::UnknownFunction)
+            .collect();
+
+        // Should flag App\Utils\helper as unknown since it's namespaced
+        assert!(
+            !unknown_funcs.is_empty(),
+            "Expected unknown function diagnostic for namespaced call"
+        );
+    }
+
+    #[test]
+    fn test_no_false_positives_for_builtins() {
+        let code = r#"<?php
+$x = new \stdClass();
+strlen("hello");
+array_map(fn($x) => $x, []);
+"#;
+        // All symbols are known (built-in)
+        let diags = parse_and_check(code, |_fqn| true);
+
+        assert!(
+            diags.is_empty(),
+            "Should have no diagnostics for built-in usage, got: {:?}",
+            diags
+        );
+    }
+}

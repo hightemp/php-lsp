@@ -188,6 +188,8 @@ pub struct UseStatement {
     pub fqn: String,
     pub alias: Option<String>,
     pub kind: UseKind,
+    /// Source range (start_line, start_col, end_line, end_col).
+    pub range: (u32, u32, u32, u32),
 }
 
 /// Kind of use statement.
