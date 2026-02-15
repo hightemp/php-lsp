@@ -9,7 +9,7 @@ use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::diagnostics::extract_syntax_errors;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
-use php_lsp_parser::references::find_references_in_file;
+use php_lsp_parser::references::{find_references_in_file, find_variable_references_at_position};
 use php_lsp_parser::resolve::{symbol_at_position, variable_definition_at_position, RefKind};
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::symbols::extract_file_symbols;
@@ -180,6 +180,48 @@ impl PhpLspBackend {
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
     }
+}
+
+fn normalize_variable_new_name(new_name: &str) -> Option<String> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let raw = trimmed.strip_prefix('$').unwrap_or(trimmed);
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut chars = raw.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return None;
+    }
+
+    Some(format!("${}", raw))
+}
+
+fn is_renameable_variable(var_name: &str) -> bool {
+    !matches!(
+        var_name,
+        "$this"
+            | "$GLOBALS"
+            | "$_SERVER"
+            | "$_GET"
+            | "$_POST"
+            | "$_FILES"
+            | "$_COOKIE"
+            | "$_SESSION"
+            | "$_REQUEST"
+            | "$_ENV"
+            | "$http_response_header"
+            | "$argc"
+            | "$argv"
+    )
 }
 
 /// Compute diagnostics for a file (syntax + semantic).
@@ -1084,6 +1126,34 @@ impl LanguageServer for PhpLspBackend {
 
             match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
                 Some(sym) => {
+                    if sym.ref_kind == RefKind::Variable {
+                        let refs = find_variable_references_at_position(
+                            tree,
+                            &source,
+                            pos.line,
+                            pos.character,
+                            include_declaration,
+                        );
+                        if refs.is_empty() {
+                            return Ok(None);
+                        }
+                        let uri = match uri_str.parse::<Uri>() {
+                            Ok(u) => u,
+                            Err(_) => return Ok(None),
+                        };
+                        let locations: Vec<Location> = refs
+                            .into_iter()
+                            .map(|r| Location {
+                                uri: uri.clone(),
+                                range: Range {
+                                    start: Position::new(r.range.0, r.range.1),
+                                    end: Position::new(r.range.2, r.range.3),
+                                },
+                            })
+                            .collect();
+                        return Ok(Some(locations));
+                    }
+
                     let kind = match sym.ref_kind {
                         RefKind::ClassName => php_lsp_types::PhpSymbolKind::Class,
                         RefKind::FunctionCall => php_lsp_types::PhpSymbolKind::Function,
@@ -1093,7 +1163,7 @@ impl LanguageServer for PhpLspBackend {
                         }
                         RefKind::ClassConstant => php_lsp_types::PhpSymbolKind::ClassConstant,
                         RefKind::GlobalConstant => php_lsp_types::PhpSymbolKind::GlobalConstant,
-                        RefKind::Variable => return Ok(None), // Variable references not supported yet
+                        RefKind::Variable => return Ok(None),
                         RefKind::NamespaceName | RefKind::Unknown => return Ok(None),
                     };
 
@@ -1195,51 +1265,83 @@ impl LanguageServer for PhpLspBackend {
             ));
         }
 
+        let parser = match self.open_files.get(&uri_str) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let tree = match parser.tree() {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let source = parser.source();
+        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+
+        let sym = match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        if sym.ref_kind == RefKind::Variable {
+            if !is_renameable_variable(&sym.name) {
+                return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                    "Cannot rename this variable",
+                ));
+            }
+            let replacement = normalize_variable_new_name(new_name).ok_or_else(|| {
+                tower_lsp::jsonrpc::Error::invalid_params("Invalid variable name")
+            })?;
+            let refs =
+                find_variable_references_at_position(tree, &source, pos.line, pos.character, true);
+            if refs.is_empty() {
+                return Ok(None);
+            }
+            let uri = match uri_str.parse::<Uri>() {
+                Ok(u) => u,
+                Err(_) => return Ok(None),
+            };
+            let edits: Vec<TextEdit> = refs
+                .into_iter()
+                .map(|r| TextEdit {
+                    range: Range {
+                        start: Position::new(r.range.0, r.range.1),
+                        end: Position::new(r.range.2, r.range.3),
+                    },
+                    new_text: replacement.clone(),
+                })
+                .collect();
+            let mut changes: std::collections::HashMap<Uri, Vec<TextEdit>> =
+                std::collections::HashMap::new();
+            changes.insert(uri, edits);
+            return Ok(Some(WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            }));
+        }
+
+        if sym.ref_kind == RefKind::Unknown || sym.ref_kind == RefKind::NamespaceName {
+            return Ok(None);
+        }
+
         // Resolve symbol under cursor
         let (target_fqn, target_kind, _old_name) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(p) => p,
-                None => return Ok(None),
-            };
-            let tree = match parser.tree() {
-                Some(t) => t,
-                None => return Ok(None),
-            };
-            let source = parser.source();
-            let file_symbols = extract_file_symbols(tree, &source, &uri_str);
-
-            match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
-                Some(sym) => {
-                    // Don't allow renaming variables (too complex without full type inference)
-                    if sym.ref_kind == RefKind::Variable {
-                        return Err(tower_lsp::jsonrpc::Error::invalid_params(
-                            "Cannot rename variables",
-                        ));
-                    }
-                    if sym.ref_kind == RefKind::Unknown || sym.ref_kind == RefKind::NamespaceName {
-                        return Ok(None);
-                    }
-
-                    let kind = match sym.ref_kind {
-                        RefKind::ClassName => php_lsp_types::PhpSymbolKind::Class,
-                        RefKind::FunctionCall => php_lsp_types::PhpSymbolKind::Function,
-                        RefKind::MethodCall => php_lsp_types::PhpSymbolKind::Method,
-                        RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {
-                            php_lsp_types::PhpSymbolKind::Property
-                        }
-                        RefKind::ClassConstant => php_lsp_types::PhpSymbolKind::ClassConstant,
-                        RefKind::GlobalConstant => php_lsp_types::PhpSymbolKind::GlobalConstant,
-                        _ => return Ok(None),
-                    };
-
-                    let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
-                    if let Some(resolved) = resolved {
-                        (resolved.fqn.clone(), resolved.kind, sym.name.clone())
-                    } else {
-                        (sym.fqn.clone(), kind, sym.name.clone())
-                    }
+            let kind = match sym.ref_kind {
+                RefKind::ClassName => php_lsp_types::PhpSymbolKind::Class,
+                RefKind::FunctionCall => php_lsp_types::PhpSymbolKind::Function,
+                RefKind::MethodCall => php_lsp_types::PhpSymbolKind::Method,
+                RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {
+                    php_lsp_types::PhpSymbolKind::Property
                 }
-                None => return Ok(None),
+                RefKind::ClassConstant => php_lsp_types::PhpSymbolKind::ClassConstant,
+                RefKind::GlobalConstant => php_lsp_types::PhpSymbolKind::GlobalConstant,
+                _ => return Ok(None),
+            };
+
+            let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
+            if let Some(resolved) = resolved {
+                (resolved.fqn.clone(), resolved.kind, sym.name.clone())
+            } else {
+                (sym.fqn.clone(), kind, sym.name.clone())
             }
         };
 
@@ -1340,11 +1442,18 @@ impl LanguageServer for PhpLspBackend {
 
         match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
             Some(sym) => {
-                // Don't allow renaming variables, namespaces, or unknowns
-                if sym.ref_kind == RefKind::Variable
-                    || sym.ref_kind == RefKind::Unknown
-                    || sym.ref_kind == RefKind::NamespaceName
-                {
+                // Variable rename support is local-scope only.
+                if sym.ref_kind == RefKind::Variable {
+                    if !is_renameable_variable(&sym.name) {
+                        return Ok(None);
+                    }
+                    let range = Range {
+                        start: Position::new(sym.range.0, sym.range.1),
+                        end: Position::new(sym.range.2, sym.range.3),
+                    };
+                    return Ok(Some(PrepareRenameResponse::Range(range)));
+                }
+                if sym.ref_kind == RefKind::Unknown || sym.ref_kind == RefKind::NamespaceName {
                     return Ok(None);
                 }
 

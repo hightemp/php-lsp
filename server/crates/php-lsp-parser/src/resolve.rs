@@ -1229,8 +1229,7 @@ mod tests {
         let code = "<?php\nnamespace App;\n\nclass User { public static string $var = 'u'; }\n\nclass Demo {\n    public static string $created = 'c';\n    public static string $var = 'd';\n\n    public function run(): void {\n        echo self::$created;\n        echo static::$var;\n        echo User::$var;\n    }\n}\n";
 
         let (l1, c1) = find_line_col(code, "self::$created");
-        let self_prop =
-            parse_and_resolve(code, l1, c1 + 8).expect("self::$created should resolve");
+        let self_prop = parse_and_resolve(code, l1, c1 + 8).expect("self::$created should resolve");
         assert_eq!(self_prop.ref_kind, RefKind::StaticPropertyAccess);
         assert_eq!(self_prop.fqn, "App\\Demo::$created");
 

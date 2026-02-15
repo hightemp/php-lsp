@@ -4,12 +4,72 @@
 //! in the file that reference the target.
 
 use php_lsp_types::{FileSymbols, PhpSymbolKind, UseKind};
-use tree_sitter::{Node, Tree};
+use tree_sitter::{Node, Point, Tree};
 
 /// A location within a file where a reference was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceLocation {
     pub range: (u32, u32, u32, u32),
+}
+
+/// Find local variable references in the same lexical scope at cursor position.
+///
+/// Scope is the nearest enclosing function/method/closure/arrow function,
+/// or the whole file if cursor is at top level.
+pub fn find_variable_references_at_position(
+    tree: &Tree,
+    source: &str,
+    line: u32,
+    character: u32,
+    include_declaration: bool,
+) -> Vec<ReferenceLocation> {
+    let root = tree.root_node();
+    let point = Point::new(line as usize, character as usize);
+    let mut node = match root.descendant_for_point_range(point, point) {
+        Some(n) => n,
+        None => return vec![],
+    };
+
+    while !node.is_named() {
+        node = match node.parent() {
+            Some(p) => p,
+            None => return vec![],
+        };
+    }
+    if node.kind() == "name" {
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "variable_name" {
+                node = parent;
+            }
+        }
+    }
+
+    // Climb to a variable-like node.
+    loop {
+        let text = &source[node.byte_range()];
+        if node.kind() == "variable_name" || text.starts_with('$') {
+            break;
+        }
+        node = match node.parent() {
+            Some(p) => p,
+            None => return vec![],
+        };
+    }
+
+    let var_name = normalize_var_name(&source[node.byte_range()]);
+    let scope = find_variable_scope(node).unwrap_or(root);
+
+    let mut refs: Vec<ReferenceLocation> = Vec::new();
+    let mut declarations: Vec<(u32, u32, u32, u32)> = Vec::new();
+    walk_variable_refs(scope, source, &var_name, &mut refs, &mut declarations);
+
+    if include_declaration {
+        refs
+    } else {
+        refs.into_iter()
+            .filter(|r| !declarations.contains(&r.range))
+            .collect()
+    }
 }
 
 /// Find all references to the given FQN within a single file.
@@ -638,6 +698,95 @@ fn walk_for_constant_refs(
     }
 }
 
+fn walk_variable_refs(
+    node: Node,
+    source: &str,
+    var_name: &str,
+    refs: &mut Vec<ReferenceLocation>,
+    declarations: &mut Vec<(u32, u32, u32, u32)>,
+) {
+    if node.kind() == "variable_name" {
+        let text = normalize_var_name(&source[node.byte_range()]);
+        if text == var_name {
+            let range = node_range(node);
+            refs.push(ReferenceLocation { range });
+            if is_variable_declaration(node, source, var_name) {
+                declarations.push(range);
+            }
+        }
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.named_children(cursor) {
+        walk_variable_refs(child, source, var_name, refs, declarations);
+    }
+}
+
+fn is_variable_declaration(node: Node, source: &str, var_name: &str) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    match parent.kind() {
+        "simple_parameter" | "property_promotion_parameter" => parent
+            .child_by_field_name("name")
+            .map(|n| n.id() == node.id())
+            .unwrap_or(false),
+        "assignment_expression" => parent
+            .child_by_field_name("left")
+            .map(|n| normalize_var_name(&source[n.byte_range()]) == var_name)
+            .unwrap_or(false),
+        "foreach_statement" => ["key", "value"].iter().any(|field| {
+            parent
+                .child_by_field_name(field)
+                .map(|n| n.id() == node.id())
+                .unwrap_or(false)
+        }),
+        "catch_clause" => ["name", "variable"].iter().any(|field| {
+            parent
+                .child_by_field_name(field)
+                .map(|n| n.id() == node.id())
+                .unwrap_or(false)
+        }),
+        "anonymous_function_use_clause" => true,
+        _ => false,
+    }
+}
+
+fn find_variable_scope(node: Node) -> Option<Node> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        match n.kind() {
+            "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function_creation_expression" => return Some(n),
+            _ => current = n.parent(),
+        }
+    }
+    None
+}
+
+fn normalize_var_name(text: &str) -> String {
+    if text.starts_with('$') {
+        text.to_string()
+    } else {
+        format!("${}", text)
+    }
+}
+
+fn node_range(node: Node) -> (u32, u32, u32, u32) {
+    let start = node.start_position();
+    let end = node.end_position();
+    (
+        start.row as u32,
+        start.column as u32,
+        end.row as u32,
+        end.column as u32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +799,27 @@ mod tests {
         let tree = parser.tree().unwrap();
         let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
         find_references_in_file(tree, code, &file_symbols, target_fqn, kind, true)
+    }
+
+    fn find_var_refs_at(
+        code: &str,
+        line: u32,
+        col: u32,
+        include_declaration: bool,
+    ) -> Vec<ReferenceLocation> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        find_variable_references_at_position(tree, code, line, col, include_declaration)
+    }
+
+    fn find_line_col(code: &str, needle: &str) -> (u32, u32) {
+        for (line, row) in code.lines().enumerate() {
+            if let Some(col) = row.find(needle) {
+                return (line as u32, col as u32);
+            }
+        }
+        panic!("needle not found: {}", needle);
     }
 
     #[test]
@@ -765,5 +935,39 @@ echo RenameTarget::STATE_ACTIVE;
         );
         // declaration + 2 usages
         assert_eq!(refs.len(), 3, "Should find declaration + 2 constant usages");
+    }
+
+    #[test]
+    fn test_find_variable_references_in_function_scope() {
+        let code = r#"<?php
+function run(string $x): void {
+    $x = $x . "!";
+    echo $x;
+}
+"#;
+        let (line, col) = find_line_col(code, "echo $x;");
+        let refs = find_var_refs_at(code, line, col + 6, true);
+        // param + assignment left + assignment right + echo usage
+        assert_eq!(refs.len(), 4);
+
+        let refs_no_decl = find_var_refs_at(code, line, col + 6, false);
+        // assignment right + echo usage
+        assert_eq!(refs_no_decl.len(), 2);
+    }
+
+    #[test]
+    fn test_find_variable_references_do_not_cross_scope() {
+        let code = r#"<?php
+$x = 1;
+function demo(): void {
+    $x = 2;
+    echo $x;
+}
+echo $x;
+"#;
+        let (line, col) = find_line_col(code, "echo $x;");
+        let refs = find_var_refs_at(code, line, col + 6, true);
+        // only inner assignment + inner usage
+        assert_eq!(refs.len(), 2);
     }
 }

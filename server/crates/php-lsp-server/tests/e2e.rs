@@ -118,6 +118,23 @@ fn prepare_rename_request(id: i64, uri: &str, line: u32, character: u32) -> Requ
         .finish()
 }
 
+fn references_request(
+    id: i64,
+    uri: &str,
+    line: u32,
+    character: u32,
+    include_declaration: bool,
+) -> Request {
+    Request::build("textDocument/references")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": include_declaration }
+        }))
+        .id(id)
+        .finish()
+}
+
 /// Helper to extract the "result" field from a JSON-RPC response.
 fn extract_result(response: Option<tower_lsp::jsonrpc::Response>) -> serde_json::Value {
     let resp = response.expect("expected a response");
@@ -871,6 +888,125 @@ class Demo {
     assert_eq!(
         user_prop_line, 4,
         "User::$var should go to referenced class static property declaration"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_variable_references_and_rename() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+function run(string $name): void {
+    $name = $name . "!";
+    echo $name;
+}
+"#;
+    let uri = "file:///test/VariableRefsRename.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    // Cursor on second "$name" in assignment expression.
+    let refs_with_decl = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(2, uri, 2, 13, true))
+        .await
+        .unwrap();
+    let refs_with_decl_result = extract_result(refs_with_decl);
+    let refs_with_decl_len = refs_with_decl_result
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        refs_with_decl_len, 4,
+        "variable references should include declaration + usages"
+    );
+
+    let refs_without_decl = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(3, uri, 2, 13, false))
+        .await
+        .unwrap();
+    let refs_without_decl_result = extract_result(refs_without_decl);
+    let refs_without_decl_len = refs_without_decl_result
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        refs_without_decl_len, 2,
+        "variable references without declaration should include only usages"
+    );
+
+    let prep = service
+        .ready()
+        .await
+        .unwrap()
+        .call(prepare_rename_request(4, uri, 3, 10))
+        .await
+        .unwrap();
+    assert!(
+        !extract_result(prep).is_null(),
+        "prepareRename should work for local variables"
+    );
+
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(5, uri, 3, 10, "title"))
+        .await
+        .unwrap();
+    let rename_result = extract_result(rename);
+    let edits = rename_result
+        .get("changes")
+        .and_then(|c| c.get(uri))
+        .and_then(|arr| arr.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        edits.len(),
+        4,
+        "rename should update all variable references"
+    );
+    assert!(
+        edits
+            .iter()
+            .all(|e| e.get("newText").and_then(|t| t.as_str()) == Some("$title")),
+        "variable rename should preserve '$' prefix"
     );
 
     service
