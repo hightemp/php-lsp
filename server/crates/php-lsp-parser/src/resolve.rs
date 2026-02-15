@@ -404,12 +404,13 @@ fn try_resolve_object_type<'a>(object_node: Node<'a>, source: &str, file_symbols
             None
         }
         // $this → find enclosing class
+        // $var → try to infer type from assignment or parameter
         "variable_name" => {
             let text = &source[object_node.byte_range()];
             if text == "$this" {
                 find_parent_class_fqn(object_node, source, file_symbols)
             } else {
-                None
+                infer_variable_type(object_node, text, source, file_symbols)
             }
         }
         // Name / qualified_name might be a class used as scope
@@ -421,6 +422,138 @@ fn try_resolve_object_type<'a>(object_node: Node<'a>, source: &str, file_symbols
         // Static call: Foo::create() — can't resolve return type without type info
         _ => None,
     }
+}
+
+/// Infer the type of a variable by scanning for assignments and typed parameters.
+///
+/// Handles:
+/// - `$var = new ClassName()` → ClassName
+/// - `function foo(ClassName $var)` → ClassName (typed parameter)
+fn infer_variable_type(var_node: Node, var_name: &str, source: &str, file_symbols: &FileSymbols) -> Option<String> {
+    // 1. Find enclosing function/method body
+    let func_node = find_enclosing_function(var_node)?;
+
+    // 2. Check function parameters for type hints
+    if let Some(params) = func_node.child_by_field_name("parameters") {
+        for i in 0..params.named_child_count() {
+            if let Some(param) = params.named_child(i) {
+                if param.kind() == "simple_parameter" || param.kind() == "property_promotion_parameter" {
+                    // Check if parameter name matches
+                    if let Some(name_node) = param.child_by_field_name("name") {
+                        let param_name = &source[name_node.byte_range()];
+                        if param_name == var_name {
+                            // Get the type hint
+                            if let Some(type_node) = param.child_by_field_name("type") {
+                                if let Some(class_name) = extract_type_name(type_node, source) {
+                                    return Some(resolve_class_name(&class_name, file_symbols));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Scan function body for assignment: $var = new ClassName()
+    if let Some(body) = func_node.child_by_field_name("body") {
+        if let Some(resolved) = find_assignment_type(body, var_name, var_node, source, file_symbols) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+/// Find the enclosing function/method node.
+fn find_enclosing_function(node: Node) -> Option<Node> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        match n.kind() {
+            "method_declaration" | "function_definition" | "arrow_function" | "anonymous_function_creation_expression" => {
+                return Some(n);
+            }
+            _ => current = n.parent(),
+        }
+    }
+    None
+}
+
+/// Extract a type name from a type node (named_type, optional_type, etc.).
+fn extract_type_name(type_node: Node, source: &str) -> Option<String> {
+    match type_node.kind() {
+        "named_type" => {
+            // named_type contains a name or qualified_name child
+            for i in 0..type_node.named_child_count() {
+                if let Some(child) = type_node.named_child(i) {
+                    if child.kind() == "name" || child.kind() == "qualified_name" {
+                        return Some(source[child.byte_range()].to_string());
+                    }
+                }
+            }
+            None
+        }
+        "optional_type" => {
+            // ?Type — recurse into inner type
+            for i in 0..type_node.named_child_count() {
+                if let Some(child) = type_node.named_child(i) {
+                    if let Some(name) = extract_type_name(child, source) {
+                        return Some(name);
+                    }
+                }
+            }
+            None
+        }
+        "name" | "qualified_name" => {
+            Some(source[type_node.byte_range()].to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Scan a compound_statement for `$var = new ClassName()` before the usage point.
+fn find_assignment_type(
+    body: Node,
+    var_name: &str,
+    usage_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    let usage_start = usage_node.start_byte();
+
+    for i in 0..body.named_child_count() {
+        let stmt = match body.named_child(i) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Only look at statements before the usage point
+        if stmt.start_byte() >= usage_start {
+            break;
+        }
+
+        // Look for expression_statement → assignment_expression
+        if stmt.kind() == "expression_statement" {
+            if let Some(expr) = stmt.named_child(0) {
+                if expr.kind() == "assignment_expression" {
+                    if let (Some(left), Some(right)) = (
+                        expr.child_by_field_name("left"),
+                        expr.child_by_field_name("right"),
+                    ) {
+                        let left_text = &source[left.byte_range()];
+                        if left_text == var_name {
+                            // Check if right side is `new ClassName()`
+                            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols) {
+                                return Some(resolved);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Resolve a simple name node to a SymbolAtPosition.
@@ -650,5 +783,40 @@ mod tests {
         // \\DateTime at line 1
         let result = parse_and_resolve(code, 1, 1);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_resolve_method_call_on_variable_assigned_new() {
+        let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nclass Bar {\n    public function greet(): void {\n        $baz = new Baz();\n        $baz->test();\n    }\n}\n";
+        // "test" in "$baz->test()" at line 7, col 15
+        let result = parse_and_resolve(code, 7, 15);
+        assert!(result.is_some(), "Should resolve method on variable assigned via new");
+        let sym = result.unwrap();
+        assert_eq!(sym.name, "test");
+        assert_eq!(sym.ref_kind, RefKind::MethodCall);
+        assert_eq!(sym.fqn, "App\\Test\\Baz::test");
+    }
+
+    #[test]
+    fn test_resolve_method_call_on_typed_parameter() {
+        let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nclass Bar {\n    public function greet(Baz $baz2): void {\n        $baz2->test();\n    }\n}\n";
+        // "test" in "$baz2->test()" at line 6, col 16
+        let result = parse_and_resolve(code, 6, 16);
+        assert!(result.is_some(), "Should resolve method on typed parameter");
+        let sym = result.unwrap();
+        assert_eq!(sym.name, "test");
+        assert_eq!(sym.ref_kind, RefKind::MethodCall);
+        assert_eq!(sym.fqn, "App\\Test\\Baz::test");
+    }
+
+    #[test]
+    fn test_resolve_property_access_on_typed_parameter() {
+        let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nclass Bar {\n    public function greet(Baz $baz2): void {\n        echo $baz2->name;\n    }\n}\n";
+        // "name" in "$baz2->name" at line 6, col 20
+        let result = parse_and_resolve(code, 6, 20);
+        assert!(result.is_some(), "Should resolve property on typed parameter");
+        let sym = result.unwrap();
+        assert_eq!(sym.name, "name");
+        assert_eq!(sym.fqn, "App\\Test\\Baz::name");
     }
 }
