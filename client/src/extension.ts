@@ -16,6 +16,22 @@ import {
 let client: LanguageClient | undefined;
 
 /**
+ * Map Node.js os.platform()+os.arch() to the binary subdirectory name.
+ */
+function getPlatformDir(): string | undefined {
+  const platform = os.platform();
+  const arch = os.arch();
+
+  const map: Record<string, Record<string, string>> = {
+    linux:  { x64: "linux-x64",   arm64: "linux-arm64" },
+    darwin: { x64: "darwin-x64",  arm64: "darwin-arm64" },
+    win32:  { x64: "win32-x64",   arm64: "win32-arm64" },
+  };
+
+  return map[platform]?.[arch];
+}
+
+/**
  * Determine the path to the php-lsp server binary.
  */
 function getServerPath(context: ExtensionContext): string {
@@ -26,10 +42,16 @@ function getServerPath(context: ExtensionContext): string {
     return customPath;
   }
 
-  // Use bundled binary from extension's bin/ folder
-  const platform = os.platform();
-  const binaryName = platform === "win32" ? "php-lsp.exe" : "php-lsp";
-  return context.asAbsolutePath(path.join("bin", binaryName));
+  // Use bundled binary from bin/<platform>/ subdirectory
+  const platformDir = getPlatformDir();
+  if (!platformDir) {
+    const msg = `Unsupported platform: ${os.platform()}-${os.arch()}`;
+    window.showErrorMessage(`PHP Language Server: ${msg}`);
+    throw new Error(msg);
+  }
+
+  const binaryName = os.platform() === "win32" ? "php-lsp.exe" : "php-lsp";
+  return context.asAbsolutePath(path.join("bin", platformDir, binaryName));
 }
 
 /**

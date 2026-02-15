@@ -24,33 +24,28 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            vscode-target: linux-x64
+            platform: linux-x64
 
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            vscode-target: linux-arm64
-            cross: true
-
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            vscode-target: alpine-x64
+            platform: linux-arm64
             cross: true
 
           - target: x86_64-apple-darwin
             os: macos-13
-            vscode-target: darwin-x64
+            platform: darwin-x64
 
           - target: aarch64-apple-darwin
             os: macos-14
-            vscode-target: darwin-arm64
+            platform: darwin-arm64
 
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            vscode-target: win32-x64
+            platform: win32-x64
 
           - target: aarch64-pc-windows-msvc
             os: windows-latest
-            vscode-target: win32-arm64
+            platform: win32-arm64
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -94,24 +89,14 @@ jobs:
       - name: Upload server binary
         uses: actions/upload-artifact@v4
         with:
-          name: server-${{ matrix.vscode-target }}
+          name: server-${{ matrix.platform }}
           path: server/target/${{ matrix.target }}/release/${{ steps.binary.outputs.name }}
           if-no-files-found: error
 
   package-vsix:
-    name: Package VSIX (${{ matrix.vscode-target }})
+    name: Package Universal VSIX
     needs: build-server
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        vscode-target:
-          - linux-x64
-          - linux-arm64
-          - alpine-x64
-          - darwin-x64
-          - darwin-arm64
-          - win32-x64
-          - win32-arm64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,15 +106,52 @@ jobs:
         with:
           node-version: 20
 
-      - name: Download server binary
+      # Download all platform binaries into bin/<platform>/
+      - name: Download linux-x64 binary
         uses: actions/download-artifact@v4
         with:
-          name: server-${{ matrix.vscode-target }}
-          path: client/bin/
+          name: server-linux-x64
+          path: client/bin/linux-x64/
 
-      - name: Make binary executable
-        if: "!contains(matrix.vscode-target, 'win32')"
-        run: chmod +x client/bin/php-lsp
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: server-linux-arm64
+          path: client/bin/linux-arm64/
+
+      - name: Download darwin-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: server-darwin-x64
+          path: client/bin/darwin-x64/
+
+      - name: Download darwin-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: server-darwin-arm64
+          path: client/bin/darwin-arm64/
+
+      - name: Download win32-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: server-win32-x64
+          path: client/bin/win32-x64/
+
+      - name: Download win32-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: server-win32-arm64
+          path: client/bin/win32-arm64/
+
+      - name: Make Unix binaries executable
+        run: |
+          chmod +x client/bin/linux-x64/php-lsp
+          chmod +x client/bin/linux-arm64/php-lsp
+          chmod +x client/bin/darwin-x64/php-lsp
+          chmod +x client/bin/darwin-arm64/php-lsp
+
+      - name: List bundled binaries
+        run: find client/bin -type f | xargs ls -lh
 
       - name: Bundle phpstorm-stubs
         run: bash scripts/bundle-stubs.sh
@@ -145,15 +167,18 @@ jobs:
       - name: Install vsce
         run: npm install -g @vscode/vsce
 
-      - name: Package VSIX
+      - name: Package universal VSIX
         working-directory: client
-        run: vsce package --target ${{ matrix.vscode-target }} -o ../php-lsp-${{ matrix.vscode-target }}.vsix
+        run: vsce package -o ../php-lsp.vsix
+
+      - name: Show VSIX contents
+        run: unzip -l php-lsp.vsix | head -30
 
       - name: Upload VSIX
         uses: actions/upload-artifact@v4
         with:
-          name: vsix-${{ matrix.vscode-target }}
-          path: php-lsp-${{ matrix.vscode-target }}.vsix
+          name: vsix-universal
+          path: php-lsp.vsix
           if-no-files-found: error
 
   release:
@@ -163,17 +188,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all VSIX artifacts
+      - name: Download VSIX
         uses: actions/download-artifact@v4
         with:
-          pattern: vsix-*
-          merge-multiple: true
+          name: vsix-universal
           path: vsix/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: vsix/*.vsix
+          files: vsix/php-lsp.vsix
           generate_release_notes: true
           draft: false
         env:
@@ -185,20 +209,16 @@ jobs:
   #   needs: package-vsix
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - name: Download all VSIX artifacts
+  #     - name: Download VSIX
   #       uses: actions/download-artifact@v4
   #       with:
-  #         pattern: vsix-*
-  #         merge-multiple: true
+  #         name: vsix-universal
   #         path: vsix/
   #
   #     - name: Install vsce
   #       run: npm install -g @vscode/vsce
   #
   #     - name: Publish
-  #       run: |
-  #         for vsix in vsix/*.vsix; do
-  #           vsce publish --packagePath "$vsix"
-  #         done
+  #       run: vsce publish --packagePath vsix/php-lsp.vsix
   #       env:
   #         VSCE_PAT: ${{ secrets.VSCE_PAT }}

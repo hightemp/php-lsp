@@ -45,30 +45,42 @@ npm run build
 
 ### Packaging VSIX (with bundled server)
 
-Build the server, bundle stubs, and package into a platform-specific `.vsix`:
+Build the server, bundle stubs, and package into a universal `.vsix` containing all platform binaries:
 
 ```bash
-# 1. Build server binary → copies to client/bin/
+# 1. Build server binary for current platform → copies to client/bin/<platform>/
 ./scripts/build-server.sh
 
 # 2. Bundle phpstorm-stubs → copies to client/stubs/
 ./scripts/bundle-stubs.sh
 
-# 3. Package VSIX for current platform
+# 3. Package universal VSIX
 cd client
 npm install
-npx @vscode/vsce package --target linux-x64
+npx @vscode/vsce package
 ```
 
-For cross-compilation, pass the Rust target triple:
+The VSIX contains binaries for all platforms in `bin/<platform>/php-lsp`:
+```
+bin/
+├── linux-x64/php-lsp
+├── linux-arm64/php-lsp
+├── darwin-x64/php-lsp
+├── darwin-arm64/php-lsp
+├── win32-x64/php-lsp.exe
+└── win32-arm64/php-lsp.exe
+```
 
+The extension auto-detects the current OS/arch and uses the correct binary.
+
+For local development, build only your host target:
 ```bash
-./scripts/build-server.sh aarch64-unknown-linux-gnu
+./scripts/build-server.sh                          # auto-detect host
+./scripts/build-server.sh x86_64-unknown-linux-gnu # specific target
+./scripts/build-server.sh --all                    # all 6 targets (CI)
 ```
 
-Supported targets: `linux-x64`, `linux-arm64`, `alpine-x64`, `darwin-x64`, `darwin-arm64`, `win32-x64`, `win32-arm64`.
-
-CI produces platform-specific VSIX files automatically on git tag push (see `.github/workflows/release.yml`).
+CI builds all targets and produces a single universal VSIX on git tag push (see `.github/workflows/release.yml`).
 
 ## Project Structure
 
