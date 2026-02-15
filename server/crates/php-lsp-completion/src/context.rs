@@ -13,6 +13,8 @@ pub enum CompletionContext {
     MemberAccess {
         /// The object expression text (e.g. "$this", "$foo").
         object_expr: String,
+        /// Optional inferred FQN of object class (filled later by server).
+        class_fqn: Option<String>,
     },
 
     /// After `::`: static member access (static methods, properties, constants).
@@ -139,7 +141,10 @@ fn check_member_access(text_before: &str, node: &Node, source: &str) -> Option<C
                 find_object_in_cst(node, source).unwrap_or_else(|| "$this".to_string())
             };
 
-            return Some(CompletionContext::MemberAccess { object_expr });
+            return Some(CompletionContext::MemberAccess {
+                object_expr,
+                class_fqn: None,
+            });
         }
     }
 
@@ -341,7 +346,7 @@ mod tests {
         let code = "<?php\n$obj->meth";
         let ctx = detect(code, 1, 11);
         match ctx {
-            CompletionContext::MemberAccess { object_expr } => {
+            CompletionContext::MemberAccess { object_expr, .. } => {
                 assert_eq!(object_expr, "$obj");
             }
             other => panic!("Expected MemberAccess, got {:?}", other),

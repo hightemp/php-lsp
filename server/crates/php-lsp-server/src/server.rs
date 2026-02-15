@@ -10,7 +10,9 @@ use php_lsp_parser::diagnostics::extract_syntax_errors;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::references::{find_references_in_file, find_variable_references_at_position};
-use php_lsp_parser::resolve::{symbol_at_position, variable_definition_at_position, RefKind};
+use php_lsp_parser::resolve::{
+    infer_variable_type_at_position, symbol_at_position, variable_definition_at_position, RefKind,
+};
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::symbols::extract_file_symbols;
 use std::path::{Path, PathBuf};
@@ -1761,6 +1763,33 @@ impl LanguageServer for PhpLspBackend {
 
         // Detect completion context
         let context = detect_context(tree, &source, pos.line, pos.character, &file_symbols);
+        let context = match context {
+            php_lsp_completion::context::CompletionContext::MemberAccess {
+                object_expr,
+                class_fqn,
+            } => {
+                let inferred = class_fqn.or_else(|| {
+                    if object_expr.starts_with('$') {
+                        infer_variable_type_at_position(
+                            tree,
+                            &source,
+                            &file_symbols,
+                            pos.line,
+                            pos.character,
+                            &object_expr,
+                        )
+                    } else {
+                        None
+                    }
+                });
+
+                php_lsp_completion::context::CompletionContext::MemberAccess {
+                    object_expr,
+                    class_fqn: inferred,
+                }
+            }
+            other => other,
+        };
 
         if context == php_lsp_completion::context::CompletionContext::None {
             return Ok(None);

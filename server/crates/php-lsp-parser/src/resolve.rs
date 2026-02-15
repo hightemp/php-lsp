@@ -4,7 +4,8 @@
 //! position and resolves it to an identifier name, considering namespace context
 //! and use statements.
 
-use php_lsp_types::{FileSymbols, UseKind};
+use crate::phpdoc::parse_phpdoc;
+use php_lsp_types::{FileSymbols, TypeInfo, UseKind};
 use tree_sitter::{Node, Point, Tree};
 
 /// Information about the symbol under the cursor.
@@ -95,6 +96,26 @@ pub fn variable_definition_at_position(
     find_variable_definition_before(scope, &var_name, usage_start, source, &mut best);
 
     best.map(|(_, range)| range)
+}
+
+/// Infer variable type by name before a given position.
+///
+/// This is used by completion to resolve `$var->...` when cursor is at `...`.
+pub fn infer_variable_type_at_position(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    line: u32,
+    character: u32,
+    var_name: &str,
+) -> Option<String> {
+    let root = tree.root_node();
+    let point = Point::new(line as usize, character as usize);
+    let node = find_node_at_point(root, point).unwrap_or(root);
+    let usage_start = position_to_byte(source, line, character);
+    let normalized = normalize_var_name(var_name);
+    let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
+    infer_variable_type_in_scope(scope, &normalized, usage_start, source, file_symbols)
 }
 
 /// Find the deepest (most specific) named node at the given point.
@@ -566,42 +587,8 @@ fn infer_variable_type(
     source: &str,
     file_symbols: &FileSymbols,
 ) -> Option<String> {
-    // 1. Find enclosing function/method body
-    let func_node = find_enclosing_function(var_node)?;
-
-    // 2. Check function parameters for type hints
-    if let Some(params) = func_node.child_by_field_name("parameters") {
-        for i in 0..params.named_child_count() {
-            if let Some(param) = params.named_child(i) {
-                if param.kind() == "simple_parameter"
-                    || param.kind() == "property_promotion_parameter"
-                {
-                    // Check if parameter name matches
-                    if let Some(name_node) = param.child_by_field_name("name") {
-                        let param_name = &source[name_node.byte_range()];
-                        if param_name == var_name {
-                            // Get the type hint
-                            if let Some(type_node) = param.child_by_field_name("type") {
-                                if let Some(class_name) = extract_type_name(type_node, source) {
-                                    return Some(resolve_class_name(&class_name, file_symbols));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Scan function body for assignment: $var = new ClassName()
-    if let Some(body) = func_node.child_by_field_name("body") {
-        if let Some(resolved) = find_assignment_type(body, var_name, var_node, source, file_symbols)
-        {
-            return Some(resolved);
-        }
-    }
-
-    None
+    let scope = find_enclosing_function(var_node).unwrap_or_else(|| find_root_node(var_node));
+    infer_variable_type_in_scope(scope, var_name, var_node.start_byte(), source, file_symbols)
 }
 
 /// Find the enclosing function/method node.
@@ -619,6 +606,48 @@ fn find_enclosing_function(node: Node) -> Option<Node> {
         }
     }
     None
+}
+
+fn find_root_node(node: Node) -> Node {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        current = parent;
+    }
+    current
+}
+
+fn infer_variable_type_in_scope(
+    scope_node: Node,
+    var_name: &str,
+    usage_start: usize,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    // 1. Check function parameters for typed variables
+    if let Some(params) = scope_node.child_by_field_name("parameters") {
+        for i in 0..params.named_child_count() {
+            if let Some(param) = params.named_child(i) {
+                if param.kind() == "simple_parameter"
+                    || param.kind() == "property_promotion_parameter"
+                {
+                    if let Some(name_node) = param.child_by_field_name("name") {
+                        let param_name = normalize_var_name(&source[name_node.byte_range()]);
+                        if param_name == var_name {
+                            if let Some(type_node) = param.child_by_field_name("type") {
+                                if let Some(class_name) = extract_type_name(type_node, source) {
+                                    return Some(resolve_class_name(&class_name, file_symbols));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Scan statements before usage for assignments and inline @var docs.
+    let statements = scope_node.child_by_field_name("body").unwrap_or(scope_node);
+    find_variable_type_before_usage(statements, var_name, usage_start, source, file_symbols)
 }
 
 /// Extract a type name from a type node (named_type, optional_type, etc.).
@@ -652,14 +681,14 @@ fn extract_type_name(type_node: Node, source: &str) -> Option<String> {
 }
 
 /// Scan a compound_statement for `$var = new ClassName()` before the usage point.
-fn find_assignment_type(
+fn find_variable_type_before_usage(
     body: Node,
     var_name: &str,
-    usage_node: Node,
+    usage_start: usize,
     source: &str,
     file_symbols: &FileSymbols,
 ) -> Option<String> {
-    let usage_start = usage_node.start_byte();
+    let mut inferred: Option<(usize, String)> = None;
 
     for i in 0..body.named_child_count() {
         let stmt = match body.named_child(i) {
@@ -672,30 +701,207 @@ fn find_assignment_type(
             break;
         }
 
-        // Look for expression_statement → assignment_expression
-        if stmt.kind() == "expression_statement" {
-            if let Some(expr) = stmt.named_child(0) {
-                if expr.kind() == "assignment_expression" {
-                    if let (Some(left), Some(right)) = (
-                        expr.child_by_field_name("left"),
-                        expr.child_by_field_name("right"),
-                    ) {
-                        let left_text = &source[left.byte_range()];
-                        if left_text == var_name {
-                            // Check if right side is `new ClassName()`
-                            if let Some(resolved) =
-                                try_resolve_object_type(right, source, file_symbols)
-                            {
-                                return Some(resolved);
-                            }
-                        }
-                    }
-                }
+        let assignment_rhs = assignment_rhs_for_var(stmt, var_name, source);
+
+        // Inline PHPDoc immediately before statement:
+        //  - apply named @var always when variable matches
+        //  - unnamed @var only for direct assignment to target variable
+        if let Some(doc_type) = extract_preceding_phpdoc_var_type(
+            stmt,
+            var_name,
+            assignment_rhs.is_some(),
+            source,
+            file_symbols,
+        ) {
+            inferred = Some((stmt.start_byte(), doc_type));
+            continue;
+        }
+
+        // Assignment inference: $var = <expr>;
+        if let Some(right) = assignment_rhs {
+            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols) {
+                inferred = Some((stmt.start_byte(), resolved));
             }
         }
     }
 
+    inferred.map(|(_, ty)| ty)
+}
+
+fn assignment_rhs_for_var<'a>(stmt: Node<'a>, var_name: &str, source: &str) -> Option<Node<'a>> {
+    if stmt.kind() != "expression_statement" {
+        return None;
+    }
+
+    let expr = stmt.named_child(0)?;
+    if expr.kind() != "assignment_expression" {
+        return None;
+    }
+
+    let left = expr.child_by_field_name("left")?;
+    let right = expr.child_by_field_name("right")?;
+    let left_text = normalize_var_name(&source[left.byte_range()]);
+    if left_text == var_name {
+        Some(right)
+    } else {
+        None
+    }
+}
+
+fn extract_preceding_phpdoc_var_type(
+    stmt: Node,
+    var_name: &str,
+    allow_unnamed_var_tag: bool,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    let comment = find_preceding_phpdoc_comment(stmt, source)?;
+    let phpdoc = parse_phpdoc(comment);
+    let type_info = phpdoc.var_type?;
+    let tagged_var = parse_tagged_var_name(comment);
+
+    if let Some(name) = tagged_var {
+        if normalize_var_name(&name) != var_name {
+            return None;
+        }
+    } else if !allow_unnamed_var_tag {
+        return None;
+    }
+
+    resolve_phpdoc_var_type(&type_info, stmt, source, file_symbols)
+}
+
+fn find_preceding_phpdoc_comment<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str> {
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        if p.kind() == "comment" {
+            let text = &source[p.byte_range()];
+            return if text.starts_with("/**") {
+                Some(text)
+            } else {
+                None
+            };
+        }
+        // A statement between comment and target means comment is not attached.
+        if p.is_named() {
+            return None;
+        }
+        prev = p.prev_sibling();
+    }
     None
+}
+
+fn parse_tagged_var_name(comment: &str) -> Option<String> {
+    for raw_line in comment.lines() {
+        let mut line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("/**") {
+            line = rest.trim_start();
+        }
+        if let Some(rest) = line.strip_prefix('*') {
+            line = rest.trim_start();
+        }
+        if line.starts_with("*/") || line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@var") {
+            for token in rest.split_whitespace() {
+                if let Some(name) = normalize_doc_var_token(token) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_doc_var_token(token: &str) -> Option<String> {
+    let trimmed = token.trim_matches(|c: char| c == ',' || c == ';' || c == ')' || c == '(');
+    if !trimmed.starts_with('$') {
+        return None;
+    }
+
+    let ident: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    if ident.len() > 1 {
+        Some(ident)
+    } else {
+        None
+    }
+}
+
+fn resolve_phpdoc_var_type(
+    type_info: &TypeInfo,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    match type_info {
+        TypeInfo::Simple(name) => {
+            if is_builtin_non_object_type(name) {
+                None
+            } else {
+                Some(resolve_class_name(name, file_symbols))
+            }
+        }
+        TypeInfo::Nullable(inner) => {
+            resolve_phpdoc_var_type(inner, context_node, source, file_symbols)
+        }
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            for ty in types {
+                if let Some(resolved) =
+                    resolve_phpdoc_var_type(ty, context_node, source, file_symbols)
+                {
+                    return Some(resolved);
+                }
+            }
+            None
+        }
+        TypeInfo::Self_ | TypeInfo::Static_ => {
+            find_parent_class_fqn(context_node, source, file_symbols)
+        }
+        TypeInfo::Parent_ => None,
+        TypeInfo::Void | TypeInfo::Never | TypeInfo::Mixed => None,
+    }
+}
+
+fn is_builtin_non_object_type(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches('\\').to_ascii_lowercase().as_str(),
+        "int"
+            | "float"
+            | "string"
+            | "bool"
+            | "boolean"
+            | "array"
+            | "object"
+            | "null"
+            | "void"
+            | "never"
+            | "mixed"
+            | "callable"
+            | "iterable"
+            | "true"
+            | "false"
+            | "resource"
+            | "self"
+            | "static"
+            | "parent"
+    )
+}
+
+fn position_to_byte(source: &str, line: u32, character: u32) -> usize {
+    let mut offset = 0usize;
+    let line_idx = line as usize;
+    for (i, row) in source.lines().enumerate() {
+        if i == line_idx {
+            let col = character as usize;
+            return offset + col.min(row.len());
+        }
+        offset += row.len() + 1;
+    }
+    source.len()
 }
 
 /// Resolve a simple name node to a SymbolAtPosition.
@@ -1021,6 +1227,19 @@ mod tests {
         variable_definition_at_position(tree, code, line, col)
     }
 
+    fn parse_and_infer_var_type_at(
+        code: &str,
+        line: u32,
+        col: u32,
+        var_name: &str,
+    ) -> Option<String> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        infer_variable_type_at_position(tree, code, &file_symbols, line, col, var_name)
+    }
+
     fn find_line_col(code: &str, needle: &str) -> (u32, u32) {
         for (line, row) in code.lines().enumerate() {
             if let Some(col) = row.find(needle) {
@@ -1159,6 +1378,52 @@ mod tests {
         assert_eq!(sym.name, "name");
         assert_eq!(sym.fqn, "App\\Test\\Baz::$name");
         assert_eq!(sym.ref_kind, RefKind::PropertyAccess);
+    }
+
+    #[test]
+    fn test_resolve_method_call_on_variable_typed_by_inline_phpdoc_var() {
+        let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nclass Bar {\n    public function greet(): void {\n        /** @var Baz $baz2 */\n        $baz2 = makeBaz();\n        $baz2->test();\n    }\n}\n";
+        // "test" in "$baz2->test()" at line 8
+        let result = parse_and_resolve(code, 8, 16);
+        assert!(
+            result.is_some(),
+            "Should resolve method on variable typed by inline @var"
+        );
+        let sym = result.unwrap();
+        assert_eq!(sym.name, "test");
+        assert_eq!(sym.ref_kind, RefKind::MethodCall);
+        assert_eq!(sym.fqn, "App\\Test\\Baz::test");
+    }
+
+    #[test]
+    fn test_inline_phpdoc_var_must_match_variable_name() {
+        let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nclass Bar {\n    public function greet(): void {\n        /** @var Baz $other */\n        $baz2 = makeBaz();\n        $baz2->test();\n    }\n}\n";
+        // No matching @var for $baz2, so it should not be force-resolved as Baz.
+        let result = parse_and_resolve(code, 8, 16).expect("symbol should resolve");
+        assert_ne!(result.fqn, "App\\Test\\Baz::test");
+    }
+
+    #[test]
+    fn test_unnamed_inline_phpdoc_var_applies_to_immediate_assignment() {
+        let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nclass Bar {\n    public function greet(): void {\n        /** @var Baz */\n        $baz2 = makeBaz();\n        $baz2->test();\n    }\n}\n";
+        let result = parse_and_resolve(code, 8, 16).expect("symbol should resolve");
+        assert_eq!(result.fqn, "App\\Test\\Baz::test");
+    }
+
+    #[test]
+    fn test_unnamed_inline_phpdoc_var_does_not_apply_without_assignment() {
+        let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nclass Bar {\n    public function greet(): void {\n        /** @var Baz */\n        consume($baz2);\n        $baz2->test();\n    }\n}\n";
+        let result = parse_and_resolve(code, 8, 16).expect("symbol should resolve");
+        assert_ne!(result.fqn, "App\\Test\\Baz::test");
+    }
+
+    #[test]
+    fn test_infer_variable_type_at_position_from_inline_phpdoc_var() {
+        let code = "<?php\nnamespace App;\nuse App\\Test\\Baz;\n\nfunction run(): void {\n    /** @var Baz $baz2 */\n    $baz2 = makeBaz();\n    $baz2->\n}\n";
+        // Cursor is after "$baz2->"
+        let inferred =
+            parse_and_infer_var_type_at(code, 7, 11, "$baz2").expect("type should be inferred");
+        assert_eq!(inferred, "App\\Test\\Baz");
     }
 
     #[test]

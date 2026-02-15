@@ -427,6 +427,102 @@ echo $
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_member_access_from_inline_phpdoc_var() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Baz {
+    public function test(): void {}
+}
+
+function makeBaz() {}
+
+function run(): void {
+    /** @var Baz $baz2 */
+    $baz2 = makeBaz();
+    $baz2->
+}
+"#;
+    let uri = "file:///test/phpdoc-completion.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    // Completion at the end of "$baz2->"
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, uri, 12, 11))
+        .await
+        .unwrap();
+
+    let result = extract_result(resp);
+    assert!(
+        !result.is_null(),
+        "completion should return member items from inline @var type"
+    );
+
+    let labels: Vec<String> = if let Some(arr) = result.as_array() {
+        arr.iter()
+            .filter_map(|item| item.get("label").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        result
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("label").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    assert!(
+        labels.iter().any(|label| label == "test"),
+        "expected member completion to include `test`, got: {:?}",
+        labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_document_symbols() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

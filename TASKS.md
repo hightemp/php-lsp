@@ -262,7 +262,7 @@
     - На `test-fixtures/lsp-cases/src/PhpDoc/SupportedTags.php` в hover видны `@throws` и virtual members.
     - В completion resolve видны doc-блоки с расширенными тегами без поломки markdown.
 
-- [ ] **H-011** Type inference из inline/local PHPDoc `@var`
+- [x] **H-011** Type inference из inline/local PHPDoc `@var` *(done 2026-02-15)*
   - Проблема: локальные аннотации `/** @var Type $x */` не участвуют в резолве типа, поэтому страдает completion/definition после присваивания.
   - Что сделать:
     - Добавить extraction inline-`@var` рядом с assignment/variable nodes.

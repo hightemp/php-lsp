@@ -73,9 +73,10 @@ pub fn provide_completions(
     file_symbols: &FileSymbols,
 ) -> Vec<CompletionItem> {
     match context {
-        CompletionContext::MemberAccess { object_expr } => {
-            provide_member_completions(object_expr, index, file_symbols)
-        }
+        CompletionContext::MemberAccess {
+            object_expr,
+            class_fqn,
+        } => provide_member_completions(object_expr, class_fqn.as_deref(), index, file_symbols),
         CompletionContext::StaticAccess {
             class_fqn,
             class_expr,
@@ -93,6 +94,7 @@ pub fn provide_completions(
 /// Provide member access completions (`->`).
 fn provide_member_completions(
     object_expr: &str,
+    inferred_class_fqn: Option<&str>,
     index: &WorkspaceIndex,
     file_symbols: &FileSymbols,
 ) -> Vec<CompletionItem> {
@@ -100,7 +102,9 @@ fn provide_member_completions(
 
     // Try to resolve the type of the object expression
     // For `$this`, look up the current class
-    let class_fqn = if object_expr == "$this" {
+    let class_fqn = if let Some(fqn) = inferred_class_fqn {
+        Some(fqn.to_string())
+    } else if object_expr == "$this" {
         // Find the class we're inside
         find_current_class_fqn(file_symbols)
     } else {
@@ -431,6 +435,59 @@ mod tests {
         assert!(
             items.iter().any(|i| i.label == "$username"),
             "Should find $username"
+        );
+    }
+
+    #[test]
+    fn test_member_completion_uses_inferred_class_fqn() {
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![
+                SymbolInfo {
+                    name: "Baz".to_string(),
+                    fqn: "App\\Test\\Baz".to_string(),
+                    kind: PhpSymbolKind::Class,
+                    uri: "file:///test.php".to_string(),
+                    range: (0, 0, 10, 0),
+                    selection_range: (0, 6, 0, 9),
+                    visibility: Visibility::Public,
+                    modifiers: SymbolModifiers::default(),
+                    doc_comment: None,
+                    signature: None,
+                    parent_fqn: None,
+                },
+                SymbolInfo {
+                    name: "test".to_string(),
+                    fqn: "App\\Test\\Baz::test".to_string(),
+                    kind: PhpSymbolKind::Method,
+                    uri: "file:///test.php".to_string(),
+                    range: (2, 4, 2, 20),
+                    selection_range: (2, 13, 2, 17),
+                    visibility: Visibility::Public,
+                    modifiers: SymbolModifiers::default(),
+                    doc_comment: None,
+                    signature: Some(Signature {
+                        params: vec![],
+                        return_type: None,
+                    }),
+                    parent_fqn: Some("App\\Test\\Baz".to_string()),
+                },
+            ],
+        };
+
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::MemberAccess {
+            object_expr: "$baz2".to_string(),
+            class_fqn: Some("App\\Test\\Baz".to_string()),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+
+        assert!(
+            items.iter().any(|i| i.label == "test"),
+            "Should include members of inferred class"
         );
     }
 }
