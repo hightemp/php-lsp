@@ -1,5 +1,8 @@
 # php-lsp
 
+![Experimental](https://img.shields.io/badge/status-experimental-orange)
+![Vibe Coded](https://img.shields.io/badge/vibe-coded-blueviolet)
+
 PHP Language Server (LSP 3.17) written in Rust for Visual Studio Code.
 
 Provides IDE-level features for PHP 7.4+ projects: diagnostics, hover, go-to-definition, completion, references, rename, and more.

@@ -16,6 +16,7 @@ This fixture set is designed for manual and automated checks of `php-lsp`.
 - `src/Diagnostics`: semantic positive/negative cases.
 - `src/Syntax`: intentionally broken PHP files.
 - `src/Lsp`: focused fixtures per LSP feature and edge case.
+- `src/PhpDoc`: phpDoc parsing/extraction cases (supported tags and malformed edge cases).
 
 ## Coverage Map
 - `src/Diagnostics/SemanticUnknowns.php`:
@@ -38,6 +39,10 @@ This fixture set is designed for manual and automated checks of `php-lsp`.
   completion contexts: variable, member, static, namespace, free keyword (with intentionally incomplete code).
 - `src/Lsp/DocumentSymbols.php`:
   namespace tree with const/function/interface/trait/enum/class + members.
+- `src/PhpDoc/SupportedTags.php`:
+  supported phpDoc tags coverage (`@param`, `@return`, `@var`, `@throws`, `@deprecated`, `@property*`, `@method`) on class/method/property/function.
+- `src/PhpDoc/EdgeCases.php`:
+  unsupported/malformed tags that should be ignored safely, bare `@deprecated`, multiline summary, inline `@var`, nullable and intersection type examples.
 
 ## Notes
 - Some files are intentionally invalid while typing (especially completion fixtures).
