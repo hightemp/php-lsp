@@ -25,7 +25,7 @@ pub struct PhpLspBackend {
     /// Client handle for sending notifications to VS Code.
     client: Client,
     /// Open document parsers (URI string → FileParser).
-    open_files: DashMap<String, FileParser>,
+    open_files: Arc<DashMap<String, FileParser>>,
     /// Global workspace symbol index.
     index: Arc<WorkspaceIndex>,
     /// Workspace root path (set during initialize).
@@ -42,7 +42,7 @@ impl PhpLspBackend {
     pub fn new(client: Client) -> Self {
         PhpLspBackend {
             client,
-            open_files: DashMap::new(),
+            open_files: Arc::new(DashMap::new()),
             index: Arc::new(WorkspaceIndex::new()),
             workspace_root: Mutex::new(None),
             namespace_map: Mutex::new(None),
@@ -136,56 +136,7 @@ impl PhpLspBackend {
 
         let diagnostics = {
             if let Some(parser) = self.open_files.get(&uri_str) {
-                if let Some(tree) = parser.tree() {
-                    let source = parser.source();
-
-                    // Syntax errors (ERROR / MISSING nodes)
-                    let lsp_diags = extract_syntax_errors(tree, &source);
-                    let mut diagnostics: Vec<Diagnostic> = lsp_diags
-                        .into_iter()
-                        .map(|d| Diagnostic {
-                            range: Range {
-                                start: Position::new(d.range.start.line, d.range.start.character),
-                                end: Position::new(d.range.end.line, d.range.end.character),
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            source: Some("php-lsp".to_string()),
-                            message: d.message,
-                            ..Default::default()
-                        })
-                        .collect();
-
-                    // Semantic diagnostics (unknown class, function, unresolved use)
-                    let file_symbols = self
-                        .index
-                        .file_symbols
-                        .get(&uri_str)
-                        .map(|entry| entry.value().clone())
-                        .unwrap_or_default();
-
-                    let index = self.index.clone();
-                    let sem_diags =
-                        extract_semantic_diagnostics(tree, &source, &file_symbols, |fqn| {
-                            index.resolve_fqn(fqn).is_some()
-                        });
-
-                    for sd in sem_diags {
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position::new(sd.range.0, sd.range.1),
-                                end: Position::new(sd.range.2, sd.range.3),
-                            },
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            source: Some("php-lsp".to_string()),
-                            message: sd.message,
-                            ..Default::default()
-                        });
-                    }
-
-                    diagnostics
-                } else {
-                    vec![]
-                }
+                compute_diagnostics(&uri_str, &parser, &self.index)
             } else {
                 vec![]
             }
@@ -195,6 +146,64 @@ impl PhpLspBackend {
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
     }
+}
+
+/// Compute diagnostics for a file (syntax + semantic).
+///
+/// Extracted as a free function so it can be called both from
+/// `publish_diagnostics` and from the post-indexing re-check in `initialized`.
+fn compute_diagnostics(
+    uri_str: &str,
+    parser: &FileParser,
+    index: &WorkspaceIndex,
+) -> Vec<Diagnostic> {
+    let tree = match parser.tree() {
+        Some(t) => t,
+        None => return vec![],
+    };
+    let source = parser.source();
+
+    // Syntax errors (ERROR / MISSING nodes)
+    let lsp_diags = extract_syntax_errors(tree, &source);
+    let mut diagnostics: Vec<Diagnostic> = lsp_diags
+        .into_iter()
+        .map(|d| Diagnostic {
+            range: Range {
+                start: Position::new(d.range.start.line, d.range.start.character),
+                end: Position::new(d.range.end.line, d.range.end.character),
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("php-lsp".to_string()),
+            message: d.message,
+            ..Default::default()
+        })
+        .collect();
+
+    // Semantic diagnostics (unknown class, function, unresolved use)
+    let file_symbols = index
+        .file_symbols
+        .get(uri_str)
+        .map(|entry| entry.value().clone())
+        .unwrap_or_default();
+
+    let sem_diags = extract_semantic_diagnostics(tree, &source, &file_symbols, |fqn| {
+        index.resolve_fqn(fqn).is_some()
+    });
+
+    for sd in sem_diags {
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(sd.range.0, sd.range.1),
+                end: Position::new(sd.range.2, sd.range.3),
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
+            source: Some("php-lsp".to_string()),
+            message: sd.message,
+            ..Default::default()
+        });
+    }
+
+    diagnostics
 }
 
 /// Collect all .php files from the given directories.
@@ -657,12 +666,27 @@ impl LanguageServer for PhpLspBackend {
             .await
             .ok();
 
+            let open_files = self.open_files.clone();
+            let reindex_index = self.index.clone();
+            let reindex_client = self.client.clone();
             tokio::spawn(async move {
                 if let Err(e) = index_workspace(&client, &index, &root, ns_map_storage.as_ref()).await {
                     tracing::error!("Background indexing failed: {}", e);
                     client
                         .log_message(MessageType::ERROR, format!("Indexing failed: {}", e))
                         .await;
+                    return;
+                }
+
+                // Re-publish diagnostics for all open files now that the index is populated
+                for entry in open_files.iter() {
+                    let uri_str = entry.key().clone();
+                    if let Ok(uri) = uri_str.parse::<Uri>() {
+                        let diags = compute_diagnostics(&uri_str, &entry, &reindex_index);
+                        reindex_client
+                            .publish_diagnostics(uri, diags, None)
+                            .await;
+                    }
                 }
             });
         } else {
@@ -786,26 +810,6 @@ impl LanguageServer for PhpLspBackend {
 
         // Look up symbol in index (with lazy vendor fallback)
         let symbol_info = match sym_at_pos.ref_kind {
-            RefKind::ClassName | RefKind::FunctionCall => {
-                self.resolve_fqn_lazy(&sym_at_pos.fqn).await
-            }
-            RefKind::MethodCall | RefKind::ClassConstant | RefKind::StaticPropertyAccess | RefKind::PropertyAccess => {
-                // For member access, try to find by FQN (e.g., "App\Foo::bar")
-                let direct = self.resolve_fqn_lazy(&sym_at_pos.fqn).await;
-                if direct.is_some() {
-                    direct
-                } else if let Some(ref obj) = sym_at_pos.object_expr {
-                    let class_fqn = {
-                        let fs = self.index.file_symbols.get(&uri_str);
-                        let fs_ref = fs.as_ref().map(|e| e.value().clone()).unwrap_or_default();
-                        php_lsp_parser::resolve::resolve_class_name_pub(obj, &fs_ref)
-                    };
-                    let members = self.index.get_members(&class_fqn);
-                    members.into_iter().find(|m| m.name == sym_at_pos.name)
-                } else {
-                    None
-                }
-            }
             RefKind::Variable => None, // Variables are not in the index (yet)
             _ => self.resolve_fqn_lazy(&sym_at_pos.fqn).await,
         };
@@ -974,25 +978,6 @@ impl LanguageServer for PhpLspBackend {
 
         // Look up symbol in index (with lazy vendor fallback)
         let symbol_info = match sym_at_pos.ref_kind {
-            RefKind::ClassName | RefKind::FunctionCall => {
-                self.resolve_fqn_lazy(&sym_at_pos.fqn).await
-            }
-            RefKind::MethodCall | RefKind::ClassConstant | RefKind::StaticPropertyAccess | RefKind::PropertyAccess => {
-                let direct = self.resolve_fqn_lazy(&sym_at_pos.fqn).await;
-                if direct.is_some() {
-                    direct
-                } else if let Some(ref obj) = sym_at_pos.object_expr {
-                    let class_fqn = {
-                        let fs = self.index.file_symbols.get(&uri_str);
-                        let fs_ref = fs.as_ref().map(|e| e.value().clone()).unwrap_or_default();
-                        php_lsp_parser::resolve::resolve_class_name_pub(obj, &fs_ref)
-                    };
-                    let members = self.index.get_members(&class_fqn);
-                    members.into_iter().find(|m| m.name == sym_at_pos.name)
-                } else {
-                    None
-                }
-            }
             RefKind::Variable => None,
             _ => self.resolve_fqn_lazy(&sym_at_pos.fqn).await,
         };

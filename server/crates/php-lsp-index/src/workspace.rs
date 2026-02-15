@@ -85,12 +85,30 @@ impl WorkspaceIndex {
     }
 
     /// Resolve a fully qualified name to a symbol.
+    ///
+    /// Handles both top-level symbols (`App\Foo`) and member symbols
+    /// (`App\Foo::method`, `App\Foo::CONST`, `App\Foo::$prop`).
     pub fn resolve_fqn(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
-        self.types
-            .get(fqn)
-            .map(|r| r.value().clone())
-            .or_else(|| self.functions.get(fqn).map(|r| r.value().clone()))
-            .or_else(|| self.constants.get(fqn).map(|r| r.value().clone()))
+        // Try top-level lookup first
+        if let Some(sym) = self.types.get(fqn).map(|r| r.value().clone()) {
+            return Some(sym);
+        }
+        if let Some(sym) = self.functions.get(fqn).map(|r| r.value().clone()) {
+            return Some(sym);
+        }
+        if let Some(sym) = self.constants.get(fqn).map(|r| r.value().clone()) {
+            return Some(sym);
+        }
+
+        // Try Class::member resolution
+        self.resolve_member(fqn)
+    }
+
+    /// Resolve a `Class::member` FQN to the member symbol.
+    pub fn resolve_member(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
+        let (class_fqn, member_name) = fqn.rsplit_once("::")?;
+        let members = self.get_members(class_fqn);
+        members.into_iter().find(|m| m.name == member_name)
     }
 
     /// Search symbols by name (simple substring match for now).
@@ -247,5 +265,45 @@ mod tests {
         index.update_file("file:///test.php", sym_v2);
         assert!(index.resolve_fqn("Foo").is_none());
         assert!(index.resolve_fqn("Bar").is_some());
+    }
+
+    #[test]
+    fn test_resolve_member() {
+        let index = WorkspaceIndex::new();
+        let class_sym = make_class("Foo", "App\\Foo", "file:///test.php");
+        let method_sym = SymbolInfo {
+            name: "increment".to_string(),
+            fqn: "App\\Foo::increment".to_string(),
+            kind: PhpSymbolKind::Method,
+            uri: "file:///test.php".to_string(),
+            range: (10, 0, 15, 0),
+            selection_range: (10, 20, 10, 29),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: Some("App\\Foo".to_string()),
+        };
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![class_sym, method_sym],
+        };
+        index.update_file("file:///test.php", file_symbols);
+
+        // resolve_fqn should find the class
+        let found = index.resolve_fqn("App\\Foo");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "Foo");
+
+        // resolve_fqn should also find the method via Class::member
+        let found = index.resolve_fqn("App\\Foo::increment");
+        assert!(found.is_some());
+        let method = found.unwrap();
+        assert_eq!(method.name, "increment");
+        assert_eq!(method.kind, PhpSymbolKind::Method);
+
+        // Non-existent member should return None
+        assert!(index.resolve_fqn("App\\Foo::nonexistent").is_none());
     }
 }
