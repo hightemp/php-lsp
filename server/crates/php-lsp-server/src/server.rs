@@ -205,6 +205,11 @@ fn normalize_variable_new_name(new_name: &str) -> Option<String> {
     Some(format!("${}", raw))
 }
 
+fn normalize_property_new_name(new_name: &str) -> Option<String> {
+    let var = normalize_variable_new_name(new_name)?;
+    Some(var.trim_start_matches('$').to_string())
+}
+
 fn is_renameable_variable(var_name: &str) -> bool {
     !matches!(
         var_name,
@@ -222,6 +227,47 @@ fn is_renameable_variable(var_name: &str) -> bool {
             | "$argc"
             | "$argv"
     )
+}
+
+fn line_col_to_byte(source: &str, line: u32, col: u32) -> Option<usize> {
+    let mut current_line = 0u32;
+    let mut offset = 0usize;
+
+    for l in source.split_inclusive('\n') {
+        if current_line == line {
+            let mut byte_col = 0usize;
+            let mut char_col = 0u32;
+            for ch in l.chars() {
+                if char_col == col {
+                    return Some(offset + byte_col);
+                }
+                byte_col += ch.len_utf8();
+                char_col += 1;
+                if ch == '\n' {
+                    break;
+                }
+            }
+            if char_col == col {
+                return Some(offset + byte_col);
+            }
+            return None;
+        }
+        offset += l.len();
+        current_line += 1;
+    }
+
+    None
+}
+
+fn range_starts_with_dollar(source: &str, range: (u32, u32, u32, u32)) -> bool {
+    let Some(start) = line_col_to_byte(source, range.0, range.1) else {
+        return false;
+    };
+    source
+        .as_bytes()
+        .get(start)
+        .map(|b| *b == b'$')
+        .unwrap_or(false)
 }
 
 /// Compute diagnostics for a file (syntax + semantic).
@@ -1345,6 +1391,14 @@ impl LanguageServer for PhpLspBackend {
             }
         };
 
+        let property_new_name = if target_kind == php_lsp_types::PhpSymbolKind::Property {
+            Some(normalize_property_new_name(new_name).ok_or_else(|| {
+                tower_lsp::jsonrpc::Error::invalid_params("Invalid property name")
+            })?)
+        } else {
+            None
+        };
+
         // Don't rename built-in symbols
         if let Some(sym) = self.index.resolve_fqn(&target_fqn) {
             if sym.modifiers.is_builtin {
@@ -1362,17 +1416,18 @@ impl LanguageServer for PhpLspBackend {
             let file_uri = entry.key().clone();
             let file_syms = entry.value().clone();
 
-            let refs = if let Some(parser) = self.open_files.get(&file_uri) {
+            let (refs, source_text) = if let Some(parser) = self.open_files.get(&file_uri) {
                 if let Some(tree) = parser.tree() {
                     let source = parser.source();
-                    find_references_in_file(
+                    let refs = find_references_in_file(
                         tree,
                         &source,
                         &file_syms,
                         &target_fqn,
                         target_kind,
                         true, // include declaration
-                    )
+                    );
+                    (refs, source)
                 } else {
                     continue;
                 }
@@ -1391,7 +1446,15 @@ impl LanguageServer for PhpLspBackend {
                     Some(t) => t,
                     None => continue,
                 };
-                find_references_in_file(tree, &source, &file_syms, &target_fqn, target_kind, true)
+                let refs = find_references_in_file(
+                    tree,
+                    &source,
+                    &file_syms,
+                    &target_fqn,
+                    target_kind,
+                    true,
+                );
+                (refs, source)
             };
 
             if !refs.is_empty() {
@@ -1403,7 +1466,18 @@ impl LanguageServer for PhpLspBackend {
                                 start: Position::new(r.range.0, r.range.1),
                                 end: Position::new(r.range.2, r.range.3),
                             },
-                            new_text: new_name.clone(),
+                            new_text: if target_kind == php_lsp_types::PhpSymbolKind::Property
+                                && range_starts_with_dollar(&source_text, r.range)
+                            {
+                                format!(
+                                    "${}",
+                                    property_new_name
+                                        .as_deref()
+                                        .unwrap_or(new_name.trim_start_matches('$'))
+                                )
+                            } else {
+                                property_new_name.as_deref().unwrap_or(new_name).to_string()
+                            },
                         })
                         .collect();
                     changes.entry(uri).or_default().extend(edits);

@@ -1017,3 +1017,98 @@ function run(string $name): void {
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_property_rename_preserves_dollar_only_where_needed() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+class Repo {
+    private array $users = [];
+
+    public function add(string $u): void {
+        $this->users[] = $u;
+        echo $this->users[0] ?? '';
+    }
+}
+"#;
+    let uri = "file:///test/PropertyRenameDollar.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    // Cursor on "users" in "$this->users[]"
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(2, uri, 5, 16, "users2"))
+        .await
+        .unwrap();
+    let result = extract_result(rename);
+
+    let edits = result
+        .get("changes")
+        .and_then(|c| c.get(uri))
+        .and_then(|arr| arr.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(edits.len(), 3, "declaration + 2 usages should be renamed");
+
+    let mut has_decl = false;
+    let mut has_usage_1 = false;
+    let mut has_usage_2 = false;
+    for e in edits {
+        let line = e
+            .get("range")
+            .and_then(|r| r.get("start"))
+            .and_then(|s| s.get("line"))
+            .and_then(|n| n.as_u64())
+            .unwrap_or(u64::MAX);
+        let new_text = e.get("newText").and_then(|t| t.as_str()).unwrap_or("");
+
+        if line == 2 && new_text == "$users2" {
+            has_decl = true;
+        }
+        if line == 5 && new_text == "users2" {
+            has_usage_1 = true;
+        }
+        if line == 6 && new_text == "users2" {
+            has_usage_2 = true;
+        }
+    }
+
+    assert!(has_decl, "declaration should keep '$' prefix");
+    assert!(has_usage_1, "member usage should not add '$'");
+    assert!(has_usage_2, "member usage should not add '$'");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
