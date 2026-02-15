@@ -106,8 +106,17 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
                     RefKind::PropertyAccess
                 };
 
+                // Try to resolve object type to build a proper FQN
+                let class_fqn = object_field
+                    .and_then(|o| try_resolve_object_type(o, source, file_symbols));
+                let fqn = if let Some(ref cls) = class_fqn {
+                    format!("{}::{}", cls, node_text)
+                } else {
+                    node_text.to_string()
+                };
+
                 return Some(SymbolAtPosition {
-                    fqn: node_text.to_string(), // Cannot fully resolve without type info
+                    fqn,
                     name: node_text.to_string(),
                     ref_kind,
                     object_expr: object_text,
@@ -126,8 +135,16 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
 
             if name_field.map(|n| n.id()) == Some(node.id()) {
                 let object_text = object_field.map(|o| source[o.byte_range()].to_string());
+                // Try to resolve object type to build a proper FQN
+                let class_fqn = object_field
+                    .and_then(|o| try_resolve_object_type(o, source, file_symbols));
+                let fqn = if let Some(ref cls) = class_fqn {
+                    format!("{}::{}", cls, node_text)
+                } else {
+                    node_text.to_string()
+                };
                 return Some(SymbolAtPosition {
-                    fqn: node_text.to_string(),
+                    fqn,
                     name: node_text.to_string(),
                     ref_kind: RefKind::MethodCall,
                     object_expr: object_text,
@@ -346,6 +363,66 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
     }
 }
 
+/// Try to infer the class name from an object expression node.
+///
+/// Handles common patterns:
+/// - `new Foo()` / `(new Foo())` → `Foo`
+/// - `$this` → looks up parent class
+/// - `Foo::create()` (static call returning self/static) → `Foo`
+/// - `ClassName` (as scope in scoped expressions) → `ClassName`
+fn try_resolve_object_type<'a>(object_node: Node<'a>, source: &str, file_symbols: &FileSymbols) -> Option<String> {
+    let kind = object_node.kind();
+    match kind {
+        // Direct: new Foo()
+        "object_creation_expression" => {
+            // The class name is a named child with kind "name" or "qualified_name"
+            let child_count = object_node.named_child_count();
+            for i in 0..child_count {
+                if let Some(child) = object_node.named_child(i) {
+                    match child.kind() {
+                        "name" | "qualified_name" => {
+                            let class_name = &source[child.byte_range()];
+                            return Some(resolve_class_name(class_name, file_symbols));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None
+        }
+        // Parenthesized: (new Foo())
+        "parenthesized_expression" => {
+            // Look for object_creation_expression inside
+            let child_count = object_node.named_child_count();
+            for i in 0..child_count {
+                if let Some(child) = object_node.named_child(i) {
+                    if let Some(resolved) = try_resolve_object_type(child, source, file_symbols) {
+                        return Some(resolved);
+                    }
+                }
+            }
+            None
+        }
+        // $this → find enclosing class
+        "variable_name" => {
+            let text = &source[object_node.byte_range()];
+            if text == "$this" {
+                find_parent_class_fqn(object_node, source, file_symbols)
+            } else {
+                None
+            }
+        }
+        // Name / qualified_name might be a class used as scope
+        "name" | "qualified_name" => {
+            let text = &source[object_node.byte_range()];
+            Some(resolve_class_name(text, file_symbols))
+        }
+        // Member call chain: $obj->foo()->bar() — can't resolve without full type inference
+        // Static call: Foo::create() — can't resolve return type without type info
+        _ => None,
+    }
+}
+
 /// Resolve a simple name node to a SymbolAtPosition.
 fn resolve_name_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<SymbolAtPosition> {
     let text = &source[node.byte_range()];
@@ -529,6 +606,42 @@ mod tests {
         let sym = result.unwrap();
         assert_eq!(sym.name, "Foo");
         assert_eq!(sym.fqn, "App\\Foo");
+    }
+
+    #[test]
+    fn test_resolve_method_call_on_new() {
+        // (new Foo())->increment(5)
+        let code = "<?php\nnamespace App;\nuse App\\Foo;\n\n(new Foo())->increment(5);\n";
+        // "increment" is at line 4, col 13
+        let result = parse_and_resolve(code, 4, 13);
+        assert!(result.is_some(), "Should resolve method call on new expression");
+        let sym = result.unwrap();
+        assert_eq!(sym.name, "increment");
+        assert_eq!(sym.ref_kind, RefKind::MethodCall);
+        assert_eq!(sym.fqn, "App\\Foo::increment");
+    }
+
+    #[test]
+    fn test_resolve_method_call_on_this() {
+        let code = "<?php\nnamespace App;\n\nclass Foo {\n    public function bar(): void {\n        $this->baz();\n    }\n}\n";
+        // "baz" in "$this->baz()" at line 5, col 16
+        let result = parse_and_resolve(code, 5, 16);
+        assert!(result.is_some(), "Should resolve method call on $this");
+        let sym = result.unwrap();
+        assert_eq!(sym.name, "baz");
+        assert_eq!(sym.ref_kind, RefKind::MethodCall);
+        assert_eq!(sym.fqn, "App\\Foo::baz");
+    }
+
+    #[test]
+    fn test_resolve_property_access_on_this() {
+        let code = "<?php\nnamespace App;\n\nclass Foo {\n    private string $name;\n    public function bar(): string {\n        return $this->name;\n    }\n}\n";
+        // "name" in "$this->name" at line 6, col 22
+        let result = parse_and_resolve(code, 6, 22);
+        assert!(result.is_some(), "Should resolve property access on $this");
+        let sym = result.unwrap();
+        assert_eq!(sym.name, "name");
+        assert_eq!(sym.fqn, "App\\Foo::name");
     }
 
     #[test]
