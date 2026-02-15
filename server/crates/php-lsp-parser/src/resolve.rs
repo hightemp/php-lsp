@@ -106,6 +106,15 @@ fn find_node_at_point(root: Node, point: Point) -> Option<Node> {
         node = node.parent()?;
     }
 
+    // Prefer the full variable node when cursor is inside "$name" token.
+    if node.kind() == "name" {
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "variable_name" {
+                node = parent;
+            }
+        }
+    }
+
     Some(node)
 }
 
@@ -189,7 +198,11 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
                 let scope_text = scope_field.map(|s| source[s.byte_range()].to_string());
                 let scope_fqn = scope_text
                     .as_ref()
-                    .map(|s| resolve_class_name(s, file_symbols))
+                    .map(|s| match s.as_str() {
+                        "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
+                            .unwrap_or_else(|| s.to_string()),
+                        _ => resolve_class_name(s, file_symbols),
+                    })
                     .unwrap_or_default();
 
                 return Some(SymbolAtPosition {
@@ -206,7 +219,11 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
             }
 
             // Cursor on scope (class name)
-            let resolved = resolve_class_name(node_text, file_symbols);
+            let resolved = match node_text {
+                "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
+                    .unwrap_or_else(|| resolve_class_name(node_text, file_symbols)),
+                _ => resolve_class_name(node_text, file_symbols),
+            };
             Some(SymbolAtPosition {
                 fqn: resolved,
                 name: node_text.to_string(),
@@ -225,7 +242,11 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
                 let scope_text = scope_field.map(|s| source[s.byte_range()].to_string());
                 let scope_fqn = scope_text
                     .as_ref()
-                    .map(|s| resolve_class_name(s, file_symbols))
+                    .map(|s| match s.as_str() {
+                        "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
+                            .unwrap_or_else(|| s.to_string()),
+                        _ => resolve_class_name(s, file_symbols),
+                    })
                     .unwrap_or_default();
 
                 let (ref_kind, member_name) = if node_text.starts_with('$') {
@@ -247,7 +268,11 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
                 });
             }
 
-            let resolved = resolve_class_name(node_text, file_symbols);
+            let resolved = match node_text {
+                "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
+                    .unwrap_or_else(|| resolve_class_name(node_text, file_symbols)),
+                _ => resolve_class_name(node_text, file_symbols),
+            };
             Some(SymbolAtPosition {
                 fqn: resolved,
                 name: node_text.to_string(),
@@ -328,7 +353,11 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
             }
 
             if scope_node.map(|n| n.id()) == Some(node.id()) {
-                let resolved = resolve_class_name(node_text, file_symbols);
+                let resolved = match node_text {
+                    "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
+                        .unwrap_or_else(|| resolve_class_name(node_text, file_symbols)),
+                    _ => resolve_class_name(node_text, file_symbols),
+                };
                 return Some(SymbolAtPosition {
                     fqn: resolved,
                     name: node_text.to_string(),
@@ -992,6 +1021,15 @@ mod tests {
         variable_definition_at_position(tree, code, line, col)
     }
 
+    fn find_line_col(code: &str, needle: &str) -> (u32, u32) {
+        for (line, row) in code.lines().enumerate() {
+            if let Some(col) = row.find(needle) {
+                return (line as u32, col as u32);
+            }
+        }
+        panic!("needle not found: {}", needle);
+    }
+
     #[test]
     fn test_resolve_class_name_with_use() {
         let code = "<?php\nuse App\\Service\\UserService;\n\nnew UserService();\n";
@@ -1184,5 +1222,26 @@ mod tests {
         let sym = parse_and_resolve(code, 9, 17).expect("BUILD symbol should resolve");
         assert_eq!(sym.ref_kind, RefKind::GlobalConstant);
         assert_eq!(sym.fqn, "App\\BUILD");
+    }
+
+    #[test]
+    fn test_resolve_static_property_access_variants() {
+        let code = "<?php\nnamespace App;\n\nclass User { public static string $var = 'u'; }\n\nclass Demo {\n    public static string $created = 'c';\n    public static string $var = 'd';\n\n    public function run(): void {\n        echo self::$created;\n        echo static::$var;\n        echo User::$var;\n    }\n}\n";
+
+        let (l1, c1) = find_line_col(code, "self::$created");
+        let self_prop =
+            parse_and_resolve(code, l1, c1 + 8).expect("self::$created should resolve");
+        assert_eq!(self_prop.ref_kind, RefKind::StaticPropertyAccess);
+        assert_eq!(self_prop.fqn, "App\\Demo::$created");
+
+        let (l2, c2) = find_line_col(code, "static::$var");
+        let static_prop = parse_and_resolve(code, l2, c2 + 9).expect("static::$var should resolve");
+        assert_eq!(static_prop.ref_kind, RefKind::StaticPropertyAccess);
+        assert_eq!(static_prop.fqn, "App\\Demo::$var");
+
+        let (l3, c3) = find_line_col(code, "User::$var");
+        let user_prop = parse_and_resolve(code, l3, c3 + 7).expect("User::$var should resolve");
+        assert_eq!(user_prop.ref_kind, RefKind::StaticPropertyAccess);
+        assert_eq!(user_prop.fqn, "App\\User::$var");
     }
 }

@@ -788,6 +788,91 @@ class Foo {
         "class constant usage should go to class const declaration line"
     );
 
+    // 4) Static property usages: self::$created, static::$var, User::$var
+    let static_prop_code = r#"<?php
+namespace App;
+
+class User {
+    public static string $var = 'u';
+}
+
+class Demo {
+    public static string $created = 'c';
+    public static string $var = 'd';
+
+    public function run(): void {
+        echo self::$created;
+        echo static::$var;
+        echo User::$var;
+    }
+}
+"#;
+    let static_prop_uri = "file:///test/GotoStaticProperty.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(static_prop_uri, static_prop_code))
+        .await
+        .unwrap();
+
+    let self_prop_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(5, static_prop_uri, 12, 21))
+        .await
+        .unwrap();
+    let self_prop_result = extract_result(self_prop_resp);
+    let self_prop_line = self_prop_result
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(u64::MAX);
+    assert_eq!(
+        self_prop_line, 8,
+        "self::$created should go to static property declaration"
+    );
+
+    let static_prop_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(6, static_prop_uri, 13, 23))
+        .await
+        .unwrap();
+    let static_prop_result = extract_result(static_prop_resp);
+    let static_prop_line = static_prop_result
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(u64::MAX);
+    assert_eq!(
+        static_prop_line, 9,
+        "static::$var should go to class static property declaration"
+    );
+
+    let user_prop_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(7, static_prop_uri, 14, 20))
+        .await
+        .unwrap();
+    let user_prop_result = extract_result(user_prop_resp);
+    let user_prop_line = user_prop_result
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(u64::MAX);
+    assert_eq!(
+        user_prop_line, 4,
+        "User::$var should go to referenced class static property declaration"
+    );
+
     service
         .ready()
         .await
