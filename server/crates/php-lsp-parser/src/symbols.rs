@@ -555,6 +555,8 @@ fn extract_signature(node: Node, source: &str) -> Signature {
         }
     }
 
+    params = normalize_signature_params(params);
+
     let return_type = node
         .child_by_field_name("return_type")
         .map(|t| parse_type_node(t, source));
@@ -563,6 +565,42 @@ fn extract_signature(node: Node, source: &str) -> Signature {
         params,
         return_type,
     }
+}
+
+/// Normalize signature parameters to handle version-gated stub overloads.
+///
+/// phpstorm-stubs may contain duplicated parameter names in one declaration
+/// with attributes like PhpStormStubsElementAvailable. We collapse duplicates
+/// by name and merge flags, preferring a richer/variadic variant.
+fn normalize_signature_params(params: Vec<ParamInfo>) -> Vec<ParamInfo> {
+    let mut out: Vec<ParamInfo> = Vec::new();
+    let mut index_by_name: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for p in params {
+        if let Some(&idx) = index_by_name.get(&p.name) {
+            let existing = &mut out[idx];
+
+            // Prefer concrete type info when existing param is untyped.
+            if existing.type_info.is_none() && p.type_info.is_some() {
+                existing.type_info = p.type_info.clone();
+            }
+            // Keep any explicit default value.
+            if existing.default_value.is_none() && p.default_value.is_some() {
+                existing.default_value = p.default_value.clone();
+            }
+            // Merge flags; variadic=true is critical for arity checks.
+            existing.is_variadic = existing.is_variadic || p.is_variadic;
+            existing.is_by_ref = existing.is_by_ref || p.is_by_ref;
+            existing.is_promoted = existing.is_promoted || p.is_promoted;
+        } else {
+            let idx = out.len();
+            index_by_name.insert(p.name.clone(), idx);
+            out.push(p);
+        }
+    }
+
+    out
 }
 
 fn extract_param(node: Node, source: &str) -> ParamInfo {
@@ -929,5 +967,23 @@ mod tests {
             .find(|s| s.kind == PhpSymbolKind::Function)
             .unwrap();
         assert_eq!(func.fqn, "globalFunc");
+    }
+
+    #[test]
+    fn test_extract_signature_dedupes_version_gated_duplicate_params() {
+        let syms = parse_and_extract(
+            "<?php\nfunction array_map(?callable $callback, array $array, $arrays, array ...$arrays): array {}\n",
+        );
+        let func = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Function)
+            .unwrap();
+        let sig = func.signature.as_ref().unwrap();
+
+        // callback, array, arrays(variadic)
+        assert_eq!(sig.params.len(), 3);
+        assert_eq!(sig.params[2].name, "arrays");
+        assert!(sig.params[2].is_variadic);
     }
 }

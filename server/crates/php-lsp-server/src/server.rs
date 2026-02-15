@@ -126,6 +126,44 @@ impl PhpLspBackend {
         None
     }
 
+    /// Resolve symbol from index with fallback for built-in/global functions.
+    fn resolve_fqn_with_function_fallback(
+        &self,
+        fqn: &str,
+        ref_kind: RefKind,
+    ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+        if let Some(sym) = self.index.resolve_fqn(fqn) {
+            return Some(sym);
+        }
+        if ref_kind == RefKind::FunctionCall {
+            if let Some((_, short_name)) = fqn.rsplit_once('\\') {
+                if let Some(sym) = self.index.resolve_fqn(short_name) {
+                    return Some(sym);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve symbol lazily with fallback for built-in/global functions.
+    async fn resolve_fqn_lazy_with_function_fallback(
+        &self,
+        fqn: &str,
+        ref_kind: RefKind,
+    ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+        if let Some(sym) = self.resolve_fqn_lazy(fqn).await {
+            return Some(sym);
+        }
+        if ref_kind == RefKind::FunctionCall {
+            if let Some((_, short_name)) = fqn.rsplit_once('\\') {
+                if let Some(sym) = self.resolve_fqn_lazy(short_name).await {
+                    return Some(sym);
+                }
+            }
+        }
+        None
+    }
+
     /// Publish diagnostics for a file.
     async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
@@ -174,6 +212,11 @@ fn compute_diagnostics(
             ..Default::default()
         })
         .collect();
+
+    // Avoid semantic noise while the file has syntax errors.
+    if !diagnostics.is_empty() {
+        return diagnostics;
+    }
 
     // Semantic diagnostics (unknown class, function, unresolved use)
     let file_symbols = index
@@ -973,7 +1016,10 @@ impl LanguageServer for PhpLspBackend {
         // Look up symbol in index (with lazy vendor fallback)
         let symbol_info = match sym_at_pos.ref_kind {
             RefKind::Variable => None,
-            _ => self.resolve_fqn_lazy(&sym_at_pos.fqn).await,
+            _ => {
+                self.resolve_fqn_lazy_with_function_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
+                    .await
+            }
         };
 
         let result = if let Some(sym) = symbol_info {
@@ -1034,15 +1080,13 @@ impl LanguageServer for PhpLspBackend {
                         RefKind::NamespaceName | RefKind::Unknown => return Ok(None),
                     };
 
-                    // For methods/properties, also try to find the exact kind from the index
-                    let fqn = sym.fqn.clone();
-                    let refined_kind = if let Some(resolved) = self.index.resolve_fqn(&fqn) {
-                        resolved.kind
+                    // Try to canonicalize symbol via index lookup.
+                    let resolved = self.resolve_fqn_with_function_fallback(&sym.fqn, sym.ref_kind);
+                    if let Some(resolved) = resolved {
+                        (resolved.fqn.clone(), resolved.kind)
                     } else {
-                        kind
-                    };
-
-                    (fqn, refined_kind)
+                        (sym.fqn.clone(), kind)
+                    }
                 }
                 None => return Ok(None),
             }
@@ -1170,13 +1214,12 @@ impl LanguageServer for PhpLspBackend {
                         _ => return Ok(None),
                     };
 
-                    let refined_kind = if let Some(resolved) = self.index.resolve_fqn(&sym.fqn) {
-                        resolved.kind
+                    let resolved = self.resolve_fqn_with_function_fallback(&sym.fqn, sym.ref_kind);
+                    if let Some(resolved) = resolved {
+                        (resolved.fqn.clone(), resolved.kind, sym.name.clone())
                     } else {
-                        kind
-                    };
-
-                    (sym.fqn.clone(), refined_kind, sym.name.clone())
+                        (sym.fqn.clone(), kind, sym.name.clone())
+                    }
                 }
                 None => return Ok(None),
             }
@@ -1288,7 +1331,9 @@ impl LanguageServer for PhpLspBackend {
                 }
 
                 // Don't rename built-in symbols
-                if let Some(resolved) = self.index.resolve_fqn(&sym.fqn) {
+                if let Some(resolved) =
+                    self.resolve_fqn_with_function_fallback(&sym.fqn, sym.ref_kind)
+                {
                     if resolved.modifiers.is_builtin {
                         return Ok(None);
                     }

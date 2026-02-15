@@ -187,6 +187,31 @@
 
 ---
 
+## Hotfix backlog (post-MVP)
+
+- [x] **H-001** Built-in function resolution в namespace (definition/rename) *(done 2026-02-15)*
+  - Символы вида `strlen()` внутри namespace не должны резолвиться только как `App\\Ns\\strlen`
+  - Добавить fallback до global/built-in функции при lookup в server/resolve-path
+  - Проверить блокировку rename для built-in (invalid params)
+
+- [x] **H-002** References для class constant (`Class::CONST`, `self::CONST`) *(done 2026-02-15)*
+  - Поддержать CST-узел `class_constant_access_expression` в поиске ссылок
+  - Убедиться, что references включает declaration + все usage
+
+- [x] **H-003** Ложный `ArgumentCountMismatch` на stubs с version-gated сигнатурами *(done 2026-02-15)*
+  - Нормализовать извлечение параметров из stubs (дубликаты параметров одного имени, variadic-варианты)
+  - Устранить false positive (пример: `array_map`)
+
+- [x] **H-004** Шум семантических диагностик при синтаксически битом файле *(done 2026-02-15)*
+  - Не публиковать semantic warning'и, если в файле есть syntax errors
+  - Оставлять только syntax diagnostics до восстановления парсинга
+
+- [x] **H-005** Консистентный FQN для qualified function call *(done 2026-02-15)*
+  - Исправить резолв `A\\B\\fn()` (без потери префикса и без двойного namespace в сообщениях)
+  - Синхронизировать поведение в `resolve`, `semantic`, `references`
+
+---
+
 ## Этап v1 (4-6 недель после MVP)
 
 ### Signature Help

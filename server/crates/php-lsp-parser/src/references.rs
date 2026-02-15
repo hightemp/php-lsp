@@ -353,7 +353,12 @@ fn resolve_function_name_to_fqn(name: &str, file_symbols: &FileSymbols) -> Strin
         }
     }
 
-    // Namespace-qualified
+    // Keep already-qualified names stable.
+    if name.contains('\\') {
+        return name.to_string();
+    }
+
+    // Namespace-qualified for simple names
     if let Some(ref ns) = file_symbols.namespace {
         format!("{}\\{}", ns, name)
     } else {
@@ -507,6 +512,39 @@ fn walk_for_member_refs(
                                 ),
                             });
                         }
+                    }
+                }
+            }
+        }
+
+        // self::CONST / ClassName::CONST
+        "class_constant_access_expression" => {
+            if is_property_target {
+                // Property target should not match class constant access.
+            } else if let (Some(scope_node), Some(name_node)) =
+                (node.named_child(0), node.named_child(1))
+            {
+                let text = &source[name_node.byte_range()];
+                if text == member_name {
+                    let scope_text = &source[scope_node.byte_range()];
+                    let scope_fqn = resolve_name_to_fqn(scope_text, _file_symbols);
+                    let expected_class = &target_fqn[..target_fqn.rfind("::").unwrap_or(0)];
+
+                    if scope_fqn == expected_class
+                        || scope_text == "self"
+                        || scope_text == "static"
+                        || scope_text == "parent"
+                    {
+                        let start = name_node.start_position();
+                        let end = name_node.end_position();
+                        results.push(ReferenceLocation {
+                            range: (
+                                start.row as u32,
+                                start.column as u32,
+                                end.row as u32,
+                                end.column as u32,
+                            ),
+                        });
                     }
                 }
             }
@@ -704,5 +742,28 @@ function run(Baz $baz): void {
             2,
             "Property references should not include method calls with the same name"
         );
+    }
+
+    #[test]
+    fn test_find_class_constant_references() {
+        let code = r#"<?php
+namespace App;
+
+class RenameTarget {
+    public const STATE_ACTIVE = 'active';
+    public function touch(): void {
+        echo self::STATE_ACTIVE;
+    }
+}
+
+echo RenameTarget::STATE_ACTIVE;
+"#;
+        let refs = find_refs(
+            code,
+            "App\\RenameTarget::STATE_ACTIVE",
+            PhpSymbolKind::ClassConstant,
+        );
+        // declaration + 2 usages
+        assert_eq!(refs.len(), 3, "Should find declaration + 2 constant usages");
     }
 }

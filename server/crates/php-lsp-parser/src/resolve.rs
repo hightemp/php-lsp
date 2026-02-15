@@ -230,7 +230,10 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
                     || node.kind() == "qualified_name"
                     || node.kind() == "namespace_name")
             {
-                let resolved = resolve_function_name(node_text, file_symbols);
+                let function_text = func_field
+                    .map(|n| &source[n.byte_range()])
+                    .unwrap_or(node_text);
+                let resolved = resolve_function_name(function_text, file_symbols);
                 return Some(SymbolAtPosition {
                     fqn: resolved,
                     name: node_text.to_string(),
@@ -241,6 +244,62 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
             }
 
             resolve_name_node(node, source, file_symbols)
+        }
+
+        // Child name inside qualified_name used by function call (e.g. App\Utils\fn()).
+        "qualified_name" | "namespace_name"
+            if parent
+                .parent()
+                .map(|gp| gp.kind() == "function_call_expression")
+                .unwrap_or(false) =>
+        {
+            let qname_text = &source[parent.byte_range()];
+            let resolved = resolve_function_name(qname_text, file_symbols);
+            Some(SymbolAtPosition {
+                fqn: resolved,
+                name: node_text.to_string(),
+                ref_kind: RefKind::FunctionCall,
+                object_expr: None,
+                range: node_range(node),
+            })
+        }
+
+        // Class constant access: self::CONST / ClassName::CONST
+        "class_constant_access_expression" => {
+            let scope_node = parent.named_child(0);
+            let name_node = parent.named_child(1);
+
+            if name_node.map(|n| n.id()) == Some(node.id()) {
+                let scope_text = scope_node.map(|s| source[s.byte_range()].to_string());
+                let scope_fqn = scope_text
+                    .as_ref()
+                    .map(|s| resolve_class_name(s, file_symbols))
+                    .unwrap_or_default();
+                return Some(SymbolAtPosition {
+                    fqn: if scope_fqn.is_empty() {
+                        node_text.to_string()
+                    } else {
+                        format!("{}::{}", scope_fqn, node_text)
+                    },
+                    name: node_text.to_string(),
+                    ref_kind: RefKind::ClassConstant,
+                    object_expr: scope_text,
+                    range: node_range(node),
+                });
+            }
+
+            if scope_node.map(|n| n.id()) == Some(node.id()) {
+                let resolved = resolve_class_name(node_text, file_symbols);
+                return Some(SymbolAtPosition {
+                    fqn: resolved,
+                    name: node_text.to_string(),
+                    ref_kind: RefKind::ClassName,
+                    object_expr: None,
+                    range: node_range(node),
+                });
+            }
+
+            None
         }
 
         // Object creation expression: new ClassName()
@@ -674,7 +733,12 @@ fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
         }
     }
 
-    // For functions, try namespace-qualified first, then global
+    // Keep already-qualified names stable.
+    if name.contains('\\') {
+        return name.to_string();
+    }
+
+    // For simple function names, try namespace-qualified first.
     if let Some(ref ns) = file_symbols.namespace {
         format!("{}\\{}", ns, name)
     } else {
@@ -750,6 +814,16 @@ mod tests {
         assert!(result.is_some());
         let sym = result.unwrap();
         assert_eq!(sym.ref_kind, RefKind::FunctionCall);
+    }
+
+    #[test]
+    fn test_resolve_qualified_function_call_without_double_namespace() {
+        let code = "<?php\nnamespace App\\Diagnostics;\n\nApp\\Utils\\helper();\n";
+        let result = parse_and_resolve(code, 3, 13);
+        assert!(result.is_some());
+        let sym = result.unwrap();
+        assert_eq!(sym.ref_kind, RefKind::FunctionCall);
+        assert_eq!(sym.fqn, "App\\Utils\\helper");
     }
 
     #[test]
@@ -866,5 +940,16 @@ mod tests {
         let method = parse_and_resolve(code, 10, 12).expect("method should resolve");
         assert_eq!(method.ref_kind, RefKind::MethodCall);
         assert_eq!(method.fqn, "App\\Test\\Baz::test");
+    }
+
+    #[test]
+    fn test_resolve_class_constant_access() {
+        let code = "<?php\nnamespace App;\n\nclass Foo {\n    public const VERSION = '1.0';\n    public function run(): string {\n        return self::VERSION;\n    }\n}\n";
+        // VERSION in self::VERSION
+        let result = parse_and_resolve(code, 6, 21);
+        assert!(result.is_some(), "Should resolve class constant access");
+        let sym = result.unwrap();
+        assert_eq!(sym.ref_kind, RefKind::ClassConstant);
+        assert_eq!(sym.fqn, "self::VERSION");
     }
 }

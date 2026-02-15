@@ -5,6 +5,7 @@
 
 use futures::StreamExt;
 use serde_json::json;
+use std::fs;
 use tower::{Service, ServiceExt};
 use tower_lsp::jsonrpc::Request;
 use tower_lsp::LspService;
@@ -19,6 +20,21 @@ fn initialize_request(id: i64) -> Request {
         }))
         .id(id)
         .finish()
+}
+
+fn initialize_request_with_options(
+    id: i64,
+    root_uri: Option<&str>,
+    initialization_options: Option<serde_json::Value>,
+) -> Request {
+    let mut params = json!({
+        "capabilities": {},
+        "rootUri": root_uri
+    });
+    if let Some(opts) = initialization_options {
+        params["initializationOptions"] = opts;
+    }
+    Request::build("initialize").params(params).id(id).finish()
 }
 
 fn initialized_notification() -> Request {
@@ -92,6 +108,16 @@ fn rename_request(id: i64, uri: &str, line: u32, character: u32, new_name: &str)
         .finish()
 }
 
+fn prepare_rename_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
+    Request::build("textDocument/prepareRename")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+        .id(id)
+        .finish()
+}
+
 /// Helper to extract the "result" field from a JSON-RPC response.
 fn extract_result(response: Option<tower_lsp::jsonrpc::Response>) -> serde_json::Value {
     let resp = response.expect("expected a response");
@@ -99,6 +125,17 @@ fn extract_result(response: Option<tower_lsp::jsonrpc::Response>) -> serde_json:
     // We'll serialize and parse to get the result
     let serialized = serde_json::to_value(&resp).unwrap();
     serialized.get("result").cloned().unwrap_or(json!(null))
+}
+
+/// Helper to extract the "error.message" field from a JSON-RPC response.
+fn extract_error_message(response: Option<tower_lsp::jsonrpc::Response>) -> Option<String> {
+    let resp = response?;
+    let serialized = serde_json::to_value(&resp).ok()?;
+    serialized
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -512,4 +549,109 @@ $x = new OldName();
         .call(shutdown_request(99))
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_builtin_function_fallback_blocks_rename_in_namespace() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!("php-lsp-e2e-{}", std::process::id()));
+    fs::create_dir_all(&tmp_root).unwrap();
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+
+    let stubs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../client/stubs")
+        .canonicalize()
+        .unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            Some(&root_uri),
+            Some(json!({
+                "stubsPath": stubs_path.to_string_lossy().to_string()
+            })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App\Lsp;
+
+strlen("x");
+"#;
+    let uri = "file:///test/BuiltinRename.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    // Ensure function call in namespace resolves via global built-in fallback.
+    let def_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(2, uri, 3, 2))
+        .await
+        .unwrap();
+    let def_result = extract_result(def_resp);
+    assert!(
+        !def_result.is_null(),
+        "definition for strlen() in namespace should resolve via built-in fallback"
+    );
+
+    // Built-ins must not be renameable.
+    let prepare_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(prepare_rename_request(3, uri, 3, 2))
+        .await
+        .unwrap();
+    let prepare_result = extract_result(prepare_resp);
+    assert!(
+        prepare_result.is_null(),
+        "prepareRename should return null for built-in symbol"
+    );
+
+    let rename_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(4, uri, 3, 2, "str_len"))
+        .await
+        .unwrap();
+    let err = extract_error_message(rename_resp).unwrap_or_default();
+    assert!(
+        err.contains("Cannot rename built-in symbols"),
+        "rename should return built-in rename error, got: {}",
+        err
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+
+    let _ = fs::remove_dir_all(&tmp_root);
 }

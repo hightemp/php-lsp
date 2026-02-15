@@ -302,8 +302,12 @@ fn check_function_call<F>(
 ) where
     F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
-    // The function name is the first named child (name or qualified_name)
-    if let Some(name_node) = node.named_child(0) {
+    // Prefer the explicit "function" field to preserve qualified names.
+    let target_node = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0));
+
+    if let Some(name_node) = target_node {
         let nk = name_node.kind();
         if nk == "name" || nk == "qualified_name" || nk == "namespace_name" {
             let name = &source[name_node.byte_range()];
@@ -467,14 +471,12 @@ fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
         }
     }
 
-    // If name is qualified (has \), prepend namespace
+    // Keep already-qualified names stable.
     if name.contains('\\') {
-        if let Some(ref ns) = file_symbols.namespace {
-            return format!("{}\\{}", ns, name);
-        }
+        return name.to_string();
     }
 
-    // Simple name — could be a global PHP function, don't resolve
+    // Simple name — could be global or namespace function.
     name.to_string()
 }
 
