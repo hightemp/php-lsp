@@ -655,3 +655,144 @@ strlen("x");
 
     let _ = fs::remove_dir_all(&tmp_root);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_goto_definition_variables_and_constants() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let var_code = r#"<?php
+function demo(): void {
+    $value = 1;
+    echo $value;
+}
+"#;
+    let var_uri = "file:///test/GotoVariable.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(var_uri, var_code))
+        .await
+        .unwrap();
+
+    // 1) Variable usage -> assignment definition
+    let var_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(2, var_uri, 3, 10))
+        .await
+        .unwrap();
+    let var_result = extract_result(var_resp);
+    let var_def_line = var_result
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(u64::MAX);
+    assert_eq!(
+        var_def_line, 2,
+        "variable usage should go to assignment line"
+    );
+
+    // 2) Global const usage -> const declaration
+    let const_code = r#"<?php
+namespace App;
+
+const BUILD = 'dev';
+
+echo BUILD;
+"#;
+    let const_uri = "file:///test/GotoConstant.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(const_uri, const_code))
+        .await
+        .unwrap();
+
+    let build_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(3, const_uri, 5, 5))
+        .await
+        .unwrap();
+    let build_result = extract_result(build_resp);
+    let build_def_line = build_result
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(u64::MAX);
+    assert_eq!(
+        build_def_line, 3,
+        "constant usage should go to const declaration line"
+    );
+
+    // 3) self::CLASS_CONST usage -> class const declaration
+    let class_const_code = r#"<?php
+namespace App;
+
+class Foo {
+    public const VERSION = '1.0';
+    public function run(): string {
+        return self::VERSION;
+    }
+}
+"#;
+    let class_const_uri = "file:///test/GotoClassConstant.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(class_const_uri, class_const_code))
+        .await
+        .unwrap();
+
+    let cc_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(4, class_const_uri, 6, 21))
+        .await
+        .unwrap();
+    let cc_result = extract_result(cc_resp);
+    let cc_def_line = cc_result
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(u64::MAX);
+    assert_eq!(
+        cc_def_line, 4,
+        "class constant usage should go to class const declaration line"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}

@@ -10,7 +10,7 @@ use php_lsp_parser::diagnostics::extract_syntax_errors;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::references::find_references_in_file;
-use php_lsp_parser::resolve::{symbol_at_position, RefKind};
+use php_lsp_parser::resolve::{symbol_at_position, variable_definition_at_position, RefKind};
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::symbols::extract_file_symbols;
 use std::path::{Path, PathBuf};
@@ -126,8 +126,8 @@ impl PhpLspBackend {
         None
     }
 
-    /// Resolve symbol from index with fallback for built-in/global functions.
-    fn resolve_fqn_with_function_fallback(
+    /// Resolve symbol from index with fallback for global built-ins.
+    fn resolve_fqn_with_fallback(
         &self,
         fqn: &str,
         ref_kind: RefKind,
@@ -135,7 +135,7 @@ impl PhpLspBackend {
         if let Some(sym) = self.index.resolve_fqn(fqn) {
             return Some(sym);
         }
-        if ref_kind == RefKind::FunctionCall {
+        if ref_kind == RefKind::FunctionCall || ref_kind == RefKind::GlobalConstant {
             if let Some((_, short_name)) = fqn.rsplit_once('\\') {
                 if let Some(sym) = self.index.resolve_fqn(short_name) {
                     return Some(sym);
@@ -145,8 +145,8 @@ impl PhpLspBackend {
         None
     }
 
-    /// Resolve symbol lazily with fallback for built-in/global functions.
-    async fn resolve_fqn_lazy_with_function_fallback(
+    /// Resolve symbol lazily with fallback for global built-ins.
+    async fn resolve_fqn_lazy_with_fallback(
         &self,
         fqn: &str,
         ref_kind: RefKind,
@@ -154,7 +154,7 @@ impl PhpLspBackend {
         if let Some(sym) = self.resolve_fqn_lazy(fqn).await {
             return Some(sym);
         }
-        if ref_kind == RefKind::FunctionCall {
+        if ref_kind == RefKind::FunctionCall || ref_kind == RefKind::GlobalConstant {
             if let Some((_, short_name)) = fqn.rsplit_once('\\') {
                 if let Some(sym) = self.resolve_fqn_lazy(short_name).await {
                     return Some(sym);
@@ -847,8 +847,11 @@ impl LanguageServer for PhpLspBackend {
 
         // Look up symbol in index (with lazy vendor fallback)
         let symbol_info = match sym_at_pos.ref_kind {
-            RefKind::Variable => None, // Variables are not in the index (yet)
-            _ => self.resolve_fqn_lazy(&sym_at_pos.fqn).await,
+            RefKind::Variable => None, // Variables are local, handled by gotoDefinition.
+            _ => {
+                self.resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
+                    .await
+            }
         };
 
         let result = if let Some(sym) = symbol_info {
@@ -987,7 +990,7 @@ impl LanguageServer for PhpLspBackend {
         tracing::debug!("gotoDefinition: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position inside a block so DashMap guard is dropped
-        let sym_at_pos = {
+        let (sym_at_pos, local_var_def) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -1007,20 +1010,33 @@ impl LanguageServer for PhpLspBackend {
                 .map(|entry| entry.value().clone())
                 .unwrap_or_default();
 
-            match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
-                Some(s) => s,
-                None => return Ok(None),
-            }
+            let local_var_def =
+                variable_definition_at_position(tree, &source, pos.line, pos.character);
+            let sym = symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols);
+            (sym, local_var_def)
+        };
+
+        // Local variable definition (same file/scope).
+        if let Some(def) = local_var_def {
+            let range = Range {
+                start: Position::new(def.0, def.1),
+                end: Position::new(def.2, def.3),
+            };
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                uri,
+                range,
+            })));
+        }
+
+        let sym_at_pos = match sym_at_pos {
+            Some(s) => s,
+            None => return Ok(None),
         };
 
         // Look up symbol in index (with lazy vendor fallback)
-        let symbol_info = match sym_at_pos.ref_kind {
-            RefKind::Variable => None,
-            _ => {
-                self.resolve_fqn_lazy_with_function_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
-                    .await
-            }
-        };
+        let symbol_info = self
+            .resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
+            .await;
 
         let result = if let Some(sym) = symbol_info {
             // Convert URI string to lsp_types::Uri
@@ -1076,12 +1092,13 @@ impl LanguageServer for PhpLspBackend {
                             php_lsp_types::PhpSymbolKind::Property
                         }
                         RefKind::ClassConstant => php_lsp_types::PhpSymbolKind::ClassConstant,
+                        RefKind::GlobalConstant => php_lsp_types::PhpSymbolKind::GlobalConstant,
                         RefKind::Variable => return Ok(None), // Variable references not supported yet
                         RefKind::NamespaceName | RefKind::Unknown => return Ok(None),
                     };
 
                     // Try to canonicalize symbol via index lookup.
-                    let resolved = self.resolve_fqn_with_function_fallback(&sym.fqn, sym.ref_kind);
+                    let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
                     if let Some(resolved) = resolved {
                         (resolved.fqn.clone(), resolved.kind)
                     } else {
@@ -1211,10 +1228,11 @@ impl LanguageServer for PhpLspBackend {
                             php_lsp_types::PhpSymbolKind::Property
                         }
                         RefKind::ClassConstant => php_lsp_types::PhpSymbolKind::ClassConstant,
+                        RefKind::GlobalConstant => php_lsp_types::PhpSymbolKind::GlobalConstant,
                         _ => return Ok(None),
                     };
 
-                    let resolved = self.resolve_fqn_with_function_fallback(&sym.fqn, sym.ref_kind);
+                    let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
                     if let Some(resolved) = resolved {
                         (resolved.fqn.clone(), resolved.kind, sym.name.clone())
                     } else {
@@ -1331,9 +1349,7 @@ impl LanguageServer for PhpLspBackend {
                 }
 
                 // Don't rename built-in symbols
-                if let Some(resolved) =
-                    self.resolve_fqn_with_function_fallback(&sym.fqn, sym.ref_kind)
-                {
+                if let Some(resolved) = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind) {
                     if resolved.modifiers.is_builtin {
                         return Ok(None);
                     }

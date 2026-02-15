@@ -486,7 +486,12 @@ fn extract_global_constants(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "const_element" {
-            if let Some(name_node) = child.child_by_field_name("name") {
+            let name_node = child.child_by_field_name("name").or_else(|| {
+                (0..child.child_count())
+                    .filter_map(|i| child.child(i))
+                    .find(|c| c.kind() == "name")
+            });
+            if let Some(name_node) = name_node {
                 let name = node_text(name_node, source).to_string();
                 let fqn = make_fqn(current_ns, &name);
 
@@ -985,5 +990,17 @@ mod tests {
         assert_eq!(sig.params.len(), 3);
         assert_eq!(sig.params[2].name, "arrays");
         assert!(sig.params[2].is_variadic);
+    }
+
+    #[test]
+    fn test_extract_namespaced_global_constant() {
+        let syms = parse_and_extract("<?php\nnamespace App;\n\nconst BUILD = 'dev';\n");
+        let c = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::GlobalConstant)
+            .expect("global constant should be extracted");
+        assert_eq!(c.name, "BUILD");
+        assert_eq!(c.fqn, "App\\BUILD");
     }
 }

@@ -37,6 +37,8 @@ pub enum RefKind {
     StaticPropertyAccess,
     /// A class constant access (::CONST).
     ClassConstant,
+    /// A global/user constant (CONST_NAME).
+    GlobalConstant,
     /// A variable ($var).
     Variable,
     /// A namespace name.
@@ -60,6 +62,39 @@ pub fn symbol_at_position(
     let node = find_node_at_point(root, point)?;
 
     resolve_node(node, source, file_symbols)
+}
+
+/// Find local variable definition range for the variable under cursor.
+///
+/// This supports function/method parameters and assignment-based definitions
+/// in the current scope (function body or top-level program).
+pub fn variable_definition_at_position(
+    tree: &Tree,
+    source: &str,
+    line: u32,
+    character: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let root = tree.root_node();
+    let point = Point::new(line as usize, character as usize);
+    let mut node = find_node_at_point(root, point)?;
+
+    // Climb to a variable-like node.
+    loop {
+        let text = &source[node.byte_range()];
+        if node.kind() == "variable_name" || text.starts_with('$') {
+            break;
+        }
+        node = node.parent()?;
+    }
+
+    let var_name = normalize_var_name(&source[node.byte_range()]);
+    let usage_start = node.start_byte();
+    let scope = find_enclosing_function(node).unwrap_or(root);
+
+    let mut best: Option<(usize, (u32, u32, u32, u32))> = None;
+    find_variable_definition_before(scope, &var_name, usage_start, source, &mut best);
+
+    best.map(|(_, range)| range)
 }
 
 /// Find the deepest (most specific) named node at the given point.
@@ -273,7 +308,11 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
                 let scope_text = scope_node.map(|s| source[s.byte_range()].to_string());
                 let scope_fqn = scope_text
                     .as_ref()
-                    .map(|s| resolve_class_name(s, file_symbols))
+                    .map(|s| match s.as_str() {
+                        "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
+                            .unwrap_or_else(|| s.to_string()),
+                        _ => resolve_class_name(s, file_symbols),
+                    })
                     .unwrap_or_default();
                 return Some(SymbolAtPosition {
                     fqn: if scope_fqn.is_empty() {
@@ -637,12 +676,25 @@ fn resolve_name_node(
     file_symbols: &FileSymbols,
 ) -> Option<SymbolAtPosition> {
     let text = &source[node.byte_range()];
+    let parent_kind = node.parent().map(|p| p.kind()).unwrap_or_default();
 
     if text.starts_with('$') {
         return Some(SymbolAtPosition {
             fqn: text.to_string(),
             name: text.to_string(),
             ref_kind: RefKind::Variable,
+            object_expr: None,
+            range: node_range(node),
+        });
+    }
+
+    // Resolve as global/user constant in expression-like contexts.
+    if is_constant_reference_context(parent_kind) {
+        let resolved = resolve_constant_name(text, file_symbols);
+        return Some(SymbolAtPosition {
+            fqn: resolved,
+            name: text.to_string(),
+            ref_kind: RefKind::GlobalConstant,
             object_expr: None,
             range: node_range(node),
         });
@@ -746,6 +798,143 @@ fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
     }
 }
 
+/// Resolve a constant name using use statements and current namespace.
+fn resolve_constant_name(name: &str, file_symbols: &FileSymbols) -> String {
+    if name.starts_with('\\') {
+        return name.trim_start_matches('\\').to_string();
+    }
+
+    let parts: Vec<&str> = name.split('\\').collect();
+    let first_part = parts[0];
+
+    for use_stmt in &file_symbols.use_statements {
+        if use_stmt.kind != UseKind::Constant {
+            continue;
+        }
+
+        let alias = use_stmt
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+
+        if alias == first_part {
+            if parts.len() == 1 {
+                return use_stmt.fqn.clone();
+            }
+            return format!("{}\\{}", use_stmt.fqn, parts[1..].join("\\"));
+        }
+    }
+
+    // Keep already-qualified names stable.
+    if name.contains('\\') {
+        if let Some(ref ns) = file_symbols.namespace {
+            return format!("{}\\{}", ns, name);
+        }
+        return name.to_string();
+    }
+
+    if let Some(ref ns) = file_symbols.namespace {
+        format!("{}\\{}", ns, name)
+    } else {
+        name.to_string()
+    }
+}
+
+fn is_constant_reference_context(parent_kind: &str) -> bool {
+    !matches!(
+        parent_kind,
+        "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+            | "function_definition"
+            | "method_declaration"
+            | "named_type"
+            | "optional_type"
+            | "union_type"
+            | "intersection_type"
+            | "object_creation_expression"
+            | "function_call_expression"
+            | "scoped_call_expression"
+            | "member_call_expression"
+            | "namespace_use_clause"
+            | "namespace_definition"
+    )
+}
+
+fn find_variable_definition_before(
+    node: Node,
+    var_name: &str,
+    usage_start: usize,
+    source: &str,
+    best: &mut Option<(usize, (u32, u32, u32, u32))>,
+) {
+    if node.start_byte() >= usage_start {
+        return;
+    }
+
+    match node.kind() {
+        "simple_parameter" | "property_promotion_parameter" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if normalize_var_name(&source[name_node.byte_range()]) == var_name {
+                    let start = name_node.start_byte();
+                    if start < usage_start {
+                        *best = Some((start, node_range(name_node)));
+                    }
+                }
+            }
+        }
+        "assignment_expression" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                if normalize_var_name(&source[left.byte_range()]) == var_name {
+                    let start = left.start_byte();
+                    if start < usage_start {
+                        *best = Some((start, node_range(left)));
+                    }
+                }
+            }
+        }
+        "foreach_statement" => {
+            for field in ["key", "value"] {
+                if let Some(var_node) = node.child_by_field_name(field) {
+                    if normalize_var_name(&source[var_node.byte_range()]) == var_name {
+                        let start = var_node.start_byte();
+                        if start < usage_start {
+                            *best = Some((start, node_range(var_node)));
+                        }
+                    }
+                }
+            }
+        }
+        "catch_clause" => {
+            for field in ["name", "variable"] {
+                if let Some(var_node) = node.child_by_field_name(field) {
+                    if normalize_var_name(&source[var_node.byte_range()]) == var_name {
+                        let start = var_node.start_byte();
+                        if start < usage_start {
+                            *best = Some((start, node_range(var_node)));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.named_children(cursor) {
+        find_variable_definition_before(child, var_name, usage_start, source, best);
+    }
+}
+
+fn normalize_var_name(text: &str) -> String {
+    if text.starts_with('$') {
+        text.to_string()
+    } else {
+        format!("${}", text)
+    }
+}
+
 /// Try to find the FQN of the class containing a method node.
 fn find_parent_class_fqn(
     method_node: Node,
@@ -794,6 +983,13 @@ mod tests {
         let tree = parser.tree().unwrap();
         let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
         symbol_at_position(tree, code, line, col, &file_symbols)
+    }
+
+    fn parse_and_find_var_def(code: &str, line: u32, col: u32) -> Option<(u32, u32, u32, u32)> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        variable_definition_at_position(tree, code, line, col)
     }
 
     #[test]
@@ -950,6 +1146,43 @@ mod tests {
         assert!(result.is_some(), "Should resolve class constant access");
         let sym = result.unwrap();
         assert_eq!(sym.ref_kind, RefKind::ClassConstant);
-        assert_eq!(sym.fqn, "self::VERSION");
+        assert_eq!(sym.fqn, "App\\Foo::VERSION");
+    }
+
+    #[test]
+    fn test_resolve_global_constant_reference() {
+        let code = "<?php\nnamespace App;\n\nconst BUILD = 'dev';\n\necho BUILD;\n";
+        let result = parse_and_resolve(code, 5, 5);
+        assert!(result.is_some(), "Should resolve global constant usage");
+        let sym = result.unwrap();
+        assert_eq!(sym.ref_kind, RefKind::GlobalConstant);
+        assert_eq!(sym.fqn, "App\\BUILD");
+    }
+
+    #[test]
+    fn test_find_variable_definition_assignment() {
+        let code = "<?php\nfunction demo(): void {\n    $value = 1;\n    echo $value;\n}\n";
+        // $value in echo $value;
+        let def = parse_and_find_var_def(code, 3, 10).expect("definition should be found");
+        // points to assignment L3
+        assert_eq!(def.0, 2);
+    }
+
+    #[test]
+    fn test_find_variable_definition_parameter() {
+        let code = "<?php\nfunction demo(string $name): void {\n    echo $name;\n}\n";
+        // $name in echo $name;
+        let def =
+            parse_and_find_var_def(code, 2, 10).expect("parameter definition should be found");
+        // points to parameter line
+        assert_eq!(def.0, 1);
+    }
+
+    #[test]
+    fn test_resolve_global_constant_in_method_body() {
+        let code = "<?php\nnamespace App;\n\nconst BUILD = 'dev';\n\nclass Demo {\n    public const VERSION = '1.0';\n\n    public function run(): string {\n        $value = BUILD;\n        return self::VERSION . $value;\n    }\n}\n";
+        let sym = parse_and_resolve(code, 9, 17).expect("BUILD symbol should resolve");
+        assert_eq!(sym.ref_kind, RefKind::GlobalConstant);
+        assert_eq!(sym.fqn, "App\\BUILD");
     }
 }
