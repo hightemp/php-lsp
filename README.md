@@ -13,15 +13,18 @@ Provides IDE-level features for PHP 7.4+ projects: diagnostics, hover, go-to-def
 
 ## Features (planned for MVP)
 
-- Syntax error diagnostics (incremental, tree-sitter based)
-- Hover: type/signature/PHPDoc
-- Go to Definition
-- Completion (members, statics, variables, namespaces, keywords)
-- Find All References
-- Rename symbol
-- Document/workspace symbols
-- Composer PSR-4 autoload support
-- Built-in PHP stubs (phpstorm-stubs)
+- [x] Syntax error diagnostics (incremental, tree-sitter based)
+- [x] Hover: type/signature/PHPDoc
+- [x] Go to Definition (classes/functions/methods/properties/consts/variables)
+- [x] Completion (members, statics, variables, namespaces, keywords)
+- [x] Find All References (classes/functions/methods/properties/class const/global const)
+- [x] Rename symbol (classes/functions/methods/properties/class const/global const)
+- [x] Document/workspace symbols
+- [x] Composer PSR-4 autoload support
+- [x] Built-in PHP stubs (phpstorm-stubs)
+
+Current gaps:
+- [ ] Variable references/rename (not supported yet)
 
 ## Architecture
 
