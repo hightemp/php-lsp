@@ -107,3 +107,5 @@ php-lsp/
 ## License
 
 MIT
+
+![](https://asdertasd.site/counter/php-lsp)
