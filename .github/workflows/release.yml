@@ -31,10 +31,6 @@ jobs:
             platform: linux-arm64
             cross: true
 
-          - target: x86_64-apple-darwin
-            os: macos-13
-            platform: darwin-x64
-
           - target: aarch64-apple-darwin
             os: macos-14
             platform: darwin-arm64
@@ -119,12 +115,6 @@ jobs:
           name: server-linux-arm64
           path: client/bin/linux-arm64/
 
-      - name: Download darwin-x64 binary
-        uses: actions/download-artifact@v4
-        with:
-          name: server-darwin-x64
-          path: client/bin/darwin-x64/
-
       - name: Download darwin-arm64 binary
         uses: actions/download-artifact@v4
         with:
@@ -147,7 +137,6 @@ jobs:
         run: |
           chmod +x client/bin/linux-x64/php-lsp
           chmod +x client/bin/linux-arm64/php-lsp
-          chmod +x client/bin/darwin-x64/php-lsp
           chmod +x client/bin/darwin-arm64/php-lsp
 
       - name: List bundled binaries
