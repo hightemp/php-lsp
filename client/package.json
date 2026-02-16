@@ -20,6 +20,7 @@
     "workspaceContains:**/composer.json"
   ],
   "main": "./out/extension.js",
+  "icon": "images/php-lsp-icon.png",
   "contributes": {
     "configuration": {
       "title": "PHP Language Server",
