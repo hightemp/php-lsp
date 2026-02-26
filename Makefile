@@ -5,6 +5,8 @@
 #   make client     — install deps & build VS Code extension JS
 #   make stubs      — init submodule & bundle stubs
 #   make package    — produce .vsix (depends on all above)
+#   make server-all — cross-compile server for all 6 platforms
+#   make package-all— universal .vsix with all platform binaries
 #   make clean      — remove build artefacts
 #   make check      — run all lints and tests
 
@@ -36,7 +38,7 @@ BIN_NAME   := $(if $(findstring windows,$(HOST_TARGET)),php-lsp.exe,php-lsp)
 SERVER_BIN := $(BIN_DIR)/$(BIN_NAME)
 
 # ─── Phony targets ───────────────────────────────────────────────
-.PHONY: all package install server client stubs clean check test lint fmt
+.PHONY: all package package-all install server server-all client stubs clean check test lint fmt
 
 all: package
 
@@ -63,6 +65,18 @@ $(SERVER_BIN): $(RUST_SOURCES) $(SERVER_DIR)/Cargo.toml $(SERVER_DIR)/Cargo.lock
 
 server: $(SERVER_BIN)
 
+# ─── Server (all platforms) ──────────────────────────────────────
+ALL_TARGETS := \
+	x86_64-unknown-linux-gnu \
+	aarch64-unknown-linux-gnu \
+	x86_64-apple-darwin \
+	aarch64-apple-darwin \
+	x86_64-pc-windows-msvc \
+	aarch64-pc-windows-msvc
+
+server-all:
+	$(ROOT_DIR)/scripts/build-server.sh --all
+
 # ─── Client (TypeScript) ────────────────────────────────────────
 $(CLIENT_DIR)/node_modules: $(CLIENT_DIR)/package.json $(wildcard $(CLIENT_DIR)/package-lock.json)
 	cd $(CLIENT_DIR) && npm ci
@@ -77,6 +91,12 @@ client: $(CLIENT_DIR)/out/extension.js
 package: $(SERVER_BIN) $(CLIENT_DIR)/out/extension.js $(STUBS_DEST)
 	cd $(CLIENT_DIR) && npx @vscode/vsce package --no-dependencies
 	@echo "=== .vsix created ==="
+	@ls -lh $(CLIENT_DIR)/*.vsix 2>/dev/null
+
+# ─── Package all platforms (.vsix) ───────────────────────────────
+package-all: server-all $(CLIENT_DIR)/out/extension.js $(STUBS_DEST)
+	cd $(CLIENT_DIR) && npx @vscode/vsce package --no-dependencies
+	@echo "=== universal .vsix created ==="
 	@ls -lh $(CLIENT_DIR)/*.vsix 2>/dev/null
 
 # ─── Quality checks ─────────────────────────────────────────────

@@ -54,6 +54,8 @@ All available targets:
 | `make` / `make package` | Full build: server + client + stubs → `.vsix` |
 | `make install` | Build and install `.vsix` into VS Code |
 | `make server` | Build Rust binary for host platform |
+| `make server-all` | Cross-compile server for all 6 platforms |
+| `make package-all` | Universal `.vsix` with all platform binaries |
 | `make client` | `npm ci` + build extension JS |
 | `make stubs` | Init submodule + bundle phpstorm-stubs |
 | `make check` | Lint + test (Rust & TypeScript) |
