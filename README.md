@@ -34,65 +34,81 @@ Current gaps:
 
 ## Building
 
-### Server
+### Prerequisites
+
+- **Rust** 1.85+ (`rustup update stable`)
+- **Node.js** 20+ and npm
+- **Git** (for submodules)
+
+### Quick start (Makefile)
+
+```bash
+make            # build server + client + stubs → .vsix
+make install    # build + install extension into VS Code
+```
+
+All available targets:
+
+| Command | Description |
+|---|---|
+| `make` / `make package` | Full build: server + client + stubs → `.vsix` |
+| `make install` | Build and install `.vsix` into VS Code |
+| `make server` | Build Rust binary for host platform |
+| `make client` | `npm ci` + build extension JS |
+| `make stubs` | Init submodule + bundle phpstorm-stubs |
+| `make check` | Lint + test (Rust & TypeScript) |
+| `make test` | Run Rust tests |
+| `make lint` | `cargo fmt --check`, `clippy`, `tsc --noEmit` |
+| `make fmt` | Auto-format Rust code |
+| `make clean` | Remove all build artefacts |
+
+Stubs submodule (`server/data/stubs`) is pulled automatically on first build if not initialized.
+
+### Manual steps
+
+#### Server
 
 ```bash
 cd server
 cargo build --release
 ```
 
-### Client (VS Code extension)
+#### Client (VS Code extension)
 
 ```bash
 cd client
-npm install
+npm ci
 npm run build
 ```
 
-### Packaging VSIX (with bundled server)
-
-Build the server, bundle stubs, and package into a universal `.vsix` containing all platform binaries:
+#### Packaging VSIX
 
 ```bash
-# 1. Build server binary for current platform → copies to client/bin/<platform>/
+# 1. Build server binary for current platform → client/bin/<platform>/
 ./scripts/build-server.sh
 
-# 2. Bundle phpstorm-stubs → copies to client/stubs/
+# 2. Bundle phpstorm-stubs → client/stubs/
 ./scripts/bundle-stubs.sh
 
-# 3. Package universal VSIX
+# 3. Package VSIX
 cd client
-npm install
 npx @vscode/vsce package
 ```
 
-The VSIX contains binaries for all platforms in `bin/<platform>/php-lsp`:
-```
-bin/
-├── linux-x64/php-lsp
-├── linux-arm64/php-lsp
-├── darwin-x64/php-lsp
-├── darwin-arm64/php-lsp
-├── win32-x64/php-lsp.exe
-└── win32-arm64/php-lsp.exe
-```
+#### Cross-compilation
 
-The extension auto-detects the current OS/arch and uses the correct binary.
-
-For local development, build only your host target:
 ```bash
-./scripts/build-server.sh                          # auto-detect host
 ./scripts/build-server.sh x86_64-unknown-linux-gnu # specific target
 ./scripts/build-server.sh --all                    # all 6 targets (CI)
 ```
-
-CI builds all targets and produces a single universal VSIX on git tag push (see `.github/workflows/release.yml`).
 
 ## Project Structure
 
 ```
 php-lsp/
+├── Makefile         # Build automation
 ├── server/          # Rust LSP server (Cargo workspace)
+│   ├── data/stubs/  # phpstorm-stubs (git submodule)
 │   └── crates/
 │       ├── php-lsp-server/      # Main binary
 │       ├── php-lsp-parser/      # tree-sitter PHP wrapper
@@ -100,6 +116,7 @@ php-lsp/
 │       ├── php-lsp-completion/  # Completion engine
 │       └── php-lsp-types/       # Shared types
 ├── client/          # VS Code extension (TypeScript)
+├── scripts/         # Build helpers (build-server.sh, bundle-stubs.sh)
 ├── test-fixtures/   # Test PHP projects
 └── docs/            # Documentation
 ```
