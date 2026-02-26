@@ -239,6 +239,54 @@ fn determine_use_kind(node: Node, source: &str) -> UseKind {
     UseKind::Class
 }
 
+/// Resolve a class name from a `base_clause` or `class_interface_clause` child
+/// using the file's namespace and use statements.
+fn resolve_class_name_in_file(name: &str, file_symbols: &FileSymbols) -> String {
+    crate::resolve::resolve_class_name_pub(name, file_symbols)
+}
+
+/// Extract FQNs from a `base_clause` (extends) child of a class/interface node.
+fn extract_base_clause(node: Node, source: &str, file_symbols: &FileSymbols) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "base_clause" {
+            let mut inner_cursor = child.walk();
+            for inner in child.children(&mut inner_cursor) {
+                match inner.kind() {
+                    "name" | "qualified_name" => {
+                        let name = node_text(inner, source);
+                        result.push(resolve_class_name_in_file(name, file_symbols));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Extract FQNs from a `class_interface_clause` (implements) child of a class node.
+fn extract_interface_clause(node: Node, source: &str, file_symbols: &FileSymbols) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "class_interface_clause" {
+            let mut inner_cursor = child.walk();
+            for inner in child.children(&mut inner_cursor) {
+                match inner.kind() {
+                    "name" | "qualified_name" => {
+                        let name = node_text(inner, source);
+                        result.push(resolve_class_name_in_file(name, file_symbols));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Extract a class-like declaration (class, interface, trait, enum).
 fn extract_class_like(
     node: Node,
@@ -258,6 +306,10 @@ fn extract_class_like(
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
 
+    // Extract extends (base_clause) and implements (class_interface_clause)
+    let extends_fqns = extract_base_clause(node, source, result);
+    let implements_fqns = extract_interface_clause(node, source, result);
+
     let sym = SymbolInfo {
         name: name.clone(),
         fqn: fqn.clone(),
@@ -270,6 +322,8 @@ fn extract_class_like(
         doc_comment,
         signature: None,
         parent_fqn: None,
+        extends: extends_fqns,
+        implements: implements_fqns,
     };
     result.symbols.push(sym);
 
@@ -351,6 +405,8 @@ fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols,
         doc_comment,
         signature: Some(signature),
         parent_fqn: Some(parent_fqn.to_string()),
+        extends: vec![],
+        implements: vec![],
     });
 }
 
@@ -382,6 +438,8 @@ fn extract_function(
         doc_comment,
         signature: Some(signature),
         parent_fqn: None,
+        extends: vec![],
+        implements: vec![],
     });
 }
 
@@ -425,6 +483,8 @@ fn extract_properties(
                         return_type: Some(t.clone()),
                     }),
                     parent_fqn: Some(parent_fqn.to_string()),
+                    extends: vec![],
+                    implements: vec![],
                 });
             }
         }
@@ -468,6 +528,8 @@ fn extract_class_constants(
                     doc_comment: doc_comment.clone(),
                     signature: None,
                     parent_fqn: Some(parent_fqn.to_string()),
+                    extends: vec![],
+                    implements: vec![],
                 });
             }
         }
@@ -507,6 +569,8 @@ fn extract_global_constants(
                     doc_comment: doc_comment.clone(),
                     signature: None,
                     parent_fqn: None,
+                    extends: vec![],
+                    implements: vec![],
                 });
             }
         }
@@ -540,6 +604,8 @@ fn extract_enum_case(
         doc_comment,
         signature: None,
         parent_fqn: Some(parent_fqn.to_string()),
+        extends: vec![],
+        implements: vec![],
     });
 }
 
@@ -1002,5 +1068,61 @@ mod tests {
             .expect("global constant should be extracted");
         assert_eq!(c.name, "BUILD");
         assert_eq!(c.fqn, "App\\BUILD");
+    }
+
+    #[test]
+    fn test_extract_class_extends() {
+        let syms = parse_and_extract(
+            "<?php\nnamespace App;\n\nuse App\\Base\\BaseClass;\n\nclass Foo extends BaseClass {}\n",
+        );
+        let cls = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Class)
+            .unwrap();
+        assert_eq!(cls.name, "Foo");
+        assert_eq!(cls.fqn, "App\\Foo");
+        assert_eq!(cls.extends, vec!["App\\Base\\BaseClass".to_string()]);
+        assert!(cls.implements.is_empty());
+    }
+
+    #[test]
+    fn test_extract_class_implements() {
+        let syms = parse_and_extract(
+            "<?php\nnamespace App;\n\nclass Foo implements \\Countable, \\Serializable {}\n",
+        );
+        let cls = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Class)
+            .unwrap();
+        assert_eq!(
+            cls.implements,
+            vec!["Countable".to_string(), "Serializable".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_extract_class_extends_and_implements() {
+        let syms = parse_and_extract("<?php\nclass Child extends Parent_ implements Foo, Bar {}\n");
+        let cls = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Class)
+            .unwrap();
+        assert_eq!(cls.extends, vec!["Parent_".to_string()]);
+        assert_eq!(cls.implements, vec!["Foo".to_string(), "Bar".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_interface_extends() {
+        let syms = parse_and_extract("<?php\ninterface Foo extends Bar, Baz {}\n");
+        let iface = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Interface)
+            .unwrap();
+        assert_eq!(iface.extends, vec!["Bar".to_string(), "Baz".to_string()]);
+        assert!(iface.implements.is_empty());
     }
 }

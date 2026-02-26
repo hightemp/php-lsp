@@ -383,6 +383,8 @@ mod tests {
                 doc_comment: None,
                 signature: None,
                 parent_fqn: None,
+                extends: vec![],
+                implements: vec![],
             }],
         };
         index.update_file("file:///test.php", file_symbols.clone());
@@ -424,6 +426,8 @@ mod tests {
                     return_type: None,
                 }),
                 parent_fqn: None,
+                extends: vec![],
+                implements: vec![],
             }],
         };
         let index = WorkspaceIndex::new();
@@ -456,6 +460,8 @@ mod tests {
                     doc_comment: None,
                     signature: None,
                     parent_fqn: None,
+                    extends: vec![],
+                    implements: vec![],
                 },
                 SymbolInfo {
                     name: "test".to_string(),
@@ -472,6 +478,8 @@ mod tests {
                         return_type: None,
                     }),
                     parent_fqn: Some("App\\Test\\Baz".to_string()),
+                    extends: vec![],
+                    implements: vec![],
                 },
             ],
         };

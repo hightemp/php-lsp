@@ -180,6 +180,12 @@ pub struct SymbolInfo {
     pub signature: Option<Signature>,
     /// Parent FQN (for methods/properties → class FQN)
     pub parent_fqn: Option<String>,
+    /// Extended class/interface FQNs (for class-like symbols)
+    #[serde(default)]
+    pub extends: Vec<String>,
+    /// Implemented interface FQNs (for classes/enums)
+    #[serde(default)]
+    pub implements: Vec<String>,
 }
 
 /// A use statement in a PHP file.

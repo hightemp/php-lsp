@@ -634,6 +634,35 @@ fn try_resolve_object_type<'a>(
             let text = &source[object_node.byte_range()];
             Some(resolve_class_name(text, file_symbols))
         }
+        // Member access: $obj->prop → try to resolve object type, then look up property type
+        "member_access_expression" => {
+            let obj_field = object_node.child_by_field_name("object")?;
+            let name_field = object_node.child_by_field_name("name")?;
+            let prop_name = &source[name_field.byte_range()];
+
+            // Resolve the object type first
+            let class_fqn = try_resolve_object_type(obj_field, source, file_symbols)?;
+
+            // Look up the property in the file's symbols to get its type
+            let property_fqn_dollar = format!("{}::${}", class_fqn, prop_name);
+            for sym in &file_symbols.symbols {
+                if sym.fqn == property_fqn_dollar {
+                    if let Some(ref sig) = sym.signature {
+                        if let Some(ref ret) = sig.return_type {
+                            let type_str = ret.to_string();
+                            // Resolve the type name to FQN
+                            if !type_str.is_empty() && type_str != "mixed" {
+                                // Strip nullable prefix for resolution
+                                let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
+                                return Some(resolve_class_name(base_type, file_symbols));
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            None
+        }
         // Member call chain: $obj->foo()->bar() — can't resolve without full type inference
         // Static call: Foo::create() — can't resolve return type without type info
         _ => None,

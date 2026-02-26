@@ -293,6 +293,16 @@
     - E2E тесты падают на регрессиях по PHPDoc UI/навигации.
     - Документация соответствует фактическому поведению и тестам.
 
+- [x] **H-014** Go-to-definition: наследование и chained member access *(done 2026-02-26)*
+  - Проблема 1: `$this->okResponse()` — вызов метода, определённого в родительском классе. Go-to-definition не находил метод, т.к. не обходил цепочку наследования (extends/implements).
+  - Проблема 2: `$this->timerService->method('start')` — chained member access. Не мог определить тип промежуточного свойства для дальнейшего lookup'а.
+  - Что сделано:
+    - `php-lsp-types`: добавлены поля `extends: Vec<String>`, `implements: Vec<String>` в `SymbolInfo`.
+    - `php-lsp-parser/symbols.rs`: извлечение `base_clause` (extends) и `class_interface_clause` (implements) при парсинге class-like деклараций; FQN-резолв через use statements.
+    - `php-lsp-index/workspace.rs`: `resolve_member` и `get_members` теперь обходят иерархию наследования рекурсивно (с защитой от циклических ссылок).
+    - `php-lsp-parser/resolve.rs`: `try_resolve_object_type` теперь обрабатывает `member_access_expression` — резолвит тип объекта, затем ищет тип свойства в file symbols.
+  - Тесты: 6 новых тестов (4 на парсинг extends/implements, 2 на наследование в индексе).
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

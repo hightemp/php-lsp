@@ -551,6 +551,8 @@ mod tests {
             doc_comment: None,
             signature: None,
             parent_fqn: None,
+            extends: vec![],
+            implements: vec![],
         })
     }
 
@@ -570,6 +572,8 @@ mod tests {
                 return_type: None,
             }),
             parent_fqn: None,
+            extends: vec![],
+            implements: vec![],
         })
     }
 

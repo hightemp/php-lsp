@@ -2017,6 +2017,8 @@ mod tests {
             doc_comment: None,
             signature: None,
             parent_fqn: parent_fqn.map(|s| s.to_string()),
+            extends: vec![],
+            implements: vec![],
         }
     }
 
