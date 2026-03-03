@@ -8,6 +8,15 @@ use crate::phpdoc::parse_phpdoc;
 use php_lsp_types::{FileSymbols, TypeInfo, UseKind};
 use tree_sitter::{Node, Point, Tree};
 
+/// Callback for resolving a member's type from an external source (e.g., workspace index).
+///
+/// Takes `(class_fqn, member_name)` and returns the member's type FQN.
+/// For properties: `member_name` includes `$` prefix (e.g., `"$timer"`).
+/// For methods: `member_name` is the method name (e.g., `"start"`).
+///
+/// Returns the resolved type FQN (e.g., `"App\\TimerService"`) or None.
+pub type MemberTypeResolver<'a> = &'a dyn Fn(&str, &str) -> Option<String>;
+
 /// Information about the symbol under the cursor.
 #[derive(Debug, Clone)]
 pub struct SymbolAtPosition {
@@ -84,13 +93,25 @@ pub fn symbol_at_position(
     character: u32,
     file_symbols: &FileSymbols,
 ) -> Option<SymbolAtPosition> {
+    symbol_at_position_with_resolver(tree, source, line, character, file_symbols, None)
+}
+
+/// Find the symbol at the given position, with an optional cross-file type resolver.
+pub fn symbol_at_position_with_resolver(
+    tree: &Tree,
+    source: &str,
+    line: u32,
+    character: u32,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<SymbolAtPosition> {
     let root = tree.root_node();
     let point = Point::new(line as usize, character as usize);
 
     // Find the most specific node at the position
     let node = find_node_at_point(root, point)?;
 
-    resolve_node(node, source, file_symbols)
+    resolve_node(node, source, file_symbols, resolver)
 }
 
 /// Find local variable definition range for the variable under cursor.
@@ -204,7 +225,12 @@ fn find_node_at_point(root: Node, point: Point) -> Option<Node> {
 }
 
 /// Resolve a CST node to symbol information.
-fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<SymbolAtPosition> {
+fn resolve_node(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<SymbolAtPosition> {
     let parent = node.parent()?;
     let node_text = &source[node.byte_range()];
     let parent_kind = parent.kind();
@@ -227,7 +253,7 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
                     format!("${}", node_text)
                 };
                 let class_fqn =
-                    object_field.and_then(|o| try_resolve_object_type(o, source, file_symbols));
+                    object_field.and_then(|o| try_resolve_object_type(o, source, file_symbols, resolver));
                 let fqn = if let Some(ref cls) = class_fqn {
                     format!("{}::{}", cls, property_name)
                 } else {
@@ -256,7 +282,7 @@ fn resolve_node(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<
                 let object_text = object_field.map(|o| source[o.byte_range()].to_string());
                 // Try to resolve object type to build a proper FQN
                 let class_fqn =
-                    object_field.and_then(|o| try_resolve_object_type(o, source, file_symbols));
+                    object_field.and_then(|o| try_resolve_object_type(o, source, file_symbols, resolver));
                 let fqn = if let Some(ref cls) = class_fqn {
                     format!("{}::{}", cls, node_text)
                 } else {
@@ -586,6 +612,7 @@ fn try_resolve_object_type<'a>(
     object_node: Node<'a>,
     source: &str,
     file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
 ) -> Option<String> {
     let kind = object_node.kind();
     match kind {
@@ -612,7 +639,7 @@ fn try_resolve_object_type<'a>(
             let child_count = object_node.named_child_count();
             for i in 0..child_count {
                 if let Some(child) = object_node.named_child(i) {
-                    if let Some(resolved) = try_resolve_object_type(child, source, file_symbols) {
+                    if let Some(resolved) = try_resolve_object_type(child, source, file_symbols, resolver) {
                         return Some(resolved);
                     }
                 }
@@ -641,7 +668,7 @@ fn try_resolve_object_type<'a>(
             let prop_name = &source[name_field.byte_range()];
 
             // Resolve the object type first
-            let class_fqn = try_resolve_object_type(obj_field, source, file_symbols)?;
+            let class_fqn = try_resolve_object_type(obj_field, source, file_symbols, resolver)?;
 
             // Look up the property in the file's symbols to get its type
             let property_fqn_dollar = format!("{}::${}", class_fqn, prop_name);
@@ -661,10 +688,33 @@ fn try_resolve_object_type<'a>(
                     break;
                 }
             }
+            // Fallback: use the cross-file resolver for inherited properties
+            if let Some(ref resolve_fn) = resolver {
+                let member_name = format!("${}", prop_name);
+                if let Some(type_fqn) = resolve_fn(&class_fqn, &member_name) {
+                    return Some(type_fqn);
+                }
+            }
             None
         }
-        // Member call chain: $obj->foo()->bar() — can't resolve without full type inference
-        // Static call: Foo::create() — can't resolve return type without type info
+        // Member call: $obj->foo() → resolve object type, then look up method return type
+        "member_call_expression" => {
+            let obj_field = object_node.child_by_field_name("object")?;
+            let name_field = object_node.child_by_field_name("name")?;
+            let method_name = &source[name_field.byte_range()];
+
+            // Resolve the object type first
+            let class_fqn = try_resolve_object_type(obj_field, source, file_symbols, resolver)?;
+
+            // Use the cross-file resolver to get the method's return type
+            if let Some(ref resolve_fn) = resolver {
+                if let Some(type_fqn) = resolve_fn(&class_fqn, method_name) {
+                    return Some(type_fqn);
+                }
+            }
+            None
+        }
+        // Static call: Foo::create() — can't resolve return type without full type info
         _ => None,
     }
 }
@@ -789,7 +839,7 @@ fn find_variable_inference_before_usage(
 
         // Assignment inference: $var = <expr>;
         if let Some(right) = assignment_rhs {
-            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols) {
+            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols, None) {
                 inferred = Some((
                     stmt.start_byte(),
                     VariableInference {
@@ -1085,7 +1135,7 @@ pub fn resolve_class_name_pub(name: &str, file_symbols: &FileSymbols) -> String 
 }
 
 /// Resolve a class name using use statements and current namespace.
-fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
+pub fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
     // Already fully qualified
     if name.starts_with('\\') {
         return name.trim_start_matches('\\').to_string();
@@ -1230,6 +1280,7 @@ fn is_constant_reference_context(parent_kind: &str) -> bool {
     )
 }
 
+#[allow(clippy::type_complexity)]
 fn find_variable_definition_before(
     node: Node,
     var_name: &str,

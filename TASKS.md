@@ -303,6 +303,26 @@
     - `php-lsp-parser/resolve.rs`: `try_resolve_object_type` теперь обрабатывает `member_access_expression` — резолвит тип объекта, затем ищет тип свойства в file symbols.
   - Тесты: 6 новых тестов (4 на парсинг extends/implements, 2 на наследование в индексе).
 
+- [x] **H-015** Go-to-definition: vendor-классы и cross-file type resolution *(done 2026-03-03)*
+  - Проблема: go-to-definition не работает для методов из vendor-зависимостей (PHPUnit `createStub`, `method` и т.п.).
+  - Три бага:
+    1. **Bug 1 — `::member` ломает PSR-4 resolve**: `resolve_fqn_lazy` получает FQN вида `PHPUnit\Framework\TestCase::createStub`, передаёт его целиком в `ns_map.resolve_class_to_paths()` и `resolve_vendor_paths()`. Суффикс `::createStub` ломает PSR-4 prefix matching → vendor файл не подгружается.
+       - Фикс: в `resolve_fqn_lazy` (server.rs) перед PSR-4 lookup вызвать `rsplit_once("::")` чтобы извлечь class FQN без member, использовать class FQN для поиска файла, после индексации повторить resolve по полному FQN.
+    2. **Bug 2 — нет рекурсивной подгрузки parent классов**: после lazy-индексации vendor-файла (напр. `TestCase.php`) его parent-классы (`Assert`, trait'ы) НЕ подгружаются рекурсивно. `resolve_member_in_hierarchy` обходит extends/implements, но parent-классы отсутствуют в индексе.
+       - Фикс: после lazy-индексации файла прочитать `extends`/`implements` загруженного класса, рекурсивно вызвать `resolve_fqn_lazy` для каждого parent FQN (с глубиной ≤10).
+    3. **Bug 3 — `try_resolve_object_type` не видит cross-file символы**: в `resolve.rs` `try_resolve_object_type` ищет тип свойства только в `file_symbols` (текущий файл). Свойства/методы определённые в других файлах (vendor, другие src файлы) невидимы. `member_call_expression` вообще возвращает `None`.
+       - Фикс: ввести callback `MemberTypeResolver = Option<&dyn Fn(&str, &str) -> Option<String>>` в `symbol_at_position`/`try_resolve_object_type`. В `server.rs` при вызове `goto_definition` передавать closure с доступом к `WorkspaceIndex`. Обработать `member_call_expression` (определение return type метода через index).
+  - Тестовые данные:
+    - `test-fixtures/vendor-resolve/` — фикстура с fake vendor структурой (composer.json, vendor/composer/installed.json, vendor package files)
+    - Покрывает: vendor lazy load, inheritance chain из vendor, chained member access, member_call_expression
+  - Тесты:
+    - Unit-тест в workspace.rs: inheritance chain across separately-indexed files
+    - E2E тесты в e2e.rs: go-to-definition через vendor class, inherited vendor method, chained method call
+  - Критерии готовности:
+    - `$this->createStub()` (метод из parent vendor-класса) → go-to-definition находит его
+    - `$this->timerService->method('start')` (chained member call) → go-to-definition на `method` работает
+    - Все тесты проходят `cargo test --all`
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

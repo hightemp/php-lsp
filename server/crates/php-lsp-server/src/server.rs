@@ -11,8 +11,8 @@ use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::references::{find_references_in_file, find_variable_references_at_position};
 use php_lsp_parser::resolve::{
-    infer_variable_type_at_position, symbol_at_position, variable_definition_at_position,
-    variable_hover_info_at_position, RefKind,
+    infer_variable_type_at_position, symbol_at_position, symbol_at_position_with_resolver,
+    variable_definition_at_position, variable_hover_info_at_position, RefKind,
 };
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::symbols::extract_file_symbols;
@@ -63,6 +63,45 @@ impl PhpLspBackend {
         }
     }
 
+    /// Resolve a member's type from the workspace index (for cross-file type resolution).
+    ///
+    /// For properties (`member_name` starts with `$`): returns the property type FQN.
+    /// For methods: returns the method's return type FQN.
+    ///
+    /// Walks the class hierarchy to find inherited members.
+    fn resolve_member_type(&self, class_fqn: &str, member_name: &str) -> Option<String> {
+        // Build the member FQN to look up
+        let member_fqn = format!("{}::{}", class_fqn, member_name);
+
+        // Try to resolve via the workspace index (includes inheritance walk)
+        let sym = self.index.resolve_fqn(&member_fqn)?;
+
+        // Get the type from the signature
+        let sig = sym.signature.as_ref()?;
+        let ret = sig.return_type.as_ref()?;
+        let type_str = ret.to_string();
+
+        if type_str.is_empty() || type_str == "mixed" {
+            return None;
+        }
+
+        // Strip nullable prefix for resolution
+        let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
+
+        // If it looks like an FQN already (contains \), return as-is
+        if base_type.contains('\\') {
+            return Some(base_type.to_string());
+        }
+
+        // Resolve the type name using the member's file's use statements
+        if let Some(file_syms) = self.index.file_symbols.get(&sym.uri) {
+            let resolved = php_lsp_parser::resolve::resolve_class_name(base_type, &file_syms);
+            Some(resolved)
+        } else {
+            Some(base_type.to_string())
+        }
+    }
+
     /// Resolve a FQN, falling back to lazy vendor indexing if not found.
     async fn resolve_fqn_lazy(
         &self,
@@ -73,26 +112,49 @@ impl PhpLspBackend {
             return Some(sym);
         }
 
-        // Try vendor lazy loading
+        // For member FQNs like "Class::method", extract the class part
+        // so PSR-4 resolution works (PSR-4 maps class names, not members).
+        let class_fqn = if let Some((cls, _member)) = fqn.rsplit_once("::") {
+            cls
+        } else {
+            fqn
+        };
+
+        // Try vendor lazy loading using the class FQN
+        self.lazy_index_class(class_fqn).await;
+
+        // After indexing the class file, also index parent classes recursively
+        self.lazy_index_parents(class_fqn, 0).await;
+
+        // Retry resolution with the full FQN
+        if let Some(sym) = self.index.resolve_fqn(fqn) {
+            return Some(sym);
+        }
+
+        None
+    }
+
+    /// Lazy-index a single class FQN by finding its file via PSR-4/vendor mappings.
+    /// Returns true if a new file was indexed.
+    async fn lazy_index_class(&self, class_fqn: &str) -> bool {
+        // Skip if already in the index
+        if self.index.types.contains_key(class_fqn) {
+            return false;
+        }
+
         let ns_map = self.namespace_map.lock().await;
         let root = self.workspace_root.lock().await;
 
         if let (Some(ref ns_map), Some(ref root)) = (&*ns_map, &*root) {
-            let candidate_paths = ns_map.resolve_class_to_paths(fqn);
+            let candidate_paths = ns_map.resolve_class_to_paths(class_fqn);
 
-            // Also try vendor directory paths
             let vendor_dir = root.join("vendor");
             let mut all_paths = candidate_paths;
 
-            // Try loading vendor/composer/installed.json for additional mappings
-            // For now, just try the vendor directory with common structures
             if vendor_dir.is_dir() {
-                // Try to find the file in vendor using the FQN structure
-                // Try to find the file in vendor using installed.json
                 let vendor_autoload = root.join("vendor/composer/autoload_psr4.php");
                 if vendor_autoload.exists() && all_paths.is_empty() {
-                    // Parse vendor PSR-4 mappings from installed packages
-                    if let Some(vendor_paths) = resolve_vendor_paths(fqn, &vendor_dir) {
+                    if let Some(vendor_paths) = resolve_vendor_paths(class_fqn, &vendor_dir) {
                         all_paths.extend(vendor_paths);
                     }
                 }
@@ -106,7 +168,6 @@ impl PhpLspBackend {
                 };
 
                 if abs.exists() {
-                    // Parse the file and add to index
                     if let Ok(source) = std::fs::read_to_string(&abs) {
                         let mut parser = FileParser::new();
                         parser.parse_full(&source);
@@ -114,19 +175,48 @@ impl PhpLspBackend {
                             let uri = path_to_uri(&abs);
                             let file_symbols = extract_file_symbols(tree, &source, &uri);
                             self.index.update_file(&uri, file_symbols);
-                            tracing::debug!("Lazy-indexed vendor file: {}", abs.display());
-
-                            // Try resolving again
-                            if let Some(sym) = self.index.resolve_fqn(fqn) {
-                                return Some(sym);
-                            }
+                            tracing::debug!("Lazy-indexed file: {}", abs.display());
+                            return true;
                         }
                     }
                 }
             }
         }
 
-        None
+        false
+    }
+
+    /// Recursively lazy-index parent classes (extends + implements) up to a depth limit.
+    fn lazy_index_parents<'a>(
+        &'a self,
+        class_fqn: &'a str,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            const MAX_DEPTH: usize = 10;
+            if depth >= MAX_DEPTH {
+                return;
+            }
+
+            // Get the class from the index to read its extends/implements
+            let parent_fqns: Vec<String> =
+                if let Some(sym) = self.index.types.get(class_fqn) {
+                    sym.extends
+                        .iter()
+                        .chain(sym.implements.iter())
+                        .cloned()
+                        .collect()
+                } else {
+                    return;
+                };
+
+            for parent_fqn in parent_fqns {
+                // Lazy-index the parent class file
+                self.lazy_index_class(&parent_fqn).await;
+                // Recurse into the parent's parents
+                self.lazy_index_parents(&parent_fqn, depth + 1).await;
+            }
+        })
     }
 
     /// Resolve symbol from index with fallback for global built-ins.
@@ -233,11 +323,10 @@ fn is_renameable_variable(var_name: &str) -> bool {
 }
 
 fn line_col_to_byte(source: &str, line: u32, col: u32) -> Option<usize> {
-    let mut current_line = 0u32;
     let mut offset = 0usize;
 
-    for l in source.split_inclusive('\n') {
-        if current_line == line {
+    for (current_line, l) in source.split_inclusive('\n').enumerate() {
+        if current_line as u32 == line {
             let mut byte_col = 0usize;
             let mut char_col = 0u32;
             for ch in l.chars() {
@@ -256,7 +345,6 @@ fn line_col_to_byte(source: &str, line: u32, col: u32) -> Option<usize> {
             return None;
         }
         offset += l.len();
-        current_line += 1;
     }
 
     None
@@ -1157,9 +1245,21 @@ impl LanguageServer for PhpLspBackend {
                 .map(|entry| entry.value().clone())
                 .unwrap_or_default();
 
+            // Build a cross-file type resolver that uses the workspace index
+            let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+                self.resolve_member_type(class_fqn, member_name)
+            };
+
             let local_var_def =
                 variable_definition_at_position(tree, &source, pos.line, pos.character);
-            let sym = symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols);
+            let sym = symbol_at_position_with_resolver(
+                tree,
+                &source,
+                pos.line,
+                pos.character,
+                &file_symbols,
+                Some(&resolver),
+            );
             (sym, local_var_def)
         };
 

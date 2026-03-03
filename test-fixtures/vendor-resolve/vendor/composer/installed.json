@@ -1,0 +1,14 @@
+{
+    "packages": [
+        {
+            "name": "fakevendor/framework",
+            "version": "1.0.0",
+            "install-path": "../fakevendor/framework",
+            "autoload": {
+                "psr-4": {
+                    "FakeVendor\\Framework\\": "src/"
+                }
+            }
+        }
+    ]
+}

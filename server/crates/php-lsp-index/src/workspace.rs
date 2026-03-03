@@ -136,7 +136,12 @@ impl WorkspaceIndex {
             return Some(sym.clone());
         }
         // Fallback: match by name (for cases where caller doesn't know exact FQN form)
-        if let Some(sym) = members.iter().find(|m| m.name == member_name) {
+        // Property names in SymbolInfo are stored without '$' prefix, so strip it for comparison
+        let bare_name = member_name.strip_prefix('$').unwrap_or(member_name);
+        if let Some(sym) = members
+            .iter()
+            .find(|m| m.name == member_name || m.name == bare_name)
+        {
             return Some(sym.clone());
         }
 
@@ -530,5 +535,131 @@ mod tests {
 
         // Should not hang — just return None
         assert!(index.resolve_fqn("A::nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_resolve_inherited_member_after_incremental_load() {
+        // Simulates vendor lazy-loading: child class is indexed first,
+        // parent is added later. After parent is indexed, inherited
+        // member resolution should work.
+        let index = WorkspaceIndex::new();
+
+        // Step 1: Index child class (extends a parent not yet indexed)
+        let child_class = SymbolInfo {
+            name: "MyTest".to_string(),
+            fqn: "App\\MyTest".to_string(),
+            kind: PhpSymbolKind::Class,
+            uri: "file:///tests/MyTest.php".to_string(),
+            range: (0, 0, 10, 0),
+            selection_range: (0, 6, 0, 12),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: None,
+            extends: vec!["Vendor\\TestCase".to_string()],
+            implements: vec![],
+        };
+        let child_file = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![child_class],
+        };
+        index.update_file("file:///tests/MyTest.php", child_file);
+
+        // Before parent is loaded, inherited member should NOT resolve
+        assert!(
+            index.resolve_fqn("App\\MyTest::doSetUp").is_none(),
+            "member should not resolve before parent is indexed"
+        );
+
+        // Step 2: Index parent class (vendor lazy-load simulation)
+        let parent_class = SymbolInfo {
+            name: "TestCase".to_string(),
+            fqn: "Vendor\\TestCase".to_string(),
+            kind: PhpSymbolKind::Class,
+            uri: "file:///vendor/TestCase.php".to_string(),
+            range: (0, 0, 20, 0),
+            selection_range: (0, 6, 0, 14),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: None,
+            extends: vec!["Vendor\\BaseAssert".to_string()],
+            implements: vec![],
+        };
+        let parent_method = SymbolInfo {
+            name: "doSetUp".to_string(),
+            fqn: "Vendor\\TestCase::doSetUp".to_string(),
+            kind: PhpSymbolKind::Method,
+            uri: "file:///vendor/TestCase.php".to_string(),
+            range: (5, 4, 8, 5),
+            selection_range: (5, 20, 5, 27),
+            visibility: Visibility::Protected,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: Some("Vendor\\TestCase".to_string()),
+            extends: vec![],
+            implements: vec![],
+        };
+        let parent_file = FileSymbols {
+            namespace: Some("Vendor".to_string()),
+            use_statements: vec![],
+            symbols: vec![parent_class, parent_method],
+        };
+        index.update_file("file:///vendor/TestCase.php", parent_file);
+
+        // After parent is indexed, inherited member SHOULD resolve
+        let found = index.resolve_fqn("App\\MyTest::doSetUp");
+        assert!(found.is_some(), "member should resolve after parent is indexed");
+        assert_eq!(found.unwrap().name, "doSetUp");
+
+        // Step 3: Index grandparent class (deeper vendor lazy-load)
+        let gp_class = SymbolInfo {
+            name: "BaseAssert".to_string(),
+            fqn: "Vendor\\BaseAssert".to_string(),
+            kind: PhpSymbolKind::Class,
+            uri: "file:///vendor/BaseAssert.php".to_string(),
+            range: (0, 0, 30, 0),
+            selection_range: (0, 6, 0, 16),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: None,
+            extends: vec![],
+            implements: vec![],
+        };
+        let gp_method = SymbolInfo {
+            name: "createStub".to_string(),
+            fqn: "Vendor\\BaseAssert::createStub".to_string(),
+            kind: PhpSymbolKind::Method,
+            uri: "file:///vendor/BaseAssert.php".to_string(),
+            range: (10, 4, 13, 5),
+            selection_range: (10, 20, 10, 30),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: Some("Vendor\\BaseAssert".to_string()),
+            extends: vec![],
+            implements: vec![],
+        };
+        let gp_file = FileSymbols {
+            namespace: Some("Vendor".to_string()),
+            use_statements: vec![],
+            symbols: vec![gp_class, gp_method],
+        };
+        index.update_file("file:///vendor/BaseAssert.php", gp_file);
+
+        // Grandparent method should now resolve through the full chain
+        let found = index.resolve_fqn("App\\MyTest::createStub");
+        assert!(
+            found.is_some(),
+            "grandparent method should resolve through inheritance chain"
+        );
+        assert_eq!(found.unwrap().name, "createStub");
     }
 }

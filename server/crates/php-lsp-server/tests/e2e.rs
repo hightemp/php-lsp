@@ -1298,3 +1298,326 @@ class Repo {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Vendor resolution / cross-file type resolution tests (H-015)
+// ---------------------------------------------------------------------------
+
+/// Helper: resolve the path to `test-fixtures/vendor-resolve` directory.
+fn vendor_resolve_fixture_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../test-fixtures/vendor-resolve")
+        .canonicalize()
+        .expect("test-fixtures/vendor-resolve must exist")
+}
+
+/// Bug 1 + Bug 2: go-to-definition on a method inherited from a vendor grandparent.
+///
+/// `$this->createStub(...)` in SampleTest where:
+///   SampleTest extends TestCase (vendor) extends BaseAssert (vendor, has createStub).
+///
+/// Requires: stripping `::member` from FQN before PSR-4 vendor lookup,
+/// and recursively lazy-loading parent classes from vendor.
+#[tokio::test(flavor = "current_thread")]
+async fn test_goto_definition_vendor_inherited_method() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let fixture_root = vendor_resolve_fixture_root();
+    let root_uri = format!("file://{}", fixture_root.display());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    // Open SampleTest.php
+    let test_path = fixture_root.join("tests/SampleTest.php");
+    let test_file_uri = format!("file://{}", test_path.display());
+    let content = fs::read_to_string(&test_path).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&test_file_uri, &content))
+        .await
+        .unwrap();
+
+    // Cursor on "createStub" in:  $stub = $this->createStub(TimerService::class);
+    // Line 40, col 23 (0-indexed)
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(10, &test_file_uri, 40, 23))
+        .await
+        .unwrap();
+
+    let result = extract_result(resp);
+    assert!(
+        !result.is_null(),
+        "go-to-definition on createStub() should resolve to vendor BaseAssert::createStub"
+    );
+
+    let target_uri = result.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+    assert!(
+        target_uri.contains("BaseAssert.php"),
+        "definition should point to BaseAssert.php, got: {}",
+        target_uri
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+/// Bug 1: go-to-definition on a vendor method via typed property in same file.
+///
+/// `$this->timerMock->method('start')` in SampleTest where:
+///   timerMock is `private MockBuilder $timerMock` (same file),
+///   MockBuilder is a vendor class with method().
+///
+/// Requires: stripping `::member` from FQN for vendor PSR-4 lookup.
+#[tokio::test(flavor = "current_thread")]
+async fn test_goto_definition_vendor_method_via_typed_property() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let fixture_root = vendor_resolve_fixture_root();
+    let root_uri = format!("file://{}", fixture_root.display());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    // Open SampleTest.php
+    let test_path = fixture_root.join("tests/SampleTest.php");
+    let test_file_uri = format!("file://{}", test_path.display());
+    let content = fs::read_to_string(&test_path).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&test_file_uri, &content))
+        .await
+        .unwrap();
+
+    // Cursor on "method" in:  $this->timerMock->method('start');
+    // Line 46, col 26 (0-indexed)
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(10, &test_file_uri, 46, 26))
+        .await
+        .unwrap();
+
+    let result = extract_result(resp);
+    assert!(
+        !result.is_null(),
+        "go-to-definition on method() should resolve to vendor MockBuilder::method"
+    );
+
+    let target_uri = result.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+    assert!(
+        target_uri.contains("MockBuilder.php"),
+        "definition should point to MockBuilder.php, got: {}",
+        target_uri
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+/// Bug 3 (cross-file): go-to-definition on method of a property declared in parent class.
+///
+/// `$this->timer->start('handle')` in ConcreteHandler where:
+///   ConcreteHandler extends BaseHandler,
+///   BaseHandler declares `protected TimerService $timer`.
+///   The property is NOT in ConcreteHandler's file_symbols.
+///
+/// Requires: cross-file property type resolution (callback into WorkspaceIndex).
+#[tokio::test(flavor = "current_thread")]
+async fn test_goto_definition_cross_file_inherited_property_method() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let fixture_root = vendor_resolve_fixture_root();
+    let root_uri = format!("file://{}", fixture_root.display());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    // Open all needed files
+    for rel in &["src/ConcreteHandler.php", "src/BaseHandler.php", "src/TimerService.php"] {
+        let p = fixture_root.join(rel);
+        let u = format!("file://{}", p.display());
+        let c = fs::read_to_string(&p).unwrap();
+        service.ready().await.unwrap().call(did_open_notification(&u, &c)).await.unwrap();
+    }
+
+    let handler_uri = format!(
+        "file://{}/src/ConcreteHandler.php",
+        fixture_root.display()
+    );
+
+    // Cursor on "start" in:  $this->timer->start('handle');
+    // Line 21, col 22 (0-indexed)
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(10, &handler_uri, 21, 22))
+        .await
+        .unwrap();
+
+    let result = extract_result(resp);
+    assert!(
+        !result.is_null(),
+        "go-to-definition on start() via inherited property $timer should resolve to TimerService::start"
+    );
+
+    let target_uri = result.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+    assert!(
+        target_uri.contains("TimerService.php"),
+        "definition should point to TimerService.php, got: {}",
+        target_uri
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+/// Same-project cross-file: go-to-definition on method via property in same file.
+///
+/// `$this->timerService->start('benchmark')` in SampleTest where:
+///   timerService is `private TimerService $timerService` (same file),
+///   TimerService is a local class opened via did_open.
+///
+/// This validates the basic chained access + cross-file method resolution.
+#[tokio::test(flavor = "current_thread")]
+async fn test_goto_definition_cross_file_method_via_same_file_property() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let fixture_root = vendor_resolve_fixture_root();
+    let root_uri = format!("file://{}", fixture_root.display());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    // Open both needed files
+    for rel in &["tests/SampleTest.php", "src/TimerService.php"] {
+        let p = fixture_root.join(rel);
+        let u = format!("file://{}", p.display());
+        let c = fs::read_to_string(&p).unwrap();
+        service.ready().await.unwrap().call(did_open_notification(&u, &c)).await.unwrap();
+    }
+
+    let test_file_uri = format!(
+        "file://{}/tests/SampleTest.php",
+        fixture_root.display()
+    );
+
+    // Cursor on "start" in:  $this->timerService->start('benchmark');
+    // Line 58, col 29 (0-indexed)
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(10, &test_file_uri, 58, 29))
+        .await
+        .unwrap();
+
+    let result = extract_result(resp);
+    assert!(
+        !result.is_null(),
+        "go-to-definition on start() via $timerService property should resolve to TimerService::start"
+    );
+
+    let target_uri = result.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+    assert!(
+        target_uri.contains("TimerService.php"),
+        "definition should point to TimerService.php, got: {}",
+        target_uri
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
