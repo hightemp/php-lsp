@@ -135,7 +135,30 @@ def main():
             "text": test_content,
         }
     })
-    time.sleep(1)
+
+    # Collect diagnostics published for our file
+    published_diagnostics = []
+    diag_deadline = time.time() + 10  # wait up to 10s for diagnostics
+    while time.time() < diag_deadline:
+        msg = read_response(proc, timeout=diag_deadline - time.time())
+        if msg is None:
+            break
+        if msg.get("method") == "textDocument/publishDiagnostics":
+            params = msg.get("params", {})
+            if params.get("uri") == test_file_uri:
+                published_diagnostics = params.get("diagnostics", [])
+                break  # got our diagnostics
+
+    # Report diagnostics
+    if published_diagnostics:
+        unresolved = [d for d in published_diagnostics if "Unresolved" in d.get("message", "")]
+        print(f"\n  Diagnostics: {len(published_diagnostics)} total, {len(unresolved)} unresolved use")
+        for d in unresolved:
+            line = d["range"]["start"]["line"] + 1
+            print(f"    L{line}: {d['message']}")
+    else:
+        print(f"\n  Diagnostics: 0 (clean)")
+
 
     # Define test cases: (description, line_0based, character_0based)
     test_cases = [

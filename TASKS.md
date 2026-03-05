@@ -349,6 +349,13 @@
   - Результат: **16/16 тестов проходят** (было 10/13 → 16/16).
   - 133 unit/e2e теста, clippy clean.
 
+- [x] **H-018** Lazy-resolve use statements в diagnostics *(done 2026-03-05)*
+  - **Проблема**: «Unresolved use statement: Doctrine\ORM\EntityManagerInterface» и другие vendor-классы показывались как warnings, потому что `compute_diagnostics` использовал синхронный `index.resolve_fqn()`, который НЕ триггерил lazy vendor indexing.
+  - **Фикс**: в `publish_diagnostics` перед вызовом `compute_diagnostics` добавлен pre-resolve: итерируем use statements файла, для каждого неизвестного class-type FQN вызываем `lazy_index_class()` (async), который находит файл через PSR-4/vendor маппинг и индексирует.
+  - **Результат**: vendor use statements (Doctrine, PHPUnit, Psr\Log и др.) резолвятся on-demand, ложные warnings исчезли.
+  - Тест на реальном проекте: `Diagnostics: 0 (clean)` для SoapHandlerTest.php.
+  - 133 unit/e2e теста, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

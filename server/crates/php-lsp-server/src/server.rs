@@ -346,6 +346,23 @@ impl PhpLspBackend {
     async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
 
+        // Pre-resolve use statements via lazy indexing so that vendor classes
+        // are available for the synchronous `compute_diagnostics` resolver.
+        if let Some(fs) = self.index.file_symbols.get(&uri_str) {
+            let fqns_to_resolve: Vec<String> = fs
+                .use_statements
+                .iter()
+                .filter(|u| u.kind == php_lsp_types::UseKind::Class)
+                .filter(|u| u.fqn.contains('\\'))
+                .filter(|u| !self.index.types.contains_key(u.fqn.as_str()))
+                .map(|u| u.fqn.clone())
+                .collect();
+            drop(fs); // release DashMap ref before async calls
+            for fqn in fqns_to_resolve {
+                self.lazy_index_class(&fqn).await;
+            }
+        }
+
         let diagnostics = {
             if let Some(parser) = self.open_files.get(&uri_str) {
                 compute_diagnostics(&uri_str, &parser, &self.index)
