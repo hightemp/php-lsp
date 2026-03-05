@@ -145,8 +145,6 @@ release:
 	cd $(CLIENT_DIR) && npm version "$(VERSION)" --no-git-tag-version --allow-same-version
 	@echo "--- Patching server/Cargo.toml workspace version ---"
 	sed -i 's/^version = ".*"/version = "$(VERSION)"/' $(SERVER_DIR)/Cargo.toml
-	@echo "--- Building all platforms ---"
-	$(MAKE) package-all
 	@echo "--- Tagging v$(VERSION) (force) ---"
 	git -C $(ROOT_DIR) add $(CLIENT_DIR)/package.json $(SERVER_DIR)/Cargo.toml
 	git -C $(ROOT_DIR) diff --cached --quiet || \
