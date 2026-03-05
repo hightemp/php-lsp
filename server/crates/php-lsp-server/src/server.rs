@@ -72,14 +72,22 @@ impl PhpLspBackend {
     fn resolve_member_type(&self, class_fqn: &str, member_name: &str) -> Option<String> {
         // Build the member FQN to look up
         let member_fqn = format!("{}::{}", class_fqn, member_name);
+        tracing::debug!("resolve_member_type: looking up {}", member_fqn);
 
         // Try to resolve via the workspace index (includes inheritance walk)
-        let sym = self.index.resolve_fqn(&member_fqn)?;
+        let sym = match self.index.resolve_fqn(&member_fqn) {
+            Some(s) => s,
+            None => {
+                tracing::debug!("resolve_member_type: {} not found in index", member_fqn);
+                return None;
+            }
+        };
 
         // Get the type from the signature
         let sig = sym.signature.as_ref()?;
         let ret = sig.return_type.as_ref()?;
         let type_str = ret.to_string();
+        tracing::debug!("resolve_member_type: {} -> return type '{}'", member_fqn, type_str);
 
         if type_str.is_empty() || type_str == "mixed" {
             return None;
@@ -602,11 +610,14 @@ async fn index_workspace(
     // Create progress token
     let progress_token = ProgressToken::String("php-lsp-indexing".to_string());
 
-    // Request progress support from client
-    let progress_supported = client
-        .create_work_done_progress(progress_token.clone())
-        .await
-        .is_ok();
+    // Request progress support from client (with timeout to avoid hanging if client doesn't respond)
+    let progress_supported = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.create_work_done_progress(progress_token.clone()),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
 
     // Start progress reporting (Bounded with percentage)
     let ongoing = if progress_supported {
@@ -1276,8 +1287,14 @@ impl LanguageServer for PhpLspBackend {
         }
 
         let sym_at_pos = match sym_at_pos {
-            Some(s) => s,
-            None => return Ok(None),
+            Some(s) => {
+                tracing::debug!("goto_definition: sym_at_pos fqn='{}', name='{}', ref_kind={:?}", s.fqn, s.name, s.ref_kind);
+                s
+            }
+            None => {
+                tracing::debug!("goto_definition: no symbol at position");
+                return Ok(None);
+            }
         };
 
         // Look up symbol in index (with lazy vendor fallback)

@@ -323,6 +323,21 @@
     - `$this->timerService->method('start')` (chained member call) → go-to-definition на `method` работает
     - Все тесты проходят `cargo test --all`
 
+- [x] **H-016** Тестирование go-to-definition на реальном проекте + 3 bugfix'а *(done 2026-03-05)*
+  - Проверка go-to-definition на реальном Symfony+PHPUnit проекте (bdpn-ui, ~4000 PHP файлов).
+  - Создан тестовый скрипт `scripts/test-goto-def.py` — Python LSP-клиент для автотестирования.
+  - 13 test cases: наследование, vendor-классы, same-file методы, stub-методы, chained calls, type hints.
+  - Три бага найдены и исправлены:
+    1. **Bug 1 — `member_call_expression` не ищет return type в локальных `file_symbols`**: метод `makeHandler()` определён в том же файле, но `try_resolve_object_type` не проверял `file_symbols` для вызовов методов (только для свойств). Результат: `$handler->callOkResponse()` не работал.
+       - Фикс: в `try_resolve_object_type` (resolve.rs), `member_call_expression` branch — добавлен локальный поиск по `file_symbols.symbols` перед fallback в resolver callback.
+    2. **Bug 2 — `MemberTypeResolver` не передавался через цепочку inferring переменных**: `find_variable_inference_before_usage` вызывал `try_resolve_object_type(right, ..., None)`, теряя resolver. Результат: `$repo = $this->createStub(EntityRepository::class)` не резолвил тип через cross-file lookup.
+       - Фикс: параметр `resolver: Option<MemberTypeResolver<'_>>` пробросан через всю цепочку: `infer_variable_type` → `infer_variable_type_in_scope` → `infer_variable_in_scope` → `find_variable_inference_before_usage` → `try_resolve_object_type`.
+    3. **Bug 3 — `create_work_done_progress` блокирует workspace indexing навсегда**: `client.create_work_done_progress()` отправляет запрос клиенту и ожидает ответ. Если клиент не обрабатывает `window/workDoneProgress/create`, task блокируется навсегда, workspace НЕ индексируется.
+       - Фикс: обёрнут вызов в `tokio::time::timeout(Duration::from_secs(5))`.
+  - Результат: **10/13 тестов проходят** (было 6/13 → 10/13).
+  - Оставшиеся 3 фейла — PHPUnit mock/stub паттерн (свойство объявлено как `TimerService`, а `expects()`/`method()` на `MockObject`/`Stub`). Требуется поддержка intersection types (`MockObject&TimerService`).
+  - Все 132 unit/e2e тестов проходят, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

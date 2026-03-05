@@ -164,7 +164,7 @@ pub fn infer_variable_type_at_position(
     let usage_start = position_to_byte(source, line, character);
     let normalized = normalize_var_name(var_name);
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
-    infer_variable_type_in_scope(scope, &normalized, usage_start, source, file_symbols)
+    infer_variable_type_in_scope(scope, &normalized, usage_start, source, file_symbols, None)
 }
 
 /// Infer hover info for a variable under cursor at a given position.
@@ -190,7 +190,7 @@ pub fn variable_hover_info_at_position(
     let var_name = normalize_var_name(&source[node.byte_range()]);
     let usage_start = node.start_byte();
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
-    let inference = infer_variable_in_scope(scope, &var_name, usage_start, source, file_symbols);
+    let inference = infer_variable_in_scope(scope, &var_name, usage_start, source, file_symbols, None);
     if !inference.has_data() {
         return None;
     }
@@ -653,7 +653,7 @@ fn try_resolve_object_type<'a>(
             if text == "$this" {
                 find_parent_class_fqn(object_node, source, file_symbols)
             } else {
-                infer_variable_type(object_node, text, source, file_symbols)
+                infer_variable_type(object_node, text, source, file_symbols, resolver)
             }
         }
         // Name / qualified_name might be a class used as scope
@@ -706,7 +706,24 @@ fn try_resolve_object_type<'a>(
             // Resolve the object type first
             let class_fqn = try_resolve_object_type(obj_field, source, file_symbols, resolver)?;
 
-            // Use the cross-file resolver to get the method's return type
+            // First: look up the method's return type in the current file's symbols
+            let method_fqn = format!("{}::{}", class_fqn, method_name);
+            for sym in &file_symbols.symbols {
+                if sym.fqn == method_fqn {
+                    if let Some(ref sig) = sym.signature {
+                        if let Some(ref ret) = sig.return_type {
+                            let type_str = ret.to_string();
+                            if !type_str.is_empty() && type_str != "mixed" {
+                                let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
+                                return Some(resolve_class_name(base_type, file_symbols));
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Fallback: use the cross-file resolver to get the method's return type
             if let Some(ref resolve_fn) = resolver {
                 if let Some(type_fqn) = resolve_fn(&class_fqn, method_name) {
                     return Some(type_fqn);
@@ -729,9 +746,10 @@ fn infer_variable_type(
     var_name: &str,
     source: &str,
     file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
 ) -> Option<String> {
     let scope = find_enclosing_function(var_node).unwrap_or_else(|| find_root_node(var_node));
-    infer_variable_type_in_scope(scope, var_name, var_node.start_byte(), source, file_symbols)
+    infer_variable_type_in_scope(scope, var_name, var_node.start_byte(), source, file_symbols, resolver)
 }
 
 /// Find the enclosing function/method node.
@@ -765,8 +783,9 @@ fn infer_variable_type_in_scope(
     usage_start: usize,
     source: &str,
     file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
 ) -> Option<String> {
-    infer_variable_in_scope(scope_node, var_name, usage_start, source, file_symbols)
+    infer_variable_in_scope(scope_node, var_name, usage_start, source, file_symbols, resolver)
         .resolved_type_fqn
 }
 
@@ -807,6 +826,7 @@ fn find_variable_inference_before_usage(
     usage_start: usize,
     source: &str,
     file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
 ) -> Option<VariableInference> {
     let mut inferred: Option<(usize, VariableInference)> = None;
 
@@ -839,7 +859,7 @@ fn find_variable_inference_before_usage(
 
         // Assignment inference: $var = <expr>;
         if let Some(right) = assignment_rhs {
-            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols, None) {
+            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols, resolver) {
                 inferred = Some((
                     stmt.start_byte(),
                     VariableInference {
@@ -910,6 +930,7 @@ fn infer_variable_in_scope(
     usage_start: usize,
     source: &str,
     file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
 ) -> VariableInference {
     let mut inferred = VariableInference::default();
 
@@ -947,6 +968,7 @@ fn infer_variable_in_scope(
         usage_start,
         source,
         file_symbols,
+        resolver,
     ) {
         inferred = stmt_info;
     }
