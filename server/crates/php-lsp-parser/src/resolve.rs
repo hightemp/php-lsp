@@ -61,7 +61,7 @@ impl VariableInference {
 }
 
 /// What kind of reference is this?
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefKind {
     /// A class/interface/trait/enum name reference.
     ClassName,
@@ -201,6 +201,101 @@ pub fn variable_hover_info_at_position(
         resolved_type_fqn: inference.resolved_type_fqn,
         phpdoc_comment: inference.phpdoc_comment,
     })
+}
+
+/// Infer the type of a class property by scanning for `$this->propName = <expr>`
+/// assignments throughout the class body.
+///
+/// This is used as a fallback when the declared property type doesn't have a
+/// requested member (e.g., PHPUnit stubs where `$this->em` is typed as
+/// `EntityManagerInterface` but assigned via `$this->createStub(...)` which
+/// returns `Stub`).
+pub fn infer_property_type_from_assignments(
+    tree: &Tree,
+    source: &str,
+    prop_name: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<String> {
+    let root = tree.root_node();
+    find_property_assignment_type(root, source, prop_name, file_symbols, resolver)
+}
+
+/// Recursively search the tree for `$this->propName = <expr>` assignments
+/// and resolve the RHS expression type.
+fn find_property_assignment_type(
+    node: Node,
+    source: &str,
+    prop_name: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<String> {
+    for i in 0..node.child_count() {
+        let child = match node.child(i) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Check expression_statement for property assignment
+        if child.kind() == "expression_statement" {
+            if let Some(rhs) = property_assignment_rhs(child, prop_name, source) {
+                if let Some(resolved) = try_resolve_object_type(rhs, source, file_symbols, resolver) {
+                    return Some(resolved);
+                }
+            }
+        }
+
+        // Recurse into child nodes, but skip anonymous functions/closures
+        // to avoid matching assignments in nested scopes.
+        // We DO enter class_declaration and method_declaration since
+        // that's where $this->prop assignments live.
+        if child.kind() != "anonymous_function_creation_expression"
+            && child.kind() != "arrow_function"
+        {
+            if let Some(found) =
+                find_property_assignment_type(child, source, prop_name, file_symbols, resolver)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Check if a statement is `$this->propName = <expr>` and return the RHS node.
+fn property_assignment_rhs<'a>(
+    stmt: Node<'a>,
+    prop_name: &str,
+    source: &str,
+) -> Option<Node<'a>> {
+    if stmt.kind() != "expression_statement" {
+        return None;
+    }
+
+    let expr = stmt.named_child(0)?;
+    if expr.kind() != "assignment_expression" {
+        return None;
+    }
+
+    let left = expr.child_by_field_name("left")?;
+    let right = expr.child_by_field_name("right")?;
+
+    // Check that left is `$this->propName`
+    if left.kind() != "member_access_expression" {
+        return None;
+    }
+
+    let obj = left.child_by_field_name("object")?;
+    let name = left.child_by_field_name("name")?;
+
+    let obj_text = &source[obj.byte_range()];
+    let name_text = &source[name.byte_range()];
+
+    if obj_text == "$this" && name_text == prop_name {
+        Some(right)
+    } else {
+        None
+    }
 }
 
 /// Find the deepest (most specific) named node at the given point.
@@ -729,6 +824,38 @@ fn try_resolve_object_type<'a>(
                     return Some(type_fqn);
                 }
             }
+
+            // Secondary fallback: if the object is `$this->prop` and the method
+            // wasn't found on the declared type, try the assignment-inferred type.
+            // This handles PHPUnit patterns: `$this->em = $this->createStub(...)` → Stub
+            if obj_field.kind() == "member_access_expression" {
+                if let Some(this_obj) = obj_field.child_by_field_name("object") {
+                    let this_text = &source[this_obj.byte_range()];
+                    if this_text == "$this" {
+                        if let Some(prop_field) = obj_field.child_by_field_name("name") {
+                            let prop_name_text = &source[prop_field.byte_range()];
+                            // Find the class body root to scan for assignments
+                            if let Some(class_node) = find_enclosing_class_node(object_node) {
+                                if let Some(alt_type) = find_property_assignment_type(
+                                    class_node,
+                                    source,
+                                    prop_name_text,
+                                    file_symbols,
+                                    resolver,
+                                ) {
+                                    // Try the method on the assignment-inferred type
+                                    if let Some(ref resolve_fn) = resolver {
+                                        if let Some(type_fqn) = resolve_fn(&alt_type, method_name) {
+                                            return Some(type_fqn);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             None
         }
         // Static call: Foo::create() — can't resolve return type without full type info
@@ -761,6 +888,20 @@ fn find_enclosing_function(node: Node) -> Option<Node> {
             | "function_definition"
             | "arrow_function"
             | "anonymous_function_creation_expression" => {
+                return Some(n);
+            }
+            _ => current = n.parent(),
+        }
+    }
+    None
+}
+
+/// Find the enclosing class/interface/trait declaration node.
+fn find_enclosing_class_node(node: Node) -> Option<Node> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        match n.kind() {
+            "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration" => {
                 return Some(n);
             }
             _ => current = n.parent(),
@@ -1735,5 +1876,62 @@ mod tests {
         let user_prop = parse_and_resolve(code, l3, c3 + 7).expect("User::$var should resolve");
         assert_eq!(user_prop.ref_kind, RefKind::StaticPropertyAccess);
         assert_eq!(user_prop.fqn, "App\\User::$var");
+    }
+
+    #[test]
+    fn test_infer_property_type_from_assignments() {
+        use crate::parser::FileParser;
+        use crate::symbols::extract_file_symbols;
+
+        let code = r#"<?php
+namespace App\Tests;
+
+use App\Service\TimerService;
+use Doctrine\ORM\EntityManagerInterface;
+
+class MyTest {
+    private EntityManagerInterface $em;
+    private TimerService $timerService;
+
+    protected function setUp(): void {
+        $this->em = $this->createStub(EntityManagerInterface::class);
+        $this->timerService = $this->createStub(TimerService::class);
+    }
+
+    public function testSomething(): void {
+        $this->em->method('findAll');
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "test://file");
+
+        // createStub returns Stub type via the resolver
+        let resolver = |_class_fqn: &str, member_name: &str| -> Option<String> {
+            if member_name == "createStub" {
+                Some("PHPUnit\\Framework\\MockObject\\Stub".to_string())
+            } else {
+                None
+            }
+        };
+
+        let result = super::infer_property_type_from_assignments(
+            tree, code, "em", &file_symbols, Some(&resolver),
+        );
+        assert_eq!(result, Some("PHPUnit\\Framework\\MockObject\\Stub".to_string()));
+
+        let result2 = super::infer_property_type_from_assignments(
+            tree, code, "timerService", &file_symbols, Some(&resolver),
+        );
+        assert_eq!(result2, Some("PHPUnit\\Framework\\MockObject\\Stub".to_string()));
+
+        // Non-existent property should return None
+        let result3 = super::infer_property_type_from_assignments(
+            tree, code, "nonexistent", &file_symbols, Some(&resolver),
+        );
+        assert_eq!(result3, None);
     }
 }

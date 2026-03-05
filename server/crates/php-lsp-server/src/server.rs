@@ -246,6 +246,83 @@ impl PhpLspBackend {
         None
     }
 
+    /// Fallback for `$this->prop->member()` when the declared property type
+    /// doesn't have `member`. Scans the file for `$this->prop = <expr>`
+    /// assignments, infers the RHS type, and tries to resolve the member on that
+    /// type instead.
+    async fn try_property_assignment_type_fallback(
+        &self,
+        uri_str: &str,
+        prop_name: &str,
+        member_name: &str,
+    ) -> Option<GotoDefinitionResponse> {
+        use php_lsp_parser::resolve::infer_property_type_from_assignments;
+
+        let inferred_type = {
+            let parser = match self.open_files.get(uri_str) {
+                Some(p) => p,
+                None => {
+                    tracing::debug!("Property fallback: file not open: {}", uri_str);
+                    return None;
+                }
+            };
+            let tree = match parser.tree() {
+                Some(t) => t,
+                None => {
+                    tracing::debug!("Property fallback: no tree for {}", uri_str);
+                    return None;
+                }
+            };
+            let source = parser.source();
+
+            let file_symbols = self
+                .index
+                .file_symbols
+                .get(uri_str)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default();
+
+            let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+                self.resolve_member_type(class_fqn, member_name)
+            };
+
+            let result = infer_property_type_from_assignments(
+                tree,
+                &source,
+                prop_name,
+                &file_symbols,
+                Some(&resolver),
+            );
+            tracing::debug!("Property fallback: infer_property_type_from_assignments('{}') = {:?}", prop_name, result);
+            result
+        };
+
+        if let Some(ref assigned_type) = inferred_type {
+            let fallback_fqn = format!("{}::{}", assigned_type, member_name);
+            tracing::debug!(
+                "Property assignment fallback: $this->{} assigned type '{}', trying '{}'",
+                prop_name,
+                assigned_type,
+                fallback_fqn
+            );
+
+            if let Some(sym) = self.resolve_fqn_lazy(&fallback_fqn).await {
+                if let Ok(target_uri) = sym.uri.parse::<Uri>() {
+                    let range = Range {
+                        start: Position::new(sym.selection_range.0, sym.selection_range.1),
+                        end: Position::new(sym.selection_range.2, sym.selection_range.3),
+                    };
+                    return Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: target_uri,
+                        range,
+                    }));
+                }
+            }
+        }
+
+        None
+    }
+
     /// Resolve symbol lazily with fallback for global built-ins.
     async fn resolve_fqn_lazy_with_fallback(
         &self,
@@ -481,6 +558,61 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
 /// Convert a file path to a file:// URI.
 fn path_to_uri(path: &Path) -> String {
     format!("file://{}", path.display())
+}
+
+/// Find composer.json in the workspace root or immediate subdirectories.
+///
+/// Searches the root first, then scans depth-1 subdirectories (skipping hidden
+/// directories and common non-project dirs like `node_modules`, `vendor`).
+fn find_composer_json(root: &Path) -> Option<PathBuf> {
+    // Check root first
+    let in_root = root.join("composer.json");
+    if in_root.exists() {
+        return Some(in_root);
+    }
+
+    // Scan immediate subdirectories (depth 1)
+    let entries = std::fs::read_dir(root).ok()?;
+    let skip_dirs = ["node_modules", "vendor", ".git", ".github", "docker", "cache", "logs", "tmp"];
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip hidden dirs and known non-project dirs
+        if name_str.starts_with('.') || skip_dirs.contains(&name_str.as_ref()) {
+            continue;
+        }
+        let subdir_composer = entry.path().join("composer.json");
+        if subdir_composer.exists() {
+            candidates.push(subdir_composer);
+        }
+    }
+
+    // If exactly one found, use it; if multiple, prefer the one with autoload section
+    match candidates.len() {
+        0 => None,
+        1 => Some(candidates.into_iter().next().unwrap()),
+        _ => {
+            // Prefer the candidate with the most autoload entries
+            for c in &candidates {
+                if let Ok(content) = std::fs::read_to_string(c) {
+                    if content.contains("\"autoload\"") || content.contains("\"psr-4\"") {
+                        return Some(c.clone());
+                    }
+                }
+            }
+            // Fallback to first
+            Some(candidates.into_iter().next().unwrap())
+        }
+    }
 }
 
 /// Try to resolve a FQN to file paths by scanning vendor/composer installed packages.
@@ -820,28 +952,46 @@ impl LanguageServer for PhpLspBackend {
         if let Some(root) = workspace_root {
             let client = self.client.clone();
             let index = self.index.clone();
-            let ns_map_storage = {
-                // We'll compute and store the namespace map
-                let composer_path = root.join("composer.json");
-                if composer_path.exists() {
-                    match parse_composer_json(&composer_path) {
+
+            // Auto-discover composer.json: check root, then immediate subdirectories
+            let (ns_map_storage, project_root) = {
+                let composer_path = find_composer_json(&root);
+                if let Some(ref cp) = composer_path {
+                    let effective_root = cp.parent().unwrap_or(&root).to_path_buf();
+                    if effective_root != root {
+                        tracing::info!(
+                            "Found composer.json in subdirectory: {}",
+                            effective_root.display()
+                        );
+                    }
+                    match parse_composer_json(cp) {
                         Ok(ns_map) => {
                             tracing::info!(
                                 "Parsed composer.json with {} PSR-4 entries",
                                 ns_map.psr4.len()
                             );
-                            Some(ns_map)
+                            (Some(ns_map), effective_root)
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse composer.json: {}", e);
-                            None
+                            (None, root.clone())
                         }
                     }
                 } else {
                     tracing::info!("No composer.json found, will scan all PHP files");
-                    None
+                    (None, root.clone())
                 }
             };
+
+            // Update workspace root to the effective project root (where composer.json is)
+            if project_root != root {
+                *self.workspace_root.lock().await = Some(project_root.clone());
+                tracing::info!(
+                    "Effective project root: {}",
+                    project_root.display()
+                );
+            }
+            let root = project_root;
 
             // Store namespace map
             *self.namespace_map.lock().await = ns_map_storage.clone();
@@ -1318,6 +1468,40 @@ impl LanguageServer for PhpLspBackend {
             }
         } else {
             None
+        };
+
+        // Fallback: when a member call on `$this->prop` fails because the declared
+        // property type doesn't have that member, try resolving from the actual
+        // assignment (e.g., `$this->em = $this->createStub(...)` → Stub type).
+        let result = if result.is_none()
+            && (sym_at_pos.ref_kind == RefKind::MethodCall
+                || sym_at_pos.ref_kind == RefKind::PropertyAccess)
+        {
+            tracing::debug!(
+                "goto_definition: primary resolution failed, trying property assignment fallback for obj_expr={:?}",
+                sym_at_pos.object_expr
+            );
+            if let Some(ref obj_expr) = sym_at_pos.object_expr {
+                if let Some(prop_name) = obj_expr.strip_prefix("$this->") {
+                    // Only handle simple property access (no chaining)
+                    if !prop_name.contains("->") {
+                        self.try_property_assignment_type_fallback(
+                            &uri_str,
+                            prop_name,
+                            &sym_at_pos.name,
+                        )
+                        .await
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            result
         };
 
         Ok(result)
