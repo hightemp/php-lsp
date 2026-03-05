@@ -679,7 +679,19 @@ fn resolve_node(
         }
 
         // Qualified name used as type or reference
+        // Check if this is inside a use statement (qualified_name → namespace_use_clause)
         _ if node.kind() == "qualified_name" || node.kind() == "name" => {
+            if is_inside_use_clause(node, parent) {
+                // Extract the full FQN from the qualified_name or namespace_use_clause
+                let fqn = extract_use_clause_fqn(node, parent, source);
+                return Some(SymbolAtPosition {
+                    fqn: fqn.trim_start_matches('\\').to_string(),
+                    name: node_text.to_string(),
+                    ref_kind: RefKind::ClassName,
+                    object_expr: None,
+                    range: node_range(node),
+                });
+            }
             resolve_name_node(node, source, file_symbols)
         }
 
@@ -1446,6 +1458,59 @@ fn is_constant_reference_context(parent_kind: &str) -> bool {
     )
 }
 
+/// Check if a node is inside a `namespace_use_clause` (a use statement).
+fn is_inside_use_clause(node: Node, parent: Node) -> bool {
+    // Walk up a few levels looking for namespace_use_clause.
+    // Possible structures:
+    //   name → namespace_use_clause  (single-segment)
+    //   name → qualified_name → namespace_use_clause
+    //   name → namespace_name → qualified_name → namespace_use_clause
+    let _ = node; // suppress unused warning
+    let mut current = parent;
+    for _ in 0..3 {
+        if current.kind() == "namespace_use_clause" {
+            return true;
+        }
+        match current.parent() {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+    false
+}
+
+/// Extract the full FQN string from a use clause.
+///
+/// For `use Doctrine\ORM\EntityManagerInterface;`, returns
+/// `Doctrine\ORM\EntityManagerInterface` regardless of which segment
+/// the cursor is on.
+fn extract_use_clause_fqn(node: Node, parent: Node, source: &str) -> String {
+    // Walk up to find the namespace_use_clause node
+    let _ = node; // suppress unused
+    let mut current = parent;
+    for _ in 0..4 {
+        if current.kind() == "namespace_use_clause" {
+            // The namespace_use_clause contains a qualified_name or name child
+            for i in 0..current.named_child_count() {
+                if let Some(child) = current.named_child(i) {
+                    match child.kind() {
+                        "qualified_name" | "name" => {
+                            return source[child.byte_range()].to_string();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return source[current.byte_range()].to_string();
+        }
+        match current.parent() {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+    source[parent.byte_range()].to_string()
+}
+
 #[allow(clippy::type_complexity)]
 fn find_variable_definition_before(
     node: Node,
@@ -1936,5 +2001,31 @@ class MyTest {
             tree, code, "nonexistent", &file_symbols, Some(&resolver),
         );
         assert!(result3.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_use_statement_goto_def() {
+        let code = "<?php\nuse Doctrine\\ORM\\EntityManagerInterface;\n";
+
+        // Cursor on "EntityManagerInterface" — should resolve full FQN
+        let result = parse_and_resolve(code, 1, 20).unwrap();
+        assert_eq!(result.fqn, "Doctrine\\ORM\\EntityManagerInterface");
+        assert_eq!(result.ref_kind, RefKind::ClassName);
+
+        // Cursor on "Doctrine" (first segment)
+        let result2 = parse_and_resolve(code, 1, 4).unwrap();
+        assert_eq!(result2.fqn, "Doctrine\\ORM\\EntityManagerInterface");
+        assert_eq!(result2.ref_kind, RefKind::ClassName);
+
+        // Cursor on "ORM" (middle segment)
+        let result3 = parse_and_resolve(code, 1, 13).unwrap();
+        assert_eq!(result3.fqn, "Doctrine\\ORM\\EntityManagerInterface");
+        assert_eq!(result3.ref_kind, RefKind::ClassName);
+
+        // Single-segment use statement
+        let code2 = "<?php\nuse TestCase;\n";
+        let result4 = parse_and_resolve(code2, 1, 4).unwrap();
+        assert_eq!(result4.fqn, "TestCase");
+        assert_eq!(result4.ref_kind, RefKind::ClassName);
     }
 }

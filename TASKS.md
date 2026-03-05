@@ -356,6 +356,14 @@
   - Тест на реальном проекте: `Diagnostics: 0 (clean)` для SoapHandlerTest.php.
   - 133 unit/e2e теста, clippy clean.
 
+- [x] **H-019** Go-to-definition для use statements *(done 2026-03-05)*
+  - **Проблема**: go-to-definition на `use Doctrine\ORM\EntityManagerInterface;` не работал — FQN резолвился как `EntityManagerInterface` (короткое имя) вместо полного `Doctrine\ORM\EntityManagerInterface`.
+  - **Причина**: `resolve_node` видел `name` → `qualified_name` (или `namespace_name`) → `namespace_use_clause`. Для `name` node с parent `qualified_name`/`namespace_name` попадал в generic wildcard → `resolve_name_node` → `is_constant_reference_context` → resolve как constant с коротким именем.
+  - **Фикс**: добавлены `is_inside_use_clause()` и `extract_use_clause_fqn()` — при обнаружении что cursor внутри `namespace_use_clause` (walk up до 3 уровней), извлекается полный FQN из `qualified_name` child и возвращается как `RefKind::ClassName`.
+  - **Unit test**: `test_resolve_use_statement_goto_def` — проверяет cursor на каждом сегменте (first/middle/last), single-segment use.
+  - Результат: **19/19 тестов** (3 новых use statement теста).
+  - 134 unit/e2e теста, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

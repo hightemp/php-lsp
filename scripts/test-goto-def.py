@@ -211,6 +211,17 @@ def main():
 
         # Line 328: $this->timerService->method('start')
         ("method on timerService stub", 327, 29),  # col 29 = 'm' in method
+
+        # --- Use statement go-to-definition ---
+
+        # Line 15: use Doctrine\ORM\EntityManagerInterface;
+        ("use Doctrine\\ORM\\EntityManagerInterface", 14, 30),  # col 30 = 'E' in EntityManagerInterface
+
+        # Line 19: use PHPUnit\Framework\TestCase;
+        ("use PHPUnit\\Framework\\TestCase", 18, 23),  # col 23 = 'T' in TestCase
+
+        # Line 20: use Psr\Log\LoggerInterface;
+        ("use Psr\\Log\\LoggerInterface", 19, 15),  # col 15 = 'L' in LoggerInterface
     ]
 
     print(f"\n{'='*80}")
