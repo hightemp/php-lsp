@@ -7,6 +7,7 @@
 #   make package    — produce .vsix (depends on all above)
 #   make server-all — cross-compile server for all 6 platforms
 #   make package-all— universal .vsix with all platform binaries
+#   make release    — bump versions from VERSION, build all, tag & push to GitHub
 #   make clean      — remove build artefacts
 #   make check      — run all lints and tests
 
@@ -18,6 +19,8 @@ SERVER_DIR := $(ROOT_DIR)/server
 CLIENT_DIR := $(ROOT_DIR)/client
 STUBS_SRC  := $(SERVER_DIR)/data/stubs
 STUBS_DEST := $(CLIENT_DIR)/stubs
+
+VERSION    := $(shell cat $(ROOT_DIR)/VERSION | tr -d '[:space:]')
 
 # Detect host Rust target
 HOST_TARGET := $(shell rustc -vV | awk '/^host:/ {print $$2}')
@@ -38,7 +41,7 @@ BIN_NAME   := $(if $(findstring windows,$(HOST_TARGET)),php-lsp.exe,php-lsp)
 SERVER_BIN := $(BIN_DIR)/$(BIN_NAME)
 
 # ─── Phony targets ───────────────────────────────────────────────
-.PHONY: all package package-all install server server-all client stubs clean check test lint fmt
+.PHONY: all package package-all install server server-all client stubs clean check test lint fmt release
 
 all: package
 
@@ -131,3 +134,24 @@ clean:
 	rm -rf $(CLIENT_DIR)/bin
 	rm -rf $(STUBS_DEST)
 	rm -f $(CLIENT_DIR)/*.vsix
+
+# ─── Release ─────────────────────────────────────────────────────
+# Reads version from VERSION file, patches package.json and Cargo.toml,
+# builds a universal .vsix, creates/force-updates the git tag and pushes.
+release:
+	@if [[ -z "$(VERSION)" ]]; then echo "ERROR: VERSION file is empty"; exit 1; fi
+	@echo "=== Release v$(VERSION) ==="
+	@echo "--- Patching client/package.json ---"
+	cd $(CLIENT_DIR) && npm version "$(VERSION)" --no-git-tag-version --allow-same-version
+	@echo "--- Patching server/Cargo.toml workspace version ---"
+	sed -i 's/^version = ".*"/version = "$(VERSION)"/' $(SERVER_DIR)/Cargo.toml
+	@echo "--- Building all platforms ---"
+	$(MAKE) package-all
+	@echo "--- Tagging v$(VERSION) (force) ---"
+	git -C $(ROOT_DIR) add $(CLIENT_DIR)/package.json $(SERVER_DIR)/Cargo.toml
+	git -C $(ROOT_DIR) diff --cached --quiet || \
+		git -C $(ROOT_DIR) commit -m "chore(release): bump version to $(VERSION)"
+	git -C $(ROOT_DIR) tag -f "v$(VERSION)"
+	@echo "--- Pushing tag to GitHub ---"
+	git -C $(ROOT_DIR) push origin "v$(VERSION)" --force
+	@echo "=== Released v$(VERSION) ==="

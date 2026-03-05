@@ -453,6 +453,10 @@
   - Поддержанные платформы: linux-x64, linux-arm64, alpine-x64, darwin-x64, darwin-arm64, win32-x64, win32-arm64
   - Локальная сборка VSIX: 2.56 MB (бинарник + стабы + клиент)
 
+- [x] **VN-011** Make release target — сборка + тегирование + push в GitHub *(done 2026-03-05)*
+  - `VERSION` файл — единый источник версии
+  - `make release` — берёт версию из `VERSION`, патчит `client/package.json` и `server/Cargo.toml`, собирает `package-all`, создаёт force-теग `v<VERSION>` и пушит на GitHub
+
 ---
 
 ## Зависимости между задачами
