@@ -258,7 +258,7 @@ impl PhpLspBackend {
     ) -> Option<GotoDefinitionResponse> {
         use php_lsp_parser::resolve::infer_property_type_from_assignments;
 
-        let inferred_type = {
+        let inferred_types = {
             let parser = match self.open_files.get(uri_str) {
                 Some(p) => p,
                 None => {
@@ -297,7 +297,7 @@ impl PhpLspBackend {
             result
         };
 
-        if let Some(ref assigned_type) = inferred_type {
+        for assigned_type in &inferred_types {
             let fallback_fqn = format!("{}::{}", assigned_type, member_name);
             tracing::debug!(
                 "Property assignment fallback: $this->{} assigned type '{}', trying '{}'",

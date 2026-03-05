@@ -203,33 +203,37 @@ pub fn variable_hover_info_at_position(
     })
 }
 
-/// Infer the type of a class property by scanning for `$this->propName = <expr>`
+/// Infer all possible types of a class property by scanning for `$this->propName = <expr>`
 /// assignments throughout the class body.
 ///
+/// Returns all distinct resolved types found across all assignments.
 /// This is used as a fallback when the declared property type doesn't have a
 /// requested member (e.g., PHPUnit stubs where `$this->em` is typed as
 /// `EntityManagerInterface` but assigned via `$this->createStub(...)` which
-/// returns `Stub`).
+/// returns `Stub`, or `$this->createMock(...)` which returns `MockObject`).
 pub fn infer_property_type_from_assignments(
     tree: &Tree,
     source: &str,
     prop_name: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
-) -> Option<String> {
+) -> Vec<String> {
     let root = tree.root_node();
-    find_property_assignment_type(root, source, prop_name, file_symbols, resolver)
+    let mut results = Vec::new();
+    find_all_property_assignment_types(root, source, prop_name, file_symbols, resolver, &mut results);
+    results
 }
 
 /// Recursively search the tree for `$this->propName = <expr>` assignments
-/// and resolve the RHS expression type.
-fn find_property_assignment_type(
+/// and collect all distinct resolved RHS expression types.
+fn find_all_property_assignment_types(
     node: Node,
     source: &str,
     prop_name: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
-) -> Option<String> {
+    results: &mut Vec<String>,
+) {
     for i in 0..node.child_count() {
         let child = match node.child(i) {
             Some(c) => c,
@@ -240,7 +244,9 @@ fn find_property_assignment_type(
         if child.kind() == "expression_statement" {
             if let Some(rhs) = property_assignment_rhs(child, prop_name, source) {
                 if let Some(resolved) = try_resolve_object_type(rhs, source, file_symbols, resolver) {
-                    return Some(resolved);
+                    if !results.contains(&resolved) {
+                        results.push(resolved);
+                    }
                 }
             }
         }
@@ -252,14 +258,9 @@ fn find_property_assignment_type(
         if child.kind() != "anonymous_function_creation_expression"
             && child.kind() != "arrow_function"
         {
-            if let Some(found) =
-                find_property_assignment_type(child, source, prop_name, file_symbols, resolver)
-            {
-                return Some(found);
-            }
+            find_all_property_assignment_types(child, source, prop_name, file_symbols, resolver, results);
         }
     }
-    None
 }
 
 /// Check if a statement is `$this->propName = <expr>` and return the RHS node.
@@ -836,16 +837,18 @@ fn try_resolve_object_type<'a>(
                             let prop_name_text = &source[prop_field.byte_range()];
                             // Find the class body root to scan for assignments
                             if let Some(class_node) = find_enclosing_class_node(object_node) {
-                                if let Some(alt_type) = find_property_assignment_type(
+                                let mut alt_types = Vec::new();
+                                find_all_property_assignment_types(
                                     class_node,
                                     source,
                                     prop_name_text,
                                     file_symbols,
                                     resolver,
-                                ) {
-                                    // Try the method on the assignment-inferred type
+                                    &mut alt_types,
+                                );
+                                for alt_type in &alt_types {
                                     if let Some(ref resolve_fn) = resolver {
-                                        if let Some(type_fqn) = resolve_fn(&alt_type, method_name) {
+                                        if let Some(type_fqn) = resolve_fn(alt_type, method_name) {
                                             return Some(type_fqn);
                                         }
                                     }
@@ -1921,17 +1924,17 @@ class MyTest {
         let result = super::infer_property_type_from_assignments(
             tree, code, "em", &file_symbols, Some(&resolver),
         );
-        assert_eq!(result, Some("PHPUnit\\Framework\\MockObject\\Stub".to_string()));
+        assert_eq!(result, vec!["PHPUnit\\Framework\\MockObject\\Stub".to_string()]);
 
         let result2 = super::infer_property_type_from_assignments(
             tree, code, "timerService", &file_symbols, Some(&resolver),
         );
-        assert_eq!(result2, Some("PHPUnit\\Framework\\MockObject\\Stub".to_string()));
+        assert_eq!(result2, vec!["PHPUnit\\Framework\\MockObject\\Stub".to_string()]);
 
-        // Non-existent property should return None
+        // Non-existent property should return empty vec
         let result3 = super::infer_property_type_from_assignments(
             tree, code, "nonexistent", &file_symbols, Some(&resolver),
         );
-        assert_eq!(result3, None);
+        assert!(result3.is_empty());
     }
 }

@@ -338,6 +338,17 @@
   - Оставшиеся 3 фейла — PHPUnit mock/stub паттерн (свойство объявлено как `TimerService`, а `expects()`/`method()` на `MockObject`/`Stub`). Требуется поддержка intersection types (`MockObject&TimerService`).
   - Все 132 unit/e2e тестов проходят, clippy clean.
 
+- [x] **H-017** Auto-discovery composer.json + property assignment fallback + chain resolution *(done 2026-03-05)*
+  - **Auto-discovery composer.json в subdirectories**: добавлена `find_composer_json(root)` — если `composer.json` нет в корне workspace, сканирует поддиректории (глубина 1), пропускает `node_modules/vendor/.git/docker/cache/logs/tmp`, при нескольких кандидатах предпочитает файл с секцией `autoload`. `workspace_root` обновляется на найденный effective root.
+  - **Property assignment type fallback**: добавлен `infer_property_type_from_assignments()` — сканирует AST класса для `$this->prop = <expr>`, резолвит тип RHS через `try_resolve_object_type`. Используется как fallback в `goto_definition` когда объявленный тип свойства не содержит запрошенный member.
+  - **Multi-type property resolution**: `find_all_property_assignment_types()` собирает ВСЕ distinct типы из разных assignments (напр. `createStub` → `Stub`, `createMock` → `MockObject`), fallback пробует каждый тип по порядку.
+  - **Chain resolution**: secondary fallback в `try_resolve_object_type`'s `member_call_expression` handler — когда метод не найден на объявленном типе и объект `$this->prop`, ищет assignment-inferred type и пробует метод на нём. Обрабатывает `$this->em->method(...)->willReturn(...)` цепочки.
+  - **Helper functions**: `find_enclosing_class_node()` (walks up to class/interface/trait/enum), `property_assignment_rhs()` (matches `$this->prop = <expr>` pattern), `find_all_property_assignment_types()` (recursive DFS collecting types).
+  - **Bug fix**: column positions в тестах были off-by-1 (col 28 = `>` in `->`, а не `e` in `expects`).
+  - **Unit test**: `test_infer_property_type_from_assignments` — тестирует с mock resolver, проверяет `em` и `timerService`.
+  - Результат: **16/16 тестов проходят** (было 10/13 → 16/16).
+  - 133 unit/e2e теста, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)
