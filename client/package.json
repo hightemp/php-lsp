@@ -2,7 +2,7 @@
   "name": "php-lsp",
   "displayName": "PHP Language Server",
   "description": "PHP language support powered by php-lsp (Rust)",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "php-lsp",
   "repository": {
     "type": "git",
@@ -34,7 +34,14 @@
         "phpLsp.phpVersion": {
           "type": "string",
           "default": "8.2",
-          "enum": ["7.4", "8.0", "8.1", "8.2", "8.3", "8.4"],
+          "enum": [
+            "7.4",
+            "8.0",
+            "8.1",
+            "8.2",
+            "8.3",
+            "8.4"
+          ],
           "scope": "resource",
           "description": "Target PHP version for diagnostics and completion"
         },
@@ -46,21 +53,50 @@
         },
         "phpLsp.includePaths": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "scope": "resource",
           "description": "Additional paths to include in indexing"
         },
         "phpLsp.stubs.extensions": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [
-            "Core", "SPL", "standard", "pcre", "date", "json",
-            "mbstring", "ctype", "tokenizer", "dom", "SimpleXML",
-            "PDO", "curl", "filter", "hash", "session",
-            "Reflection", "intl", "fileinfo", "openssl", "phar",
-            "xml", "xmlreader", "xmlwriter", "zip", "zlib",
-            "bcmath", "gd", "iconv", "mysqli", "sodium"
+            "Core",
+            "SPL",
+            "standard",
+            "pcre",
+            "date",
+            "json",
+            "mbstring",
+            "ctype",
+            "tokenizer",
+            "dom",
+            "SimpleXML",
+            "PDO",
+            "curl",
+            "filter",
+            "hash",
+            "session",
+            "Reflection",
+            "intl",
+            "fileinfo",
+            "openssl",
+            "phar",
+            "xml",
+            "xmlreader",
+            "xmlwriter",
+            "zip",
+            "zlib",
+            "bcmath",
+            "gd",
+            "iconv",
+            "mysqli",
+            "sodium"
           ],
           "scope": "resource",
           "description": "PHP extensions to load stubs for"
@@ -80,7 +116,11 @@
         "phpLsp.diagnostics.mode": {
           "type": "string",
           "default": "basic-semantic",
-          "enum": ["off", "syntax-only", "basic-semantic"],
+          "enum": [
+            "off",
+            "syntax-only",
+            "basic-semantic"
+          ],
           "enumDescriptions": [
             "No diagnostics",
             "Only syntax errors from parser",
@@ -91,14 +131,24 @@
         },
         "phpLsp.trace.server": {
           "type": "string",
-          "enum": ["off", "messages", "verbose"],
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
           "default": "off",
           "scope": "window",
           "description": "Trace LSP communication between client and server"
         },
         "phpLsp.logLevel": {
           "type": "string",
-          "enum": ["error", "warn", "info", "debug", "trace"],
+          "enum": [
+            "error",
+            "warn",
+            "info",
+            "debug",
+            "trace"
+          ],
           "default": "info",
           "scope": "window",
           "description": "Server log level"
