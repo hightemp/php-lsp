@@ -427,6 +427,14 @@
   - **Тесты**: 2 новых теста — `test_phpdoc_optional_sets_default_value` (эмулирует `mb_strtolower`), `test_phpdoc_optional_on_byref_param` (эмулирует `str_replace` с `&$count`).
   - 147 unit тестов, 16 e2e тестов, clippy clean.
 
+- [x] **H-026** Go-to-definition для promoted constructor properties (`$this->logger->debug()`) *(done 2026-03-18)*
+  - **Проблема**: go-to-definition не работал для методов на свойствах, объявленных через constructor promotion (`protected readonly LoggerInterface $logger`). `$this->logger->debug(...)` не разрешался.
+  - **Причина**: `extract_method` создавал `ParamInfo` с `is_promoted: true` для промоутнутых параметров, но НЕ создавал `SymbolInfo` с `kind: Property`. Поэтому при разрешении `$this->logger` поиск символа `Class::$logger` не находил ничего, и тип не определялся.
+  - **Фикс**:
+    - **symbols.rs**: в `extract_method` после создания Method символа добавлен проход по `property_promotion_parameter` нодам — для каждого создаётся дополнительный `SymbolInfo` с `kind: Property`, `fqn: Class::$name`, правильными visibility/modifiers и типом.
+  - **Тесты**: 1 новый тест `test_promoted_constructor_params_emit_property_symbols` — проверяет что promoted параметры создают Property символы с правильным FQN, visibility, readonly модификатором и типом, а обычные параметры — нет.
+  - 148 unit тестов, 16 e2e тестов, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)
@@ -539,3 +547,14 @@ M-016 ──→ M-014          (phpdoc → hover)
 M-019 ──→ M-020          (references → rename)
 M-013 ──→ M-014          (stubs → hover on built-ins)
 ```
+
+---
+
+## Research: Go-to-definition for promoted property member chains
+
+- [x] **R-001** Analyze resolution chain for `$this->logger->debug()` *(done 2026-03-18)*
+  - Read `resolve.rs`: `try_resolve_object_type`, `resolve_node`, variable type inference
+  - Read `server.rs`: `resolve_member_type`, `goto_definition`, `symbol_at_position_with_resolver`
+  - Read `symbols.rs`: symbol extraction for promoted constructor params
+  - Read `workspace.rs`: `resolve_fqn`, `resolve_member`, `get_direct_members`
+  - Identified root cause: promoted constructor params not emitted as Property symbols

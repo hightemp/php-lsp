@@ -413,6 +413,47 @@ fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols,
         extends: vec![],
         implements: vec![],
     });
+
+    // Emit Property symbols for promoted constructor parameters.
+    // PHP constructor promotion (`public readonly Type $prop`) creates both a
+    // constructor parameter AND a class property. We need the Property symbol
+    // so that `$this->prop` can be resolved to its type.
+    if let Some(param_list) = node.child_by_field_name("parameters") {
+        let mut cursor = param_list.walk();
+        for child in param_list.children(&mut cursor) {
+            if child.kind() == "property_promotion_parameter" {
+                let prop_vis = extract_visibility(child, source);
+                let prop_mods = extract_modifiers(child, source);
+                let prop_type = child
+                    .child_by_field_name("type")
+                    .map(|t| parse_type_node(t, source));
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let raw_name = node_text(name_node, source);
+                    let prop_name = raw_name.strip_prefix('$').unwrap_or(raw_name).to_string();
+                    let prop_fqn = format!("{}::${}", parent_fqn, prop_name);
+
+                    result.symbols.push(SymbolInfo {
+                        name: prop_name,
+                        fqn: prop_fqn,
+                        kind: PhpSymbolKind::Property,
+                        uri: uri.to_string(),
+                        range: node_range(child),
+                        selection_range: node_range(name_node),
+                        visibility: prop_vis,
+                        modifiers: prop_mods,
+                        doc_comment: None,
+                        signature: prop_type.map(|t| Signature {
+                            params: vec![],
+                            return_type: Some(t),
+                        }),
+                        parent_fqn: Some(parent_fqn.to_string()),
+                        extends: vec![],
+                        implements: vec![],
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn extract_function(
@@ -1230,6 +1271,68 @@ function str_replace(array|string $search, array|string $replace, array|string $
         assert!(
             sig.params[3].default_value.is_some(),
             "&$count should have a synthetic default_value from PHPDoc [optional]"
+        );
+    }
+
+    #[test]
+    fn test_promoted_constructor_params_emit_property_symbols() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App;
+
+class MyService {
+    public function __construct(
+        protected readonly LoggerInterface $logger,
+        private string $name,
+        int $notPromoted = 0,
+    ) {}
+}
+"#,
+        );
+
+        // Should have Property symbols for promoted params
+        let logger_prop = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\MyService::$logger");
+        assert!(
+            logger_prop.is_some(),
+            "Expected Property symbol for promoted $logger, symbols: {:?}",
+            syms.symbols.iter().map(|s| (&s.fqn, &s.kind)).collect::<Vec<_>>()
+        );
+        let logger = logger_prop.unwrap();
+        assert_eq!(logger.visibility, Visibility::Protected);
+        assert!(logger.modifiers.is_readonly);
+        // Type should be LoggerInterface
+        let ret_type = logger
+            .signature
+            .as_ref()
+            .and_then(|s| s.return_type.as_ref());
+        assert!(
+            matches!(ret_type, Some(TypeInfo::Simple(t)) if t == "LoggerInterface"),
+            "Expected LoggerInterface type, got: {:?}",
+            ret_type
+        );
+
+        let name_prop = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\MyService::$name");
+        assert!(
+            name_prop.is_some(),
+            "Expected Property symbol for promoted $name"
+        );
+        let name = name_prop.unwrap();
+        assert_eq!(name.visibility, Visibility::Private);
+
+        // $notPromoted is a regular parameter — should NOT be a Property
+        let not_promoted = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.name == "notPromoted");
+        assert!(
+            not_promoted.is_none(),
+            "Regular param $notPromoted should NOT become a Property symbol"
         );
     }
 }
