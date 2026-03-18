@@ -1239,8 +1239,21 @@ impl LanguageServer for PhpLspBackend {
         let symbol_info = match sym_at_pos.ref_kind {
             RefKind::Variable => None, // Variables are local, handled by gotoDefinition.
             _ => {
-                self.resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
-                    .await
+                let info = self
+                    .resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
+                    .await;
+                // For constructor refs, fall back to the class if __construct is
+                // not explicitly defined.
+                if info.is_none() && sym_at_pos.ref_kind == RefKind::Constructor {
+                    if let Some(class_fqn) = sym_at_pos.fqn.strip_suffix("::__construct") {
+                        self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName)
+                            .await
+                    } else {
+                        None
+                    }
+                } else {
+                    info
+                }
             }
         };
 
@@ -1488,6 +1501,19 @@ impl LanguageServer for PhpLspBackend {
             .resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
             .await;
 
+        // For constructor refs (`new ClassName()`), fall back to the class
+        // declaration when `__construct` is not explicitly defined.
+        let symbol_info = if symbol_info.is_none() && sym_at_pos.ref_kind == RefKind::Constructor {
+            if let Some(class_fqn) = sym_at_pos.fqn.strip_suffix("::__construct") {
+                self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName)
+                    .await
+            } else {
+                None
+            }
+        } else {
+            symbol_info
+        };
+
         let result = if let Some(sym) = symbol_info {
             // Convert URI string to lsp_types::Uri
             if let Ok(target_uri) = sym.uri.parse::<Uri>() {
@@ -1597,7 +1623,7 @@ impl LanguageServer for PhpLspBackend {
                     }
 
                     let kind = match sym.ref_kind {
-                        RefKind::ClassName => php_lsp_types::PhpSymbolKind::Class,
+                        RefKind::ClassName | RefKind::Constructor => php_lsp_types::PhpSymbolKind::Class,
                         RefKind::FunctionCall => php_lsp_types::PhpSymbolKind::Function,
                         RefKind::MethodCall => php_lsp_types::PhpSymbolKind::Method,
                         RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {
@@ -1768,7 +1794,7 @@ impl LanguageServer for PhpLspBackend {
         // Resolve symbol under cursor
         let (target_fqn, target_kind, _old_name) = {
             let kind = match sym.ref_kind {
-                RefKind::ClassName => php_lsp_types::PhpSymbolKind::Class,
+                RefKind::ClassName | RefKind::Constructor => php_lsp_types::PhpSymbolKind::Class,
                 RefKind::FunctionCall => php_lsp_types::PhpSymbolKind::Function,
                 RefKind::MethodCall => php_lsp_types::PhpSymbolKind::Method,
                 RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {

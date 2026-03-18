@@ -379,6 +379,14 @@
   - Результат: **33/33 go-to-def**, **0 diagnostics**, **19/19 regression tests**.
   - 138 unit тестов, clippy clean.
 
+- [x] **H-021** `new ClassName()` go-to-definition → конструктор *(done 2026-03-18)*
+  - **Проблема**: `new Assert\NotBlank(...)` вёл на объявление класса (строка 24), а не на конструктор `__construct` (строка 41).
+  - **Фикс**: добавлен `RefKind::Constructor` в resolve.rs. Для `new ClassName()` и `new Alias\Class()` возвращается `fqn = "ClassName::__construct"` с `RefKind::Constructor`. В `goto_definition` и `hover` (server.rs) при неудаче поиска `__construct` делается fallback на класс.
+  - **Затронутые файлы**: resolve.rs (новый RefKind + 2 match arms + helper `is_inside_object_creation_context`), server.rs (goto_definition fallback + hover fallback + references/rename match arms).
+  - **Результат**: `new Assert\NotBlank` → NotBlank.php:41 (`__construct`), `new Assert\Length` → Length.php:69 (`__construct`).
+  - **E2E**: 33/33 go-to-def, 19/19 regression, 0 diagnostics.
+  - 138 unit тестов, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

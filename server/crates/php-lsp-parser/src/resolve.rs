@@ -65,6 +65,8 @@ impl VariableInference {
 pub enum RefKind {
     /// A class/interface/trait/enum name reference.
     ClassName,
+    /// A constructor call via `new ClassName()`.
+    Constructor,
     /// A function call.
     FunctionCall,
     /// A method call (->method or ::method).
@@ -370,6 +372,16 @@ fn is_inside_class_reference_context(start: Node) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if a `qualified_name`/`namespace_name` node is specifically inside
+/// an `object_creation_expression` context (`new ClassName`).
+fn is_inside_object_creation_context(start: Node) -> bool {
+    let qname = find_qualified_name_ancestor(start);
+    qname
+        .parent()
+        .map(|p| p.kind() == "object_creation_expression")
+        .unwrap_or(false)
+}
+
 /// Resolve a CST node to symbol information.
 fn resolve_node(
     node: Node,
@@ -590,10 +602,15 @@ fn resolve_node(
             let qname_node = find_qualified_name_ancestor(parent);
             let qname_text = &source[qname_node.byte_range()];
             let resolved = resolve_class_name(qname_text, file_symbols);
+            let is_new = is_inside_object_creation_context(parent);
             Some(SymbolAtPosition {
-                fqn: resolved,
+                fqn: if is_new {
+                    format!("{}::__construct", resolved)
+                } else {
+                    resolved
+                },
                 name: node_text.to_string(),
-                ref_kind: RefKind::ClassName,
+                ref_kind: if is_new { RefKind::Constructor } else { RefKind::ClassName },
                 object_expr: None,
                 range: node_range(node),
             })
@@ -649,9 +666,9 @@ fn resolve_node(
         "object_creation_expression" => {
             let resolved = resolve_class_name(node_text, file_symbols);
             Some(SymbolAtPosition {
-                fqn: resolved,
+                fqn: format!("{}::__construct", resolved),
                 name: node_text.to_string(),
-                ref_kind: RefKind::ClassName,
+                ref_kind: RefKind::Constructor,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -1748,8 +1765,8 @@ mod tests {
         let result = parse_and_resolve(code, 3, 5);
         assert!(result.is_some());
         let sym = result.unwrap();
-        assert_eq!(sym.fqn, "App\\Service\\UserService");
-        assert_eq!(sym.ref_kind, RefKind::ClassName);
+        assert_eq!(sym.fqn, "App\\Service\\UserService::__construct");
+        assert_eq!(sym.ref_kind, RefKind::Constructor);
     }
 
     #[test]
@@ -2117,17 +2134,17 @@ class Foo {
         let result = parse_and_resolve(code, l1, c1 + 7).unwrap();
         assert_eq!(
             result.fqn,
-            "Symfony\\Component\\Validator\\Constraints\\NotBlank"
+            "Symfony\\Component\\Validator\\Constraints\\NotBlank::__construct"
         );
-        assert_eq!(result.ref_kind, RefKind::ClassName);
+        assert_eq!(result.ref_kind, RefKind::Constructor);
 
         // Cursor on "Assert" (namespace part)
         let result2 = parse_and_resolve(code, l1, c1).unwrap();
         assert_eq!(
             result2.fqn,
-            "Symfony\\Component\\Validator\\Constraints\\NotBlank"
+            "Symfony\\Component\\Validator\\Constraints\\NotBlank::__construct"
         );
-        assert_eq!(result2.ref_kind, RefKind::ClassName);
+        assert_eq!(result2.ref_kind, RefKind::Constructor);
     }
 
     #[test]
