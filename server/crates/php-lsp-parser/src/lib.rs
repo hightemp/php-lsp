@@ -10,3 +10,4 @@ pub mod references;
 pub mod resolve;
 pub mod semantic;
 pub mod symbols;
+pub mod utf16;

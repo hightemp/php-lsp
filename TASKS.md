@@ -387,6 +387,16 @@
   - **E2E**: 33/33 go-to-def, 19/19 regression, 0 diagnostics.
   - 138 unit тестов, clippy clean.
 
+- [x] **H-022** Исправление UTF-16 позиций — файл подсвечивался целиком красным при редактировании *(done 2026-03-18)*
+  - **Проблема**: при редактировании файлов с кириллицей (и другими не-ASCII символами) LSP-сервер подсвечивал весь файл ошибками. После исправления ошибки диагностика не обновлялась.
+  - **Причина**: LSP протокол передаёт `Position.character` в кодовых единицах UTF-16, а tree-sitter использует байтовые смещения для `Point.column`. `apply_edit` в parser.rs трактовал UTF-16 символы как байтовые смещения, что повреждало содержимое rope-буфера на строках с кириллицей (2 байта UTF-8, 1 UTF-16 code unit).
+  - **Фикс**:
+    - **parser.rs**: переписан `apply_edit` — новая `utf16_position_to_byte()` правильно конвертирует UTF-16 позиции в байтовые смещения. Tree-sitter `Point` теперь создаётся с байтовыми колонками.
+    - **utf16.rs** (НОВЫЙ модуль): `Utf16LineIndex` (индекс для batch-конверсии), `byte_col_to_utf16()`, `utf16_col_to_byte()`, `range_byte_to_utf16()`.
+    - **server.rs**: все 10 входящих вызовов (`symbol_at_position`, `variable_definition_at_position`, `detect_context`, `find_variable_references_at_position`, `infer_variable_type_at_position`) конвертируют `pos.character` через `utf16_col_to_byte()`. Все исходящие позиции (diagnostics, variable refs, rename edits, prepareRename ranges, reference locations) конвертируются через `range_byte_to_utf16()` / `Utf16LineIndex`.
+  - **Затронутые файлы**: parser.rs, utf16.rs (новый), lib.rs, server.rs.
+  - 141 unit тест, 16 e2e тестов, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

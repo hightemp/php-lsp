@@ -16,6 +16,7 @@ use php_lsp_parser::resolve::{
 };
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::semantic::collect_aliased_class_fqns;
+use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
 use php_lsp_parser::symbols::extract_file_symbols;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -496,20 +497,26 @@ fn compute_diagnostics(
         None => return vec![],
     };
     let source = parser.source();
+    let utf16_index = Utf16LineIndex::new(&source);
 
     // Syntax errors (ERROR / MISSING nodes)
     let lsp_diags = extract_syntax_errors(tree, &source);
     let mut diagnostics: Vec<Diagnostic> = lsp_diags
         .into_iter()
-        .map(|d| Diagnostic {
-            range: Range {
-                start: Position::new(d.range.start.line, d.range.start.character),
-                end: Position::new(d.range.end.line, d.range.end.character),
-            },
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("php-lsp".to_string()),
-            message: d.message,
-            ..Default::default()
+        .map(|d| {
+            // tree-sitter positions use byte columns; convert to UTF-16
+            let start_char = utf16_index.byte_col_to_utf16(d.range.start.line, d.range.start.character);
+            let end_char = utf16_index.byte_col_to_utf16(d.range.end.line, d.range.end.character);
+            Diagnostic {
+                range: Range {
+                    start: Position::new(d.range.start.line, start_char),
+                    end: Position::new(d.range.end.line, end_char),
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("php-lsp".to_string()),
+                message: d.message,
+                ..Default::default()
+            }
         })
         .collect();
 
@@ -531,8 +538,8 @@ fn compute_diagnostics(
     for sd in sem_diags {
         diagnostics.push(Diagnostic {
             range: Range {
-                start: Position::new(sd.range.0, sd.range.1),
-                end: Position::new(sd.range.2, sd.range.3),
+                start: Position::new(sd.range.0, utf16_index.byte_col_to_utf16(sd.range.0, sd.range.1)),
+                end: Position::new(sd.range.2, utf16_index.byte_col_to_utf16(sd.range.2, sd.range.3)),
             },
             severity: Some(DiagnosticSeverity::WARNING),
             source: Some("php-lsp".to_string()),
@@ -1205,6 +1212,7 @@ impl LanguageServer for PhpLspBackend {
             };
 
             let source = parser.source();
+            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
 
             // Get file symbols for name resolution
             let file_symbols = self
@@ -1216,7 +1224,7 @@ impl LanguageServer for PhpLspBackend {
 
             // Find symbol at cursor position
             let sym_at_pos =
-                match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
+                match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
                     Some(s) => s,
                     None => return Ok(None),
                 };
@@ -1226,7 +1234,7 @@ impl LanguageServer for PhpLspBackend {
                     &source,
                     &file_symbols,
                     pos.line,
-                    pos.character,
+                    byte_col,
                 )
             } else {
                 None
@@ -1447,6 +1455,7 @@ impl LanguageServer for PhpLspBackend {
             };
 
             let source = parser.source();
+            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
 
             let file_symbols = self
                 .index
@@ -1461,12 +1470,13 @@ impl LanguageServer for PhpLspBackend {
             };
 
             let local_var_def =
-                variable_definition_at_position(tree, &source, pos.line, pos.character);
+                variable_definition_at_position(tree, &source, pos.line, byte_col)
+                    .map(|d| range_byte_to_utf16(&source, d));
             let sym = symbol_at_position_with_resolver(
                 tree,
                 &source,
                 pos.line,
-                pos.character,
+                byte_col,
                 &file_symbols,
                 Some(&resolver),
             );
@@ -1590,16 +1600,17 @@ impl LanguageServer for PhpLspBackend {
                 None => return Ok(None),
             };
             let source = parser.source();
+            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
             let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
-            match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
+            match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
                 Some(sym) => {
                     if sym.ref_kind == RefKind::Variable {
                         let refs = find_variable_references_at_position(
                             tree,
                             &source,
                             pos.line,
-                            pos.character,
+                            byte_col,
                             include_declaration,
                         );
                         if refs.is_empty() {
@@ -1611,12 +1622,15 @@ impl LanguageServer for PhpLspBackend {
                         };
                         let locations: Vec<Location> = refs
                             .into_iter()
-                            .map(|r| Location {
-                                uri: uri.clone(),
-                                range: Range {
-                                    start: Position::new(r.range.0, r.range.1),
-                                    end: Position::new(r.range.2, r.range.3),
-                                },
+                            .map(|r| {
+                                let rng = range_byte_to_utf16(&source, r.range);
+                                Location {
+                                    uri: uri.clone(),
+                                    range: Range {
+                                        start: Position::new(rng.0, rng.1),
+                                        end: Position::new(rng.2, rng.3),
+                                    },
+                                }
                             })
                             .collect();
                         return Ok(Some(locations));
@@ -1659,14 +1673,20 @@ impl LanguageServer for PhpLspBackend {
             let refs = if let Some(parser) = self.open_files.get(&file_uri) {
                 if let Some(tree) = parser.tree() {
                     let source = parser.source();
-                    find_references_in_file(
+                    let raw = find_references_in_file(
                         tree,
                         &source,
                         &file_syms,
                         &target_fqn,
                         target_kind,
                         include_declaration,
-                    )
+                    );
+                    raw.into_iter()
+                        .map(|mut r| {
+                            r.range = range_byte_to_utf16(&source, r.range);
+                            r
+                        })
+                        .collect::<Vec<_>>()
                 } else {
                     continue;
                 }
@@ -1686,14 +1706,20 @@ impl LanguageServer for PhpLspBackend {
                     Some(t) => t,
                     None => continue,
                 };
-                find_references_in_file(
+                let raw = find_references_in_file(
                     tree,
                     &source,
                     &file_syms,
                     &target_fqn,
                     target_kind,
                     include_declaration,
-                )
+                );
+                raw.into_iter()
+                    .map(|mut r| {
+                        r.range = range_byte_to_utf16(&source, r.range);
+                        r
+                    })
+                    .collect::<Vec<_>>()
             };
 
             for r in refs {
@@ -1742,9 +1768,10 @@ impl LanguageServer for PhpLspBackend {
             None => return Ok(None),
         };
         let source = parser.source();
+        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
-        let sym = match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
+        let sym = match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -1759,7 +1786,7 @@ impl LanguageServer for PhpLspBackend {
                 tower_lsp::jsonrpc::Error::invalid_params("Invalid variable name")
             })?;
             let refs =
-                find_variable_references_at_position(tree, &source, pos.line, pos.character, true);
+                find_variable_references_at_position(tree, &source, pos.line, byte_col, true);
             if refs.is_empty() {
                 return Ok(None);
             }
@@ -1769,12 +1796,15 @@ impl LanguageServer for PhpLspBackend {
             };
             let edits: Vec<TextEdit> = refs
                 .into_iter()
-                .map(|r| TextEdit {
-                    range: Range {
-                        start: Position::new(r.range.0, r.range.1),
-                        end: Position::new(r.range.2, r.range.3),
-                    },
-                    new_text: replacement.clone(),
+                .map(|r| {
+                    let rng = range_byte_to_utf16(&source, r.range);
+                    TextEdit {
+                        range: Range {
+                            start: Position::new(rng.0, rng.1),
+                            end: Position::new(rng.2, rng.3),
+                        },
+                        new_text: replacement.clone(),
+                    }
                 })
                 .collect();
             let mut changes: std::collections::HashMap<Uri, Vec<TextEdit>> =
@@ -1883,23 +1913,26 @@ impl LanguageServer for PhpLspBackend {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     let edits: Vec<TextEdit> = refs
                         .into_iter()
-                        .map(|r| TextEdit {
-                            range: Range {
-                                start: Position::new(r.range.0, r.range.1),
-                                end: Position::new(r.range.2, r.range.3),
-                            },
-                            new_text: if target_kind == php_lsp_types::PhpSymbolKind::Property
-                                && range_starts_with_dollar(&source_text, r.range)
-                            {
-                                format!(
-                                    "${}",
-                                    property_new_name
-                                        .as_deref()
-                                        .unwrap_or(new_name.trim_start_matches('$'))
-                                )
-                            } else {
-                                property_new_name.as_deref().unwrap_or(new_name).to_string()
-                            },
+                        .map(|r| {
+                            let rng = range_byte_to_utf16(&source_text, r.range);
+                            TextEdit {
+                                range: Range {
+                                    start: Position::new(rng.0, rng.1),
+                                    end: Position::new(rng.2, rng.3),
+                                },
+                                new_text: if target_kind == php_lsp_types::PhpSymbolKind::Property
+                                    && range_starts_with_dollar(&source_text, r.range)
+                                {
+                                    format!(
+                                        "${}",
+                                        property_new_name
+                                            .as_deref()
+                                            .unwrap_or(new_name.trim_start_matches('$'))
+                                    )
+                                } else {
+                                    property_new_name.as_deref().unwrap_or(new_name).to_string()
+                                },
+                            }
                         })
                         .collect();
                     changes.entry(uri).or_default().extend(edits);
@@ -1934,18 +1967,20 @@ impl LanguageServer for PhpLspBackend {
             None => return Ok(None),
         };
         let source = parser.source();
+        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
-        match symbol_at_position(tree, &source, pos.line, pos.character, &file_symbols) {
+        match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
             Some(sym) => {
                 // Variable rename support is local-scope only.
                 if sym.ref_kind == RefKind::Variable {
                     if !is_renameable_variable(&sym.name) {
                         return Ok(None);
                     }
+                    let rng = range_byte_to_utf16(&source, sym.range);
                     let range = Range {
-                        start: Position::new(sym.range.0, sym.range.1),
-                        end: Position::new(sym.range.2, sym.range.3),
+                        start: Position::new(rng.0, rng.1),
+                        end: Position::new(rng.2, rng.3),
                     };
                     return Ok(Some(PrepareRenameResponse::Range(range)));
                 }
@@ -1960,9 +1995,10 @@ impl LanguageServer for PhpLspBackend {
                     }
                 }
 
+                let rng2 = range_byte_to_utf16(&source, sym.range);
                 let range = Range {
-                    start: Position::new(sym.range.0, sym.range.1),
-                    end: Position::new(sym.range.2, sym.range.3),
+                    start: Position::new(rng2.0, rng2.1),
+                    end: Position::new(rng2.2, rng2.3),
                 };
 
                 Ok(Some(PrepareRenameResponse::Range(range)))
@@ -2179,10 +2215,11 @@ impl LanguageServer for PhpLspBackend {
             None => return Ok(None),
         };
         let source = parser.source();
+        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
         // Detect completion context
-        let context = detect_context(tree, &source, pos.line, pos.character, &file_symbols);
+        let context = detect_context(tree, &source, pos.line, byte_col, &file_symbols);
         let context = match context {
             php_lsp_completion::context::CompletionContext::MemberAccess {
                 object_expr,
@@ -2195,7 +2232,7 @@ impl LanguageServer for PhpLspBackend {
                             &source,
                             &file_symbols,
                             pos.line,
-                            pos.character,
+                            byte_col,
                             &object_expr,
                         )
                     } else {
