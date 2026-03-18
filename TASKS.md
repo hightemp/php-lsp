@@ -364,6 +364,21 @@
   - Результат: **19/19 тестов** (3 новых use statement теста).
   - 134 unit/e2e теста, clippy clean.
 
+- [x] **H-020** Aliased use statements, qualified names, closure params *(done 2026-03-18)*
+  - **Проблема 1**: `use Symfony\...\Constraints as Assert;` — ложная диагностика «Unresolved use statement» (FQN — namespace, не класс).
+  - **Фикс 1**: в `check_use_statements` (semantic.rs) при `alias.is_some()` пропускаем диагностику для неразрешённых FQN.
+  - **Проблема 2**: `new Assert\NotBlank(...)` — go-to-definition не работал: parent ноды `name("NotBlank")` — `qualified_name`, а не `object_creation_expression`.
+  - **Фикс 2**: добавлены `find_qualified_name_ancestor()` и `is_inside_class_reference_context()` в resolve.rs, новый match arm для `"qualified_name" | "namespace_name"` в контексте class reference.
+  - **Проблема 3**: `$er->createQueryBuilder()` и `$subscriber->getLastName()` внутри closure — go-to-definition не работал.
+  - **Причина**: `find_enclosing_function` использовал `"anonymous_function_creation_expression"`, но tree-sitter PHP использует `"anonymous_function"`.
+  - **Фикс 3**: добавлен `"anonymous_function"` в resolve.rs (2 места) и references.rs (1 место).
+  - **Проблема 4**: 8 «Unknown class» warnings для классов через aliased namespace (Assert\NotBlank → Symfony\...\Constraints\NotBlank).
+  - **Фикс 4**: добавлена `collect_aliased_class_fqns()` в semantic.rs — обходит CST и собирает FQN классов из aliased qualified names. В `publish_diagnostics` (server.rs) вызывается перед `compute_diagnostics` для pre-resolve через `lazy_index_class`.
+  - **Unit tests**: `test_resolve_new_qualified_name`, `test_resolve_closure_param_method_call`, `test_resolve_closure_param_method_chain`, `test_aliased_use_no_false_diagnostic`.
+  - **E2E test**: `scripts/test-porting-request-type.py` — 33 теста по всему PortingRequestType.php.
+  - Результат: **33/33 go-to-def**, **0 diagnostics**, **19/19 regression tests**.
+  - 138 unit тестов, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

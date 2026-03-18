@@ -15,6 +15,7 @@ use php_lsp_parser::resolve::{
     variable_definition_at_position, variable_hover_info_at_position, RefKind,
 };
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
+use php_lsp_parser::semantic::collect_aliased_class_fqns;
 use php_lsp_parser::symbols::extract_file_symbols;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -360,6 +361,24 @@ impl PhpLspBackend {
             drop(fs); // release DashMap ref before async calls
             for fqn in fqns_to_resolve {
                 self.lazy_index_class(&fqn).await;
+            }
+        }
+
+        // Also pre-resolve: class FQNs from aliased qualified names used in code.
+        // e.g. `use Symfony\...\Constraints as Assert;` → `new Assert\NotBlank`
+        // → need to lazily index `Symfony\...\Constraints\NotBlank`.
+        if let Some(parser) = self.open_files.get(&uri_str) {
+            if let Some(tree) = parser.tree() {
+                let source = parser.source();
+                if let Some(fs) = self.index.file_symbols.get(&uri_str) {
+                    let alias_fqns = collect_aliased_class_fqns(tree, &source, &fs);
+                    drop(fs);
+                    for fqn in alias_fqns {
+                        if !self.index.types.contains_key(fqn.as_str()) {
+                            self.lazy_index_class(&fqn).await;
+                        }
+                    }
+                }
             }
         }
 

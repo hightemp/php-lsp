@@ -255,7 +255,8 @@ fn find_all_property_assignment_types(
         // to avoid matching assignments in nested scopes.
         // We DO enter class_declaration and method_declaration since
         // that's where $this->prop assignments live.
-        if child.kind() != "anonymous_function_creation_expression"
+        if child.kind() != "anonymous_function"
+            && child.kind() != "anonymous_function_creation_expression"
             && child.kind() != "arrow_function"
         {
             find_all_property_assignment_types(child, source, prop_name, file_symbols, resolver, results);
@@ -318,6 +319,55 @@ fn find_node_at_point(root: Node, point: Point) -> Option<Node> {
     }
 
     Some(node)
+}
+
+/// Walk up from a `qualified_name` or `namespace_name` node to find the
+/// `qualified_name` ancestor that sits directly inside a class-reference
+/// context (object_creation_expression, named_type, etc.).
+fn find_qualified_name_ancestor(start: Node) -> Node {
+    let mut current = start;
+    while matches!(
+        current.kind(),
+        "namespace_name" | "namespace_name_as_prefix" | "qualified_name"
+    ) {
+        if let Some(p) = current.parent() {
+            if !matches!(
+                p.kind(),
+                "namespace_name" | "namespace_name_as_prefix" | "qualified_name"
+            ) {
+                // `current` is the topmost qualified/namespace node; its parent
+                // is the actual class-reference context.
+                return current;
+            }
+            current = p;
+        } else {
+            break;
+        }
+    }
+    current
+}
+
+/// Check if a `qualified_name`/`namespace_name` node is inside a class-reference
+/// context (object_creation_expression, named_type, etc.).
+fn is_inside_class_reference_context(start: Node) -> bool {
+    let qname = find_qualified_name_ancestor(start);
+    qname
+        .parent()
+        .map(|p| {
+            matches!(
+                p.kind(),
+                "object_creation_expression"
+                    | "named_type"
+                    | "optional_type"
+                    | "base_clause"
+                    | "class_interface_clause"
+                    | "type_list"
+                    | "class_constant_access_expression"
+                    | "scoped_call_expression"
+                    | "scoped_property_access_expression"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Resolve a CST node to symbol information.
@@ -526,6 +576,24 @@ fn resolve_node(
                 fqn: resolved,
                 name: node_text.to_string(),
                 ref_kind: RefKind::FunctionCall,
+                object_expr: None,
+                range: node_range(node),
+            })
+        }
+
+        // Child name inside qualified_name used as a class reference (e.g. new Assert\NotBlank, type hints).
+        // Walk up through qualified_name / namespace_name to find the context.
+        "qualified_name" | "namespace_name"
+            if is_inside_class_reference_context(parent) =>
+        {
+            // Walk up to find the qualified_name ancestor and resolve its full text
+            let qname_node = find_qualified_name_ancestor(parent);
+            let qname_text = &source[qname_node.byte_range()];
+            let resolved = resolve_class_name(qname_text, file_symbols);
+            Some(SymbolAtPosition {
+                fqn: resolved,
+                name: node_text.to_string(),
+                ref_kind: RefKind::ClassName,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -902,6 +970,7 @@ fn find_enclosing_function(node: Node) -> Option<Node> {
             "method_declaration"
             | "function_definition"
             | "arrow_function"
+            | "anonymous_function"
             | "anonymous_function_creation_expression" => {
                 return Some(n);
             }
@@ -2027,5 +2096,86 @@ class MyTest {
         let result4 = parse_and_resolve(code2, 1, 4).unwrap();
         assert_eq!(result4.fqn, "TestCase");
         assert_eq!(result4.ref_kind, RefKind::ClassName);
+    }
+
+    #[test]
+    fn test_resolve_new_qualified_name() {
+        // new Assert\NotBlank — qualified name in object_creation_expression
+        let code = r#"<?php
+namespace App\Form;
+
+use Symfony\Component\Validator\Constraints as Assert;
+
+class Foo {
+    public function build(): void {
+        $x = new Assert\NotBlank(message: 'Test');
+    }
+}
+"#;
+        // Cursor on "NotBlank"
+        let (l1, c1) = find_line_col(code, "Assert\\NotBlank");
+        let result = parse_and_resolve(code, l1, c1 + 7).unwrap();
+        assert_eq!(
+            result.fqn,
+            "Symfony\\Component\\Validator\\Constraints\\NotBlank"
+        );
+        assert_eq!(result.ref_kind, RefKind::ClassName);
+
+        // Cursor on "Assert" (namespace part)
+        let result2 = parse_and_resolve(code, l1, c1).unwrap();
+        assert_eq!(
+            result2.fqn,
+            "Symfony\\Component\\Validator\\Constraints\\NotBlank"
+        );
+        assert_eq!(result2.ref_kind, RefKind::ClassName);
+    }
+
+    #[test]
+    fn test_resolve_closure_param_method_call() {
+        // Method call on closure parameter with type hint
+        let code = r#"<?php
+namespace App\Form;
+
+use App\Repository\PortingRequestTypesRepository;
+
+class Foo {
+    public function build(): void {
+        $fn = static function (PortingRequestTypesRepository $er) {
+            return $er->createQueryBuilder('prt');
+        };
+    }
+}
+"#;
+        // Cursor on "createQueryBuilder"
+        let (l1, c1) = find_line_col(code, "createQueryBuilder");
+        let result = parse_and_resolve(code, l1, c1).unwrap();
+        assert_eq!(
+            result.fqn,
+            "App\\Repository\\PortingRequestTypesRepository::createQueryBuilder"
+        );
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_closure_param_method_chain() {
+        // Method call chain on closure parameter: $subscriber->getLastName()
+        let code = r#"<?php
+namespace App\Form;
+
+use App\Entity\Subscriber;
+
+class Foo {
+    public function build(): void {
+        $fn = static function (Subscriber $subscriber) {
+            return $subscriber->getLastName();
+        };
+    }
+}
+"#;
+        // Cursor on "getLastName"
+        let (l1, c1) = find_line_col(code, "getLastName");
+        let result = parse_and_resolve(code, l1, c1).unwrap();
+        assert_eq!(result.fqn, "App\\Entity\\Subscriber::getLastName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
     }
 }
