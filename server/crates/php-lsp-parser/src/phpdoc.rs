@@ -103,17 +103,27 @@ fn parse_tag(line: &str, doc: &mut PhpDoc) {
     }
 }
 
+fn is_param_name(s: &str) -> bool {
+    s.starts_with('$') || s.starts_with("&$")
+}
+
+fn strip_param_prefix(s: &str) -> &str {
+    s.strip_prefix("&$")
+        .or_else(|| s.strip_prefix('$'))
+        .unwrap_or(s)
+}
+
 fn parse_param_tag(rest: &str, doc: &mut PhpDoc) {
     let parts: Vec<&str> = rest.splitn(3, char::is_whitespace).collect();
     if parts.is_empty() {
         return;
     }
 
-    let (type_str, name_str, desc) = if parts[0].starts_with('$') {
+    let (type_str, name_str, desc) = if is_param_name(parts[0]) {
         // @param $name — no type
         (None, parts[0], parts.get(1).map(|s| s.to_string()))
-    } else if parts.len() >= 2 && parts[1].starts_with('$') {
-        // @param Type $name [description]
+    } else if parts.len() >= 2 && is_param_name(parts[1]) {
+        // @param Type $name [description]  or  @param Type &$name [description]
         (
             Some(parts[0]),
             parts[1],
@@ -123,7 +133,7 @@ fn parse_param_tag(rest: &str, doc: &mut PhpDoc) {
         return;
     };
 
-    let name = name_str.strip_prefix('$').unwrap_or(name_str).to_string();
+    let name = strip_param_prefix(name_str).to_string();
 
     doc.params.push(PhpDocParam {
         name,

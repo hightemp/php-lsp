@@ -410,6 +410,23 @@
   - **Тесты**: 3 новых теста — `test_resolve_method_chain_static_return_type`, `test_resolve_method_chain_phpdoc_return_this`, `test_resolve_method_chain_cross_class_return`.
   - 144 unit теста, 16 e2e тестов, clippy clean.
 
+- [x] **H-024** Ложные срабатывания "Too few arguments" для функций с необязательными параметрами *(done 2026-03-18)*
+  - **Проблема**: для `preg_replace_callback()`, `mb_strtolower()`, `file_get_contents()` и других функций выдавалась ошибка "Too few arguments", хотя вызовы были корректными.
+  - **Причина**: расчёт `required` считал ВСЕ параметры без `default_value` как обязательные. Но в phpstorm-stubs (и в PHP) параметры, идущие после параметра с дефолтом, фактически необязательны, даже если у них нет явного `default_value`. Пример: `preg_replace_callback(..., int $limit = -1, &$count, ...)` — `&$count` не имеет default, но стоит после `$limit` (с дефолтом) и является необязательным в PHP.
+  - **Фикс**: изменён расчёт `required` с подсчёта всех не-default параметров на "непрерывный обязательный префикс" — позиция первого параметра с `default_value` или `is_variadic`. Параметры после этой позиции считаются необязательными.
+    - **semantic.rs**: два места — проверка аргументов обычных функций (~line 357) и конструкторов (~line 192). В обоих использован `.position()` вместо `.filter().count()`.
+  - **Тесты**: 1 новый тест `test_no_false_positive_for_optional_params_after_default` — эмулирует сигнатуру `preg_replace_callback` с 6 параметрами (3 required, 1 default, 1 by-ref без default, 1 default), вызов с 3 аргументами не должен давать ошибку.
+  - 145 unit тестов, 16 e2e тестов, clippy clean.
+
+- [x] **H-025** Ложные "Too few arguments" для `mb_strtolower()`, `str_replace()` и аналогичных *(done 2026-03-18)*
+  - **Проблема**: H-024 не закрыл все случаи. `mb_strtolower(string $string, ?string $encoding)` — оба параметра без default → required=2. `str_replace($search, $replace, $subject, &$count)` — все 4 без default → required=4. Но `$encoding` и `&$count` помечены `[optional]` в PHPDoc стабов, и фактически необязательны в PHP.
+  - **Причина**: phpstorm-stubs помечают необязательные параметры через `@param ... [optional]` в PHPDoc, а не через `default_value` в сигнатуре. Парсер не учитывал эту аннотацию.
+  - **Фикс**:
+    - **symbols.rs**: новая функция `apply_phpdoc_to_signature()` — парсит PHPDoc, находит `@param` с `[optional]` в описании, и ставит синтетический `default_value = "null"` для соответствующих параметров сигнатуры. Вызывается из `extract_method` и `extract_function` (заменила дублированный код PHPDoc `@return` fallback).
+    - **phpdoc.rs**: исправлен `parse_param_tag` — добавлена поддержка `&$name` (by-ref) в PHPDoc `@param`. Ранее `&$count` не распознавался как имя параметра.
+  - **Тесты**: 2 новых теста — `test_phpdoc_optional_sets_default_value` (эмулирует `mb_strtolower`), `test_phpdoc_optional_on_byref_param` (эмулирует `str_replace` с `&$count`).
+  - 147 unit тестов, 16 e2e тестов, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

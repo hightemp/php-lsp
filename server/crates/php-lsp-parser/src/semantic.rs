@@ -187,11 +187,13 @@ fn check_class_in_new<F>(
         let ctor_fqn = format!("{}::__construct", fqn);
         if let Some(ctor_sym) = resolver(&ctor_fqn) {
             if let Some(ref sig) = ctor_sym.signature {
+                // Required = contiguous leading params without defaults.
+                // Once a param has a default or is variadic, all subsequent are optional.
                 let required = sig
                     .params
                     .iter()
-                    .filter(|p| p.default_value.is_none() && !p.is_variadic)
-                    .count();
+                    .position(|p| p.default_value.is_some() || p.is_variadic)
+                    .unwrap_or(sig.params.len());
                 let max = if sig.params.iter().any(|p| p.is_variadic) {
                     usize::MAX
                 } else {
@@ -351,11 +353,13 @@ fn check_function_call<F>(
 
             if let Some((resolved_fqn, func_sym)) = resolved {
                 if let Some(ref sig) = func_sym.signature {
+                    // Required = contiguous leading params without defaults.
+                    // Once a param has a default or is variadic, all subsequent are optional.
                     let required = sig
                         .params
                         .iter()
-                        .filter(|p| p.default_value.is_none() && !p.is_variadic)
-                        .count();
+                        .position(|p| p.default_value.is_some() || p.is_variadic)
+                        .unwrap_or(sig.params.len());
                     let max = if sig.params.iter().any(|p| p.is_variadic) {
                         usize::MAX
                     } else {
@@ -956,6 +960,88 @@ class Child extends Base {
             unknown.is_empty(),
             "Expected no unknown-class diagnostics for case-insensitive self/static/parent, got: {:?}",
             unknown
+        );
+    }
+
+    /// Params after the first default-value param are implicitly optional even
+    /// without their own default value (common in phpstorm-stubs, e.g.
+    /// `preg_replace_callback`, `file_get_contents`).
+    #[test]
+    fn test_no_false_positive_for_optional_params_after_default() {
+        // Simulates preg_replace_callback($pattern, $callback, $subject, int $limit = -1, &$count, int $flags = 0)
+        // Only the first 3 params (before $limit which has a default) are truly required.
+        let code = r#"<?php
+preg_replace_callback('/x/', function(){}, 'input');
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "preg_replace_callback" {
+                Some(function_symbol(
+                    fqn,
+                    vec![
+                        ParamInfo {
+                            name: "pattern".to_string(),
+                            type_info: None,
+                            default_value: None,
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "callback".to_string(),
+                            type_info: None,
+                            default_value: None,
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "subject".to_string(),
+                            type_info: None,
+                            default_value: None,
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "limit".to_string(),
+                            type_info: None,
+                            default_value: Some("-1".to_string()),
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "count".to_string(),
+                            type_info: None,
+                            default_value: None, // no default but after a defaulted param
+                            is_variadic: false,
+                            is_by_ref: true,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "flags".to_string(),
+                            type_info: None,
+                            default_value: Some("0".to_string()),
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                    ],
+                ))
+            } else {
+                None
+            }
+        });
+
+        let arg_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::ArgumentCountMismatch)
+            .collect();
+
+        assert!(
+            arg_diags.is_empty(),
+            "Expected NO argument-count diagnostic for 3 args to preg_replace_callback (required prefix = 3), got: {:?}",
+            arg_diags
         );
     }
 }
