@@ -397,6 +397,19 @@
   - **Затронутые файлы**: parser.rs, utf16.rs (новый), lib.rs, server.rs.
   - 141 unit тест, 16 e2e тестов, clippy clean.
 
+- [x] **H-023** Go-to-definition и hover для method chains (`$er->createQueryBuilder()->orderBy()->addOrderBy()`) *(done 2026-03-18)*
+  - **Проблема**: go-to-definition не работал для методов в цепочке вызовов. `$er->createQueryBuilder('s')->orderBy(...)` — `orderBy` не разрешался, потому что LSP не мог определить тип возвращаемый `createQueryBuilder()` и далее по цепочке.
+  - **Причины**:
+    1. Типы возвращаемых значений `self`/`static`/`$this` не обрабатывались — `resolve_member_type` и `try_resolve_object_type` передавали их в `resolve_class_name`, который не мог их разрешить.
+    2. Hover handler использовал `symbol_at_position` (без resolver), поэтому не мог резолвить cross-file типы в цепочках.
+    3. PHPDoc `@return` не использовался как fallback когда PHP-тип возврата отсутствует.
+  - **Фикс**:
+    - **resolve.rs**: в `try_resolve_object_type` для `member_call_expression` и `member_access_expression` — если return type = `self`/`static`/`$this`, возвращает FQN класса-владельца метода.
+    - **server.rs**: `resolve_member_type` — аналогичная обработка `self`/`static`/`$this`. Hover handler переведён на `symbol_at_position_with_resolver` для поддержки цепочек.
+    - **symbols.rs**: `extract_method` и `extract_function` — когда PHP return type отсутствует, берётся `@return` из PHPDoc как fallback.
+  - **Тесты**: 3 новых теста — `test_resolve_method_chain_static_return_type`, `test_resolve_method_chain_phpdoc_return_this`, `test_resolve_method_chain_cross_class_return`.
+  - 144 unit теста, 16 e2e тестов, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)

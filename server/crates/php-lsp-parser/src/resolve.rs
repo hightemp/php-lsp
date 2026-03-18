@@ -874,6 +874,10 @@ fn try_resolve_object_type<'a>(
                             if !type_str.is_empty() && type_str != "mixed" {
                                 // Strip nullable prefix for resolution
                                 let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
+                                // self/static/$this → return owning class
+                                if base_type == "self" || base_type == "static" || base_type == "$this" {
+                                    return Some(class_fqn.clone());
+                                }
                                 return Some(resolve_class_name(base_type, file_symbols));
                             }
                         }
@@ -908,6 +912,10 @@ fn try_resolve_object_type<'a>(
                             let type_str = ret.to_string();
                             if !type_str.is_empty() && type_str != "mixed" {
                                 let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
+                                // self/static/$this → return owning class
+                                if base_type == "self" || base_type == "static" || base_type == "$this" {
+                                    return Some(class_fqn.clone());
+                                }
                                 return Some(resolve_class_name(base_type, file_symbols));
                             }
                         }
@@ -2194,5 +2202,129 @@ class Foo {
         let result = parse_and_resolve(code, l1, c1).unwrap();
         assert_eq!(result.fqn, "App\\Entity\\Subscriber::getLastName");
         assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_method_chain_static_return_type() {
+        // Method chain: $qb->orderBy(...)->addOrderBy(...)
+        // orderBy() returns `static`, addOrderBy is on same class
+        let code = r#"<?php
+namespace App\ORM;
+
+class QueryBuilder {
+    public function orderBy(string $sort): static {
+        return $this;
+    }
+    public function addOrderBy(string $sort): static {
+        return $this;
+    }
+}
+
+class Foo {
+    public function test(): void {
+        $qb = new QueryBuilder();
+        $qb->orderBy('a')->addOrderBy('b');
+    }
+}
+"#;
+        // Cursor on "addOrderBy" in the chain
+        let (l, c) = find_line_col(code, "addOrderBy('b')");
+        let result = parse_and_resolve(code, l, c).unwrap();
+        assert_eq!(result.fqn, "App\\ORM\\QueryBuilder::addOrderBy");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+
+        // Cursor on "orderBy" — first in chain
+        let (l2, c2) = find_line_col(code, "orderBy('a')");
+        let result2 = parse_and_resolve(code, l2, c2).unwrap();
+        assert_eq!(result2.fqn, "App\\ORM\\QueryBuilder::orderBy");
+        assert_eq!(result2.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_method_chain_phpdoc_return_this() {
+        // Method chain where return type comes from PHPDoc @return $this
+        let code = r#"<?php
+namespace App\ORM;
+
+class Builder {
+    /** @return $this */
+    public function where(string $cond) {
+        return $this;
+    }
+    /** @return $this */
+    public function setParameter(string $name, $value) {
+        return $this;
+    }
+    /** @return $this */
+    public function orderBy(string $sort) {
+        return $this;
+    }
+}
+
+class Foo {
+    public function test(): void {
+        $b = new Builder();
+        $b->where('x')->setParameter('y', 1)->orderBy('z');
+    }
+}
+"#;
+        // Cursor on "orderBy" — 3rd in chain
+        let (l, c) = find_line_col(code, "orderBy('z')");
+        let result = parse_and_resolve(code, l, c).unwrap();
+        assert_eq!(result.fqn, "App\\ORM\\Builder::orderBy");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+
+        // Cursor on "setParameter" — 2nd in chain
+        let (l2, c2) = find_line_col(code, "setParameter('y'");
+        let result2 = parse_and_resolve(code, l2, c2).unwrap();
+        assert_eq!(result2.fqn, "App\\ORM\\Builder::setParameter");
+        assert_eq!(result2.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_method_chain_cross_class_return() {
+        // Chain where createQueryBuilder() returns a different class
+        let code = r#"<?php
+namespace App\ORM;
+
+class QueryBuilder {
+    public function orderBy(string $sort): static {
+        return $this;
+    }
+    public function addOrderBy(string $sort): static {
+        return $this;
+    }
+}
+
+class EntityRepository {
+    public function createQueryBuilder(string $alias): QueryBuilder {
+        return new QueryBuilder();
+    }
+}
+
+class Foo {
+    public function test(): void {
+        $er = new EntityRepository();
+        $er->createQueryBuilder('s')->orderBy('a')->addOrderBy('b');
+    }
+}
+"#;
+        // Cursor on "addOrderBy" — 3rd level chain
+        let (l, c) = find_line_col(code, "addOrderBy('b')");
+        let result = parse_and_resolve(code, l, c).unwrap();
+        assert_eq!(result.fqn, "App\\ORM\\QueryBuilder::addOrderBy");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+
+        // Cursor on "orderBy" — 2nd level
+        let (l2, c2) = find_line_col(code, "orderBy('a')");
+        let result2 = parse_and_resolve(code, l2, c2).unwrap();
+        assert_eq!(result2.fqn, "App\\ORM\\QueryBuilder::orderBy");
+        assert_eq!(result2.ref_kind, RefKind::MethodCall);
+
+        // Cursor on "createQueryBuilder" — 1st level
+        let (l3, c3) = find_line_col(code, "createQueryBuilder('s')");
+        let result3 = parse_and_resolve(code, l3, c3).unwrap();
+        assert_eq!(result3.fqn, "App\\ORM\\EntityRepository::createQueryBuilder");
+        assert_eq!(result3.ref_kind, RefKind::MethodCall);
     }
 }

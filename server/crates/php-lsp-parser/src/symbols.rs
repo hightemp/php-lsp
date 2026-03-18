@@ -391,7 +391,17 @@ fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols,
     let visibility = extract_visibility(node, source);
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
-    let signature = extract_signature(node, source);
+    let mut signature = extract_signature(node, source);
+
+    // Fallback: use PHPDoc @return when PHP return type is absent
+    if signature.return_type.is_none() {
+        if let Some(ref doc) = doc_comment {
+            let phpdoc = crate::phpdoc::parse_phpdoc(doc);
+            if let Some(ret) = phpdoc.return_type {
+                signature.return_type = Some(ret);
+            }
+        }
+    }
 
     result.symbols.push(SymbolInfo {
         name,
@@ -424,7 +434,17 @@ fn extract_function(
     let name = node_text(name_node, source).to_string();
     let fqn = make_fqn(current_ns, &name);
     let doc_comment = find_doc_comment(node, source);
-    let signature = extract_signature(node, source);
+    let mut signature = extract_signature(node, source);
+
+    // Fallback: use PHPDoc @return when PHP return type is absent
+    if signature.return_type.is_none() {
+        if let Some(ref doc) = doc_comment {
+            let phpdoc = crate::phpdoc::parse_phpdoc(doc);
+            if let Some(ret) = phpdoc.return_type {
+                signature.return_type = Some(ret);
+            }
+        }
+    }
 
     result.symbols.push(SymbolInfo {
         name,

@@ -98,6 +98,11 @@ impl PhpLspBackend {
         // Strip nullable prefix for resolution
         let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
 
+        // Handle self/static/$this return types → return the owning class FQN
+        if base_type == "self" || base_type == "static" || base_type == "$this" {
+            return Some(class_fqn.to_string());
+        }
+
         // If it looks like an FQN already (contains \), return as-is
         if base_type.contains('\\') {
             return Some(base_type.to_string());
@@ -1222,9 +1227,14 @@ impl LanguageServer for PhpLspBackend {
                 .map(|entry| entry.value().clone())
                 .unwrap_or_default();
 
-            // Find symbol at cursor position
+            // Build a cross-file type resolver for method chain resolution
+            let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+                self.resolve_member_type(class_fqn, member_name)
+            };
+
+            // Find symbol at cursor position (with resolver for chains)
             let sym_at_pos =
-                match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
+                match symbol_at_position_with_resolver(tree, &source, pos.line, byte_col, &file_symbols, Some(&resolver)) {
                     Some(s) => s,
                     None => return Ok(None),
                 };
