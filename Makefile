@@ -146,7 +146,7 @@ release:
 	@echo "--- Patching server/Cargo.toml workspace version ---"
 	sed -i 's/^version = ".*"/version = "$(VERSION)"/' $(SERVER_DIR)/Cargo.toml
 	@echo "--- Tagging v$(VERSION) (force) ---"
-	git -C $(ROOT_DIR) add $(CLIENT_DIR)/package.json $(SERVER_DIR)/Cargo.toml
+	git -C $(ROOT_DIR) add $(CLIENT_DIR)/package.json $(SERVER_DIR)/Cargo.toml $(ROOT_DIR)/VERSION
 	git -C $(ROOT_DIR) diff --cached --quiet || \
 		git -C $(ROOT_DIR) commit -m "chore(release): bump version to $(VERSION)"
 	git -C $(ROOT_DIR) tag -f "v$(VERSION)"
