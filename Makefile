@@ -140,16 +140,30 @@ clean:
 # builds a universal .vsix, creates/force-updates the git tag and pushes.
 release:
 	@if [[ -z "$(VERSION)" ]]; then echo "ERROR: VERSION file is empty"; exit 1; fi
+	@if ! echo "$(VERSION)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then \
+		echo "ERROR: VERSION '$(VERSION)' is not valid semver (X.Y.Z)"; exit 1; \
+	fi
+	@if ! git -C $(ROOT_DIR) diff --quiet || ! git -C $(ROOT_DIR) diff --cached --quiet; then \
+		echo "ERROR: working tree is not clean, commit or stash changes first"; exit 1; \
+	fi
 	@echo "=== Release v$(VERSION) ==="
 	@echo "--- Patching client/package.json ---"
 	cd $(CLIENT_DIR) && npm version "$(VERSION)" --no-git-tag-version --allow-same-version
 	@echo "--- Patching server/Cargo.toml workspace version ---"
 	sed -i 's/^version = ".*"/version = "$(VERSION)"/' $(SERVER_DIR)/Cargo.toml
+	@echo "--- Updating Cargo.lock ---"
+	cd $(SERVER_DIR) && cargo update --workspace --quiet 2>/dev/null || true
 	@echo "--- Tagging v$(VERSION) (force) ---"
-	git -C $(ROOT_DIR) add $(CLIENT_DIR)/package.json $(SERVER_DIR)/Cargo.toml $(ROOT_DIR)/VERSION
+	git -C $(ROOT_DIR) add \
+		$(CLIENT_DIR)/package.json \
+		$(CLIENT_DIR)/package-lock.json \
+		$(SERVER_DIR)/Cargo.toml \
+		$(SERVER_DIR)/Cargo.lock \
+		$(ROOT_DIR)/VERSION
 	git -C $(ROOT_DIR) diff --cached --quiet || \
 		git -C $(ROOT_DIR) commit -m "chore(release): bump version to $(VERSION)"
 	git -C $(ROOT_DIR) tag -f "v$(VERSION)"
-	@echo "--- Pushing tag to GitHub ---"
+	@echo "--- Pushing branch and tag to GitHub ---"
+	git -C $(ROOT_DIR) push origin main
 	git -C $(ROOT_DIR) push origin "v$(VERSION)" --force
 	@echo "=== Released v$(VERSION) ==="
