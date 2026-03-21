@@ -761,6 +761,7 @@ fn find_variable_scope(node: Node) -> Option<Node> {
             "method_declaration"
             | "function_definition"
             | "arrow_function"
+            | "anonymous_function"
             | "anonymous_function_creation_expression" => return Some(n),
             _ => current = n.parent(),
         }

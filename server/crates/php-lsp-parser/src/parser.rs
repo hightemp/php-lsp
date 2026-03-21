@@ -34,8 +34,9 @@ impl FileParser {
 
     /// Apply an incremental edit from LSP didChange and reparse.
     ///
-    /// `range` is (start_line, start_char, end_line, end_char) in 0-based LSP coordinates.
-    /// `new_text` is the replacement text.
+    /// LSP positions use (line, character) where `character` is measured in
+    /// **UTF-16 code units**.  Tree-sitter and ropey work in bytes, so we must
+    /// convert before applying the edit.
     pub fn apply_edit(
         &mut self,
         start_line: u32,
@@ -49,12 +50,16 @@ impl FileParser {
         let end_line = end_line as usize;
         let end_char = end_char as usize;
 
-        // Calculate byte offsets from rope
-        let start_byte = self.position_to_byte(start_line, start_char);
-        let old_end_byte = self.position_to_byte(end_line, end_char);
+        // Calculate byte offsets from rope (UTF-16 → byte).
+        let start_byte = self.utf16_position_to_byte(start_line, start_char);
+        let old_end_byte = self.utf16_position_to_byte(end_line, end_char);
 
-        let start_point = Point::new(start_line, start_char);
-        let old_end_point = Point::new(end_line, end_char);
+        // Tree-sitter Points need byte columns (byte offset from line start).
+        let start_byte_col = start_byte - self.line_start_byte(start_line);
+        let old_end_byte_col = old_end_byte - self.line_start_byte(end_line);
+
+        let start_point = Point::new(start_line, start_byte_col);
+        let old_end_point = Point::new(end_line, old_end_byte_col);
 
         // Apply the edit to the rope
         let start_char_idx = self.rope.byte_to_char(start_byte);
@@ -64,8 +69,9 @@ impl FileParser {
 
         // Calculate new end position
         let new_end_byte = start_byte + new_text.len();
-        let new_end_line_char = self.byte_to_position(new_end_byte);
-        let new_end_point = Point::new(new_end_line_char.0, new_end_line_char.1);
+        let new_end_line = self.rope.byte_to_line(new_end_byte.min(self.rope.len_bytes()));
+        let new_end_byte_col = new_end_byte - self.line_start_byte(new_end_line);
+        let new_end_point = Point::new(new_end_line, new_end_byte_col);
 
         // Apply edit to tree-sitter tree for incremental reparsing
         if let Some(tree) = &mut self.tree {
@@ -99,27 +105,63 @@ impl FileParser {
         &self.rope
     }
 
-    /// Convert (line, char) to byte offset in the rope.
-    fn position_to_byte(&self, line: usize, character: usize) -> usize {
+    /// Convert (line, utf16_character) to byte offset in the rope.
+    ///
+    /// LSP `Position.character` is measured in UTF-16 code units.
+    /// For ASCII this is the same as byte offset, but for multi-byte characters
+    /// (Cyrillic, CJK, emoji, etc.) it differs.
+    fn utf16_position_to_byte(&self, line: usize, utf16_char: usize) -> usize {
         if line >= self.rope.len_lines() {
             return self.rope.len_bytes();
         }
         let line_start = self.rope.line_to_byte(line);
-        let line_len = if line + 1 < self.rope.len_lines() {
-            self.rope.line_to_byte(line + 1) - line_start
-        } else {
-            self.rope.len_bytes() - line_start
-        };
-        line_start + character.min(line_len)
+        let line_slice = self.rope.line(line);
+
+        let mut utf16_offset = 0;
+        let mut byte_offset = 0;
+
+        for ch in line_slice.chars() {
+            if utf16_offset >= utf16_char {
+                break;
+            }
+            byte_offset += ch.len_utf8();
+            utf16_offset += ch.len_utf16();
+        }
+
+        line_start + byte_offset
     }
 
-    /// Convert byte offset to (line, char).
-    fn byte_to_position(&self, byte: usize) -> (usize, usize) {
-        let byte = byte.min(self.rope.len_bytes());
-        let line = self.rope.byte_to_line(byte);
-        let line_start = self.rope.line_to_byte(line);
-        let character = byte - line_start;
-        (line, character)
+    /// Get the byte offset of the start of a line.
+    fn line_start_byte(&self, line: usize) -> usize {
+        if line >= self.rope.len_lines() {
+            return self.rope.len_bytes();
+        }
+        self.rope.line_to_byte(line)
+    }
+
+    /// Convert (line, byte_column) to (line, utf16_character) for LSP.
+    ///
+    /// Tree-sitter positions use byte columns; LSP uses UTF-16 code unit columns.
+    pub fn byte_col_to_utf16(&self, line: u32, byte_col: u32) -> u32 {
+        let line = line as usize;
+        if line >= self.rope.len_lines() {
+            return byte_col;
+        }
+        let line_slice = self.rope.line(line);
+        let byte_col = byte_col as usize;
+
+        let mut utf16_offset: usize = 0;
+        let mut byte_offset: usize = 0;
+
+        for ch in line_slice.chars() {
+            if byte_offset >= byte_col {
+                break;
+            }
+            byte_offset += ch.len_utf8();
+            utf16_offset += ch.len_utf16();
+        }
+
+        utf16_offset as u32
     }
 }
 

@@ -391,7 +391,12 @@ fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols,
     let visibility = extract_visibility(node, source);
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
-    let signature = extract_signature(node, source);
+    let mut signature = extract_signature(node, source);
+
+    // Apply PHPDoc fallbacks: @return type and [optional] params
+    if let Some(ref doc) = doc_comment {
+        apply_phpdoc_to_signature(&mut signature, doc);
+    }
 
     result.symbols.push(SymbolInfo {
         name,
@@ -408,6 +413,47 @@ fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols,
         extends: vec![],
         implements: vec![],
     });
+
+    // Emit Property symbols for promoted constructor parameters.
+    // PHP constructor promotion (`public readonly Type $prop`) creates both a
+    // constructor parameter AND a class property. We need the Property symbol
+    // so that `$this->prop` can be resolved to its type.
+    if let Some(param_list) = node.child_by_field_name("parameters") {
+        let mut cursor = param_list.walk();
+        for child in param_list.children(&mut cursor) {
+            if child.kind() == "property_promotion_parameter" {
+                let prop_vis = extract_visibility(child, source);
+                let prop_mods = extract_modifiers(child, source);
+                let prop_type = child
+                    .child_by_field_name("type")
+                    .map(|t| parse_type_node(t, source));
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let raw_name = node_text(name_node, source);
+                    let prop_name = raw_name.strip_prefix('$').unwrap_or(raw_name).to_string();
+                    let prop_fqn = format!("{}::${}", parent_fqn, prop_name);
+
+                    result.symbols.push(SymbolInfo {
+                        name: prop_name,
+                        fqn: prop_fqn,
+                        kind: PhpSymbolKind::Property,
+                        uri: uri.to_string(),
+                        range: node_range(child),
+                        selection_range: node_range(name_node),
+                        visibility: prop_vis,
+                        modifiers: prop_mods,
+                        doc_comment: None,
+                        signature: prop_type.map(|t| Signature {
+                            params: vec![],
+                            return_type: Some(t),
+                        }),
+                        parent_fqn: Some(parent_fqn.to_string()),
+                        extends: vec![],
+                        implements: vec![],
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn extract_function(
@@ -424,7 +470,12 @@ fn extract_function(
     let name = node_text(name_node, source).to_string();
     let fqn = make_fqn(current_ns, &name);
     let doc_comment = find_doc_comment(node, source);
-    let signature = extract_signature(node, source);
+    let mut signature = extract_signature(node, source);
+
+    // Apply PHPDoc fallbacks: @return type and [optional] params
+    if let Some(ref doc) = doc_comment {
+        apply_phpdoc_to_signature(&mut signature, doc);
+    }
 
     result.symbols.push(SymbolInfo {
         name,
@@ -607,6 +658,41 @@ fn extract_enum_case(
         extends: vec![],
         implements: vec![],
     });
+}
+
+/// Apply PHPDoc information to a signature:
+/// - Use `@return` as fallback when PHP return type is absent.
+/// - Mark params as optional (set synthetic default) when PHPDoc description
+///   contains `[optional]`, which is the convention used by phpstorm-stubs for
+///   parameters that are optional in PHP but have no explicit default value.
+fn apply_phpdoc_to_signature(signature: &mut Signature, doc_comment: &str) {
+    let phpdoc = crate::phpdoc::parse_phpdoc(doc_comment);
+
+    // Fallback: @return type
+    if signature.return_type.is_none() {
+        if let Some(ret) = phpdoc.return_type {
+            signature.return_type = Some(ret);
+        }
+    }
+
+    // Mark [optional] params with a synthetic default value
+    for phpdoc_param in &phpdoc.params {
+        let is_optional = phpdoc_param
+            .description
+            .as_deref()
+            .is_some_and(|d| d.contains("[optional]"));
+        if is_optional {
+            if let Some(sig_param) = signature
+                .params
+                .iter_mut()
+                .find(|p| p.name == phpdoc_param.name)
+            {
+                if sig_param.default_value.is_none() {
+                    sig_param.default_value = Some("null".to_string());
+                }
+            }
+        }
+    }
 }
 
 /// Extract function/method signature (parameters + return type).
@@ -1124,5 +1210,129 @@ mod tests {
             .unwrap();
         assert_eq!(iface.extends, vec!["Bar".to_string(), "Baz".to_string()]);
         assert!(iface.implements.is_empty());
+    }
+
+    #[test]
+    fn test_phpdoc_optional_sets_default_value() {
+        // Simulates mb_strtolower stub: $encoding has no default but PHPDoc says [optional]
+        let syms = parse_and_extract(
+            r#"<?php
+/**
+ * @param string $string The string
+ * @param string|null $encoding [optional]
+ * @return string
+ */
+function mb_strtolower(string $string, ?string $encoding): string {}
+"#,
+        );
+        let func = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Function && s.name == "mb_strtolower")
+            .unwrap();
+        let sig = func.signature.as_ref().unwrap();
+        assert_eq!(sig.params.len(), 2);
+        // $string has no default
+        assert!(sig.params[0].default_value.is_none());
+        // $encoding should now have a synthetic default from [optional]
+        assert!(
+            sig.params[1].default_value.is_some(),
+            "$encoding should have a synthetic default_value from PHPDoc [optional]"
+        );
+    }
+
+    #[test]
+    fn test_phpdoc_optional_on_byref_param() {
+        // Simulates str_replace stub: &$count has no default but PHPDoc says [optional]
+        let syms = parse_and_extract(
+            r#"<?php
+/**
+ * @param array|string $search
+ * @param array|string $replace
+ * @param array|string $subject
+ * @param int &$count [optional] How many replacements were done
+ * @return array|string
+ */
+function str_replace(array|string $search, array|string $replace, array|string $subject, &$count): array|string {}
+"#,
+        );
+        let func = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Function && s.name == "str_replace")
+            .unwrap();
+        let sig = func.signature.as_ref().unwrap();
+        assert_eq!(sig.params.len(), 4);
+        // First 3 have no default
+        assert!(sig.params[0].default_value.is_none());
+        assert!(sig.params[1].default_value.is_none());
+        assert!(sig.params[2].default_value.is_none());
+        // &$count should have a synthetic default from [optional]
+        assert!(
+            sig.params[3].default_value.is_some(),
+            "&$count should have a synthetic default_value from PHPDoc [optional]"
+        );
+    }
+
+    #[test]
+    fn test_promoted_constructor_params_emit_property_symbols() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App;
+
+class MyService {
+    public function __construct(
+        protected readonly LoggerInterface $logger,
+        private string $name,
+        int $notPromoted = 0,
+    ) {}
+}
+"#,
+        );
+
+        // Should have Property symbols for promoted params
+        let logger_prop = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\MyService::$logger");
+        assert!(
+            logger_prop.is_some(),
+            "Expected Property symbol for promoted $logger, symbols: {:?}",
+            syms.symbols.iter().map(|s| (&s.fqn, &s.kind)).collect::<Vec<_>>()
+        );
+        let logger = logger_prop.unwrap();
+        assert_eq!(logger.visibility, Visibility::Protected);
+        assert!(logger.modifiers.is_readonly);
+        // Type should be LoggerInterface
+        let ret_type = logger
+            .signature
+            .as_ref()
+            .and_then(|s| s.return_type.as_ref());
+        assert!(
+            matches!(ret_type, Some(TypeInfo::Simple(t)) if t == "LoggerInterface"),
+            "Expected LoggerInterface type, got: {:?}",
+            ret_type
+        );
+
+        let name_prop = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\MyService::$name");
+        assert!(
+            name_prop.is_some(),
+            "Expected Property symbol for promoted $name"
+        );
+        let name = name_prop.unwrap();
+        assert_eq!(name.visibility, Visibility::Private);
+
+        // $notPromoted is a regular parameter — should NOT be a Property
+        let not_promoted = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.name == "notPromoted");
+        assert!(
+            not_promoted.is_none(),
+            "Regular param $notPromoted should NOT become a Property symbol"
+        );
     }
 }

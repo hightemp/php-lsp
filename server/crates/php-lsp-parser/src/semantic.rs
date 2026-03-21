@@ -89,6 +89,13 @@ fn check_use_statements<F>(
         }
 
         if resolver(fqn).is_none() {
+            // Skip aliased use statements that don't resolve — they are often
+            // namespace-prefix imports (e.g., `use Symfony\...\Constraints as Assert;`)
+            // where the FQN refers to a namespace, not a class.
+            if use_stmt.alias.is_some() {
+                continue;
+            }
+
             diagnostics.push(SemanticDiagnostic {
                 range: use_stmt.range,
                 message: format!("Unresolved use statement: {}", fqn),
@@ -180,11 +187,13 @@ fn check_class_in_new<F>(
         let ctor_fqn = format!("{}::__construct", fqn);
         if let Some(ctor_sym) = resolver(&ctor_fqn) {
             if let Some(ref sig) = ctor_sym.signature {
+                // Required = contiguous leading params without defaults.
+                // Once a param has a default or is variadic, all subsequent are optional.
                 let required = sig
                     .params
                     .iter()
-                    .filter(|p| p.default_value.is_none() && !p.is_variadic)
-                    .count();
+                    .position(|p| p.default_value.is_some() || p.is_variadic)
+                    .unwrap_or(sig.params.len());
                 let max = if sig.params.iter().any(|p| p.is_variadic) {
                     usize::MAX
                 } else {
@@ -344,11 +353,13 @@ fn check_function_call<F>(
 
             if let Some((resolved_fqn, func_sym)) = resolved {
                 if let Some(ref sig) = func_sym.signature {
+                    // Required = contiguous leading params without defaults.
+                    // Once a param has a default or is variadic, all subsequent are optional.
                     let required = sig
                         .params
                         .iter()
-                        .filter(|p| p.default_value.is_none() && !p.is_variadic)
-                        .count();
+                        .position(|p| p.default_value.is_some() || p.is_variadic)
+                        .unwrap_or(sig.params.len());
                     let max = if sig.params.iter().any(|p| p.is_variadic) {
                         usize::MAX
                     } else {
@@ -531,6 +542,69 @@ fn node_range(node: &tree_sitter::Node) -> (u32, u32, u32, u32) {
     )
 }
 
+/// Walk a tree-sitter tree and collect all class FQNs that arise from aliased
+/// use statements.  For example, `use Symfony\...\Constraints as Assert;` +
+/// code containing `new Assert\NotBlank(...)` produces FQN
+/// `Symfony\...\Constraints\NotBlank`.
+///
+/// This is used by the server to pre-resolve (lazily index) these FQNs before
+/// running `compute_diagnostics`, so that "Unknown class" warnings are not
+/// emitted for classes reachable through namespace aliases.
+pub fn collect_aliased_class_fqns(tree: &Tree, source: &str, file_symbols: &FileSymbols) -> Vec<String> {
+    use std::collections::HashSet;
+    use crate::resolve::resolve_class_name_pub;
+
+    // Build a set of alias prefixes for quick lookup.
+    let aliases: HashSet<&str> = file_symbols
+        .use_statements
+        .iter()
+        .filter(|u| u.kind == UseKind::Class && u.alias.is_some())
+        .filter_map(|u| u.alias.as_deref())
+        .collect();
+
+    if aliases.is_empty() {
+        return vec![];
+    }
+
+    let src = source.as_bytes();
+    let mut fqns = HashSet::new();
+    let mut cursor = tree.root_node().walk();
+    collect_qualified_names_recursive(&mut cursor, src, &aliases, file_symbols, &mut fqns, &resolve_class_name_pub);
+    fqns.into_iter().collect()
+}
+
+/// Recursively walk the CST looking for `qualified_name` nodes whose first
+/// segment matches one of the given `aliases`.
+fn collect_qualified_names_recursive(
+    cursor: &mut tree_sitter::TreeCursor,
+    source: &[u8],
+    aliases: &std::collections::HashSet<&str>,
+    file_symbols: &FileSymbols,
+    out: &mut std::collections::HashSet<String>,
+    resolver: &dyn Fn(&str, &FileSymbols) -> String,
+) {
+    loop {
+        let node = cursor.node();
+        if node.kind() == "qualified_name" {
+            let text = node.utf8_text(source).unwrap_or_default();
+            if let Some(first) = text.split('\\').next() {
+                if aliases.contains(first) {
+                    let fqn = resolver(text, file_symbols);
+                    out.insert(fqn);
+                }
+            }
+        }
+        // Recurse into children
+        if cursor.goto_first_child() {
+            collect_qualified_names_recursive(cursor, source, aliases, file_symbols, out, resolver);
+            cursor.goto_parent();
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +728,37 @@ use App\Missing\SomeClass;
             unresolved
         );
         assert!(unresolved[0].message.contains("App\\Missing\\SomeClass"));
+    }
+
+    #[test]
+    fn test_aliased_use_no_false_diagnostic() {
+        // use ... as Alias; should NOT produce an unresolved diagnostic even
+        // when the FQN doesn't resolve (it may be a namespace prefix import).
+        let code = r#"<?php
+namespace App;
+
+use Symfony\Component\Validator\Constraints as Assert;
+use App\Missing\SomeClass;
+"#;
+        let diags = parse_and_check(code, |_fqn| None);
+
+        let unresolved: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::UnresolvedUse)
+            .collect();
+
+        // Only the non-aliased one should be reported
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "Expected 1 unresolved use (not the aliased one), got: {:?}",
+            unresolved
+        );
+        assert!(unresolved[0].message.contains("App\\Missing\\SomeClass"));
+        assert!(
+            !unresolved.iter().any(|d| d.message.contains("Constraints")),
+            "Aliased use statement should NOT be reported as unresolved"
+        );
     }
 
     #[test]
@@ -855,6 +960,88 @@ class Child extends Base {
             unknown.is_empty(),
             "Expected no unknown-class diagnostics for case-insensitive self/static/parent, got: {:?}",
             unknown
+        );
+    }
+
+    /// Params after the first default-value param are implicitly optional even
+    /// without their own default value (common in phpstorm-stubs, e.g.
+    /// `preg_replace_callback`, `file_get_contents`).
+    #[test]
+    fn test_no_false_positive_for_optional_params_after_default() {
+        // Simulates preg_replace_callback($pattern, $callback, $subject, int $limit = -1, &$count, int $flags = 0)
+        // Only the first 3 params (before $limit which has a default) are truly required.
+        let code = r#"<?php
+preg_replace_callback('/x/', function(){}, 'input');
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "preg_replace_callback" {
+                Some(function_symbol(
+                    fqn,
+                    vec![
+                        ParamInfo {
+                            name: "pattern".to_string(),
+                            type_info: None,
+                            default_value: None,
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "callback".to_string(),
+                            type_info: None,
+                            default_value: None,
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "subject".to_string(),
+                            type_info: None,
+                            default_value: None,
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "limit".to_string(),
+                            type_info: None,
+                            default_value: Some("-1".to_string()),
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "count".to_string(),
+                            type_info: None,
+                            default_value: None, // no default but after a defaulted param
+                            is_variadic: false,
+                            is_by_ref: true,
+                            is_promoted: false,
+                        },
+                        ParamInfo {
+                            name: "flags".to_string(),
+                            type_info: None,
+                            default_value: Some("0".to_string()),
+                            is_variadic: false,
+                            is_by_ref: false,
+                            is_promoted: false,
+                        },
+                    ],
+                ))
+            } else {
+                None
+            }
+        });
+
+        let arg_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::ArgumentCountMismatch)
+            .collect();
+
+        assert!(
+            arg_diags.is_empty(),
+            "Expected NO argument-count diagnostic for 3 args to preg_replace_callback (required prefix = 3), got: {:?}",
+            arg_diags
         );
     }
 }

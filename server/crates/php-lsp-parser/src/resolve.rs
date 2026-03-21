@@ -65,6 +65,8 @@ impl VariableInference {
 pub enum RefKind {
     /// A class/interface/trait/enum name reference.
     ClassName,
+    /// A constructor call via `new ClassName()`.
+    Constructor,
     /// A function call.
     FunctionCall,
     /// A method call (->method or ::method).
@@ -255,7 +257,8 @@ fn find_all_property_assignment_types(
         // to avoid matching assignments in nested scopes.
         // We DO enter class_declaration and method_declaration since
         // that's where $this->prop assignments live.
-        if child.kind() != "anonymous_function_creation_expression"
+        if child.kind() != "anonymous_function"
+            && child.kind() != "anonymous_function_creation_expression"
             && child.kind() != "arrow_function"
         {
             find_all_property_assignment_types(child, source, prop_name, file_symbols, resolver, results);
@@ -318,6 +321,65 @@ fn find_node_at_point(root: Node, point: Point) -> Option<Node> {
     }
 
     Some(node)
+}
+
+/// Walk up from a `qualified_name` or `namespace_name` node to find the
+/// `qualified_name` ancestor that sits directly inside a class-reference
+/// context (object_creation_expression, named_type, etc.).
+fn find_qualified_name_ancestor(start: Node) -> Node {
+    let mut current = start;
+    while matches!(
+        current.kind(),
+        "namespace_name" | "namespace_name_as_prefix" | "qualified_name"
+    ) {
+        if let Some(p) = current.parent() {
+            if !matches!(
+                p.kind(),
+                "namespace_name" | "namespace_name_as_prefix" | "qualified_name"
+            ) {
+                // `current` is the topmost qualified/namespace node; its parent
+                // is the actual class-reference context.
+                return current;
+            }
+            current = p;
+        } else {
+            break;
+        }
+    }
+    current
+}
+
+/// Check if a `qualified_name`/`namespace_name` node is inside a class-reference
+/// context (object_creation_expression, named_type, etc.).
+fn is_inside_class_reference_context(start: Node) -> bool {
+    let qname = find_qualified_name_ancestor(start);
+    qname
+        .parent()
+        .map(|p| {
+            matches!(
+                p.kind(),
+                "object_creation_expression"
+                    | "named_type"
+                    | "optional_type"
+                    | "base_clause"
+                    | "class_interface_clause"
+                    | "type_list"
+                    | "class_constant_access_expression"
+                    | "scoped_call_expression"
+                    | "scoped_property_access_expression"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Check if a `qualified_name`/`namespace_name` node is specifically inside
+/// an `object_creation_expression` context (`new ClassName`).
+fn is_inside_object_creation_context(start: Node) -> bool {
+    let qname = find_qualified_name_ancestor(start);
+    qname
+        .parent()
+        .map(|p| p.kind() == "object_creation_expression")
+        .unwrap_or(false)
 }
 
 /// Resolve a CST node to symbol information.
@@ -531,6 +593,29 @@ fn resolve_node(
             })
         }
 
+        // Child name inside qualified_name used as a class reference (e.g. new Assert\NotBlank, type hints).
+        // Walk up through qualified_name / namespace_name to find the context.
+        "qualified_name" | "namespace_name"
+            if is_inside_class_reference_context(parent) =>
+        {
+            // Walk up to find the qualified_name ancestor and resolve its full text
+            let qname_node = find_qualified_name_ancestor(parent);
+            let qname_text = &source[qname_node.byte_range()];
+            let resolved = resolve_class_name(qname_text, file_symbols);
+            let is_new = is_inside_object_creation_context(parent);
+            Some(SymbolAtPosition {
+                fqn: if is_new {
+                    format!("{}::__construct", resolved)
+                } else {
+                    resolved
+                },
+                name: node_text.to_string(),
+                ref_kind: if is_new { RefKind::Constructor } else { RefKind::ClassName },
+                object_expr: None,
+                range: node_range(node),
+            })
+        }
+
         // Class constant access: self::CONST / ClassName::CONST
         "class_constant_access_expression" => {
             let scope_node = parent.named_child(0);
@@ -581,9 +666,9 @@ fn resolve_node(
         "object_creation_expression" => {
             let resolved = resolve_class_name(node_text, file_symbols);
             Some(SymbolAtPosition {
-                fqn: resolved,
+                fqn: format!("{}::__construct", resolved),
                 name: node_text.to_string(),
-                ref_kind: RefKind::ClassName,
+                ref_kind: RefKind::Constructor,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -789,6 +874,10 @@ fn try_resolve_object_type<'a>(
                             if !type_str.is_empty() && type_str != "mixed" {
                                 // Strip nullable prefix for resolution
                                 let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
+                                // self/static/$this → return owning class
+                                if base_type == "self" || base_type == "static" || base_type == "$this" {
+                                    return Some(class_fqn.clone());
+                                }
                                 return Some(resolve_class_name(base_type, file_symbols));
                             }
                         }
@@ -823,6 +912,10 @@ fn try_resolve_object_type<'a>(
                             let type_str = ret.to_string();
                             if !type_str.is_empty() && type_str != "mixed" {
                                 let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
+                                // self/static/$this → return owning class
+                                if base_type == "self" || base_type == "static" || base_type == "$this" {
+                                    return Some(class_fqn.clone());
+                                }
                                 return Some(resolve_class_name(base_type, file_symbols));
                             }
                         }
@@ -902,6 +995,7 @@ fn find_enclosing_function(node: Node) -> Option<Node> {
             "method_declaration"
             | "function_definition"
             | "arrow_function"
+            | "anonymous_function"
             | "anonymous_function_creation_expression" => {
                 return Some(n);
             }
@@ -1679,8 +1773,8 @@ mod tests {
         let result = parse_and_resolve(code, 3, 5);
         assert!(result.is_some());
         let sym = result.unwrap();
-        assert_eq!(sym.fqn, "App\\Service\\UserService");
-        assert_eq!(sym.ref_kind, RefKind::ClassName);
+        assert_eq!(sym.fqn, "App\\Service\\UserService::__construct");
+        assert_eq!(sym.ref_kind, RefKind::Constructor);
     }
 
     #[test]
@@ -2027,5 +2121,210 @@ class MyTest {
         let result4 = parse_and_resolve(code2, 1, 4).unwrap();
         assert_eq!(result4.fqn, "TestCase");
         assert_eq!(result4.ref_kind, RefKind::ClassName);
+    }
+
+    #[test]
+    fn test_resolve_new_qualified_name() {
+        // new Assert\NotBlank — qualified name in object_creation_expression
+        let code = r#"<?php
+namespace App\Form;
+
+use Symfony\Component\Validator\Constraints as Assert;
+
+class Foo {
+    public function build(): void {
+        $x = new Assert\NotBlank(message: 'Test');
+    }
+}
+"#;
+        // Cursor on "NotBlank"
+        let (l1, c1) = find_line_col(code, "Assert\\NotBlank");
+        let result = parse_and_resolve(code, l1, c1 + 7).unwrap();
+        assert_eq!(
+            result.fqn,
+            "Symfony\\Component\\Validator\\Constraints\\NotBlank::__construct"
+        );
+        assert_eq!(result.ref_kind, RefKind::Constructor);
+
+        // Cursor on "Assert" (namespace part)
+        let result2 = parse_and_resolve(code, l1, c1).unwrap();
+        assert_eq!(
+            result2.fqn,
+            "Symfony\\Component\\Validator\\Constraints\\NotBlank::__construct"
+        );
+        assert_eq!(result2.ref_kind, RefKind::Constructor);
+    }
+
+    #[test]
+    fn test_resolve_closure_param_method_call() {
+        // Method call on closure parameter with type hint
+        let code = r#"<?php
+namespace App\Form;
+
+use App\Repository\PortingRequestTypesRepository;
+
+class Foo {
+    public function build(): void {
+        $fn = static function (PortingRequestTypesRepository $er) {
+            return $er->createQueryBuilder('prt');
+        };
+    }
+}
+"#;
+        // Cursor on "createQueryBuilder"
+        let (l1, c1) = find_line_col(code, "createQueryBuilder");
+        let result = parse_and_resolve(code, l1, c1).unwrap();
+        assert_eq!(
+            result.fqn,
+            "App\\Repository\\PortingRequestTypesRepository::createQueryBuilder"
+        );
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_closure_param_method_chain() {
+        // Method call chain on closure parameter: $subscriber->getLastName()
+        let code = r#"<?php
+namespace App\Form;
+
+use App\Entity\Subscriber;
+
+class Foo {
+    public function build(): void {
+        $fn = static function (Subscriber $subscriber) {
+            return $subscriber->getLastName();
+        };
+    }
+}
+"#;
+        // Cursor on "getLastName"
+        let (l1, c1) = find_line_col(code, "getLastName");
+        let result = parse_and_resolve(code, l1, c1).unwrap();
+        assert_eq!(result.fqn, "App\\Entity\\Subscriber::getLastName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_method_chain_static_return_type() {
+        // Method chain: $qb->orderBy(...)->addOrderBy(...)
+        // orderBy() returns `static`, addOrderBy is on same class
+        let code = r#"<?php
+namespace App\ORM;
+
+class QueryBuilder {
+    public function orderBy(string $sort): static {
+        return $this;
+    }
+    public function addOrderBy(string $sort): static {
+        return $this;
+    }
+}
+
+class Foo {
+    public function test(): void {
+        $qb = new QueryBuilder();
+        $qb->orderBy('a')->addOrderBy('b');
+    }
+}
+"#;
+        // Cursor on "addOrderBy" in the chain
+        let (l, c) = find_line_col(code, "addOrderBy('b')");
+        let result = parse_and_resolve(code, l, c).unwrap();
+        assert_eq!(result.fqn, "App\\ORM\\QueryBuilder::addOrderBy");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+
+        // Cursor on "orderBy" — first in chain
+        let (l2, c2) = find_line_col(code, "orderBy('a')");
+        let result2 = parse_and_resolve(code, l2, c2).unwrap();
+        assert_eq!(result2.fqn, "App\\ORM\\QueryBuilder::orderBy");
+        assert_eq!(result2.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_method_chain_phpdoc_return_this() {
+        // Method chain where return type comes from PHPDoc @return $this
+        let code = r#"<?php
+namespace App\ORM;
+
+class Builder {
+    /** @return $this */
+    public function where(string $cond) {
+        return $this;
+    }
+    /** @return $this */
+    public function setParameter(string $name, $value) {
+        return $this;
+    }
+    /** @return $this */
+    public function orderBy(string $sort) {
+        return $this;
+    }
+}
+
+class Foo {
+    public function test(): void {
+        $b = new Builder();
+        $b->where('x')->setParameter('y', 1)->orderBy('z');
+    }
+}
+"#;
+        // Cursor on "orderBy" — 3rd in chain
+        let (l, c) = find_line_col(code, "orderBy('z')");
+        let result = parse_and_resolve(code, l, c).unwrap();
+        assert_eq!(result.fqn, "App\\ORM\\Builder::orderBy");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+
+        // Cursor on "setParameter" — 2nd in chain
+        let (l2, c2) = find_line_col(code, "setParameter('y'");
+        let result2 = parse_and_resolve(code, l2, c2).unwrap();
+        assert_eq!(result2.fqn, "App\\ORM\\Builder::setParameter");
+        assert_eq!(result2.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_method_chain_cross_class_return() {
+        // Chain where createQueryBuilder() returns a different class
+        let code = r#"<?php
+namespace App\ORM;
+
+class QueryBuilder {
+    public function orderBy(string $sort): static {
+        return $this;
+    }
+    public function addOrderBy(string $sort): static {
+        return $this;
+    }
+}
+
+class EntityRepository {
+    public function createQueryBuilder(string $alias): QueryBuilder {
+        return new QueryBuilder();
+    }
+}
+
+class Foo {
+    public function test(): void {
+        $er = new EntityRepository();
+        $er->createQueryBuilder('s')->orderBy('a')->addOrderBy('b');
+    }
+}
+"#;
+        // Cursor on "addOrderBy" — 3rd level chain
+        let (l, c) = find_line_col(code, "addOrderBy('b')");
+        let result = parse_and_resolve(code, l, c).unwrap();
+        assert_eq!(result.fqn, "App\\ORM\\QueryBuilder::addOrderBy");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+
+        // Cursor on "orderBy" — 2nd level
+        let (l2, c2) = find_line_col(code, "orderBy('a')");
+        let result2 = parse_and_resolve(code, l2, c2).unwrap();
+        assert_eq!(result2.fqn, "App\\ORM\\QueryBuilder::orderBy");
+        assert_eq!(result2.ref_kind, RefKind::MethodCall);
+
+        // Cursor on "createQueryBuilder" — 1st level
+        let (l3, c3) = find_line_col(code, "createQueryBuilder('s')");
+        let result3 = parse_and_resolve(code, l3, c3).unwrap();
+        assert_eq!(result3.fqn, "App\\ORM\\EntityRepository::createQueryBuilder");
+        assert_eq!(result3.ref_kind, RefKind::MethodCall);
     }
 }

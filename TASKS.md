@@ -364,6 +364,77 @@
   - Результат: **19/19 тестов** (3 новых use statement теста).
   - 134 unit/e2e теста, clippy clean.
 
+- [x] **H-020** Aliased use statements, qualified names, closure params *(done 2026-03-18)*
+  - **Проблема 1**: `use Symfony\...\Constraints as Assert;` — ложная диагностика «Unresolved use statement» (FQN — namespace, не класс).
+  - **Фикс 1**: в `check_use_statements` (semantic.rs) при `alias.is_some()` пропускаем диагностику для неразрешённых FQN.
+  - **Проблема 2**: `new Assert\NotBlank(...)` — go-to-definition не работал: parent ноды `name("NotBlank")` — `qualified_name`, а не `object_creation_expression`.
+  - **Фикс 2**: добавлены `find_qualified_name_ancestor()` и `is_inside_class_reference_context()` в resolve.rs, новый match arm для `"qualified_name" | "namespace_name"` в контексте class reference.
+  - **Проблема 3**: `$er->createQueryBuilder()` и `$subscriber->getLastName()` внутри closure — go-to-definition не работал.
+  - **Причина**: `find_enclosing_function` использовал `"anonymous_function_creation_expression"`, но tree-sitter PHP использует `"anonymous_function"`.
+  - **Фикс 3**: добавлен `"anonymous_function"` в resolve.rs (2 места) и references.rs (1 место).
+  - **Проблема 4**: 8 «Unknown class» warnings для классов через aliased namespace (Assert\NotBlank → Symfony\...\Constraints\NotBlank).
+  - **Фикс 4**: добавлена `collect_aliased_class_fqns()` в semantic.rs — обходит CST и собирает FQN классов из aliased qualified names. В `publish_diagnostics` (server.rs) вызывается перед `compute_diagnostics` для pre-resolve через `lazy_index_class`.
+  - **Unit tests**: `test_resolve_new_qualified_name`, `test_resolve_closure_param_method_call`, `test_resolve_closure_param_method_chain`, `test_aliased_use_no_false_diagnostic`.
+  - **E2E test**: `scripts/test-porting-request-type.py` — 33 теста по всему PortingRequestType.php.
+  - Результат: **33/33 go-to-def**, **0 diagnostics**, **19/19 regression tests**.
+  - 138 unit тестов, clippy clean.
+
+- [x] **H-021** `new ClassName()` go-to-definition → конструктор *(done 2026-03-18)*
+  - **Проблема**: `new Assert\NotBlank(...)` вёл на объявление класса (строка 24), а не на конструктор `__construct` (строка 41).
+  - **Фикс**: добавлен `RefKind::Constructor` в resolve.rs. Для `new ClassName()` и `new Alias\Class()` возвращается `fqn = "ClassName::__construct"` с `RefKind::Constructor`. В `goto_definition` и `hover` (server.rs) при неудаче поиска `__construct` делается fallback на класс.
+  - **Затронутые файлы**: resolve.rs (новый RefKind + 2 match arms + helper `is_inside_object_creation_context`), server.rs (goto_definition fallback + hover fallback + references/rename match arms).
+  - **Результат**: `new Assert\NotBlank` → NotBlank.php:41 (`__construct`), `new Assert\Length` → Length.php:69 (`__construct`).
+  - **E2E**: 33/33 go-to-def, 19/19 regression, 0 diagnostics.
+  - 138 unit тестов, clippy clean.
+
+- [x] **H-022** Исправление UTF-16 позиций — файл подсвечивался целиком красным при редактировании *(done 2026-03-18)*
+  - **Проблема**: при редактировании файлов с кириллицей (и другими не-ASCII символами) LSP-сервер подсвечивал весь файл ошибками. После исправления ошибки диагностика не обновлялась.
+  - **Причина**: LSP протокол передаёт `Position.character` в кодовых единицах UTF-16, а tree-sitter использует байтовые смещения для `Point.column`. `apply_edit` в parser.rs трактовал UTF-16 символы как байтовые смещения, что повреждало содержимое rope-буфера на строках с кириллицей (2 байта UTF-8, 1 UTF-16 code unit).
+  - **Фикс**:
+    - **parser.rs**: переписан `apply_edit` — новая `utf16_position_to_byte()` правильно конвертирует UTF-16 позиции в байтовые смещения. Tree-sitter `Point` теперь создаётся с байтовыми колонками.
+    - **utf16.rs** (НОВЫЙ модуль): `Utf16LineIndex` (индекс для batch-конверсии), `byte_col_to_utf16()`, `utf16_col_to_byte()`, `range_byte_to_utf16()`.
+    - **server.rs**: все 10 входящих вызовов (`symbol_at_position`, `variable_definition_at_position`, `detect_context`, `find_variable_references_at_position`, `infer_variable_type_at_position`) конвертируют `pos.character` через `utf16_col_to_byte()`. Все исходящие позиции (diagnostics, variable refs, rename edits, prepareRename ranges, reference locations) конвертируются через `range_byte_to_utf16()` / `Utf16LineIndex`.
+  - **Затронутые файлы**: parser.rs, utf16.rs (новый), lib.rs, server.rs.
+  - 141 unit тест, 16 e2e тестов, clippy clean.
+
+- [x] **H-023** Go-to-definition и hover для method chains (`$er->createQueryBuilder()->orderBy()->addOrderBy()`) *(done 2026-03-18)*
+  - **Проблема**: go-to-definition не работал для методов в цепочке вызовов. `$er->createQueryBuilder('s')->orderBy(...)` — `orderBy` не разрешался, потому что LSP не мог определить тип возвращаемый `createQueryBuilder()` и далее по цепочке.
+  - **Причины**:
+    1. Типы возвращаемых значений `self`/`static`/`$this` не обрабатывались — `resolve_member_type` и `try_resolve_object_type` передавали их в `resolve_class_name`, который не мог их разрешить.
+    2. Hover handler использовал `symbol_at_position` (без resolver), поэтому не мог резолвить cross-file типы в цепочках.
+    3. PHPDoc `@return` не использовался как fallback когда PHP-тип возврата отсутствует.
+  - **Фикс**:
+    - **resolve.rs**: в `try_resolve_object_type` для `member_call_expression` и `member_access_expression` — если return type = `self`/`static`/`$this`, возвращает FQN класса-владельца метода.
+    - **server.rs**: `resolve_member_type` — аналогичная обработка `self`/`static`/`$this`. Hover handler переведён на `symbol_at_position_with_resolver` для поддержки цепочек.
+    - **symbols.rs**: `extract_method` и `extract_function` — когда PHP return type отсутствует, берётся `@return` из PHPDoc как fallback.
+  - **Тесты**: 3 новых теста — `test_resolve_method_chain_static_return_type`, `test_resolve_method_chain_phpdoc_return_this`, `test_resolve_method_chain_cross_class_return`.
+  - 144 unit теста, 16 e2e тестов, clippy clean.
+
+- [x] **H-024** Ложные срабатывания "Too few arguments" для функций с необязательными параметрами *(done 2026-03-18)*
+  - **Проблема**: для `preg_replace_callback()`, `mb_strtolower()`, `file_get_contents()` и других функций выдавалась ошибка "Too few arguments", хотя вызовы были корректными.
+  - **Причина**: расчёт `required` считал ВСЕ параметры без `default_value` как обязательные. Но в phpstorm-stubs (и в PHP) параметры, идущие после параметра с дефолтом, фактически необязательны, даже если у них нет явного `default_value`. Пример: `preg_replace_callback(..., int $limit = -1, &$count, ...)` — `&$count` не имеет default, но стоит после `$limit` (с дефолтом) и является необязательным в PHP.
+  - **Фикс**: изменён расчёт `required` с подсчёта всех не-default параметров на "непрерывный обязательный префикс" — позиция первого параметра с `default_value` или `is_variadic`. Параметры после этой позиции считаются необязательными.
+    - **semantic.rs**: два места — проверка аргументов обычных функций (~line 357) и конструкторов (~line 192). В обоих использован `.position()` вместо `.filter().count()`.
+  - **Тесты**: 1 новый тест `test_no_false_positive_for_optional_params_after_default` — эмулирует сигнатуру `preg_replace_callback` с 6 параметрами (3 required, 1 default, 1 by-ref без default, 1 default), вызов с 3 аргументами не должен давать ошибку.
+  - 145 unit тестов, 16 e2e тестов, clippy clean.
+
+- [x] **H-025** Ложные "Too few arguments" для `mb_strtolower()`, `str_replace()` и аналогичных *(done 2026-03-18)*
+  - **Проблема**: H-024 не закрыл все случаи. `mb_strtolower(string $string, ?string $encoding)` — оба параметра без default → required=2. `str_replace($search, $replace, $subject, &$count)` — все 4 без default → required=4. Но `$encoding` и `&$count` помечены `[optional]` в PHPDoc стабов, и фактически необязательны в PHP.
+  - **Причина**: phpstorm-stubs помечают необязательные параметры через `@param ... [optional]` в PHPDoc, а не через `default_value` в сигнатуре. Парсер не учитывал эту аннотацию.
+  - **Фикс**:
+    - **symbols.rs**: новая функция `apply_phpdoc_to_signature()` — парсит PHPDoc, находит `@param` с `[optional]` в описании, и ставит синтетический `default_value = "null"` для соответствующих параметров сигнатуры. Вызывается из `extract_method` и `extract_function` (заменила дублированный код PHPDoc `@return` fallback).
+    - **phpdoc.rs**: исправлен `parse_param_tag` — добавлена поддержка `&$name` (by-ref) в PHPDoc `@param`. Ранее `&$count` не распознавался как имя параметра.
+  - **Тесты**: 2 новых теста — `test_phpdoc_optional_sets_default_value` (эмулирует `mb_strtolower`), `test_phpdoc_optional_on_byref_param` (эмулирует `str_replace` с `&$count`).
+  - 147 unit тестов, 16 e2e тестов, clippy clean.
+
+- [x] **H-026** Go-to-definition для promoted constructor properties (`$this->logger->debug()`) *(done 2026-03-18)*
+  - **Проблема**: go-to-definition не работал для методов на свойствах, объявленных через constructor promotion (`protected readonly LoggerInterface $logger`). `$this->logger->debug(...)` не разрешался.
+  - **Причина**: `extract_method` создавал `ParamInfo` с `is_promoted: true` для промоутнутых параметров, но НЕ создавал `SymbolInfo` с `kind: Property`. Поэтому при разрешении `$this->logger` поиск символа `Class::$logger` не находил ничего, и тип не определялся.
+  - **Фикс**:
+    - **symbols.rs**: в `extract_method` после создания Method символа добавлен проход по `property_promotion_parameter` нодам — для каждого создаётся дополнительный `SymbolInfo` с `kind: Property`, `fqn: Class::$name`, правильными visibility/modifiers и типом.
+  - **Тесты**: 1 новый тест `test_promoted_constructor_params_emit_property_symbols` — проверяет что promoted параметры создают Property символы с правильным FQN, visibility, readonly модификатором и типом, а обычные параметры — нет.
+  - 148 unit тестов, 16 e2e тестов, clippy clean.
+
 ---
 
 ## Этап v1 (4-6 недель после MVP)
@@ -480,3 +551,14 @@ M-016 ──→ M-014          (phpdoc → hover)
 M-019 ──→ M-020          (references → rename)
 M-013 ──→ M-014          (stubs → hover on built-ins)
 ```
+
+---
+
+## Research: Go-to-definition for promoted property member chains
+
+- [x] **R-001** Analyze resolution chain for `$this->logger->debug()` *(done 2026-03-18)*
+  - Read `resolve.rs`: `try_resolve_object_type`, `resolve_node`, variable type inference
+  - Read `server.rs`: `resolve_member_type`, `goto_definition`, `symbol_at_position_with_resolver`
+  - Read `symbols.rs`: symbol extraction for promoted constructor params
+  - Read `workspace.rs`: `resolve_fqn`, `resolve_member`, `get_direct_members`
+  - Identified root cause: promoted constructor params not emitted as Property symbols
