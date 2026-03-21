@@ -1298,7 +1298,10 @@ class MyService {
         assert!(
             logger_prop.is_some(),
             "Expected Property symbol for promoted $logger, symbols: {:?}",
-            syms.symbols.iter().map(|s| (&s.fqn, &s.kind)).collect::<Vec<_>>()
+            syms.symbols
+                .iter()
+                .map(|s| (&s.fqn, &s.kind))
+                .collect::<Vec<_>>()
         );
         let logger = logger_prop.unwrap();
         assert_eq!(logger.visibility, Visibility::Protected);

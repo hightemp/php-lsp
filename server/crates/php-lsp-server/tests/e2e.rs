@@ -1500,17 +1500,24 @@ async fn test_goto_definition_cross_file_inherited_property_method() {
     tokio::task::yield_now().await;
 
     // Open all needed files
-    for rel in &["src/ConcreteHandler.php", "src/BaseHandler.php", "src/TimerService.php"] {
+    for rel in &[
+        "src/ConcreteHandler.php",
+        "src/BaseHandler.php",
+        "src/TimerService.php",
+    ] {
         let p = fixture_root.join(rel);
         let u = format!("file://{}", p.display());
         let c = fs::read_to_string(&p).unwrap();
-        service.ready().await.unwrap().call(did_open_notification(&u, &c)).await.unwrap();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(&u, &c))
+            .await
+            .unwrap();
     }
 
-    let handler_uri = format!(
-        "file://{}/src/ConcreteHandler.php",
-        fixture_root.display()
-    );
+    let handler_uri = format!("file://{}/src/ConcreteHandler.php", fixture_root.display());
 
     // Cursor on "start" in:  $this->timer->start('handle');
     // Line 21, col 22 (0-indexed)
@@ -1582,13 +1589,16 @@ async fn test_goto_definition_cross_file_method_via_same_file_property() {
         let p = fixture_root.join(rel);
         let u = format!("file://{}", p.display());
         let c = fs::read_to_string(&p).unwrap();
-        service.ready().await.unwrap().call(did_open_notification(&u, &c)).await.unwrap();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(&u, &c))
+            .await
+            .unwrap();
     }
 
-    let test_file_uri = format!(
-        "file://{}/tests/SampleTest.php",
-        fixture_root.display()
-    );
+    let test_file_uri = format!("file://{}/tests/SampleTest.php", fixture_root.display());
 
     // Cursor on "start" in:  $this->timerService->start('benchmark');
     // Line 58, col 29 (0-indexed)

@@ -192,7 +192,8 @@ pub fn variable_hover_info_at_position(
     let var_name = normalize_var_name(&source[node.byte_range()]);
     let usage_start = node.start_byte();
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
-    let inference = infer_variable_in_scope(scope, &var_name, usage_start, source, file_symbols, None);
+    let inference =
+        infer_variable_in_scope(scope, &var_name, usage_start, source, file_symbols, None);
     if !inference.has_data() {
         return None;
     }
@@ -222,7 +223,14 @@ pub fn infer_property_type_from_assignments(
 ) -> Vec<String> {
     let root = tree.root_node();
     let mut results = Vec::new();
-    find_all_property_assignment_types(root, source, prop_name, file_symbols, resolver, &mut results);
+    find_all_property_assignment_types(
+        root,
+        source,
+        prop_name,
+        file_symbols,
+        resolver,
+        &mut results,
+    );
     results
 }
 
@@ -245,7 +253,8 @@ fn find_all_property_assignment_types(
         // Check expression_statement for property assignment
         if child.kind() == "expression_statement" {
             if let Some(rhs) = property_assignment_rhs(child, prop_name, source) {
-                if let Some(resolved) = try_resolve_object_type(rhs, source, file_symbols, resolver) {
+                if let Some(resolved) = try_resolve_object_type(rhs, source, file_symbols, resolver)
+                {
                     if !results.contains(&resolved) {
                         results.push(resolved);
                     }
@@ -261,17 +270,20 @@ fn find_all_property_assignment_types(
             && child.kind() != "anonymous_function_creation_expression"
             && child.kind() != "arrow_function"
         {
-            find_all_property_assignment_types(child, source, prop_name, file_symbols, resolver, results);
+            find_all_property_assignment_types(
+                child,
+                source,
+                prop_name,
+                file_symbols,
+                resolver,
+                results,
+            );
         }
     }
 }
 
 /// Check if a statement is `$this->propName = <expr>` and return the RHS node.
-fn property_assignment_rhs<'a>(
-    stmt: Node<'a>,
-    prop_name: &str,
-    source: &str,
-) -> Option<Node<'a>> {
+fn property_assignment_rhs<'a>(stmt: Node<'a>, prop_name: &str, source: &str) -> Option<Node<'a>> {
     if stmt.kind() != "expression_statement" {
         return None;
     }
@@ -410,8 +422,8 @@ fn resolve_node(
                 } else {
                     format!("${}", node_text)
                 };
-                let class_fqn =
-                    object_field.and_then(|o| try_resolve_object_type(o, source, file_symbols, resolver));
+                let class_fqn = object_field
+                    .and_then(|o| try_resolve_object_type(o, source, file_symbols, resolver));
                 let fqn = if let Some(ref cls) = class_fqn {
                     format!("{}::{}", cls, property_name)
                 } else {
@@ -439,8 +451,8 @@ fn resolve_node(
             if name_field.map(|n| n.id()) == Some(node.id()) {
                 let object_text = object_field.map(|o| source[o.byte_range()].to_string());
                 // Try to resolve object type to build a proper FQN
-                let class_fqn =
-                    object_field.and_then(|o| try_resolve_object_type(o, source, file_symbols, resolver));
+                let class_fqn = object_field
+                    .and_then(|o| try_resolve_object_type(o, source, file_symbols, resolver));
                 let fqn = if let Some(ref cls) = class_fqn {
                     format!("{}::{}", cls, node_text)
                 } else {
@@ -595,9 +607,7 @@ fn resolve_node(
 
         // Child name inside qualified_name used as a class reference (e.g. new Assert\NotBlank, type hints).
         // Walk up through qualified_name / namespace_name to find the context.
-        "qualified_name" | "namespace_name"
-            if is_inside_class_reference_context(parent) =>
-        {
+        "qualified_name" | "namespace_name" if is_inside_class_reference_context(parent) => {
             // Walk up to find the qualified_name ancestor and resolve its full text
             let qname_node = find_qualified_name_ancestor(parent);
             let qname_text = &source[qname_node.byte_range()];
@@ -610,7 +620,11 @@ fn resolve_node(
                     resolved
                 },
                 name: node_text.to_string(),
-                ref_kind: if is_new { RefKind::Constructor } else { RefKind::ClassName },
+                ref_kind: if is_new {
+                    RefKind::Constructor
+                } else {
+                    RefKind::ClassName
+                },
                 object_expr: None,
                 range: node_range(node),
             })
@@ -832,7 +846,9 @@ fn try_resolve_object_type<'a>(
             let child_count = object_node.named_child_count();
             for i in 0..child_count {
                 if let Some(child) = object_node.named_child(i) {
-                    if let Some(resolved) = try_resolve_object_type(child, source, file_symbols, resolver) {
+                    if let Some(resolved) =
+                        try_resolve_object_type(child, source, file_symbols, resolver)
+                    {
                         return Some(resolved);
                     }
                 }
@@ -875,7 +891,10 @@ fn try_resolve_object_type<'a>(
                                 // Strip nullable prefix for resolution
                                 let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
                                 // self/static/$this → return owning class
-                                if base_type == "self" || base_type == "static" || base_type == "$this" {
+                                if base_type == "self"
+                                    || base_type == "static"
+                                    || base_type == "$this"
+                                {
                                     return Some(class_fqn.clone());
                                 }
                                 return Some(resolve_class_name(base_type, file_symbols));
@@ -913,7 +932,10 @@ fn try_resolve_object_type<'a>(
                             if !type_str.is_empty() && type_str != "mixed" {
                                 let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
                                 // self/static/$this → return owning class
-                                if base_type == "self" || base_type == "static" || base_type == "$this" {
+                                if base_type == "self"
+                                    || base_type == "static"
+                                    || base_type == "$this"
+                                {
                                     return Some(class_fqn.clone());
                                 }
                                 return Some(resolve_class_name(base_type, file_symbols));
@@ -984,7 +1006,14 @@ fn infer_variable_type(
     resolver: Option<MemberTypeResolver<'_>>,
 ) -> Option<String> {
     let scope = find_enclosing_function(var_node).unwrap_or_else(|| find_root_node(var_node));
-    infer_variable_type_in_scope(scope, var_name, var_node.start_byte(), source, file_symbols, resolver)
+    infer_variable_type_in_scope(
+        scope,
+        var_name,
+        var_node.start_byte(),
+        source,
+        file_symbols,
+        resolver,
+    )
 }
 
 /// Find the enclosing function/method node.
@@ -1010,7 +1039,10 @@ fn find_enclosing_class_node(node: Node) -> Option<Node> {
     let mut current = node.parent();
     while let Some(n) = current {
         match n.kind() {
-            "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration" => {
+            "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration" => {
                 return Some(n);
             }
             _ => current = n.parent(),
@@ -1035,8 +1067,15 @@ fn infer_variable_type_in_scope(
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
 ) -> Option<String> {
-    infer_variable_in_scope(scope_node, var_name, usage_start, source, file_symbols, resolver)
-        .resolved_type_fqn
+    infer_variable_in_scope(
+        scope_node,
+        var_name,
+        usage_start,
+        source,
+        file_symbols,
+        resolver,
+    )
+    .resolved_type_fqn
 }
 
 /// Extract a type name from a type node (named_type, optional_type, etc.).
@@ -2081,18 +2120,36 @@ class MyTest {
         };
 
         let result = super::infer_property_type_from_assignments(
-            tree, code, "em", &file_symbols, Some(&resolver),
+            tree,
+            code,
+            "em",
+            &file_symbols,
+            Some(&resolver),
         );
-        assert_eq!(result, vec!["PHPUnit\\Framework\\MockObject\\Stub".to_string()]);
+        assert_eq!(
+            result,
+            vec!["PHPUnit\\Framework\\MockObject\\Stub".to_string()]
+        );
 
         let result2 = super::infer_property_type_from_assignments(
-            tree, code, "timerService", &file_symbols, Some(&resolver),
+            tree,
+            code,
+            "timerService",
+            &file_symbols,
+            Some(&resolver),
         );
-        assert_eq!(result2, vec!["PHPUnit\\Framework\\MockObject\\Stub".to_string()]);
+        assert_eq!(
+            result2,
+            vec!["PHPUnit\\Framework\\MockObject\\Stub".to_string()]
+        );
 
         // Non-existent property should return empty vec
         let result3 = super::infer_property_type_from_assignments(
-            tree, code, "nonexistent", &file_symbols, Some(&resolver),
+            tree,
+            code,
+            "nonexistent",
+            &file_symbols,
+            Some(&resolver),
         );
         assert!(result3.is_empty());
     }
@@ -2324,7 +2381,10 @@ class Foo {
         // Cursor on "createQueryBuilder" — 1st level
         let (l3, c3) = find_line_col(code, "createQueryBuilder('s')");
         let result3 = parse_and_resolve(code, l3, c3).unwrap();
-        assert_eq!(result3.fqn, "App\\ORM\\EntityRepository::createQueryBuilder");
+        assert_eq!(
+            result3.fqn,
+            "App\\ORM\\EntityRepository::createQueryBuilder"
+        );
         assert_eq!(result3.ref_kind, RefKind::MethodCall);
     }
 }

@@ -14,10 +14,10 @@ use php_lsp_parser::resolve::{
     infer_variable_type_at_position, symbol_at_position, symbol_at_position_with_resolver,
     variable_definition_at_position, variable_hover_info_at_position, RefKind,
 };
-use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::semantic::collect_aliased_class_fqns;
-use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
+use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::symbols::extract_file_symbols;
+use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
@@ -89,7 +89,11 @@ impl PhpLspBackend {
         let sig = sym.signature.as_ref()?;
         let ret = sig.return_type.as_ref()?;
         let type_str = ret.to_string();
-        tracing::debug!("resolve_member_type: {} -> return type '{}'", member_fqn, type_str);
+        tracing::debug!(
+            "resolve_member_type: {} -> return type '{}'",
+            member_fqn,
+            type_str
+        );
 
         if type_str.is_empty() || type_str == "mixed" {
             return None;
@@ -214,16 +218,15 @@ impl PhpLspBackend {
             }
 
             // Get the class from the index to read its extends/implements
-            let parent_fqns: Vec<String> =
-                if let Some(sym) = self.index.types.get(class_fqn) {
-                    sym.extends
-                        .iter()
-                        .chain(sym.implements.iter())
-                        .cloned()
-                        .collect()
-                } else {
-                    return;
-                };
+            let parent_fqns: Vec<String> = if let Some(sym) = self.index.types.get(class_fqn) {
+                sym.extends
+                    .iter()
+                    .chain(sym.implements.iter())
+                    .cloned()
+                    .collect()
+            } else {
+                return;
+            };
 
             for parent_fqn in parent_fqns {
                 // Lazy-index the parent class file
@@ -300,7 +303,11 @@ impl PhpLspBackend {
                 &file_symbols,
                 Some(&resolver),
             );
-            tracing::debug!("Property fallback: infer_property_type_from_assignments('{}') = {:?}", prop_name, result);
+            tracing::debug!(
+                "Property fallback: infer_property_type_from_assignments('{}') = {:?}",
+                prop_name,
+                result
+            );
             result
         };
 
@@ -510,7 +517,8 @@ fn compute_diagnostics(
         .into_iter()
         .map(|d| {
             // tree-sitter positions use byte columns; convert to UTF-16
-            let start_char = utf16_index.byte_col_to_utf16(d.range.start.line, d.range.start.character);
+            let start_char =
+                utf16_index.byte_col_to_utf16(d.range.start.line, d.range.start.character);
             let end_char = utf16_index.byte_col_to_utf16(d.range.end.line, d.range.end.character);
             Diagnostic {
                 range: Range {
@@ -543,8 +551,14 @@ fn compute_diagnostics(
     for sd in sem_diags {
         diagnostics.push(Diagnostic {
             range: Range {
-                start: Position::new(sd.range.0, utf16_index.byte_col_to_utf16(sd.range.0, sd.range.1)),
-                end: Position::new(sd.range.2, utf16_index.byte_col_to_utf16(sd.range.2, sd.range.3)),
+                start: Position::new(
+                    sd.range.0,
+                    utf16_index.byte_col_to_utf16(sd.range.0, sd.range.1),
+                ),
+                end: Position::new(
+                    sd.range.2,
+                    utf16_index.byte_col_to_utf16(sd.range.2, sd.range.3),
+                ),
             },
             severity: Some(DiagnosticSeverity::WARNING),
             source: Some("php-lsp".to_string()),
@@ -621,7 +635,16 @@ fn find_composer_json(root: &Path) -> Option<PathBuf> {
 
     // Scan immediate subdirectories (depth 1)
     let entries = std::fs::read_dir(root).ok()?;
-    let skip_dirs = ["node_modules", "vendor", ".git", ".github", "docker", "cache", "logs", "tmp"];
+    let skip_dirs = [
+        "node_modules",
+        "vendor",
+        ".git",
+        ".github",
+        "docker",
+        "cache",
+        "logs",
+        "tmp",
+    ];
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
@@ -1034,10 +1057,7 @@ impl LanguageServer for PhpLspBackend {
             // Update workspace root to the effective project root (where composer.json is)
             if project_root != root {
                 *self.workspace_root.lock().await = Some(project_root.clone());
-                tracing::info!(
-                    "Effective project root: {}",
-                    project_root.display()
-                );
+                tracing::info!("Effective project root: {}", project_root.display());
             }
             let root = project_root;
 
@@ -1233,19 +1253,19 @@ impl LanguageServer for PhpLspBackend {
             };
 
             // Find symbol at cursor position (with resolver for chains)
-            let sym_at_pos =
-                match symbol_at_position_with_resolver(tree, &source, pos.line, byte_col, &file_symbols, Some(&resolver)) {
-                    Some(s) => s,
-                    None => return Ok(None),
-                };
+            let sym_at_pos = match symbol_at_position_with_resolver(
+                tree,
+                &source,
+                pos.line,
+                byte_col,
+                &file_symbols,
+                Some(&resolver),
+            ) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
             let var_hover_info = if sym_at_pos.ref_kind == RefKind::Variable {
-                variable_hover_info_at_position(
-                    tree,
-                    &source,
-                    &file_symbols,
-                    pos.line,
-                    byte_col,
-                )
+                variable_hover_info_at_position(tree, &source, &file_symbols, pos.line, byte_col)
             } else {
                 None
             };
@@ -1479,9 +1499,8 @@ impl LanguageServer for PhpLspBackend {
                 self.resolve_member_type(class_fqn, member_name)
             };
 
-            let local_var_def =
-                variable_definition_at_position(tree, &source, pos.line, byte_col)
-                    .map(|d| range_byte_to_utf16(&source, d));
+            let local_var_def = variable_definition_at_position(tree, &source, pos.line, byte_col)
+                .map(|d| range_byte_to_utf16(&source, d));
             let sym = symbol_at_position_with_resolver(
                 tree,
                 &source,
@@ -1507,7 +1526,12 @@ impl LanguageServer for PhpLspBackend {
 
         let sym_at_pos = match sym_at_pos {
             Some(s) => {
-                tracing::debug!("goto_definition: sym_at_pos fqn='{}', name='{}', ref_kind={:?}", s.fqn, s.name, s.ref_kind);
+                tracing::debug!(
+                    "goto_definition: sym_at_pos fqn='{}', name='{}', ref_kind={:?}",
+                    s.fqn,
+                    s.name,
+                    s.ref_kind
+                );
                 s
             }
             None => {
@@ -1647,7 +1671,9 @@ impl LanguageServer for PhpLspBackend {
                     }
 
                     let kind = match sym.ref_kind {
-                        RefKind::ClassName | RefKind::Constructor => php_lsp_types::PhpSymbolKind::Class,
+                        RefKind::ClassName | RefKind::Constructor => {
+                            php_lsp_types::PhpSymbolKind::Class
+                        }
                         RefKind::FunctionCall => php_lsp_types::PhpSymbolKind::Function,
                         RefKind::MethodCall => php_lsp_types::PhpSymbolKind::Method,
                         RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {

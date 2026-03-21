@@ -613,7 +613,10 @@ mod tests {
 
         // After parent is indexed, inherited member SHOULD resolve
         let found = index.resolve_fqn("App\\MyTest::doSetUp");
-        assert!(found.is_some(), "member should resolve after parent is indexed");
+        assert!(
+            found.is_some(),
+            "member should resolve after parent is indexed"
+        );
         assert_eq!(found.unwrap().name, "doSetUp");
 
         // Step 3: Index grandparent class (deeper vendor lazy-load)

@@ -69,7 +69,9 @@ impl FileParser {
 
         // Calculate new end position
         let new_end_byte = start_byte + new_text.len();
-        let new_end_line = self.rope.byte_to_line(new_end_byte.min(self.rope.len_bytes()));
+        let new_end_line = self
+            .rope
+            .byte_to_line(new_end_byte.min(self.rope.len_bytes()));
         let new_end_byte_col = new_end_byte - self.line_start_byte(new_end_line);
         let new_end_point = Point::new(new_end_line, new_end_byte_col);
 
