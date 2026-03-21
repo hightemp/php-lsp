@@ -765,10 +765,14 @@ async fn test_builtin_function_fallback_blocks_rename_in_namespace() {
     fs::create_dir_all(&tmp_root).unwrap();
     let root_uri = format!("file://{}", tmp_root.to_string_lossy());
 
-    let stubs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../client/stubs")
-        .canonicalize()
-        .unwrap();
+    let stubs_path_raw =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../client/stubs");
+    // Skip test if client/stubs hasn't been built (CI without bundle-stubs.sh)
+    if !stubs_path_raw.join("PhpStormStubsMap.php").exists() {
+        eprintln!("Skipping test: client/stubs not found, run bundle-stubs.sh first");
+        return;
+    }
+    let stubs_path = stubs_path_raw.canonicalize().unwrap();
 
     service
         .ready()
