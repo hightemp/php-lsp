@@ -2,6 +2,8 @@
 
 ## Текущие задачи
 
+- [x] **T-2026-05-19** Дополнить README полным набором badge для GitHub и VS Marketplace.
+- [x] **T-2026-05-19** Добавить release/downloads badge в README и перенести нижний счётчик наверх.
 - [x] **T-2026-05-19** Добавить `.semantic-search` в ignore и проверить статус `server/data/stubs`.
 
 ## Обзор этапов
