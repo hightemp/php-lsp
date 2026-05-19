@@ -102,6 +102,26 @@ fn declaration_request(id: i64, uri: &str, line: u32, character: u32) -> Request
         .finish()
 }
 
+fn type_definition_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
+    Request::build("textDocument/typeDefinition")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+        .id(id)
+        .finish()
+}
+
+fn document_highlight_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
+    Request::build("textDocument/documentHighlight")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn completion_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/completion")
         .params(json!({
@@ -421,6 +441,22 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected declarationProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("typeDefinitionProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected typeDefinitionProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("documentHighlightProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected documentHighlightProvider capability"
     );
     assert!(
         result
@@ -925,6 +961,103 @@ new Local();
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_goto_type_definition_for_variables_returns_and_properties() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Service {}
+
+function makeService(): Service { return new Service(); }
+
+class Demo {
+    public Service $service;
+
+    public function run(Service $param): void {
+        /** @var Service $local */
+        $local = makeService();
+        $param;
+        $local;
+        makeService();
+        $this->service;
+    }
+}
+"#;
+    let uri = "file:///test/TypeDefinition.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    for (id, line, character, label) in [
+        (2, 13, 9, "typed parameter"),
+        (3, 14, 9, "inline @var local"),
+        (4, 15, 10, "function return"),
+        (5, 16, 16, "property type"),
+    ] {
+        let resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(type_definition_request(id, uri, line, character))
+            .await
+            .unwrap();
+        let result = extract_result(resp);
+        assert_eq!(
+            result.get("uri").and_then(|value| value.as_str()),
+            Some(uri),
+            "type definition for {} should point to current file, got: {}",
+            label,
+            result
+        );
+        assert_eq!(
+            result["range"]["start"]["line"].as_u64(),
+            Some(3),
+            "type definition for {} should point to Service class, got: {}",
+            label,
+            result
+        );
+        assert_eq!(
+            result["range"]["start"]["character"].as_u64(),
+            Some(6),
+            "type definition for {} should point to Service class name, got: {}",
+            label,
+            result
+        );
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -1074,6 +1207,120 @@ function run(): void {
         labels.iter().any(|label| label == "test"),
         "expected member completion to include `test`, got: {:?}",
         labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_document_highlight_variables_and_properties() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+class Demo {
+    public string $name;
+
+    public function run(string $name): void {
+        $name = $name . "!";
+        echo $name;
+        $this->name = $name;
+        echo $this->name;
+    }
+}
+"#;
+    let uri = "file:///test/DocumentHighlight.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let variable_highlights = service
+        .ready()
+        .await
+        .unwrap()
+        .call(document_highlight_request(2, uri, 6, 15))
+        .await
+        .unwrap();
+    let variable_result = extract_result(variable_highlights);
+    let variable_items = variable_result.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        variable_items.len(),
+        5,
+        "local variable highlights should include declaration and scoped usages"
+    );
+    assert_eq!(
+        variable_items
+            .iter()
+            .filter(|item| item.get("kind").and_then(|kind| kind.as_u64()) == Some(3))
+            .count(),
+        2,
+        "parameter declaration and assignment target should be write highlights"
+    );
+    assert_eq!(
+        variable_items
+            .iter()
+            .filter(|item| item.get("kind").and_then(|kind| kind.as_u64()) == Some(2))
+            .count(),
+        3,
+        "variable usages should be read highlights"
+    );
+
+    let property_highlights = service
+        .ready()
+        .await
+        .unwrap()
+        .call(document_highlight_request(3, uri, 8, 21))
+        .await
+        .unwrap();
+    let property_result = extract_result(property_highlights);
+    let property_items = property_result.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        property_items.len(),
+        3,
+        "property highlights should include declaration and member accesses"
+    );
+    assert_eq!(
+        property_items
+            .iter()
+            .filter(|item| item.get("kind").and_then(|kind| kind.as_u64()) == Some(3))
+            .count(),
+        2,
+        "property declaration and assignment target should be write highlights"
+    );
+    assert_eq!(
+        property_items
+            .iter()
+            .filter(|item| item.get("kind").and_then(|kind| kind.as_u64()) == Some(2))
+            .count(),
+        1,
+        "property read access should be a read highlight"
     );
 
     service

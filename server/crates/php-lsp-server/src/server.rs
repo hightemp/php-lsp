@@ -11,8 +11,9 @@ use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::references::{find_references_in_file, find_variable_references_at_position};
 use php_lsp_parser::resolve::{
-    infer_variable_type_at_position, symbol_at_position, symbol_at_position_with_resolver,
-    variable_definition_at_position, variable_hover_info_at_position, RefKind, SymbolAtPosition,
+    infer_variable_type_at_position, resolve_class_name_pub, symbol_at_position,
+    symbol_at_position_with_resolver, variable_definition_at_position,
+    variable_hover_info_at_position, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
     find_missing_return_type_candidates, MissingReturnTypeCandidate,
@@ -490,6 +491,62 @@ impl PhpLspBackend {
         }))
     }
 
+    fn file_symbols_for_uri(&self, uri_str: &str) -> Option<php_lsp_types::FileSymbols> {
+        if let Some(file_symbols) = self.index.file_symbols.get(uri_str) {
+            return Some(file_symbols.value().clone());
+        }
+
+        let parser = self.open_files.get(uri_str)?;
+        let tree = parser.tree()?;
+        let source = parser.source();
+        Some(extract_file_symbols(tree, &source, uri_str))
+    }
+
+    fn type_definition_fqn_for_symbol(
+        &self,
+        symbol: &php_lsp_types::SymbolInfo,
+        fallback_file_symbols: &php_lsp_types::FileSymbols,
+    ) -> Option<String> {
+        if matches!(
+            symbol.kind,
+            php_lsp_types::PhpSymbolKind::Class
+                | php_lsp_types::PhpSymbolKind::Interface
+                | php_lsp_types::PhpSymbolKind::Trait
+                | php_lsp_types::PhpSymbolKind::Enum
+        ) {
+            return Some(symbol.fqn.clone());
+        }
+
+        let return_type = symbol.signature.as_ref()?.return_type.as_ref()?;
+        let declaring_file_symbols = self
+            .file_symbols_for_uri(&symbol.uri)
+            .unwrap_or_else(|| fallback_file_symbols.clone());
+
+        first_type_definition_fqn(
+            return_type,
+            &declaring_file_symbols,
+            symbol.parent_fqn.as_deref(),
+        )
+    }
+
+    async fn location_for_type_fqn(&self, fqn: &str) -> Option<Location> {
+        if is_builtin_type_name(fqn) {
+            return None;
+        }
+
+        let symbol = self
+            .resolve_fqn_lazy_with_fallback(fqn, RefKind::ClassName)
+            .await?;
+        let uri = symbol.uri.parse::<Uri>().ok()?;
+        Some(Location {
+            uri,
+            range: Range {
+                start: Position::new(symbol.selection_range.0, symbol.selection_range.1),
+                end: Position::new(symbol.selection_range.2, symbol.selection_range.3),
+            },
+        })
+    }
+
     /// Publish diagnostics for a file.
     async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
@@ -590,27 +647,13 @@ fn is_renameable_variable(var_name: &str) -> bool {
     )
 }
 
-fn line_col_to_byte(source: &str, line: u32, col: u32) -> Option<usize> {
+fn line_byte_col_to_byte(source: &str, line: u32, byte_col: u32) -> Option<usize> {
     let mut offset = 0usize;
 
     for (current_line, l) in source.split_inclusive('\n').enumerate() {
         if current_line as u32 == line {
-            let mut byte_col = 0usize;
-            let mut char_col = 0u32;
-            for ch in l.chars() {
-                if char_col == col {
-                    return Some(offset + byte_col);
-                }
-                byte_col += ch.len_utf8();
-                char_col += 1;
-                if ch == '\n' {
-                    break;
-                }
-            }
-            if char_col == col {
-                return Some(offset + byte_col);
-            }
-            return None;
+            let col = byte_col as usize;
+            return (col <= l.len()).then_some(offset + col);
         }
         offset += l.len();
     }
@@ -619,7 +662,7 @@ fn line_col_to_byte(source: &str, line: u32, col: u32) -> Option<usize> {
 }
 
 fn range_starts_with_dollar(source: &str, range: (u32, u32, u32, u32)) -> bool {
-    let Some(start) = line_col_to_byte(source, range.0, range.1) else {
+    let Some(start) = line_byte_col_to_byte(source, range.0, range.1) else {
         return false;
     };
     source
@@ -627,6 +670,114 @@ fn range_starts_with_dollar(source: &str, range: (u32, u32, u32, u32)) -> bool {
         .get(start)
         .map(|b| *b == b'$')
         .unwrap_or(false)
+}
+
+fn starts_with_assignment_operator(text: &str) -> bool {
+    matches!(
+        text.as_bytes(),
+        [b'=', rest @ ..] if !matches!(rest.first(), Some(b'=' | b'>'))
+    ) || text.starts_with("+=")
+        || text.starts_with("-=")
+        || text.starts_with("*=")
+        || text.starts_with("/=")
+        || text.starts_with("%=")
+        || text.starts_with(".=")
+        || text.starts_with("&=")
+        || text.starts_with("|=")
+        || text.starts_with("^=")
+        || text.starts_with("??=")
+        || text.starts_with("<<=")
+        || text.starts_with(">>=")
+}
+
+fn is_declaration_like_write(before_trimmed: &str, after_trimmed: &str) -> bool {
+    let segment = before_trimmed
+        .rsplit([';', '{', '}'])
+        .next()
+        .unwrap_or(before_trimmed)
+        .trim_start();
+    let declaration_tail = after_trimmed.starts_with([',', ')', ';', '=']);
+
+    declaration_tail
+        && (segment.contains("function ")
+            || segment.starts_with("public ")
+            || segment.starts_with("protected ")
+            || segment.starts_with("private ")
+            || segment.starts_with("readonly ")
+            || segment.starts_with("static ")
+            || segment.starts_with("var "))
+}
+
+fn is_write_reference(source: &str, range: (u32, u32, u32, u32)) -> bool {
+    let Some(start) = line_byte_col_to_byte(source, range.0, range.1) else {
+        return false;
+    };
+    let Some(end) = line_byte_col_to_byte(source, range.2, range.3) else {
+        return false;
+    };
+    if start > end || end > source.len() {
+        return false;
+    }
+
+    let line_start = source[..start].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let line_end = source[end..]
+        .find('\n')
+        .map(|idx| end + idx)
+        .unwrap_or(source.len());
+    let before_trimmed = source[line_start..start].trim_end();
+    let after_trimmed = source[end..line_end].trim_start();
+
+    starts_with_assignment_operator(after_trimmed)
+        || after_trimmed.starts_with("++")
+        || after_trimmed.starts_with("--")
+        || before_trimmed.ends_with("++")
+        || before_trimmed.ends_with("--")
+        || is_declaration_like_write(before_trimmed, after_trimmed)
+}
+
+fn document_highlight_kind(
+    source: &str,
+    range: (u32, u32, u32, u32),
+    read_write_capable: bool,
+) -> DocumentHighlightKind {
+    if !read_write_capable {
+        return DocumentHighlightKind::TEXT;
+    }
+
+    if is_write_reference(source, range) {
+        DocumentHighlightKind::WRITE
+    } else {
+        DocumentHighlightKind::READ
+    }
+}
+
+fn document_highlight_from_range(
+    source: &str,
+    range: (u32, u32, u32, u32),
+    read_write_capable: bool,
+) -> DocumentHighlight {
+    let rng = range_byte_to_utf16(source, range);
+    DocumentHighlight {
+        range: Range {
+            start: Position::new(rng.0, rng.1),
+            end: Position::new(rng.2, rng.3),
+        },
+        kind: Some(document_highlight_kind(source, range, read_write_capable)),
+    }
+}
+
+fn php_symbol_kind_for_ref_kind(ref_kind: RefKind) -> Option<php_lsp_types::PhpSymbolKind> {
+    match ref_kind {
+        RefKind::ClassName | RefKind::Constructor => Some(php_lsp_types::PhpSymbolKind::Class),
+        RefKind::FunctionCall => Some(php_lsp_types::PhpSymbolKind::Function),
+        RefKind::MethodCall => Some(php_lsp_types::PhpSymbolKind::Method),
+        RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {
+            Some(php_lsp_types::PhpSymbolKind::Property)
+        }
+        RefKind::ClassConstant => Some(php_lsp_types::PhpSymbolKind::ClassConstant),
+        RefKind::GlobalConstant => Some(php_lsp_types::PhpSymbolKind::GlobalConstant),
+        RefKind::Variable | RefKind::NamespaceName | RefKind::Unknown => None,
+    }
 }
 
 fn format_signature_param(param: &php_lsp_types::ParamInfo) -> String {
@@ -801,6 +952,65 @@ fn imported_use_statement_for_symbol<'a>(
     file_symbols.use_statements.iter().find(|use_stmt| {
         use_stmt.kind == use_kind && use_stmt.fqn.trim_start_matches('\\') == target_fqn
     })
+}
+
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches('\\').to_ascii_lowercase().as_str(),
+        "int"
+            | "float"
+            | "string"
+            | "bool"
+            | "boolean"
+            | "array"
+            | "object"
+            | "null"
+            | "void"
+            | "never"
+            | "mixed"
+            | "callable"
+            | "iterable"
+            | "true"
+            | "false"
+            | "resource"
+    )
+}
+
+fn first_type_definition_fqn(
+    type_info: &php_lsp_types::TypeInfo,
+    file_symbols: &php_lsp_types::FileSymbols,
+    current_class_fqn: Option<&str>,
+) -> Option<String> {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            if is_builtin_type_name(name) {
+                None
+            } else {
+                Some(resolve_class_name_pub(name, file_symbols))
+            }
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            first_type_definition_fqn(inner, file_symbols, current_class_fqn)
+        }
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            types
+                .iter()
+                .find_map(|ty| first_type_definition_fqn(ty, file_symbols, current_class_fqn))
+        }
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
+            current_class_fqn.map(str::to_string)
+        }
+        php_lsp_types::TypeInfo::Parent_ => current_class_fqn.and_then(|class_fqn| {
+            file_symbols
+                .symbols
+                .iter()
+                .find(|sym| sym.fqn == class_fqn)
+                .and_then(|sym| sym.extends.first().cloned())
+        }),
+        php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed => None,
+    }
 }
 
 fn use_kind_matches(import_kind: ImportKind, use_kind: php_lsp_types::UseKind) -> bool {
@@ -2202,7 +2412,9 @@ impl LanguageServer for PhpLspBackend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 declaration_provider: Some(DeclarationCapability::Simple(true)),
+                type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
@@ -2895,6 +3107,120 @@ impl LanguageServer for PhpLspBackend {
         self.goto_definition(params).await
     }
 
+    async fn goto_type_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let uri_str = uri.as_str().to_string();
+        let pos = params.text_document_position_params.position;
+        tracing::debug!(
+            "gotoTypeDefinition: {}:{}:{}",
+            uri_str,
+            pos.line,
+            pos.character
+        );
+
+        let (sym_at_pos, variable_type_fqn, file_symbols) = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            let tree = match parser.tree() {
+                Some(tree) => tree,
+                None => return Ok(None),
+            };
+            let source = parser.source();
+            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let file_symbols = self
+                .index
+                .file_symbols
+                .get(&uri_str)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
+
+            let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+                self.resolve_member_type(class_fqn, member_name)
+            };
+
+            let sym_at_pos = symbol_at_position_with_resolver(
+                tree,
+                &source,
+                pos.line,
+                byte_col,
+                &file_symbols,
+                Some(&resolver),
+            );
+            let variable_type_fqn = if let Some(sym) = &sym_at_pos {
+                if sym.ref_kind == RefKind::Variable {
+                    variable_hover_info_at_position(
+                        tree,
+                        &source,
+                        &file_symbols,
+                        pos.line,
+                        byte_col,
+                    )
+                    .and_then(|info| info.resolved_type_fqn)
+                    .or_else(|| {
+                        infer_variable_type_at_position(
+                            tree,
+                            &source,
+                            &file_symbols,
+                            pos.line,
+                            byte_col,
+                            &sym.name,
+                        )
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            (sym_at_pos, variable_type_fqn, file_symbols)
+        };
+
+        if let Some(type_fqn) = variable_type_fqn {
+            return Ok(self
+                .location_for_type_fqn(&type_fqn)
+                .await
+                .map(GotoDefinitionResponse::Scalar));
+        }
+
+        let Some(sym_at_pos) = sym_at_pos else {
+            return Ok(None);
+        };
+
+        if matches!(
+            sym_at_pos.ref_kind,
+            RefKind::ClassName | RefKind::Constructor
+        ) {
+            let type_fqn = import_target_fqn(&sym_at_pos);
+            return Ok(self
+                .location_for_type_fqn(type_fqn)
+                .await
+                .map(GotoDefinitionResponse::Scalar));
+        }
+
+        let symbol_info = self
+            .resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
+            .await;
+
+        let Some(symbol_info) = symbol_info else {
+            return Ok(None);
+        };
+        let Some(type_fqn) = self.type_definition_fqn_for_symbol(&symbol_info, &file_symbols)
+        else {
+            return Ok(None);
+        };
+
+        Ok(self
+            .location_for_type_fqn(&type_fqn)
+            .await
+            .map(GotoDefinitionResponse::Scalar))
+    }
+
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
@@ -3043,6 +3369,73 @@ impl LanguageServer for PhpLspBackend {
         };
 
         Ok(result)
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri_str = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .as_str()
+            .to_string();
+        let pos = params.text_document_position_params.position;
+
+        let parser = match self.open_files.get(&uri_str) {
+            Some(parser) => parser,
+            None => return Ok(None),
+        };
+        let tree = match parser.tree() {
+            Some(tree) => tree,
+            None => return Ok(None),
+        };
+        let source = parser.source();
+        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+        let sym = match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
+            Some(sym) => sym,
+            None => return Ok(None),
+        };
+
+        if sym.ref_kind == RefKind::Variable {
+            let highlights: Vec<DocumentHighlight> =
+                find_variable_references_at_position(tree, &source, pos.line, byte_col, true)
+                    .into_iter()
+                    .map(|reference| document_highlight_from_range(&source, reference.range, true))
+                    .collect();
+            return if highlights.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(highlights))
+            };
+        }
+
+        let Some(kind) = php_symbol_kind_for_ref_kind(sym.ref_kind) else {
+            return Ok(None);
+        };
+        let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
+        let (target_fqn, target_kind) = if let Some(resolved) = resolved {
+            (resolved.fqn.clone(), resolved.kind)
+        } else {
+            (sym.fqn.clone(), kind)
+        };
+        let read_write_capable = target_kind == php_lsp_types::PhpSymbolKind::Property;
+
+        let highlights: Vec<DocumentHighlight> =
+            find_references_in_file(tree, &source, &file_symbols, &target_fqn, target_kind, true)
+                .into_iter()
+                .map(|reference| {
+                    document_highlight_from_range(&source, reference.range, read_write_capable)
+                })
+                .collect();
+
+        if highlights.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(highlights))
+        }
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {

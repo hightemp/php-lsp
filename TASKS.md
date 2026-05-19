@@ -495,11 +495,11 @@
   - Переход к декларации symbol/type alias/import, когда она отличается от definition
   - Fallback к definition для PHP-символов без отдельной declaration
 
-- [ ] **V1-017** textDocument/typeDefinition
+- [x] **V1-017** textDocument/typeDefinition *(done 2026-05-19)*
   - Для переменных/свойств/return values переходить к объявлению класса типа
   - Использовать PHPDoc `@var`, `@param`, `@return` как fallback
 
-- [ ] **V1-018** textDocument/documentHighlight
+- [x] **V1-018** textDocument/documentHighlight *(done 2026-05-19)*
   - Подсветка всех occurrences символа в текущем документе
   - Отдельно Read/Write для переменных и свойств где возможно
 
@@ -678,8 +678,8 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-008 / V1-007** `textDocument/semanticTokens/full`
 - [x] **LP-009 / V1-008** `textDocument/semanticTokens/full/delta`
 - [x] **LP-010 / V1-016** `textDocument/declaration`
-- [ ] **LP-011 / V1-017** `textDocument/typeDefinition`
-- [ ] **LP-012 / V1-018** `textDocument/documentHighlight`
+- [x] **LP-011 / V1-017** `textDocument/typeDefinition`
+- [x] **LP-012 / V1-018** `textDocument/documentHighlight`
 - [ ] **LP-013 / V1-019** `textDocument/selectionRange`
 - [ ] **LP-014 / V1-020** `textDocument/linkedEditingRange`
 - [ ] **LP-015 / V1-021** Completion polish: snippets, sorting, auto-imports, visibility-aware members
@@ -720,3 +720,5 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-008 / V1-007` `textDocument/semanticTokens/full`.
 - [x] **T-2026-05-19** Реализовать `LP-009 / V1-008` `textDocument/semanticTokens/full/delta`.
 - [x] **T-2026-05-19** Реализовать `LP-010 / V1-016` `textDocument/declaration`.
+- [x] **T-2026-05-19** Реализовать `LP-011 / V1-017` `textDocument/typeDefinition`.
+- [x] **T-2026-05-19** Реализовать `LP-012 / V1-018` `textDocument/documentHighlight`.
