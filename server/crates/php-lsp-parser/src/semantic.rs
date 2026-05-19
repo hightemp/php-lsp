@@ -550,9 +550,13 @@ fn node_range(node: &tree_sitter::Node) -> (u32, u32, u32, u32) {
 /// This is used by the server to pre-resolve (lazily index) these FQNs before
 /// running `compute_diagnostics`, so that "Unknown class" warnings are not
 /// emitted for classes reachable through namespace aliases.
-pub fn collect_aliased_class_fqns(tree: &Tree, source: &str, file_symbols: &FileSymbols) -> Vec<String> {
-    use std::collections::HashSet;
+pub fn collect_aliased_class_fqns(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Vec<String> {
     use crate::resolve::resolve_class_name_pub;
+    use std::collections::HashSet;
 
     // Build a set of alias prefixes for quick lookup.
     let aliases: HashSet<&str> = file_symbols
@@ -569,7 +573,14 @@ pub fn collect_aliased_class_fqns(tree: &Tree, source: &str, file_symbols: &File
     let src = source.as_bytes();
     let mut fqns = HashSet::new();
     let mut cursor = tree.root_node().walk();
-    collect_qualified_names_recursive(&mut cursor, src, &aliases, file_symbols, &mut fqns, &resolve_class_name_pub);
+    collect_qualified_names_recursive(
+        &mut cursor,
+        src,
+        &aliases,
+        file_symbols,
+        &mut fqns,
+        &resolve_class_name_pub,
+    );
     fqns.into_iter().collect()
 }
 

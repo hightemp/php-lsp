@@ -131,15 +131,20 @@ mod tests {
         assert!(DEFAULT_EXTENSIONS.contains(&"standard"));
     }
 
+    fn stubs_are_available(stubs_path: &Path) -> bool {
+        // Check that the submodule is actually initialized (not just an empty dir)
+        stubs_path.join("Core/Core.php").is_file()
+    }
+
     #[test]
     fn test_load_stubs_with_real_data() {
         // This test uses actual phpstorm-stubs if available
         let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
 
-        if !stubs_path.is_dir() {
+        if !stubs_are_available(&stubs_path) {
             // Skip if stubs are not available (e.g., in CI without submodule)
             eprintln!(
-                "Skipping stubs test: stubs directory not found at {}",
+                "Skipping stubs test: stubs not initialized at {}",
                 stubs_path.display()
             );
             return;
@@ -163,7 +168,7 @@ mod tests {
     fn test_load_stubs_nonexistent_extension() {
         let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
 
-        if !stubs_path.is_dir() {
+        if !stubs_are_available(&stubs_path) {
             return;
         }
 
@@ -176,7 +181,7 @@ mod tests {
     fn test_load_multiple_extensions() {
         let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
 
-        if !stubs_path.is_dir() {
+        if !stubs_are_available(&stubs_path) {
             return;
         }
 

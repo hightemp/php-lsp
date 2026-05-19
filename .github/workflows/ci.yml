@@ -18,6 +18,8 @@ jobs:
         working-directory: server
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -26,6 +28,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
+
+      - name: Bundle stubs
+        run: ../scripts/bundle-stubs.sh
 
       - name: Check formatting
         run: cargo fmt --all --check
