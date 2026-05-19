@@ -610,14 +610,15 @@ fn build_signature_help(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ImportKind {
     Class,
     Function,
+    Constant,
 }
 
 fn code_action_kind_allowed(only: Option<&Vec<CodeActionKind>>, kind: &CodeActionKind) -> bool {
-    only.map(|kinds| kinds.iter().any(|k| k == kind))
+    only.map(|kinds| kinds.is_empty() || kinds.iter().any(|k| k == kind))
         .unwrap_or(true)
 }
 
@@ -643,7 +644,16 @@ fn use_kind_matches(import_kind: ImportKind, use_kind: php_lsp_types::UseKind) -
         (import_kind, use_kind),
         (ImportKind::Class, php_lsp_types::UseKind::Class)
             | (ImportKind::Function, php_lsp_types::UseKind::Function)
+            | (ImportKind::Constant, php_lsp_types::UseKind::Constant)
     )
+}
+
+fn import_kind_from_use_kind(use_kind: php_lsp_types::UseKind) -> ImportKind {
+    match use_kind {
+        php_lsp_types::UseKind::Class => ImportKind::Class,
+        php_lsp_types::UseKind::Function => ImportKind::Function,
+        php_lsp_types::UseKind::Constant => ImportKind::Constant,
+    }
 }
 
 fn existing_use_alias(use_stmt: &php_lsp_types::UseStatement) -> String {
@@ -737,14 +747,237 @@ fn find_use_insert_line(source: &str, file_symbols: &php_lsp_types::FileSymbols)
 }
 
 fn build_use_statement(import_fqn: &str, import_kind: ImportKind, alias: Option<&str>) -> String {
+    let import_fqn = import_fqn.trim_start_matches('\\');
     let prefix = match import_kind {
         ImportKind::Class => "use",
         ImportKind::Function => "use function",
+        ImportKind::Constant => "use const",
     };
     match alias {
         Some(alias) => format!("{} {} as {};", prefix, import_fqn, alias),
         None => format!("{} {};", prefix, import_fqn),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OrganizableImport {
+    fqn: String,
+    alias: Option<String>,
+    kind: ImportKind,
+}
+
+fn import_kind_sort_key(kind: ImportKind) -> u8 {
+    match kind {
+        ImportKind::Class => 0,
+        ImportKind::Function => 1,
+        ImportKind::Constant => 2,
+    }
+}
+
+fn source_line(source: &str, line: u32) -> Option<&str> {
+    source.lines().nth(line as usize)
+}
+
+fn is_simple_use_statement_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("use ")
+        && trimmed.ends_with(';')
+        && !trimmed.contains('{')
+        && !trimmed.contains('}')
+}
+
+fn find_organizable_use_block(
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<(u32, u32)> {
+    let start_line = file_symbols
+        .use_statements
+        .iter()
+        .map(|use_stmt| use_stmt.range.0)
+        .min()?;
+    let end_line = file_symbols
+        .use_statements
+        .iter()
+        .map(|use_stmt| use_stmt.range.2)
+        .max()?
+        + 1;
+
+    for use_stmt in &file_symbols.use_statements {
+        if use_stmt.range.0 != use_stmt.range.2 {
+            return None;
+        }
+        let line = source_line(source, use_stmt.range.0)?;
+        if !is_simple_use_statement_line(line) {
+            return None;
+        }
+    }
+
+    for line_idx in start_line..end_line {
+        let line = source_line(source, line_idx)?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !is_simple_use_statement_line(line) {
+            return None;
+        }
+    }
+
+    Some((start_line, end_line))
+}
+
+fn source_without_line_range(source: &str, start_line: u32, end_line: u32) -> String {
+    let mut result = String::with_capacity(source.len());
+    for (line_idx, line) in source.split_inclusive('\n').enumerate() {
+        if (start_line as usize..end_line as usize).contains(&line_idx) {
+            result.push('\n');
+        } else {
+            result.push_str(line);
+        }
+    }
+    result
+}
+
+fn is_php_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() || !ch.is_ascii()
+}
+
+fn has_identifier_boundaries(source: &str, start: usize, end: usize) -> bool {
+    let before_ok = source[..start]
+        .chars()
+        .next_back()
+        .map(|ch| !is_php_identifier_char(ch))
+        .unwrap_or(true);
+    let after_ok = source[end..]
+        .chars()
+        .next()
+        .map(|ch| !is_php_identifier_char(ch))
+        .unwrap_or(true);
+    before_ok && after_ok
+}
+
+fn contains_php_identifier(source: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+
+    let mut offset = 0usize;
+    while let Some(relative) = source[offset..].find(name) {
+        let start = offset + relative;
+        let end = start + name.len();
+        if has_identifier_boundaries(source, start, end) {
+            return true;
+        }
+        offset = end;
+    }
+
+    false
+}
+
+fn contains_php_function_call(source: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+
+    let mut offset = 0usize;
+    while let Some(relative) = source[offset..].find(name) {
+        let start = offset + relative;
+        let end = start + name.len();
+        if has_identifier_boundaries(source, start, end) {
+            let after_name = source[end..].trim_start();
+            if after_name.starts_with('(') {
+                return true;
+            }
+        }
+        offset = end;
+    }
+
+    false
+}
+
+fn import_is_used(source_without_imports: &str, import: &OrganizableImport) -> bool {
+    let alias = import
+        .alias
+        .as_deref()
+        .unwrap_or_else(|| short_name(&import.fqn));
+
+    match import.kind {
+        ImportKind::Class => contains_php_identifier(source_without_imports, alias),
+        ImportKind::Function => contains_php_function_call(source_without_imports, alias),
+        ImportKind::Constant => contains_php_identifier(source_without_imports, alias),
+    }
+}
+
+fn build_organize_imports_edit(
+    uri: Uri,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<WorkspaceEdit> {
+    if file_symbols.use_statements.is_empty() {
+        return None;
+    }
+
+    let (start_line, end_line) = find_organizable_use_block(source, file_symbols)?;
+    let source_without_imports = source_without_line_range(source, start_line, end_line);
+
+    let mut imports: Vec<OrganizableImport> = file_symbols
+        .use_statements
+        .iter()
+        .map(|use_stmt| OrganizableImport {
+            fqn: use_stmt.fqn.trim_start_matches('\\').to_string(),
+            alias: use_stmt.alias.clone(),
+            kind: import_kind_from_use_kind(use_stmt.kind),
+        })
+        .filter(|import| import_is_used(&source_without_imports, import))
+        .collect();
+
+    imports.sort_by(|a, b| {
+        import_kind_sort_key(a.kind)
+            .cmp(&import_kind_sort_key(b.kind))
+            .then_with(|| a.fqn.to_lowercase().cmp(&b.fqn.to_lowercase()))
+            .then_with(|| a.alias.cmp(&b.alias))
+    });
+    imports.dedup();
+
+    let mut groups = Vec::new();
+    for kind in [
+        ImportKind::Class,
+        ImportKind::Function,
+        ImportKind::Constant,
+    ] {
+        let lines: Vec<String> = imports
+            .iter()
+            .filter(|import| import.kind == kind)
+            .map(|import| build_use_statement(&import.fqn, import.kind, import.alias.as_deref()))
+            .collect();
+        if !lines.is_empty() {
+            groups.push(lines.join("\n"));
+        }
+    }
+
+    let mut new_text = groups.join("\n\n");
+    if !new_text.is_empty() {
+        new_text.push('\n');
+        if !line_is_blank(source, end_line) {
+            new_text.push('\n');
+        }
+    }
+
+    let range = Range {
+        start: Position::new(start_line, 0),
+        end: Position::new(end_line, 0),
+    };
+    if text_at_lsp_range(source, range)
+        .map(|old_text| old_text == new_text)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri, vec![TextEdit { range, new_text }]);
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    })
 }
 
 fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
@@ -1367,7 +1600,10 @@ impl LanguageServer for PhpLspBackend {
                 }),
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
-                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        code_action_kinds: Some(vec![
+                            CodeActionKind::QUICKFIX,
+                            CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                        ]),
                         resolve_provider: Some(false),
                         work_done_progress_options: WorkDoneProgressOptions::default(),
                     },
@@ -2602,7 +2838,14 @@ impl LanguageServer for PhpLspBackend {
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        if !code_action_kind_allowed(params.context.only.as_ref(), &CodeActionKind::QUICKFIX) {
+        let wants_quickfix =
+            code_action_kind_allowed(params.context.only.as_ref(), &CodeActionKind::QUICKFIX);
+        let wants_organize_imports = code_action_kind_allowed(
+            params.context.only.as_ref(),
+            &CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+        );
+
+        if !wants_quickfix && !wants_organize_imports {
             return Ok(Some(vec![]));
         }
 
@@ -2628,6 +2871,27 @@ impl LanguageServer for PhpLspBackend {
             (source, file_symbols)
         };
 
+        let mut actions = Vec::new();
+
+        if wants_organize_imports {
+            if let Some(edit) = build_organize_imports_edit(uri.clone(), &source, &file_symbols) {
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: "Organize imports".to_string(),
+                    kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
+                    diagnostics: None,
+                    edit: Some(edit),
+                    command: None,
+                    is_preferred: Some(false),
+                    disabled: None,
+                    data: None,
+                }));
+            }
+        }
+
+        if !wants_quickfix {
+            return Ok(Some(actions));
+        }
+
         let diagnostics = if params.context.diagnostics.is_empty() {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
@@ -2641,7 +2905,7 @@ impl LanguageServer for PhpLspBackend {
             params.context.diagnostics
         };
 
-        let mut actions = Vec::new();
+        let mut quickfix_count = 0usize;
 
         for diagnostic in diagnostics {
             let Some((import_kind, unresolved_fqn)) =
@@ -2676,6 +2940,7 @@ impl LanguageServer for PhpLspBackend {
                     })
                     .map(|entry| entry.value().clone())
                     .collect(),
+                ImportKind::Constant => Vec::new(),
             };
             candidates.sort_by(|a, b| a.fqn.cmp(&b.fqn));
             candidates.dedup_by(|a, b| a.fqn == b.fqn);
@@ -2705,10 +2970,11 @@ impl LanguageServer for PhpLspBackend {
                     diagnostics: Some(vec![diagnostic.clone()]),
                     edit: Some(edit),
                     command: None,
-                    is_preferred: Some(actions.is_empty()),
+                    is_preferred: Some(quickfix_count == 0),
                     disabled: None,
                     data: None,
                 }));
+                quickfix_count += 1;
             }
         }
 

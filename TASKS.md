@@ -457,7 +457,7 @@
   - Разрешение конфликтов alias/import
   - Поддержка `function`/`const` imports там, где применимо
 
-- [ ] **V1-003** textDocument/codeAction — organize imports
+- [x] **V1-003** textDocument/codeAction — organize imports *(done 2026-05-19)*
   - source.organizeImports
   - Сортировка use-statements алфавитно, удаление неиспользуемых
   - Группировка class/function/const imports
@@ -670,7 +670,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 
 - [x] **LP-001 / V1-001** `textDocument/signatureHelp`
 - [x] **LP-002 / V1-002** `textDocument/codeAction` — quick-fix: add use
-- [ ] **LP-003 / V1-003** `source.organizeImports`
+- [x] **LP-003 / V1-003** `source.organizeImports`
 - [ ] **LP-004 / V1-004** `textDocument/codeAction` — add return type
 - [ ] **LP-005 / V1-005** `textDocument/formatting`
 - [ ] **LP-006 / V1-006** `textDocument/rangeFormatting`
@@ -712,3 +712,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Добавить отдельный tracking checklist для LSP parity задач.
 - [x] **T-2026-05-19** Реализовать `LP-001 / V1-001` `textDocument/signatureHelp`.
 - [x] **T-2026-05-19** Реализовать `LP-002 / V1-002` quick-fix `Add use`.
+- [x] **T-2026-05-19** Реализовать `LP-003 / V1-003` `source.organizeImports`.

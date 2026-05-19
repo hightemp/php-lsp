@@ -107,20 +107,46 @@ fn code_action_request(
     end_character: u32,
     diagnostics: serde_json::Value,
 ) -> Request {
+    code_action_request_with_only(
+        id,
+        uri,
+        ((start_line, start_character), (end_line, end_character)),
+        diagnostics,
+        vec!["quickfix"],
+    )
+}
+
+fn code_action_request_with_only(
+    id: i64,
+    uri: &str,
+    range: ((u32, u32), (u32, u32)),
+    diagnostics: serde_json::Value,
+    only: Vec<&str>,
+) -> Request {
     Request::build("textDocument/codeAction")
         .params(json!({
             "textDocument": { "uri": uri },
             "range": {
-                "start": { "line": start_line, "character": start_character },
-                "end": { "line": end_line, "character": end_character }
+                "start": { "line": range.0.0, "character": range.0.1 },
+                "end": { "line": range.1.0, "character": range.1.1 }
             },
             "context": {
                 "diagnostics": diagnostics,
-                "only": ["quickfix"]
+                "only": only
             }
         }))
         .id(id)
         .finish()
+}
+
+fn organize_imports_request(id: i64, uri: &str) -> Request {
+    code_action_request_with_only(
+        id,
+        uri,
+        ((0, 0), (0, 0)),
+        json!([]),
+        vec!["source.organizeImports"],
+    )
 }
 
 fn document_symbol_request(id: i64, uri: &str) -> Request {
@@ -226,6 +252,20 @@ async fn test_initialize_and_shutdown() {
             .and_then(|c| c.get("codeActionProvider"))
             .is_some(),
         "expected codeActionProvider capability"
+    );
+    let code_action_kinds = result
+        .get("capabilities")
+        .and_then(|c| c.get("codeActionProvider"))
+        .and_then(|p| p.get("codeActionKinds"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        code_action_kinds
+            .iter()
+            .any(|kind| kind.as_str() == Some("source.organizeImports")),
+        "expected source.organizeImports capability, got: {}",
+        result
     );
     assert!(
         result
@@ -995,6 +1035,94 @@ class ConflictDemo {
             .any(|edit| edit["newText"].as_str() == Some("BarImport")),
         "expected usage replacement with alias, got: {}",
         conflict_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_organize_imports_sorts_groups_and_removes_unused() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+use Zed\Unused;
+use function Vendor\zeta;
+use Vendor\Foo;
+use const Vendor\VALUE;
+use Alpha\Bar;
+
+class Demo {
+    public function run(Foo $foo, Bar $bar): void {
+        zeta();
+        echo VALUE;
+    }
+}
+"#;
+    let uri = "file:///test/OrganizeImports.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(organize_imports_request(2, uri))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let actions = result.as_array().expect("code actions array");
+    let organize_action = actions
+        .iter()
+        .find(|action| action.get("title").and_then(|v| v.as_str()) == Some("Organize imports"))
+        .unwrap_or_else(|| panic!("expected Organize imports action, got: {}", result));
+
+    assert_eq!(
+        organize_action.get("kind").and_then(|v| v.as_str()),
+        Some("source.organizeImports")
+    );
+
+    let new_text = organize_action["edit"]["changes"][uri][0]["newText"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(
+        new_text,
+        "use Alpha\\Bar;\nuse Vendor\\Foo;\n\nuse function Vendor\\zeta;\n\nuse const Vendor\\VALUE;\n"
+    );
+    assert!(
+        !new_text.contains("Zed\\Unused"),
+        "unused import should be removed, got: {}",
+        new_text
     );
 
     service
