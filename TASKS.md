@@ -463,7 +463,7 @@
   - Группировка class/function/const imports
   - Сохранение комментариев рядом с use-блоком
 
-- [ ] **V1-004** textDocument/codeAction — добавить return type
+- [x] **V1-004** textDocument/codeAction — добавить return type *(done 2026-05-19)*
   - Если есть PHPDoc @return но нет return type hint
   - Не предлагать несовместимые типы для текущей target PHP version
 
@@ -671,7 +671,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-001 / V1-001** `textDocument/signatureHelp`
 - [x] **LP-002 / V1-002** `textDocument/codeAction` — quick-fix: add use
 - [x] **LP-003 / V1-003** `source.organizeImports`
-- [ ] **LP-004 / V1-004** `textDocument/codeAction` — add return type
+- [x] **LP-004 / V1-004** `textDocument/codeAction` — add return type
 - [ ] **LP-005 / V1-005** `textDocument/formatting`
 - [ ] **LP-006 / V1-006** `textDocument/rangeFormatting`
 - [ ] **LP-007 / V1-015** `textDocument/onTypeFormatting`
@@ -713,3 +713,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-001 / V1-001` `textDocument/signatureHelp`.
 - [x] **T-2026-05-19** Реализовать `LP-002 / V1-002` quick-fix `Add use`.
 - [x] **T-2026-05-19** Реализовать `LP-003 / V1-003` `source.organizeImports`.
+- [x] **T-2026-05-19** Реализовать `LP-004 / V1-004` code action `Add return type`.

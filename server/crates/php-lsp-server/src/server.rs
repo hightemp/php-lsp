@@ -14,6 +14,9 @@ use php_lsp_parser::resolve::{
     infer_variable_type_at_position, symbol_at_position, symbol_at_position_with_resolver,
     variable_definition_at_position, variable_hover_info_at_position, RefKind,
 };
+use php_lsp_parser::return_type::{
+    find_missing_return_type_candidates, MissingReturnTypeCandidate,
+};
 use php_lsp_parser::semantic::collect_aliased_class_fqns;
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
 use php_lsp_parser::signature_help::signature_help_context_at_position;
@@ -25,6 +28,27 @@ use tokio::sync::{Mutex, Semaphore};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::*;
 use tower_lsp::{Client, LanguageServer};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PhpVersion {
+    major: u16,
+    minor: u16,
+}
+
+impl PhpVersion {
+    const DEFAULT: Self = Self { major: 8, minor: 2 };
+
+    fn parse(raw: &str) -> Option<Self> {
+        let mut parts = raw.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next().unwrap_or("0").parse().ok()?;
+        Some(Self { major, minor })
+    }
+
+    fn at_least(self, major: u16, minor: u16) -> bool {
+        self >= Self { major, minor }
+    }
+}
 
 /// Main LSP backend holding all state.
 pub struct PhpLspBackend {
@@ -42,6 +66,8 @@ pub struct PhpLspBackend {
     trace_level: Mutex<TraceValue>,
     /// Path to bundled phpstorm-stubs (from client initializationOptions).
     stubs_path: Mutex<Option<PathBuf>>,
+    /// Target PHP version from client initializationOptions.
+    php_version: Mutex<PhpVersion>,
 }
 
 impl PhpLspBackend {
@@ -54,6 +80,7 @@ impl PhpLspBackend {
             namespace_map: Mutex::new(None),
             trace_level: Mutex::new(TraceValue::Off),
             stubs_path: Mutex::new(None),
+            php_version: Mutex::new(PhpVersion::DEFAULT),
         }
     }
 
@@ -980,6 +1007,165 @@ fn build_organize_imports_edit(
     })
 }
 
+fn lsp_range_to_byte_range(source: &str, range: Range) -> (u32, u32, u32, u32) {
+    (
+        range.start.line,
+        utf16_col_to_byte(source, range.start.line, range.start.character),
+        range.end.line,
+        utf16_col_to_byte(source, range.end.line, range.end.character),
+    )
+}
+
+fn simple_return_type_hint_is_supported(
+    name: &str,
+    php_version: PhpVersion,
+    in_union: bool,
+) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('$')
+        || trimmed.contains(['<', '>', '[', ']', '(', ')', ',', ' '])
+    {
+        return false;
+    }
+
+    let lower = trimmed.trim_start_matches('\\').to_ascii_lowercase();
+    match lower.as_str() {
+        "void" => false,
+        "never" => php_version.at_least(8, 1),
+        "mixed" => php_version.at_least(8, 0),
+        "static" => php_version.at_least(8, 0),
+        "false" | "null" => {
+            if in_union {
+                php_version.at_least(8, 0)
+            } else {
+                php_version.at_least(8, 2)
+            }
+        }
+        "true" => php_version.at_least(8, 2),
+        "resource" => false,
+        _ => true,
+    }
+}
+
+fn is_intersection_member_type(type_info: &php_lsp_types::TypeInfo) -> bool {
+    let php_lsp_types::TypeInfo::Simple(name) = type_info else {
+        return false;
+    };
+    let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "array"
+            | "bool"
+            | "callable"
+            | "false"
+            | "float"
+            | "int"
+            | "iterable"
+            | "mixed"
+            | "never"
+            | "null"
+            | "object"
+            | "resource"
+            | "string"
+            | "true"
+            | "void"
+    ) && simple_return_type_hint_is_supported(name, PhpVersion::DEFAULT, false)
+}
+
+fn return_type_hint_is_supported(
+    type_info: &php_lsp_types::TypeInfo,
+    php_version: PhpVersion,
+    in_union: bool,
+) -> bool {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            simple_return_type_hint_is_supported(name, php_version, in_union)
+        }
+        php_lsp_types::TypeInfo::Union(types) => {
+            php_version.at_least(8, 0)
+                && types
+                    .iter()
+                    .all(|t| !matches!(t, php_lsp_types::TypeInfo::Void))
+                && types
+                    .iter()
+                    .all(|t| return_type_hint_is_supported(t, php_version, true))
+        }
+        php_lsp_types::TypeInfo::Intersection(types) => {
+            php_version.at_least(8, 1) && types.iter().all(is_intersection_member_type)
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            php_version.at_least(7, 1)
+                && !matches!(
+                    inner.as_ref(),
+                    php_lsp_types::TypeInfo::Mixed
+                        | php_lsp_types::TypeInfo::Never
+                        | php_lsp_types::TypeInfo::Void
+                        | php_lsp_types::TypeInfo::Union(_)
+                        | php_lsp_types::TypeInfo::Intersection(_)
+                )
+                && return_type_hint_is_supported(inner, php_version, false)
+        }
+        php_lsp_types::TypeInfo::Void => php_version.at_least(7, 1),
+        php_lsp_types::TypeInfo::Never => php_version.at_least(8, 1),
+        php_lsp_types::TypeInfo::Mixed => php_version.at_least(8, 0),
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Parent_ => true,
+        php_lsp_types::TypeInfo::Static_ => php_version.at_least(8, 0),
+    }
+}
+
+fn return_type_hint(
+    type_info: &php_lsp_types::TypeInfo,
+    php_version: PhpVersion,
+) -> Option<String> {
+    if return_type_hint_is_supported(type_info, php_version, false) {
+        Some(type_info.to_string())
+    } else {
+        None
+    }
+}
+
+fn build_add_return_type_action(
+    uri: Uri,
+    source: &str,
+    candidate: &MissingReturnTypeCandidate,
+    php_version: PhpVersion,
+) -> Option<CodeActionOrCommand> {
+    let hint = return_type_hint(&candidate.return_type, php_version)?;
+    let utf16_index = Utf16LineIndex::new(source);
+    let insert_position = Position::new(
+        candidate.insert_position.0,
+        utf16_index.byte_col_to_utf16(candidate.insert_position.0, candidate.insert_position.1),
+    );
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(
+        uri,
+        vec![TextEdit {
+            range: Range {
+                start: insert_position,
+                end: insert_position,
+            },
+            new_text: format!(": {}", hint),
+        }],
+    );
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Add return type `{}`", hint),
+        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+        diagnostics: None,
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: None,
+    }))
+}
+
 fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
     let byte_col = utf16_col_to_byte(source, position.line, position.character) as usize;
     let mut offset = 0usize;
@@ -1550,6 +1736,15 @@ impl LanguageServer for PhpLspBackend {
 
         // Extract stubsPath from client initializationOptions
         if let Some(ref opts) = params.initialization_options {
+            if let Some(raw_php_version) = opts.get("phpVersion").and_then(|v| v.as_str()) {
+                if let Some(parsed) = PhpVersion::parse(raw_php_version) {
+                    tracing::info!("Client provided phpVersion: {}", raw_php_version);
+                    *self.php_version.lock().await = parsed;
+                } else {
+                    tracing::warn!("Ignoring invalid phpVersion: {}", raw_php_version);
+                }
+            }
+
             if let Some(sp) = opts.get("stubsPath").and_then(|v| v.as_str()) {
                 let p = PathBuf::from(sp);
                 tracing::info!("Client provided stubsPath: {}", p.display());
@@ -1603,6 +1798,7 @@ impl LanguageServer for PhpLspBackend {
                         code_action_kinds: Some(vec![
                             CodeActionKind::QUICKFIX,
                             CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                            CodeActionKind::REFACTOR_REWRITE,
                         ]),
                         resolve_provider: Some(false),
                         work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -2844,15 +3040,20 @@ impl LanguageServer for PhpLspBackend {
             params.context.only.as_ref(),
             &CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
         );
+        let wants_add_return_type = code_action_kind_allowed(
+            params.context.only.as_ref(),
+            &CodeActionKind::REFACTOR_REWRITE,
+        );
 
-        if !wants_quickfix && !wants_organize_imports {
+        if !wants_quickfix && !wants_organize_imports && !wants_add_return_type {
             return Ok(Some(vec![]));
         }
 
         let uri = params.text_document.uri;
         let uri_str = uri.as_str().to_string();
+        let php_version = *self.php_version.lock().await;
 
-        let (source, file_symbols) = {
+        let (source, file_symbols, add_return_type_actions) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(Some(vec![])),
@@ -2868,10 +3069,22 @@ impl LanguageServer for PhpLspBackend {
                 .get(&uri_str)
                 .map(|entry| entry.value().clone())
                 .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
-            (source, file_symbols)
+            let add_return_type_actions = if wants_add_return_type {
+                let range = lsp_range_to_byte_range(&source, params.range);
+                find_missing_return_type_candidates(tree, &source, range)
+                    .into_iter()
+                    .filter_map(|candidate| {
+                        build_add_return_type_action(uri.clone(), &source, &candidate, php_version)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (source, file_symbols, add_return_type_actions)
         };
 
         let mut actions = Vec::new();
+        actions.extend(add_return_type_actions);
 
         if wants_organize_imports {
             if let Some(edit) = build_organize_imports_edit(uri.clone(), &source, &file_symbols) {

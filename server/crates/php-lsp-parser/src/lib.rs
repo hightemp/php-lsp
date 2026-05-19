@@ -8,6 +8,7 @@ pub mod parser;
 pub mod phpdoc;
 pub mod references;
 pub mod resolve;
+pub mod return_type;
 pub mod semantic;
 pub mod signature_help;
 pub mod symbols;

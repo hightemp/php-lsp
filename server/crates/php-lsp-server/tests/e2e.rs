@@ -149,6 +149,10 @@ fn organize_imports_request(id: i64, uri: &str) -> Request {
     )
 }
 
+fn add_return_type_request(id: i64, uri: &str, range: ((u32, u32), (u32, u32))) -> Request {
+    code_action_request_with_only(id, uri, range, json!([]), vec!["refactor.rewrite"])
+}
+
 fn document_symbol_request(id: i64, uri: &str) -> Request {
     Request::build("textDocument/documentSymbol")
         .params(json!({
@@ -265,6 +269,13 @@ async fn test_initialize_and_shutdown() {
             .iter()
             .any(|kind| kind.as_str() == Some("source.organizeImports")),
         "expected source.organizeImports capability, got: {}",
+        result
+    );
+    assert!(
+        code_action_kinds
+            .iter()
+            .any(|kind| kind.as_str() == Some("refactor.rewrite")),
+        "expected refactor.rewrite capability, got: {}",
         result
     );
     assert!(
@@ -1123,6 +1134,190 @@ class Demo {
         !new_text.contains("Zed\\Unused"),
         "unused import should be removed, got: {}",
         new_text
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_add_return_type_from_phpdoc() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "8.2" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+/**
+ * @return string|null
+ */
+function label($value) {
+    return $value;
+}
+
+class Demo {
+    /**
+     * @return static
+     */
+    public function fluent() {
+        return $this;
+    }
+
+    /** @return int */
+    public function already(): int {
+        return 1;
+    }
+
+    /** @return string */
+    public function __construct() {}
+}
+"#;
+    let uri = "file:///test/AddReturnType.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(add_return_type_request(2, uri, ((0, 0), (26, 0))))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let actions = result.as_array().expect("code actions array");
+
+    let function_action = actions
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|v| v.as_str()) == Some("Add return type `string|null`")
+        })
+        .unwrap_or_else(|| panic!("expected string|null return type action, got: {}", result));
+    assert_eq!(
+        function_action.get("kind").and_then(|v| v.as_str()),
+        Some("refactor.rewrite")
+    );
+    assert_eq!(
+        function_action["edit"]["changes"][uri][0]["newText"].as_str(),
+        Some(": string|null")
+    );
+
+    let method_action = actions
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|v| v.as_str()) == Some("Add return type `static`")
+        })
+        .unwrap_or_else(|| panic!("expected static return type action, got: {}", result));
+    assert_eq!(
+        method_action["edit"]["changes"][uri][0]["newText"].as_str(),
+        Some(": static")
+    );
+    assert!(
+        !actions.iter().any(|action| {
+            action
+                .get("title")
+                .and_then(|v| v.as_str())
+                .is_some_and(|title| title.contains("int"))
+        }),
+        "should not offer action for declarations that already have native return type: {}",
+        result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_add_return_type_respects_php_version() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "7.4" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+/**
+ * @return string|null
+ */
+function label($value) {
+    return $value;
+}
+"#;
+    let uri = "file:///test/AddReturnTypePhp74.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(add_return_type_request(2, uri, ((0, 0), (8, 0))))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let actions = result.as_array().expect("code actions array");
+    assert!(
+        actions.is_empty(),
+        "PHP 7.4 should not offer PHP 8 union return type action, got: {}",
+        result
     );
 
     service
