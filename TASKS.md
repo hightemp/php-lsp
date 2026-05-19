@@ -1,12 +1,5 @@
 # PHP Language Server — Roadmap и задачи
 
-## Текущие задачи
-
-- [x] **T-2026-05-19** Добавить Rust MSRV badge из `server/Cargo.toml` в README.
-- [x] **T-2026-05-19** Дополнить README полным набором badge для GitHub и VS Marketplace.
-- [x] **T-2026-05-19** Добавить release/downloads badge в README и перенести нижний счётчик наверх.
-- [x] **T-2026-05-19** Добавить `.semantic-search` в ignore и проверить статус `server/data/stubs`.
-
 ## Обзор этапов
 
 | Этап | Срок | Цель |
@@ -574,3 +567,13 @@ M-013 ──→ M-014          (stubs → hover on built-ins)
   - Просмотреть структуру workspace, ключевые crate'ы и клиент VS Code
   - Проверить основные потоки: парсинг, индекс, completion, LSP server
   - Сформулировать риски по архитектуре, корректности, производительности и поддерживаемости
+
+---
+
+## Текущие задачи
+
+- [x] **T-2026-05-19** Добавить `.semantic-search` в ignore и проверить статус `server/data/stubs`.
+- [x] **T-2026-05-19** Добавить release/downloads badge в README и перенести нижний счётчик наверх.
+- [x] **T-2026-05-19** Дополнить README полным набором badge для GitHub и VS Marketplace.
+- [x] **T-2026-05-19** Добавить Rust MSRV badge из `server/Cargo.toml` в README.
+- [x] **T-2026-05-19** Перенести блок новых задач в конец `TASKS.md`.
