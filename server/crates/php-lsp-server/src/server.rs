@@ -786,6 +786,74 @@ fn selection_range_from_byte_ranges(
     parent.map(|selection_range| *selection_range)
 }
 
+fn node_byte_range(node: tree_sitter::Node) -> (u32, u32, u32, u32) {
+    let start = node.start_position();
+    let end = node.end_position();
+    (
+        start.row as u32,
+        start.column as u32,
+        end.row as u32,
+        end.column as u32,
+    )
+}
+
+fn node_text<'a>(source: &'a str, node: tree_sitter::Node) -> &'a str {
+    source.get(node.byte_range()).unwrap_or("")
+}
+
+fn enclosing_linked_edit_construct(mut node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    loop {
+        if matches!(
+            node.kind(),
+            "namespace_definition"
+                | "namespace_use_declaration"
+                | "namespace_use_clause"
+                | "namespace_use_group"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn collect_matching_name_ranges(
+    node: tree_sitter::Node,
+    source: &str,
+    target: &str,
+    ranges: &mut Vec<(u32, u32, u32, u32)>,
+) {
+    if node.kind() == "name" && node_text(source, node) == target {
+        ranges.push(node_byte_range(node));
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_matching_name_ranges(child, source, target, ranges);
+    }
+}
+
+fn linked_editing_ranges_for_namespace_or_use(
+    source: &str,
+    node: tree_sitter::Node,
+) -> Option<Vec<(u32, u32, u32, u32)>> {
+    if node.kind() != "name" {
+        return None;
+    }
+
+    let target = node_text(source, node);
+    if target.is_empty() {
+        return None;
+    }
+
+    let construct = enclosing_linked_edit_construct(node)?;
+    let mut ranges = Vec::new();
+    collect_matching_name_ranges(construct, source, target, &mut ranges);
+    ranges.sort_unstable();
+    ranges.dedup();
+
+    (ranges.len() >= 2).then_some(ranges)
+}
+
 fn php_symbol_kind_for_ref_kind(ref_kind: RefKind) -> Option<php_lsp_types::PhpSymbolKind> {
     match ref_kind {
         RefKind::ClassName | RefKind::Constructor => Some(php_lsp_types::PhpSymbolKind::Class),
@@ -2430,6 +2498,9 @@ impl LanguageServer for PhpLspBackend {
                     },
                 )),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
+                    true,
+                )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 declaration_provider: Some(DeclarationCapability::Simple(true)),
@@ -3520,6 +3591,62 @@ impl LanguageServer for PhpLspBackend {
         } else {
             Ok(Some(results))
         }
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> Result<Option<LinkedEditingRanges>> {
+        let uri_str = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .as_str()
+            .to_string();
+        let position = params.text_document_position_params.position;
+
+        let parser = match self.open_files.get(&uri_str) {
+            Some(parser) => parser,
+            None => return Ok(None),
+        };
+        let tree = match parser.tree() {
+            Some(tree) => tree,
+            None => return Ok(None),
+        };
+        let source = parser.source();
+        let byte_col = utf16_col_to_byte(&source, position.line, position.character);
+        let point = tree_sitter::Point::new(position.line as usize, byte_col as usize);
+        let root = tree.root_node();
+        let mut node = match root.descendant_for_point_range(point, point) {
+            Some(node) => node,
+            None => return Ok(None),
+        };
+
+        while !node.is_named() {
+            node = match node.parent() {
+                Some(parent) => parent,
+                None => return Ok(None),
+            };
+        }
+
+        let Some(byte_ranges) = linked_editing_ranges_for_namespace_or_use(&source, node) else {
+            return Ok(None);
+        };
+        let ranges = byte_ranges
+            .into_iter()
+            .map(|range| {
+                let range = range_byte_to_utf16(&source, range);
+                Range {
+                    start: Position::new(range.0, range.1),
+                    end: Position::new(range.2, range.3),
+                }
+            })
+            .collect();
+
+        Ok(Some(LinkedEditingRanges {
+            ranges,
+            word_pattern: Some("[A-Za-z_][A-Za-z0-9_]*".to_string()),
+        }))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {

@@ -136,6 +136,16 @@ fn selection_range_request(id: i64, uri: &str, positions: Vec<(u32, u32)>) -> Re
         .finish()
 }
 
+fn linked_editing_range_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
+    Request::build("textDocument/linkedEditingRange")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn completion_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/completion")
         .params(json!({
@@ -500,6 +510,14 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected selectionRangeProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("linkedEditingRangeProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected linkedEditingRangeProvider capability"
     );
     assert!(
         result
@@ -1468,6 +1486,106 @@ class Demo {
             .iter()
             .any(|range| range.0 == 4 && range.1 <= 14 && range.2 == 4 && range.3 >= 19),
         "variable selection should include the variable node: {variable_chain:?}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_linked_editing_range_for_use_alias_identifier() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+use Vendor\Service as Service;
+use Vendor\Other;
+
+class Demo {}
+"#;
+    let uri = "file:///test/LinkedEditingRange.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(linked_editing_range_request(2, uri, 3, 13))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let ranges = result
+        .get("ranges")
+        .and_then(|ranges| ranges.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        ranges.len(),
+        2,
+        "linked editing should return FQN tail and alias ranges"
+    );
+    let actual_ranges: Vec<_> = ranges
+        .iter()
+        .map(|range| {
+            (
+                range["start"]["line"].as_u64().unwrap_or(u64::MAX),
+                range["start"]["character"].as_u64().unwrap_or(u64::MAX),
+                range["end"]["line"].as_u64().unwrap_or(u64::MAX),
+                range["end"]["character"].as_u64().unwrap_or(u64::MAX),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual_ranges,
+        vec![(3, 11, 3, 18), (3, 22, 3, 29)],
+        "linked editing ranges should point to both Service identifiers"
+    );
+    assert_eq!(
+        result.get("wordPattern").and_then(|value| value.as_str()),
+        Some("[A-Za-z_][A-Za-z0-9_]*"),
+        "linked editing should constrain edits to PHP identifier segments"
+    );
+
+    let single_name_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(linked_editing_range_request(3, uri, 4, 12))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(single_name_response).is_null(),
+        "linked editing should not return a single unpaired identifier"
     );
 
     service
