@@ -486,7 +486,7 @@
   - Legend: token types + modifiers по таблице в PRD
   - Обход CST, маппинг нод в semantic tokens
 
-- [ ] **V1-008** textDocument/semanticTokens/full/delta
+- [x] **V1-008** textDocument/semanticTokens/full/delta *(done 2026-05-19)*
   - Инкрементальное обновление на основе previousResultId
 
 ### Navigation polish
@@ -676,7 +676,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-006 / V1-006** `textDocument/rangeFormatting`
 - [x] **LP-007 / V1-015** `textDocument/onTypeFormatting`
 - [x] **LP-008 / V1-007** `textDocument/semanticTokens/full`
-- [ ] **LP-009 / V1-008** `textDocument/semanticTokens/full/delta`
+- [x] **LP-009 / V1-008** `textDocument/semanticTokens/full/delta`
 - [ ] **LP-010 / V1-016** `textDocument/declaration`
 - [ ] **LP-011 / V1-017** `textDocument/typeDefinition`
 - [ ] **LP-012 / V1-018** `textDocument/documentHighlight`
@@ -718,3 +718,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-006 / V1-006` `textDocument/rangeFormatting`.
 - [x] **T-2026-05-19** Реализовать `LP-007 / V1-015` `textDocument/onTypeFormatting`.
 - [x] **T-2026-05-19** Реализовать `LP-008 / V1-007` `textDocument/semanticTokens/full`.
+- [x] **T-2026-05-19** Реализовать `LP-009 / V1-008` `textDocument/semanticTokens/full/delta`.

@@ -58,6 +58,20 @@ fn did_open_notification(uri: &str, text: &str) -> Request {
         .finish()
 }
 
+fn did_change_full_notification(uri: &str, version: i32, text: &str) -> Request {
+    Request::build("textDocument/didChange")
+        .params(json!({
+            "textDocument": {
+                "uri": uri,
+                "version": version
+            },
+            "contentChanges": [
+                { "text": text }
+            ]
+        }))
+        .finish()
+}
+
 fn hover_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/hover")
         .params(json!({
@@ -223,6 +237,16 @@ fn semantic_tokens_full_request(id: i64, uri: &str) -> Request {
         .finish()
 }
 
+fn semantic_tokens_full_delta_request(id: i64, uri: &str, previous_result_id: &str) -> Request {
+    Request::build("textDocument/semanticTokens/full/delta")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "previousResultId": previous_result_id
+        }))
+        .id(id)
+        .finish()
+}
+
 fn rename_request(id: i64, uri: &str, line: u32, character: u32, new_name: &str) -> Request {
     Request::build("textDocument/rename")
         .params(json!({
@@ -281,11 +305,18 @@ fn extract_error_message(response: Option<tower_lsp::jsonrpc::Response>) -> Opti
         .map(|s| s.to_string())
 }
 
-fn decode_semantic_tokens(result: &serde_json::Value) -> Vec<(u64, u64, u64, u64, u64)> {
-    let data = result
+fn semantic_token_data(result: &serde_json::Value) -> Vec<u64> {
+    result
         .get("data")
         .and_then(|value| value.as_array())
-        .expect("semantic token data array");
+        .expect("semantic token data array")
+        .iter()
+        .map(|value| value.as_u64().expect("semantic token integer"))
+        .collect()
+}
+
+fn decode_semantic_tokens(result: &serde_json::Value) -> Vec<(u64, u64, u64, u64, u64)> {
+    let data = semantic_token_data(result);
     assert_eq!(
         data.len() % 5,
         0,
@@ -296,8 +327,8 @@ fn decode_semantic_tokens(result: &serde_json::Value) -> Vec<(u64, u64, u64, u64
     let mut start = 0u64;
     let mut tokens = Vec::new();
     for chunk in data.chunks(5) {
-        let delta_line = chunk[0].as_u64().expect("deltaLine");
-        let delta_start = chunk[1].as_u64().expect("deltaStart");
+        let delta_line = chunk[0];
+        let delta_start = chunk[1];
         line += delta_line;
         if delta_line == 0 {
             start += delta_start;
@@ -305,16 +336,42 @@ fn decode_semantic_tokens(result: &serde_json::Value) -> Vec<(u64, u64, u64, u64
             start = delta_start;
         }
 
-        tokens.push((
-            line,
-            start,
-            chunk[2].as_u64().expect("length"),
-            chunk[3].as_u64().expect("tokenType"),
-            chunk[4].as_u64().expect("tokenModifiers"),
-        ));
+        tokens.push((line, start, chunk[2], chunk[3], chunk[4]));
     }
 
     tokens
+}
+
+fn apply_semantic_token_delta(mut data: Vec<u64>, delta_result: &serde_json::Value) -> Vec<u64> {
+    let edits = delta_result
+        .get("edits")
+        .and_then(|value| value.as_array())
+        .expect("semantic token delta edits array");
+
+    for edit in edits {
+        let start = edit
+            .get("start")
+            .and_then(|value| value.as_u64())
+            .expect("edit start") as usize;
+        let delete_count = edit
+            .get("deleteCount")
+            .and_then(|value| value.as_u64())
+            .expect("edit deleteCount") as usize;
+        let inserted: Vec<u64> = edit
+            .get("data")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_u64().expect("semantic token edit integer"))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        data.splice(start..start + delete_count, inserted);
+    }
+
+    data
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -401,10 +458,13 @@ async fn test_initialize_and_shutdown() {
         .get("capabilities")
         .and_then(|c| c.get("semanticTokensProvider"))
         .expect("expected semanticTokensProvider capability");
+    let semantic_full = semantic_provider
+        .get("full")
+        .expect("expected full semantic tokens support");
     assert_eq!(
-        semantic_provider.get("full").and_then(|v| v.as_bool()),
+        semantic_full.get("delta").and_then(|v| v.as_bool()),
         Some(true),
-        "expected full semantic tokens support, got: {}",
+        "expected full/delta semantic tokens support, got: {}",
         result
     );
     let semantic_token_types = semantic_provider
@@ -1901,6 +1961,115 @@ async fn test_semantic_tokens_full_returns_php_token_types() {
                 && *token_type == TOKEN_VARIABLE),
         "expected local variable token for $message, got: {:?}",
         tokens
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_semantic_tokens_full_delta_updates_previous_result() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let uri = "file:///test/SemanticTokensDelta.php";
+    let original_code = "<?php\nclass Demo {\n    public function run(): void {\n        $value = \"one\";\n    }\n}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, original_code))
+        .await
+        .unwrap();
+
+    let full_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(semantic_tokens_full_request(2, uri))
+        .await
+        .unwrap();
+    let full_result = extract_result(full_resp);
+    let previous_result_id = full_result
+        .get("resultId")
+        .and_then(|value| value.as_str())
+        .expect("semantic full resultId")
+        .to_string();
+    let previous_data = semantic_token_data(&full_result);
+
+    let changed_code = "<?php\nclass Demo {\n    public function run(): void {\n        $value = \"one\";\n        $other = \"two\";\n    }\n}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(uri, 2, changed_code))
+        .await
+        .unwrap();
+
+    let delta_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(semantic_tokens_full_delta_request(
+            3,
+            uri,
+            &previous_result_id,
+        ))
+        .await
+        .unwrap();
+    let delta_result = extract_result(delta_resp);
+    let next_result_id = delta_result
+        .get("resultId")
+        .and_then(|value| value.as_str())
+        .expect("semantic delta resultId");
+    assert_ne!(
+        next_result_id, previous_result_id,
+        "delta should publish a fresh result id"
+    );
+    assert!(
+        delta_result
+            .get("edits")
+            .and_then(|value| value.as_array())
+            .is_some_and(|edits| !edits.is_empty()),
+        "delta response should contain edits, got: {}",
+        delta_result
+    );
+
+    let patched_data = apply_semantic_token_delta(previous_data, &delta_result);
+    let fresh_full_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(semantic_tokens_full_request(4, uri))
+        .await
+        .unwrap();
+    let fresh_full_result = extract_result(fresh_full_resp);
+    assert_eq!(
+        patched_data,
+        semantic_token_data(&fresh_full_result),
+        "delta edits should transform old token data into fresh full token data"
     );
 
     service

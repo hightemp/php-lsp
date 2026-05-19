@@ -25,6 +25,7 @@ use php_lsp_parser::semantic_tokens::{
 use php_lsp_parser::signature_help::signature_help_context_at_position;
 use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -92,6 +93,39 @@ impl FormattingConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SemanticTokensSnapshot {
+    result_id: String,
+    data: Vec<SemanticToken>,
+}
+
+#[derive(Debug, Default)]
+struct SemanticTokensCache {
+    next_result_id: u64,
+    by_uri: HashMap<String, SemanticTokensSnapshot>,
+}
+
+impl SemanticTokensCache {
+    fn store(&mut self, uri: &str, data: Vec<SemanticToken>) -> SemanticTokensSnapshot {
+        self.next_result_id += 1;
+        let snapshot = SemanticTokensSnapshot {
+            result_id: format!("semantic-tokens-{}", self.next_result_id),
+            data,
+        };
+        self.by_uri.insert(uri.to_string(), snapshot.clone());
+        snapshot
+    }
+
+    fn previous_data(&self, uri: &str, result_id: &str) -> Option<Vec<SemanticToken>> {
+        let snapshot = self.by_uri.get(uri)?;
+        (snapshot.result_id == result_id).then(|| snapshot.data.clone())
+    }
+
+    fn remove(&mut self, uri: &str) {
+        self.by_uri.remove(uri);
+    }
+}
+
 /// Main LSP backend holding all state.
 pub struct PhpLspBackend {
     /// Client handle for sending notifications to VS Code.
@@ -112,6 +146,8 @@ pub struct PhpLspBackend {
     php_version: Mutex<PhpVersion>,
     /// External formatter configuration.
     formatting_config: Mutex<FormattingConfig>,
+    /// Last semantic token snapshots used for full/delta requests.
+    semantic_tokens_cache: Mutex<SemanticTokensCache>,
 }
 
 impl PhpLspBackend {
@@ -126,6 +162,7 @@ impl PhpLspBackend {
             stubs_path: Mutex::new(None),
             php_version: Mutex::new(PhpVersion::DEFAULT),
             formatting_config: Mutex::new(FormattingConfig::default()),
+            semantic_tokens_cache: Mutex::new(SemanticTokensCache::default()),
         }
     }
 
@@ -1224,6 +1261,63 @@ fn semantic_tokens_legend() -> SemanticTokensLegend {
     }
 }
 
+fn semantic_tokens_for_parser(parser: &FileParser) -> Option<Vec<SemanticToken>> {
+    let tree = parser.tree()?;
+    let source = parser.source();
+    Some(
+        extract_semantic_tokens(tree, &source)
+            .into_iter()
+            .map(|token| SemanticToken {
+                delta_line: token.delta_line,
+                delta_start: token.delta_start,
+                length: token.length,
+                token_type: token.token_type,
+                token_modifiers_bitset: token.token_modifiers_bitset,
+            })
+            .collect(),
+    )
+}
+
+fn semantic_tokens_flat_len(token_count: usize) -> u32 {
+    u32::try_from(token_count.saturating_mul(5)).unwrap_or(u32::MAX)
+}
+
+fn semantic_tokens_delta_edits(
+    previous: &[SemanticToken],
+    current: &[SemanticToken],
+) -> Vec<SemanticTokensEdit> {
+    if previous == current {
+        return vec![];
+    }
+
+    let mut common_prefix = 0usize;
+    while common_prefix < previous.len()
+        && common_prefix < current.len()
+        && previous[common_prefix] == current[common_prefix]
+    {
+        common_prefix += 1;
+    }
+
+    let mut common_suffix = 0usize;
+    while common_suffix < previous.len().saturating_sub(common_prefix)
+        && common_suffix < current.len().saturating_sub(common_prefix)
+        && previous[previous.len() - 1 - common_suffix]
+            == current[current.len() - 1 - common_suffix]
+    {
+        common_suffix += 1;
+    }
+
+    let delete_count = previous.len() - common_prefix - common_suffix;
+    let insert_end = current.len() - common_suffix;
+    let inserted = current[common_prefix..insert_end].to_vec();
+
+    vec![SemanticTokensEdit {
+        start: semantic_tokens_flat_len(common_prefix),
+        delete_count: semantic_tokens_flat_len(delete_count),
+        data: (!inserted.is_empty()).then_some(inserted),
+    }]
+}
+
 fn full_document_range(source: &str) -> Range {
     let mut line = 0u32;
     let mut character = 0u32;
@@ -2097,7 +2191,7 @@ impl LanguageServer for PhpLspBackend {
                             work_done_progress_options: WorkDoneProgressOptions::default(),
                             legend: semantic_tokens_legend(),
                             range: None,
-                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                         },
                     ),
                 ),
@@ -2306,6 +2400,7 @@ impl LanguageServer for PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         tracing::debug!("didClose: {}", uri_str);
         self.open_files.remove(&uri_str);
+        self.semantic_tokens_cache.lock().await.remove(&uri_str);
         // Clear diagnostics for closed file
         self.client.publish_diagnostics(uri, vec![], None).await;
     }
@@ -3452,27 +3547,64 @@ impl LanguageServer for PhpLspBackend {
                 Some(parser) => parser,
                 None => return Ok(None),
             };
-            let tree = match parser.tree() {
-                Some(tree) => tree,
+            match semantic_tokens_for_parser(&parser) {
+                Some(data) => data,
                 None => return Ok(None),
-            };
-            let source = parser.source();
-            extract_semantic_tokens(tree, &source)
-                .into_iter()
-                .map(|token| SemanticToken {
-                    delta_line: token.delta_line,
-                    delta_start: token.delta_start,
-                    length: token.length,
-                    token_type: token.token_type,
-                    token_modifiers_bitset: token.token_modifiers_bitset,
-                })
-                .collect()
+            }
         };
+        let snapshot = self
+            .semantic_tokens_cache
+            .lock()
+            .await
+            .store(&uri_str, data);
 
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-            result_id: None,
-            data,
+            result_id: Some(snapshot.result_id),
+            data: snapshot.data,
         })))
+    }
+
+    async fn semantic_tokens_full_delta(
+        &self,
+        params: SemanticTokensDeltaParams,
+    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
+        let uri_str = params.text_document.uri.as_str().to_string();
+        tracing::debug!(
+            "semanticTokens/full/delta: {} previous={}",
+            uri_str,
+            params.previous_result_id
+        );
+
+        let data = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            match semantic_tokens_for_parser(&parser) {
+                Some(data) => data,
+                None => return Ok(None),
+            }
+        };
+
+        let mut cache = self.semantic_tokens_cache.lock().await;
+        let previous = cache.previous_data(&uri_str, &params.previous_result_id);
+        let snapshot = cache.store(&uri_str, data);
+
+        let Some(previous) = previous else {
+            return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
+                SemanticTokens {
+                    result_id: Some(snapshot.result_id),
+                    data: snapshot.data,
+                },
+            )));
+        };
+
+        Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+            SemanticTokensDelta {
+                result_id: Some(snapshot.result_id),
+                edits: semantic_tokens_delta_edits(&previous, &snapshot.data),
+            },
+        )))
     }
 
     async fn symbol(
