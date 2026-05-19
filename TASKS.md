@@ -1,5 +1,9 @@
 # PHP Language Server — Roadmap и задачи
 
+## Текущие задачи
+
+- [x] **T-2026-05-19** Добавить `.semantic-search` в ignore и проверить статус `server/data/stubs`.
+
 ## Обзор этапов
 
 | Этап | Срок | Цель |
