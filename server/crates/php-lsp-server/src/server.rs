@@ -2286,6 +2286,94 @@ fn lsp_completion_kind_to_ls(kind: lsp_types::CompletionItemKind) -> CompletionI
     }
 }
 
+fn lsp_insert_text_format_to_ls(format: lsp_types::InsertTextFormat) -> InsertTextFormat {
+    if format == lsp_types::InsertTextFormat::SNIPPET {
+        InsertTextFormat::SNIPPET
+    } else {
+        InsertTextFormat::PLAIN_TEXT
+    }
+}
+
+fn lsp_position_to_ls(position: lsp_types::Position) -> Position {
+    Position::new(position.line, position.character)
+}
+
+fn lsp_range_to_ls(range: lsp_types::Range) -> Range {
+    Range {
+        start: lsp_position_to_ls(range.start),
+        end: lsp_position_to_ls(range.end),
+    }
+}
+
+fn lsp_text_edit_to_ls(edit: lsp_types::TextEdit) -> TextEdit {
+    TextEdit {
+        range: lsp_range_to_ls(edit.range),
+        new_text: edit.new_text,
+    }
+}
+
+fn import_kind_for_completion_symbol(sym: &php_lsp_types::SymbolInfo) -> Option<ImportKind> {
+    match sym.kind {
+        php_lsp_types::PhpSymbolKind::Class
+        | php_lsp_types::PhpSymbolKind::Interface
+        | php_lsp_types::PhpSymbolKind::Trait
+        | php_lsp_types::PhpSymbolKind::Enum => Some(ImportKind::Class),
+        php_lsp_types::PhpSymbolKind::Function => Some(ImportKind::Function),
+        php_lsp_types::PhpSymbolKind::GlobalConstant => Some(ImportKind::Constant),
+        _ => None,
+    }
+}
+
+fn symbol_is_in_current_namespace(file_symbols: &php_lsp_types::FileSymbols, fqn: &str) -> bool {
+    let Some(namespace) = file_symbols.namespace.as_deref() else {
+        return false;
+    };
+    fqn.rsplit_once('\\')
+        .map(|(symbol_namespace, _)| symbol_namespace == namespace)
+        .unwrap_or(false)
+}
+
+fn build_completion_auto_import_edit(
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    sym: &php_lsp_types::SymbolInfo,
+) -> Option<TextEdit> {
+    if sym.modifiers.is_builtin || !sym.fqn.contains('\\') {
+        return None;
+    }
+    if symbol_is_in_current_namespace(file_symbols, &sym.fqn) {
+        return None;
+    }
+
+    let import_kind = import_kind_for_completion_symbol(sym)?;
+    if existing_import_for_fqn(file_symbols, &sym.fqn, import_kind).is_some() {
+        return None;
+    }
+
+    let import_short_name = short_name(&sym.fqn);
+    let used_aliases = used_import_aliases(file_symbols, import_kind);
+    if used_aliases.contains(import_short_name) {
+        return None;
+    }
+
+    let insert_line = find_use_insert_line(source, file_symbols);
+    let needs_spacing =
+        file_symbols.use_statements.is_empty() && !line_is_blank(source, insert_line);
+    let mut new_text = build_use_statement(&sym.fqn, import_kind, None);
+    new_text.push('\n');
+    if needs_spacing {
+        new_text.push('\n');
+    }
+
+    Some(TextEdit {
+        range: Range {
+            start: Position::new(insert_line, 0),
+            end: Position::new(insert_line, 0),
+        },
+        new_text,
+    })
+}
+
 /// Background workspace indexing.
 ///
 /// Scans PHP files in the workspace and adds their symbols to the index.
@@ -4625,11 +4713,17 @@ impl LanguageServer for PhpLspBackend {
         // Get completion items from the provider
         let lsp_items = provide_completions(&context, &self.index, &file_symbols);
 
+        let enable_auto_imports = matches!(
+            context,
+            php_lsp_completion::context::CompletionContext::Free { .. }
+                | php_lsp_completion::context::CompletionContext::Namespace { .. }
+        );
+
         // Convert lsp_types::CompletionItem to ls_types::CompletionItem
         // We need to map between the two different type systems
         let items: Vec<CompletionItem> = lsp_items
             .into_iter()
-            .map(|item| {
+            .map(|mut item| {
                 let kind = item.kind.map(lsp_completion_kind_to_ls);
 
                 let tags = item.tags.map(|tags| {
@@ -4644,10 +4738,40 @@ impl LanguageServer for PhpLspBackend {
                         .collect()
                 });
 
+                let auto_import_edit = if enable_auto_imports {
+                    item.data
+                        .as_ref()
+                        .and_then(|data| data.as_str())
+                        .and_then(|fqn| self.index.resolve_fqn(fqn))
+                        .and_then(|sym| {
+                            build_completion_auto_import_edit(&source, &file_symbols, &sym)
+                        })
+                } else {
+                    None
+                };
+                let mut additional_text_edits: Vec<TextEdit> = item
+                    .additional_text_edits
+                    .take()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(lsp_text_edit_to_ls)
+                    .collect();
+                if let Some(edit) = auto_import_edit {
+                    additional_text_edits.insert(0, edit);
+                }
+                let additional_text_edits =
+                    (!additional_text_edits.is_empty()).then_some(additional_text_edits);
+
                 CompletionItem {
                     label: item.label,
                     kind,
                     detail: item.detail,
+                    sort_text: item.sort_text,
+                    filter_text: item.filter_text,
+                    insert_text: item.insert_text,
+                    insert_text_format: item.insert_text_format.map(lsp_insert_text_format_to_ls),
+                    additional_text_edits,
+                    commit_characters: item.commit_characters,
                     tags,
                     data: item.data,
                     ..Default::default()

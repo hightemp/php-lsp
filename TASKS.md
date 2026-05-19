@@ -512,7 +512,7 @@
 
 ### Completion polish
 
-- [ ] **V1-021** Улучшить completion до привычного IDE-уровня
+- [x] **V1-021** Улучшить completion до привычного IDE-уровня *(done 2026-05-19)*
   - snippets для `class`, `interface`, `trait`, `enum`, `function`, control-flow constructs
   - `sortText`, `filterText`, `insertTextFormat`, `commitCharacters`
   - auto-import completion через `additionalTextEdits`
@@ -682,7 +682,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-012 / V1-018** `textDocument/documentHighlight`
 - [x] **LP-013 / V1-019** `textDocument/selectionRange`
 - [x] **LP-014 / V1-020** `textDocument/linkedEditingRange`
-- [ ] **LP-015 / V1-021** Completion polish: snippets, sorting, auto-imports, visibility-aware members
+- [x] **LP-015 / V1-021** Completion polish: snippets, sorting, auto-imports, visibility-aware members
 - [ ] **LP-016 / V1-022** `workspace/didChangeWatchedFiles` and incremental reindex
 - [ ] **LP-017 / V1-023** `workspace/didChangeConfiguration` and real config application
 - [ ] **LP-018 / V1-024** Workspace file operations: create, rename, delete
@@ -724,3 +724,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-012 / V1-018` `textDocument/documentHighlight`.
 - [x] **T-2026-05-19** Реализовать `LP-013 / V1-019` `textDocument/selectionRange`.
 - [x] **T-2026-05-19** Реализовать `LP-014 / V1-020` `textDocument/linkedEditingRange`.
+- [x] **T-2026-05-19** Реализовать `LP-015 / V1-021` Completion polish.

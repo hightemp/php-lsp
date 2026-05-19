@@ -380,6 +380,18 @@ fn selection_range_chain(value: &serde_json::Value) -> Vec<(u64, u64, u64, u64)>
     ranges
 }
 
+fn completion_items_from_result(result: &serde_json::Value) -> Vec<serde_json::Value> {
+    if let Some(items) = result.as_array() {
+        return items.clone();
+    }
+
+    result
+        .get("items")
+        .and_then(|items| items.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn semantic_token_data(result: &serde_json::Value) -> Vec<u64> {
     result
         .get("data")
@@ -1268,6 +1280,153 @@ function run(): void {
         labels.iter().any(|label| label == "test"),
         "expected member completion to include `test`, got: {:?}",
         labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_completion_polish_snippets_and_auto_imports() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_uri = "file:///test/VendorService.php";
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+class Service {}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let app_uri = "file:///test/CompletionPolish.php";
+    let app_code = r#"<?php
+namespace App;
+
+class Demo {
+    public function run(): void {
+        Ser
+    }
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(app_uri, app_code))
+        .await
+        .unwrap();
+
+    let auto_import_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, app_uri, 5, 11))
+        .await
+        .unwrap();
+    let auto_import_result = extract_result(auto_import_resp);
+    let auto_import_items = completion_items_from_result(&auto_import_result);
+    let service_item = auto_import_items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("Service"))
+        .unwrap_or_else(|| panic!("expected Service completion, got: {auto_import_items:?}"));
+    assert!(
+        service_item.get("sortText").is_some(),
+        "completion item should include stable sortText"
+    );
+    assert!(
+        service_item.get("filterText").is_some(),
+        "completion item should include filterText"
+    );
+    let edits = service_item
+        .get("additionalTextEdits")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        edits.len(),
+        1,
+        "Service completion should add one import edit"
+    );
+    assert_eq!(
+        edits[0].get("newText").and_then(|value| value.as_str()),
+        Some("use Vendor\\Service;\n"),
+        "auto-import edit should insert the selected class import"
+    );
+    assert_eq!(
+        edits[0]["range"]["start"]["line"].as_u64(),
+        Some(2),
+        "auto-import should be inserted after namespace declaration"
+    );
+
+    let snippet_uri = "file:///test/CompletionSnippet.php";
+    let snippet_code = "<?php\ncla";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(snippet_uri, snippet_code))
+        .await
+        .unwrap();
+    let snippet_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(3, snippet_uri, 1, 3))
+        .await
+        .unwrap();
+    let snippet_result = extract_result(snippet_resp);
+    let snippet_items = completion_items_from_result(&snippet_result);
+    let class_item = snippet_items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("class"))
+        .unwrap_or_else(|| panic!("expected class snippet completion, got: {snippet_items:?}"));
+    assert_eq!(
+        class_item.get("kind").and_then(|value| value.as_u64()),
+        Some(15),
+        "class completion should be a snippet item"
+    );
+    assert_eq!(
+        class_item
+            .get("insertTextFormat")
+            .and_then(|value| value.as_u64()),
+        Some(2),
+        "class completion should use snippet insert text format"
+    );
+    assert!(
+        class_item
+            .get("insertText")
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| text.contains("${1:Name}")),
+        "class snippet should include a name placeholder"
     );
 
     service
