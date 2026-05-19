@@ -441,7 +441,7 @@
 
 ### Signature Help
 
-- [ ] **V1-001** textDocument/signatureHelp
+- [x] **V1-001** textDocument/signatureHelp *(done 2026-05-19)*
   - triggerCharacters: ['(', ',']
   - Показать параметры функции/метода
   - Подсветить текущий параметр
@@ -668,7 +668,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 
 Короткий список для отслеживания прогресса по возможностям, которые обычно есть в зрелых LSP серверах. Подробности по каждой задаче описаны в соответствующих `V1-*` / `VN-*` пунктах выше.
 
-- [ ] **LP-001 / V1-001** `textDocument/signatureHelp`
+- [x] **LP-001 / V1-001** `textDocument/signatureHelp`
 - [ ] **LP-002 / V1-002** `textDocument/codeAction` — quick-fix: add use
 - [ ] **LP-003 / V1-003** `source.organizeImports`
 - [ ] **LP-004 / V1-004** `textDocument/codeAction` — add return type
@@ -710,3 +710,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Проанализировать отсутствующие LSP-возможности относительно обычных LSP серверов.
 - [x] **T-2026-05-19** Добавить отсутствующие LSP-возможности в roadmap `TASKS.md`.
 - [x] **T-2026-05-19** Добавить отдельный tracking checklist для LSP parity задач.
+- [x] **T-2026-05-19** Реализовать `LP-001 / V1-001` `textDocument/signatureHelp`.

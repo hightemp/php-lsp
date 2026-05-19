@@ -9,5 +9,6 @@ pub mod phpdoc;
 pub mod references;
 pub mod resolve;
 pub mod semantic;
+pub mod signature_help;
 pub mod symbols;
 pub mod utf16;

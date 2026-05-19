@@ -88,6 +88,16 @@ fn completion_request(id: i64, uri: &str, line: u32, character: u32) -> Request 
         .finish()
 }
 
+fn signature_help_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
+    Request::build("textDocument/signatureHelp")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn document_symbol_request(id: i64, uri: &str) -> Request {
     Request::build("textDocument/documentSymbol")
         .params(json!({
@@ -177,6 +187,13 @@ async fn test_initialize_and_shutdown() {
     assert!(
         result.get("capabilities").is_some(),
         "expected capabilities in init result"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("signatureHelpProvider"))
+            .is_some(),
+        "expected signatureHelpProvider capability"
     );
     assert!(
         result
@@ -601,6 +618,146 @@ function run(): void {
         labels.iter().any(|label| label == "test"),
         "expected member completion to include `test`, got: {:?}",
         labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_signature_help_for_function_method_and_constructor() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+/**
+ * Build a greeting.
+ * @param string $name Person name.
+ * @param int $count Repeat count.
+ * @return string
+ */
+function greet(string $name, int $count = 1): string { return $name; }
+
+class Greeter {
+    /**
+     * @param string $prefix Prefix text.
+     */
+    public function __construct(string $prefix) {}
+
+    /**
+     * @param string $name Person name.
+     * @param int $count Repeat count.
+     */
+    public function say(string $name, int $count): string { return $name; }
+}
+
+function run(): void {
+    greet("Ada", 2);
+    $greeter = new Greeter("Hi");
+    $greeter->say("Ada", 2);
+}
+"#;
+    let uri = "file:///test/signature-help.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let function_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(signature_help_request(2, uri, 25, 18))
+        .await
+        .unwrap();
+    let function_result = extract_result(function_resp);
+    assert!(
+        function_result["signatures"][0]["label"]
+            .as_str()
+            .unwrap_or("")
+            .contains("App\\greet(string $name, int $count = 1): string"),
+        "expected function signature, got: {}",
+        function_result
+    );
+    assert_eq!(
+        function_result["activeParameter"].as_u64(),
+        Some(1),
+        "second function argument should be active"
+    );
+    assert!(
+        function_result["signatures"][0]["parameters"][0]["documentation"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Person name."),
+        "expected @param documentation, got: {}",
+        function_result
+    );
+
+    let ctor_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(signature_help_request(3, uri, 26, 30))
+        .await
+        .unwrap();
+    let ctor_result = extract_result(ctor_resp);
+    assert!(
+        ctor_result["signatures"][0]["label"]
+            .as_str()
+            .unwrap_or("")
+            .contains("App\\Greeter::__construct(string $prefix)"),
+        "expected constructor signature, got: {}",
+        ctor_result
+    );
+
+    let method_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(signature_help_request(4, uri, 27, 26))
+        .await
+        .unwrap();
+    let method_result = extract_result(method_resp);
+    assert!(
+        method_result["signatures"][0]["label"]
+            .as_str()
+            .unwrap_or("")
+            .contains("App\\Greeter::say(string $name, int $count): string"),
+        "expected method signature, got: {}",
+        method_result
+    );
+    assert_eq!(
+        method_result["activeParameter"].as_u64(),
+        Some(1),
+        "second method argument should be active"
     );
 
     service

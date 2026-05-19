@@ -16,6 +16,7 @@ use php_lsp_parser::resolve::{
 };
 use php_lsp_parser::semantic::collect_aliased_class_fqns;
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
+use php_lsp_parser::signature_help::signature_help_context_at_position;
 use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
 use std::path::{Path, PathBuf};
@@ -493,6 +494,120 @@ fn range_starts_with_dollar(source: &str, range: (u32, u32, u32, u32)) -> bool {
         .get(start)
         .map(|b| *b == b'$')
         .unwrap_or(false)
+}
+
+fn format_signature_param(param: &php_lsp_types::ParamInfo) -> String {
+    let mut label = String::new();
+    if let Some(ref type_info) = param.type_info {
+        label.push_str(&type_info.to_string());
+        label.push(' ');
+    }
+    if param.is_variadic {
+        label.push_str("...");
+    }
+    if param.is_by_ref {
+        label.push('&');
+    }
+    if param.name.starts_with('$') {
+        label.push_str(&param.name);
+    } else {
+        label.push('$');
+        label.push_str(&param.name);
+    }
+    if let Some(ref default) = param.default_value {
+        label.push_str(" = ");
+        label.push_str(default);
+    }
+    label
+}
+
+fn build_signature_help(
+    sym: &php_lsp_types::SymbolInfo,
+    active_parameter: usize,
+) -> Option<SignatureHelp> {
+    let sig = sym.signature.as_ref()?;
+    let param_labels: Vec<String> = sig.params.iter().map(format_signature_param).collect();
+
+    let mut label = String::new();
+    label.push_str(&sym.fqn);
+    label.push('(');
+    label.push_str(&param_labels.join(", "));
+    label.push(')');
+    if let Some(ref ret) = sig.return_type {
+        label.push_str(": ");
+        label.push_str(&ret.to_string());
+    }
+
+    let phpdoc = sym.doc_comment.as_ref().map(|doc| parse_phpdoc(doc));
+    let documentation = phpdoc.as_ref().and_then(|doc| {
+        let mut parts = Vec::new();
+        if let Some(ref summary) = doc.summary {
+            parts.push(summary.clone());
+        }
+        if let Some(ref ret) = doc.return_type {
+            parts.push(format!("@return `{}`", ret));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: parts.join("\n\n"),
+            }))
+        }
+    });
+
+    let parameters: Vec<ParameterInformation> = sig
+        .params
+        .iter()
+        .zip(param_labels.iter())
+        .map(|(param, label)| {
+            let documentation = phpdoc.as_ref().and_then(|doc| {
+                doc.params
+                    .iter()
+                    .find(|p| p.name == param.name)
+                    .and_then(|p| {
+                        let mut parts = Vec::new();
+                        if let Some(ref type_info) = p.type_info {
+                            parts.push(format!("`{}`", type_info));
+                        }
+                        if let Some(ref desc) = p.description {
+                            parts.push(desc.clone());
+                        }
+                        if parts.is_empty() {
+                            None
+                        } else {
+                            Some(Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: parts.join(" — "),
+                            }))
+                        }
+                    })
+            });
+
+            ParameterInformation {
+                label: ParameterLabel::Simple(label.clone()),
+                documentation,
+            }
+        })
+        .collect();
+
+    let active_parameter = if sig.params.is_empty() {
+        None
+    } else {
+        Some(active_parameter.min(sig.params.len() - 1) as u32)
+    };
+
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label,
+            documentation,
+            parameters: Some(parameters),
+            active_parameter,
+        }],
+        active_signature: Some(0),
+        active_parameter,
+    })
 }
 
 /// Compute diagnostics for a file (syntax + semantic).
@@ -1002,6 +1117,11 @@ impl LanguageServer for PhpLspBackend {
                     ]),
                     resolve_provider: Some(true),
                     ..Default::default()
+                }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: Some(vec![",".to_string()]),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
                 ..Default::default()
             },
@@ -2230,6 +2350,71 @@ impl LanguageServer for PhpLspBackend {
             .collect();
 
         Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri_str = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .as_str()
+            .to_string();
+        let pos = params.text_document_position_params.position;
+        tracing::debug!("signatureHelp: {}:{}:{}", uri_str, pos.line, pos.character);
+
+        let (sym_at_pos, active_parameter) = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            let tree = match parser.tree() {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let source = parser.source();
+            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let file_symbols = self
+                .index
+                .file_symbols
+                .get(&uri_str)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
+
+            let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+                self.resolve_member_type(class_fqn, member_name)
+            };
+
+            let context = match signature_help_context_at_position(
+                tree,
+                &source,
+                pos.line,
+                byte_col,
+                &file_symbols,
+                Some(&resolver),
+            ) {
+                Some(context) => context,
+                None => return Ok(None),
+            };
+
+            (context.symbol, context.active_parameter)
+        };
+
+        let symbol_info = self
+            .resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
+            .await;
+
+        let symbol_info = if symbol_info.is_none() && sym_at_pos.ref_kind == RefKind::Constructor {
+            if let Some(class_fqn) = sym_at_pos.fqn.strip_suffix("::__construct") {
+                self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName)
+                    .await
+            } else {
+                None
+            }
+        } else {
+            symbol_info
+        };
+
+        Ok(symbol_info.and_then(|sym| build_signature_help(&sym, active_parameter)))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
