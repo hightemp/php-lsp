@@ -98,6 +98,31 @@ fn signature_help_request(id: i64, uri: &str, line: u32, character: u32) -> Requ
         .finish()
 }
 
+fn code_action_request(
+    id: i64,
+    uri: &str,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+    diagnostics: serde_json::Value,
+) -> Request {
+    Request::build("textDocument/codeAction")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character }
+            },
+            "context": {
+                "diagnostics": diagnostics,
+                "only": ["quickfix"]
+            }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn document_symbol_request(id: i64, uri: &str) -> Request {
     Request::build("textDocument/documentSymbol")
         .params(json!({
@@ -194,6 +219,13 @@ async fn test_initialize_and_shutdown() {
             .and_then(|c| c.get("signatureHelpProvider"))
             .is_some(),
         "expected signatureHelpProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("codeActionProvider"))
+            .is_some(),
+        "expected codeActionProvider capability"
     );
     assert!(
         result
@@ -758,6 +790,211 @@ function run(): void {
         method_result["activeParameter"].as_u64(),
         Some(1),
         "second method argument should be active"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_add_use_for_unknown_class_and_function() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+class Bar {}
+
+function helper(): void {}
+"#;
+    let vendor_uri = "file:///test/Vendor.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let app_code = r#"<?php
+namespace App;
+
+class Demo {
+    public function run(): void {
+        new Bar();
+        helper();
+    }
+}
+"#;
+    let app_uri = "file:///test/AddUse.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(app_uri, app_code))
+        .await
+        .unwrap();
+
+    let class_diag = json!([{
+        "range": {
+            "start": { "line": 5, "character": 12 },
+            "end": { "line": 5, "character": 15 }
+        },
+        "severity": 2,
+        "source": "php-lsp",
+        "message": "Unknown class: App\\Bar"
+    }]);
+    let class_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(2, app_uri, 5, 12, 5, 15, class_diag))
+        .await
+        .unwrap();
+    let class_result = extract_result(class_resp);
+    let class_actions = class_result.as_array().expect("code actions array");
+    assert!(
+        class_actions.iter().any(
+            |action| action.get("title").and_then(|v| v.as_str()) == Some("Import Vendor\\Bar")
+        ),
+        "expected import action for Vendor\\Bar, got: {}",
+        class_result
+    );
+    let class_edit_text = class_actions[0]["edit"]["changes"][app_uri][0]["newText"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        class_edit_text.contains("use Vendor\\Bar;"),
+        "expected use insertion edit, got: {}",
+        class_result
+    );
+
+    let function_diag = json!([{
+        "range": {
+            "start": { "line": 6, "character": 8 },
+            "end": { "line": 6, "character": 14 }
+        },
+        "severity": 2,
+        "source": "php-lsp",
+        "message": "Unknown function: App\\helper"
+    }]);
+    let function_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(3, app_uri, 6, 8, 6, 14, function_diag))
+        .await
+        .unwrap();
+    let function_result = extract_result(function_resp);
+    let function_actions = function_result.as_array().expect("code actions array");
+    assert!(
+        function_actions.iter().any(|action| {
+            action.get("title").and_then(|v| v.as_str()) == Some("Import Vendor\\helper")
+        }),
+        "expected import action for Vendor\\helper, got: {}",
+        function_result
+    );
+    let function_edit_text = function_actions[0]["edit"]["changes"][app_uri][0]["newText"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        function_edit_text.contains("use function Vendor\\helper;"),
+        "expected use function insertion edit, got: {}",
+        function_result
+    );
+
+    let conflict_code = r#"<?php
+namespace App;
+
+use Other\Bar;
+
+class ConflictDemo {
+    public function run(): void {
+        new Bar();
+    }
+}
+"#;
+    let conflict_uri = "file:///test/AddUseConflict.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(conflict_uri, conflict_code))
+        .await
+        .unwrap();
+
+    let conflict_diag = json!([{
+        "range": {
+            "start": { "line": 7, "character": 12 },
+            "end": { "line": 7, "character": 15 }
+        },
+        "severity": 2,
+        "source": "php-lsp",
+        "message": "Unknown class: Other\\Bar"
+    }]);
+    let conflict_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(
+            4,
+            conflict_uri,
+            7,
+            12,
+            7,
+            15,
+            conflict_diag,
+        ))
+        .await
+        .unwrap();
+    let conflict_result = extract_result(conflict_resp);
+    let conflict_actions = conflict_result.as_array().expect("code actions array");
+    assert!(
+        conflict_actions.iter().any(|action| {
+            action.get("title").and_then(|v| v.as_str()) == Some("Import Vendor\\Bar as BarImport")
+        }),
+        "expected aliased import action for Vendor\\Bar, got: {}",
+        conflict_result
+    );
+    let conflict_edits = conflict_actions[0]["edit"]["changes"][conflict_uri]
+        .as_array()
+        .expect("edits");
+    assert!(
+        conflict_edits
+            .iter()
+            .any(|edit| edit["newText"].as_str() == Some("use Vendor\\Bar as BarImport;\n")),
+        "expected aliased use insertion, got: {}",
+        conflict_result
+    );
+    assert!(
+        conflict_edits
+            .iter()
+            .any(|edit| edit["newText"].as_str() == Some("BarImport")),
+        "expected usage replacement with alias, got: {}",
+        conflict_result
     );
 
     service

@@ -610,6 +610,248 @@ fn build_signature_help(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportKind {
+    Class,
+    Function,
+}
+
+fn code_action_kind_allowed(only: Option<&Vec<CodeActionKind>>, kind: &CodeActionKind) -> bool {
+    only.map(|kinds| kinds.iter().any(|k| k == kind))
+        .unwrap_or(true)
+}
+
+fn unknown_symbol_from_diagnostic(message: &str) -> Option<(ImportKind, String)> {
+    if let Some(fqn) = message.strip_prefix("Unknown class: ") {
+        return Some((ImportKind::Class, fqn.to_string()));
+    }
+    if let Some(fqn) = message.strip_prefix("Unknown function: ") {
+        return Some((ImportKind::Function, fqn.to_string()));
+    }
+    None
+}
+
+fn short_name(fqn: &str) -> &str {
+    fqn.trim_start_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or(fqn)
+}
+
+fn use_kind_matches(import_kind: ImportKind, use_kind: php_lsp_types::UseKind) -> bool {
+    matches!(
+        (import_kind, use_kind),
+        (ImportKind::Class, php_lsp_types::UseKind::Class)
+            | (ImportKind::Function, php_lsp_types::UseKind::Function)
+    )
+}
+
+fn existing_use_alias(use_stmt: &php_lsp_types::UseStatement) -> String {
+    use_stmt
+        .alias
+        .clone()
+        .unwrap_or_else(|| short_name(&use_stmt.fqn).to_string())
+}
+
+fn used_import_aliases(
+    file_symbols: &php_lsp_types::FileSymbols,
+    import_kind: ImportKind,
+) -> std::collections::HashSet<String> {
+    let mut aliases = std::collections::HashSet::new();
+    for use_stmt in &file_symbols.use_statements {
+        if use_kind_matches(import_kind, use_stmt.kind) {
+            aliases.insert(existing_use_alias(use_stmt));
+        }
+    }
+    if import_kind == ImportKind::Class {
+        for sym in &file_symbols.symbols {
+            if matches!(
+                sym.kind,
+                php_lsp_types::PhpSymbolKind::Class
+                    | php_lsp_types::PhpSymbolKind::Interface
+                    | php_lsp_types::PhpSymbolKind::Trait
+                    | php_lsp_types::PhpSymbolKind::Enum
+            ) {
+                aliases.insert(sym.name.clone());
+            }
+        }
+    }
+    aliases
+}
+
+fn unique_import_alias(base: &str, used: &std::collections::HashSet<String>) -> String {
+    let mut candidate = format!("{}Import", base);
+    let mut suffix = 2usize;
+    while used.contains(&candidate) {
+        candidate = format!("{}Import{}", base, suffix);
+        suffix += 1;
+    }
+    candidate
+}
+
+fn existing_import_for_fqn<'a>(
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    fqn: &str,
+    import_kind: ImportKind,
+) -> Option<&'a php_lsp_types::UseStatement> {
+    file_symbols
+        .use_statements
+        .iter()
+        .find(|use_stmt| use_kind_matches(import_kind, use_stmt.kind) && use_stmt.fqn == fqn)
+}
+
+fn line_is_blank(source: &str, line: u32) -> bool {
+    source
+        .lines()
+        .nth(line as usize)
+        .map(|line| line.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn find_use_insert_line(source: &str, file_symbols: &php_lsp_types::FileSymbols) -> u32 {
+    if let Some(last_use_line) = file_symbols
+        .use_statements
+        .iter()
+        .map(|use_stmt| use_stmt.range.2)
+        .max()
+    {
+        return last_use_line + 1;
+    }
+
+    for (idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("namespace ") && (trimmed.contains(';') || trimmed.contains('{')) {
+            return idx as u32 + 1;
+        }
+    }
+
+    if source
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim() == "<?php")
+    {
+        1
+    } else {
+        0
+    }
+}
+
+fn build_use_statement(import_fqn: &str, import_kind: ImportKind, alias: Option<&str>) -> String {
+    let prefix = match import_kind {
+        ImportKind::Class => "use",
+        ImportKind::Function => "use function",
+    };
+    match alias {
+        Some(alias) => format!("{} {} as {};", prefix, import_fqn, alias),
+        None => format!("{} {};", prefix, import_fqn),
+    }
+}
+
+fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
+    let byte_col = utf16_col_to_byte(source, position.line, position.character) as usize;
+    let mut offset = 0usize;
+
+    for (current_line, row) in source.split_inclusive('\n').enumerate() {
+        if current_line as u32 == position.line {
+            return Some(offset + byte_col.min(row.len()));
+        }
+        offset += row.len();
+    }
+
+    if position.line as usize == source.lines().count() {
+        Some(source.len())
+    } else {
+        None
+    }
+}
+
+fn text_at_lsp_range(source: &str, range: Range) -> Option<&str> {
+    let start = lsp_position_to_byte(source, range.start)?;
+    let end = lsp_position_to_byte(source, range.end)?;
+    source.get(start..end)
+}
+
+fn build_add_import_edit(
+    uri: Uri,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    import_fqn: &str,
+    import_kind: ImportKind,
+    diagnostic_range: Range,
+) -> Option<(WorkspaceEdit, Option<String>)> {
+    if let Some(existing) = existing_import_for_fqn(file_symbols, import_fqn, import_kind) {
+        if let Some(alias) = existing.alias.clone() {
+            let edit = TextEdit {
+                range: diagnostic_range,
+                new_text: alias.clone(),
+            };
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(uri, vec![edit]);
+            return Some((
+                WorkspaceEdit {
+                    changes: Some(changes),
+                    document_changes: None,
+                    change_annotations: None,
+                },
+                Some(alias),
+            ));
+        }
+        return None;
+    }
+
+    let import_short_name = short_name(import_fqn);
+    let used_aliases = used_import_aliases(file_symbols, import_kind);
+    let alias = if used_aliases.contains(import_short_name) {
+        Some(unique_import_alias(import_short_name, &used_aliases))
+    } else {
+        None
+    };
+
+    let insert_line = find_use_insert_line(source, file_symbols);
+    let needs_spacing =
+        file_symbols.use_statements.is_empty() && !line_is_blank(source, insert_line);
+    let mut import_text = build_use_statement(import_fqn, import_kind, alias.as_deref());
+    import_text.push('\n');
+    if needs_spacing {
+        import_text.push('\n');
+    }
+
+    let mut edits = vec![TextEdit {
+        range: Range {
+            start: Position::new(insert_line, 0),
+            end: Position::new(insert_line, 0),
+        },
+        new_text: import_text,
+    }];
+
+    let replacement_name = alias.as_deref().unwrap_or(import_short_name);
+    if alias.is_some()
+        || text_at_lsp_range(source, diagnostic_range)
+            .map(|text| text.trim_start_matches('\\') != replacement_name)
+            .unwrap_or(false)
+    {
+        edits.push(TextEdit {
+            range: diagnostic_range,
+            new_text: replacement_name.to_string(),
+        });
+    }
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri, edits);
+    Some((
+        WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        },
+        alias,
+    ))
+}
+
+fn range_overlaps(a: Range, b: Range) -> bool {
+    a.start <= b.end && b.start <= a.end
+}
+
 /// Compute diagnostics for a file (syntax + semantic).
 ///
 /// Extracted as a free function so it can be called both from
@@ -1123,6 +1365,13 @@ impl LanguageServer for PhpLspBackend {
                     retrigger_characters: Some(vec![",".to_string()]),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        resolve_provider: Some(false),
+                        work_done_progress_options: WorkDoneProgressOptions::default(),
+                    },
+                )),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -2350,6 +2599,120 @@ impl LanguageServer for PhpLspBackend {
             .collect();
 
         Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        if !code_action_kind_allowed(params.context.only.as_ref(), &CodeActionKind::QUICKFIX) {
+            return Ok(Some(vec![]));
+        }
+
+        let uri = params.text_document.uri;
+        let uri_str = uri.as_str().to_string();
+
+        let (source, file_symbols) = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(p) => p,
+                None => return Ok(Some(vec![])),
+            };
+            let tree = match parser.tree() {
+                Some(t) => t,
+                None => return Ok(Some(vec![])),
+            };
+            let source = parser.source();
+            let file_symbols = self
+                .index
+                .file_symbols
+                .get(&uri_str)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
+            (source, file_symbols)
+        };
+
+        let diagnostics = if params.context.diagnostics.is_empty() {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(p) => p,
+                None => return Ok(Some(vec![])),
+            };
+            compute_diagnostics(&uri_str, &parser, &self.index)
+                .into_iter()
+                .filter(|diag| range_overlaps(diag.range, params.range))
+                .collect()
+        } else {
+            params.context.diagnostics
+        };
+
+        let mut actions = Vec::new();
+
+        for diagnostic in diagnostics {
+            let Some((import_kind, unresolved_fqn)) =
+                unknown_symbol_from_diagnostic(&diagnostic.message)
+            else {
+                continue;
+            };
+            let unresolved_short = short_name(&unresolved_fqn);
+
+            let mut candidates: Vec<std::sync::Arc<php_lsp_types::SymbolInfo>> = match import_kind {
+                ImportKind::Class => self
+                    .index
+                    .types
+                    .iter()
+                    .filter(|entry| {
+                        let sym = entry.value();
+                        !sym.modifiers.is_builtin
+                            && (sym.name == unresolved_short
+                                || short_name(&sym.fqn) == unresolved_short)
+                    })
+                    .map(|entry| entry.value().clone())
+                    .collect(),
+                ImportKind::Function => self
+                    .index
+                    .functions
+                    .iter()
+                    .filter(|entry| {
+                        let sym = entry.value();
+                        !sym.modifiers.is_builtin
+                            && (sym.name == unresolved_short
+                                || short_name(&sym.fqn) == unresolved_short)
+                    })
+                    .map(|entry| entry.value().clone())
+                    .collect(),
+            };
+            candidates.sort_by(|a, b| a.fqn.cmp(&b.fqn));
+            candidates.dedup_by(|a, b| a.fqn == b.fqn);
+            candidates.truncate(5);
+
+            for candidate in candidates {
+                let Some((edit, alias)) = build_add_import_edit(
+                    uri.clone(),
+                    &source,
+                    &file_symbols,
+                    &candidate.fqn,
+                    import_kind,
+                    diagnostic.range,
+                ) else {
+                    continue;
+                };
+
+                let title = if let Some(alias) = alias {
+                    format!("Import {} as {}", candidate.fqn, alias)
+                } else {
+                    format!("Import {}", candidate.fqn)
+                };
+
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title,
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diagnostic.clone()]),
+                    edit: Some(edit),
+                    command: None,
+                    is_preferred: Some(actions.is_empty()),
+                    disabled: None,
+                    data: None,
+                }));
+            }
+        }
+
+        Ok(Some(actions))
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
