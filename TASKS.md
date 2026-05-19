@@ -558,3 +558,8 @@ M-013 ──→ M-014          (stubs → hover on built-ins)
   - Read `symbols.rs`: symbol extraction for promoted constructor params
   - Read `workspace.rs`: `resolve_fqn`, `resolve_member`, `get_direct_members`
   - Identified root cause: promoted constructor params not emitted as Property symbols
+
+- [x] **R-002** Оценить архитектуру и потенциальные проблемы проекта *(done 2026-05-04)*
+  - Просмотреть структуру workspace, ключевые crate'ы и клиент VS Code
+  - Проверить основные потоки: парсинг, индекс, completion, LSP server
+  - Сформулировать риски по архитектуре, корректности, производительности и поддерживаемости
