@@ -476,7 +476,7 @@
 
 - [x] **V1-006** textDocument/rangeFormatting *(done 2026-05-19)*
 
-- [ ] **V1-015** textDocument/onTypeFormatting
+- [x] **V1-015** textDocument/onTypeFormatting *(done 2026-05-19)*
   - Автоформатирование после `;`, `}`, newline
   - Минимальные локальные edits без полного форматирования файла
 
@@ -674,7 +674,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-004 / V1-004** `textDocument/codeAction` — add return type
 - [x] **LP-005 / V1-005** `textDocument/formatting`
 - [x] **LP-006 / V1-006** `textDocument/rangeFormatting`
-- [ ] **LP-007 / V1-015** `textDocument/onTypeFormatting`
+- [x] **LP-007 / V1-015** `textDocument/onTypeFormatting`
 - [ ] **LP-008 / V1-007** `textDocument/semanticTokens/full`
 - [ ] **LP-009 / V1-008** `textDocument/semanticTokens/full/delta`
 - [ ] **LP-010 / V1-016** `textDocument/declaration`
@@ -716,3 +716,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-004 / V1-004` code action `Add return type`.
 - [x] **T-2026-05-19** Реализовать `LP-005 / V1-005` `textDocument/formatting`.
 - [x] **T-2026-05-19** Реализовать `LP-006 / V1-006` `textDocument/rangeFormatting`.
+- [x] **T-2026-05-19** Реализовать `LP-007 / V1-015` `textDocument/onTypeFormatting`.

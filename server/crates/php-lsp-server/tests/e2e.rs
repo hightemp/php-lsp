@@ -135,6 +135,21 @@ fn range_formatting_request(
         .finish()
 }
 
+fn on_type_formatting_request(id: i64, uri: &str, line: u32, character: u32, ch: &str) -> Request {
+    Request::build("textDocument/onTypeFormatting")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "ch": ch,
+            "options": {
+                "tabSize": 4,
+                "insertSpaces": true
+            }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn code_action_request(
     id: i64,
     uri: &str,
@@ -309,6 +324,33 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected documentRangeFormattingProvider capability"
+    );
+    let on_type_provider = result
+        .get("capabilities")
+        .and_then(|c| c.get("documentOnTypeFormattingProvider"))
+        .expect("expected documentOnTypeFormattingProvider capability");
+    assert_eq!(
+        on_type_provider
+            .get("firstTriggerCharacter")
+            .and_then(|v| v.as_str()),
+        Some("\n"),
+        "expected newline on-type trigger, got: {}",
+        result
+    );
+    let on_type_more_triggers = on_type_provider
+        .get("moreTriggerCharacter")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        on_type_more_triggers
+            .iter()
+            .any(|trigger| trigger.as_str() == Some(";"))
+            && on_type_more_triggers
+                .iter()
+                .any(|trigger| trigger.as_str() == Some("}")),
+        "expected ';' and '}}' on-type triggers, got: {}",
+        result
     );
     let code_action_kinds = result
         .get("capabilities")
@@ -1035,6 +1077,97 @@ async fn test_document_range_formatting_uses_custom_external_command() {
     );
     assert_eq!(edits[0]["range"]["start"]["line"].as_u64(), Some(2));
     assert_eq!(edits[0]["range"]["end"]["line"].as_u64(), Some(3));
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_on_type_formatting_returns_local_indentation_edits() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = "<?php\nfunction ok(): void {\necho \"one\";\n    }\n";
+    let uri = "file:///test/OnTypeFormat.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let newline_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(on_type_formatting_request(2, uri, 2, 0, "\n"))
+        .await
+        .unwrap();
+    let newline_result = extract_result(newline_resp);
+    let newline_edits = newline_result.as_array().expect("newline edits array");
+    assert_eq!(newline_edits.len(), 1, "expected newline indent edit");
+    assert_eq!(newline_edits[0]["range"]["start"]["line"].as_u64(), Some(2));
+    assert_eq!(
+        newline_edits[0]["range"]["end"]["character"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(newline_edits[0]["newText"].as_str(), Some("    "));
+
+    let semicolon_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(on_type_formatting_request(3, uri, 2, 11, ";"))
+        .await
+        .unwrap();
+    let semicolon_result = extract_result(semicolon_resp);
+    let semicolon_edits = semicolon_result.as_array().expect("semicolon edits array");
+    assert_eq!(semicolon_edits.len(), 1, "expected semicolon indent edit");
+    assert_eq!(
+        semicolon_edits[0]["range"]["start"]["line"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(semicolon_edits[0]["newText"].as_str(), Some("    "));
+
+    let brace_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(on_type_formatting_request(4, uri, 3, 5, "}"))
+        .await
+        .unwrap();
+    let brace_result = extract_result(brace_resp);
+    let brace_edits = brace_result.as_array().expect("brace edits array");
+    assert_eq!(brace_edits.len(), 1, "expected closing-brace dedent edit");
+    assert_eq!(brace_edits[0]["range"]["start"]["line"].as_u64(), Some(3));
+    assert_eq!(
+        brace_edits[0]["range"]["end"]["character"].as_u64(),
+        Some(4)
+    );
+    assert_eq!(brace_edits[0]["newText"].as_str(), Some(""));
 
     service
         .ready()

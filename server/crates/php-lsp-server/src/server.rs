@@ -1344,6 +1344,74 @@ fn strip_range_formatter_wrapper(formatted: String, was_wrapped: bool) -> String
         .to_string()
 }
 
+fn formatting_source_line(source: &str, line: u32) -> Option<&str> {
+    source.split('\n').nth(line as usize)
+}
+
+fn leading_indent(line: &str) -> &str {
+    let indent_end = line
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, ' ' | '\t'))
+        .map(|(idx, _)| idx)
+        .unwrap_or(line.len());
+    &line[..indent_end]
+}
+
+fn utf16_len(text: &str) -> u32 {
+    text.chars().map(|ch| ch.len_utf16() as u32).sum()
+}
+
+fn formatting_indent_unit(options: &FormattingOptions) -> String {
+    if options.insert_spaces {
+        " ".repeat(options.tab_size.max(1) as usize)
+    } else {
+        "\t".to_string()
+    }
+}
+
+fn brace_delta(line: &str) -> isize {
+    let mut delta = 0isize;
+    for ch in line.chars() {
+        match ch {
+            '{' => delta += 1,
+            '}' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
+fn brace_depth_before_line(source: &str, line: u32) -> usize {
+    let mut depth = 0isize;
+    for row in source.split('\n').take(line as usize) {
+        depth = (depth + brace_delta(row)).max(0);
+    }
+    depth as usize
+}
+
+fn on_type_indent_edit(source: &str, line: u32, options: &FormattingOptions) -> Option<TextEdit> {
+    let current_line = formatting_source_line(source, line)?;
+    let current_indent = leading_indent(current_line);
+    let trimmed = current_line.trim_start_matches([' ', '\t']);
+    let mut depth = brace_depth_before_line(source, line);
+    if trimmed.starts_with('}') {
+        depth = depth.saturating_sub(1);
+    }
+
+    let desired_indent = formatting_indent_unit(options).repeat(depth);
+    if desired_indent == current_indent {
+        return None;
+    }
+
+    Some(TextEdit {
+        range: Range {
+            start: Position::new(line, 0),
+            end: Position::new(line, utf16_len(current_indent)),
+        },
+        new_text: desired_indent,
+    })
+}
+
 fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
     let byte_col = utf16_col_to_byte(source, position.line, position.character) as usize;
     let mut offset = 0usize;
@@ -2003,6 +2071,10 @@ impl LanguageServer for PhpLspBackend {
                 )),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 document_range_formatting_provider: Some(OneOf::Left(true)),
+                document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+                    first_trigger_character: "\n".to_string(),
+                    more_trigger_character: Some(vec![";".to_string(), "}".to_string()]),
+                }),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -2326,6 +2398,55 @@ impl LanguageServer for PhpLspBackend {
             range: params.range,
             new_text: formatted,
         }]))
+    }
+
+    async fn on_type_formatting(
+        &self,
+        params: DocumentOnTypeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri_str = params
+            .text_document_position
+            .text_document
+            .uri
+            .as_str()
+            .to_string();
+        let position = params.text_document_position.position;
+        tracing::debug!(
+            "onTypeFormatting: {}:{}:{} trigger={:?}",
+            uri_str,
+            position.line,
+            position.character,
+            params.ch
+        );
+
+        if !matches!(params.ch.as_str(), "\n" | ";" | "}") {
+            return Ok(Some(vec![]));
+        }
+
+        let source = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            parser.source()
+        };
+
+        let Some(current_line) = formatting_source_line(&source, position.line) else {
+            return Ok(Some(vec![]));
+        };
+        if params.ch == "}"
+            && !current_line
+                .trim_start_matches([' ', '\t'])
+                .starts_with('}')
+        {
+            return Ok(Some(vec![]));
+        }
+
+        Ok(Some(
+            on_type_indent_edit(&source, position.line, &params.options)
+                .into_iter()
+                .collect(),
+        ))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
