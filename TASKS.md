@@ -503,7 +503,7 @@
   - Подсветка всех occurrences символа в текущем документе
   - Отдельно Read/Write для переменных и свойств где возможно
 
-- [ ] **V1-019** textDocument/selectionRange
+- [x] **V1-019** textDocument/selectionRange *(done 2026-05-19)*
   - AST-based расширение выделения: identifier → expression → statement → block → class/function
 
 - [ ] **V1-020** textDocument/linkedEditingRange
@@ -680,7 +680,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-010 / V1-016** `textDocument/declaration`
 - [x] **LP-011 / V1-017** `textDocument/typeDefinition`
 - [x] **LP-012 / V1-018** `textDocument/documentHighlight`
-- [ ] **LP-013 / V1-019** `textDocument/selectionRange`
+- [x] **LP-013 / V1-019** `textDocument/selectionRange`
 - [ ] **LP-014 / V1-020** `textDocument/linkedEditingRange`
 - [ ] **LP-015 / V1-021** Completion polish: snippets, sorting, auto-imports, visibility-aware members
 - [ ] **LP-016 / V1-022** `workspace/didChangeWatchedFiles` and incremental reindex
@@ -722,3 +722,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-010 / V1-016` `textDocument/declaration`.
 - [x] **T-2026-05-19** Реализовать `LP-011 / V1-017` `textDocument/typeDefinition`.
 - [x] **T-2026-05-19** Реализовать `LP-012 / V1-018` `textDocument/documentHighlight`.
+- [x] **T-2026-05-19** Реализовать `LP-013 / V1-019` `textDocument/selectionRange`.

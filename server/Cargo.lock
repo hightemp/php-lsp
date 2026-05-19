@@ -391,6 +391,7 @@ dependencies = [
  "tower-lsp-server",
  "tracing",
  "tracing-subscriber",
+ "tree-sitter",
 ]
 
 [[package]]

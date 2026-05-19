@@ -766,6 +766,26 @@ fn document_highlight_from_range(
     }
 }
 
+fn selection_range_from_byte_ranges(
+    source: &str,
+    byte_ranges: Vec<(u32, u32, u32, u32)>,
+) -> Option<SelectionRange> {
+    let mut parent = None;
+
+    for byte_range in byte_ranges.into_iter().rev() {
+        let range = range_byte_to_utf16(source, byte_range);
+        parent = Some(Box::new(SelectionRange {
+            range: Range {
+                start: Position::new(range.0, range.1),
+                end: Position::new(range.2, range.3),
+            },
+            parent,
+        }));
+    }
+
+    parent.map(|selection_range| *selection_range)
+}
+
 fn php_symbol_kind_for_ref_kind(ref_kind: RefKind) -> Option<php_lsp_types::PhpSymbolKind> {
     match ref_kind {
         RefKind::ClassName | RefKind::Constructor => Some(php_lsp_types::PhpSymbolKind::Class),
@@ -2409,6 +2429,7 @@ impl LanguageServer for PhpLspBackend {
                         ..Default::default()
                     },
                 )),
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 declaration_provider: Some(DeclarationCapability::Simple(true)),
@@ -3435,6 +3456,69 @@ impl LanguageServer for PhpLspBackend {
             Ok(None)
         } else {
             Ok(Some(highlights))
+        }
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let uri_str = params.text_document.uri.as_str().to_string();
+        let parser = match self.open_files.get(&uri_str) {
+            Some(parser) => parser,
+            None => return Ok(None),
+        };
+        let tree = match parser.tree() {
+            Some(tree) => tree,
+            None => return Ok(None),
+        };
+        let source = parser.source();
+        let root = tree.root_node();
+
+        let mut results = Vec::with_capacity(params.positions.len());
+        for position in params.positions {
+            let byte_col = utf16_col_to_byte(&source, position.line, position.character);
+            let point = tree_sitter::Point::new(position.line as usize, byte_col as usize);
+            let mut node = match root.descendant_for_point_range(point, point) {
+                Some(node) => node,
+                None => continue,
+            };
+
+            while !node.is_named() {
+                node = match node.parent() {
+                    Some(parent) => parent,
+                    None => break,
+                };
+            }
+
+            let mut byte_ranges = Vec::new();
+            let mut current = Some(node);
+            while let Some(node) = current {
+                if node.is_named() && node.kind() != "program" {
+                    let start = node.start_position();
+                    let end = node.end_position();
+                    let range = (
+                        start.row as u32,
+                        start.column as u32,
+                        end.row as u32,
+                        end.column as u32,
+                    );
+                    if byte_ranges.last() != Some(&range) {
+                        byte_ranges.push(range);
+                    }
+                }
+                current = node.parent();
+            }
+
+            if let Some(selection_range) = selection_range_from_byte_ranges(&source, byte_ranges) {
+                results.push(selection_range);
+            }
+        }
+
+        if results.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(results))
         }
     }
 

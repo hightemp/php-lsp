@@ -122,6 +122,20 @@ fn document_highlight_request(id: i64, uri: &str, line: u32, character: u32) -> 
         .finish()
 }
 
+fn selection_range_request(id: i64, uri: &str, positions: Vec<(u32, u32)>) -> Request {
+    let positions: Vec<_> = positions
+        .into_iter()
+        .map(|(line, character)| json!({ "line": line, "character": character }))
+        .collect();
+    Request::build("textDocument/selectionRange")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "positions": positions
+        }))
+        .id(id)
+        .finish()
+}
+
 fn completion_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/completion")
         .params(json!({
@@ -335,6 +349,27 @@ fn extract_error_message(response: Option<tower_lsp::jsonrpc::Response>) -> Opti
         .map(|s| s.to_string())
 }
 
+fn selection_range_chain(value: &serde_json::Value) -> Vec<(u64, u64, u64, u64)> {
+    let mut ranges = Vec::new();
+    let mut current = Some(value);
+
+    while let Some(selection_range) = current {
+        if let Some(range) = selection_range.get("range") {
+            let start = &range["start"];
+            let end = &range["end"];
+            ranges.push((
+                start["line"].as_u64().unwrap_or(u64::MAX),
+                start["character"].as_u64().unwrap_or(u64::MAX),
+                end["line"].as_u64().unwrap_or(u64::MAX),
+                end["character"].as_u64().unwrap_or(u64::MAX),
+            ));
+        }
+        current = selection_range.get("parent");
+    }
+
+    ranges
+}
+
 fn semantic_token_data(result: &serde_json::Value) -> Vec<u64> {
     result
         .get("data")
@@ -457,6 +492,14 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected documentHighlightProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("selectionRangeProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected selectionRangeProvider capability"
     );
     assert!(
         result
@@ -1321,6 +1364,110 @@ class Demo {
             .count(),
         1,
         "property read access should be a read highlight"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_selection_range_expands_ast_chain() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+class Demo {
+    public function run(): void {
+        $value = trim(" hi ");
+        echo $value;
+    }
+}
+"#;
+    let uri = "file:///test/SelectionRange.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(selection_range_request(2, uri, vec![(3, 18), (4, 15)]))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let items = result.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        items.len(),
+        2,
+        "selectionRange should return one chain per requested position"
+    );
+
+    let call_chain = selection_range_chain(&items[0]);
+    assert!(
+        call_chain.len() >= 5,
+        "function call selection should expand through expression, statement, method and class: {call_chain:?}"
+    );
+    assert_eq!(
+        call_chain[0],
+        (3, 17, 3, 21),
+        "first selection range should be the function identifier"
+    );
+    assert!(
+        call_chain
+            .iter()
+            .any(|range| range.0 == 3 && range.1 <= 17 && range.2 == 3 && range.3 > 21),
+        "selection range should include a wider same-line expression: {call_chain:?}"
+    );
+    assert!(
+        call_chain
+            .iter()
+            .any(|range| range.0 == 2 && range.1 == 4 && range.2 >= 5),
+        "selection range should include the enclosing method: {call_chain:?}"
+    );
+    assert!(
+        call_chain
+            .iter()
+            .any(|range| range.0 == 1 && range.1 == 0 && range.2 >= 6),
+        "selection range should include the enclosing class: {call_chain:?}"
+    );
+
+    let variable_chain = selection_range_chain(&items[1]);
+    assert!(
+        variable_chain.len() >= 4,
+        "variable selection should expand through expression and enclosing scopes: {variable_chain:?}"
+    );
+    assert!(
+        variable_chain
+            .iter()
+            .any(|range| range.0 == 4 && range.1 <= 14 && range.2 == 4 && range.3 >= 19),
+        "variable selection should include the variable node: {variable_chain:?}"
     );
 
     service
