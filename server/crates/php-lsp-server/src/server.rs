@@ -1324,6 +1324,26 @@ fn run_external_formatter(
     }
 }
 
+fn range_formatter_input(fragment: &str) -> (String, bool) {
+    if fragment.trim_start().starts_with("<?php") {
+        (fragment.to_string(), false)
+    } else {
+        (format!("<?php\n{}", fragment), true)
+    }
+}
+
+fn strip_range_formatter_wrapper(formatted: String, was_wrapped: bool) -> String {
+    if !was_wrapped {
+        return formatted;
+    }
+
+    formatted
+        .strip_prefix("<?php\n")
+        .or_else(|| formatted.strip_prefix("<?php\r\n"))
+        .unwrap_or(&formatted)
+        .to_string()
+}
+
 fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
     let byte_col = utf16_col_to_byte(source, position.line, position.character) as usize;
     let mut offset = 0usize;
@@ -1982,6 +2002,7 @@ impl LanguageServer for PhpLspBackend {
                     },
                 )),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -2241,6 +2262,68 @@ impl LanguageServer for PhpLspBackend {
 
         Ok(Some(vec![TextEdit {
             range: full_document_range(&source),
+            new_text: formatted,
+        }]))
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri_str = params.text_document.uri.as_str().to_string();
+        tracing::debug!("rangeFormatting: {}", uri_str);
+
+        let source = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            parser.source()
+        };
+
+        let Some(fragment) = text_at_lsp_range(&source, params.range) else {
+            return Ok(Some(vec![]));
+        };
+        if fragment.is_empty() {
+            return Ok(Some(vec![]));
+        }
+
+        let config = self.formatting_config.lock().await.clone();
+        if config.command_template().is_none() {
+            return Ok(None);
+        }
+
+        let (formatter_input, was_wrapped) = range_formatter_input(fragment);
+        let workspace_root = self.workspace_root.lock().await.clone();
+        let formatted = tokio::task::spawn_blocking(move || {
+            run_external_formatter(formatter_input, config, workspace_root)
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!("Range formatter task failed: {}", err);
+            tower_lsp::jsonrpc::Error::internal_error()
+        })?;
+
+        let formatted = match formatted {
+            Ok(Some(formatted)) => strip_range_formatter_wrapper(formatted, was_wrapped),
+            Ok(None) => return Ok(Some(vec![])),
+            Err(message) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("php-lsp range formatter failed: {}", message),
+                    )
+                    .await;
+                return Ok(Some(vec![]));
+            }
+        };
+
+        if formatted == fragment {
+            return Ok(Some(vec![]));
+        }
+
+        Ok(Some(vec![TextEdit {
+            range: params.range,
             new_text: formatted,
         }]))
     }

@@ -111,6 +111,30 @@ fn formatting_request(id: i64, uri: &str) -> Request {
         .finish()
 }
 
+fn range_formatting_request(
+    id: i64,
+    uri: &str,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+) -> Request {
+    Request::build("textDocument/rangeFormatting")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character }
+            },
+            "options": {
+                "tabSize": 4,
+                "insertSpaces": true
+            }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn code_action_request(
     id: i64,
     uri: &str,
@@ -277,6 +301,14 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected documentFormattingProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("documentRangeFormattingProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected documentRangeFormattingProvider capability"
     );
     let code_action_kinds = result
         .get("capabilities")
@@ -933,6 +965,76 @@ async fn test_document_formatting_uses_custom_external_command() {
     );
     assert_eq!(edits[0]["range"]["start"]["line"].as_u64(), Some(0));
     assert_eq!(edits[0]["range"]["start"]["character"].as_u64(), Some(0));
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_document_range_formatting_uses_custom_external_command() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let formatted_range = "    echo \"one\";\n";
+    let formatter_command = format!("printf '%s' '{}' > {{file}}", formatted_range);
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({
+                "formattingProvider": "custom",
+                "formattingCommand": formatter_command
+            })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = "<?php\nfunction ok(): void {\necho \"one\";\necho \"two\";\n}\n";
+    let uri = "file:///test/RangeFormat.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(range_formatting_request(2, uri, 2, 0, 3, 0))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let edits = result.as_array().expect("range formatting edits array");
+    assert_eq!(edits.len(), 1, "expected one range edit");
+    assert_eq!(
+        edits[0]["newText"].as_str(),
+        Some(formatted_range),
+        "range formatter edit should contain formatted selection, got: {}",
+        result
+    );
+    assert_eq!(edits[0]["range"]["start"]["line"].as_u64(), Some(2));
+    assert_eq!(edits[0]["range"]["end"]["line"].as_u64(), Some(3));
 
     service
         .ready()
