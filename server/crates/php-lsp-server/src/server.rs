@@ -19,6 +19,9 @@ use php_lsp_parser::return_type::{
 };
 use php_lsp_parser::semantic::collect_aliased_class_fqns;
 use php_lsp_parser::semantic::extract_semantic_diagnostics;
+use php_lsp_parser::semantic_tokens::{
+    extract_semantic_tokens, SEMANTIC_TOKEN_MODIFIERS, SEMANTIC_TOKEN_TYPES,
+};
 use php_lsp_parser::signature_help::signature_help_context_at_position;
 use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
@@ -1208,6 +1211,19 @@ fn build_add_return_type_action(
     }))
 }
 
+fn semantic_tokens_legend() -> SemanticTokensLegend {
+    SemanticTokensLegend {
+        token_types: SEMANTIC_TOKEN_TYPES
+            .iter()
+            .map(|token_type| SemanticTokenType::from(*token_type))
+            .collect(),
+        token_modifiers: SEMANTIC_TOKEN_MODIFIERS
+            .iter()
+            .map(|modifier| SemanticTokenModifier::from(*modifier))
+            .collect(),
+    }
+}
+
 fn full_document_range(source: &str) -> Range {
     let mut line = 0u32;
     let mut character = 0u32;
@@ -2075,6 +2091,16 @@ impl LanguageServer for PhpLspBackend {
                     first_trigger_character: "\n".to_string(),
                     more_trigger_character: Some(vec![";".to_string(), "}".to_string()]),
                 }),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: WorkDoneProgressOptions::default(),
+                            legend: semantic_tokens_legend(),
+                            range: None,
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                    ),
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -3412,6 +3438,41 @@ impl LanguageServer for PhpLspBackend {
         } else {
             Ok(Some(DocumentSymbolResponse::Nested(top_level)))
         }
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri_str = params.text_document.uri.as_str().to_string();
+        tracing::debug!("semanticTokens/full: {}", uri_str);
+
+        let data = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            let tree = match parser.tree() {
+                Some(tree) => tree,
+                None => return Ok(None),
+            };
+            let source = parser.source();
+            extract_semantic_tokens(tree, &source)
+                .into_iter()
+                .map(|token| SemanticToken {
+                    delta_line: token.delta_line,
+                    delta_start: token.delta_start,
+                    length: token.length,
+                    token_type: token.token_type,
+                    token_modifiers_bitset: token.token_modifiers_bitset,
+                })
+                .collect()
+        };
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 
     async fn symbol(

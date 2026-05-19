@@ -214,6 +214,15 @@ fn document_symbol_request(id: i64, uri: &str) -> Request {
         .finish()
 }
 
+fn semantic_tokens_full_request(id: i64, uri: &str) -> Request {
+    Request::build("textDocument/semanticTokens/full")
+        .params(json!({
+            "textDocument": { "uri": uri }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn rename_request(id: i64, uri: &str, line: u32, character: u32, new_name: &str) -> Request {
     Request::build("textDocument/rename")
         .params(json!({
@@ -270,6 +279,42 @@ fn extract_error_message(response: Option<tower_lsp::jsonrpc::Response>) -> Opti
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .map(|s| s.to_string())
+}
+
+fn decode_semantic_tokens(result: &serde_json::Value) -> Vec<(u64, u64, u64, u64, u64)> {
+    let data = result
+        .get("data")
+        .and_then(|value| value.as_array())
+        .expect("semantic token data array");
+    assert_eq!(
+        data.len() % 5,
+        0,
+        "semantic token data should be grouped by five integers"
+    );
+
+    let mut line = 0u64;
+    let mut start = 0u64;
+    let mut tokens = Vec::new();
+    for chunk in data.chunks(5) {
+        let delta_line = chunk[0].as_u64().expect("deltaLine");
+        let delta_start = chunk[1].as_u64().expect("deltaStart");
+        line += delta_line;
+        if delta_line == 0 {
+            start += delta_start;
+        } else {
+            start = delta_start;
+        }
+
+        tokens.push((
+            line,
+            start,
+            chunk[2].as_u64().expect("length"),
+            chunk[3].as_u64().expect("tokenType"),
+            chunk[4].as_u64().expect("tokenModifiers"),
+        ));
+    }
+
+    tokens
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -352,6 +397,32 @@ async fn test_initialize_and_shutdown() {
         "expected ';' and '}}' on-type triggers, got: {}",
         result
     );
+    let semantic_provider = result
+        .get("capabilities")
+        .and_then(|c| c.get("semanticTokensProvider"))
+        .expect("expected semanticTokensProvider capability");
+    assert_eq!(
+        semantic_provider.get("full").and_then(|v| v.as_bool()),
+        Some(true),
+        "expected full semantic tokens support, got: {}",
+        result
+    );
+    let semantic_token_types = semantic_provider
+        .get("legend")
+        .and_then(|legend| legend.get("tokenTypes"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for expected in ["namespace", "class", "method", "property", "variable"] {
+        assert!(
+            semantic_token_types
+                .iter()
+                .any(|token_type| token_type.as_str() == Some(expected)),
+            "expected semantic token type `{}`, got: {}",
+            expected,
+            result
+        );
+    }
     let code_action_kinds = result
         .get("capabilities")
         .and_then(|c| c.get("codeActionProvider"))
@@ -1717,6 +1788,121 @@ class UserService {
     }
 
     // Shutdown
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_semantic_tokens_full_returns_php_token_types() {
+    const TOKEN_CLASS: u64 = 2;
+    const TOKEN_PARAMETER: u64 = 5;
+    const TOKEN_VARIABLE: u64 = 6;
+    const TOKEN_PROPERTY: u64 = 7;
+    const TOKEN_METHOD: u64 = 10;
+    const MOD_DECLARATION: u64 = 1;
+
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = "<?php\nnamespace App\\Demo;\n\nclass UserService {\n    private readonly string $name = \"Ada\";\n\n    public function greet(int $count): string {\n        $message = \"Hi\";\n        return $message;\n    }\n}\n";
+    let uri = "file:///test/SemanticTokens.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(semantic_tokens_full_request(2, uri))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let tokens = decode_semantic_tokens(&result);
+    assert!(
+        !tokens.is_empty(),
+        "expected semantic tokens, got: {}",
+        result
+    );
+
+    assert!(
+        tokens
+            .iter()
+            .any(|(line, start, length, token_type, modifiers)| *line == 3
+                && *start == 6
+                && *length == 11
+                && *token_type == TOKEN_CLASS
+                && (*modifiers & MOD_DECLARATION) != 0),
+        "expected class declaration token for UserService, got: {:?}",
+        tokens
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(line, start, length, token_type, _)| *line == 4
+                && *start == 28
+                && *length == 5
+                && *token_type == TOKEN_PROPERTY),
+        "expected property declaration token for $name, got: {:?}",
+        tokens
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(line, start, length, token_type, _)| *line == 6
+                && *start == 20
+                && *length == 5
+                && *token_type == TOKEN_METHOD),
+        "expected method declaration token for greet, got: {:?}",
+        tokens
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(line, start, length, token_type, _)| *line == 6
+                && *start == 30
+                && *length == 6
+                && *token_type == TOKEN_PARAMETER),
+        "expected parameter token for $count, got: {:?}",
+        tokens
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(line, start, length, token_type, _)| *line == 7
+                && *start == 8
+                && *length == 8
+                && *token_type == TOKEN_VARIABLE),
+        "expected local variable token for $message, got: {:?}",
+        tokens
+    );
+
     service
         .ready()
         .await

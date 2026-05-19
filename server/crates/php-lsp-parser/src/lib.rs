@@ -10,6 +10,7 @@ pub mod references;
 pub mod resolve;
 pub mod return_type;
 pub mod semantic;
+pub mod semantic_tokens;
 pub mod signature_help;
 pub mod symbols;
 pub mod utf16;
