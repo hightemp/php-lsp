@@ -446,27 +446,39 @@
   - Показать параметры функции/метода
   - Подсветить текущий параметр
   - PHPDoc @param
+  - Поддержать overload-like варианты из стабов/PHPDoc где возможно
+  - Работать для функций, методов, конструкторов и статических вызовов
 
 ### Code Actions
 
 - [ ] **V1-002** textDocument/codeAction — quick-fix: добавить use
   - Диагностика "unknown class" + code action "Add use statement"
   - Вставка `use FQN;` в блок use-statements
+  - Разрешение конфликтов alias/import
+  - Поддержка `function`/`const` imports там, где применимо
 
 - [ ] **V1-003** textDocument/codeAction — organize imports
   - source.organizeImports
   - Сортировка use-statements алфавитно, удаление неиспользуемых
+  - Группировка class/function/const imports
+  - Сохранение комментариев рядом с use-блоком
 
 - [ ] **V1-004** textDocument/codeAction — добавить return type
   - Если есть PHPDoc @return но нет return type hint
+  - Не предлагать несовместимые типы для текущей target PHP version
 
 ### Formatting
 
 - [ ] **V1-005** textDocument/formatting — внешний formatter
   - Интеграция: php-cs-fixer / phpcbf через subprocess
   - Конфигурация: phpLsp.formatting.provider + phpLsp.formatting.command
+  - Возврат TextEdit без записи файла напрямую
 
 - [ ] **V1-006** textDocument/rangeFormatting
+
+- [ ] **V1-015** textDocument/onTypeFormatting
+  - Автоформатирование после `;`, `}`, newline
+  - Минимальные локальные edits без полного форматирования файла
 
 ### Semantic Tokens
 
@@ -476,6 +488,68 @@
 
 - [ ] **V1-008** textDocument/semanticTokens/full/delta
   - Инкрементальное обновление на основе previousResultId
+
+### Navigation polish
+
+- [ ] **V1-016** textDocument/declaration
+  - Переход к декларации symbol/type alias/import, когда она отличается от definition
+  - Fallback к definition для PHP-символов без отдельной declaration
+
+- [ ] **V1-017** textDocument/typeDefinition
+  - Для переменных/свойств/return values переходить к объявлению класса типа
+  - Использовать PHPDoc `@var`, `@param`, `@return` как fallback
+
+- [ ] **V1-018** textDocument/documentHighlight
+  - Подсветка всех occurrences символа в текущем документе
+  - Отдельно Read/Write для переменных и свойств где возможно
+
+- [ ] **V1-019** textDocument/selectionRange
+  - AST-based расширение выделения: identifier → expression → statement → block → class/function
+
+- [ ] **V1-020** textDocument/linkedEditingRange
+  - Связанные edits для парных PHP constructs где применимо
+  - Минимум: namespace/use-safe rename внутри одного syntactic construct
+
+### Completion polish
+
+- [ ] **V1-021** Улучшить completion до привычного IDE-уровня
+  - snippets для `class`, `interface`, `trait`, `enum`, `function`, control-flow constructs
+  - `sortText`, `filterText`, `insertTextFormat`, `commitCharacters`
+  - auto-import completion через `additionalTextEdits`
+  - Не предлагать недоступные private/protected/static/instance members в неправильном контексте
+
+### Workspace & configuration
+
+- [ ] **V1-022** workspace/didChangeWatchedFiles и переиндексация изменённых файлов
+  - Обрабатывать create/change/delete PHP файлов
+  - Обновлять индекс без полного restart сервера
+  - Удалять символы удалённых файлов из индекса
+
+- [ ] **V1-023** workspace/didChangeConfiguration и применение настроек клиента
+  - Реально использовать `phpVersion`, `diagnosticsMode`, `composerEnabled`, `indexVendor`, `stubExtensions`, `logLevel`
+  - Поддержать изменение настроек без restart где возможно
+  - Синхронизировать VS Code configuration schema и server initializationOptions
+
+- [ ] **V1-024** Workspace file operations
+  - Поддержать will/did create/rename/delete files где клиент это отдаёт
+  - Обновлять URI символов при rename/move
+  - Инвалидировать кэш и diagnostics для удалённых/перемещённых файлов
+
+### Diagnostics parity
+
+- [ ] **V1-025** Расширить базовые diagnostics
+  - Undefined variables
+  - Unused imports
+  - Unused local variables/parameters
+  - Duplicate symbols в workspace
+
+- [ ] **V1-026** Type/member diagnostics
+  - Unknown method/property/class constant
+  - Visibility violations: private/protected access
+  - Static/instance misuse
+  - Basic type compatibility для параметров, return values, property assignments
+  - Override/signature compatibility для inheritance
+  - PHP-version-specific diagnostics
 
 ### Disk Cache
 
@@ -510,10 +584,17 @@
 - [ ] **VN-003** textDocument/prepareTypeHierarchy + supertypes/subtypes
 - [ ] **VN-004** textDocument/implementation (interface → concrete)
 - [ ] **VN-005** Multi-root workspace поддержка
+  - Использовать `workspaceFolders` вместо одного `rootUri`
+  - Отдельные composer namespace maps и индексы по workspace folder
+  - Корректные diagnostics/search/symbols across folders
 - [ ] **VN-006** Интеграция PHPStan — subprocess + маппинг output → Diagnostics
 - [ ] **VN-007** Интеграция Psalm — subprocess + маппинг output → Diagnostics
 - [ ] **VN-008** Code Lens — количество ссылок на класс/метод
+  - references count
+  - test/run/debug codelens где применимо
 - [ ] **VN-009** Folding Range — складывание функций, классов, PHPDoc
+  - textDocument/foldingRange capability
+  - Функции, методы, классы, namespaces, PHPDoc, массивы/blocks
 - [x] **VN-010** Release pipeline — cross-platform VSIX сборка + публикация в Marketplace *(done 2026-02-15)*
   - `scripts/build-server.sh` — сборка Rust бинарника, копирование в `client/bin/`
   - `scripts/bundle-stubs.sh` — копирование phpstorm-stubs в `client/stubs/`
@@ -550,6 +631,19 @@ M-012 ──→ M-019          (indexing → references)
 M-016 ──→ M-014          (phpdoc → hover)
 M-019 ──→ M-020          (references → rename)
 M-013 ──→ M-014          (stubs → hover on built-ins)
+V1-023 ─→ V1-004         (configuration → PHP-version-aware code actions)
+V1-023 ─→ V1-026         (configuration → PHP-version-specific diagnostics)
+V1-022 ─→ V1-009         (file watching → disk cache invalidation)
+V1-022 ─→ V1-024         (watched file changes → file operation handling)
+V1-002 ─→ V1-021         (add use quick-fix → auto-import completion)
+V1-017 ─→ V1-026         (type definition → type/member diagnostics)
+V1-025 ─→ V1-002         (unknown/unused diagnostics → quick-fixes)
+V1-025 ─→ V1-003         (unused imports → organize imports)
+V1-026 ─→ VN-002         (member/type model → call hierarchy)
+V1-026 ─→ VN-003         (type model → type hierarchy)
+V1-026 ─→ VN-004         (inheritance model → implementation)
+V1-022 ─→ VN-005         (single-root file watching → multi-root support)
+V1-023 ─→ VN-005         (single-root config → multi-root config)
 ```
 
 ---
@@ -570,6 +664,42 @@ M-013 ──→ M-014          (stubs → hover on built-ins)
 
 ---
 
+## LSP parity tracking checklist
+
+Короткий список для отслеживания прогресса по возможностям, которые обычно есть в зрелых LSP серверах. Подробности по каждой задаче описаны в соответствующих `V1-*` / `VN-*` пунктах выше.
+
+- [ ] **LP-001 / V1-001** `textDocument/signatureHelp`
+- [ ] **LP-002 / V1-002** `textDocument/codeAction` — quick-fix: add use
+- [ ] **LP-003 / V1-003** `source.organizeImports`
+- [ ] **LP-004 / V1-004** `textDocument/codeAction` — add return type
+- [ ] **LP-005 / V1-005** `textDocument/formatting`
+- [ ] **LP-006 / V1-006** `textDocument/rangeFormatting`
+- [ ] **LP-007 / V1-015** `textDocument/onTypeFormatting`
+- [ ] **LP-008 / V1-007** `textDocument/semanticTokens/full`
+- [ ] **LP-009 / V1-008** `textDocument/semanticTokens/full/delta`
+- [ ] **LP-010 / V1-016** `textDocument/declaration`
+- [ ] **LP-011 / V1-017** `textDocument/typeDefinition`
+- [ ] **LP-012 / V1-018** `textDocument/documentHighlight`
+- [ ] **LP-013 / V1-019** `textDocument/selectionRange`
+- [ ] **LP-014 / V1-020** `textDocument/linkedEditingRange`
+- [ ] **LP-015 / V1-021** Completion polish: snippets, sorting, auto-imports, visibility-aware members
+- [ ] **LP-016 / V1-022** `workspace/didChangeWatchedFiles` and incremental reindex
+- [ ] **LP-017 / V1-023** `workspace/didChangeConfiguration` and real config application
+- [ ] **LP-018 / V1-024** Workspace file operations: create, rename, delete
+- [ ] **LP-019 / V1-025** Basic diagnostics parity: undefined/unused/duplicate symbols
+- [ ] **LP-020 / V1-026** Type/member diagnostics: unknown members, visibility, static misuse, type compatibility
+- [ ] **LP-021 / VN-001** `textDocument/inlayHint`
+- [ ] **LP-022 / VN-002** `textDocument/prepareCallHierarchy` + incoming/outgoing calls
+- [ ] **LP-023 / VN-003** `textDocument/prepareTypeHierarchy` + supertypes/subtypes
+- [ ] **LP-024 / VN-004** `textDocument/implementation`
+- [ ] **LP-025 / VN-005** Multi-root workspace support
+- [ ] **LP-026 / VN-006** PHPStan diagnostics integration
+- [ ] **LP-027 / VN-007** Psalm diagnostics integration
+- [ ] **LP-028 / VN-008** `textDocument/codeLens`
+- [ ] **LP-029 / VN-009** `textDocument/foldingRange`
+
+---
+
 ## Текущие задачи
 
 - [x] **T-2026-05-19** Добавить `.semantic-search` в ignore и проверить статус `server/data/stubs`.
@@ -577,3 +707,6 @@ M-013 ──→ M-014          (stubs → hover on built-ins)
 - [x] **T-2026-05-19** Дополнить README полным набором badge для GitHub и VS Marketplace.
 - [x] **T-2026-05-19** Добавить Rust MSRV badge из `server/Cargo.toml` в README.
 - [x] **T-2026-05-19** Перенести блок новых задач в конец `TASKS.md`.
+- [x] **T-2026-05-19** Проанализировать отсутствующие LSP-возможности относительно обычных LSP серверов.
+- [x] **T-2026-05-19** Добавить отсутствующие LSP-возможности в roadmap `TASKS.md`.
+- [x] **T-2026-05-19** Добавить отдельный tracking checklist для LSP parity задач.
