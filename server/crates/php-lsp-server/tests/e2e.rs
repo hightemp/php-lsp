@@ -98,6 +98,19 @@ fn signature_help_request(id: i64, uri: &str, line: u32, character: u32) -> Requ
         .finish()
 }
 
+fn formatting_request(id: i64, uri: &str) -> Request {
+    Request::build("textDocument/formatting")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "options": {
+                "tabSize": 4,
+                "insertSpaces": true
+            }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn code_action_request(
     id: i64,
     uri: &str,
@@ -256,6 +269,14 @@ async fn test_initialize_and_shutdown() {
             .and_then(|c| c.get("codeActionProvider"))
             .is_some(),
         "expected codeActionProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("documentFormattingProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected documentFormattingProvider capability"
     );
     let code_action_kinds = result
         .get("capabilities")
@@ -842,6 +863,76 @@ function run(): void {
         Some(1),
         "second method argument should be active"
     );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_document_formatting_uses_custom_external_command() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let formatted = "<?php\nfunction ok(): void\n{\n    echo \"ok\";\n}\n";
+    let formatter_command = format!("printf '%s' '{}' > {{file}}", formatted);
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({
+                "formattingProvider": "custom",
+                "formattingCommand": formatter_command
+            })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = "<?php\nfunction ok(): void { echo \"ok\"; }\n";
+    let uri = "file:///test/Format.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(formatting_request(2, uri))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let edits = result.as_array().expect("formatting edits array");
+    assert_eq!(edits.len(), 1, "expected one full-document edit");
+    assert_eq!(
+        edits[0]["newText"].as_str(),
+        Some(formatted),
+        "formatter edit should contain formatted source, got: {}",
+        result
+    );
+    assert_eq!(edits[0]["range"]["start"]["line"].as_u64(), Some(0));
+    assert_eq!(edits[0]["range"]["start"]["character"].as_u64(), Some(0));
 
     service
         .ready()

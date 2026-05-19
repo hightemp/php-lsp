@@ -24,6 +24,7 @@ use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::*;
@@ -50,6 +51,44 @@ impl PhpVersion {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FormattingConfig {
+    provider: String,
+    command: Option<String>,
+}
+
+impl Default for FormattingConfig {
+    fn default() -> Self {
+        Self {
+            provider: "none".to_string(),
+            command: None,
+        }
+    }
+}
+
+impl FormattingConfig {
+    fn from_options(provider: Option<&str>, command: Option<&str>) -> Self {
+        let provider = provider.unwrap_or("none").trim().to_ascii_lowercase();
+        let command = command
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        Self { provider, command }
+    }
+
+    fn command_template(&self) -> Option<String> {
+        if let Some(command) = &self.command {
+            return Some(command.clone());
+        }
+
+        match self.provider.as_str() {
+            "php-cs-fixer" => Some("php-cs-fixer fix --using-cache=no --quiet {file}".to_string()),
+            "phpcbf" => Some("phpcbf {file}".to_string()),
+            _ => None,
+        }
+    }
+}
+
 /// Main LSP backend holding all state.
 pub struct PhpLspBackend {
     /// Client handle for sending notifications to VS Code.
@@ -68,6 +107,8 @@ pub struct PhpLspBackend {
     stubs_path: Mutex<Option<PathBuf>>,
     /// Target PHP version from client initializationOptions.
     php_version: Mutex<PhpVersion>,
+    /// External formatter configuration.
+    formatting_config: Mutex<FormattingConfig>,
 }
 
 impl PhpLspBackend {
@@ -81,6 +122,7 @@ impl PhpLspBackend {
             trace_level: Mutex::new(TraceValue::Off),
             stubs_path: Mutex::new(None),
             php_version: Mutex::new(PhpVersion::DEFAULT),
+            formatting_config: Mutex::new(FormattingConfig::default()),
         }
     }
 
@@ -1166,6 +1208,122 @@ fn build_add_return_type_action(
     }))
 }
 
+fn full_document_range(source: &str) -> Range {
+    let mut line = 0u32;
+    let mut character = 0u32;
+
+    for ch in source.chars() {
+        if ch == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += ch.len_utf16() as u32;
+        }
+    }
+
+    Range {
+        start: Position::new(0, 0),
+        end: Position::new(line, character),
+    }
+}
+
+fn shell_escape(value: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn build_formatter_shell_command(template: &str, file_path: &Path) -> String {
+    let escaped_file = shell_escape(&file_path.to_string_lossy());
+    if template.contains("{file}") {
+        template.replace("{file}", &escaped_file)
+    } else {
+        format!("{} {}", template, escaped_file)
+    }
+}
+
+fn run_formatter_shell_command(
+    command: &str,
+    current_dir: Option<&Path>,
+) -> std::io::Result<std::process::Output> {
+    let mut process = if cfg!(windows) {
+        let mut command_process = std::process::Command::new("cmd");
+        command_process.arg("/C").arg(command);
+        command_process
+    } else {
+        let mut command_process = std::process::Command::new("sh");
+        command_process.arg("-c").arg(command);
+        command_process
+    };
+
+    if let Some(current_dir) = current_dir {
+        process.current_dir(current_dir);
+    }
+
+    process.output()
+}
+
+fn temp_format_dir() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!("php-lsp-format-{}-{}", std::process::id(), nanos))
+}
+
+fn run_external_formatter(
+    source: String,
+    config: FormattingConfig,
+    workspace_root: Option<PathBuf>,
+) -> std::result::Result<Option<String>, String> {
+    let Some(template) = config.command_template() else {
+        return Ok(None);
+    };
+
+    let temp_dir = temp_format_dir();
+    let file_path = temp_dir.join("input.php");
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|err| format!("failed to create formatter temp dir: {}", err))?;
+    std::fs::write(&file_path, &source)
+        .map_err(|err| format!("failed to write formatter temp file: {}", err))?;
+
+    let command = build_formatter_shell_command(&template, &file_path);
+    let output = run_formatter_shell_command(&command, workspace_root.as_deref())
+        .map_err(|err| format!("failed to run formatter command: {}", err));
+    let formatted = std::fs::read_to_string(&file_path)
+        .map_err(|err| format!("failed to read formatter temp file: {}", err));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let output = output?;
+    let formatted = formatted?;
+
+    if !output.status.success() && formatted == source {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let details = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else {
+            stdout.trim().to_string()
+        };
+        return Err(if details.is_empty() {
+            format!("formatter command exited with {}", output.status)
+        } else {
+            format!(
+                "formatter command exited with {}: {}",
+                output.status, details
+            )
+        });
+    }
+
+    if formatted == source {
+        Ok(None)
+    } else {
+        Ok(Some(formatted))
+    }
+}
+
 fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
     let byte_col = utf16_col_to_byte(source, position.line, position.character) as usize;
     let mut offset = 0usize;
@@ -1750,6 +1908,25 @@ impl LanguageServer for PhpLspBackend {
                 tracing::info!("Client provided stubsPath: {}", p.display());
                 *self.stubs_path.lock().await = Some(p);
             }
+
+            let formatting_provider = opts
+                .get("formattingProvider")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    opts.get("formatting")
+                        .and_then(|v| v.get("provider"))
+                        .and_then(|v| v.as_str())
+                });
+            let formatting_command = opts
+                .get("formattingCommand")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    opts.get("formatting")
+                        .and_then(|v| v.get("command"))
+                        .and_then(|v| v.as_str())
+                });
+            *self.formatting_config.lock().await =
+                FormattingConfig::from_options(formatting_provider, formatting_command);
         }
 
         if let Some(ref root) = root_path {
@@ -1804,6 +1981,7 @@ impl LanguageServer for PhpLspBackend {
                         work_done_progress_options: WorkDoneProgressOptions::default(),
                     },
                 )),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -2018,6 +2196,54 @@ impl LanguageServer for PhpLspBackend {
     }
 
     // --- Language Features ---
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let uri_str = params.text_document.uri.as_str().to_string();
+        tracing::debug!("formatting: {}", uri_str);
+
+        let source = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            parser.source()
+        };
+
+        let config = self.formatting_config.lock().await.clone();
+        if config.command_template().is_none() {
+            return Ok(None);
+        }
+
+        let workspace_root = self.workspace_root.lock().await.clone();
+        let source_for_formatter = source.clone();
+        let formatted = tokio::task::spawn_blocking(move || {
+            run_external_formatter(source_for_formatter, config, workspace_root)
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!("Formatter task failed: {}", err);
+            tower_lsp::jsonrpc::Error::internal_error()
+        })?;
+
+        let formatted = match formatted {
+            Ok(Some(formatted)) => formatted,
+            Ok(None) => return Ok(Some(vec![])),
+            Err(message) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("php-lsp formatter failed: {}", message),
+                    )
+                    .await;
+                return Ok(Some(vec![]));
+            }
+        };
+
+        Ok(Some(vec![TextEdit {
+            range: full_document_range(&source),
+            new_text: formatted,
+        }]))
+    }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;

@@ -102,6 +102,8 @@ export function activate(context: ExtensionContext): void {
       indexVendor: config.get<boolean>("indexVendor", true),
       stubExtensions: config.get<string[]>("stubs.extensions", []),
       logLevel: config.get<string>("logLevel", "info"),
+      formattingProvider: config.get<string>("formatting.provider", "none"),
+      formattingCommand: config.get<string>("formatting.command", ""),
       stubsPath: stubsPath,
     },
   };

@@ -129,6 +129,30 @@
           "scope": "resource",
           "description": "Diagnostics mode"
         },
+        "phpLsp.formatting.provider": {
+          "type": "string",
+          "default": "none",
+          "enum": [
+            "none",
+            "php-cs-fixer",
+            "phpcbf",
+            "custom"
+          ],
+          "enumDescriptions": [
+            "Disable document formatting",
+            "Run php-cs-fixer on a temporary file",
+            "Run phpcbf on a temporary file",
+            "Run the custom formatting command"
+          ],
+          "scope": "resource",
+          "description": "External formatter provider for textDocument/formatting"
+        },
+        "phpLsp.formatting.command": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Custom formatter command. Use {file} as the temporary PHP file placeholder; if omitted, the file path is appended."
+        },
         "phpLsp.trace.server": {
           "type": "string",
           "enum": [

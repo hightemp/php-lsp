@@ -469,7 +469,7 @@
 
 ### Formatting
 
-- [ ] **V1-005** textDocument/formatting — внешний formatter
+- [x] **V1-005** textDocument/formatting — внешний formatter *(done 2026-05-19)*
   - Интеграция: php-cs-fixer / phpcbf через subprocess
   - Конфигурация: phpLsp.formatting.provider + phpLsp.formatting.command
   - Возврат TextEdit без записи файла напрямую
@@ -672,7 +672,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-002 / V1-002** `textDocument/codeAction` — quick-fix: add use
 - [x] **LP-003 / V1-003** `source.organizeImports`
 - [x] **LP-004 / V1-004** `textDocument/codeAction` — add return type
-- [ ] **LP-005 / V1-005** `textDocument/formatting`
+- [x] **LP-005 / V1-005** `textDocument/formatting`
 - [ ] **LP-006 / V1-006** `textDocument/rangeFormatting`
 - [ ] **LP-007 / V1-015** `textDocument/onTypeFormatting`
 - [ ] **LP-008 / V1-007** `textDocument/semanticTokens/full`
@@ -714,3 +714,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-002 / V1-002` quick-fix `Add use`.
 - [x] **T-2026-05-19** Реализовать `LP-003 / V1-003` `source.organizeImports`.
 - [x] **T-2026-05-19** Реализовать `LP-004 / V1-004` code action `Add return type`.
+- [x] **T-2026-05-19** Реализовать `LP-005 / V1-005` `textDocument/formatting`.
