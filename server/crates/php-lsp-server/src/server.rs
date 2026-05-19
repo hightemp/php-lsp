@@ -12,7 +12,7 @@ use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::references::{find_references_in_file, find_variable_references_at_position};
 use php_lsp_parser::resolve::{
     infer_variable_type_at_position, symbol_at_position, symbol_at_position_with_resolver,
-    variable_definition_at_position, variable_hover_info_at_position, RefKind,
+    variable_definition_at_position, variable_hover_info_at_position, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
     find_missing_return_type_candidates, MissingReturnTypeCandidate,
@@ -466,6 +466,30 @@ impl PhpLspBackend {
         None
     }
 
+    fn import_declaration_at_position(
+        &self,
+        uri: &Uri,
+        pos: Position,
+    ) -> Option<GotoDefinitionResponse> {
+        let uri_str = uri.as_str().to_string();
+        let parser = self.open_files.get(&uri_str)?;
+        let tree = parser.tree()?;
+        let source = parser.source();
+        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+        let sym = symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols)?;
+        let use_stmt = imported_use_statement_for_symbol(&file_symbols, &sym)?;
+        let range = range_byte_to_utf16(&source, use_stmt.range);
+
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range: Range {
+                start: Position::new(range.0, range.1),
+                end: Position::new(range.2, range.3),
+            },
+        }))
+    }
+
     /// Publish diagnostics for a file.
     async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
@@ -746,6 +770,37 @@ fn short_name(fqn: &str) -> &str {
         .rsplit('\\')
         .next()
         .unwrap_or(fqn)
+}
+
+fn use_kind_for_ref_kind(ref_kind: RefKind) -> Option<php_lsp_types::UseKind> {
+    match ref_kind {
+        RefKind::ClassName | RefKind::Constructor => Some(php_lsp_types::UseKind::Class),
+        RefKind::FunctionCall => Some(php_lsp_types::UseKind::Function),
+        RefKind::GlobalConstant => Some(php_lsp_types::UseKind::Constant),
+        _ => None,
+    }
+}
+
+fn import_target_fqn(sym: &SymbolAtPosition) -> &str {
+    if sym.ref_kind == RefKind::Constructor {
+        sym.fqn
+            .strip_suffix("::__construct")
+            .unwrap_or(sym.fqn.as_str())
+    } else {
+        sym.fqn.as_str()
+    }
+}
+
+fn imported_use_statement_for_symbol<'a>(
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    sym: &SymbolAtPosition,
+) -> Option<&'a php_lsp_types::UseStatement> {
+    let use_kind = use_kind_for_ref_kind(sym.ref_kind)?;
+    let target_fqn = import_target_fqn(sym).trim_start_matches('\\');
+
+    file_symbols.use_statements.iter().find(|use_stmt| {
+        use_stmt.kind == use_kind && use_stmt.fqn.trim_start_matches('\\') == target_fqn
+    })
 }
 
 fn use_kind_matches(import_kind: ImportKind, use_kind: php_lsp_types::UseKind) -> bool {
@@ -2146,6 +2201,7 @@ impl LanguageServer for PhpLspBackend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                declaration_provider: Some(DeclarationCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
@@ -2813,6 +2869,30 @@ impl LanguageServer for PhpLspBackend {
         };
 
         Ok(result)
+    }
+
+    async fn goto_declaration(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .clone();
+        let pos = params.text_document_position_params.position;
+        tracing::debug!(
+            "gotoDeclaration: {}:{}:{}",
+            uri.as_str(),
+            pos.line,
+            pos.character
+        );
+
+        if let Some(import_declaration) = self.import_declaration_at_position(&uri, pos) {
+            return Ok(Some(import_declaration));
+        }
+
+        self.goto_definition(params).await
     }
 
     async fn goto_definition(

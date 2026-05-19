@@ -491,7 +491,7 @@
 
 ### Navigation polish
 
-- [ ] **V1-016** textDocument/declaration
+- [x] **V1-016** textDocument/declaration *(done 2026-05-19)*
   - Переход к декларации symbol/type alias/import, когда она отличается от definition
   - Fallback к definition для PHP-символов без отдельной declaration
 
@@ -677,7 +677,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-007 / V1-015** `textDocument/onTypeFormatting`
 - [x] **LP-008 / V1-007** `textDocument/semanticTokens/full`
 - [x] **LP-009 / V1-008** `textDocument/semanticTokens/full/delta`
-- [ ] **LP-010 / V1-016** `textDocument/declaration`
+- [x] **LP-010 / V1-016** `textDocument/declaration`
 - [ ] **LP-011 / V1-017** `textDocument/typeDefinition`
 - [ ] **LP-012 / V1-018** `textDocument/documentHighlight`
 - [ ] **LP-013 / V1-019** `textDocument/selectionRange`
@@ -719,3 +719,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-007 / V1-015` `textDocument/onTypeFormatting`.
 - [x] **T-2026-05-19** Реализовать `LP-008 / V1-007` `textDocument/semanticTokens/full`.
 - [x] **T-2026-05-19** Реализовать `LP-009 / V1-008` `textDocument/semanticTokens/full/delta`.
+- [x] **T-2026-05-19** Реализовать `LP-010 / V1-016` `textDocument/declaration`.

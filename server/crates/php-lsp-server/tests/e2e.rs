@@ -92,6 +92,16 @@ fn definition_request(id: i64, uri: &str, line: u32, character: u32) -> Request 
         .finish()
 }
 
+fn declaration_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
+    Request::build("textDocument/declaration")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn completion_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/completion")
         .params(json!({
@@ -403,6 +413,14 @@ async fn test_initialize_and_shutdown() {
             .and_then(|c| c.get("signatureHelpProvider"))
             .is_some(),
         "expected signatureHelpProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("declarationProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected declarationProvider capability"
     );
     assert!(
         result
@@ -768,6 +786,135 @@ $f->bar();
     }
 
     // Shutdown
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_goto_declaration_points_to_import_or_definition_fallback() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+class Service {}
+"#;
+    let vendor_uri = "file:///test/VendorService.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let app_code = r#"<?php
+namespace App;
+
+use Vendor\Service;
+
+class Demo {
+    public function run(): void {
+        new Service();
+    }
+}
+"#;
+    let app_uri = "file:///test/DeclarationImport.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(app_uri, app_code))
+        .await
+        .unwrap();
+
+    let import_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(declaration_request(2, app_uri, 7, 12))
+        .await
+        .unwrap();
+    let import_result = extract_result(import_resp);
+    assert_eq!(
+        import_result.get("uri").and_then(|value| value.as_str()),
+        Some(app_uri),
+        "declaration for imported class should point to current file use statement, got: {}",
+        import_result
+    );
+    assert_eq!(
+        import_result["range"]["start"]["line"].as_u64(),
+        Some(3),
+        "declaration should start on use statement, got: {}",
+        import_result
+    );
+    assert_eq!(
+        import_result["range"]["start"]["character"].as_u64(),
+        Some(4),
+        "declaration should point to imported FQN inside use statement, got: {}",
+        import_result
+    );
+
+    let local_code = r#"<?php
+namespace App;
+
+class Local {}
+
+new Local();
+"#;
+    let local_uri = "file:///test/DeclarationLocal.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(local_uri, local_code))
+        .await
+        .unwrap();
+
+    let fallback_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(declaration_request(3, local_uri, 5, 5))
+        .await
+        .unwrap();
+    let fallback_result = extract_result(fallback_resp);
+    assert_eq!(
+        fallback_result.get("uri").and_then(|value| value.as_str()),
+        Some(local_uri),
+        "declaration without import should fall back to definition, got: {}",
+        fallback_result
+    );
+    assert_eq!(
+        fallback_result["range"]["start"]["line"].as_u64(),
+        Some(3),
+        "fallback declaration should point to class name definition, got: {}",
+        fallback_result
+    );
+
     service
         .ready()
         .await
