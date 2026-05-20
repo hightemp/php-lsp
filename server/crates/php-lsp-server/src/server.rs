@@ -4132,6 +4132,10 @@ fn check_member_access_node(
     utf16_index: &Utf16LineIndex,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    if node_inside_anonymous_class_body(node, source) {
+        return;
+    }
+
     let Some(name_node) = member_reference_name_node(node) else {
         return;
     };
@@ -4165,8 +4169,9 @@ fn check_member_access_node(
     }
 
     let Some(resolved) = resolve_member_for_ref_kind(index, &sym_at_pos) else {
-        if is_phpunit_testcase_helper_call(&sym_at_pos, file_symbols)
+        if is_phpunit_testcase_helper_call(&sym_at_pos, file_symbols, index)
             || is_phpunit_test_double_api_call(tree, source, file_symbols, index, &sym_at_pos)
+            || is_dynamic_member_access(index, &sym_at_pos)
         {
             return;
         }
@@ -4203,40 +4208,86 @@ fn member_reference_name_node(node: tree_sitter::Node) -> Option<tree_sitter::No
 fn is_phpunit_testcase_helper_call(
     sym_at_pos: &SymbolAtPosition,
     file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
 ) -> bool {
-    if sym_at_pos.ref_kind != RefKind::MethodCall || !file_is_phpunit_test_case(file_symbols) {
+    if sym_at_pos.ref_kind != RefKind::MethodCall
+        || !file_is_phpunit_test_context(file_symbols, index)
+        || !phpunit_testcase_helper_method(&sym_at_pos.name)
+    {
         return false;
     }
 
-    match sym_at_pos.object_expr.as_deref() {
-        Some("$this") => matches!(
-            sym_at_pos.name.as_str(),
-            "createMock"
+    matches!(
+        sym_at_pos.object_expr.as_deref(),
+        Some("$this" | "self" | "static" | "parent")
+    )
+}
+
+fn file_is_phpunit_test_context(
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+) -> bool {
+    file_symbols.symbols.iter().any(|sym| {
+        matches!(sym.kind, php_lsp_types::PhpSymbolKind::Class)
+            && sym.extends.iter().any(|parent| {
+                is_phpunit_testcase_like_fqn(parent)
+                    || class_extends_or_implements(
+                        index,
+                        parent.trim_start_matches('\\'),
+                        "PHPUnit\\Framework\\TestCase",
+                        &mut Vec::new(),
+                    )
+            })
+    }) || file_symbols.symbols.iter().any(|sym| {
+        matches!(sym.kind, php_lsp_types::PhpSymbolKind::Trait)
+            && (sym.name.ends_with("TestTrait")
+                || sym
+                    .fqn
+                    .split('\\')
+                    .any(|segment| segment.eq_ignore_ascii_case("Tests")))
+    })
+}
+
+fn is_phpunit_testcase_like_fqn(fqn: &str) -> bool {
+    let fqn = fqn.trim_start_matches('\\');
+    fqn == "PHPUnit\\Framework\\TestCase" || fqn.ends_with("\\TestCase")
+}
+
+fn phpunit_testcase_helper_method(member_name: &str) -> bool {
+    member_name.starts_with("assert")
+        || matches!(
+            member_name,
+            "fail"
+                | "markTestIncomplete"
+                | "markTestSkipped"
+                | "setUp"
+                | "tearDown"
+                | "createMock"
                 | "createConfiguredMock"
                 | "createPartialMock"
                 | "createStub"
                 | "createStubForIntersectionOfInterfaces"
                 | "createMockForIntersectionOfInterfaces"
-        ),
-        Some("self" | "static" | "parent") => {
-            sym_at_pos.name.starts_with("assert")
-                || matches!(
-                    sym_at_pos.name.as_str(),
-                    "fail" | "markTestIncomplete" | "markTestSkipped"
-                )
-        }
-        _ => false,
-    }
-}
-
-fn file_is_phpunit_test_case(file_symbols: &php_lsp_types::FileSymbols) -> bool {
-    file_symbols.symbols.iter().any(|sym| {
-        matches!(sym.kind, php_lsp_types::PhpSymbolKind::Class)
-            && sym
-                .extends
-                .iter()
-                .any(|parent| parent == "PHPUnit\\Framework\\TestCase")
-    })
+                | "once"
+                | "never"
+                | "any"
+                | "exactly"
+                | "atLeast"
+                | "atLeastOnce"
+                | "atMost"
+                | "callback"
+                | "anything"
+                | "equalTo"
+                | "identicalTo"
+                | "isInstanceOf"
+                | "isType"
+                | "stringContains"
+                | "logicalAnd"
+                | "logicalOr"
+                | "logicalNot"
+                | "containsEqual"
+                | "containsIdentical"
+        )
 }
 
 fn is_phpunit_test_double_api_call(
@@ -4324,13 +4375,50 @@ fn phpunit_test_double_api_method(member_name: &str) -> bool {
 }
 
 fn phpunit_test_double_type_has_method(class_fqn: &str, member_name: &str) -> bool {
+    is_phpunit_test_double_type(class_fqn) && phpunit_test_double_api_method(member_name)
+}
+
+fn is_dynamic_member_access(index: &WorkspaceIndex, sym_at_pos: &SymbolAtPosition) -> bool {
+    let Some((class_fqn, member_name)) = sym_at_pos.fqn.rsplit_once("::") else {
+        return false;
+    };
+
+    if is_generic_object_type_name(class_fqn) {
+        return true;
+    }
+
+    if sym_at_pos.ref_kind != RefKind::PropertyAccess {
+        return false;
+    }
+
+    if fqn_matches(class_fqn, "stdClass") || is_phpunit_test_double_type(class_fqn) {
+        return true;
+    }
+
+    let bare_member_name = member_name.strip_prefix('$').unwrap_or(member_name);
+    matches!(bare_member_name, "name" | "value")
+        && index
+            .types
+            .get(class_fqn.trim_start_matches('\\'))
+            .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
+}
+
+fn is_generic_object_type_name(class_fqn: &str) -> bool {
+    class_fqn
+        .trim_start_matches('\\')
+        .rsplit('\\')
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("object"))
+}
+
+fn is_phpunit_test_double_type(class_fqn: &str) -> bool {
     matches!(
-        class_fqn,
+        class_fqn.trim_start_matches('\\'),
         "PHPUnit\\Framework\\MockObject\\MockObject"
             | "PHPUnit\\Framework\\MockObject\\Stub"
             | "PHPUnit\\Framework\\MockObject\\MockBuilder"
             | "PHPUnit\\Framework\\MockObject\\InvocationMocker"
-    ) && phpunit_test_double_api_method(member_name)
+    )
 }
 
 fn is_magic_class_constant_access(
@@ -4475,8 +4563,11 @@ fn visibility_violation_message(
         php_lsp_types::Visibility::Public => None,
         php_lsp_types::Visibility::Private => {
             let current_class = current_class_fqn_at_range(file_symbols, access_range);
-            (current_class.as_deref() != Some(declaring_class))
-                .then(|| format!("Private member is not accessible here: {}", sym.fqn))
+            let accessible = current_class.as_deref().is_some_and(|current| {
+                fqn_matches(current, declaring_class)
+                    || class_uses_trait(index, current, declaring_class, &mut Vec::new())
+            });
+            (!accessible).then(|| format!("Private member is not accessible here: {}", sym.fqn))
         }
         php_lsp_types::Visibility::Protected => {
             let current_class = current_class_fqn_at_range(file_symbols, access_range);
@@ -4512,10 +4603,11 @@ fn class_can_access_protected_member(
     current_class: &str,
     declaring_class: &str,
 ) -> bool {
-    if current_class == declaring_class {
+    if fqn_matches(current_class, declaring_class) {
         return true;
     }
     class_extends_or_implements(index, current_class, declaring_class, &mut Vec::new())
+        || class_or_ancestor_uses_trait(index, current_class, declaring_class, &mut Vec::new())
 }
 
 fn class_extends_or_implements(
@@ -4524,7 +4616,12 @@ fn class_extends_or_implements(
     target_class: &str,
     visited: &mut Vec<String>,
 ) -> bool {
-    if visited.iter().any(|visited| visited == current_class) {
+    let current_class = current_class.trim_start_matches('\\');
+    let target_class = target_class.trim_start_matches('\\');
+    if visited
+        .iter()
+        .any(|visited| fqn_matches(visited, current_class))
+    {
         return false;
     }
     visited.push(current_class.to_string());
@@ -4542,14 +4639,96 @@ fn class_extends_or_implements(
         .iter()
         .chain(class_sym.implements.iter())
         .any(|parent| {
-            parent == target_class
+            fqn_matches(parent, target_class)
                 || class_extends_or_implements(index, parent, target_class, visited)
         })
+}
+
+fn class_or_ancestor_uses_trait(
+    index: &WorkspaceIndex,
+    current_class: &str,
+    target_trait: &str,
+    visited: &mut Vec<String>,
+) -> bool {
+    let current_class = current_class.trim_start_matches('\\');
+    if visited
+        .iter()
+        .any(|visited| fqn_matches(visited, current_class))
+    {
+        return false;
+    }
+    visited.push(current_class.to_string());
+
+    if class_uses_trait(index, current_class, target_trait, &mut Vec::new()) {
+        return true;
+    }
+
+    let Some(class_sym) = index
+        .types
+        .get(current_class)
+        .map(|entry| entry.value().clone())
+    else {
+        return false;
+    };
+
+    class_sym
+        .extends
+        .iter()
+        .any(|parent| class_or_ancestor_uses_trait(index, parent, target_trait, visited))
+}
+
+fn class_uses_trait(
+    index: &WorkspaceIndex,
+    current_class: &str,
+    target_trait: &str,
+    visited: &mut Vec<String>,
+) -> bool {
+    let current_class = current_class.trim_start_matches('\\');
+    if visited
+        .iter()
+        .any(|visited| fqn_matches(visited, current_class))
+    {
+        return false;
+    }
+    visited.push(current_class.to_string());
+
+    let Some(class_sym) = index
+        .types
+        .get(current_class)
+        .map(|entry| entry.value().clone())
+    else {
+        return false;
+    };
+
+    class_sym.traits.iter().any(|used_trait| {
+        fqn_matches(used_trait, target_trait)
+            || class_uses_trait(index, used_trait, target_trait, visited)
+    })
+}
+
+fn fqn_matches(left: &str, right: &str) -> bool {
+    left.trim_start_matches('\\') == right.trim_start_matches('\\')
 }
 
 fn byte_range_contains(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {
     (inner.0 > outer.0 || (inner.0 == outer.0 && inner.1 >= outer.1))
         && (inner.2 < outer.2 || (inner.2 == outer.2 && inner.3 <= outer.3))
+}
+
+fn node_inside_anonymous_class_body(node: tree_sitter::Node, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "object_creation_expression" {
+            let text = &source[parent.byte_range()];
+            if text.trim_start().starts_with("new class") {
+                return text.find('{').is_some_and(|body_start| {
+                    node.start_byte() > parent.start_byte().saturating_add(body_start)
+                });
+            }
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -4800,6 +4979,10 @@ fn check_return_type_compatibility(
     utf16_index: &Utf16LineIndex,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    if node_inside_anonymous_class_body(node, source) {
+        return;
+    }
+
     let Some(expr_node) = return_expression_node(node) else {
         return;
     };
@@ -9740,6 +9923,255 @@ final class ChangeUserPasswordCommandTest extends TestCase
             "Unknown method: App\\Tests\\Command\\UserRepository::method",
             "Unknown method: App\\Tests\\Command\\ChangeUserPasswordCommandTest::assertSame",
             "Property assignment type mismatch for App\\Tests\\Command\\ChangeUserPasswordCommandTest::$commandTester",
+        ] {
+            assert!(
+                !messages.iter().any(|message| message.contains(unexpected)),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
+                messages
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_trait_member_visibility_and_stdclass_properties() {
+        let uri = "file:///trait-members.php";
+        let code = r#"<?php
+namespace App\Tests;
+
+enum TimerType: string {
+    case Test = 'test';
+}
+
+trait HelperTestTrait {
+    protected int $count;
+    protected function protectedHelper(): void {}
+    private function privateHelper(): void {}
+}
+
+final class HelperConsumerTest {
+    use HelperTestTrait;
+
+    public function run(\stdClass $payload, object $response, TimerType $type): void {
+        $this->count = 1;
+        $this->protectedHelper();
+        $this->privateHelper();
+        echo $payload->PortMessages;
+        echo $response->getContent();
+        echo $response->headers;
+        echo $type->name;
+        echo $type->value;
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Protected member is not accessible here: App\\Tests\\HelperTestTrait::$count",
+            "Protected member is not accessible here: App\\Tests\\HelperTestTrait::protectedHelper",
+            "Private member is not accessible here: App\\Tests\\HelperTestTrait::privateHelper",
+            "Unknown property: stdClass::$PortMessages",
+            "Unknown method: object::getContent",
+            "Unknown property: object::$headers",
+            "Unknown property: App\\Tests\\TimerType::$name",
+            "Unknown property: App\\Tests\\TimerType::$value",
+        ] {
+            assert!(
+                !messages.iter().any(|message| {
+                    message.contains(unexpected)
+                        || (unexpected.contains("object::getContent")
+                            && message.ends_with("object::getContent"))
+                        || (unexpected.contains("object::$headers")
+                            && message.ends_with("object::$headers"))
+                }),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
+                messages
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_skips_anonymous_class_body_member_checks() {
+        let uri = "file:///anonymous-class.php";
+        let code = r#"<?php
+namespace App\Tests;
+
+final class Factory
+{
+    public function make(): object
+    {
+        return new class('demo') {
+            private string $name;
+
+            public function __construct(string $name)
+            {
+                $this->name = $name;
+            }
+
+            public function getName(): string
+            {
+                return $this->name;
+            }
+
+            public function getDate(): ?\DateTime
+            {
+                return null;
+            }
+        };
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Unknown property: App\\Tests\\Factory::$name",
+            "Return type mismatch in App\\Tests\\Factory::make: expected object, got null",
+        ] {
+            assert!(
+                !messages.iter().any(|message| message.contains(unexpected)),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
+                messages
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_phpunit_helpers_in_framework_tests_and_test_traits() {
+        let deps_uri = "file:///phpunit-deps.php";
+        let deps_code = r#"<?php
+namespace PHPUnit\Framework;
+class TestCase {}
+
+namespace Symfony\Bundle\FrameworkBundle\Test;
+class WebTestCase extends \PHPUnit\Framework\TestCase {}
+"#;
+
+        let test_uri = "file:///framework-test.php";
+        let test_code = r#"<?php
+namespace App\Tests\Controller;
+
+use Symfony\Bundle\FrameworkBundle\Test\WebTestCase;
+
+final class FlowTest extends WebTestCase
+{
+    protected function setUp(): void
+    {
+        parent::setUp();
+    }
+
+    protected function tearDown(): void
+    {
+        parent::tearDown();
+    }
+
+    public function run(): void
+    {
+        self::assertSame(1, 1);
+        $this->anything();
+        $this->stringContains('needle');
+    }
+}
+"#;
+
+        let trait_uri = "file:///outbound-test-trait.php";
+        let trait_code = r#"<?php
+namespace App\Tests\Soap\Outbound;
+
+trait OutboundTestTrait
+{
+    protected function helper(): void
+    {
+        $this->createStub(\stdClass::class);
+    }
+}
+"#;
+
+        let mut deps_parser = FileParser::new();
+        deps_parser.parse_full(deps_code);
+        let mut test_parser = FileParser::new();
+        test_parser.parse_full(test_code);
+        let mut trait_parser = FileParser::new();
+        trait_parser.parse_full(trait_code);
+
+        let index = WorkspaceIndex::new();
+        index.update_file(
+            deps_uri,
+            extract_file_symbols(deps_parser.tree().unwrap(), deps_code, deps_uri),
+        );
+        index.update_file(
+            test_uri,
+            extract_file_symbols(test_parser.tree().unwrap(), test_code, test_uri),
+        );
+        index.update_file(
+            trait_uri,
+            extract_file_symbols(trait_parser.tree().unwrap(), trait_code, trait_uri),
+        );
+
+        let test_diagnostics = compute_diagnostics(
+            test_uri,
+            &test_parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let trait_diagnostics = compute_diagnostics(
+            trait_uri,
+            &trait_parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = test_diagnostics
+            .iter()
+            .chain(trait_diagnostics.iter())
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Unknown method: App\\Tests\\Controller\\FlowTest::assertSame",
+            "Unknown method: App\\Tests\\Controller\\FlowTest::anything",
+            "Unknown method: App\\Tests\\Controller\\FlowTest::stringContains",
+            "Unknown method: parent::setUp",
+            "Unknown method: parent::tearDown",
+            "Unknown method: App\\Tests\\Soap\\Outbound\\OutboundTestTrait::createStub",
         ] {
             assert!(
                 !messages.iter().any(|message| message.contains(unexpected)),

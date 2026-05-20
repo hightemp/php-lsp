@@ -669,6 +669,7 @@ fn collect_variable_occurrences(
     occurrences: &mut Vec<VariableOccurrence>,
 ) {
     if node.id() != scope_id && is_variable_scope(node) {
+        collect_closure_use_reads(node, source, occurrences);
         return;
     }
 
@@ -687,6 +688,49 @@ fn collect_variable_occurrences(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_variable_occurrences(child, scope_id, source, occurrences);
+    }
+}
+
+fn collect_closure_use_reads(
+    scope: tree_sitter::Node,
+    source: &str,
+    occurrences: &mut Vec<VariableOccurrence>,
+) {
+    if !matches!(
+        scope.kind(),
+        "anonymous_function" | "anonymous_function_creation_expression"
+    ) {
+        return;
+    }
+
+    let mut cursor = scope.walk();
+    for child in scope.named_children(&mut cursor) {
+        if child.kind() == "anonymous_function_use_clause" {
+            collect_variable_reads_in_node(child, source, occurrences);
+        }
+    }
+}
+
+fn collect_variable_reads_in_node(
+    node: tree_sitter::Node,
+    source: &str,
+    occurrences: &mut Vec<VariableOccurrence>,
+) {
+    if node.kind() == "variable_name" {
+        let name = normalize_var_name(&source[node.byte_range()]);
+        if !is_ignorable_variable(&name) {
+            occurrences.push(VariableOccurrence {
+                name,
+                range: node_range(&node),
+                start_byte: node.start_byte(),
+                declaration_kind: None,
+            });
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_variable_reads_in_node(child, source, occurrences);
     }
 }
 
@@ -808,8 +852,14 @@ fn variable_declaration_kind(
     if is_foreach_header_declared_variable(node, source) {
         return Some(VariableDeclarationKind::Variable);
     }
+    if is_assignment_left_hand_declared_variable(node) {
+        return Some(VariableDeclarationKind::Variable);
+    }
     if ancestor_field_contains(node, "catch_clause", &["name", "variable"]) {
         return Some(VariableDeclarationKind::Variable);
+    }
+    if has_ancestor_before_scope(node, "anonymous_function_use_clause") {
+        return Some(VariableDeclarationKind::ClosureUse);
     }
 
     let parent = node.parent()?;
@@ -841,6 +891,47 @@ fn variable_declaration_kind(
         }
         _ => None,
     }
+}
+
+fn is_assignment_left_hand_declared_variable(node: tree_sitter::Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "assignment_expression" | "by_ref_assignment_expression" => {
+                return parent
+                    .child_by_field_name("left")
+                    .is_some_and(|left| left.id() == node.id() || node_contains(left, node));
+            }
+            "method_declaration"
+            | "function_definition"
+            | "anonymous_function"
+            | "anonymous_function_creation_expression"
+            | "program" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
+}
+
+fn has_ancestor_before_scope(node: tree_sitter::Node, ancestor_kind: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == ancestor_kind {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "method_declaration"
+                | "function_definition"
+                | "anonymous_function"
+                | "anonymous_function_creation_expression"
+                | "program"
+        ) {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 fn is_foreach_header_declared_variable(node: tree_sitter::Node, source: &str) -> bool {
@@ -1604,6 +1695,76 @@ function run(array $requests): void {
             "foreach key variable should be declared, got: {:?}",
             diags
         );
+    }
+
+    #[test]
+    fn test_closure_use_by_reference_is_declared() {
+        let code = r#"<?php
+function run(): void {
+    $persisted = null;
+    $callback = function (object $entity) use (&$persisted): void {
+        $persisted = $entity;
+    };
+    $callback(new stdClass());
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && d.message.contains("$persisted")
+            }),
+            "Closure use variables should be declared inside closures, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_closure_use_counts_as_outer_variable_read() {
+        let code = r#"<?php
+function run(): void {
+    $callCount = 0;
+    $callback = function () use (&$callCount): void {
+        $callCount++;
+    };
+    $callback();
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedVariable && d.message.contains("$callCount")
+            }),
+            "Closure use variables should count as reads in the outer scope, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_array_destructuring_assignment_declares_variables() {
+        let code = r#"<?php
+function pair(): array { return [1, 2]; }
+function run(): void {
+    [$left, $right] = pair();
+    echo $left;
+    echo $right;
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        for unexpected in ["$left", "$right"] {
+            assert!(
+                !diags.iter().any(|d| {
+                    d.kind == SemanticDiagnosticKind::UndefinedVariable
+                        && d.message.contains(unexpected)
+                }),
+                "Array destructuring target `{}` should be declared, got: {:?}",
+                unexpected,
+                diags
+            );
+        }
     }
 
     #[test]
