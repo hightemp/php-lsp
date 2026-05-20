@@ -70,7 +70,7 @@ where
     // Walk CST for class and function references
     walk_node_for_diagnostics(root, source, file_symbols, &resolver, &mut diagnostics);
     check_unused_imports(root, source, file_symbols, &mut diagnostics);
-    check_variable_diagnostics(root, source, &mut diagnostics);
+    check_variable_diagnostics(root, source, file_symbols, &resolver, &mut diagnostics);
     check_duplicate_symbols_in_file(file_symbols, &mut diagnostics);
 
     diagnostics
@@ -663,48 +663,62 @@ struct VariableOccurrence {
 type ByteRange = (u32, u32, u32, u32);
 type SymbolKey<'a> = (php_lsp_types::PhpSymbolKind, &'a str);
 
-fn check_variable_diagnostics(
+fn check_variable_diagnostics<F>(
     root: tree_sitter::Node,
     source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
-) {
-    check_variables_in_scope(root, source, diagnostics);
+) where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
+    check_variables_in_scope(root, source, file_symbols, resolver, diagnostics);
 }
 
-fn check_variables_in_scope(
+fn check_variables_in_scope<F>(
     scope: tree_sitter::Node,
     source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
-) {
+) where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
     let mut occurrences = Vec::new();
     collect_variable_occurrences(scope, scope.id(), source, &mut occurrences);
     report_variable_diagnostics(
         &occurrences,
         scope,
         source,
+        file_symbols,
+        resolver,
         should_report_unused_declarations(scope),
         diagnostics,
     );
 
     let mut cursor = scope.walk();
     for child in scope.named_children(&mut cursor) {
-        walk_nested_scopes(child, source, diagnostics);
+        walk_nested_scopes(child, source, file_symbols, resolver, diagnostics);
     }
 }
 
-fn walk_nested_scopes(
+fn walk_nested_scopes<F>(
     node: tree_sitter::Node,
     source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
-) {
+) where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
     if is_variable_scope(node) {
-        check_variables_in_scope(node, source, diagnostics);
+        check_variables_in_scope(node, source, file_symbols, resolver, diagnostics);
         return;
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_nested_scopes(child, source, diagnostics);
+        walk_nested_scopes(child, source, file_symbols, resolver, diagnostics);
     }
 }
 
@@ -827,13 +841,17 @@ fn is_null_coalesce_probe(node: tree_sitter::Node, source: &str) -> bool {
     false
 }
 
-fn report_variable_diagnostics(
+fn report_variable_diagnostics<F>(
     occurrences: &[VariableOccurrence],
     scope: tree_sitter::Node,
     source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
     report_unused_declarations: bool,
     diagnostics: &mut Vec<SemanticDiagnostic>,
-) {
+) where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
     let mut declared_by_name: HashMap<&str, Vec<&VariableOccurrence>> = HashMap::new();
     let mut used_by_name: HashMap<&str, Vec<&VariableOccurrence>> = HashMap::new();
 
@@ -899,7 +917,7 @@ fn report_variable_diagnostics(
         };
         match first_declaration.declaration_kind {
             Some(VariableDeclarationKind::Parameter) => {
-                if should_suppress_unused_parameter(scope, source, &first_declaration.name) {
+                if should_suppress_unused_parameter(scope, source, file_symbols, resolver) {
                     continue;
                 }
                 diagnostics.push(SemanticDiagnostic {
@@ -947,7 +965,15 @@ fn is_bodyless_method_scope(scope: tree_sitter::Node) -> bool {
     !has_body
 }
 
-fn should_suppress_unused_parameter(scope: tree_sitter::Node, source: &str, name: &str) -> bool {
+fn should_suppress_unused_parameter<F>(
+    scope: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+) -> bool
+where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
     if scope.kind() != "method_declaration" {
         return false;
     }
@@ -960,10 +986,84 @@ fn should_suppress_unused_parameter(scope: tree_sitter::Node, source: &str, name
         return false;
     };
 
-    matches!(
-        (method_name.as_str(), name),
-        ("buildForm", "$options") | ("voteOnAttribute", "$vote")
-    )
+    method_overrides_indexed_parent(scope, &method_name, file_symbols, resolver)
+}
+
+fn method_overrides_indexed_parent<F>(
+    scope: tree_sitter::Node,
+    method_name: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+) -> bool
+where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
+    let scope_range = node_range(&scope);
+    let Some(class_sym) = innermost_class_symbol_containing(file_symbols, scope_range) else {
+        return false;
+    };
+
+    class_sym
+        .extends
+        .iter()
+        .chain(class_sym.implements.iter())
+        .any(|parent| {
+            class_or_ancestor_has_method(parent, method_name, resolver, &mut HashSet::new())
+        })
+}
+
+fn innermost_class_symbol_containing(
+    file_symbols: &FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&SymbolInfo> {
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|sym| {
+            matches!(
+                sym.kind,
+                php_lsp_types::PhpSymbolKind::Class
+                    | php_lsp_types::PhpSymbolKind::Interface
+                    | php_lsp_types::PhpSymbolKind::Trait
+                    | php_lsp_types::PhpSymbolKind::Enum
+            ) && range_contains(sym.range, range)
+        })
+        .min_by_key(|sym| {
+            (
+                sym.range.2.saturating_sub(sym.range.0),
+                sym.range.3.saturating_sub(sym.range.1),
+            )
+        })
+}
+
+fn class_or_ancestor_has_method<F>(
+    class_fqn: &str,
+    method_name: &str,
+    resolver: &F,
+    visited: &mut HashSet<String>,
+) -> bool
+where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
+    let class_fqn = class_fqn.trim_start_matches('\\');
+    if !visited.insert(class_fqn.to_string()) {
+        return false;
+    }
+
+    let method_fqn = format!("{}::{}", class_fqn, method_name);
+    if resolver(&method_fqn).is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Method) {
+        return true;
+    }
+
+    let Some(class_sym) = resolver(class_fqn) else {
+        return false;
+    };
+
+    class_sym
+        .extends
+        .iter()
+        .chain(class_sym.implements.iter())
+        .any(|parent| class_or_ancestor_has_method(parent, method_name, resolver, visited))
 }
 
 fn method_has_override_attribute(scope: tree_sitter::Node, source: &str) -> bool {
@@ -1436,6 +1536,21 @@ mod tests {
         let tree = parser.tree().unwrap();
         let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
         extract_semantic_diagnostics(tree, code, &file_symbols, resolver)
+    }
+
+    fn parse_and_check_with_file_resolver(code: &str) -> Vec<SemanticDiagnostic> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let symbols = file_symbols.symbols.clone();
+        extract_semantic_diagnostics(tree, code, &file_symbols, |fqn| {
+            symbols
+                .iter()
+                .find(|sym| sym.fqn == fqn)
+                .cloned()
+                .map(Arc::new)
+        })
     }
 
     #[test]
@@ -2036,45 +2151,63 @@ abstract class BaseHandler {
     }
 
     #[test]
-    fn test_framework_override_unused_parameters_are_not_reported() {
+    fn test_override_unused_parameters_are_not_reported_without_name_hardcode() {
         let code = r#"<?php
-namespace App\Form;
+namespace Vendor;
 
-use Symfony\Component\Form\FormBuilderInterface;
-use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
-use Symfony\Component\Security\Core\Authorization\Voter\Vote;
+class BaseType {
+    public function configure(object $builder, array $contractOnly = []): void {
+        echo $builder;
+        echo $contractOnly;
+    }
+}
 
-class UserType {
-    public function buildForm(FormBuilderInterface $builder, array $options = []): void {
+interface VoteContract {
+    public function voteOn(object $token, ?object $vote = null): bool;
+}
+
+namespace App;
+
+class UserType extends \Vendor\BaseType {
+    public function configure(object $builder, array $contractOnly = []): void {
         $builder->add('email');
     }
+}
 
-    protected function voteOnAttribute(
-        string $attribute,
-        mixed $subject,
-        TokenInterface $token,
-        ?Vote $vote = null
-    ): bool {
-        echo $attribute;
-        echo $subject;
+class ConcreteVote implements \Vendor\VoteContract {
+    public function voteOn(object $token, ?object $vote = null): bool {
         echo $token;
         return true;
     }
 }
-"#;
-        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
 
-        for unexpected in ["$options", "$vote"] {
+class PlainType {
+    public function buildForm(object $builder, array $options = []): void {
+        echo $builder;
+    }
+}
+"#;
+        let diags = parse_and_check_with_file_resolver(code);
+
+        for unexpected in ["$contractOnly", "$vote"] {
             assert!(
                 !diags.iter().any(|d| {
                     d.kind == SemanticDiagnosticKind::UnusedParameter
                         && d.message.contains(unexpected)
                 }),
-                "Framework override parameter `{}` should not be reported, got: {:?}",
+                "Override parameter `{}` should not be reported, got: {:?}",
                 unexpected,
                 diags
             );
         }
+
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedParameter && d.message.contains("$options")
+            }),
+            "Non-override `buildForm` must still report unused params; no method-name hardcode, got: {:?}",
+            diags
+        );
     }
 
     #[test]
