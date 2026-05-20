@@ -153,6 +153,25 @@
           "scope": "resource",
           "description": "Custom formatter command. Use {file} as the temporary PHP file placeholder; if omitted, the file path is appended."
         },
+        "phpLsp.phpstan.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Enable PHPStan diagnostics. Requires PHPStan to be installed in the workspace or configured command path."
+        },
+        "phpLsp.phpstan.command": {
+          "type": "string",
+          "default": "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}",
+          "scope": "resource",
+          "description": "PHPStan command template. Use {file} as the PHP file placeholder; command must print PHPStan JSON output."
+        },
+        "phpLsp.phpstan.timeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "scope": "resource",
+          "description": "Maximum time in milliseconds to wait for PHPStan diagnostics per file."
+        },
         "phpLsp.trace.server": {
           "type": "string",
           "enum": [

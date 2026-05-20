@@ -29,7 +29,7 @@ use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineInd
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
@@ -91,6 +91,24 @@ impl FormattingConfig {
             "php-cs-fixer" => Some("php-cs-fixer fix --using-cache=no --quiet {file}".to_string()),
             "phpcbf" => Some("phpcbf {file}".to_string()),
             _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhpStanConfig {
+    enabled: bool,
+    command: String,
+    timeout_ms: u64,
+}
+
+impl Default for PhpStanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}"
+                .to_string(),
+            timeout_ms: 30_000,
         }
     }
 }
@@ -210,6 +228,10 @@ fn settings_string_array(
     )
 }
 
+fn settings_u64(settings: &serde_json::Value, flat_key: &str, nested_path: &[&str]) -> Option<u64> {
+    settings_value(settings, flat_key, nested_path).and_then(|value| value.as_u64())
+}
+
 /// Main LSP backend holding all state.
 pub struct PhpLspBackend {
     /// Client handle for sending notifications to VS Code.
@@ -234,6 +256,8 @@ pub struct PhpLspBackend {
     php_version: Mutex<PhpVersion>,
     /// Diagnostics level from phpLsp.diagnostics.mode.
     diagnostics_mode: Mutex<DiagnosticsMode>,
+    /// PHPStan subprocess diagnostics configuration.
+    phpstan_config: Mutex<PhpStanConfig>,
     /// Whether composer.json autoload discovery is enabled.
     composer_enabled: Mutex<bool>,
     /// Whether lazy vendor indexing is enabled.
@@ -264,6 +288,7 @@ impl PhpLspBackend {
             stubs_path: Mutex::new(None),
             php_version: Mutex::new(PhpVersion::DEFAULT),
             diagnostics_mode: Mutex::new(DiagnosticsMode::default()),
+            phpstan_config: Mutex::new(PhpStanConfig::default()),
             composer_enabled: Mutex::new(true),
             index_vendor: Mutex::new(true),
             stub_extensions: Mutex::new(Vec::new()),
@@ -365,6 +390,35 @@ impl PhpLspBackend {
                 FormattingConfig::from_options(Some(provider), command)
             };
             *self.formatting_config.lock().await = next_config;
+        }
+
+        let phpstan_enabled = settings_bool(settings, "phpstanEnabled", &["phpstan", "enabled"]);
+        let phpstan_command = settings_string(settings, "phpstanCommand", &["phpstan", "command"]);
+        let phpstan_timeout_ms =
+            settings_u64(settings, "phpstanTimeoutMs", &["phpstan", "timeoutMs"]);
+
+        if phpstan_enabled.is_some() || phpstan_command.is_some() || phpstan_timeout_ms.is_some() {
+            let current = self.phpstan_config.lock().await.clone();
+            let mut next_config = current.clone();
+            if let Some(enabled) = phpstan_enabled {
+                next_config.enabled = enabled;
+            }
+            if let Some(command) = phpstan_command {
+                let command = command.trim();
+                if command.is_empty() {
+                    next_config.command = PhpStanConfig::default().command;
+                } else {
+                    next_config.command = command.to_string();
+                }
+            }
+            if let Some(timeout_ms) = phpstan_timeout_ms {
+                next_config.timeout_ms = timeout_ms.max(1_000);
+            }
+
+            if next_config != current {
+                *self.phpstan_config.lock().await = next_config;
+                applied.diagnostics_changed = true;
+            }
         }
 
         applied
@@ -760,6 +814,43 @@ impl PhpLspBackend {
         })
     }
 
+    async fn phpstan_diagnostics_for_uri(&self, uri: &Uri) -> Vec<Diagnostic> {
+        let config = self.phpstan_config.lock().await.clone();
+        if !config.enabled {
+            return vec![];
+        }
+
+        if !uri_is_php_file(uri) {
+            return vec![];
+        }
+
+        let Some(file_path) = uri_to_path(uri.as_str()) else {
+            return vec![];
+        };
+        if !file_path.exists() {
+            return vec![];
+        }
+
+        let workspace_root = self.workspace_root_for_uri(uri.as_str()).await;
+        match run_phpstan_for_file(config, file_path, workspace_root).await {
+            Ok(diagnostics) => diagnostics,
+            Err(message) => {
+                tracing::warn!(
+                    "PHPStan diagnostics failed for {}: {}",
+                    uri.as_str(),
+                    message
+                );
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("php-lsp PHPStan diagnostics failed: {}", message),
+                    )
+                    .await;
+                vec![]
+            }
+        }
+    }
+
     /// Publish diagnostics for a file.
     async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
@@ -801,7 +892,7 @@ impl PhpLspBackend {
 
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let php_version = *self.php_version.lock().await;
-        let diagnostics = {
+        let mut diagnostics = {
             if let Some(parser) = self.open_files.get(&uri_str) {
                 compute_diagnostics(
                     &uri_str,
@@ -814,6 +905,14 @@ impl PhpLspBackend {
                 vec![]
             }
         };
+
+        let has_syntax_errors = diagnostics.iter().any(|diagnostic| {
+            diagnostic.source.as_deref() == Some("php-lsp")
+                && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+        });
+        if diagnostics_mode == DiagnosticsMode::BasicSemantic && !has_syntax_errors {
+            diagnostics.extend(self.phpstan_diagnostics_for_uri(uri).await);
+        }
 
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
@@ -2066,6 +2165,188 @@ fn run_formatter_shell_command(
     }
 
     process.output()
+}
+
+fn build_phpstan_shell_command(template: &str, file_path: &Path) -> String {
+    let escaped_file = shell_escape(&file_path.to_string_lossy());
+    if template.contains("{file}") {
+        template.replace("{file}", &escaped_file)
+    } else {
+        format!("{} {}", template, escaped_file)
+    }
+}
+
+async fn run_shell_command_with_timeout(
+    command: &str,
+    current_dir: Option<&Path>,
+    timeout_ms: u64,
+) -> std::result::Result<std::process::Output, String> {
+    let mut process = if cfg!(windows) {
+        let mut command_process = tokio::process::Command::new("cmd");
+        command_process.arg("/C").arg(command);
+        command_process
+    } else {
+        let mut command_process = tokio::process::Command::new("sh");
+        command_process.arg("-c").arg(command);
+        command_process
+    };
+
+    if let Some(current_dir) = current_dir {
+        process.current_dir(current_dir);
+    }
+
+    process
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    process.kill_on_drop(true);
+    let child = process
+        .spawn()
+        .map_err(|err| format!("failed to start PHPStan command: {}", err))?;
+
+    tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
+        .await
+        .map_err(|_| format!("PHPStan command timed out after {}ms", timeout_ms))?
+        .map_err(|err| format!("failed to wait for PHPStan command: {}", err))
+}
+
+fn phpstan_json_message_line(message: &serde_json::Value) -> Option<u32> {
+    message
+        .get("line")
+        .and_then(|value| value.as_u64())
+        .and_then(|line| u32::try_from(line).ok())
+}
+
+fn phpstan_json_message_u32(message: &serde_json::Value, key: &str) -> Option<u32> {
+    message
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn phpstan_file_key_matches(key: &str, target: &Path) -> bool {
+    let key_path = PathBuf::from(key);
+    if key_path == target {
+        return true;
+    }
+
+    if let (Ok(key_canonical), Ok(target_canonical)) =
+        (key_path.canonicalize(), target.canonicalize())
+    {
+        return key_canonical == target_canonical;
+    }
+
+    false
+}
+
+fn phpstan_message_to_diagnostic(message: &serde_json::Value) -> Option<Diagnostic> {
+    let raw_message = message.get("message")?.as_str()?;
+    let line = phpstan_json_message_line(message).unwrap_or(1).max(1);
+    let start_line = line - 1;
+    let start_character = phpstan_json_message_u32(message, "column")
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let end_line = phpstan_json_message_u32(message, "endLine")
+        .unwrap_or(line)
+        .max(1)
+        - 1;
+    let end_character = phpstan_json_message_u32(message, "endColumn")
+        .map(|column| column.saturating_sub(1))
+        .unwrap_or(start_character + 1);
+
+    let tip = message
+        .get("tip")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let diagnostic_message = if let Some(tip) = tip {
+        format!("{}\n\n{}", raw_message, tip)
+    } else {
+        raw_message.to_string()
+    };
+
+    Some(Diagnostic {
+        range: Range {
+            start: Position::new(start_line, start_character),
+            end: Position::new(end_line, end_character),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: message
+            .get("identifier")
+            .and_then(|value| value.as_str())
+            .map(|identifier| NumberOrString::String(identifier.to_string())),
+        source: Some("phpstan".to_string()),
+        message: diagnostic_message,
+        ..Default::default()
+    })
+}
+
+fn parse_phpstan_json_diagnostics(
+    stdout: &str,
+    file_path: &Path,
+) -> std::result::Result<Vec<Diagnostic>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(stdout).map_err(|err| format!("invalid PHPStan JSON: {}", err))?;
+    let Some(files) = value.get("files").and_then(|files| files.as_object()) else {
+        return Ok(vec![]);
+    };
+
+    let mut diagnostics = Vec::new();
+    for (file_key, file_value) in files {
+        if files.len() != 1 && !phpstan_file_key_matches(file_key, file_path) {
+            continue;
+        }
+
+        let Some(messages) = file_value
+            .get("messages")
+            .and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+
+        diagnostics.extend(messages.iter().filter_map(phpstan_message_to_diagnostic));
+    }
+
+    Ok(diagnostics)
+}
+
+async fn run_phpstan_for_file(
+    config: PhpStanConfig,
+    file_path: PathBuf,
+    workspace_root: Option<PathBuf>,
+) -> std::result::Result<Vec<Diagnostic>, String> {
+    let command = build_phpstan_shell_command(&config.command, &file_path);
+    let output =
+        run_shell_command_with_timeout(&command, workspace_root.as_deref(), config.timeout_ms)
+            .await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if stdout.trim().is_empty() {
+        if output.status.success() {
+            return Ok(vec![]);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = stderr.trim();
+        return Err(if details.is_empty() {
+            format!("PHPStan command exited with {}", output.status)
+        } else {
+            format!("PHPStan command exited with {}: {}", output.status, details)
+        });
+    }
+
+    parse_phpstan_json_diagnostics(&stdout, &file_path).map_err(|err| {
+        if output.status.success() {
+            err
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let details = stderr.trim();
+            if details.is_empty() {
+                format!("{} (exit {})", err, output.status)
+            } else {
+                format!("{} (exit {}: {})", err, output.status, details)
+            }
+        }
+    })
 }
 
 fn temp_format_dir() -> PathBuf {
@@ -8504,6 +8785,113 @@ function nullableUnion(): string|null {
                 messages
             );
         }
+    }
+
+    #[test]
+    fn test_parse_phpstan_json_diagnostics_maps_messages() {
+        let file_path = PathBuf::from("/tmp/php-lsp-phpstan/src/Foo.php");
+        let output = serde_json::json!({
+            "totals": { "errors": 0, "file_errors": 1 },
+            "files": {
+                (file_path.to_string_lossy().to_string()): {
+                    "errors": 1,
+                    "messages": [
+                        {
+                            "message": "Call to an undefined method App\\Foo::missing().",
+                            "line": 7,
+                            "identifier": "method.notFound",
+                            "tip": "Check the object type."
+                        }
+                    ]
+                }
+            },
+            "errors": []
+        })
+        .to_string();
+
+        let diagnostics = parse_phpstan_json_diagnostics(&output, &file_path).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start.line, 6);
+        assert_eq!(diagnostics[0].source.as_deref(), Some("phpstan"));
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("method.notFound".to_string()))
+        );
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Call to an undefined method App\\Foo::missing()."),
+            "unexpected message: {}",
+            diagnostics[0].message
+        );
+        assert!(
+            diagnostics[0].message.contains("Check the object type."),
+            "tip should be appended to diagnostic message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_phpstan_for_file_accepts_nonzero_json_output() {
+        if cfg!(windows) {
+            return;
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let tmp = std::env::temp_dir().join(format!(
+            "php-lsp-phpstan-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file_path = tmp.join("Subject.php");
+        std::fs::write(&file_path, "<?php\nclass Subject {}\n").unwrap();
+
+        let output = serde_json::json!({
+            "totals": { "errors": 0, "file_errors": 1 },
+            "files": {
+                (file_path.to_string_lossy().to_string()): {
+                    "errors": 1,
+                    "messages": [
+                        {
+                            "message": "PHPStan reported a test error.",
+                            "line": 2,
+                            "identifier": "test.identifier"
+                        }
+                    ]
+                }
+            },
+            "errors": []
+        })
+        .to_string();
+
+        let script_path = tmp.join("phpstan-fake.sh");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\ncat <<'JSON'\n{}\nJSON\nexit 1\n", output),
+        )
+        .unwrap();
+
+        let config = PhpStanConfig {
+            enabled: true,
+            command: format!(
+                "sh {} {{file}}",
+                shell_escape(&script_path.to_string_lossy())
+            ),
+            timeout_ms: 5_000,
+        };
+        let diagnostics = run_phpstan_for_file(config, file_path, Some(tmp.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].source.as_deref(), Some("phpstan"));
+        assert_eq!(diagnostics[0].message, "PHPStan reported a test error.");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

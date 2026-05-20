@@ -105,6 +105,12 @@ export function activate(context: ExtensionContext): void {
       logLevel: config.get<string>("logLevel", "info"),
       formattingProvider: config.get<string>("formatting.provider", "none"),
       formattingCommand: config.get<string>("formatting.command", ""),
+      phpstanEnabled: config.get<boolean>("phpstan.enabled", false),
+      phpstanCommand: config.get<string>(
+        "phpstan.command",
+        "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}",
+      ),
+      phpstanTimeoutMs: config.get<number>("phpstan.timeoutMs", 30000),
       stubsPath: stubsPath,
     },
   };
