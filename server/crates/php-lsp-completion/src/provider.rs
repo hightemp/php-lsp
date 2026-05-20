@@ -124,11 +124,19 @@ pub fn provide_completions(
         CompletionContext::MemberAccess {
             object_expr,
             class_fqn,
-        } => provide_member_completions(object_expr, class_fqn.as_deref(), index, file_symbols),
+            member_prefix,
+        } => provide_member_completions(
+            object_expr,
+            member_prefix,
+            class_fqn.as_deref(),
+            index,
+            file_symbols,
+        ),
         CompletionContext::StaticAccess {
             class_fqn,
             class_expr,
-        } => provide_static_completions(class_fqn, class_expr, index, file_symbols),
+            member_prefix,
+        } => provide_static_completions(class_fqn, class_expr, member_prefix, index, file_symbols),
         CompletionContext::Variable { prefix } => {
             provide_variable_completions(prefix, file_symbols)
         }
@@ -142,6 +150,7 @@ pub fn provide_completions(
 /// Provide member access completions (`->`).
 fn provide_member_completions(
     object_expr: &str,
+    member_prefix: &str,
     inferred_class_fqn: Option<&str>,
     index: &WorkspaceIndex,
     file_symbols: &FileSymbols,
@@ -172,7 +181,11 @@ fn provide_member_completions(
                 continue;
             }
 
-            items.push(symbol_to_completion_item(&member, false));
+            items.push(symbol_to_completion_item(
+                &member,
+                false,
+                Some(member_prefix),
+            ));
         }
     }
 
@@ -184,6 +197,7 @@ fn provide_member_completions(
 fn provide_static_completions(
     class_fqn: &str,
     class_expr: &str,
+    member_prefix: &str,
     index: &WorkspaceIndex,
     file_symbols: &FileSymbols,
 ) -> Vec<CompletionItem> {
@@ -215,7 +229,11 @@ fn provide_static_completions(
         ) {
             continue;
         }
-        items.push(symbol_to_completion_item(&member, true));
+        items.push(symbol_to_completion_item(
+            &member,
+            true,
+            Some(member_prefix),
+        ));
     }
 
     // Also add class constants and enum cases
@@ -350,7 +368,11 @@ fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Complet
 }
 
 /// Convert a SymbolInfo to a CompletionItem.
-fn symbol_to_completion_item(sym: &SymbolInfo, is_static_access: bool) -> CompletionItem {
+fn symbol_to_completion_item(
+    sym: &SymbolInfo,
+    is_static_access: bool,
+    member_prefix: Option<&str>,
+) -> CompletionItem {
     let kind = symbol_kind_to_completion_kind(sym.kind);
 
     let detail = sym.signature.as_ref().map(|sig| {
@@ -397,8 +419,9 @@ fn symbol_to_completion_item(sym: &SymbolInfo, is_static_access: bool) -> Comple
         ..Default::default()
     };
     item.sort_text = Some(format!(
-        "{}_{}",
+        "{}_{}_{}",
         symbol_sort_rank(sym.kind),
+        completion_prefix_rank(&item.label, member_prefix),
         item.label.to_ascii_lowercase()
     ));
     item.filter_text = Some(format!("{} {}", item.label, sym.fqn));
@@ -412,6 +435,26 @@ fn symbol_to_completion_item(sym: &SymbolInfo, is_static_access: bool) -> Comple
         _ => None,
     };
     item
+}
+
+fn completion_prefix_rank(label: &str, member_prefix: Option<&str>) -> &'static str {
+    let Some(prefix) = member_prefix
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return "1000";
+    };
+
+    let normalized_label = label.trim_start_matches('$').to_ascii_lowercase();
+    let normalized_prefix = prefix.trim_start_matches('$').to_ascii_lowercase();
+
+    if normalized_label.starts_with(&normalized_prefix) {
+        "0000"
+    } else if normalized_label.contains(&normalized_prefix) {
+        "0100"
+    } else {
+        "1000"
+    }
 }
 
 fn keyword_completion_item(keyword: &str) -> CompletionItem {
@@ -708,6 +751,7 @@ mod tests {
 
         let ctx = CompletionContext::MemberAccess {
             object_expr: "$baz2".to_string(),
+            member_prefix: String::new(),
             class_fqn: Some("App\\Test\\Baz".to_string()),
         };
         let items = provide_completions(&ctx, &index, &file_symbols);
@@ -763,6 +807,7 @@ mod tests {
 
         let ctx = CompletionContext::MemberAccess {
             object_expr: "$service".to_string(),
+            member_prefix: String::new(),
             class_fqn: Some("App\\Service".to_string()),
         };
         let items = provide_completions(&ctx, &index, &file_symbols);
@@ -780,6 +825,76 @@ mod tests {
         assert!(
             !labels.contains(&"create"),
             "static method should be hidden on `->`"
+        );
+    }
+
+    #[test]
+    fn test_member_completion_sorts_methods_before_properties() {
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![
+                make_symbol(
+                    "Client",
+                    "App\\Client",
+                    PhpSymbolKind::Class,
+                    None,
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "requestHeaders",
+                    "App\\Client::$requestHeaders",
+                    PhpSymbolKind::Property,
+                    Some("App\\Client"),
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "getRequest",
+                    "App\\Client::getRequest",
+                    PhpSymbolKind::Method,
+                    Some("App\\Client"),
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "request",
+                    "App\\Client::request",
+                    PhpSymbolKind::Method,
+                    Some("App\\Client"),
+                    Visibility::Public,
+                    false,
+                ),
+            ],
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::MemberAccess {
+            object_expr: "$client".to_string(),
+            member_prefix: "reques".to_string(),
+            class_fqn: Some("App\\Client".to_string()),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert_eq!(labels.first().copied(), Some("request"));
+        assert!(
+            labels.iter().position(|label| *label == "request").unwrap()
+                < labels
+                    .iter()
+                    .position(|label| *label == "requestHeaders")
+                    .unwrap(),
+            "methods should sort before properties in member completion"
+        );
+        assert!(
+            labels.iter().position(|label| *label == "request").unwrap()
+                < labels
+                    .iter()
+                    .position(|label| *label == "getRequest")
+                    .unwrap(),
+            "members starting with typed prefix should sort before substring matches"
         );
     }
 
@@ -828,6 +943,7 @@ mod tests {
 
         let ctx = CompletionContext::StaticAccess {
             class_expr: "Service".to_string(),
+            member_prefix: String::new(),
             class_fqn: "App\\Service".to_string(),
         };
         let items = provide_completions(&ctx, &index, &file_symbols);

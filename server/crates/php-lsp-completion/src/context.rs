@@ -13,6 +13,8 @@ pub enum CompletionContext {
     MemberAccess {
         /// The object expression text (e.g. "$this", "$foo").
         object_expr: String,
+        /// The member prefix already typed after `->`.
+        member_prefix: String,
         /// Optional inferred FQN of object class (filled later by server).
         class_fqn: Option<String>,
     },
@@ -21,6 +23,8 @@ pub enum CompletionContext {
     StaticAccess {
         /// The class name or expression (e.g. "self", "Foo").
         class_expr: String,
+        /// The member prefix already typed after `::`.
+        member_prefix: String,
         /// Resolved FQN of the class.
         class_fqn: String,
     },
@@ -131,7 +135,10 @@ fn check_member_access(text_before: &str, node: &Node, source: &str) -> Option<C
         let after_arrow = &trimmed[arrow_pos + 2..];
         // Ensure after arrow is a valid identifier prefix or empty
         if after_arrow.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            let before_arrow = trimmed[..arrow_pos].trim_end();
+            let before_arrow = trimmed[..arrow_pos]
+                .trim_end()
+                .trim_end_matches('?')
+                .trim_end();
 
             // Walk up to find the object
             let object_expr = if !before_arrow.is_empty() {
@@ -143,6 +150,7 @@ fn check_member_access(text_before: &str, node: &Node, source: &str) -> Option<C
 
             return Some(CompletionContext::MemberAccess {
                 object_expr,
+                member_prefix: after_arrow.to_string(),
                 class_fqn: None,
             });
         }
@@ -172,6 +180,7 @@ fn check_static_access(
 
             return Some(CompletionContext::StaticAccess {
                 class_expr,
+                member_prefix: after_colons.to_string(),
                 class_fqn,
             });
         }
@@ -260,10 +269,12 @@ fn extract_object_expr(text: &str) -> String {
     let chars: Vec<char> = trimmed.chars().collect();
     let mut i = chars.len();
 
-    // Simple: take last identifier/variable
+    // Take the last object expression segment. This must keep simple member
+    // chains such as `$this->client`, because completion after
+    // `$this->client->` needs the property type, not just the bare `client`.
     while i > 0 {
         let c = chars[i - 1];
-        if c.is_alphanumeric() || c == '_' || c == '$' {
+        if c.is_alphanumeric() || matches!(c, '_' | '$' | '\\' | '-' | '>' | '?') {
             i -= 1;
         } else {
             break;
@@ -346,8 +357,30 @@ mod tests {
         let code = "<?php\n$obj->meth";
         let ctx = detect(code, 1, 11);
         match ctx {
-            CompletionContext::MemberAccess { object_expr, .. } => {
+            CompletionContext::MemberAccess {
+                object_expr,
+                member_prefix,
+                ..
+            } => {
                 assert_eq!(object_expr, "$obj");
+                assert_eq!(member_prefix, "meth");
+            }
+            other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_context_keeps_property_chain() {
+        let code = "<?php\n$this->client->reques";
+        let ctx = detect(code, 1, 21);
+        match ctx {
+            CompletionContext::MemberAccess {
+                object_expr,
+                member_prefix,
+                ..
+            } => {
+                assert_eq!(object_expr, "$this->client");
+                assert_eq!(member_prefix, "reques");
             }
             other => panic!("Expected MemberAccess, got {:?}", other),
         }
@@ -358,8 +391,13 @@ mod tests {
         let code = "<?php\nFoo::bar";
         let ctx = detect(code, 1, 8);
         match ctx {
-            CompletionContext::StaticAccess { class_expr, .. } => {
+            CompletionContext::StaticAccess {
+                class_expr,
+                member_prefix,
+                ..
+            } => {
                 assert_eq!(class_expr, "Foo");
+                assert_eq!(member_prefix, "bar");
             }
             other => panic!("Expected StaticAccess, got {:?}", other),
         }

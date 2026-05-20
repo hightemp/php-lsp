@@ -535,6 +535,110 @@ impl PhpLspBackend {
         resolve_member_type_from_index(&self.index, class_fqn, member_name)
     }
 
+    fn resolve_completion_member_type(
+        &self,
+        class_fqn: &str,
+        member_name: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+    ) -> Option<String> {
+        self.resolve_member_type(class_fqn, member_name)
+            .or_else(|| {
+                let member_fqn = format!("{}::{}", class_fqn, member_name);
+                let bare_name = member_name.strip_prefix('$').unwrap_or(member_name);
+                file_symbols.symbols.iter().find_map(|sym| {
+                    if sym.fqn == member_fqn
+                        || (sym.parent_fqn.as_deref() == Some(class_fqn)
+                            && (sym.name == member_name || sym.name == bare_name))
+                    {
+                        symbol_return_type_fqn(&self.index, class_fqn, sym)
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+
+    fn infer_completion_object_type(
+        &self,
+        object_expr: &str,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        line: u32,
+        byte_col: u32,
+    ) -> Option<String> {
+        let object_expr = object_expr.trim();
+        if object_expr.contains("->") || object_expr.contains("?->") {
+            return self.infer_completion_member_chain_type(
+                object_expr,
+                tree,
+                source,
+                file_symbols,
+                line,
+                byte_col,
+            );
+        }
+
+        if object_expr == "$this" {
+            current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
+                .or_else(|| current_class_fqn(file_symbols))
+        } else if object_expr.starts_with('$') {
+            infer_variable_type_at_position(tree, source, file_symbols, line, byte_col, object_expr)
+        } else {
+            None
+        }
+    }
+
+    fn infer_completion_member_chain_type(
+        &self,
+        object_expr: &str,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        line: u32,
+        byte_col: u32,
+    ) -> Option<String> {
+        let normalized = object_expr.replace("?->", "->");
+        let mut parts = normalized.split("->");
+        let base_expr = parts.next()?.trim();
+        let mut class_fqn = if base_expr == "$this" {
+            current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
+                .or_else(|| current_class_fqn(file_symbols))?
+        } else if base_expr.starts_with('$') {
+            infer_variable_type_at_position(tree, source, file_symbols, line, byte_col, base_expr)?
+        } else {
+            return None;
+        };
+
+        for raw_member in parts {
+            let member = raw_member.trim();
+            if member.is_empty() {
+                return None;
+            }
+
+            let is_method_call = member.contains('(');
+            let member_name = member
+                .split('(')
+                .next()
+                .unwrap_or(member)
+                .trim()
+                .trim_start_matches('$');
+            if member_name.is_empty() {
+                return None;
+            }
+
+            let lookup_name = if is_method_call {
+                member_name.to_string()
+            } else {
+                format!("${}", member_name)
+            };
+            class_fqn =
+                self.resolve_completion_member_type(&class_fqn, &lookup_name, file_symbols)?;
+        }
+
+        Some(class_fqn)
+    }
+
     /// Resolve a FQN, falling back to lazy vendor indexing if not found.
     async fn resolve_fqn_lazy(
         &self,
@@ -5132,6 +5236,19 @@ fn is_duplicate_checked_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool 
     )
 }
 
+fn current_class_fqn(file_symbols: &php_lsp_types::FileSymbols) -> Option<String> {
+    file_symbols.symbols.iter().find_map(|sym| {
+        matches!(
+            sym.kind,
+            php_lsp_types::PhpSymbolKind::Class
+                | php_lsp_types::PhpSymbolKind::Interface
+                | php_lsp_types::PhpSymbolKind::Trait
+                | php_lsp_types::PhpSymbolKind::Enum
+        )
+        .then(|| sym.fqn.clone())
+    })
+}
+
 fn resolve_member_type_from_index(
     index: &WorkspaceIndex,
     class_fqn: &str,
@@ -8762,50 +8879,62 @@ impl LanguageServer for PhpLspBackend {
         let pos = params.text_document_position.position;
         tracing::debug!("completion: {}:{}:{}", uri_str, pos.line, pos.character);
 
-        let parser = match self.open_files.get(&uri_str) {
-            Some(p) => p,
-            None => return Ok(None),
+        let (tree, source) = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            let tree = match parser.tree() {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            };
+            (tree, parser.source())
         };
-        let tree = match parser.tree() {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        let source = parser.source();
         let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
-        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+        let file_symbols = extract_file_symbols(&tree, &source, &uri_str);
 
         // Detect completion context
-        let context = detect_context(tree, &source, pos.line, byte_col, &file_symbols);
+        let context = detect_context(&tree, &source, pos.line, byte_col, &file_symbols);
         let context = match context {
             php_lsp_completion::context::CompletionContext::MemberAccess {
                 object_expr,
                 class_fqn,
-            } => {
-                let inferred = class_fqn.or_else(|| {
-                    if object_expr.starts_with('$') {
-                        infer_variable_type_at_position(
-                            tree,
-                            &source,
-                            &file_symbols,
-                            pos.line,
-                            byte_col,
-                            &object_expr,
-                        )
-                    } else {
-                        None
-                    }
-                });
-
-                php_lsp_completion::context::CompletionContext::MemberAccess {
-                    object_expr,
-                    class_fqn: inferred,
-                }
-            }
+                member_prefix,
+            } => php_lsp_completion::context::CompletionContext::MemberAccess {
+                class_fqn: class_fqn.or_else(|| {
+                    self.infer_completion_object_type(
+                        &object_expr,
+                        &tree,
+                        &source,
+                        &file_symbols,
+                        pos.line,
+                        byte_col,
+                    )
+                }),
+                object_expr,
+                member_prefix,
+            },
             other => other,
         };
 
         if context == php_lsp_completion::context::CompletionContext::None {
             return Ok(None);
+        }
+
+        let completion_class_fqn =
+            match &context {
+                php_lsp_completion::context::CompletionContext::MemberAccess {
+                    class_fqn: Some(class_fqn),
+                    ..
+                } => Some(class_fqn.clone()),
+                php_lsp_completion::context::CompletionContext::StaticAccess {
+                    class_fqn, ..
+                } if !class_fqn.is_empty() => Some(class_fqn.clone()),
+                _ => None,
+            };
+
+        if let Some(class_fqn) = completion_class_fqn {
+            self.lazy_index_class_dependencies(&class_fqn).await;
         }
 
         // Get completion items from the provider

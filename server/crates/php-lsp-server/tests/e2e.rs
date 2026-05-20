@@ -1561,6 +1561,89 @@ function run(): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_member_access_from_this_property_chain() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Browser {
+    public string $requestHeaders;
+    public function request(): void {}
+}
+
+class Controller {
+    private Browser $client;
+    public function test(): void {
+        $this->client->reques
+    }
+}
+"#;
+    let uri = "file:///test/property-chain-completion.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, uri, 11, 29))
+        .await
+        .unwrap();
+
+    let result = extract_result(resp);
+    let items = completion_items_from_result(&result);
+    let labels: Vec<_> = items
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .collect();
+
+    assert_eq!(
+        labels.first().copied(),
+        Some("request"),
+        "expected method completion to sort first, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"requestHeaders"),
+        "expected property completion from chained type, got: {:?}",
+        labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_polish_snippets_and_auto_imports() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
