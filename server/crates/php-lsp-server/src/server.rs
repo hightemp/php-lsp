@@ -1199,6 +1199,33 @@ impl PhpLspBackend {
             .await;
     }
 
+    /// Publish only in-process diagnostics from the current open buffer.
+    ///
+    /// This path is used for `didChange` so editor feedback is not blocked by
+    /// lazy vendor indexing or external analyzers such as PHPStan/Psalm.
+    async fn publish_fast_diagnostics(&self, uri: &Uri) {
+        let uri_str = uri.as_str().to_string();
+        let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let php_version = *self.php_version.lock().await;
+        let diagnostics = {
+            if let Some(parser) = self.open_files.get(&uri_str) {
+                compute_diagnostics(
+                    &uri_str,
+                    &parser,
+                    &self.index,
+                    diagnostics_mode,
+                    php_version,
+                )
+            } else {
+                vec![]
+            }
+        };
+
+        self.client
+            .publish_diagnostics(uri.clone(), diagnostics, None)
+            .await;
+    }
+
     /// Reindex one changed PHP file from the open buffer when available,
     /// otherwise from disk.
     async fn reindex_php_file(&self, uri: &Uri) {
@@ -6402,7 +6429,7 @@ impl LanguageServer for PhpLspBackend {
             }
         }
 
-        self.publish_diagnostics(&uri).await;
+        self.publish_fast_diagnostics(&uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -6417,6 +6444,7 @@ impl LanguageServer for PhpLspBackend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         tracing::debug!("didSave: {}", params.text_document.uri.as_str());
+        self.publish_diagnostics(&params.text_document.uri).await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
