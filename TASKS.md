@@ -750,3 +750,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Исправить ложные diagnostics в PHPUnit mock chains и `::class` в `EmailNotifierTest.php`.
 - [x] **T-2026-05-20** Исправить ложный `Undefined variable` для value-переменной в `foreach`.
 - [x] **T-2026-05-20** Ускорить публикацию diagnostics при правках открытого файла.
+- [x] **T-2026-05-20** Исправить ложные diagnostics в `ChangeUserPasswordCommandTest.php`.

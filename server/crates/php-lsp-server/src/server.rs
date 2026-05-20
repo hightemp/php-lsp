@@ -11,8 +11,8 @@ use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::references::{find_references_in_file, find_variable_references_at_position};
 use php_lsp_parser::resolve::{
-    infer_variable_type_at_position, resolve_class_name_pub, symbol_at_position,
-    symbol_at_position_with_resolver, variable_definition_at_position,
+    infer_property_type_from_assignments, infer_variable_type_at_position, resolve_class_name_pub,
+    symbol_at_position, symbol_at_position_with_resolver, variable_definition_at_position,
     variable_hover_info_at_position, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
@@ -4165,6 +4165,12 @@ fn check_member_access_node(
     }
 
     let Some(resolved) = resolve_member_for_ref_kind(index, &sym_at_pos) else {
+        if is_phpunit_testcase_helper_call(&sym_at_pos, file_symbols)
+            || is_phpunit_test_double_api_call(tree, source, file_symbols, index, &sym_at_pos)
+        {
+            return;
+        }
+
         diagnostics.push(member_diagnostic(
             &sym_at_pos,
             utf16_index,
@@ -4192,6 +4198,139 @@ fn member_reference_name_node(node: tree_sitter::Node) -> Option<tree_sitter::No
             None
         }
     })
+}
+
+fn is_phpunit_testcase_helper_call(
+    sym_at_pos: &SymbolAtPosition,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> bool {
+    if sym_at_pos.ref_kind != RefKind::MethodCall || !file_is_phpunit_test_case(file_symbols) {
+        return false;
+    }
+
+    match sym_at_pos.object_expr.as_deref() {
+        Some("$this") => matches!(
+            sym_at_pos.name.as_str(),
+            "createMock"
+                | "createConfiguredMock"
+                | "createPartialMock"
+                | "createStub"
+                | "createStubForIntersectionOfInterfaces"
+                | "createMockForIntersectionOfInterfaces"
+        ),
+        Some("self" | "static" | "parent") => {
+            sym_at_pos.name.starts_with("assert")
+                || matches!(
+                    sym_at_pos.name.as_str(),
+                    "fail" | "markTestIncomplete" | "markTestSkipped"
+                )
+        }
+        _ => false,
+    }
+}
+
+fn file_is_phpunit_test_case(file_symbols: &php_lsp_types::FileSymbols) -> bool {
+    file_symbols.symbols.iter().any(|sym| {
+        matches!(sym.kind, php_lsp_types::PhpSymbolKind::Class)
+            && sym
+                .extends
+                .iter()
+                .any(|parent| parent == "PHPUnit\\Framework\\TestCase")
+    })
+}
+
+fn is_phpunit_test_double_api_call(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    sym_at_pos: &SymbolAtPosition,
+) -> bool {
+    if sym_at_pos.ref_kind != RefKind::MethodCall
+        || !phpunit_test_double_api_method(&sym_at_pos.name)
+    {
+        return false;
+    }
+
+    let Some(prop_name) = sym_at_pos
+        .object_expr
+        .as_deref()
+        .and_then(|object_expr| object_expr.strip_prefix("$this->"))
+        .filter(|prop_name| !prop_name.contains("->"))
+    else {
+        return false;
+    };
+
+    let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+        phpunit_testcase_factory_return_type(member_name)
+            .map(str::to_string)
+            .or_else(|| resolve_member_type_from_index(index, class_fqn, member_name))
+    };
+
+    infer_property_type_from_assignments(
+        tree,
+        source,
+        prop_name,
+        file_symbols,
+        Some(&member_type_resolver),
+    )
+    .into_iter()
+    .any(|class_fqn| {
+        phpunit_test_double_type_has_method(&class_fqn, &sym_at_pos.name)
+            || resolve_member_on_class_for_ref_kind(
+                index,
+                &class_fqn,
+                &sym_at_pos.name,
+                sym_at_pos.ref_kind,
+                None,
+            )
+            .is_some()
+    })
+}
+
+fn phpunit_testcase_factory_return_type(member_name: &str) -> Option<&'static str> {
+    match member_name {
+        "createMock"
+        | "createConfiguredMock"
+        | "createPartialMock"
+        | "createMockForIntersectionOfInterfaces" => {
+            Some("PHPUnit\\Framework\\MockObject\\MockObject")
+        }
+        "createStub" | "createStubForIntersectionOfInterfaces" => {
+            Some("PHPUnit\\Framework\\MockObject\\Stub")
+        }
+        _ => None,
+    }
+}
+
+fn phpunit_test_double_api_method(member_name: &str) -> bool {
+    matches!(
+        member_name,
+        "expects"
+            | "method"
+            | "with"
+            | "withAnyParameters"
+            | "withConsecutive"
+            | "will"
+            | "willReturn"
+            | "willReturnArgument"
+            | "willReturnCallback"
+            | "willReturnMap"
+            | "willReturnOnConsecutiveCalls"
+            | "willReturnReference"
+            | "willReturnSelf"
+            | "willThrowException"
+    )
+}
+
+fn phpunit_test_double_type_has_method(class_fqn: &str, member_name: &str) -> bool {
+    matches!(
+        class_fqn,
+        "PHPUnit\\Framework\\MockObject\\MockObject"
+            | "PHPUnit\\Framework\\MockObject\\Stub"
+            | "PHPUnit\\Framework\\MockObject\\MockBuilder"
+            | "PHPUnit\\Framework\\MockObject\\InvocationMocker"
+    ) && phpunit_test_double_api_method(member_name)
 }
 
 fn is_magic_class_constant_access(
@@ -4245,10 +4384,28 @@ fn resolve_member_for_ref_kind(
     }
 
     let (class_fqn, member_name) = sym_at_pos.fqn.rsplit_once("::")?;
+    resolve_member_on_class_for_ref_kind(
+        index,
+        class_fqn,
+        member_name,
+        sym_at_pos.ref_kind,
+        Some(&sym_at_pos.fqn),
+    )
+}
+
+fn resolve_member_on_class_for_ref_kind(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+    ref_kind: RefKind,
+    exact_fqn: Option<&str>,
+) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
     let bare_name = member_name.strip_prefix('$').unwrap_or(member_name);
     index.get_members(class_fqn).into_iter().find(|sym| {
-        symbol_kind_matches_ref_kind(sym, sym_at_pos.ref_kind)
-            && (sym.fqn == sym_at_pos.fqn || sym.name == member_name || sym.name == bare_name)
+        symbol_kind_matches_ref_kind(sym, ref_kind)
+            && (exact_fqn.is_some_and(|fqn| sym.fqn == fqn)
+                || sym.name == member_name
+                || sym.name == bare_name)
     })
 }
 
@@ -4604,6 +4761,12 @@ fn check_call_argument_types(
         return;
     };
 
+    let callable_file_symbols = index.file_symbols.get(&callable.uri);
+    let expected_file_symbols = callable_file_symbols
+        .as_ref()
+        .map(|entry| entry.value())
+        .unwrap_or(file_symbols);
+
     let arguments = call_argument_nodes(call_node);
     for (arg_index, arg_node) in arguments.into_iter().enumerate() {
         let Some(param) = signature_param_for_arg(signature, arg_index) else {
@@ -4616,7 +4779,7 @@ fn check_call_argument_types(
             continue;
         };
 
-        if !type_info_accepts_inferred_type(expected, &actual, index) {
+        if !type_info_accepts_inferred_type(expected, &actual, expected_file_symbols, index) {
             diagnostics.push(diagnostic_at_byte_range(
                 actual.range,
                 utf16_index,
@@ -4659,7 +4822,7 @@ fn check_return_type_compatibility(
         return;
     };
 
-    if !type_info_accepts_inferred_type(expected, &actual, index) {
+    if !type_info_accepts_inferred_type(expected, &actual, file_symbols, index) {
         diagnostics.push(diagnostic_at_byte_range(
             actual.range,
             utf16_index,
@@ -4721,7 +4884,13 @@ fn check_property_assignment_type_compatibility(
         return;
     };
 
-    if !type_info_accepts_inferred_type(expected, &actual, index) {
+    let property_file_symbols = index.file_symbols.get(&property.uri);
+    let expected_file_symbols = property_file_symbols
+        .as_ref()
+        .map(|entry| entry.value())
+        .unwrap_or(file_symbols);
+
+    if !type_info_accepts_inferred_type(expected, &actual, expected_file_symbols, index) {
         diagnostics.push(diagnostic_at_byte_range(
             actual.range,
             utf16_index,
@@ -4908,19 +5077,21 @@ fn inferred_builtin_type(name: &str, range: (u32, u32, u32, u32)) -> InferredExp
 fn type_info_accepts_inferred_type(
     expected: &php_lsp_types::TypeInfo,
     actual: &InferredExprType,
+    file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
 ) -> bool {
     match expected {
         php_lsp_types::TypeInfo::Mixed => true,
         php_lsp_types::TypeInfo::Nullable(inner) => {
-            actual.comparable == "null" || type_info_accepts_inferred_type(inner, actual, index)
+            actual.comparable == "null"
+                || type_info_accepts_inferred_type(inner, actual, file_symbols, index)
         }
-        php_lsp_types::TypeInfo::Union(types) => types
-            .iter()
-            .any(|type_info| type_info_accepts_inferred_type(type_info, actual, index)),
+        php_lsp_types::TypeInfo::Union(types) => types.iter().any(|type_info| {
+            type_info_accepts_inferred_type(type_info, actual, file_symbols, index)
+        }),
         php_lsp_types::TypeInfo::Intersection(_) => true,
         php_lsp_types::TypeInfo::Simple(name) => {
-            simple_type_accepts_inferred_type(name, actual, index)
+            simple_type_accepts_inferred_type(name, actual, file_symbols, index)
         }
         php_lsp_types::TypeInfo::Self_
         | php_lsp_types::TypeInfo::Static_
@@ -4932,6 +5103,7 @@ fn type_info_accepts_inferred_type(
 fn simple_type_accepts_inferred_type(
     expected: &str,
     actual: &InferredExprType,
+    file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
 ) -> bool {
     let expected_lower = expected.trim_start_matches('\\').to_ascii_lowercase();
@@ -4955,10 +5127,14 @@ fn simple_type_accepts_inferred_type(
         "callable" => true,
         "void" | "never" => false,
         _ => {
-            let expected_fqn = expected.trim_start_matches('\\');
+            let expected_fqn = if expected.starts_with('\\') {
+                expected.trim_start_matches('\\').to_string()
+            } else {
+                resolve_class_name_pub(expected, file_symbols)
+            };
             let actual_fqn = actual.comparable.trim_start_matches('\\');
             expected_fqn == actual_fqn
-                || class_extends_or_implements(index, actual_fqn, expected_fqn, &mut Vec::new())
+                || class_extends_or_implements(index, actual_fqn, &expected_fqn, &mut Vec::new())
         }
     }
 }
@@ -9497,6 +9673,76 @@ class Demo extends Base {
         ] {
             assert!(
                 !messages.contains(&unexpected),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
+                messages
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_phpunit_stub_api_on_typed_properties() {
+        let uri = "file:///phpunit-stub-api.php";
+        let code = r#"<?php
+namespace PHPUnit\Framework;
+class TestCase {}
+
+namespace Symfony\Component\Console\Tester;
+class CommandTester {}
+
+namespace App\Tests\Command;
+
+use PHPUnit\Framework\TestCase;
+use Symfony\Component\Console\Tester\CommandTester;
+
+class UserRepository {}
+
+final class ChangeUserPasswordCommandTest extends TestCase
+{
+    private UserRepository $userRepo;
+    private CommandTester $commandTester;
+
+    protected function setUp(): void
+    {
+        $this->userRepo = $this->createStub(UserRepository::class);
+        $this->commandTester = new CommandTester();
+    }
+
+    public function testUserNotFoundByEmail(): void
+    {
+        $this->userRepo->method('findOneBy')->willReturn(null);
+        self::assertSame(1, 1);
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Unknown method: App\\Tests\\Command\\ChangeUserPasswordCommandTest::createStub",
+            "Unknown method: App\\Tests\\Command\\UserRepository::method",
+            "Unknown method: App\\Tests\\Command\\ChangeUserPasswordCommandTest::assertSame",
+            "Property assignment type mismatch for App\\Tests\\Command\\ChangeUserPasswordCommandTest::$commandTester",
+        ] {
+            assert!(
+                !messages.iter().any(|message| message.contains(unexpected)),
                 "Did not expect `{}` in diagnostics, got: {:?}",
                 unexpected,
                 messages
