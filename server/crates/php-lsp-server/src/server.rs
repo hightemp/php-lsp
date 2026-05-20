@@ -113,6 +113,23 @@ impl Default for PhpStanConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PsalmConfig {
+    enabled: bool,
+    command: String,
+    timeout_ms: u64,
+}
+
+impl Default for PsalmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: "vendor/bin/psalm --output-format=json --no-progress {file}".to_string(),
+            timeout_ms: 30_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DiagnosticsMode {
     Off,
@@ -258,6 +275,8 @@ pub struct PhpLspBackend {
     diagnostics_mode: Mutex<DiagnosticsMode>,
     /// PHPStan subprocess diagnostics configuration.
     phpstan_config: Mutex<PhpStanConfig>,
+    /// Psalm subprocess diagnostics configuration.
+    psalm_config: Mutex<PsalmConfig>,
     /// Whether composer.json autoload discovery is enabled.
     composer_enabled: Mutex<bool>,
     /// Whether lazy vendor indexing is enabled.
@@ -289,6 +308,7 @@ impl PhpLspBackend {
             php_version: Mutex::new(PhpVersion::DEFAULT),
             diagnostics_mode: Mutex::new(DiagnosticsMode::default()),
             phpstan_config: Mutex::new(PhpStanConfig::default()),
+            psalm_config: Mutex::new(PsalmConfig::default()),
             composer_enabled: Mutex::new(true),
             index_vendor: Mutex::new(true),
             stub_extensions: Mutex::new(Vec::new()),
@@ -417,6 +437,34 @@ impl PhpLspBackend {
 
             if next_config != current {
                 *self.phpstan_config.lock().await = next_config;
+                applied.diagnostics_changed = true;
+            }
+        }
+
+        let psalm_enabled = settings_bool(settings, "psalmEnabled", &["psalm", "enabled"]);
+        let psalm_command = settings_string(settings, "psalmCommand", &["psalm", "command"]);
+        let psalm_timeout_ms = settings_u64(settings, "psalmTimeoutMs", &["psalm", "timeoutMs"]);
+
+        if psalm_enabled.is_some() || psalm_command.is_some() || psalm_timeout_ms.is_some() {
+            let current = self.psalm_config.lock().await.clone();
+            let mut next_config = current.clone();
+            if let Some(enabled) = psalm_enabled {
+                next_config.enabled = enabled;
+            }
+            if let Some(command) = psalm_command {
+                let command = command.trim();
+                if command.is_empty() {
+                    next_config.command = PsalmConfig::default().command;
+                } else {
+                    next_config.command = command.to_string();
+                }
+            }
+            if let Some(timeout_ms) = psalm_timeout_ms {
+                next_config.timeout_ms = timeout_ms.max(1_000);
+            }
+
+            if next_config != current {
+                *self.psalm_config.lock().await = next_config;
                 applied.diagnostics_changed = true;
             }
         }
@@ -851,6 +899,39 @@ impl PhpLspBackend {
         }
     }
 
+    async fn psalm_diagnostics_for_uri(&self, uri: &Uri) -> Vec<Diagnostic> {
+        let config = self.psalm_config.lock().await.clone();
+        if !config.enabled {
+            return vec![];
+        }
+
+        if !uri_is_php_file(uri) {
+            return vec![];
+        }
+
+        let Some(file_path) = uri_to_path(uri.as_str()) else {
+            return vec![];
+        };
+        if !file_path.exists() {
+            return vec![];
+        }
+
+        let workspace_root = self.workspace_root_for_uri(uri.as_str()).await;
+        match run_psalm_for_file(config, file_path, workspace_root).await {
+            Ok(diagnostics) => diagnostics,
+            Err(message) => {
+                tracing::warn!("Psalm diagnostics failed for {}: {}", uri.as_str(), message);
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("php-lsp Psalm diagnostics failed: {}", message),
+                    )
+                    .await;
+                vec![]
+            }
+        }
+    }
+
     /// Publish diagnostics for a file.
     async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
@@ -912,6 +993,7 @@ impl PhpLspBackend {
         });
         if diagnostics_mode == DiagnosticsMode::BasicSemantic && !has_syntax_errors {
             diagnostics.extend(self.phpstan_diagnostics_for_uri(uri).await);
+            diagnostics.extend(self.psalm_diagnostics_for_uri(uri).await);
         }
 
         self.client
@@ -2167,7 +2249,7 @@ fn run_formatter_shell_command(
     process.output()
 }
 
-fn build_phpstan_shell_command(template: &str, file_path: &Path) -> String {
+fn build_analyzer_shell_command(template: &str, file_path: &Path) -> String {
     let escaped_file = shell_escape(&file_path.to_string_lossy());
     if template.contains("{file}") {
         template.replace("{file}", &escaped_file)
@@ -2314,7 +2396,7 @@ async fn run_phpstan_for_file(
     file_path: PathBuf,
     workspace_root: Option<PathBuf>,
 ) -> std::result::Result<Vec<Diagnostic>, String> {
-    let command = build_phpstan_shell_command(&config.command, &file_path);
+    let command = build_analyzer_shell_command(&config.command, &file_path);
     let output =
         run_shell_command_with_timeout(&command, workspace_root.as_deref(), config.timeout_ms)
             .await?;
@@ -2335,6 +2417,131 @@ async fn run_phpstan_for_file(
     }
 
     parse_phpstan_json_diagnostics(&stdout, &file_path).map_err(|err| {
+        if output.status.success() {
+            err
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let details = stderr.trim();
+            if details.is_empty() {
+                format!("{} (exit {})", err, output.status)
+            } else {
+                format!("{} (exit {}: {})", err, output.status, details)
+            }
+        }
+    })
+}
+
+fn psalm_issue_u32(issue: &serde_json::Value, key: &str) -> Option<u32> {
+    issue
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn psalm_issue_path_matches(issue: &serde_json::Value, target: &Path) -> bool {
+    let Some(path) = issue
+        .get("file_path")
+        .or_else(|| issue.get("file_name"))
+        .and_then(|value| value.as_str())
+    else {
+        return true;
+    };
+
+    phpstan_file_key_matches(path, target)
+}
+
+fn psalm_severity(issue: &serde_json::Value) -> DiagnosticSeverity {
+    match issue
+        .get("severity")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("info") => DiagnosticSeverity::INFORMATION,
+        Some("warning") => DiagnosticSeverity::WARNING,
+        Some("error") | None => DiagnosticSeverity::ERROR,
+        _ => DiagnosticSeverity::ERROR,
+    }
+}
+
+fn psalm_issue_to_diagnostic(issue: &serde_json::Value) -> Option<Diagnostic> {
+    let message = issue.get("message")?.as_str()?.to_string();
+    let line_from = psalm_issue_u32(issue, "line_from").unwrap_or(1).max(1);
+    let line_to = psalm_issue_u32(issue, "line_to")
+        .unwrap_or(line_from)
+        .max(1);
+    let start_character = psalm_issue_u32(issue, "column_from")
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let end_character = psalm_issue_u32(issue, "column_to")
+        .map(|column| column.saturating_sub(1))
+        .unwrap_or(start_character + 1);
+
+    Some(Diagnostic {
+        range: Range {
+            start: Position::new(line_from - 1, start_character),
+            end: Position::new(line_to - 1, end_character),
+        },
+        severity: Some(psalm_severity(issue)),
+        code: issue
+            .get("type")
+            .and_then(|value| value.as_str())
+            .or_else(|| issue.get("shortcode").and_then(|value| value.as_str()))
+            .map(|code| NumberOrString::String(code.to_string())),
+        source: Some("psalm".to_string()),
+        message,
+        ..Default::default()
+    })
+}
+
+fn parse_psalm_json_diagnostics(
+    stdout: &str,
+    file_path: &Path,
+) -> std::result::Result<Vec<Diagnostic>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(stdout).map_err(|err| format!("invalid Psalm JSON: {}", err))?;
+    let issues = value
+        .as_array()
+        .or_else(|| value.get("issues").and_then(|issues| issues.as_array()))
+        .or_else(|| value.get("errors").and_then(|errors| errors.as_array()));
+
+    let Some(issues) = issues else {
+        return Ok(vec![]);
+    };
+
+    Ok(issues
+        .iter()
+        .filter(|issue| psalm_issue_path_matches(issue, file_path))
+        .filter_map(psalm_issue_to_diagnostic)
+        .collect())
+}
+
+async fn run_psalm_for_file(
+    config: PsalmConfig,
+    file_path: PathBuf,
+    workspace_root: Option<PathBuf>,
+) -> std::result::Result<Vec<Diagnostic>, String> {
+    let command = build_analyzer_shell_command(&config.command, &file_path);
+    let output =
+        run_shell_command_with_timeout(&command, workspace_root.as_deref(), config.timeout_ms)
+            .await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if stdout.trim().is_empty() {
+        if output.status.success() {
+            return Ok(vec![]);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = stderr.trim();
+        return Err(if details.is_empty() {
+            format!("Psalm command exited with {}", output.status)
+        } else {
+            format!("Psalm command exited with {}: {}", output.status, details)
+        });
+    }
+
+    parse_psalm_json_diagnostics(&stdout, &file_path).map_err(|err| {
         if output.status.success() {
             err
         } else {
@@ -8890,6 +9097,102 @@ function nullableUnion(): string|null {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].source.as_deref(), Some("phpstan"));
         assert_eq!(diagnostics[0].message, "PHPStan reported a test error.");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_parse_psalm_json_diagnostics_maps_issues() {
+        let file_path = PathBuf::from("/tmp/php-lsp-psalm/src/Foo.php");
+        let output = serde_json::json!([
+            {
+                "severity": "error",
+                "line_from": 4,
+                "line_to": 4,
+                "type": "UndefinedMethod",
+                "message": "Method App\\Foo::missing does not exist",
+                "file_name": file_path.to_string_lossy().to_string(),
+                "file_path": file_path.to_string_lossy().to_string(),
+                "column_from": 12,
+                "column_to": 19
+            }
+        ])
+        .to_string();
+
+        let diagnostics = parse_psalm_json_diagnostics(&output, &file_path).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start.line, 3);
+        assert_eq!(diagnostics[0].range.start.character, 11);
+        assert_eq!(diagnostics[0].range.end.character, 18);
+        assert_eq!(diagnostics[0].source.as_deref(), Some("psalm"));
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("UndefinedMethod".to_string()))
+        );
+        assert_eq!(
+            diagnostics[0].message,
+            "Method App\\Foo::missing does not exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_psalm_for_file_accepts_nonzero_json_output() {
+        if cfg!(windows) {
+            return;
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let tmp = std::env::temp_dir().join(format!(
+            "php-lsp-psalm-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file_path = tmp.join("Subject.php");
+        std::fs::write(&file_path, "<?php\nclass Subject {}\n").unwrap();
+
+        let output = serde_json::json!([
+            {
+                "severity": "info",
+                "line_from": 2,
+                "line_to": 2,
+                "type": "PossiblyUnusedMethod",
+                "message": "Psalm reported a test issue.",
+                "file_path": file_path.to_string_lossy().to_string()
+            }
+        ])
+        .to_string();
+
+        let script_path = tmp.join("psalm-fake.sh");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\ncat <<'JSON'\n{}\nJSON\nexit 1\n", output),
+        )
+        .unwrap();
+
+        let config = PsalmConfig {
+            enabled: true,
+            command: format!(
+                "sh {} {{file}}",
+                shell_escape(&script_path.to_string_lossy())
+            ),
+            timeout_ms: 5_000,
+        };
+        let diagnostics = run_psalm_for_file(config, file_path, Some(tmp.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].source.as_deref(), Some("psalm"));
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::INFORMATION)
+        );
+        assert_eq!(diagnostics[0].message, "Psalm reported a test issue.");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

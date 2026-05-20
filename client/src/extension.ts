@@ -111,6 +111,12 @@ export function activate(context: ExtensionContext): void {
         "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}",
       ),
       phpstanTimeoutMs: config.get<number>("phpstan.timeoutMs", 30000),
+      psalmEnabled: config.get<boolean>("psalm.enabled", false),
+      psalmCommand: config.get<string>(
+        "psalm.command",
+        "vendor/bin/psalm --output-format=json --no-progress {file}",
+      ),
+      psalmTimeoutMs: config.get<number>("psalm.timeoutMs", 30000),
       stubsPath: stubsPath,
     },
   };
