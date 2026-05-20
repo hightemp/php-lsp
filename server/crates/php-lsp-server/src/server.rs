@@ -2274,6 +2274,314 @@ fn range_overlaps(a: Range, b: Range) -> bool {
     a.start <= b.end && b.start <= a.end
 }
 
+fn byte_ranges_overlap(left: (u32, u32, u32, u32), right: (u32, u32, u32, u32)) -> bool {
+    (left.0, left.1) <= (right.2, right.3) && (right.0, right.1) <= (left.2, left.3)
+}
+
+fn inlay_hints(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    requested_range: Range,
+    php_version: PhpVersion,
+) -> Vec<InlayHint> {
+    let utf16_index = Utf16LineIndex::new(source);
+    let byte_range = lsp_range_to_byte_range(source, requested_range);
+    let mut hints = Vec::new();
+    let ctx = InlayHintContext {
+        tree,
+        source,
+        file_symbols,
+        index,
+        utf16_index: &utf16_index,
+        requested_range: byte_range,
+    };
+
+    collect_call_argument_inlay_hints(&ctx, tree.root_node(), &mut hints);
+    collect_phpdoc_parameter_type_inlay_hints(
+        tree.root_node(),
+        source,
+        &utf16_index,
+        byte_range,
+        &mut hints,
+    );
+    collect_phpdoc_return_type_inlay_hints(
+        tree,
+        source,
+        &utf16_index,
+        byte_range,
+        php_version,
+        &mut hints,
+    );
+
+    hints.sort_by(|left, right| {
+        (
+            left.position.line,
+            left.position.character,
+            inlay_hint_label_text(&left.label),
+        )
+            .cmp(&(
+                right.position.line,
+                right.position.character,
+                inlay_hint_label_text(&right.label),
+            ))
+    });
+    hints
+}
+
+struct InlayHintContext<'a> {
+    tree: &'a tree_sitter::Tree,
+    source: &'a str,
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    index: &'a WorkspaceIndex,
+    utf16_index: &'a Utf16LineIndex,
+    requested_range: (u32, u32, u32, u32),
+}
+
+fn collect_call_argument_inlay_hints(
+    ctx: &InlayHintContext<'_>,
+    node: tree_sitter::Node,
+    hints: &mut Vec<InlayHint>,
+) {
+    if matches!(
+        node.kind(),
+        "function_call_expression"
+            | "member_call_expression"
+            | "scoped_call_expression"
+            | "object_creation_expression"
+    ) {
+        if let Some(callable) =
+            resolve_callable_for_inlay_hint(ctx.tree, node, ctx.source, ctx.file_symbols, ctx.index)
+        {
+            add_call_argument_inlay_hints(
+                node,
+                &callable,
+                ctx.source,
+                ctx.utf16_index,
+                ctx.requested_range,
+                hints,
+            );
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_call_argument_inlay_hints(ctx, child, hints);
+    }
+}
+
+fn resolve_callable_for_inlay_hint(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    let name_node = match node.kind() {
+        "function_call_expression" => node
+            .child_by_field_name("function")
+            .or_else(|| node.named_child(0)),
+        "member_call_expression" | "scoped_call_expression" => member_reference_name_node(node),
+        "object_creation_expression" => object_creation_class_node(node),
+        _ => None,
+    }?;
+    let (_, sym) = resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)?;
+    matches!(
+        sym.kind,
+        php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+    )
+    .then_some(sym)
+}
+
+fn add_call_argument_inlay_hints(
+    call_node: tree_sitter::Node,
+    callable: &php_lsp_types::SymbolInfo,
+    source: &str,
+    utf16_index: &Utf16LineIndex,
+    requested_range: (u32, u32, u32, u32),
+    hints: &mut Vec<InlayHint>,
+) {
+    let Some(signature) = callable.signature.as_ref() else {
+        return;
+    };
+
+    for (arg_index, argument) in call_argument_nodes(call_node).into_iter().enumerate() {
+        if argument_has_explicit_name(argument, source) {
+            continue;
+        }
+        let Some(param) = signature_param_for_arg(signature, arg_index) else {
+            continue;
+        };
+        if param.name.is_empty() {
+            continue;
+        }
+        let arg_range = node_range_node(argument);
+        if !byte_ranges_overlap(arg_range, requested_range) {
+            continue;
+        }
+        let start = argument.start_position();
+        hints.push(InlayHint {
+            position: Position::new(
+                start.row as u32,
+                utf16_index.byte_col_to_utf16(start.row as u32, start.column as u32),
+            ),
+            label: InlayHintLabel::String(format!("{}:", param.name)),
+            kind: Some(InlayHintKind::PARAMETER),
+            text_edits: None,
+            tooltip: Some(InlayHintTooltip::String(callable.fqn.clone())),
+            padding_left: Some(false),
+            padding_right: Some(true),
+            data: None,
+        });
+    }
+}
+
+fn argument_has_explicit_name(argument: tree_sitter::Node, source: &str) -> bool {
+    if argument.child_by_field_name("name").is_some() {
+        return true;
+    }
+    let text = node_text(source, argument);
+    let Some(colon_index) = text.find(':') else {
+        return false;
+    };
+    let value_text = argument_value_node(argument)
+        .map(|node| node_text(source, node))
+        .unwrap_or(text);
+    colon_index < text.find(value_text).unwrap_or(text.len())
+}
+
+fn collect_phpdoc_parameter_type_inlay_hints(
+    node: tree_sitter::Node,
+    source: &str,
+    utf16_index: &Utf16LineIndex,
+    requested_range: (u32, u32, u32, u32),
+    hints: &mut Vec<InlayHint>,
+) {
+    if matches!(node.kind(), "function_definition" | "method_declaration") {
+        add_phpdoc_parameter_type_inlay_hints(node, source, utf16_index, requested_range, hints);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_phpdoc_parameter_type_inlay_hints(
+            child,
+            source,
+            utf16_index,
+            requested_range,
+            hints,
+        );
+    }
+}
+
+fn add_phpdoc_parameter_type_inlay_hints(
+    node: tree_sitter::Node,
+    source: &str,
+    utf16_index: &Utf16LineIndex,
+    requested_range: (u32, u32, u32, u32),
+    hints: &mut Vec<InlayHint>,
+) {
+    let Some(doc_comment) = doc_comment_before_node(node, source) else {
+        return;
+    };
+    let phpdoc = parse_phpdoc(&doc_comment);
+    if phpdoc.params.is_empty() {
+        return;
+    }
+
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if !matches!(
+            parameter.kind(),
+            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter"
+        ) || parameter.child_by_field_name("type").is_some()
+        {
+            continue;
+        }
+        let Some(name_node) = parameter.child_by_field_name("name") else {
+            continue;
+        };
+        if !byte_ranges_overlap(node_range_node(name_node), requested_range) {
+            continue;
+        }
+        let raw_name = node_text(source, name_node);
+        let name = raw_name.trim_start_matches('$');
+        let Some(param_doc) = phpdoc.params.iter().find(|param| param.name == name) else {
+            continue;
+        };
+        let Some(type_info) = param_doc.type_info.as_ref() else {
+            continue;
+        };
+        let end = name_node.end_position();
+        hints.push(InlayHint {
+            position: Position::new(
+                end.row as u32,
+                utf16_index.byte_col_to_utf16(end.row as u32, end.column as u32),
+            ),
+            label: InlayHintLabel::String(format!(": {}", type_info)),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: Some(InlayHintTooltip::String("PHPDoc @param".to_string())),
+            padding_left: Some(false),
+            padding_right: Some(false),
+            data: None,
+        });
+    }
+}
+
+fn collect_phpdoc_return_type_inlay_hints(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    utf16_index: &Utf16LineIndex,
+    requested_range: (u32, u32, u32, u32),
+    php_version: PhpVersion,
+    hints: &mut Vec<InlayHint>,
+) {
+    for candidate in find_missing_return_type_candidates(tree, source, requested_range) {
+        let label = return_type_hint(&candidate.return_type, php_version)
+            .unwrap_or_else(|| candidate.return_type.to_string());
+        hints.push(InlayHint {
+            position: Position::new(
+                candidate.insert_position.0,
+                utf16_index
+                    .byte_col_to_utf16(candidate.insert_position.0, candidate.insert_position.1),
+            ),
+            label: InlayHintLabel::String(format!(": {}", label)),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: Some(InlayHintTooltip::String("PHPDoc @return".to_string())),
+            padding_left: Some(false),
+            padding_right: Some(false),
+            data: None,
+        });
+    }
+}
+
+fn doc_comment_before_node(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let mut prev = node.prev_sibling();
+    while let Some(sibling) = prev {
+        if sibling.kind() == "comment" {
+            let text = node_text(source, sibling);
+            if text.starts_with("/**") {
+                return Some(text.to_string());
+            }
+            return None;
+        }
+        prev = sibling.prev_sibling();
+    }
+    None
+}
+
+fn inlay_hint_label_text(label: &InlayHintLabel) -> String {
+    match label {
+        InlayHintLabel::String(value) => value.clone(),
+        InlayHintLabel::LabelParts(parts) => parts.iter().map(|part| part.value.as_str()).collect(),
+    }
+}
+
 /// Compute diagnostics for a file (syntax + semantic).
 ///
 /// Extracted as a free function so it can be called both from
@@ -4200,6 +4508,7 @@ impl LanguageServer for PhpLspBackend {
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 workspace: Some(WorkspaceServerCapabilities {
@@ -5978,6 +6287,44 @@ impl LanguageServer for PhpLspBackend {
             Ok(None)
         } else {
             Ok(Some(DocumentSymbolResponse::Nested(top_level)))
+        }
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri_str = params.text_document.uri.as_str().to_string();
+        let php_version = *self.php_version.lock().await;
+
+        let hints = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            let tree = match parser.tree() {
+                Some(tree) => tree,
+                None => return Ok(None),
+            };
+            let source = parser.source();
+            let file_symbols = self
+                .index
+                .file_symbols
+                .get(&uri_str)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
+
+            inlay_hints(
+                tree,
+                &source,
+                &file_symbols,
+                &self.index,
+                params.range,
+                php_version,
+            )
+        };
+
+        if hints.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hints))
         }
     }
 

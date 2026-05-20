@@ -217,6 +217,26 @@ fn signature_help_request(id: i64, uri: &str, line: u32, character: u32) -> Requ
         .finish()
 }
 
+fn inlay_hint_request(
+    id: i64,
+    uri: &str,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+) -> Request {
+    Request::build("textDocument/inlayHint")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character }
+            }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn formatting_request(id: i64, uri: &str) -> Request {
     Request::build("textDocument/formatting")
         .params(json!({
@@ -612,6 +632,14 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected linkedEditingRangeProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("inlayHintProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected inlayHintProvider capability"
     );
     let file_operations = result
         .get("capabilities")
@@ -1982,6 +2010,107 @@ function run(): void {
         method_result["activeParameter"].as_u64(),
         Some(1),
         "second method argument should be active"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_inlay_hints_for_parameters_and_phpdoc_types() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+/**
+ * @param string $name
+ * @param int $count
+ * @return string
+ */
+function label($name, $count) { return $name; }
+
+class Formatter {
+    /**
+     * @param string $prefix
+     * @return string
+     */
+    public function format($prefix) { return $prefix; }
+}
+
+function run(Formatter $formatter): void {
+    label("Ada", 2);
+    $formatter->format("Hi");
+}
+"#;
+    let uri = "file:///test/inlay-hints.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 22, 0))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let hints = result.as_array().expect("expected inlay hint array");
+    let labels: Vec<&str> = hints
+        .iter()
+        .filter_map(|hint| hint.get("label").and_then(|label| label.as_str()))
+        .collect();
+
+    for expected in ["name:", "count:", "prefix:", ": string", ": int"] {
+        assert!(
+            labels.contains(&expected),
+            "expected `{}` in inlay hint labels, got: {:?}",
+            expected,
+            labels
+        );
+    }
+    assert!(
+        hints
+            .iter()
+            .any(|hint| hint.get("kind").and_then(|kind| kind.as_u64()) == Some(2)),
+        "expected parameter hint kind, got: {}",
+        result
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|hint| hint.get("kind").and_then(|kind| kind.as_u64()) == Some(1)),
+        "expected type hint kind, got: {}",
+        result
     );
 
     service
