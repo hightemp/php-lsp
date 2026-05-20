@@ -19,17 +19,6 @@ intelligence: diagnostics, hover, completion, navigation, references, rename,
 formatting integration, semantic tokens, hierarchy views, and built-in
 phpstorm-stubs support.
 
-## Status
-
-**Active development.** LSP parity work is complete: 29/29 items (100%). The
-server now exposes the common protocol surface expected from modern LSP servers,
-including navigation, refactoring, formatting, semantic highlighting, inlay
-hints, code lenses, folding, and workspace/file-operation handling.
-
-php-lsp is still not a drop-in replacement for mature PHP analyzers. The main
-remaining work is deeper type inference and data-flow analysis, performance and
-disk caching for very large repositories, and framework-specific intelligence.
-
 ## Features
 
 ### Language Intelligence
