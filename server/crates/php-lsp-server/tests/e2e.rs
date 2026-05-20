@@ -436,6 +436,15 @@ fn document_symbol_request(id: i64, uri: &str) -> Request {
         .finish()
 }
 
+fn code_lens_request(id: i64, uri: &str) -> Request {
+    Request::build("textDocument/codeLens")
+        .params(json!({
+            "textDocument": { "uri": uri }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn workspace_symbol_request(id: i64, query: &str) -> Request {
     Request::build("workspace/symbol")
         .params(json!({ "query": query }))
@@ -748,6 +757,16 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected inlayHintProvider capability"
+    );
+    assert_eq!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("codeLensProvider"))
+            .and_then(|provider| provider.get("resolveProvider"))
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "expected codeLensProvider without resolve, got: {}",
+        result
     );
     let file_operations = result
         .get("capabilities")
@@ -3616,6 +3635,92 @@ class UserService {
     }
 
     // Shutdown
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_lens_reference_counts_for_types_and_methods() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Demo {
+    public static function run(): void {}
+}
+
+function boot(): void {
+    Demo::run();
+}
+"#;
+    let uri = "file:///test/CodeLens.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_lens_request(2, uri))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let lenses = result.as_array().expect("code lens array");
+
+    let demo_lens = lenses
+        .iter()
+        .find(|lens| lens["data"]["fqn"].as_str() == Some("App\\Demo"))
+        .unwrap_or_else(|| panic!("expected class code lens, got: {}", result));
+    assert_eq!(
+        demo_lens["command"]["title"].as_str(),
+        Some("1 reference"),
+        "class code lens should count static class reference"
+    );
+    assert_eq!(
+        demo_lens["command"]["command"].as_str(),
+        Some("editor.action.showReferences")
+    );
+
+    let run_lens = lenses
+        .iter()
+        .find(|lens| lens["data"]["fqn"].as_str() == Some("App\\Demo::run"))
+        .unwrap_or_else(|| panic!("expected method code lens, got: {}", result));
+    assert_eq!(
+        run_lens["command"]["title"].as_str(),
+        Some("1 reference"),
+        "method code lens should count static method call"
+    );
+
     service
         .ready()
         .await

@@ -589,7 +589,7 @@
   - Корректные diagnostics/search/symbols across folders
 - [x] **VN-006** Интеграция PHPStan — subprocess + маппинг output → Diagnostics *(done 2026-05-20)*
 - [x] **VN-007** Интеграция Psalm — subprocess + маппинг output → Diagnostics *(done 2026-05-20)*
-- [ ] **VN-008** Code Lens — количество ссылок на класс/метод
+- [x] **VN-008** Code Lens — количество ссылок на класс/метод *(done 2026-05-20)*
   - references count
   - test/run/debug codelens где применимо
 - [ ] **VN-009** Folding Range — складывание функций, классов, PHPDoc
@@ -695,7 +695,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-025 / VN-005** Multi-root workspace support
 - [x] **LP-026 / VN-006** PHPStan diagnostics integration
 - [x] **LP-027 / VN-007** Psalm diagnostics integration
-- [ ] **LP-028 / VN-008** `textDocument/codeLens`
+- [x] **LP-028 / VN-008** `textDocument/codeLens`
 - [ ] **LP-029 / VN-009** `textDocument/foldingRange`
 
 ---
@@ -737,3 +737,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Реализовать `LP-025 / VN-005` multi-root workspace support.
 - [x] **T-2026-05-20** Реализовать `LP-026 / VN-006` PHPStan diagnostics integration.
 - [x] **T-2026-05-20** Реализовать `LP-027 / VN-007` Psalm diagnostics integration.
+- [x] **T-2026-05-20** Реализовать `LP-028 / VN-008` `textDocument/codeLens`.

@@ -862,6 +862,81 @@ impl PhpLspBackend {
         })
     }
 
+    fn reference_locations_for_symbol(
+        &self,
+        target_fqn: &str,
+        target_kind: php_lsp_types::PhpSymbolKind,
+        include_declaration: bool,
+    ) -> Vec<Location> {
+        let mut locations = Vec::new();
+
+        for entry in self.index.file_symbols.iter() {
+            let file_uri = entry.key().clone();
+            let file_syms = entry.value().clone();
+
+            let refs = if let Some(parser) = self.open_files.get(&file_uri) {
+                let Some(tree) = parser.tree() else {
+                    continue;
+                };
+                let source = parser.source();
+                find_references_in_file(
+                    tree,
+                    &source,
+                    &file_syms,
+                    target_fqn,
+                    target_kind,
+                    include_declaration,
+                )
+                .into_iter()
+                .map(|mut reference| {
+                    reference.range = range_byte_to_utf16(&source, reference.range);
+                    reference
+                })
+                .collect::<Vec<_>>()
+            } else {
+                let Some(path) = uri_to_path(&file_uri) else {
+                    continue;
+                };
+                let Ok(source) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let mut parser = FileParser::new();
+                parser.parse_full(&source);
+                let Some(tree) = parser.tree() else {
+                    continue;
+                };
+                find_references_in_file(
+                    tree,
+                    &source,
+                    &file_syms,
+                    target_fqn,
+                    target_kind,
+                    include_declaration,
+                )
+                .into_iter()
+                .map(|mut reference| {
+                    reference.range = range_byte_to_utf16(&source, reference.range);
+                    reference
+                })
+                .collect::<Vec<_>>()
+            };
+
+            for reference in refs {
+                if let Ok(uri) = file_uri.parse::<Uri>() {
+                    locations.push(Location {
+                        uri,
+                        range: Range {
+                            start: Position::new(reference.range.0, reference.range.1),
+                            end: Position::new(reference.range.2, reference.range.3),
+                        },
+                    });
+                }
+            }
+        }
+
+        locations
+    }
+
     async fn phpstan_diagnostics_for_uri(&self, uri: &Uri) -> Vec<Diagnostic> {
         let config = self.phpstan_config.lock().await.clone();
         if !config.enabled {
@@ -3233,6 +3308,25 @@ fn type_hierarchy_item_from_symbol(sym: &php_lsp_types::SymbolInfo) -> Option<Ty
             "kind": call_hierarchy_kind_key(sym.kind),
         })),
     })
+}
+
+fn is_code_lens_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
+    matches!(
+        kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+            | php_lsp_types::PhpSymbolKind::Method
+    )
+}
+
+fn reference_count_title(count: usize) -> String {
+    if count == 1 {
+        "1 reference".to_string()
+    } else {
+        format!("{} references", count)
+    }
 }
 
 fn type_hierarchy_symbol_from_item(
@@ -5638,6 +5732,9 @@ impl LanguageServer for PhpLspBackend {
                 document_highlight_provider: Some(OneOf::Left(true)),
                 call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 workspace: Some(WorkspaceServerCapabilities {
@@ -7584,6 +7681,77 @@ impl LanguageServer for PhpLspBackend {
             Ok(None)
         } else {
             Ok(Some(locations))
+        }
+    }
+
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let uri_str = params.text_document.uri.as_str().to_string();
+        let document_uri = match uri_str.parse::<Uri>() {
+            Ok(uri) => uri,
+            Err(_) => return Ok(None),
+        };
+
+        let (file_symbols, source) = if let Some(parser) = self.open_files.get(&uri_str) {
+            let Some(tree) = parser.tree() else {
+                return Ok(None);
+            };
+            let source = parser.source();
+            (extract_file_symbols(tree, &source, &uri_str), source)
+        } else if let Some(file_symbols) = self.index.file_symbols.get(&uri_str) {
+            let Some(path) = uri_to_path(&uri_str) else {
+                return Ok(None);
+            };
+            let Ok(source) = std::fs::read_to_string(path) else {
+                return Ok(None);
+            };
+            (file_symbols.value().clone(), source)
+        } else {
+            return Ok(None);
+        };
+
+        let mut lenses = Vec::new();
+        for symbol in file_symbols
+            .symbols
+            .iter()
+            .filter(|symbol| is_code_lens_symbol_kind(symbol.kind))
+        {
+            let locations = self.reference_locations_for_symbol(&symbol.fqn, symbol.kind, false);
+            let range_tuple = range_byte_to_utf16(&source, symbol.selection_range);
+            let start = Position::new(range_tuple.0, range_tuple.1);
+            let end = if range_tuple.0 == range_tuple.2 {
+                Position::new(range_tuple.2, range_tuple.3)
+            } else {
+                start
+            };
+
+            let arguments = match (
+                serde_json::to_value(document_uri.clone()),
+                serde_json::to_value(start),
+                serde_json::to_value(&locations),
+            ) {
+                (Ok(uri), Ok(position), Ok(locations)) => Some(vec![uri, position, locations]),
+                _ => None,
+            };
+
+            lenses.push(CodeLens {
+                range: Range { start, end },
+                command: Some(Command {
+                    title: reference_count_title(locations.len()),
+                    command: "editor.action.showReferences".to_string(),
+                    arguments,
+                }),
+                data: Some(serde_json::json!({
+                    "fqn": symbol.fqn,
+                    "kind": call_hierarchy_kind_key(symbol.kind),
+                    "references": locations.len(),
+                })),
+            });
+        }
+
+        if lenses.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(lenses))
         }
     }
 
