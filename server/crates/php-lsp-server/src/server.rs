@@ -26,7 +26,7 @@ use php_lsp_parser::semantic_tokens::{
 use php_lsp_parser::signature_help::signature_help_context_at_position;
 use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2671,6 +2671,106 @@ fn call_hierarchy_kind_from_key(raw: &str) -> Option<php_lsp_types::PhpSymbolKin
     }
 }
 
+fn is_type_hierarchy_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
+    matches!(
+        kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+    )
+}
+
+fn type_hierarchy_item_from_symbol(sym: &php_lsp_types::SymbolInfo) -> Option<TypeHierarchyItem> {
+    if !is_type_hierarchy_symbol_kind(sym.kind) {
+        return None;
+    }
+    let uri = sym.uri.parse::<Uri>().ok()?;
+    Some(TypeHierarchyItem {
+        name: sym.name.clone(),
+        kind: php_kind_to_lsp(sym.kind),
+        tags: sym.modifiers.is_deprecated.then_some(SymbolTag::DEPRECATED),
+        detail: Some(sym.fqn.clone()),
+        uri,
+        range: range_from_tuple(sym.range),
+        selection_range: range_from_tuple(sym.selection_range),
+        data: Some(serde_json::json!({
+            "fqn": sym.fqn,
+            "kind": call_hierarchy_kind_key(sym.kind),
+        })),
+    })
+}
+
+fn type_hierarchy_symbol_from_item(
+    index: &WorkspaceIndex,
+    item: &TypeHierarchyItem,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    if let Some(data) = item.data.as_ref() {
+        if let Some(fqn) = data.get("fqn").and_then(|value| value.as_str()) {
+            if let Some(sym) = index.resolve_fqn(fqn) {
+                if is_type_hierarchy_symbol_kind(sym.kind) {
+                    return Some(sym);
+                }
+            }
+        }
+    }
+
+    let uri = item.uri.as_str();
+    let selection = (
+        item.selection_range.start.line,
+        item.selection_range.start.character,
+        item.selection_range.end.line,
+        item.selection_range.end.character,
+    );
+    index.file_symbols.get(uri).and_then(|file_symbols| {
+        file_symbols
+            .symbols
+            .iter()
+            .find(|sym| {
+                sym.name == item.name
+                    && sym.selection_range == selection
+                    && is_type_hierarchy_symbol_kind(sym.kind)
+            })
+            .cloned()
+            .map(Arc::new)
+    })
+}
+
+fn direct_type_subtypes(
+    index: &WorkspaceIndex,
+    target_fqn: &str,
+) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
+    let mut seen = HashSet::new();
+    let mut subtypes = Vec::new();
+
+    for entry in index.types.iter() {
+        let sym = entry.value().clone();
+        if !is_type_hierarchy_symbol_kind(sym.kind) || sym.fqn == target_fqn {
+            continue;
+        }
+        let matches_target = sym
+            .extends
+            .iter()
+            .chain(sym.implements.iter())
+            .any(|parent| parent == target_fqn);
+        if matches_target && seen.insert(sym.fqn.clone()) {
+            subtypes.push(sym);
+        }
+    }
+
+    subtypes.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+    subtypes
+}
+
+fn direct_type_parent_fqns(sym: &php_lsp_types::SymbolInfo) -> Vec<String> {
+    let mut seen = HashSet::new();
+    sym.extends
+        .iter()
+        .chain(sym.implements.iter())
+        .filter_map(|fqn| seen.insert(fqn.clone()).then_some(fqn.clone()))
+        .collect()
+}
+
 fn call_hierarchy_symbol_from_item(
     index: &WorkspaceIndex,
     item: &CallHierarchyItem,
@@ -4837,6 +4937,9 @@ impl LanguageServer for PhpLspBackend {
                         },
                     ),
                 ),
+                experimental: Some(serde_json::json!({
+                    "typeHierarchyProvider": true,
+                })),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -6193,6 +6296,142 @@ impl LanguageServer for PhpLspBackend {
             Ok(None)
         } else {
             Ok(Some(calls))
+        }
+    }
+
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let uri_str = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .as_str()
+            .to_string();
+        let pos = params.text_document_position_params.position;
+
+        let (candidate, local_candidate, containing_class_fqn) = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            let tree = match parser.tree() {
+                Some(tree) => tree,
+                None => return Ok(None),
+            };
+            let source = parser.source();
+            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let file_symbols = self
+                .index
+                .file_symbols
+                .get(&uri_str)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
+            let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+                self.resolve_member_type(class_fqn, member_name)
+            };
+            let sym_at_pos = symbol_at_position_with_resolver(
+                tree,
+                &source,
+                pos.line,
+                byte_col,
+                &file_symbols,
+                Some(&resolver),
+            );
+            let candidate = sym_at_pos.as_ref().and_then(|sym| match sym.ref_kind {
+                RefKind::ClassName => Some(sym.fqn.clone()),
+                RefKind::Constructor => sym
+                    .fqn
+                    .strip_suffix("::__construct")
+                    .map(str::to_string)
+                    .or_else(|| Some(sym.fqn.clone())),
+                _ => None,
+            });
+            let local_candidate = candidate.as_ref().and_then(|fqn| {
+                file_symbols
+                    .symbols
+                    .iter()
+                    .find(|sym| sym.fqn == *fqn && is_type_hierarchy_symbol_kind(sym.kind))
+                    .cloned()
+            });
+            let point_range = (pos.line, byte_col, pos.line, byte_col);
+            let containing_class_fqn = current_class_fqn_at_range(&file_symbols, point_range);
+            (candidate, local_candidate, containing_class_fqn)
+        };
+
+        let mut symbol = None;
+        if let Some(fqn) = candidate {
+            symbol = self
+                .resolve_fqn_lazy_with_fallback(&fqn, RefKind::ClassName)
+                .await;
+            if symbol.is_none() {
+                symbol = local_candidate.map(Arc::new);
+            }
+        }
+
+        if symbol.is_none() {
+            if let Some(class_fqn) = containing_class_fqn {
+                symbol = self
+                    .resolve_fqn_lazy_with_fallback(&class_fqn, RefKind::ClassName)
+                    .await;
+            }
+        }
+
+        let Some(symbol) = symbol else {
+            return Ok(None);
+        };
+
+        Ok(type_hierarchy_item_from_symbol(&symbol).map(|item| vec![item]))
+    }
+
+    async fn supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let Some(symbol) = type_hierarchy_symbol_from_item(&self.index, &params.item) else {
+            return Ok(None);
+        };
+
+        let parent_fqns = direct_type_parent_fqns(&symbol);
+        let mut parents = Vec::new();
+        for parent_fqn in parent_fqns {
+            self.lazy_index_class(&parent_fqn).await;
+            if let Some(parent) = self
+                .resolve_fqn_lazy_with_fallback(&parent_fqn, RefKind::ClassName)
+                .await
+            {
+                if let Some(item) = type_hierarchy_item_from_symbol(&parent) {
+                    parents.push(item);
+                }
+            }
+        }
+        parents.sort_by(|left, right| left.name.cmp(&right.name));
+
+        if parents.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(parents))
+        }
+    }
+
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let Some(symbol) = type_hierarchy_symbol_from_item(&self.index, &params.item) else {
+            return Ok(None);
+        };
+
+        let subtypes: Vec<_> = direct_type_subtypes(&self.index, &symbol.fqn)
+            .into_iter()
+            .filter_map(|symbol| type_hierarchy_item_from_symbol(&symbol))
+            .collect();
+
+        if subtypes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(subtypes))
         }
     }
 

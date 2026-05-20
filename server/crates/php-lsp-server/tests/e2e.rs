@@ -261,6 +261,30 @@ fn outgoing_calls_request(id: i64, item: serde_json::Value) -> Request {
         .finish()
 }
 
+fn prepare_type_hierarchy_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
+    Request::build("textDocument/prepareTypeHierarchy")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+        .id(id)
+        .finish()
+}
+
+fn type_hierarchy_supertypes_request(id: i64, item: serde_json::Value) -> Request {
+    Request::build("typeHierarchy/supertypes")
+        .params(json!({ "item": item }))
+        .id(id)
+        .finish()
+}
+
+fn type_hierarchy_subtypes_request(id: i64, item: serde_json::Value) -> Request {
+    Request::build("typeHierarchy/subtypes")
+        .params(json!({ "item": item }))
+        .id(id)
+        .finish()
+}
+
 fn formatting_request(id: i64, uri: &str) -> Request {
     Request::build("textDocument/formatting")
         .params(json!({
@@ -664,6 +688,15 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected callHierarchyProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("experimental"))
+            .and_then(|experimental| experimental.get("typeHierarchyProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected experimental typeHierarchyProvider capability"
     );
     assert!(
         result
@@ -2290,6 +2323,146 @@ function run(Service $service): void {
         incoming_names.contains(&"caller") && incoming_names.contains(&"entry"),
         "expected incoming caller/entry calls, got: {}",
         incoming_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_type_hierarchy_prepare_supertypes_and_subtypes() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+interface Contract {}
+
+class Base {}
+
+class Child extends Base implements Contract {}
+
+class GrandChild extends Child {}
+
+class Other implements Contract {}
+"#;
+    let uri = "file:///test/type-hierarchy.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let child_prepare = service
+        .ready()
+        .await
+        .unwrap()
+        .call(prepare_type_hierarchy_request(2, uri, 7, 8))
+        .await
+        .unwrap();
+    let child_result = extract_result(child_prepare);
+    let child_item = child_result
+        .as_array()
+        .expect("expected type hierarchy prepare array")[0]
+        .clone();
+    assert_eq!(child_item["name"].as_str(), Some("Child"));
+    assert_eq!(child_item["data"]["fqn"].as_str(), Some("App\\Child"));
+
+    let supertypes_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(type_hierarchy_supertypes_request(3, child_item.clone()))
+        .await
+        .unwrap();
+    let supertypes_result = extract_result(supertypes_resp);
+    let supertypes = supertypes_result
+        .as_array()
+        .expect("expected supertypes array");
+    let supertype_names: Vec<&str> = supertypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert!(
+        supertype_names.contains(&"Base") && supertype_names.contains(&"Contract"),
+        "expected Base and Contract supertypes, got: {}",
+        supertypes_result
+    );
+
+    let child_subtypes_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(type_hierarchy_subtypes_request(4, child_item))
+        .await
+        .unwrap();
+    let child_subtypes_result = extract_result(child_subtypes_resp);
+    let child_subtype_names: Vec<&str> = child_subtypes_result
+        .as_array()
+        .expect("expected child subtypes array")
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(child_subtype_names, vec!["GrandChild"]);
+
+    let contract_prepare = service
+        .ready()
+        .await
+        .unwrap()
+        .call(prepare_type_hierarchy_request(5, uri, 3, 12))
+        .await
+        .unwrap();
+    let contract_result = extract_result(contract_prepare);
+    let contract_item = contract_result
+        .as_array()
+        .expect("expected contract prepare array")[0]
+        .clone();
+    assert_eq!(contract_item["name"].as_str(), Some("Contract"));
+
+    let contract_subtypes_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(type_hierarchy_subtypes_request(6, contract_item))
+        .await
+        .unwrap();
+    let contract_subtypes_result = extract_result(contract_subtypes_resp);
+    let contract_subtype_names: Vec<&str> = contract_subtypes_result
+        .as_array()
+        .expect("expected contract subtypes array")
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert!(
+        contract_subtype_names.contains(&"Child") && contract_subtype_names.contains(&"Other"),
+        "expected Child and Other contract subtypes, got: {}",
+        contract_subtypes_result
     );
 
     service
