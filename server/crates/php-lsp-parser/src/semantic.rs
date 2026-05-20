@@ -609,6 +609,7 @@ enum VariableDeclarationKind {
     Parameter,
     Variable,
     ClosureUse,
+    PromotedProperty,
 }
 
 #[derive(Debug, Clone)]
@@ -781,7 +782,10 @@ fn report_variable_diagnostics(
                 message: format!("Unused variable: {}", first_declaration.name),
                 kind: SemanticDiagnosticKind::UnusedVariable,
             }),
-            Some(VariableDeclarationKind::ClosureUse) | None => {}
+            Some(
+                VariableDeclarationKind::ClosureUse | VariableDeclarationKind::PromotedProperty,
+            )
+            | None => {}
         }
     }
 }
@@ -801,32 +805,27 @@ fn variable_declaration_kind(
     source: &str,
     var_name: &str,
 ) -> Option<VariableDeclarationKind> {
+    if is_foreach_header_declared_variable(node, source) {
+        return Some(VariableDeclarationKind::Variable);
+    }
+    if ancestor_field_contains(node, "catch_clause", &["name", "variable"]) {
+        return Some(VariableDeclarationKind::Variable);
+    }
+
     let parent = node.parent()?;
 
     match parent.kind() {
-        "simple_parameter" | "property_promotion_parameter" => parent
+        "simple_parameter" => parent
             .child_by_field_name("name")
             .is_some_and(|name| name.id() == node.id())
             .then_some(VariableDeclarationKind::Parameter),
+        "property_promotion_parameter" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id())
+            .then_some(VariableDeclarationKind::PromotedProperty),
         "assignment_expression" => parent
             .child_by_field_name("left")
             .is_some_and(|left| left.id() == node.id() || node_contains(left, node))
-            .then_some(VariableDeclarationKind::Variable),
-        "foreach_statement" => ["key", "value"]
-            .iter()
-            .any(|field| {
-                parent
-                    .child_by_field_name(field)
-                    .is_some_and(|field_node| field_node.id() == node.id())
-            })
-            .then_some(VariableDeclarationKind::Variable),
-        "catch_clause" => ["name", "variable"]
-            .iter()
-            .any(|field| {
-                parent
-                    .child_by_field_name(field)
-                    .is_some_and(|field_node| field_node.id() == node.id())
-            })
             .then_some(VariableDeclarationKind::Variable),
         "global_declaration" | "static_variable_declaration" => {
             Some(VariableDeclarationKind::Variable)
@@ -842,6 +841,54 @@ fn variable_declaration_kind(
         }
         _ => None,
     }
+}
+
+fn is_foreach_header_declared_variable(node: tree_sitter::Node, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "foreach_statement" {
+            let foreach_text = &source[parent.byte_range()];
+            let node_start = node.start_byte().saturating_sub(parent.start_byte());
+            let header_end = foreach_text
+                .find('{')
+                .or_else(|| foreach_text.find(':'))
+                .unwrap_or(foreach_text.len());
+
+            return find_keyword(foreach_text, "as")
+                .is_some_and(|as_pos| node_start > as_pos + "as".len() && node_start < header_end);
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn find_keyword(text: &str, keyword: &str) -> Option<usize> {
+    text.match_indices(keyword).find_map(|(index, _)| {
+        let before = text[..index].chars().next_back();
+        let after = text[index + keyword.len()..].chars().next();
+        let before_boundary = before.is_none_or(|c| !is_identifier_char(c));
+        let after_boundary = after.is_none_or(|c| !is_identifier_char(c));
+        (before_boundary && after_boundary).then_some(index)
+    })
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn ancestor_field_contains(node: tree_sitter::Node, ancestor_kind: &str, fields: &[&str]) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == ancestor_kind {
+            return fields.iter().any(|field| {
+                parent.child_by_field_name(field).is_some_and(|field_node| {
+                    field_node.id() == node.id() || node_contains(field_node, node)
+                })
+            });
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 fn node_contains(parent: tree_sitter::Node, child: tree_sitter::Node) -> bool {
@@ -1526,6 +1573,56 @@ function run(): void {
                 d.kind == SemanticDiagnosticKind::UndefinedVariable && d.message.contains("$npId")
             }),
             "Arrow functions should auto-capture outer variables, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_foreach_value_variable_is_declared() {
+        let code = r#"<?php
+function run(array $requests): void {
+    foreach ($requests as $index => $request) {
+        echo $index;
+        echo $request;
+    }
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && d.message.contains("$request")
+            }),
+            "foreach value variable should be declared, got: {:?}",
+            diags
+        );
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UndefinedVariable && d.message.contains("$index")
+            }),
+            "foreach key variable should be declared, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_promoted_constructor_property_is_not_unused_parameter() {
+        let code = r#"<?php
+class Demo {
+    public function __construct(private string $logger) {}
+    public function run(): void {
+        echo $this->logger;
+    }
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedParameter && d.message.contains("$logger")
+            }),
+            "Promoted constructor property should not be reported as unused parameter, got: {:?}",
             diags
         );
     }
