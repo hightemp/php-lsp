@@ -548,6 +548,7 @@ mod tests {
             parent_fqn: parent_fqn.map(str::to_string),
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         }
     }
 
@@ -599,6 +600,7 @@ mod tests {
                 parent_fqn: None,
                 extends: vec![],
                 implements: vec![],
+                traits: vec![],
             }],
         };
         index.update_file("file:///test.php", file_symbols.clone());
@@ -642,6 +644,7 @@ mod tests {
                 parent_fqn: None,
                 extends: vec![],
                 implements: vec![],
+                traits: vec![],
             }],
         };
         let index = WorkspaceIndex::new();
@@ -676,6 +679,7 @@ mod tests {
                     parent_fqn: None,
                     extends: vec![],
                     implements: vec![],
+                    traits: vec![],
                 },
                 SymbolInfo {
                     name: "test".to_string(),
@@ -694,6 +698,7 @@ mod tests {
                     parent_fqn: Some("App\\Test\\Baz".to_string()),
                     extends: vec![],
                     implements: vec![],
+                    traits: vec![],
                 },
             ],
         };

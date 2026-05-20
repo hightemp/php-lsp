@@ -287,6 +287,47 @@ fn extract_interface_clause(node: Node, source: &str, file_symbols: &FileSymbols
     result
 }
 
+fn class_body_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("body").or_else(|| {
+        let count = node.child_count();
+        for i in 0..count {
+            if let Some(child) = node.child(i) {
+                let kind = child.kind();
+                if kind == "declaration_list"
+                    || kind == "enum_declaration_list"
+                    || kind == "class_body"
+                {
+                    return Some(child);
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Extract FQNs from trait `use SomeTrait;` declarations inside a class/trait body.
+fn extract_trait_use_clauses(body: Node, source: &str, file_symbols: &FileSymbols) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() != "use_declaration" {
+            continue;
+        }
+
+        let mut inner_cursor = child.walk();
+        for inner in child.children(&mut inner_cursor) {
+            match inner.kind() {
+                "name" | "qualified_name" => {
+                    let name = node_text(inner, source);
+                    result.push(resolve_class_name_in_file(name, file_symbols));
+                }
+                _ => {}
+            }
+        }
+    }
+    result
+}
+
 /// Extract a class-like declaration (class, interface, trait, enum).
 fn extract_class_like(
     node: Node,
@@ -309,6 +350,10 @@ fn extract_class_like(
     // Extract extends (base_clause) and implements (class_interface_clause)
     let extends_fqns = extract_base_clause(node, source, result);
     let implements_fqns = extract_interface_clause(node, source, result);
+    let body_node = class_body_node(node);
+    let trait_fqns = body_node
+        .map(|body| extract_trait_use_clauses(body, source, result))
+        .unwrap_or_default();
 
     let sym = SymbolInfo {
         name: name.clone(),
@@ -324,28 +369,13 @@ fn extract_class_like(
         parent_fqn: None,
         extends: extends_fqns,
         implements: implements_fqns,
+        traits: trait_fqns,
     };
     result.symbols.push(sym);
 
     // Extract members from body (declaration_list)
-    let body_node = node.child_by_field_name("body");
     if let Some(body) = body_node {
         extract_class_body(body, source, uri, result, &fqn);
-    } else {
-        // Fallback: iterate children by index
-        let count = node.child_count();
-        for i in 0..count {
-            if let Some(child) = node.child(i) {
-                let kind = child.kind();
-                if kind == "declaration_list"
-                    || kind == "enum_declaration_list"
-                    || kind == "class_body"
-                {
-                    extract_class_body(child, source, uri, result, &fqn);
-                    break;
-                }
-            }
-        }
     }
 }
 
@@ -412,6 +442,7 @@ fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols,
         parent_fqn: Some(parent_fqn.to_string()),
         extends: vec![],
         implements: vec![],
+        traits: vec![],
     });
 
     // Emit Property symbols for promoted constructor parameters.
@@ -449,6 +480,7 @@ fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols,
                         parent_fqn: Some(parent_fqn.to_string()),
                         extends: vec![],
                         implements: vec![],
+                        traits: vec![],
                     });
                 }
             }
@@ -491,6 +523,7 @@ fn extract_function(
         parent_fqn: None,
         extends: vec![],
         implements: vec![],
+        traits: vec![],
     });
 }
 
@@ -536,6 +569,7 @@ fn extract_properties(
                     parent_fqn: Some(parent_fqn.to_string()),
                     extends: vec![],
                     implements: vec![],
+                    traits: vec![],
                 });
             }
         }
@@ -581,6 +615,7 @@ fn extract_class_constants(
                     parent_fqn: Some(parent_fqn.to_string()),
                     extends: vec![],
                     implements: vec![],
+                    traits: vec![],
                 });
             }
         }
@@ -622,6 +657,7 @@ fn extract_global_constants(
                     parent_fqn: None,
                     extends: vec![],
                     implements: vec![],
+                    traits: vec![],
                 });
             }
         }
@@ -657,6 +693,7 @@ fn extract_enum_case(
         parent_fqn: Some(parent_fqn.to_string()),
         extends: vec![],
         implements: vec![],
+        traits: vec![],
     });
 }
 
@@ -873,7 +910,7 @@ fn extract_visibility(node: Node, source: &str) -> Visibility {
     Visibility::Public
 }
 
-fn extract_modifiers(node: Node, source: &str) -> SymbolModifiers {
+fn extract_modifiers(node: Node, _source: &str) -> SymbolModifiers {
     let mut mods = SymbolModifiers::default();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -882,11 +919,7 @@ fn extract_modifiers(node: Node, source: &str) -> SymbolModifiers {
             "abstract_modifier" => mods.is_abstract = true,
             "final_modifier" => mods.is_final = true,
             "readonly_modifier" => mods.is_readonly = true,
-            _ => {
-                if node_text(child, source) == "static" {
-                    mods.is_static = true;
-                }
-            }
+            _ => {}
         }
     }
     mods
@@ -1022,6 +1055,34 @@ mod tests {
 
         let api = methods.iter().find(|m| m.name == "api").unwrap();
         assert_eq!(api.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn test_static_return_type_is_not_static_modifier() {
+        let syms = parse_and_extract(
+            "<?php\nclass Foo {\n    public function fluent(): static { return $this; }\n    public static function make(): static { return new static(); }\n}\n",
+        );
+        let methods: Vec<&SymbolInfo> = syms
+            .symbols
+            .iter()
+            .filter(|s| s.kind == PhpSymbolKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 2);
+
+        let fluent = methods.iter().find(|m| m.name == "fluent").unwrap();
+        assert!(!fluent.modifiers.is_static);
+        assert_eq!(
+            fluent
+                .signature
+                .as_ref()
+                .and_then(|sig| sig.return_type.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("static")
+        );
+
+        let make = methods.iter().find(|m| m.name == "make").unwrap();
+        assert!(make.modifiers.is_static);
     }
 
     #[test]
@@ -1185,6 +1246,25 @@ mod tests {
         assert_eq!(
             cls.implements,
             vec!["Countable".to_string(), "Serializable".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_extract_trait_uses() {
+        let syms = parse_and_extract(
+            "<?php\nnamespace App;\n\nuse Vendor\\Shared\\Auditable;\n\nclass Foo {\n    use Auditable;\n    use LocalTrait;\n}\n",
+        );
+        let cls = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Class)
+            .unwrap();
+        assert_eq!(
+            cls.traits,
+            vec![
+                "Vendor\\Shared\\Auditable".to_string(),
+                "App\\LocalTrait".to_string()
+            ]
         );
     }
 

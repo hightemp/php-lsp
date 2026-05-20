@@ -147,6 +147,14 @@ impl WorkspaceIndex {
 
         // Walk the class hierarchy: look up extends and implements
         if let Some(class_sym) = self.types.get(class_fqn).map(|r| r.value().clone()) {
+            // Try traits first: their members are mixed into the class/trait body.
+            for trait_fqn in &class_sym.traits {
+                if let Some(sym) =
+                    self.resolve_member_in_hierarchy(trait_fqn, member_name, original_fqn, visited)
+                {
+                    return Some(sym);
+                }
+            }
             // Try parent classes (extends)
             for parent_fqn in &class_sym.extends {
                 if let Some(sym) =
@@ -231,6 +239,9 @@ impl WorkspaceIndex {
 
         // Recurse into parent classes and interfaces
         if let Some(class_sym) = self.types.get(type_fqn).map(|r| r.value().clone()) {
+            for trait_fqn in &class_sym.traits {
+                self.collect_members_recursive(trait_fqn, members, visited);
+            }
             for parent_fqn in &class_sym.extends {
                 self.collect_members_recursive(parent_fqn, members, visited);
             }
@@ -267,6 +278,7 @@ mod tests {
             parent_fqn: None,
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         }
     }
 
@@ -285,6 +297,7 @@ mod tests {
             parent_fqn: None,
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         }
     }
 
@@ -381,6 +394,7 @@ mod tests {
             parent_fqn: Some("App\\Foo".to_string()),
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         };
         let file_symbols = FileSymbols {
             namespace: Some("App".to_string()),
@@ -424,6 +438,7 @@ mod tests {
             parent_fqn: None,
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         };
         let parent_method = SymbolInfo {
             name: "okResponse".to_string(),
@@ -439,6 +454,7 @@ mod tests {
             parent_fqn: Some("App\\SoapHandler".to_string()),
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         };
         let parent_file = FileSymbols {
             namespace: Some("App".to_string()),
@@ -462,6 +478,7 @@ mod tests {
             parent_fqn: None,
             extends: vec!["App\\SoapHandler".to_string()],
             implements: vec![],
+            traits: vec![],
         };
         let child_file = FileSymbols {
             namespace: Some("App".to_string()),
@@ -486,6 +503,81 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_trait_member() {
+        let index = WorkspaceIndex::new();
+
+        let trait_sym = SymbolInfo {
+            name: "Assertions".to_string(),
+            fqn: "App\\Assertions".to_string(),
+            kind: PhpSymbolKind::Trait,
+            uri: "file:///trait.php".to_string(),
+            range: (0, 0, 10, 0),
+            selection_range: (0, 6, 0, 16),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: None,
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+        };
+        let trait_method = SymbolInfo {
+            name: "assertOk".to_string(),
+            fqn: "App\\Assertions::assertOk".to_string(),
+            kind: PhpSymbolKind::Method,
+            uri: "file:///trait.php".to_string(),
+            range: (2, 4, 4, 5),
+            selection_range: (2, 20, 2, 28),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: Some("App\\Assertions".to_string()),
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+        };
+        index.update_file(
+            "file:///trait.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![trait_sym, trait_method],
+            },
+        );
+
+        let class_sym = SymbolInfo {
+            name: "TestCase".to_string(),
+            fqn: "App\\TestCase".to_string(),
+            kind: PhpSymbolKind::Class,
+            uri: "file:///class.php".to_string(),
+            range: (0, 0, 5, 0),
+            selection_range: (0, 6, 0, 14),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: None,
+            extends: vec![],
+            implements: vec![],
+            traits: vec!["App\\Assertions".to_string()],
+        };
+        index.update_file(
+            "file:///class.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![class_sym],
+            },
+        );
+
+        let found = index.resolve_fqn("App\\TestCase::assertOk");
+        assert!(found.is_some(), "should resolve methods mixed in by traits");
+        assert_eq!(found.unwrap().fqn, "App\\Assertions::assertOk");
+    }
+
+    #[test]
     fn test_resolve_member_no_infinite_loop() {
         let index = WorkspaceIndex::new();
 
@@ -504,6 +596,7 @@ mod tests {
             parent_fqn: None,
             extends: vec!["B".to_string()],
             implements: vec![],
+            traits: vec![],
         };
         let class_b = SymbolInfo {
             name: "B".to_string(),
@@ -519,6 +612,7 @@ mod tests {
             parent_fqn: None,
             extends: vec!["A".to_string()],
             implements: vec![],
+            traits: vec![],
         };
         let file_a = FileSymbols {
             namespace: None,
@@ -559,6 +653,7 @@ mod tests {
             parent_fqn: None,
             extends: vec!["Vendor\\TestCase".to_string()],
             implements: vec![],
+            traits: vec![],
         };
         let child_file = FileSymbols {
             namespace: Some("App".to_string()),
@@ -588,6 +683,7 @@ mod tests {
             parent_fqn: None,
             extends: vec!["Vendor\\BaseAssert".to_string()],
             implements: vec![],
+            traits: vec![],
         };
         let parent_method = SymbolInfo {
             name: "doSetUp".to_string(),
@@ -603,6 +699,7 @@ mod tests {
             parent_fqn: Some("Vendor\\TestCase".to_string()),
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         };
         let parent_file = FileSymbols {
             namespace: Some("Vendor".to_string()),
@@ -634,6 +731,7 @@ mod tests {
             parent_fqn: None,
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         };
         let gp_method = SymbolInfo {
             name: "createStub".to_string(),
@@ -649,6 +747,7 @@ mod tests {
             parent_fqn: Some("Vendor\\BaseAssert".to_string()),
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         };
         let gp_file = FileSymbols {
             namespace: Some("Vendor".to_string()),

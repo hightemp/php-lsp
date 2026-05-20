@@ -741,3 +741,8 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Реализовать `LP-029 / VN-009` `textDocument/foldingRange`.
 - [x] **T-2026-05-20** Актуализировать `README.md` по статусу, возможностям и настройкам.
 - [x] **T-2026-05-20** Убрать упоминание `TASKS.md` из `README.md`.
+- [x] **T-2026-05-20** Исправить ложные diagnostics `Static method called as instance method` на instance setters.
+- [x] **T-2026-05-20** Подтягивать parent interfaces/classes при lazy indexing для diagnostics.
+- [x] **T-2026-05-20** Учитывать методы из `use Trait;` при member diagnostics.
+- [x] **T-2026-05-20** Подтягивать class return types методов при lazy diagnostics indexing.
+- [x] **T-2026-05-20** Сделать kind-aware member resolution для diagnostics.

@@ -1021,6 +1021,7 @@ mod tests {
             parent_fqn: None,
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         })
     }
 
@@ -1042,6 +1043,7 @@ mod tests {
             parent_fqn: None,
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         })
     }
 

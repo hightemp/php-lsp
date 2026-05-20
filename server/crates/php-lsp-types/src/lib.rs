@@ -186,6 +186,9 @@ pub struct SymbolInfo {
     /// Implemented interface FQNs (for classes/enums)
     #[serde(default)]
     pub implements: Vec<String>,
+    /// Used trait FQNs (`use SomeTrait;` inside class/trait bodies)
+    #[serde(default)]
+    pub traits: Vec<String>,
 }
 
 /// A use statement in a PHP file.

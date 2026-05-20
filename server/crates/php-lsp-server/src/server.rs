@@ -553,11 +553,7 @@ impl PhpLspBackend {
             fqn
         };
 
-        // Try vendor lazy loading using the class FQN
-        self.lazy_index_class(class_fqn).await;
-
-        // After indexing the class file, also index parent classes recursively
-        self.lazy_index_parents(class_fqn, 0).await;
+        self.lazy_index_class_dependencies(class_fqn).await;
 
         // Retry resolution with the full FQN
         if let Some(sym) = self.index.resolve_fqn(fqn) {
@@ -648,6 +644,7 @@ impl PhpLspBackend {
                 sym.extends
                     .iter()
                     .chain(sym.implements.iter())
+                    .chain(sym.traits.iter())
                     .cloned()
                     .collect()
             } else {
@@ -661,6 +658,31 @@ impl PhpLspBackend {
                 self.lazy_index_parents(&parent_fqn, depth + 1).await;
             }
         })
+    }
+
+    /// Lazy-index simple class return types from already-indexed members.
+    async fn lazy_index_member_return_types(&self, class_fqn: &str) {
+        let return_fqns: Vec<String> = self
+            .index
+            .get_members(class_fqn)
+            .into_iter()
+            .filter_map(|sym| {
+                let owner_fqn = sym.parent_fqn.as_deref().unwrap_or(class_fqn);
+                symbol_return_type_fqn(&self.index, owner_fqn, &sym)
+            })
+            .filter(|fqn| fqn.contains('\\') && !self.index.types.contains_key(fqn.as_str()))
+            .collect();
+
+        for return_fqn in return_fqns {
+            self.lazy_index_class(&return_fqn).await;
+            self.lazy_index_parents(&return_fqn, 0).await;
+        }
+    }
+
+    async fn lazy_index_class_dependencies(&self, class_fqn: &str) {
+        self.lazy_index_class(class_fqn).await;
+        self.lazy_index_parents(class_fqn, 0).await;
+        self.lazy_index_member_return_types(class_fqn).await;
     }
 
     /// Resolve symbol from index with fallback for global built-ins.
@@ -1024,7 +1046,7 @@ impl PhpLspBackend {
                 .collect();
             drop(fs); // release DashMap ref before async calls
             for fqn in fqns_to_resolve {
-                self.lazy_index_class(&fqn).await;
+                self.lazy_index_class_dependencies(&fqn).await;
             }
         }
 
@@ -1038,9 +1060,7 @@ impl PhpLspBackend {
                     let alias_fqns = collect_aliased_class_fqns(tree, &source, &fs);
                     drop(fs);
                     for fqn in alias_fqns {
-                        if !self.index.types.contains_key(fqn.as_str()) {
-                            self.lazy_index_class(&fqn).await;
-                        }
+                        self.lazy_index_class_dependencies(&fqn).await;
                     }
                 }
             }
@@ -4011,7 +4031,7 @@ fn check_member_access_node(
         return;
     }
 
-    let Some(resolved) = index.resolve_fqn(&sym_at_pos.fqn) else {
+    let Some(resolved) = resolve_member_for_ref_kind(index, &sym_at_pos) else {
         diagnostics.push(member_diagnostic(
             &sym_at_pos,
             utf16_index,
@@ -4047,6 +4067,47 @@ fn member_diagnostic(
     message: String,
 ) -> Diagnostic {
     diagnostic_at_byte_range(sym_at_pos.range, utf16_index, message)
+}
+
+fn symbol_kind_matches_ref_kind(sym: &php_lsp_types::SymbolInfo, ref_kind: RefKind) -> bool {
+    matches!(
+        (ref_kind, sym.kind),
+        (RefKind::MethodCall, php_lsp_types::PhpSymbolKind::Method)
+            | (
+                RefKind::PropertyAccess,
+                php_lsp_types::PhpSymbolKind::Property
+            )
+            | (
+                RefKind::StaticPropertyAccess,
+                php_lsp_types::PhpSymbolKind::Property
+            )
+            | (
+                RefKind::ClassConstant,
+                php_lsp_types::PhpSymbolKind::ClassConstant
+            )
+            | (
+                RefKind::ClassConstant,
+                php_lsp_types::PhpSymbolKind::EnumCase
+            )
+    )
+}
+
+fn resolve_member_for_ref_kind(
+    index: &WorkspaceIndex,
+    sym_at_pos: &SymbolAtPosition,
+) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+    if let Some(sym) = index.resolve_fqn(&sym_at_pos.fqn) {
+        if symbol_kind_matches_ref_kind(&sym, sym_at_pos.ref_kind) {
+            return Some(sym);
+        }
+    }
+
+    let (class_fqn, member_name) = sym_at_pos.fqn.rsplit_once("::")?;
+    let bare_name = member_name.strip_prefix('$').unwrap_or(member_name);
+    index.get_members(class_fqn).into_iter().find(|sym| {
+        symbol_kind_matches_ref_kind(sym, sym_at_pos.ref_kind)
+            && (sym.fqn == sym_at_pos.fqn || sym.name == member_name || sym.name == bare_name)
+    })
 }
 
 fn unknown_member_message(sym_at_pos: &SymbolAtPosition) -> String {
@@ -5087,12 +5148,20 @@ fn resolve_member_type_from_index(
         }
     };
 
+    symbol_return_type_fqn(index, class_fqn, &sym)
+}
+
+fn symbol_return_type_fqn(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    sym: &php_lsp_types::SymbolInfo,
+) -> Option<String> {
     let sig = sym.signature.as_ref()?;
     let ret = sig.return_type.as_ref()?;
     let type_str = ret.to_string();
     tracing::debug!(
         "resolve_member_type: {} -> return type '{}'",
-        member_fqn,
+        sym.fqn,
         type_str
     );
 
@@ -5101,11 +5170,14 @@ fn resolve_member_type_from_index(
     }
 
     let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
+    if base_type.contains('|') || base_type.contains('&') {
+        return None;
+    }
     if base_type == "self" || base_type == "static" || base_type == "$this" {
-        return Some(class_fqn.to_string());
+        return Some(owner_fqn.to_string());
     }
     if base_type.contains('\\') {
-        return Some(base_type.to_string());
+        return Some(base_type.trim_start_matches('\\').to_string());
     }
 
     if let Some(file_syms) = index.file_symbols.get(&sym.uri) {
@@ -8939,6 +9011,7 @@ mod tests {
             parent_fqn: parent_fqn.map(|s| s.to_string()),
             extends: vec![],
             implements: vec![],
+            traits: vec![],
         }
     }
 
@@ -9118,9 +9191,12 @@ namespace App;
 class Service {
     public string $name;
     public static string $count;
+    protected object $request;
     private function hidden(): void {}
     public static function stat(): void {}
     public function inst(): void {}
+    public function fluent(): static { return $this; }
+    public function request(): void {}
     public const OK = 'ok';
 }
 
@@ -9131,6 +9207,8 @@ class Demo {
         echo Service::MISSING;
         $service->stat();
         Service::inst();
+        $service->fluent();
+        $service->request();
         echo $service->count;
         echo Service::$name;
         $service->hidden();
@@ -9174,6 +9252,17 @@ class Demo {
                 messages
             );
         }
+
+        assert!(
+            !messages.contains(&"Static method called as instance method: App\\Service::fluent"),
+            "Method returning `static` must not be treated as a static method: {:?}",
+            messages
+        );
+        assert!(
+            !messages.contains(&"Protected member is not accessible here: App\\Service::$request"),
+            "Method calls must not resolve to same-named properties: {:?}",
+            messages
+        );
     }
 
     #[test]
