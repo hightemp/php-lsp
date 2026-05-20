@@ -132,6 +132,12 @@ struct SemanticTokensCache {
     by_uri: HashMap<String, SemanticTokensSnapshot>,
 }
 
+#[derive(Debug, Clone)]
+struct WorkspaceRootConfig {
+    root: PathBuf,
+    namespace_map: Option<NamespaceMap>,
+}
+
 impl SemanticTokensCache {
     fn store(&mut self, uri: &str, data: Vec<SemanticToken>) -> SemanticTokensSnapshot {
         self.next_result_id += 1;
@@ -214,8 +220,12 @@ pub struct PhpLspBackend {
     index: Arc<WorkspaceIndex>,
     /// Workspace root path (set during initialize).
     workspace_root: Mutex<Option<PathBuf>>,
+    /// Workspace roots from initialize/workspaceFolders after composer discovery.
+    workspace_roots: Mutex<Vec<PathBuf>>,
     /// Namespace map from composer.json.
     namespace_map: Mutex<Option<NamespaceMap>>,
+    /// Per-workspace composer namespace maps and effective roots.
+    workspace_configs: Mutex<Vec<WorkspaceRootConfig>>,
     /// Trace level from InitializeParams (off/messages/verbose).
     trace_level: Mutex<TraceValue>,
     /// Path to bundled phpstorm-stubs (from client initializationOptions).
@@ -232,6 +242,8 @@ pub struct PhpLspBackend {
     stub_extensions: Mutex<Vec<String>>,
     /// Configured server log level label.
     log_level: Mutex<String>,
+    /// Whether the client advertised window/workDoneProgress support.
+    work_done_progress_supported: Mutex<bool>,
     /// External formatter configuration.
     formatting_config: Mutex<FormattingConfig>,
     /// Last semantic token snapshots used for full/delta requests.
@@ -245,7 +257,9 @@ impl PhpLspBackend {
             open_files: Arc::new(DashMap::new()),
             index: Arc::new(WorkspaceIndex::new()),
             workspace_root: Mutex::new(None),
+            workspace_roots: Mutex::new(Vec::new()),
             namespace_map: Mutex::new(None),
+            workspace_configs: Mutex::new(Vec::new()),
             trace_level: Mutex::new(TraceValue::Off),
             stubs_path: Mutex::new(None),
             php_version: Mutex::new(PhpVersion::DEFAULT),
@@ -254,6 +268,7 @@ impl PhpLspBackend {
             index_vendor: Mutex::new(true),
             stub_extensions: Mutex::new(Vec::new()),
             log_level: Mutex::new("info".to_string()),
+            work_done_progress_supported: Mutex::new(false),
             formatting_config: Mutex::new(FormattingConfig::default()),
             semantic_tokens_cache: Mutex::new(SemanticTokensCache::default()),
         }
@@ -389,6 +404,25 @@ impl PhpLspBackend {
         }
     }
 
+    async fn workspace_root_for_uri(&self, uri_str: &str) -> Option<PathBuf> {
+        let roots = self.workspace_roots.lock().await.clone();
+        if let Some(path) = uri_to_path(uri_str) {
+            if let Some(root) = roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+            {
+                return Some(root.clone());
+            }
+        }
+
+        if let Some(root) = roots.into_iter().next() {
+            return Some(root);
+        }
+
+        self.workspace_root.lock().await.clone()
+    }
+
     /// Resolve a member's type from the workspace index (for cross-file type resolution).
     ///
     /// For properties (`member_name` starts with `$`): returns the property type FQN.
@@ -440,17 +474,28 @@ impl PhpLspBackend {
         }
 
         let index_vendor = *self.index_vendor.lock().await;
-        let ns_map = self.namespace_map.lock().await;
-        let root = self.workspace_root.lock().await;
+        let mut configs = self.workspace_configs.lock().await.clone();
+        if configs.is_empty() {
+            let root = self.workspace_root.lock().await.clone();
+            let namespace_map = self.namespace_map.lock().await.clone();
+            if let Some(root) = root {
+                configs.push(WorkspaceRootConfig {
+                    root,
+                    namespace_map,
+                });
+            }
+        }
 
-        if let (Some(ref ns_map), Some(ref root)) = (&*ns_map, &*root) {
-            let candidate_paths = ns_map.resolve_class_to_paths(class_fqn);
+        for config in configs {
+            let mut all_paths = config
+                .namespace_map
+                .as_ref()
+                .map(|ns_map| ns_map.resolve_class_to_paths(class_fqn))
+                .unwrap_or_default();
 
-            let vendor_dir = root.join("vendor");
-            let mut all_paths = candidate_paths;
-
+            let vendor_dir = config.root.join("vendor");
             if index_vendor && vendor_dir.is_dir() {
-                let vendor_autoload = root.join("vendor/composer/autoload_psr4.php");
+                let vendor_autoload = config.root.join("vendor/composer/autoload_psr4.php");
                 if vendor_autoload.exists() && all_paths.is_empty() {
                     if let Some(vendor_paths) = resolve_vendor_paths(class_fqn, &vendor_dir) {
                         all_paths.extend(vendor_paths);
@@ -462,7 +507,7 @@ impl PhpLspBackend {
                 let abs = if path.is_absolute() {
                     path.clone()
                 } else {
-                    root.join(path)
+                    config.root.join(path)
                 };
 
                 if abs.exists() {
@@ -4456,6 +4501,120 @@ fn path_to_uri(path: &Path) -> String {
     format!("file://{}", path.display())
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn workspace_roots_from_initialize(params: &InitializeParams) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(folders) = params.workspace_folders.as_ref() {
+        for folder in folders {
+            if let Some(path) = uri_to_path(folder.uri.as_str()) {
+                push_unique_path(&mut roots, path);
+            }
+        }
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+
+    #[allow(deprecated)]
+    if let Some(root) = params
+        .root_uri
+        .as_ref()
+        .and_then(|uri| uri_to_path(uri.as_str()))
+        .or_else(|| params.root_path.as_ref().map(PathBuf::from))
+    {
+        push_unique_path(&mut roots, root);
+    }
+
+    roots
+}
+
+fn discover_workspace_root_config(root: &Path, composer_enabled: bool) -> WorkspaceRootConfig {
+    let composer_path = composer_enabled.then(|| find_composer_json(root)).flatten();
+
+    if let Some(ref cp) = composer_path {
+        let effective_root = cp.parent().unwrap_or(root).to_path_buf();
+        if effective_root != root {
+            tracing::info!(
+                "Found composer.json in subdirectory: {}",
+                effective_root.display()
+            );
+        }
+
+        return match parse_composer_json(cp) {
+            Ok(namespace_map) => {
+                tracing::info!(
+                    "Parsed composer.json with {} PSR-4 entries",
+                    namespace_map.psr4.len()
+                );
+                WorkspaceRootConfig {
+                    root: effective_root,
+                    namespace_map: Some(namespace_map),
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse composer.json: {}", e);
+                WorkspaceRootConfig {
+                    root: root.to_path_buf(),
+                    namespace_map: None,
+                }
+            }
+        };
+    }
+
+    if !composer_enabled {
+        tracing::info!("Composer support disabled, will scan all PHP files");
+    } else {
+        tracing::info!("No composer.json found, will scan all PHP files");
+    }
+
+    WorkspaceRootConfig {
+        root: root.to_path_buf(),
+        namespace_map: None,
+    }
+}
+
+fn dedup_workspace_configs(configs: Vec<WorkspaceRootConfig>) -> Vec<WorkspaceRootConfig> {
+    let mut roots = Vec::new();
+    let mut unique = Vec::new();
+
+    for config in configs {
+        if roots.iter().any(|root| root == &config.root) {
+            continue;
+        }
+        roots.push(config.root.clone());
+        unique.push(config);
+    }
+
+    unique
+}
+
+fn remove_indexed_files_under_roots(index: &WorkspaceIndex, roots: &[PathBuf]) -> usize {
+    let uris: Vec<String> = index
+        .file_symbols
+        .iter()
+        .filter_map(|entry| {
+            let path = uri_to_path(entry.key())?;
+            roots
+                .iter()
+                .any(|root| path.starts_with(root))
+                .then(|| entry.key().clone())
+        })
+        .collect();
+
+    let removed = uris.len();
+    for uri in uris {
+        index.remove_file(&uri);
+    }
+
+    removed
+}
+
 /// Find composer.json in the workspace root or immediate subdirectories.
 ///
 /// Searches the root first, then scans depth-1 subdirectories (skipping hidden
@@ -4798,18 +4957,23 @@ async fn index_workspace(
     index: &WorkspaceIndex,
     root: &Path,
     namespace_map: Option<&NamespaceMap>,
+    work_done_progress_supported: bool,
 ) -> std::result::Result<(), String> {
     // Create progress token
-    let progress_token = ProgressToken::String("php-lsp-indexing".to_string());
+    let progress_token = ProgressToken::String(format!("php-lsp-indexing-{}", root.display()));
 
     // Request progress support from client (with timeout to avoid hanging if client doesn't respond)
-    let progress_supported = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        client.create_work_done_progress(progress_token.clone()),
-    )
-    .await
-    .map(|r| r.is_ok())
-    .unwrap_or(false);
+    let progress_supported = if work_done_progress_supported {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.create_work_done_progress(progress_token.clone()),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+    } else {
+        false
+    };
 
     // Start progress reporting (Bounded with percentage)
     let ongoing = if progress_supported {
@@ -4939,22 +5103,26 @@ impl LanguageServer for PhpLspBackend {
             tracing::info!("Trace level: {:?}", trace);
         }
 
-        // Extract workspace root from InitializeParams
-        #[allow(deprecated)]
-        let root_path = params
-            .root_uri
+        *self.work_done_progress_supported.lock().await = params
+            .capabilities
+            .window
             .as_ref()
-            .and_then(|uri| uri_to_path(uri.as_str()))
-            .or_else(|| params.root_path.as_ref().map(PathBuf::from));
+            .and_then(|window| window.work_done_progress)
+            .unwrap_or(false);
+
+        let workspace_roots = workspace_roots_from_initialize(&params);
 
         // Extract runtime settings from client initializationOptions.
         if let Some(ref opts) = params.initialization_options {
             self.apply_configuration_settings(opts).await;
         }
 
-        if let Some(ref root) = root_path {
-            tracing::info!("Workspace root: {}", root.display());
-            *self.workspace_root.lock().await = Some(root.clone());
+        if !workspace_roots.is_empty() {
+            for root in &workspace_roots {
+                tracing::info!("Workspace root: {}", root.display());
+            }
+            *self.workspace_root.lock().await = workspace_roots.first().cloned();
+            *self.workspace_roots.lock().await = workspace_roots;
         }
 
         Ok(InitializeResult {
@@ -4985,7 +5153,10 @@ impl LanguageServer for PhpLspBackend {
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 workspace: Some(WorkspaceServerCapabilities {
-                    workspace_folders: None,
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
                     file_operations: Some({
                         let php_files = php_file_operation_registration_options();
                         WorkspaceFileOperationsServerCapabilities {
@@ -5062,83 +5233,75 @@ impl LanguageServer for PhpLspBackend {
             .log_message(MessageType::INFO, "php-lsp server initialized")
             .await;
 
-        // Start background workspace indexing
-        let workspace_root = self.workspace_root.lock().await.clone();
-        if let Some(root) = workspace_root {
-            let client = self.client.clone();
-            let index = self.index.clone();
-
-            // Auto-discover composer.json: check root, then immediate subdirectories
-            let (ns_map_storage, project_root) = {
-                let composer_enabled = *self.composer_enabled.lock().await;
-                let composer_path = composer_enabled
-                    .then(|| find_composer_json(&root))
-                    .flatten();
-                if let Some(ref cp) = composer_path {
-                    let effective_root = cp.parent().unwrap_or(&root).to_path_buf();
-                    if effective_root != root {
-                        tracing::info!(
-                            "Found composer.json in subdirectory: {}",
-                            effective_root.display()
-                        );
-                    }
-                    match parse_composer_json(cp) {
-                        Ok(ns_map) => {
-                            tracing::info!(
-                                "Parsed composer.json with {} PSR-4 entries",
-                                ns_map.psr4.len()
-                            );
-                            (Some(ns_map), effective_root)
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse composer.json: {}", e);
-                            (None, root.clone())
-                        }
-                    }
-                } else if !composer_enabled {
-                    tracing::info!("Composer support disabled, will scan all PHP files");
-                    (None, root.clone())
-                } else {
-                    tracing::info!("No composer.json found, will scan all PHP files");
-                    (None, root.clone())
-                }
-            };
-
-            // Update workspace root to the effective project root (where composer.json is)
-            if project_root != root {
-                *self.workspace_root.lock().await = Some(project_root.clone());
-                tracing::info!("Effective project root: {}", project_root.display());
+        let mut roots = self.workspace_roots.lock().await.clone();
+        if roots.is_empty() {
+            if let Some(root) = self.workspace_root.lock().await.clone() {
+                roots.push(root);
             }
-            let root = project_root;
+        }
 
-            // Store namespace map
-            *self.namespace_map.lock().await = ns_map_storage.clone();
+        if roots.is_empty() {
+            tracing::warn!("No workspace root, skipping indexing");
+            return;
+        }
 
-            // Load phpstorm-stubs for built-in PHP functions/classes
-            let stubs_index = self.index.clone();
-            let stubs_root = root.clone();
-            let client_stubs_path = self.stubs_path.lock().await.clone();
-            let stub_extensions = self.stub_extensions.lock().await.clone();
-            tokio::task::spawn_blocking(move || {
-                load_configured_stubs(
-                    &stubs_index,
-                    &stubs_root,
-                    client_stubs_path,
-                    stub_extensions,
-                    false,
-                );
-            })
-            .await
-            .ok();
+        let composer_enabled = *self.composer_enabled.lock().await;
+        let configs = dedup_workspace_configs(
+            roots
+                .iter()
+                .map(|root| discover_workspace_root_config(root, composer_enabled))
+                .collect(),
+        );
+        let effective_roots: Vec<PathBuf> =
+            configs.iter().map(|config| config.root.clone()).collect();
 
-            let open_files = self.open_files.clone();
-            let reindex_index = self.index.clone();
-            let reindex_client = self.client.clone();
-            let diagnostics_mode = *self.diagnostics_mode.lock().await;
-            let php_version = *self.php_version.lock().await;
-            tokio::spawn(async move {
-                if let Err(e) =
-                    index_workspace(&client, &index, &root, ns_map_storage.as_ref()).await
+        if let Some(first_root) = effective_roots.first() {
+            *self.workspace_root.lock().await = Some(first_root.clone());
+        }
+        *self.workspace_roots.lock().await = effective_roots;
+        *self.workspace_configs.lock().await = configs.clone();
+        *self.namespace_map.lock().await = configs
+            .iter()
+            .find_map(|config| config.namespace_map.clone());
+
+        // Load phpstorm-stubs for built-in PHP functions/classes.
+        let stubs_index = self.index.clone();
+        let stubs_root = configs
+            .first()
+            .map(|config| config.root.clone())
+            .unwrap_or_default();
+        let client_stubs_path = self.stubs_path.lock().await.clone();
+        let stub_extensions = self.stub_extensions.lock().await.clone();
+        tokio::task::spawn_blocking(move || {
+            load_configured_stubs(
+                &stubs_index,
+                &stubs_root,
+                client_stubs_path,
+                stub_extensions,
+                false,
+            );
+        })
+        .await
+        .ok();
+
+        let client = self.client.clone();
+        let index = self.index.clone();
+        let open_files = self.open_files.clone();
+        let reindex_index = self.index.clone();
+        let reindex_client = self.client.clone();
+        let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let php_version = *self.php_version.lock().await;
+        let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
+        tokio::spawn(async move {
+            for config in &configs {
+                if let Err(e) = index_workspace(
+                    &client,
+                    &index,
+                    &config.root,
+                    config.namespace_map.as_ref(),
+                    work_done_progress_supported,
+                )
+                .await
                 {
                     tracing::error!("Background indexing failed: {}", e);
                     client
@@ -5146,25 +5309,138 @@ impl LanguageServer for PhpLspBackend {
                         .await;
                     return;
                 }
+            }
 
-                // Re-publish diagnostics for all open files now that the index is populated
-                for entry in open_files.iter() {
-                    let uri_str = entry.key().clone();
-                    if let Ok(uri) = uri_str.parse::<Uri>() {
-                        let diags = compute_diagnostics(
-                            &uri_str,
-                            &entry,
-                            &reindex_index,
-                            diagnostics_mode,
-                            php_version,
-                        );
-                        reindex_client.publish_diagnostics(uri, diags, None).await;
-                    }
+            // Re-publish diagnostics for all open files now that the index is populated.
+            for entry in open_files.iter() {
+                let uri_str = entry.key().clone();
+                if let Ok(uri) = uri_str.parse::<Uri>() {
+                    let diags = compute_diagnostics(
+                        &uri_str,
+                        &entry,
+                        &reindex_index,
+                        diagnostics_mode,
+                        php_version,
+                    );
+                    reindex_client.publish_diagnostics(uri, diags, None).await;
                 }
-            });
-        } else {
-            tracing::warn!("No workspace root, skipping indexing");
+            }
+        });
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        tracing::debug!("didChangeWorkspaceFolders");
+
+        let removed_roots: Vec<PathBuf> = params
+            .event
+            .removed
+            .iter()
+            .filter_map(|folder| uri_to_path(folder.uri.as_str()))
+            .collect();
+        if !removed_roots.is_empty() {
+            let first_root = {
+                let mut roots = self.workspace_roots.lock().await;
+                roots.retain(|root| {
+                    !removed_roots
+                        .iter()
+                        .any(|removed| root.starts_with(removed))
+                });
+                roots.first().cloned()
+            };
+            let first_namespace_map = {
+                let mut configs = self.workspace_configs.lock().await;
+                configs.retain(|config| {
+                    !removed_roots
+                        .iter()
+                        .any(|removed| config.root.starts_with(removed))
+                });
+                configs
+                    .iter()
+                    .find_map(|config| config.namespace_map.clone())
+            };
+            *self.workspace_root.lock().await = first_root;
+            *self.namespace_map.lock().await = first_namespace_map;
+
+            let removed_files = remove_indexed_files_under_roots(&self.index, &removed_roots);
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "php-lsp: removed {} indexed PHP files from detached workspace folder(s)",
+                        removed_files
+                    ),
+                )
+                .await;
         }
+
+        let added_roots: Vec<PathBuf> = params
+            .event
+            .added
+            .iter()
+            .filter_map(|folder| uri_to_path(folder.uri.as_str()))
+            .collect();
+        if added_roots.is_empty() {
+            return;
+        }
+
+        let composer_enabled = *self.composer_enabled.lock().await;
+        let added_configs = dedup_workspace_configs(
+            added_roots
+                .iter()
+                .map(|root| discover_workspace_root_config(root, composer_enabled))
+                .collect(),
+        );
+
+        let first_root = {
+            let mut roots = self.workspace_roots.lock().await;
+            for config in &added_configs {
+                push_unique_path(&mut roots, config.root.clone());
+            }
+            roots.first().cloned()
+        };
+        let mut workspace_root = self.workspace_root.lock().await;
+        if workspace_root.is_none() {
+            *workspace_root = first_root;
+        }
+        drop(workspace_root);
+
+        let first_namespace_map = {
+            let mut configs = self.workspace_configs.lock().await;
+            for config in &added_configs {
+                if !configs.iter().any(|existing| existing.root == config.root) {
+                    configs.push(config.clone());
+                }
+            }
+            configs
+                .iter()
+                .find_map(|config| config.namespace_map.clone())
+        };
+        *self.namespace_map.lock().await = first_namespace_map;
+
+        let client = self.client.clone();
+        let index = self.index.clone();
+        let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
+        tokio::spawn(async move {
+            for config in &added_configs {
+                if let Err(e) = index_workspace(
+                    &client,
+                    &index,
+                    &config.root,
+                    config.namespace_map.as_ref(),
+                    work_done_progress_supported,
+                )
+                .await
+                {
+                    tracing::error!("Workspace folder indexing failed: {}", e);
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Workspace folder indexing failed: {}", e),
+                        )
+                        .await;
+                }
+            }
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -5335,7 +5611,7 @@ impl LanguageServer for PhpLspBackend {
             return Ok(None);
         }
 
-        let workspace_root = self.workspace_root.lock().await.clone();
+        let workspace_root = self.workspace_root_for_uri(&uri_str).await;
         let source_for_formatter = source.clone();
         let formatted = tokio::task::spawn_blocking(move || {
             run_external_formatter(source_for_formatter, config, workspace_root)
@@ -5394,7 +5670,7 @@ impl LanguageServer for PhpLspBackend {
         }
 
         let (formatter_input, was_wrapped) = range_formatter_input(fragment);
-        let workspace_root = self.workspace_root.lock().await.clone();
+        let workspace_root = self.workspace_root_for_uri(&uri_str).await;
         let formatted = tokio::task::spawn_blocking(move || {
             run_external_formatter(formatter_input, config, workspace_root)
         })

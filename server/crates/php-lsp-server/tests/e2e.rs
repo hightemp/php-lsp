@@ -37,6 +37,31 @@ fn initialize_request_with_options(
     Request::build("initialize").params(params).id(id).finish()
 }
 
+fn initialize_request_with_workspace_folders(id: i64, folders: Vec<(&str, &str)>) -> Request {
+    let workspace_folders: Vec<_> = folders
+        .into_iter()
+        .map(|(name, uri)| {
+            json!({
+                "name": name,
+                "uri": uri
+            })
+        })
+        .collect();
+
+    Request::build("initialize")
+        .params(json!({
+            "capabilities": {
+                "workspace": {
+                    "workspaceFolders": true
+                }
+            },
+            "rootUri": null,
+            "workspaceFolders": workspace_folders
+        }))
+        .id(id)
+        .finish()
+}
+
 fn initialized_notification() -> Request {
     Request::build("initialized").params(json!({})).finish()
 }
@@ -3850,6 +3875,117 @@ async fn test_workspace_file_operations_update_index_uris() {
         workspace_symbol_names(&deleted_result).is_empty(),
         "didDeleteFiles should remove deleted PHP symbols, got: {}",
         deleted_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_workspace_folders_index_multiple_roots() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-multiroot-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let root_a = tmp_root.join("root-a");
+    let root_b = tmp_root.join("root-b");
+    fs::create_dir_all(root_a.join("src")).unwrap();
+    fs::create_dir_all(root_b.join("src")).unwrap();
+    fs::write(
+        root_a.join("composer.json"),
+        r#"{"autoload":{"psr-4":{"RootA\\":"src/"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root_b.join("composer.json"),
+        r#"{"autoload":{"psr-4":{"RootB\\":"src/"}}}"#,
+    )
+    .unwrap();
+    let root_a_service = root_a.join("src/RootAService.php");
+    let root_b_service = root_b.join("src/RootBService.php");
+    fs::write(
+        &root_a_service,
+        "<?php\nnamespace RootA;\nclass RootAService {}\n",
+    )
+    .unwrap();
+    fs::write(
+        &root_b_service,
+        "<?php\nnamespace RootB;\nclass RootBService {}\n",
+    )
+    .unwrap();
+
+    let root_a_uri = format!("file://{}", root_a.to_string_lossy());
+    let root_b_uri = format!("file://{}", root_b.to_string_lossy());
+    let init_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_workspace_folders(
+            1,
+            vec![("root-a", &root_a_uri), ("root-b", &root_b_uri)],
+        ))
+        .await
+        .unwrap();
+    let init_result = extract_result(init_resp);
+    assert_eq!(
+        init_result["capabilities"]["workspace"]["workspaceFolders"]["supported"].as_bool(),
+        Some(true),
+        "server should advertise workspaceFolders support, got: {}",
+        init_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let expected_a_uri = format!("file://{}", root_a_service.to_string_lossy());
+    let expected_b_uri = format!("file://{}", root_b_service.to_string_lossy());
+    let mut result = json!(null);
+    for attempt in 0..50 {
+        let resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(workspace_symbol_request(10 + attempt, "Root"))
+            .await
+            .unwrap();
+        result = extract_result(resp);
+        let uris = workspace_symbol_uris(&result);
+        if uris.iter().any(|uri| uri == &expected_a_uri)
+            && uris.iter().any(|uri| uri == &expected_b_uri)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let uris = workspace_symbol_uris(&result);
+    assert!(
+        uris.iter().any(|uri| uri == &expected_a_uri)
+            && uris.iter().any(|uri| uri == &expected_b_uri),
+        "workspace/symbol should include PHP symbols from both workspace folders, got: {}",
+        result
     );
 
     service

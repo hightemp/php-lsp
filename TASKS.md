@@ -583,7 +583,7 @@
 - [x] **VN-002** textDocument/prepareCallHierarchy + incoming/outgoing *(done 2026-05-20)*
 - [x] **VN-003** textDocument/prepareTypeHierarchy + supertypes/subtypes *(done 2026-05-20)*
 - [x] **VN-004** textDocument/implementation (interface → concrete) *(done 2026-05-20)*
-- [ ] **VN-005** Multi-root workspace поддержка
+- [x] **VN-005** Multi-root workspace поддержка *(done 2026-05-20)*
   - Использовать `workspaceFolders` вместо одного `rootUri`
   - Отдельные composer namespace maps и индексы по workspace folder
   - Корректные diagnostics/search/symbols across folders
@@ -692,7 +692,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-022 / VN-002** `textDocument/prepareCallHierarchy` + incoming/outgoing calls
 - [x] **LP-023 / VN-003** `textDocument/prepareTypeHierarchy` + supertypes/subtypes
 - [x] **LP-024 / VN-004** `textDocument/implementation`
-- [ ] **LP-025 / VN-005** Multi-root workspace support
+- [x] **LP-025 / VN-005** Multi-root workspace support
 - [ ] **LP-026 / VN-006** PHPStan diagnostics integration
 - [ ] **LP-027 / VN-007** Psalm diagnostics integration
 - [ ] **LP-028 / VN-008** `textDocument/codeLens`
@@ -734,3 +734,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Реализовать `LP-022 / VN-002` call hierarchy.
 - [x] **T-2026-05-20** Реализовать `LP-023 / VN-003` type hierarchy.
 - [x] **T-2026-05-20** Реализовать `LP-024 / VN-004` `textDocument/implementation`.
+- [x] **T-2026-05-20** Реализовать `LP-025 / VN-005` multi-root workspace support.
