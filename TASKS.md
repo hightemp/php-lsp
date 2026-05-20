@@ -739,3 +739,5 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Реализовать `LP-027 / VN-007` Psalm diagnostics integration.
 - [x] **T-2026-05-20** Реализовать `LP-028 / VN-008` `textDocument/codeLens`.
 - [x] **T-2026-05-20** Реализовать `LP-029 / VN-009` `textDocument/foldingRange`.
+- [x] **T-2026-05-20** Актуализировать `README.md` по статусу, возможностям и настройкам.
+- [x] **T-2026-05-20** Убрать упоминание `TASKS.md` из `README.md`.

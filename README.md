@@ -1,6 +1,6 @@
 # php-lsp
 
-![Experimental](https://img.shields.io/badge/status-experimental-orange)
+![Status](https://img.shields.io/badge/status-active%20development-blue)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust)](server/Cargo.toml)
 [![CI](https://github.com/hightemp/php-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/hightemp/php-lsp/actions/workflows/ci.yml)
 [![Release](https://github.com/hightemp/php-lsp/actions/workflows/release.yml/badge.svg)](https://github.com/hightemp/php-lsp/actions/workflows/release.yml)
@@ -13,28 +13,132 @@
 [![License](https://img.shields.io/github/license/hightemp/php-lsp)](LICENSE)
 ![](https://asdertasd.site/counter/php-lsp)
 
-PHP Language Server (LSP 3.17) written in Rust for Visual Studio Code.
+Rust PHP Language Server (LSP 3.17) with a VS Code extension.
 
-Provides IDE-level features for PHP 7.4+ projects: diagnostics, hover, go-to-definition, completion, references, rename, and more.
+php-lsp targets PHP 7.4-8.4 projects and provides indexed PHP language
+intelligence: diagnostics, hover, completion, navigation, references, rename,
+formatting integration, semantic tokens, hierarchy views, and built-in
+phpstorm-stubs support.
 
 ## Status
 
-**In development** — MVP phase.
+**Active development.** LSP parity work is complete: 29/29 items (100%). The
+server now exposes the common protocol surface expected from modern LSP servers,
+including navigation, refactoring, formatting, semantic highlighting, inlay
+hints, code lenses, folding, and workspace/file-operation handling.
 
-## Features (planned for MVP)
+php-lsp is still not a drop-in replacement for mature PHP analyzers. The main
+remaining work is deeper type inference and data-flow analysis, performance and
+disk caching for very large repositories, and framework-specific intelligence.
 
-- [x] Syntax error diagnostics (incremental, tree-sitter based)
-- [x] Hover: type/signature/PHPDoc
-- [x] Go to Definition (classes/functions/methods/properties/consts/variables)
-- [x] Completion (members, statics, variables, namespaces, keywords)
-- [x] Find All References (classes/functions/methods/properties/class const/global const/variables)
-- [x] Rename symbol (classes/functions/methods/properties/class const/global const/variables)
-- [x] Document/workspace symbols
-- [x] Composer PSR-4 autoload support
-- [x] Built-in PHP stubs (phpstorm-stubs)
+## Features
 
-Current gaps:
-- [ ] Cross-file variable analysis (variable references/rename are local-scope only by design)
+### Language Intelligence
+
+- Syntax diagnostics with incremental tree-sitter parsing.
+- Semantic diagnostics for unknown classes, functions, imports, members, and
+  duplicate workspace symbols.
+- Member diagnostics for visibility, static/instance misuse, missing methods,
+  missing properties, and missing class constants.
+- Basic type compatibility checks for assignments, returns, arguments,
+  properties, and member calls.
+- Override signature and PHP-version compatibility diagnostics.
+- Optional PHPStan and Psalm diagnostics through configured external commands.
+- Hover for symbols, signatures, types, and PHPDoc.
+- Completion for classes, interfaces, traits, enums, functions, constants,
+  methods, properties, variables, namespaces, keywords, and snippets.
+- Signature help for functions, methods, and constructors.
+- Document symbols and workspace symbols.
+
+### Navigation
+
+- Go to definition, declaration, type definition, and implementation.
+- Find all references.
+- Document highlight.
+- Selection ranges based on the parsed AST.
+- Linked editing for namespace/use alias edits.
+- Call hierarchy and type hierarchy.
+
+### Refactoring And Editing
+
+- Rename for classes, functions, methods, properties, constants, and local
+  variables.
+- Quick fixes to import unresolved classes and functions.
+- Source action to organize imports.
+- Refactor action to add return types from PHPDoc when supported by the target
+  PHP version.
+- Document formatting, range formatting, and on-type formatting through
+  external formatters (`php-cs-fixer`, `phpcbf`, or a custom command).
+
+### Editor UI
+
+- Semantic tokens with full and delta updates.
+- Inlay hints for call arguments and PHPDoc-inferred parameter/return types.
+- Code lenses with reference counts.
+- Folding ranges for PHP structures, comments, arrays, and blocks.
+
+### Workspace Support
+
+- Composer autoload support for PSR-4, PSR-0, classmap, and files entries.
+- Built-in phpstorm-stubs bundle with configurable extension stubs.
+- Lazy `vendor/` indexing.
+- Multi-root workspace support.
+- Watched PHP file changes and LSP file-operation notifications.
+- Runtime configuration updates through `workspace/didChangeConfiguration`.
+
+## Known Limitations
+
+- Cross-file local variable analysis is intentionally limited; variable
+  references and rename are local-scope oriented.
+- Type inference is useful but still shallow compared with mature PHP static
+  analyzers.
+- External PHPStan/Psalm diagnostics require those tools to be installed and
+  configured by the workspace.
+- Formatting is delegated to external tools; php-lsp does not implement a native
+  PHP formatter.
+
+## Configuration
+
+The VS Code extension contributes these settings under `phpLsp.*`:
+
+| Setting | Default | Description |
+|---|---:|---|
+| `phpLsp.enable` | `true` | Enable the language server. |
+| `phpLsp.phpVersion` | `8.2` | Target PHP version for diagnostics and version-aware refactors (`7.4`-`8.4`). |
+| `phpLsp.serverPath` | `""` | Custom server binary path. Empty uses the bundled binary. |
+| `phpLsp.stubs.extensions` | Common extensions | PHP stub extension set to index from the bundled stubs. |
+| `phpLsp.composer.enabled` | `true` | Enable `composer.json` autoload indexing. |
+| `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
+| `phpLsp.diagnostics.mode` | `basic-semantic` | `off`, `syntax-only`, or `basic-semantic`. |
+| `phpLsp.formatting.provider` | `none` | `none`, `php-cs-fixer`, `phpcbf`, or `custom`. |
+| `phpLsp.formatting.command` | `""` | Custom formatter command; use `{file}` for the temporary PHP file. |
+| `phpLsp.phpstan.enabled` | `false` | Enable PHPStan diagnostics. |
+| `phpLsp.phpstan.command` | `vendor/bin/phpstan ... {file}` | PHPStan command that prints JSON output. |
+| `phpLsp.phpstan.timeoutMs` | `30000` | PHPStan timeout per file. |
+| `phpLsp.psalm.enabled` | `false` | Enable Psalm diagnostics. |
+| `phpLsp.psalm.command` | `vendor/bin/psalm ... {file}` | Psalm command that prints JSON output. |
+| `phpLsp.psalm.timeoutMs` | `30000` | Psalm timeout per file. |
+| `phpLsp.trace.server` | `off` | LSP transport trace: `off`, `messages`, or `verbose`. |
+| `phpLsp.logLevel` | `info` | Server log level: `error`, `warn`, `info`, `debug`, or `trace`. |
+
+Example external diagnostics setup:
+
+```json
+{
+  "phpLsp.phpstan.enabled": true,
+  "phpLsp.phpstan.command": "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}",
+  "phpLsp.psalm.enabled": true,
+  "phpLsp.psalm.command": "vendor/bin/psalm --output-format=json --no-progress {file}"
+}
+```
+
+Example external formatting setup:
+
+```json
+{
+  "phpLsp.formatting.provider": "php-cs-fixer"
+}
+```
 
 ## Architecture
 
@@ -64,7 +168,7 @@ All available targets:
 | `make` / `make package` | Full build: server + client + stubs → `.vsix` |
 | `make install` | Build and install `.vsix` into VS Code |
 | `make server` | Build Rust binary for host platform |
-| `make server-all` | Cross-compile server for all 6 platforms |
+| `make server-all` | Cross-compile server for all configured targets |
 | `make package-all` | Universal `.vsix` with all platform binaries |
 | `make client` | `npm ci` + build extension JS |
 | `make stubs` | Init submodule + bundle phpstorm-stubs |
@@ -111,7 +215,7 @@ npx @vscode/vsce package
 
 ```bash
 ./scripts/build-server.sh x86_64-unknown-linux-gnu # specific target
-./scripts/build-server.sh --all                    # all 6 targets (CI)
+./scripts/build-server.sh --all                    # configured targets
 ```
 
 ## Project Structure
