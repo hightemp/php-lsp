@@ -520,17 +520,17 @@
 
 ### Workspace & configuration
 
-- [ ] **V1-022** workspace/didChangeWatchedFiles и переиндексация изменённых файлов
+- [x] **V1-022** workspace/didChangeWatchedFiles и переиндексация изменённых файлов *(done 2026-05-19)*
   - Обрабатывать create/change/delete PHP файлов
   - Обновлять индекс без полного restart сервера
   - Удалять символы удалённых файлов из индекса
 
-- [ ] **V1-023** workspace/didChangeConfiguration и применение настроек клиента
+- [x] **V1-023** workspace/didChangeConfiguration и применение настроек клиента *(done 2026-05-19)*
   - Реально использовать `phpVersion`, `diagnosticsMode`, `composerEnabled`, `indexVendor`, `stubExtensions`, `logLevel`
   - Поддержать изменение настроек без restart где возможно
   - Синхронизировать VS Code configuration schema и server initializationOptions
 
-- [ ] **V1-024** Workspace file operations
+- [x] **V1-024** Workspace file operations *(done 2026-05-19)*
   - Поддержать will/did create/rename/delete files где клиент это отдаёт
   - Обновлять URI символов при rename/move
   - Инвалидировать кэш и diagnostics для удалённых/перемещённых файлов
@@ -683,9 +683,9 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-013 / V1-019** `textDocument/selectionRange`
 - [x] **LP-014 / V1-020** `textDocument/linkedEditingRange`
 - [x] **LP-015 / V1-021** Completion polish: snippets, sorting, auto-imports, visibility-aware members
-- [ ] **LP-016 / V1-022** `workspace/didChangeWatchedFiles` and incremental reindex
-- [ ] **LP-017 / V1-023** `workspace/didChangeConfiguration` and real config application
-- [ ] **LP-018 / V1-024** Workspace file operations: create, rename, delete
+- [x] **LP-016 / V1-022** `workspace/didChangeWatchedFiles` and incremental reindex
+- [x] **LP-017 / V1-023** `workspace/didChangeConfiguration` and real config application
+- [x] **LP-018 / V1-024** Workspace file operations: create, rename, delete
 - [ ] **LP-019 / V1-025** Basic diagnostics parity: undefined/unused/duplicate symbols
 - [ ] **LP-020 / V1-026** Type/member diagnostics: unknown members, visibility, static misuse, type compatibility
 - [ ] **LP-021 / VN-001** `textDocument/inlayHint`
@@ -725,3 +725,6 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-013 / V1-019` `textDocument/selectionRange`.
 - [x] **T-2026-05-19** Реализовать `LP-014 / V1-020` `textDocument/linkedEditingRange`.
 - [x] **T-2026-05-19** Реализовать `LP-015 / V1-021` Completion polish.
+- [x] **T-2026-05-19** Реализовать `LP-016 / V1-022` `workspace/didChangeWatchedFiles`.
+- [x] **T-2026-05-19** Реализовать `LP-017 / V1-023` `workspace/didChangeConfiguration`.
+- [x] **T-2026-05-19** Реализовать `LP-018 / V1-024` Workspace file operations.

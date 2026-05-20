@@ -94,6 +94,31 @@ impl FormattingConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DiagnosticsMode {
+    Off,
+    SyntaxOnly,
+    #[default]
+    BasicSemantic,
+}
+
+impl DiagnosticsMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "syntax-only" | "syntax" => Some(Self::SyntaxOnly),
+            "basic-semantic" | "semantic" => Some(Self::BasicSemantic),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AppliedConfiguration {
+    diagnostics_changed: bool,
+    stubs_changed: bool,
+}
+
 #[derive(Debug, Clone)]
 struct SemanticTokensSnapshot {
     result_id: String,
@@ -127,6 +152,57 @@ impl SemanticTokensCache {
     }
 }
 
+fn php_lsp_settings(settings: &serde_json::Value) -> &serde_json::Value {
+    settings.get("phpLsp").unwrap_or(settings)
+}
+
+fn settings_value<'a>(
+    settings: &'a serde_json::Value,
+    flat_key: &str,
+    nested_path: &[&str],
+) -> Option<&'a serde_json::Value> {
+    if let Some(value) = settings.get(flat_key) {
+        return Some(value);
+    }
+
+    let mut current = settings;
+    for key in nested_path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn settings_string<'a>(
+    settings: &'a serde_json::Value,
+    flat_key: &str,
+    nested_path: &[&str],
+) -> Option<&'a str> {
+    settings_value(settings, flat_key, nested_path).and_then(|value| value.as_str())
+}
+
+fn settings_bool(
+    settings: &serde_json::Value,
+    flat_key: &str,
+    nested_path: &[&str],
+) -> Option<bool> {
+    settings_value(settings, flat_key, nested_path).and_then(|value| value.as_bool())
+}
+
+fn settings_string_array(
+    settings: &serde_json::Value,
+    flat_key: &str,
+    nested_path: &[&str],
+) -> Option<Vec<String>> {
+    let values = settings_value(settings, flat_key, nested_path)?.as_array()?;
+    Some(
+        values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// Main LSP backend holding all state.
 pub struct PhpLspBackend {
     /// Client handle for sending notifications to VS Code.
@@ -145,6 +221,16 @@ pub struct PhpLspBackend {
     stubs_path: Mutex<Option<PathBuf>>,
     /// Target PHP version from client initializationOptions.
     php_version: Mutex<PhpVersion>,
+    /// Diagnostics level from phpLsp.diagnostics.mode.
+    diagnostics_mode: Mutex<DiagnosticsMode>,
+    /// Whether composer.json autoload discovery is enabled.
+    composer_enabled: Mutex<bool>,
+    /// Whether lazy vendor indexing is enabled.
+    index_vendor: Mutex<bool>,
+    /// Configured phpstorm-stubs extension directory names.
+    stub_extensions: Mutex<Vec<String>>,
+    /// Configured server log level label.
+    log_level: Mutex<String>,
     /// External formatter configuration.
     formatting_config: Mutex<FormattingConfig>,
     /// Last semantic token snapshots used for full/delta requests.
@@ -162,6 +248,11 @@ impl PhpLspBackend {
             trace_level: Mutex::new(TraceValue::Off),
             stubs_path: Mutex::new(None),
             php_version: Mutex::new(PhpVersion::DEFAULT),
+            diagnostics_mode: Mutex::new(DiagnosticsMode::default()),
+            composer_enabled: Mutex::new(true),
+            index_vendor: Mutex::new(true),
+            stub_extensions: Mutex::new(Vec::new()),
+            log_level: Mutex::new("info".to_string()),
             formatting_config: Mutex::new(FormattingConfig::default()),
             semantic_tokens_cache: Mutex::new(SemanticTokensCache::default()),
         }
@@ -173,6 +264,127 @@ impl PhpLspBackend {
         if level == TraceValue::Verbose {
             tracing::trace!("{}", message);
             self.client.log_message(MessageType::LOG, message).await;
+        }
+    }
+
+    async fn apply_configuration_settings(
+        &self,
+        raw_settings: &serde_json::Value,
+    ) -> AppliedConfiguration {
+        let settings = php_lsp_settings(raw_settings);
+        let mut applied = AppliedConfiguration::default();
+
+        if let Some(raw_php_version) = settings_string(settings, "phpVersion", &["phpVersion"]) {
+            if let Some(parsed) = PhpVersion::parse(raw_php_version) {
+                let mut php_version = self.php_version.lock().await;
+                if *php_version != parsed {
+                    *php_version = parsed;
+                    applied.diagnostics_changed = true;
+                }
+            } else {
+                tracing::warn!("Ignoring invalid phpVersion: {}", raw_php_version);
+            }
+        }
+
+        if let Some(raw_mode) =
+            settings_string(settings, "diagnosticsMode", &["diagnostics", "mode"])
+        {
+            if let Some(parsed) = DiagnosticsMode::parse(raw_mode) {
+                let mut diagnostics_mode = self.diagnostics_mode.lock().await;
+                if *diagnostics_mode != parsed {
+                    *diagnostics_mode = parsed;
+                    applied.diagnostics_changed = true;
+                }
+            } else {
+                tracing::warn!("Ignoring invalid diagnostics mode: {}", raw_mode);
+            }
+        }
+
+        if let Some(enabled) = settings_bool(settings, "composerEnabled", &["composer", "enabled"])
+        {
+            *self.composer_enabled.lock().await = enabled;
+        }
+
+        if let Some(enabled) = settings_bool(settings, "indexVendor", &["indexVendor"]) {
+            *self.index_vendor.lock().await = enabled;
+        }
+
+        if let Some(extensions) =
+            settings_string_array(settings, "stubExtensions", &["stubs", "extensions"])
+        {
+            let mut stub_extensions = self.stub_extensions.lock().await;
+            if *stub_extensions != extensions {
+                *stub_extensions = extensions;
+                applied.stubs_changed = true;
+            }
+        }
+
+        if let Some(log_level) = settings_string(settings, "logLevel", &["logLevel"]) {
+            *self.log_level.lock().await = log_level.trim().to_ascii_lowercase();
+        }
+
+        if let Some(stubs_path) = settings_string(settings, "stubsPath", &["stubsPath"]) {
+            let next_path = if stubs_path.trim().is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(stubs_path))
+            };
+            let mut current_path = self.stubs_path.lock().await;
+            if *current_path != next_path {
+                *current_path = next_path;
+                applied.stubs_changed = true;
+            }
+        }
+
+        let formatting_provider =
+            settings_string(settings, "formattingProvider", &["formatting", "provider"]);
+        let formatting_command =
+            settings_value(settings, "formattingCommand", &["formatting", "command"])
+                .and_then(|value| value.as_str());
+        if formatting_provider.is_some() || formatting_command.is_some() {
+            let current = self.formatting_config.lock().await.clone();
+            let next_config = {
+                let provider = formatting_provider.unwrap_or(&current.provider);
+                let command = formatting_command.or(current.command.as_deref());
+                FormattingConfig::from_options(Some(provider), command)
+            };
+            *self.formatting_config.lock().await = next_config;
+        }
+
+        applied
+    }
+
+    async fn reload_configured_stubs(&self) {
+        let Some(root) = self.workspace_root.lock().await.clone() else {
+            return;
+        };
+        let index = self.index.clone();
+        let client_stubs_path = self.stubs_path.lock().await.clone();
+        let stub_extensions = self.stub_extensions.lock().await.clone();
+
+        let loaded = tokio::task::spawn_blocking(move || {
+            load_configured_stubs(&index, &root, client_stubs_path, stub_extensions, true)
+        })
+        .await
+        .unwrap_or(0);
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("php-lsp: reloaded {} stub files", loaded),
+            )
+            .await;
+    }
+
+    async fn republish_open_diagnostics(&self) {
+        let open_uris: Vec<Uri> = self
+            .open_files
+            .iter()
+            .filter_map(|entry| entry.key().parse::<Uri>().ok())
+            .collect();
+
+        for uri in open_uris {
+            self.publish_diagnostics(&uri).await;
         }
     }
 
@@ -272,6 +484,7 @@ impl PhpLspBackend {
             return false;
         }
 
+        let index_vendor = *self.index_vendor.lock().await;
         let ns_map = self.namespace_map.lock().await;
         let root = self.workspace_root.lock().await;
 
@@ -281,7 +494,7 @@ impl PhpLspBackend {
             let vendor_dir = root.join("vendor");
             let mut all_paths = candidate_paths;
 
-            if vendor_dir.is_dir() {
+            if index_vendor && vendor_dir.is_dir() {
                 let vendor_autoload = root.join("vendor/composer/autoload_psr4.php");
                 if vendor_autoload.exists() && all_paths.is_empty() {
                     if let Some(vendor_paths) = resolve_vendor_paths(class_fqn, &vendor_dir) {
@@ -586,9 +799,10 @@ impl PhpLspBackend {
             }
         }
 
+        let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let diagnostics = {
             if let Some(parser) = self.open_files.get(&uri_str) {
-                compute_diagnostics(&uri_str, &parser, &self.index)
+                compute_diagnostics(&uri_str, &parser, &self.index, diagnostics_mode)
             } else {
                 vec![]
             }
@@ -597,6 +811,112 @@ impl PhpLspBackend {
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
+    }
+
+    /// Reindex one changed PHP file from the open buffer when available,
+    /// otherwise from disk.
+    async fn reindex_php_file(&self, uri: &Uri) {
+        let uri_str = uri.as_str().to_string();
+        if !uri_is_php_file(uri) {
+            return;
+        }
+
+        let open_file_symbols = {
+            self.open_files.get(&uri_str).and_then(|parser| {
+                let tree = parser.tree()?;
+                let source = parser.source();
+                Some(extract_file_symbols(tree, &source, &uri_str))
+            })
+        };
+
+        if let Some(file_symbols) = open_file_symbols {
+            self.index.update_file(&uri_str, file_symbols);
+            self.semantic_tokens_cache.lock().await.remove(&uri_str);
+            self.publish_diagnostics(uri).await;
+            return;
+        }
+
+        let Some(path) = uri_to_path(&uri_str) else {
+            return;
+        };
+
+        match std::fs::read_to_string(&path) {
+            Ok(source) => {
+                let mut parser = FileParser::new();
+                parser.parse_full(&source);
+                if let Some(tree) = parser.tree() {
+                    let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+                    self.index.update_file(&uri_str, file_symbols);
+                } else {
+                    self.index.remove_file(&uri_str);
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "Failed to read watched PHP file {}, removing from index: {}",
+                    path.display(),
+                    err
+                );
+                self.index.remove_file(&uri_str);
+            }
+        }
+
+        self.semantic_tokens_cache.lock().await.remove(&uri_str);
+    }
+
+    /// Remove one PHP file from all server-side caches/indexes.
+    async fn remove_php_file(&self, uri: &Uri) {
+        if !uri_is_php_file(uri) {
+            return;
+        }
+
+        let uri_str = uri.as_str().to_string();
+        self.index.remove_file(&uri_str);
+        self.open_files.remove(&uri_str);
+        self.semantic_tokens_cache.lock().await.remove(&uri_str);
+        self.client
+            .publish_diagnostics(uri.clone(), vec![], None)
+            .await;
+    }
+
+    async fn rename_php_file(&self, old_uri: &Uri, new_uri: &Uri) {
+        let old_is_php = uri_is_php_file(old_uri);
+        let new_is_php = uri_is_php_file(new_uri);
+
+        if !old_is_php && !new_is_php {
+            return;
+        }
+
+        let old_uri_str = old_uri.as_str().to_string();
+        let moved_parser = self
+            .open_files
+            .remove(&old_uri_str)
+            .map(|(_, parser)| parser);
+        if old_is_php {
+            self.index.remove_file(&old_uri_str);
+            self.semantic_tokens_cache.lock().await.remove(&old_uri_str);
+            self.client
+                .publish_diagnostics(old_uri.clone(), vec![], None)
+                .await;
+        }
+
+        if !new_is_php {
+            return;
+        }
+
+        if let Some(parser) = moved_parser {
+            let new_uri_str = new_uri.as_str().to_string();
+            if let Some(tree) = parser.tree() {
+                let source = parser.source();
+                let file_symbols = extract_file_symbols(tree, &source, &new_uri_str);
+                self.index.update_file(&new_uri_str, file_symbols);
+            }
+            self.open_files.insert(new_uri_str.clone(), parser);
+            self.semantic_tokens_cache.lock().await.remove(&new_uri_str);
+            self.publish_diagnostics(new_uri).await;
+        } else {
+            self.reindex_php_file(new_uri).await;
+        }
     }
 }
 
@@ -1614,6 +1934,19 @@ fn semantic_tokens_legend() -> SemanticTokensLegend {
     }
 }
 
+fn php_file_operation_registration_options() -> FileOperationRegistrationOptions {
+    FileOperationRegistrationOptions {
+        filters: vec![FileOperationFilter {
+            scheme: Some("file".to_string()),
+            pattern: FileOperationPattern {
+                glob: "**/*.php".to_string(),
+                matches: Some(FileOperationPatternKind::File),
+                options: None,
+            },
+        }],
+    }
+}
+
 fn semantic_tokens_for_parser(parser: &FileParser) -> Option<Vec<SemanticToken>> {
     let tree = parser.tree()?;
     let source = parser.source();
@@ -1988,7 +2321,12 @@ fn compute_diagnostics(
     uri_str: &str,
     parser: &FileParser,
     index: &WorkspaceIndex,
+    diagnostics_mode: DiagnosticsMode,
 ) -> Vec<Diagnostic> {
+    if diagnostics_mode == DiagnosticsMode::Off {
+        return vec![];
+    }
+
     let tree = match parser.tree() {
         Some(t) => t,
         None => return vec![],
@@ -2020,6 +2358,10 @@ fn compute_diagnostics(
 
     // Avoid semantic noise while the file has syntax errors.
     if !diagnostics.is_empty() {
+        return diagnostics;
+    }
+
+    if diagnostics_mode == DiagnosticsMode::SyntaxOnly {
         return diagnostics;
     }
 
@@ -2100,6 +2442,17 @@ fn collect_php_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
 /// Convert a file:// URI to a filesystem path.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     uri.strip_prefix("file://").map(PathBuf::from)
+}
+
+fn uri_is_php_file(uri: &Uri) -> bool {
+    if let Some(path) = uri_to_path(uri.as_str()) {
+        return path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("php"));
+    }
+
+    uri.as_str().to_ascii_lowercase().ends_with(".php")
 }
 
 /// Convert a file path to a file:// URI.
@@ -2374,6 +2727,73 @@ fn build_completion_auto_import_edit(
     })
 }
 
+fn remove_stub_symbols(index: &WorkspaceIndex) {
+    let stub_uris: Vec<String> = index
+        .file_symbols
+        .iter()
+        .filter(|entry| entry.key().starts_with("phpstub://"))
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    for uri in stub_uris {
+        index.remove_file(&uri);
+    }
+}
+
+fn candidate_stubs_paths(root: &Path, client_stubs_path: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+
+    if let Some(path) = client_stubs_path {
+        candidate_paths.push(path);
+    }
+
+    candidate_paths.push(root.join("server/data/stubs"));
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidate_paths.push(dir.join("data/stubs"));
+            candidate_paths.push(
+                dir.join("../stubs")
+                    .canonicalize()
+                    .unwrap_or_else(|_| dir.join("../stubs")),
+            );
+        }
+    }
+
+    candidate_paths.push(PathBuf::from("/usr/share/php-lsp/stubs"));
+    candidate_paths
+}
+
+fn load_configured_stubs(
+    index: &WorkspaceIndex,
+    root: &Path,
+    client_stubs_path: Option<PathBuf>,
+    stub_extensions: Vec<String>,
+    clear_existing: bool,
+) -> usize {
+    if clear_existing {
+        remove_stub_symbols(index);
+    }
+
+    for stubs_path in candidate_stubs_paths(root, client_stubs_path) {
+        if stubs_path.is_dir() {
+            tracing::info!("Loading phpstorm-stubs from {}", stubs_path.display());
+            let loaded = if stub_extensions.is_empty() {
+                stubs::load_stubs(index, &stubs_path, stubs::DEFAULT_EXTENSIONS)
+            } else {
+                let extension_refs: Vec<&str> =
+                    stub_extensions.iter().map(String::as_str).collect();
+                stubs::load_stubs(index, &stubs_path, &extension_refs)
+            };
+            tracing::info!("Loaded {} stub files", loaded);
+            return loaded;
+        }
+    }
+
+    tracing::warn!("phpstorm-stubs not found, built-in completions will be limited");
+    0
+}
+
 /// Background workspace indexing.
 ///
 /// Scans PHP files in the workspace and adds their symbols to the index.
@@ -2531,41 +2951,9 @@ impl LanguageServer for PhpLspBackend {
             .and_then(|uri| uri_to_path(uri.as_str()))
             .or_else(|| params.root_path.as_ref().map(PathBuf::from));
 
-        // Extract stubsPath from client initializationOptions
+        // Extract runtime settings from client initializationOptions.
         if let Some(ref opts) = params.initialization_options {
-            if let Some(raw_php_version) = opts.get("phpVersion").and_then(|v| v.as_str()) {
-                if let Some(parsed) = PhpVersion::parse(raw_php_version) {
-                    tracing::info!("Client provided phpVersion: {}", raw_php_version);
-                    *self.php_version.lock().await = parsed;
-                } else {
-                    tracing::warn!("Ignoring invalid phpVersion: {}", raw_php_version);
-                }
-            }
-
-            if let Some(sp) = opts.get("stubsPath").and_then(|v| v.as_str()) {
-                let p = PathBuf::from(sp);
-                tracing::info!("Client provided stubsPath: {}", p.display());
-                *self.stubs_path.lock().await = Some(p);
-            }
-
-            let formatting_provider = opts
-                .get("formattingProvider")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    opts.get("formatting")
-                        .and_then(|v| v.get("provider"))
-                        .and_then(|v| v.as_str())
-                });
-            let formatting_command = opts
-                .get("formattingCommand")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    opts.get("formatting")
-                        .and_then(|v| v.get("command"))
-                        .and_then(|v| v.as_str())
-                });
-            *self.formatting_config.lock().await =
-                FormattingConfig::from_options(formatting_provider, formatting_command);
+            self.apply_configuration_settings(opts).await;
         }
 
         if let Some(ref root) = root_path {
@@ -2597,6 +2985,20 @@ impl LanguageServer for PhpLspBackend {
                 document_highlight_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: None,
+                    file_operations: Some({
+                        let php_files = php_file_operation_registration_options();
+                        WorkspaceFileOperationsServerCapabilities {
+                            did_create: Some(php_files.clone()),
+                            will_create: Some(php_files.clone()),
+                            did_rename: Some(php_files.clone()),
+                            will_rename: Some(php_files.clone()),
+                            did_delete: Some(php_files),
+                            will_delete: Some(php_file_operation_registration_options()),
+                        }
+                    }),
+                }),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -2666,7 +3068,10 @@ impl LanguageServer for PhpLspBackend {
 
             // Auto-discover composer.json: check root, then immediate subdirectories
             let (ns_map_storage, project_root) = {
-                let composer_path = find_composer_json(&root);
+                let composer_enabled = *self.composer_enabled.lock().await;
+                let composer_path = composer_enabled
+                    .then(|| find_composer_json(&root))
+                    .flatten();
                 if let Some(ref cp) = composer_path {
                     let effective_root = cp.parent().unwrap_or(&root).to_path_buf();
                     if effective_root != root {
@@ -2688,6 +3093,9 @@ impl LanguageServer for PhpLspBackend {
                             (None, root.clone())
                         }
                     }
+                } else if !composer_enabled {
+                    tracing::info!("Composer support disabled, will scan all PHP files");
+                    (None, root.clone())
                 } else {
                     tracing::info!("No composer.json found, will scan all PHP files");
                     (None, root.clone())
@@ -2708,44 +3116,15 @@ impl LanguageServer for PhpLspBackend {
             let stubs_index = self.index.clone();
             let stubs_root = root.clone();
             let client_stubs_path = self.stubs_path.lock().await.clone();
+            let stub_extensions = self.stub_extensions.lock().await.clone();
             tokio::task::spawn_blocking(move || {
-                // Build list of candidate paths, client-provided path first
-                let mut candidate_paths: Vec<PathBuf> = Vec::new();
-
-                // 1. Path from client initializationOptions (bundled with extension)
-                if let Some(ref p) = client_stubs_path {
-                    candidate_paths.push(p.clone());
-                }
-
-                // 2. Relative to workspace (development)
-                candidate_paths.push(stubs_root.join("server/data/stubs"));
-
-                // 3. Relative to binary location
-                if let Ok(exe) = std::env::current_exe() {
-                    if let Some(dir) = exe.parent() {
-                        candidate_paths.push(dir.join("data/stubs"));
-                        // Also check sibling stubs/ dir (for extension layout: bin/php-lsp + stubs/)
-                        candidate_paths.push(
-                            dir.join("../stubs")
-                                .canonicalize()
-                                .unwrap_or_else(|_| dir.join("../stubs")),
-                        );
-                    }
-                }
-
-                // 4. Common install paths
-                candidate_paths.push(PathBuf::from("/usr/share/php-lsp/stubs"));
-
-                for stubs_path in &candidate_paths {
-                    if stubs_path.is_dir() {
-                        tracing::info!("Loading phpstorm-stubs from {}", stubs_path.display());
-                        let loaded =
-                            stubs::load_stubs(&stubs_index, stubs_path, stubs::DEFAULT_EXTENSIONS);
-                        tracing::info!("Loaded {} stub files", loaded);
-                        return;
-                    }
-                }
-                tracing::warn!("phpstorm-stubs not found, built-in completions will be limited");
+                load_configured_stubs(
+                    &stubs_index,
+                    &stubs_root,
+                    client_stubs_path,
+                    stub_extensions,
+                    false,
+                );
             })
             .await
             .ok();
@@ -2753,6 +3132,7 @@ impl LanguageServer for PhpLspBackend {
             let open_files = self.open_files.clone();
             let reindex_index = self.index.clone();
             let reindex_client = self.client.clone();
+            let diagnostics_mode = *self.diagnostics_mode.lock().await;
             tokio::spawn(async move {
                 if let Err(e) =
                     index_workspace(&client, &index, &root, ns_map_storage.as_ref()).await
@@ -2768,7 +3148,8 @@ impl LanguageServer for PhpLspBackend {
                 for entry in open_files.iter() {
                     let uri_str = entry.key().clone();
                     if let Ok(uri) = uri_str.parse::<Uri>() {
-                        let diags = compute_diagnostics(&uri_str, &entry, &reindex_index);
+                        let diags =
+                            compute_diagnostics(&uri_str, &entry, &reindex_index, diagnostics_mode);
                         reindex_client.publish_diagnostics(uri, diags, None).await;
                     }
                 }
@@ -2855,6 +3236,76 @@ impl LanguageServer for PhpLspBackend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         tracing::debug!("didSave: {}", params.text_document.uri.as_str());
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        tracing::debug!("didChangeWatchedFiles: {} change(s)", params.changes.len());
+
+        for event in params.changes {
+            match event.typ {
+                FileChangeType::DELETED => self.remove_php_file(&event.uri).await,
+                FileChangeType::CREATED | FileChangeType::CHANGED => {
+                    self.reindex_php_file(&event.uri).await
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        tracing::debug!("didChangeConfiguration");
+
+        let applied = self.apply_configuration_settings(&params.settings).await;
+        if applied.stubs_changed {
+            self.reload_configured_stubs().await;
+        }
+        if applied.diagnostics_changed || applied.stubs_changed {
+            self.republish_open_diagnostics().await;
+        }
+    }
+
+    async fn will_create_files(&self, _params: CreateFilesParams) -> Result<Option<WorkspaceEdit>> {
+        Ok(None)
+    }
+
+    async fn did_create_files(&self, params: CreateFilesParams) {
+        tracing::debug!("didCreateFiles: {} file(s)", params.files.len());
+
+        for file in params.files {
+            if let Ok(uri) = file.uri.parse::<Uri>() {
+                self.reindex_php_file(&uri).await;
+            }
+        }
+    }
+
+    async fn will_rename_files(&self, _params: RenameFilesParams) -> Result<Option<WorkspaceEdit>> {
+        Ok(None)
+    }
+
+    async fn did_rename_files(&self, params: RenameFilesParams) {
+        tracing::debug!("didRenameFiles: {} file(s)", params.files.len());
+
+        for file in params.files {
+            let old_uri = file.old_uri.parse::<Uri>();
+            let new_uri = file.new_uri.parse::<Uri>();
+            if let (Ok(old_uri), Ok(new_uri)) = (old_uri, new_uri) {
+                self.rename_php_file(&old_uri, &new_uri).await;
+            }
+        }
+    }
+
+    async fn will_delete_files(&self, _params: DeleteFilesParams) -> Result<Option<WorkspaceEdit>> {
+        Ok(None)
+    }
+
+    async fn did_delete_files(&self, params: DeleteFilesParams) {
+        tracing::debug!("didDeleteFiles: {} file(s)", params.files.len());
+
+        for file in params.files {
+            if let Ok(uri) = file.uri.parse::<Uri>() {
+                self.remove_php_file(&uri).await;
+            }
+        }
     }
 
     // --- Language Features ---
@@ -4505,7 +4956,8 @@ impl LanguageServer for PhpLspBackend {
                 Some(p) => p,
                 None => return Ok(Some(vec![])),
             };
-            compute_diagnostics(&uri_str, &parser, &self.index)
+            let diagnostics_mode = *self.diagnostics_mode.lock().await;
+            compute_diagnostics(&uri_str, &parser, &self.index, diagnostics_mode)
                 .into_iter()
                 .filter(|diag| range_overlaps(diag.range, params.range))
                 .collect()

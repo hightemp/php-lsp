@@ -72,6 +72,57 @@ fn did_change_full_notification(uri: &str, version: i32, text: &str) -> Request 
         .finish()
 }
 
+fn did_change_watched_files_notification(changes: Vec<(&str, i32)>) -> Request {
+    let changes: Vec<_> = changes
+        .into_iter()
+        .map(|(uri, typ)| {
+            json!({
+                "uri": uri,
+                "type": typ
+            })
+        })
+        .collect();
+
+    Request::build("workspace/didChangeWatchedFiles")
+        .params(json!({ "changes": changes }))
+        .finish()
+}
+
+fn did_change_configuration_notification(settings: serde_json::Value) -> Request {
+    Request::build("workspace/didChangeConfiguration")
+        .params(json!({ "settings": settings }))
+        .finish()
+}
+
+fn did_create_files_notification(files: Vec<&str>) -> Request {
+    let files: Vec<_> = files.into_iter().map(|uri| json!({ "uri": uri })).collect();
+    Request::build("workspace/didCreateFiles")
+        .params(json!({ "files": files }))
+        .finish()
+}
+
+fn did_rename_files_notification(files: Vec<(&str, &str)>) -> Request {
+    let files: Vec<_> = files
+        .into_iter()
+        .map(|(old_uri, new_uri)| {
+            json!({
+                "oldUri": old_uri,
+                "newUri": new_uri
+            })
+        })
+        .collect();
+    Request::build("workspace/didRenameFiles")
+        .params(json!({ "files": files }))
+        .finish()
+}
+
+fn did_delete_files_notification(files: Vec<&str>) -> Request {
+    let files: Vec<_> = files.into_iter().map(|uri| json!({ "uri": uri })).collect();
+    Request::build("workspace/didDeleteFiles")
+        .params(json!({ "files": files }))
+        .finish()
+}
+
 fn hover_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/hover")
         .params(json!({
@@ -282,6 +333,13 @@ fn document_symbol_request(id: i64, uri: &str) -> Request {
         .finish()
 }
 
+fn workspace_symbol_request(id: i64, query: &str) -> Request {
+    Request::build("workspace/symbol")
+        .params(json!({ "query": query }))
+        .id(id)
+        .finish()
+}
+
 fn semantic_tokens_full_request(id: i64, uri: &str) -> Request {
     Request::build("textDocument/semanticTokens/full")
         .params(json!({
@@ -399,6 +457,30 @@ fn semantic_token_data(result: &serde_json::Value) -> Vec<u64> {
         .expect("semantic token data array")
         .iter()
         .map(|value| value.as_u64().expect("semantic token integer"))
+        .collect()
+}
+
+fn workspace_symbol_names(result: &serde_json::Value) -> Vec<String> {
+    result
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("name").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn workspace_symbol_uris(result: &serde_json::Value) -> Vec<String> {
+    result
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.get("location")
+                .and_then(|location| location.get("uri"))
+                .and_then(|value| value.as_str())
+        })
+        .map(str::to_string)
         .collect()
 }
 
@@ -530,6 +612,21 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected linkedEditingRangeProvider capability"
+    );
+    let file_operations = result
+        .get("capabilities")
+        .and_then(|c| c.get("workspace"))
+        .and_then(|workspace| workspace.get("fileOperations"))
+        .expect("expected workspace fileOperations capability");
+    assert!(
+        file_operations.get("didCreate").is_some()
+            && file_operations.get("didRename").is_some()
+            && file_operations.get("didDelete").is_some()
+            && file_operations.get("willCreate").is_some()
+            && file_operations.get("willRename").is_some()
+            && file_operations.get("willDelete").is_some(),
+        "expected will/did file operation capabilities, got: {}",
+        file_operations
     );
     assert!(
         result
@@ -2605,6 +2702,190 @@ function label($value) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_did_change_configuration_updates_runtime_settings() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({
+                "phpVersion": "7.4",
+                "diagnosticsMode": "off"
+            })),
+        ))
+        .await
+        .unwrap();
+
+    let return_type_code = r#"<?php
+/**
+ * @return string|null
+ */
+function label($value) {
+    return $value;
+}
+"#;
+    let return_type_uri = "file:///test/ConfigReturnType.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(return_type_uri, return_type_code))
+        .await
+        .unwrap();
+
+    let php74_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(add_return_type_request(
+            2,
+            return_type_uri,
+            ((0, 0), (8, 0)),
+        ))
+        .await
+        .unwrap();
+    let php74_result = extract_result(php74_resp);
+    assert!(
+        php74_result
+            .as_array()
+            .is_some_and(|actions| actions.is_empty()),
+        "PHP 7.4 should not offer union return type before config change, got: {}",
+        php74_result
+    );
+
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+class Bar {}
+"#;
+    let vendor_uri = "file:///test/ConfigVendor.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let app_code = r#"<?php
+namespace App;
+
+class Demo {
+    public function run(): void {
+        new Bar();
+    }
+}
+"#;
+    let app_uri = "file:///test/ConfigDiagnostics.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(app_uri, app_code))
+        .await
+        .unwrap();
+
+    let diagnostics_off_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(3, app_uri, 5, 12, 5, 15, json!([])))
+        .await
+        .unwrap();
+    let diagnostics_off_result = extract_result(diagnostics_off_resp);
+    assert!(
+        diagnostics_off_result
+            .as_array()
+            .is_some_and(|actions| actions.is_empty()),
+        "diagnostics off should suppress computed quick-fixes, got: {}",
+        diagnostics_off_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_configuration_notification(json!({
+            "phpLsp": {
+                "phpVersion": "8.2",
+                "diagnostics": {
+                    "mode": "basic-semantic"
+                },
+                "formatting": {
+                    "provider": "none",
+                    "command": ""
+                },
+                "composer": {
+                    "enabled": true
+                },
+                "indexVendor": true,
+                "stubs": {
+                    "extensions": []
+                },
+                "logLevel": "debug"
+            }
+        })))
+        .await
+        .unwrap();
+
+    let php82_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(add_return_type_request(
+            4,
+            return_type_uri,
+            ((0, 0), (8, 0)),
+        ))
+        .await
+        .unwrap();
+    let php82_result = extract_result(php82_resp);
+    let php82_actions = php82_result.as_array().expect("code actions array");
+    assert!(
+        php82_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Add return type `string|null`")
+        }),
+        "PHP 8.2 config should enable union return type action, got: {}",
+        php82_result
+    );
+
+    let diagnostics_on_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(5, app_uri, 5, 12, 5, 15, json!([])))
+        .await
+        .unwrap();
+    let diagnostics_on_result = extract_result(diagnostics_on_resp);
+    let diagnostics_on_actions = diagnostics_on_result
+        .as_array()
+        .expect("code actions array");
+    assert!(
+        diagnostics_on_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Import Vendor\\Bar")
+        }),
+        "basic-semantic diagnostics should enable computed add-use quick-fix, got: {}",
+        diagnostics_on_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_document_symbols() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -2673,6 +2954,269 @@ class UserService {
         .call(shutdown_request(99))
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_watched_files_incrementally_reindex_created_changed_deleted_php_files() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root =
+        std::env::temp_dir().join(format!("php-lsp-watch-{}-{}", std::process::id(), nanos));
+    fs::create_dir_all(&tmp_root).unwrap();
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+
+    let watched_path = tmp_root.join("Watched.php");
+    let watched_uri = format!("file://{}", watched_path.to_string_lossy());
+    fs::write(
+        &watched_path,
+        "<?php\nnamespace Watched;\nclass Created {}\n",
+    )
+    .unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &watched_uri,
+            1,
+        )]))
+        .await
+        .unwrap();
+
+    let created_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(2, "Created"))
+        .await
+        .unwrap();
+    let created_result = extract_result(created_resp);
+    let created_names = workspace_symbol_names(&created_result);
+    assert!(
+        created_names.iter().any(|name| name == "Created"),
+        "created PHP file should be indexed, got: {}",
+        created_result
+    );
+
+    fs::write(
+        &watched_path,
+        "<?php\nnamespace Watched;\nclass Updated {}\n",
+    )
+    .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &watched_uri,
+            2,
+        )]))
+        .await
+        .unwrap();
+
+    let updated_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(3, "Updated"))
+        .await
+        .unwrap();
+    let updated_result = extract_result(updated_resp);
+    let updated_names = workspace_symbol_names(&updated_result);
+    assert!(
+        updated_names.iter().any(|name| name == "Updated"),
+        "changed PHP file should update the index, got: {}",
+        updated_result
+    );
+
+    let stale_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(4, "Created"))
+        .await
+        .unwrap();
+    let stale_result = extract_result(stale_resp);
+    let stale_names = workspace_symbol_names(&stale_result);
+    assert!(
+        !stale_names.iter().any(|name| name == "Created"),
+        "changed PHP file should remove stale symbols, got: {}",
+        stale_result
+    );
+
+    fs::remove_file(&watched_path).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &watched_uri,
+            3,
+        )]))
+        .await
+        .unwrap();
+
+    let deleted_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(5, "Updated"))
+        .await
+        .unwrap();
+    let deleted_result = extract_result(deleted_resp);
+    let deleted_names = workspace_symbol_names(&deleted_result);
+    assert!(
+        !deleted_names.iter().any(|name| name == "Updated"),
+        "deleted PHP file should be removed from the index, got: {}",
+        deleted_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_workspace_file_operations_update_index_uris() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root =
+        std::env::temp_dir().join(format!("php-lsp-fileops-{}-{}", std::process::id(), nanos));
+    fs::create_dir_all(&tmp_root).unwrap();
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+
+    let created_path = tmp_root.join("Created.php");
+    let created_uri = format!("file://{}", created_path.to_string_lossy());
+    fs::write(
+        &created_path,
+        "<?php\nnamespace FileOps;\nclass FileOperationTarget {}\n",
+    )
+    .unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_create_files_notification(vec![&created_uri]))
+        .await
+        .unwrap();
+
+    let created_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(2, "FileOperationTarget"))
+        .await
+        .unwrap();
+    let created_result = extract_result(created_resp);
+    assert!(
+        workspace_symbol_uris(&created_result)
+            .iter()
+            .any(|uri| uri == &created_uri),
+        "didCreateFiles should index the new PHP file, got: {}",
+        created_result
+    );
+
+    let renamed_path = tmp_root.join("Renamed.php");
+    let renamed_uri = format!("file://{}", renamed_path.to_string_lossy());
+    fs::rename(&created_path, &renamed_path).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_rename_files_notification(vec![(
+            &created_uri,
+            &renamed_uri,
+        )]))
+        .await
+        .unwrap();
+
+    let renamed_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(3, "FileOperationTarget"))
+        .await
+        .unwrap();
+    let renamed_result = extract_result(renamed_resp);
+    let renamed_uris = workspace_symbol_uris(&renamed_result);
+    assert!(
+        renamed_uris.iter().any(|uri| uri == &renamed_uri)
+            && !renamed_uris.iter().any(|uri| uri == &created_uri),
+        "didRenameFiles should move symbol locations to the new URI, got: {}",
+        renamed_result
+    );
+
+    fs::remove_file(&renamed_path).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_delete_files_notification(vec![&renamed_uri]))
+        .await
+        .unwrap();
+
+    let deleted_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(4, "FileOperationTarget"))
+        .await
+        .unwrap();
+    let deleted_result = extract_result(deleted_resp);
+    assert!(
+        workspace_symbol_names(&deleted_result).is_empty(),
+        "didDeleteFiles should remove deleted PHP symbols, got: {}",
+        deleted_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+
+    let _ = fs::remove_dir_all(&tmp_root);
 }
 
 #[tokio::test(flavor = "current_thread")]

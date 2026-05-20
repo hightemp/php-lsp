@@ -93,6 +93,7 @@ export function activate(context: ExtensionContext): void {
       { scheme: "untitled", language: "php" },
     ],
     synchronize: {
+      configurationSection: "phpLsp",
       fileEvents: workspace.createFileSystemWatcher("**/*.php"),
     },
     initializationOptions: {
