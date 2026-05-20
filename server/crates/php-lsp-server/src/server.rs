@@ -101,13 +101,17 @@ impl FormattingConfig {
     }
 
     fn command_template(&self) -> Option<String> {
-        if let Some(command) = &self.command {
-            return Some(command.clone());
-        }
-
         match self.provider.as_str() {
-            "php-cs-fixer" => Some("php-cs-fixer fix --using-cache=no --quiet {file}".to_string()),
-            "phpcbf" => Some("phpcbf {file}".to_string()),
+            "none" => None,
+            "custom" => self.command.clone(),
+            "php-cs-fixer" => self
+                .command
+                .clone()
+                .or_else(|| Some("php-cs-fixer fix --using-cache=no --quiet {file}".to_string())),
+            "phpcbf" => self
+                .command
+                .clone()
+                .or_else(|| Some("phpcbf {file}".to_string())),
             _ => None,
         }
     }
@@ -420,7 +424,11 @@ impl PhpLspBackend {
         }
 
         if let Some(enabled) = settings_bool(settings, "indexVendor", &["indexVendor"]) {
-            *self.index_vendor.lock().await = enabled;
+            let mut index_vendor = self.index_vendor.lock().await;
+            if *index_vendor != enabled {
+                *index_vendor = enabled;
+                applied.indexing_changed = true;
+            }
         }
 
         if let Some(paths) = settings_string_array(settings, "includePaths", &["includePaths"]) {
@@ -477,7 +485,13 @@ impl PhpLspBackend {
             let current = self.formatting_config.lock().await.clone();
             let next_config = {
                 let provider = formatting_provider.unwrap_or(&current.provider);
-                let command = formatting_command.or(current.command.as_deref());
+                let command = if formatting_command.is_some() {
+                    formatting_command
+                } else if formatting_provider.is_some() && provider != current.provider {
+                    None
+                } else {
+                    current.command.as_deref()
+                };
                 FormattingConfig::from_options(Some(provider), command)
             };
             *self.formatting_config.lock().await = next_config;
@@ -10791,6 +10805,18 @@ function nullableUnion(): string|null {
                 messages
             );
         }
+    }
+
+    #[test]
+    fn test_formatting_provider_none_disables_stale_command() {
+        let config = FormattingConfig::from_options(Some("none"), Some("vendor/bin/php-cs-fixer"));
+        assert!(config.command_template().is_none());
+
+        let custom = FormattingConfig::from_options(Some("custom"), Some("vendor/bin/fmt {file}"));
+        assert_eq!(
+            custom.command_template().as_deref(),
+            Some("vendor/bin/fmt {file}")
+        );
     }
 
     #[test]

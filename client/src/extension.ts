@@ -21,6 +21,7 @@ import {
 
 let client: LanguageClient | undefined;
 let statusController: PhpLspStatusController | undefined;
+let indexingStatusSubscription: Disposable | undefined;
 
 type IndexingPhase =
   | "starting"
@@ -56,6 +57,7 @@ interface ExtensionSnapshot {
   phpstanEnabled: boolean;
   psalmEnabled: boolean;
   formattingProvider: string;
+  logLevel: string;
   includePaths: string[];
   excludePaths: string[];
 }
@@ -131,6 +133,11 @@ class PhpLspStatusController implements Disposable {
         label: "$(tools) Formatter",
         description: snapshot.formattingProvider,
         detail: snapshot.formattingProvider === "none" ? "Document formatting is disabled" : "External formatter is configured",
+      },
+      {
+        label: "$(output) Log level",
+        description: snapshot.logLevel,
+        detail: "Applied when the language server process starts",
       },
       {
         label: "$(list-tree) Include paths",
@@ -312,11 +319,11 @@ function analyzerSummary(snapshot: ExtensionSnapshot): string {
   return enabled.length > 0 ? enabled.join(", ") : "off";
 }
 
-function getExtensionSnapshot(serverPath: string, stubsPath: string | undefined): ExtensionSnapshot {
+function getExtensionSnapshot(context: ExtensionContext): ExtensionSnapshot {
   const config = workspace.getConfiguration("phpLsp");
   return {
-    serverPath,
-    stubsPath,
+    serverPath: getServerPath(context),
+    stubsPath: getStubsPath(context),
     platformDir: getPlatformDir(),
     workspaceFolders: workspace.workspaceFolders?.map((folder) => folder.uri.fsPath) ?? [],
     phpVersion: config.get<string>("phpVersion", "8.2"),
@@ -326,8 +333,16 @@ function getExtensionSnapshot(serverPath: string, stubsPath: string | undefined)
     phpstanEnabled: config.get<boolean>("phpstan.enabled", false),
     psalmEnabled: config.get<boolean>("psalm.enabled", false),
     formattingProvider: config.get<string>("formatting.provider", "none"),
+    logLevel: config.get<string>("logLevel", "info"),
     includePaths: config.get<string[]>("includePaths", []),
     excludePaths: config.get<string[]>("excludePaths", []),
+  };
+}
+
+function getServerEnvironment(logLevel: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    RUST_LOG: logLevel.trim() || "info",
   };
 }
 
@@ -382,24 +397,28 @@ function getStubsPath(context: ExtensionContext): string | undefined {
   return undefined;
 }
 
-export function activate(context: ExtensionContext): void {
+function createLanguageClient(context: ExtensionContext): LanguageClient {
   const config = workspace.getConfiguration("phpLsp");
-  if (!config.get<boolean>("enable", true)) {
-    return;
-  }
-
   const serverPath = getServerPath(context);
   const stubsPath = getStubsPath(context);
+  const logLevel = config.get<string>("logLevel", "info");
+  const serverEnvironment = getServerEnvironment(logLevel);
 
   const serverOptions: ServerOptions = {
     run: {
       command: serverPath,
       transport: TransportKind.stdio,
+      options: {
+        env: serverEnvironment,
+      },
     },
     debug: {
       command: serverPath,
       transport: TransportKind.stdio,
       args: ["--debug"],
+      options: {
+        env: serverEnvironment,
+      },
     },
   };
 
@@ -420,7 +439,7 @@ export function activate(context: ExtensionContext): void {
       includePaths: config.get<string[]>("includePaths", []),
       excludePaths: config.get<string[]>("excludePaths", []),
       stubExtensions: config.get<string[]>("stubs.extensions", []),
-      logLevel: config.get<string>("logLevel", "info"),
+      logLevel,
       formattingProvider: config.get<string>("formatting.provider", "none"),
       formattingCommand: config.get<string>("formatting.command", ""),
       phpstanEnabled: config.get<boolean>("phpstan.enabled", false),
@@ -439,29 +458,81 @@ export function activate(context: ExtensionContext): void {
     },
   };
 
-  client = new LanguageClient(
+  return new LanguageClient(
     "phpLsp",
     "PHP Language Server",
     serverOptions,
     clientOptions,
   );
+}
 
-  const controller = new PhpLspStatusController(() => getExtensionSnapshot(serverPath, stubsPath));
+async function stopLanguageClient(): Promise<void> {
+  indexingStatusSubscription?.dispose();
+  indexingStatusSubscription = undefined;
+
+  if (client) {
+    await client.stop();
+    client = undefined;
+  }
+}
+
+async function startLanguageClient(context: ExtensionContext): Promise<boolean> {
+  try {
+    const nextClient = createLanguageClient(context);
+    client = nextClient;
+    indexingStatusSubscription = nextClient.onNotification(
+      "phpLsp/indexingStatus",
+      (status: IndexingStatus) => statusController?.update(status),
+    );
+
+    await nextClient.start();
+    return true;
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    client = undefined;
+    indexingStatusSubscription?.dispose();
+    indexingStatusSubscription = undefined;
+    statusController?.update({
+      phase: "error",
+      message,
+    });
+    window.showErrorMessage(`PHP Language Server failed to start: ${message}`);
+    return false;
+  }
+}
+
+async function restartLanguageClient(context: ExtensionContext): Promise<void> {
+  statusController?.update({
+    phase: "starting",
+    message: "Restarting language server",
+  });
+  await stopLanguageClient();
+  if (!workspace.getConfiguration("phpLsp").get<boolean>("enable", true)) {
+    statusController?.update({
+      phase: "ready",
+      message: "Language server is disabled",
+    });
+    window.showInformationMessage("PHP Language Server is disabled");
+    return;
+  }
+  if (await startLanguageClient(context)) {
+    window.showInformationMessage("PHP Language Server restarted");
+  }
+}
+
+export function activate(context: ExtensionContext): void {
+  const config = workspace.getConfiguration("phpLsp");
+  if (!config.get<boolean>("enable", true)) {
+    return;
+  }
+
+  const controller = new PhpLspStatusController(() => getExtensionSnapshot(context));
   statusController = controller;
 
   // Register restart command
   const restartCommand = commands.registerCommand(
     "phpLsp.restartServer",
-    async () => {
-      if (client) {
-        statusController?.update({
-          phase: "starting",
-          message: "Restarting language server",
-        });
-        await client.restart();
-        window.showInformationMessage("PHP Language Server restarted");
-      }
-    },
+    async () => restartLanguageClient(context),
   );
 
   const showStatusCommand = commands.registerCommand(
@@ -469,29 +540,35 @@ export function activate(context: ExtensionContext): void {
     async () => statusController?.showPopup(),
   );
 
-  const indexingStatusSubscription = client.onNotification(
-    "phpLsp/indexingStatus",
-    (status: IndexingStatus) => statusController?.update(status),
-  );
+  const enableConfigSubscription = workspace.onDidChangeConfiguration(async (event) => {
+    if (!event.affectsConfiguration("phpLsp.enable")) {
+      return;
+    }
 
-  context.subscriptions.push(controller, restartCommand, showStatusCommand, indexingStatusSubscription);
+    const enabled = workspace.getConfiguration("phpLsp").get<boolean>("enable", true);
+    if (!enabled) {
+      await stopLanguageClient();
+      statusController?.update({
+        phase: "ready",
+        message: "Language server is disabled",
+      });
+    } else if (!client) {
+      statusController?.update({
+        phase: "starting",
+        message: "Starting language server",
+      });
+      await startLanguageClient(context);
+    }
+  });
+
+  context.subscriptions.push(controller, restartCommand, showStatusCommand, enableConfigSubscription);
 
   // Start the client (also launches the server)
-  client.start().catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    statusController?.update({
-      phase: "error",
-      message,
-    });
-    window.showErrorMessage(`PHP Language Server failed to start: ${message}`);
-  });
+  void startLanguageClient(context);
 }
 
 export async function deactivate(): Promise<void> {
-  if (client) {
-    await client.stop();
-    client = undefined;
-  }
+  await stopLanguageClient();
   statusController?.dispose();
   statusController = undefined;
 }
