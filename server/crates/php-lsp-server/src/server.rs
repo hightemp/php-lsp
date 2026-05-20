@@ -27,7 +27,7 @@ use php_lsp_parser::signature_help::signature_help_context_at_position;
 use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
@@ -171,6 +171,7 @@ impl DiagnosticsMode {
 struct AppliedConfiguration {
     diagnostics_changed: bool,
     stubs_changed: bool,
+    indexing_changed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +264,30 @@ fn settings_string_array(
     )
 }
 
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) | Component::ParentDir => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn normalize_config_paths(paths: Vec<String>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let path = path.trim();
+            (!path.is_empty()).then(|| normalize_path(Path::new(path)))
+        })
+        .collect()
+}
+
 fn settings_u64(settings: &serde_json::Value, flat_key: &str, nested_path: &[&str]) -> Option<u64> {
     settings_value(settings, flat_key, nested_path).and_then(|value| value.as_u64())
 }
@@ -299,6 +324,10 @@ pub struct PhpLspBackend {
     composer_enabled: Mutex<bool>,
     /// Whether lazy vendor indexing is enabled.
     index_vendor: Mutex<bool>,
+    /// Additional files/directories included in workspace indexing.
+    include_paths: Mutex<Vec<PathBuf>>,
+    /// Files/directories excluded from workspace indexing.
+    exclude_paths: Mutex<Vec<PathBuf>>,
     /// Configured phpstorm-stubs extension directory names.
     stub_extensions: Mutex<Vec<String>>,
     /// Configured server log level label.
@@ -329,6 +358,8 @@ impl PhpLspBackend {
             psalm_config: Mutex::new(PsalmConfig::default()),
             composer_enabled: Mutex::new(true),
             index_vendor: Mutex::new(true),
+            include_paths: Mutex::new(Vec::new()),
+            exclude_paths: Mutex::new(Vec::new()),
             stub_extensions: Mutex::new(Vec::new()),
             log_level: Mutex::new("info".to_string()),
             work_done_progress_supported: Mutex::new(false),
@@ -381,11 +412,33 @@ impl PhpLspBackend {
 
         if let Some(enabled) = settings_bool(settings, "composerEnabled", &["composer", "enabled"])
         {
-            *self.composer_enabled.lock().await = enabled;
+            let mut composer_enabled = self.composer_enabled.lock().await;
+            if *composer_enabled != enabled {
+                *composer_enabled = enabled;
+                applied.indexing_changed = true;
+            }
         }
 
         if let Some(enabled) = settings_bool(settings, "indexVendor", &["indexVendor"]) {
             *self.index_vendor.lock().await = enabled;
+        }
+
+        if let Some(paths) = settings_string_array(settings, "includePaths", &["includePaths"]) {
+            let paths = normalize_config_paths(paths);
+            let mut include_paths = self.include_paths.lock().await;
+            if *include_paths != paths {
+                *include_paths = paths;
+                applied.indexing_changed = true;
+            }
+        }
+
+        if let Some(paths) = settings_string_array(settings, "excludePaths", &["excludePaths"]) {
+            let paths = normalize_config_paths(paths);
+            let mut exclude_paths = self.exclude_paths.lock().await;
+            if *exclude_paths != paths {
+                *exclude_paths = paths;
+                applied.indexing_changed = true;
+            }
         }
 
         if let Some(extensions) =
@@ -532,6 +585,101 @@ impl PhpLspBackend {
                 format!("php-lsp: reloaded {} stub files", loaded),
             )
             .await;
+    }
+
+    async fn reindex_workspaces(&self) {
+        let roots = self.workspace_roots.lock().await.clone();
+        if roots.is_empty() {
+            return;
+        }
+
+        let composer_enabled = *self.composer_enabled.lock().await;
+        let configs = dedup_workspace_configs(
+            roots
+                .iter()
+                .map(|root| discover_workspace_root_config(root, composer_enabled))
+                .collect(),
+        );
+        let effective_roots: Vec<PathBuf> =
+            configs.iter().map(|config| config.root.clone()).collect();
+
+        if let Some(first_root) = effective_roots.first() {
+            *self.workspace_root.lock().await = Some(first_root.clone());
+        }
+        *self.workspace_roots.lock().await = effective_roots;
+        *self.workspace_configs.lock().await = configs.clone();
+        *self.namespace_map.lock().await = configs
+            .iter()
+            .find_map(|config| config.namespace_map.clone());
+
+        let removed = remove_indexed_file_symbols(&self.index);
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "php-lsp: reindexing workspace after indexing configuration change (removed {} indexed files)",
+                    removed
+                ),
+            )
+            .await;
+
+        let client = self.client.clone();
+        let index = self.index.clone();
+        let open_files = self.open_files.clone();
+        let reindex_index = self.index.clone();
+        let reindex_client = self.client.clone();
+        let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let php_version = *self.php_version.lock().await;
+        let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
+        let include_paths = self.include_paths.lock().await.clone();
+        let exclude_paths = self.exclude_paths.lock().await.clone();
+        tokio::spawn(async move {
+            for config in &configs {
+                if let Err(e) = index_workspace(
+                    &client,
+                    &index,
+                    &config.root,
+                    config.namespace_map.as_ref(),
+                    &include_paths,
+                    &exclude_paths,
+                    work_done_progress_supported,
+                )
+                .await
+                {
+                    tracing::error!("Workspace reindexing failed: {}", e);
+                    send_indexing_status(
+                        &client,
+                        serde_json::json!({
+                            "phase": "error",
+                            "root": config.root.display().to_string(),
+                            "message": format!("Workspace reindexing failed: {}", e)
+                        }),
+                    )
+                    .await;
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Workspace reindexing failed: {}", e),
+                        )
+                        .await;
+                    return;
+                }
+            }
+
+            for entry in open_files.iter() {
+                let uri_str = entry.key().clone();
+                if let Ok(uri) = uri_str.parse::<Uri>() {
+                    let diags = compute_diagnostics(
+                        &uri_str,
+                        &entry,
+                        &reindex_index,
+                        diagnostics_mode,
+                        php_version,
+                    );
+                    reindex_client.publish_diagnostics(uri, diags, None).await;
+                }
+            }
+        });
     }
 
     async fn republish_open_diagnostics(&self) {
@@ -717,6 +865,7 @@ impl PhpLspBackend {
 
         let index_vendor = *self.index_vendor.lock().await;
         let mut configs = self.workspace_configs.lock().await.clone();
+        let exclude_paths = self.exclude_paths.lock().await.clone();
         if configs.is_empty() {
             let root = self.workspace_root.lock().await.clone();
             let namespace_map = self.namespace_map.lock().await.clone();
@@ -751,6 +900,10 @@ impl PhpLspBackend {
                 } else {
                     config.root.join(path)
                 };
+
+                if path_is_excluded(&abs, &config.root, &exclude_paths) {
+                    continue;
+                }
 
                 if abs.exists() {
                     if let Ok(source) = std::fs::read_to_string(&abs) {
@@ -1266,12 +1419,45 @@ impl PhpLspBackend {
             .await;
     }
 
+    async fn path_is_excluded_by_config(&self, path: &Path) -> bool {
+        let exclude_paths = self.exclude_paths.lock().await.clone();
+        if exclude_paths.is_empty() {
+            return false;
+        }
+
+        let mut roots: Vec<PathBuf> = self
+            .workspace_configs
+            .lock()
+            .await
+            .iter()
+            .map(|config| config.root.clone())
+            .collect();
+
+        if roots.is_empty() {
+            if let Some(root) = self.workspace_root.lock().await.clone() {
+                roots.push(root);
+            }
+        }
+
+        roots
+            .iter()
+            .any(|root| path_is_excluded(path, root, &exclude_paths))
+    }
+
     /// Reindex one changed PHP file from the open buffer when available,
     /// otherwise from disk.
     async fn reindex_php_file(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
         if !uri_is_php_file(uri) {
             return;
+        }
+
+        if let Some(path) = uri_to_path(&uri_str) {
+            if self.path_is_excluded_by_config(&path).await {
+                self.index.remove_file(&uri_str);
+                self.semantic_tokens_cache.lock().await.remove(&uri_str);
+                return;
+            }
         }
 
         let open_file_symbols = {
@@ -1354,6 +1540,23 @@ impl PhpLspBackend {
         }
 
         if !new_is_php {
+            return;
+        }
+
+        let new_excluded = if let Some(path) = uri_to_path(new_uri.as_str()) {
+            self.path_is_excluded_by_config(&path).await
+        } else {
+            false
+        };
+        if new_excluded {
+            if let Some(parser) = moved_parser {
+                self.open_files.insert(new_uri.as_str().to_string(), parser);
+            }
+            self.index.remove_file(new_uri.as_str());
+            self.semantic_tokens_cache
+                .lock()
+                .await
+                .remove(new_uri.as_str());
             return;
         }
 
@@ -5757,8 +5960,70 @@ fn symbol_return_type_fqn(
     }
 }
 
+fn resolve_config_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        normalize_path(path)
+    } else {
+        normalize_path(&root.join(path))
+    }
+}
+
+fn path_is_excluded(path: &Path, root: &Path, exclude_paths: &[PathBuf]) -> bool {
+    if exclude_paths.is_empty() {
+        return false;
+    }
+
+    let absolute_path = resolve_config_path(root, path);
+    let relative_path = absolute_path.strip_prefix(root).ok().map(normalize_path);
+
+    exclude_paths.iter().any(|exclude_path| {
+        if exclude_path.as_os_str().is_empty() {
+            return false;
+        }
+
+        let absolute_exclude = resolve_config_path(root, exclude_path);
+        if absolute_path == absolute_exclude || absolute_path.starts_with(&absolute_exclude) {
+            return true;
+        }
+
+        relative_path.as_ref().is_some_and(|relative_path| {
+            relative_path == exclude_path || relative_path.starts_with(exclude_path)
+        })
+    })
+}
+
+fn workspace_index_directories(
+    root: &Path,
+    namespace_map: Option<&NamespaceMap>,
+    include_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut directories: Vec<PathBuf> = namespace_map
+        .map(|ns_map| {
+            ns_map
+                .source_directories()
+                .into_iter()
+                .map(Path::to_path_buf)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if directories.is_empty() {
+        directories.push(root.to_path_buf());
+    }
+
+    for include_path in include_paths {
+        push_unique_path(&mut directories, include_path.clone());
+    }
+
+    directories
+}
+
 /// Collect all .php files from the given directories.
-fn collect_php_files(directories: &[&Path], root: &Path) -> Vec<PathBuf> {
+fn collect_php_files(
+    directories: &[PathBuf],
+    root: &Path,
+    exclude_paths: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for dir in directories {
         let abs_dir = if dir.is_absolute() {
@@ -5766,15 +6031,25 @@ fn collect_php_files(directories: &[&Path], root: &Path) -> Vec<PathBuf> {
         } else {
             root.join(dir)
         };
+        if path_is_excluded(&abs_dir, root, exclude_paths) {
+            continue;
+        }
         if abs_dir.is_dir() {
-            collect_php_files_recursive(&abs_dir, &mut files);
+            collect_php_files_recursive(&abs_dir, root, exclude_paths, &mut files);
+        } else if abs_dir.extension().and_then(|e| e.to_str()) == Some("php") {
+            push_unique_path(&mut files, abs_dir);
         }
     }
     files
 }
 
 /// Recursively collect .php files from a directory.
-fn collect_php_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+fn collect_php_files_recursive(
+    dir: &Path,
+    root: &Path,
+    exclude_paths: &[PathBuf],
+    files: &mut Vec<PathBuf>,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -5785,6 +6060,9 @@ fn collect_php_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
 
     for entry in entries.flatten() {
         let path = entry.path();
+        if path_is_excluded(&path, root, exclude_paths) {
+            continue;
+        }
         if path.is_dir() {
             // Skip hidden directories and vendor
             let name = entry.file_name();
@@ -5792,9 +6070,9 @@ fn collect_php_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
             if name_str.starts_with('.') || name_str == "vendor" || name_str == "node_modules" {
                 continue;
             }
-            collect_php_files_recursive(&path, files);
+            collect_php_files_recursive(&path, root, exclude_paths, files);
         } else if path.extension().and_then(|e| e.to_str()) == Some("php") {
-            files.push(path);
+            push_unique_path(files, path);
         }
     }
 }
@@ -5924,6 +6202,22 @@ fn remove_indexed_files_under_roots(index: &WorkspaceIndex, roots: &[PathBuf]) -
                 .any(|root| path.starts_with(root))
                 .then(|| entry.key().clone())
         })
+        .collect();
+
+    let removed = uris.len();
+    for uri in uris {
+        index.remove_file(&uri);
+    }
+
+    removed
+}
+
+fn remove_indexed_file_symbols(index: &WorkspaceIndex) -> usize {
+    let uris: Vec<String> = index
+        .file_symbols
+        .iter()
+        .filter(|entry| entry.key().starts_with("file://"))
+        .map(|entry| entry.key().clone())
         .collect();
 
     let removed = uris.len();
@@ -6276,6 +6570,8 @@ async fn index_workspace(
     index: &WorkspaceIndex,
     root: &Path,
     namespace_map: Option<&NamespaceMap>,
+    include_paths: &[PathBuf],
+    exclude_paths: &[PathBuf],
     work_done_progress_supported: bool,
 ) -> std::result::Result<(), String> {
     let root_label = root.display().to_string();
@@ -6322,16 +6618,8 @@ async fn index_workspace(
     };
 
     // Collect PHP files
-    let php_files = if let Some(ns_map) = namespace_map {
-        let source_dirs = ns_map.source_directories();
-        if source_dirs.is_empty() {
-            collect_php_files(&[root], root)
-        } else {
-            collect_php_files(&source_dirs, root)
-        }
-    } else {
-        collect_php_files(&[root], root)
-    };
+    let source_dirs = workspace_index_directories(root, namespace_map, include_paths);
+    let php_files = collect_php_files(&source_dirs, root, exclude_paths);
 
     // Also add explicit files from composer.json
     let mut all_files = php_files;
@@ -6342,7 +6630,10 @@ async fn index_workspace(
             } else {
                 root.join(file_path)
             };
-            if abs.exists() && !all_files.contains(&abs) {
+            if abs.exists()
+                && !path_is_excluded(&abs, root, exclude_paths)
+                && !all_files.contains(&abs)
+            {
                 all_files.push(abs);
             }
         }
@@ -6735,6 +7026,8 @@ impl LanguageServer for PhpLspBackend {
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let php_version = *self.php_version.lock().await;
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
+        let include_paths = self.include_paths.lock().await.clone();
+        let exclude_paths = self.exclude_paths.lock().await.clone();
         tokio::spawn(async move {
             for config in &configs {
                 if let Err(e) = index_workspace(
@@ -6742,6 +7035,8 @@ impl LanguageServer for PhpLspBackend {
                     &index,
                     &config.root,
                     config.namespace_map.as_ref(),
+                    &include_paths,
+                    &exclude_paths,
                     work_done_progress_supported,
                 )
                 .await
@@ -6872,6 +7167,8 @@ impl LanguageServer for PhpLspBackend {
         let client = self.client.clone();
         let index = self.index.clone();
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
+        let include_paths = self.include_paths.lock().await.clone();
+        let exclude_paths = self.exclude_paths.lock().await.clone();
         tokio::spawn(async move {
             for config in &added_configs {
                 if let Err(e) = index_workspace(
@@ -6879,6 +7176,8 @@ impl LanguageServer for PhpLspBackend {
                     &index,
                     &config.root,
                     config.namespace_map.as_ref(),
+                    &include_paths,
+                    &exclude_paths,
                     work_done_progress_supported,
                 )
                 .await
@@ -6923,12 +7222,21 @@ impl LanguageServer for PhpLspBackend {
         parser.parse_full(text);
 
         // Update index with symbols from this file
-        if let Some(tree) = parser.tree() {
-            let file_symbols = extract_file_symbols(tree, text, &uri_str);
-            let sym_count = file_symbols.symbols.len();
-            self.index.update_file(&uri_str, file_symbols);
-            self.log_trace(&format!("Indexed {} symbols from {}", sym_count, uri_str))
-                .await;
+        let excluded = if let Some(path) = uri_to_path(&uri_str) {
+            self.path_is_excluded_by_config(&path).await
+        } else {
+            false
+        };
+        if !excluded {
+            if let Some(tree) = parser.tree() {
+                let file_symbols = extract_file_symbols(tree, text, &uri_str);
+                let sym_count = file_symbols.symbols.len();
+                self.index.update_file(&uri_str, file_symbols);
+                self.log_trace(&format!("Indexed {} symbols from {}", sym_count, uri_str))
+                    .await;
+            }
+        } else {
+            self.index.remove_file(&uri_str);
         }
 
         self.open_files.insert(uri_str, parser);
@@ -6941,6 +7249,12 @@ impl LanguageServer for PhpLspBackend {
         let uri_str = uri.as_str().to_string();
 
         tracing::debug!("didChange: {}", uri_str);
+
+        let excluded = if let Some(path) = uri_to_path(&uri_str) {
+            self.path_is_excluded_by_config(&path).await
+        } else {
+            false
+        };
 
         if let Some(mut parser) = self.open_files.get_mut(&uri_str) {
             for change in &params.content_changes {
@@ -6959,7 +7273,9 @@ impl LanguageServer for PhpLspBackend {
             }
 
             // Update index with new symbols
-            if let Some(tree) = parser.tree() {
+            if excluded {
+                self.index.remove_file(&uri_str);
+            } else if let Some(tree) = parser.tree() {
                 let source = parser.source();
                 let file_symbols = extract_file_symbols(tree, &source, &uri_str);
                 self.index.update_file(&uri_str, file_symbols);
@@ -7004,6 +7320,9 @@ impl LanguageServer for PhpLspBackend {
         let applied = self.apply_configuration_settings(&params.settings).await;
         if applied.stubs_changed {
             self.reload_configured_stubs().await;
+        }
+        if applied.indexing_changed {
+            self.reindex_workspaces().await;
         }
         if applied.diagnostics_changed || applied.stubs_changed {
             self.republish_open_diagnostics().await;
@@ -10685,6 +11004,51 @@ function nullableUnion(): string|null {
 
         let back = uri_to_path(&uri).unwrap();
         assert_eq!(back, path);
+    }
+
+    #[test]
+    fn test_path_is_excluded_matches_relative_directory() {
+        let root = PathBuf::from("/project");
+        let exclude_paths = normalize_config_paths(vec!["var/cache".to_string()]);
+
+        assert!(path_is_excluded(
+            Path::new("/project/var/cache/Generated.php"),
+            &root,
+            &exclude_paths
+        ));
+        assert!(!path_is_excluded(
+            Path::new("/project/src/Service.php"),
+            &root,
+            &exclude_paths
+        ));
+    }
+
+    #[test]
+    fn test_collect_php_files_uses_include_paths_and_excludes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "php-lsp-include-exclude-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = tmp.join("src");
+        let extra = tmp.join("extra");
+        let generated = extra.join("generated");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(src.join("App.php"), "<?php class App {}").unwrap();
+        std::fs::write(extra.join("Helper.php"), "<?php function helper() {}").unwrap();
+        std::fs::write(generated.join("Generated.php"), "<?php class Generated {}").unwrap();
+
+        let include_paths = vec![PathBuf::from("src"), PathBuf::from("extra")];
+        let exclude_paths = normalize_config_paths(vec!["extra/generated".to_string()]);
+        let mut files = collect_php_files(&include_paths, &tmp, &exclude_paths);
+        files.sort();
+
+        assert_eq!(files, vec![extra.join("Helper.php"), src.join("App.php")]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

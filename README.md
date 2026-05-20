@@ -74,7 +74,7 @@ phpstorm-stubs support.
 ### Workspace Support
 
 - Composer autoload support for PSR-4, PSR-0, classmap, and files entries.
-- Additional include paths from extension configuration.
+- Additional include and exclude paths from extension configuration.
 - Built-in phpstorm-stubs bundle with configurable extension stubs.
 - Lazy `vendor/` indexing.
 - Multi-root workspace support.
@@ -104,7 +104,8 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.enable` | `true` | Enable the language server. |
 | `phpLsp.phpVersion` | `8.2` | Target PHP version for diagnostics and version-aware refactors (`7.4`-`8.4`). |
 | `phpLsp.serverPath` | `""` | Custom server binary path. Empty uses the bundled binary. |
-| `phpLsp.includePaths` | `[]` | Additional directories to include in workspace indexing. |
+| `phpLsp.includePaths` | `[]` | Additional relative or absolute directories/files to include in workspace indexing. |
+| `phpLsp.excludePaths` | `[]` | Relative or absolute directories/files to exclude from workspace indexing. |
 | `phpLsp.stubs.extensions` | Common extensions | PHP stub extension set to index from the bundled stubs. |
 | `phpLsp.composer.enabled` | `true` | Enable `composer.json` autoload indexing. |
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |

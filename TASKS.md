@@ -755,3 +755,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Снизить false positive diagnostics, найденные полным прогоном `app/tests`.
 - [x] **T-2026-05-20** Обновить `README.md` с учетом текущего статуса и `Makefile`.
 - [x] **T-2026-05-20** Добавить VS Code status bar popup со статусом индексации и полезной информацией расширения.
+- [x] **T-2026-05-20** Добавить настройку `phpLsp.excludePaths` и учитывать ее при индексации.

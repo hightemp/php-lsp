@@ -60,6 +60,15 @@
           "scope": "resource",
           "description": "Additional paths to include in indexing"
         },
+        "phpLsp.excludePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "resource",
+          "description": "Relative or absolute paths to exclude from workspace indexing"
+        },
         "phpLsp.stubs.extensions": {
           "type": "array",
           "items": {

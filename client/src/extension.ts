@@ -57,6 +57,7 @@ interface ExtensionSnapshot {
   psalmEnabled: boolean;
   formattingProvider: string;
   includePaths: string[];
+  excludePaths: string[];
 }
 
 interface StatusQuickPickItem extends QuickPickItem {
@@ -135,6 +136,11 @@ class PhpLspStatusController implements Disposable {
         label: "$(list-tree) Include paths",
         description: `${snapshot.includePaths.length}`,
         detail: snapshot.includePaths.length > 0 ? snapshot.includePaths.join("; ") : "No additional include paths",
+      },
+      {
+        label: "$(exclude) Exclude paths",
+        description: `${snapshot.excludePaths.length}`,
+        detail: snapshot.excludePaths.length > 0 ? snapshot.excludePaths.join("; ") : "No excluded paths",
       },
       {
         label: "$(server-process) Server binary",
@@ -321,6 +327,7 @@ function getExtensionSnapshot(serverPath: string, stubsPath: string | undefined)
     psalmEnabled: config.get<boolean>("psalm.enabled", false),
     formattingProvider: config.get<string>("formatting.provider", "none"),
     includePaths: config.get<string[]>("includePaths", []),
+    excludePaths: config.get<string[]>("excludePaths", []),
   };
 }
 
@@ -410,6 +417,8 @@ export function activate(context: ExtensionContext): void {
       diagnosticsMode: config.get<string>("diagnostics.mode", "basic-semantic"),
       composerEnabled: config.get<boolean>("composer.enabled", true),
       indexVendor: config.get<boolean>("indexVendor", true),
+      includePaths: config.get<string[]>("includePaths", []),
+      excludePaths: config.get<string[]>("excludePaths", []),
       stubExtensions: config.get<string[]>("stubs.extensions", []),
       logLevel: config.get<string>("logLevel", "info"),
       formattingProvider: config.get<string>("formatting.provider", "none"),
