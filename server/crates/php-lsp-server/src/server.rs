@@ -395,53 +395,7 @@ impl PhpLspBackend {
     ///
     /// Walks the class hierarchy to find inherited members.
     fn resolve_member_type(&self, class_fqn: &str, member_name: &str) -> Option<String> {
-        // Build the member FQN to look up
-        let member_fqn = format!("{}::{}", class_fqn, member_name);
-        tracing::debug!("resolve_member_type: looking up {}", member_fqn);
-
-        // Try to resolve via the workspace index (includes inheritance walk)
-        let sym = match self.index.resolve_fqn(&member_fqn) {
-            Some(s) => s,
-            None => {
-                tracing::debug!("resolve_member_type: {} not found in index", member_fqn);
-                return None;
-            }
-        };
-
-        // Get the type from the signature
-        let sig = sym.signature.as_ref()?;
-        let ret = sig.return_type.as_ref()?;
-        let type_str = ret.to_string();
-        tracing::debug!(
-            "resolve_member_type: {} -> return type '{}'",
-            member_fqn,
-            type_str
-        );
-
-        if type_str.is_empty() || type_str == "mixed" {
-            return None;
-        }
-
-        // Strip nullable prefix for resolution
-        let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
-
-        // Handle self/static/$this return types → return the owning class FQN
-        if base_type == "self" || base_type == "static" || base_type == "$this" {
-            return Some(class_fqn.to_string());
-        }
-
-        // If it looks like an FQN already (contains \), return as-is
-        if base_type.contains('\\') {
-            return Some(base_type.to_string());
-        }
-
-        // Resolve the type name using the member's file's use statements
-        if let Some(file_syms) = self.index.file_symbols.get(&sym.uri) {
-            let resolved = php_lsp_parser::resolve::resolve_class_name(base_type, &file_syms);
-            Some(resolved)
-        } else {
-            Some(base_type.to_string())
-        }
+        resolve_member_type_from_index(&self.index, class_fqn, member_name)
     }
 
     /// Resolve a FQN, falling back to lazy vendor indexing if not found.
@@ -800,9 +754,16 @@ impl PhpLspBackend {
         }
 
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let php_version = *self.php_version.lock().await;
         let diagnostics = {
             if let Some(parser) = self.open_files.get(&uri_str) {
-                compute_diagnostics(&uri_str, &parser, &self.index, diagnostics_mode)
+                compute_diagnostics(
+                    &uri_str,
+                    &parser,
+                    &self.index,
+                    diagnostics_mode,
+                    php_version,
+                )
             } else {
                 vec![]
             }
@@ -2322,6 +2283,7 @@ fn compute_diagnostics(
     parser: &FileParser,
     index: &WorkspaceIndex,
     diagnostics_mode: DiagnosticsMode,
+    php_version: PhpVersion,
 ) -> Vec<Diagnostic> {
     if diagnostics_mode == DiagnosticsMode::Off {
         return vec![];
@@ -2394,7 +2356,1262 @@ fn compute_diagnostics(
         });
     }
 
+    diagnostics.extend(workspace_duplicate_symbol_diagnostics(
+        uri_str,
+        &file_symbols,
+        index,
+        &utf16_index,
+    ));
+    diagnostics.extend(member_access_diagnostics(
+        tree,
+        &source,
+        &file_symbols,
+        index,
+        &utf16_index,
+    ));
+    diagnostics.extend(type_compatibility_diagnostics(
+        tree,
+        &source,
+        &file_symbols,
+        index,
+        &utf16_index,
+    ));
+    diagnostics.extend(override_signature_diagnostics(
+        &file_symbols,
+        index,
+        &utf16_index,
+    ));
+    diagnostics.extend(php_version_type_diagnostics(
+        tree,
+        &source,
+        php_version,
+        &utf16_index,
+    ));
+
     diagnostics
+}
+
+fn diagnostic_at_byte_range(
+    range: (u32, u32, u32, u32),
+    utf16_index: &Utf16LineIndex,
+    message: String,
+) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position::new(range.0, utf16_index.byte_col_to_utf16(range.0, range.1)),
+            end: Position::new(range.2, utf16_index.byte_col_to_utf16(range.2, range.3)),
+        },
+        severity: Some(DiagnosticSeverity::WARNING),
+        source: Some("php-lsp".to_string()),
+        message,
+        ..Default::default()
+    }
+}
+
+fn member_access_diagnostics(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    walk_member_access_diagnostics(
+        tree,
+        tree.root_node(),
+        source,
+        file_symbols,
+        index,
+        utf16_index,
+        &mut diagnostics,
+    );
+    diagnostics
+}
+
+fn walk_member_access_diagnostics(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if matches!(
+        node.kind(),
+        "member_access_expression"
+            | "member_call_expression"
+            | "scoped_call_expression"
+            | "scoped_property_access_expression"
+            | "class_constant_access_expression"
+    ) {
+        check_member_access_node(
+            tree,
+            node,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        );
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_member_access_diagnostics(
+            tree,
+            child,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        );
+    }
+}
+
+fn check_member_access_node(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(name_node) = member_reference_name_node(node) else {
+        return;
+    };
+    let pos = name_node.start_position();
+    let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+        resolve_member_type_from_index(index, class_fqn, member_name)
+    };
+    let Some(sym_at_pos) = symbol_at_position_with_resolver(
+        tree,
+        source,
+        pos.row as u32,
+        pos.column as u32,
+        file_symbols,
+        Some(&member_type_resolver),
+    ) else {
+        return;
+    };
+
+    if !matches!(
+        sym_at_pos.ref_kind,
+        RefKind::MethodCall
+            | RefKind::PropertyAccess
+            | RefKind::StaticPropertyAccess
+            | RefKind::ClassConstant
+    ) || !sym_at_pos.fqn.contains("::")
+    {
+        return;
+    }
+
+    let Some(resolved) = index.resolve_fqn(&sym_at_pos.fqn) else {
+        diagnostics.push(member_diagnostic(
+            &sym_at_pos,
+            utf16_index,
+            unknown_member_message(&sym_at_pos),
+        ));
+        return;
+    };
+
+    if let Some(message) = static_instance_misuse_message(node.kind(), &resolved) {
+        diagnostics.push(member_diagnostic(&sym_at_pos, utf16_index, message));
+    }
+
+    if let Some(message) =
+        visibility_violation_message(index, &resolved, file_symbols, sym_at_pos.range)
+    {
+        diagnostics.push(member_diagnostic(&sym_at_pos, utf16_index, message));
+    }
+}
+
+fn member_reference_name_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    node.child_by_field_name("name").or_else(|| {
+        if node.kind() == "class_constant_access_expression" {
+            node.named_child(1)
+        } else {
+            None
+        }
+    })
+}
+
+fn member_diagnostic(
+    sym_at_pos: &SymbolAtPosition,
+    utf16_index: &Utf16LineIndex,
+    message: String,
+) -> Diagnostic {
+    diagnostic_at_byte_range(sym_at_pos.range, utf16_index, message)
+}
+
+fn unknown_member_message(sym_at_pos: &SymbolAtPosition) -> String {
+    match sym_at_pos.ref_kind {
+        RefKind::MethodCall => format!("Unknown method: {}", sym_at_pos.fqn),
+        RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {
+            format!("Unknown property: {}", sym_at_pos.fqn)
+        }
+        RefKind::ClassConstant => format!("Unknown class constant: {}", sym_at_pos.fqn),
+        _ => format!("Unknown member: {}", sym_at_pos.fqn),
+    }
+}
+
+fn static_instance_misuse_message(
+    node_kind: &str,
+    sym: &php_lsp_types::SymbolInfo,
+) -> Option<String> {
+    match sym.kind {
+        php_lsp_types::PhpSymbolKind::Method => match (node_kind, sym.modifiers.is_static) {
+            ("member_call_expression", true) => Some(format!(
+                "Static method called as instance method: {}",
+                sym.fqn
+            )),
+            ("scoped_call_expression", false) => {
+                Some(format!("Instance method called statically: {}", sym.fqn))
+            }
+            _ => None,
+        },
+        php_lsp_types::PhpSymbolKind::Property => match (node_kind, sym.modifiers.is_static) {
+            ("member_access_expression", true) => Some(format!(
+                "Static property accessed as instance property: {}",
+                sym.fqn
+            )),
+            ("scoped_property_access_expression", false) => Some(format!(
+                "Instance property accessed statically: {}",
+                sym.fqn
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn visibility_violation_message(
+    index: &WorkspaceIndex,
+    sym: &php_lsp_types::SymbolInfo,
+    file_symbols: &php_lsp_types::FileSymbols,
+    access_range: (u32, u32, u32, u32),
+) -> Option<String> {
+    let declaring_class = sym.parent_fqn.as_deref()?;
+    match sym.visibility {
+        php_lsp_types::Visibility::Public => None,
+        php_lsp_types::Visibility::Private => {
+            let current_class = current_class_fqn_at_range(file_symbols, access_range);
+            (current_class.as_deref() != Some(declaring_class))
+                .then(|| format!("Private member is not accessible here: {}", sym.fqn))
+        }
+        php_lsp_types::Visibility::Protected => {
+            let current_class = current_class_fqn_at_range(file_symbols, access_range);
+            let accessible = current_class.as_deref().is_some_and(|current| {
+                class_can_access_protected_member(index, current, declaring_class)
+            });
+            (!accessible).then(|| format!("Protected member is not accessible here: {}", sym.fqn))
+        }
+    }
+}
+
+fn current_class_fqn_at_range(
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<String> {
+    file_symbols
+        .symbols
+        .iter()
+        .find(|sym| {
+            matches!(
+                sym.kind,
+                php_lsp_types::PhpSymbolKind::Class
+                    | php_lsp_types::PhpSymbolKind::Interface
+                    | php_lsp_types::PhpSymbolKind::Trait
+                    | php_lsp_types::PhpSymbolKind::Enum
+            ) && byte_range_contains(sym.range, range)
+        })
+        .map(|sym| sym.fqn.clone())
+}
+
+fn class_can_access_protected_member(
+    index: &WorkspaceIndex,
+    current_class: &str,
+    declaring_class: &str,
+) -> bool {
+    if current_class == declaring_class {
+        return true;
+    }
+    class_extends_or_implements(index, current_class, declaring_class, &mut Vec::new())
+}
+
+fn class_extends_or_implements(
+    index: &WorkspaceIndex,
+    current_class: &str,
+    target_class: &str,
+    visited: &mut Vec<String>,
+) -> bool {
+    if visited.iter().any(|visited| visited == current_class) {
+        return false;
+    }
+    visited.push(current_class.to_string());
+
+    let Some(class_sym) = index
+        .types
+        .get(current_class)
+        .map(|entry| entry.value().clone())
+    else {
+        return false;
+    };
+
+    class_sym
+        .extends
+        .iter()
+        .chain(class_sym.implements.iter())
+        .any(|parent| {
+            parent == target_class
+                || class_extends_or_implements(index, parent, target_class, visited)
+        })
+}
+
+fn byte_range_contains(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {
+    (inner.0 > outer.0 || (inner.0 == outer.0 && inner.1 >= outer.1))
+        && (inner.2 < outer.2 || (inner.2 == outer.2 && inner.3 <= outer.3))
+}
+
+#[derive(Debug, Clone)]
+struct InferredExprType {
+    display: String,
+    comparable: String,
+    range: (u32, u32, u32, u32),
+}
+
+fn type_compatibility_diagnostics(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    walk_type_compatibility_diagnostics(
+        tree,
+        tree.root_node(),
+        source,
+        file_symbols,
+        index,
+        utf16_index,
+        &mut diagnostics,
+    );
+    diagnostics
+}
+
+fn walk_type_compatibility_diagnostics(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match node.kind() {
+        "function_call_expression" => check_function_call_type_compatibility(
+            tree,
+            node,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        ),
+        "member_call_expression" | "scoped_call_expression" => {
+            check_member_call_type_compatibility(
+                tree,
+                node,
+                source,
+                file_symbols,
+                index,
+                utf16_index,
+                diagnostics,
+            )
+        }
+        "object_creation_expression" => check_constructor_type_compatibility(
+            tree,
+            node,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        ),
+        "return_statement" => check_return_type_compatibility(
+            node,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        ),
+        "assignment_expression" => check_property_assignment_type_compatibility(
+            tree,
+            node,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        ),
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_type_compatibility_diagnostics(
+            tree,
+            child,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        );
+    }
+}
+
+fn check_function_call_type_compatibility(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(name_node) = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))
+    else {
+        return;
+    };
+    let Some((_, sym)) =
+        resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)
+    else {
+        return;
+    };
+
+    if sym.kind == php_lsp_types::PhpSymbolKind::Function {
+        check_call_argument_types(
+            node,
+            &sym,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        );
+    }
+}
+
+fn check_member_call_type_compatibility(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(name_node) = member_reference_name_node(node) else {
+        return;
+    };
+    let Some((_, sym)) =
+        resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)
+    else {
+        return;
+    };
+
+    if sym.kind == php_lsp_types::PhpSymbolKind::Method {
+        check_call_argument_types(
+            node,
+            &sym,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        );
+    }
+}
+
+fn check_constructor_type_compatibility(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(name_node) = object_creation_class_node(node) else {
+        return;
+    };
+    let Some((_, sym)) =
+        resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)
+    else {
+        return;
+    };
+
+    if sym.kind == php_lsp_types::PhpSymbolKind::Method && sym.name == "__construct" {
+        check_call_argument_types(
+            node,
+            &sym,
+            source,
+            file_symbols,
+            index,
+            utf16_index,
+            diagnostics,
+        );
+    }
+}
+
+fn check_call_argument_types(
+    call_node: tree_sitter::Node,
+    callable: &php_lsp_types::SymbolInfo,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(signature) = callable.signature.as_ref() else {
+        return;
+    };
+
+    let arguments = call_argument_nodes(call_node);
+    for (arg_index, arg_node) in arguments.into_iter().enumerate() {
+        let Some(param) = signature_param_for_arg(signature, arg_index) else {
+            continue;
+        };
+        let Some(expected) = param.type_info.as_ref() else {
+            continue;
+        };
+        let Some(actual) = infer_expression_type(arg_node, source, file_symbols) else {
+            continue;
+        };
+
+        if !type_info_accepts_inferred_type(expected, &actual, index) {
+            diagnostics.push(diagnostic_at_byte_range(
+                actual.range,
+                utf16_index,
+                format!(
+                    "Type mismatch for {} argument ${}: expected {}, got {}",
+                    callable.fqn, param.name, expected, actual.display
+                ),
+            ));
+        }
+    }
+}
+
+fn check_return_type_compatibility(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(expr_node) = return_expression_node(node) else {
+        return;
+    };
+    let Some(callable) = containing_callable_symbol(file_symbols, node_range_node(node)) else {
+        return;
+    };
+    let Some(signature) = callable.signature.as_ref() else {
+        return;
+    };
+    let Some(expected) = signature.return_type.as_ref() else {
+        return;
+    };
+    if matches!(
+        expected,
+        php_lsp_types::TypeInfo::Void | php_lsp_types::TypeInfo::Mixed
+    ) {
+        return;
+    }
+    let Some(actual) = infer_expression_type(expr_node, source, file_symbols) else {
+        return;
+    };
+
+    if !type_info_accepts_inferred_type(expected, &actual, index) {
+        diagnostics.push(diagnostic_at_byte_range(
+            actual.range,
+            utf16_index,
+            format!(
+                "Return type mismatch in {}: expected {}, got {}",
+                callable.fqn, expected, actual.display
+            ),
+        ));
+    }
+}
+
+fn check_property_assignment_type_compatibility(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(left_node) = node
+        .child_by_field_name("left")
+        .or_else(|| node.named_child(0))
+    else {
+        return;
+    };
+    if !matches!(
+        left_node.kind(),
+        "member_access_expression" | "scoped_property_access_expression"
+    ) {
+        return;
+    }
+    let Some(right_node) = node
+        .child_by_field_name("right")
+        .or_else(|| node.named_child(1))
+    else {
+        return;
+    };
+    let Some(name_node) = member_reference_name_node(left_node) else {
+        return;
+    };
+    let Some((_, property)) =
+        resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)
+    else {
+        return;
+    };
+
+    if property.kind != php_lsp_types::PhpSymbolKind::Property {
+        return;
+    }
+    let Some(expected) = property
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.return_type.as_ref())
+    else {
+        return;
+    };
+    let Some(actual) = infer_expression_type(right_node, source, file_symbols) else {
+        return;
+    };
+
+    if !type_info_accepts_inferred_type(expected, &actual, index) {
+        diagnostics.push(diagnostic_at_byte_range(
+            actual.range,
+            utf16_index,
+            format!(
+                "Property assignment type mismatch for {}: expected {}, got {}",
+                property.fqn, expected, actual.display
+            ),
+        ));
+    }
+}
+
+fn resolve_reference_symbol_at_node(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    node: tree_sitter::Node,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+) -> Option<(SymbolAtPosition, Arc<php_lsp_types::SymbolInfo>)> {
+    let pos = node.start_position();
+    let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+        resolve_member_type_from_index(index, class_fqn, member_name)
+    };
+    let sym_at_pos = symbol_at_position_with_resolver(
+        tree,
+        source,
+        pos.row as u32,
+        pos.column as u32,
+        file_symbols,
+        Some(&member_type_resolver),
+    )?;
+    let resolved = index.resolve_fqn(&sym_at_pos.fqn)?;
+    Some((sym_at_pos, resolved))
+}
+
+fn call_argument_nodes(call_node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
+    let Some(arguments) = call_node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = call_node.walk();
+        let arguments = call_node
+            .children(&mut cursor)
+            .find(|child| child.kind() == "arguments");
+        arguments
+    }) else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    let mut cursor = arguments.walk();
+    for child in arguments.named_children(&mut cursor) {
+        if child.kind() == "argument" {
+            result.push(argument_value_node(child).unwrap_or(child));
+        }
+    }
+    result
+}
+
+fn argument_value_node(argument: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    argument.child_by_field_name("value").or_else(|| {
+        let mut cursor = argument.walk();
+        argument.named_children(&mut cursor).last()
+    })
+}
+
+fn signature_param_for_arg(
+    signature: &php_lsp_types::Signature,
+    arg_index: usize,
+) -> Option<&php_lsp_types::ParamInfo> {
+    signature
+        .params
+        .get(arg_index)
+        .or_else(|| signature.params.last().filter(|param| param.is_variadic))
+}
+
+fn return_expression_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    node.child_by_field_name("value")
+        .or_else(|| node.named_child(0))
+}
+
+fn object_creation_class_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut cursor = node.walk();
+    let class_node = node.named_children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "name" | "qualified_name" | "namespace_name" | "relative_scope"
+        )
+    });
+    class_node
+}
+
+fn containing_callable_symbol(
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&php_lsp_types::SymbolInfo> {
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|sym| {
+            matches!(
+                sym.kind,
+                php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+            ) && byte_range_contains(sym.range, range)
+        })
+        .min_by_key(|sym| {
+            (
+                sym.range.2.saturating_sub(sym.range.0),
+                sym.range.3.saturating_sub(sym.range.1),
+            )
+        })
+}
+
+fn infer_expression_type(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<InferredExprType> {
+    let node = normalized_expression_node(node);
+    let raw = source[node.byte_range()].trim();
+    let lower = raw.to_ascii_lowercase();
+    let kind = node.kind();
+    let range = node_range_node(node);
+
+    if kind == "object_creation_expression" {
+        let class_node = object_creation_class_node(node)?;
+        let class_name = source[class_node.byte_range()].trim();
+        let fqn = resolve_class_name_pub(class_name, file_symbols);
+        return Some(InferredExprType {
+            display: fqn.clone(),
+            comparable: fqn,
+            range,
+        });
+    }
+
+    if lower == "null" {
+        return Some(inferred_builtin_type("null", range));
+    }
+    if lower == "true" || lower == "false" {
+        return Some(inferred_builtin_type(&lower, range));
+    }
+    if raw.starts_with('"') || raw.starts_with('\'') || kind.contains("string") {
+        return Some(inferred_builtin_type("string", range));
+    }
+    if kind.contains("array") || raw.starts_with('[') || lower.starts_with("array(") {
+        return Some(inferred_builtin_type("array", range));
+    }
+
+    let numeric = lower.trim_start_matches(['+', '-']);
+    if kind.contains("float") || numeric.parse::<f64>().is_ok() && numeric.contains('.') {
+        return Some(inferred_builtin_type("float", range));
+    }
+    if kind.contains("integer") || numeric.parse::<i64>().is_ok() {
+        return Some(inferred_builtin_type("int", range));
+    }
+
+    None
+}
+
+fn normalized_expression_node(mut node: tree_sitter::Node) -> tree_sitter::Node {
+    loop {
+        match node.kind() {
+            "argument" => {
+                let Some(inner) = argument_value_node(node) else {
+                    return node;
+                };
+                node = inner;
+            }
+            "parenthesized_expression" | "unary_op_expression" => {
+                let Some(inner) = node.named_child(0) else {
+                    return node;
+                };
+                node = inner;
+            }
+            _ => return node,
+        }
+    }
+}
+
+fn inferred_builtin_type(name: &str, range: (u32, u32, u32, u32)) -> InferredExprType {
+    InferredExprType {
+        display: name.to_string(),
+        comparable: name.to_string(),
+        range,
+    }
+}
+
+fn type_info_accepts_inferred_type(
+    expected: &php_lsp_types::TypeInfo,
+    actual: &InferredExprType,
+    index: &WorkspaceIndex,
+) -> bool {
+    match expected {
+        php_lsp_types::TypeInfo::Mixed => true,
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            actual.comparable == "null" || type_info_accepts_inferred_type(inner, actual, index)
+        }
+        php_lsp_types::TypeInfo::Union(types) => types
+            .iter()
+            .any(|type_info| type_info_accepts_inferred_type(type_info, actual, index)),
+        php_lsp_types::TypeInfo::Intersection(_) => true,
+        php_lsp_types::TypeInfo::Simple(name) => {
+            simple_type_accepts_inferred_type(name, actual, index)
+        }
+        php_lsp_types::TypeInfo::Self_
+        | php_lsp_types::TypeInfo::Static_
+        | php_lsp_types::TypeInfo::Parent_ => true,
+        php_lsp_types::TypeInfo::Void | php_lsp_types::TypeInfo::Never => false,
+    }
+}
+
+fn simple_type_accepts_inferred_type(
+    expected: &str,
+    actual: &InferredExprType,
+    index: &WorkspaceIndex,
+) -> bool {
+    let expected_lower = expected.trim_start_matches('\\').to_ascii_lowercase();
+    let actual_lower = actual
+        .comparable
+        .trim_start_matches('\\')
+        .to_ascii_lowercase();
+
+    match expected_lower.as_str() {
+        "mixed" => true,
+        "string" => actual_lower == "string",
+        "int" => actual_lower == "int",
+        "float" => actual_lower == "float" || actual_lower == "int",
+        "bool" => matches!(actual_lower.as_str(), "bool" | "true" | "false"),
+        "false" => actual_lower == "false",
+        "true" => actual_lower == "true",
+        "null" => actual_lower == "null",
+        "array" => actual_lower == "array",
+        "iterable" => actual_lower == "array",
+        "object" => !is_builtin_comparable_type(&actual_lower),
+        "callable" => true,
+        "void" | "never" => false,
+        _ => {
+            let expected_fqn = expected.trim_start_matches('\\');
+            let actual_fqn = actual.comparable.trim_start_matches('\\');
+            expected_fqn == actual_fqn
+                || class_extends_or_implements(index, actual_fqn, expected_fqn, &mut Vec::new())
+        }
+    }
+}
+
+fn is_builtin_comparable_type(name: &str) -> bool {
+    matches!(
+        name,
+        "array" | "bool" | "false" | "float" | "int" | "null" | "string" | "true"
+    )
+}
+
+fn node_range_node(node: tree_sitter::Node) -> (u32, u32, u32, u32) {
+    let start = node.start_position();
+    let end = node.end_position();
+    (
+        start.row as u32,
+        start.column as u32,
+        end.row as u32,
+        end.column as u32,
+    )
+}
+
+fn override_signature_diagnostics(
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for class_sym in file_symbols.symbols.iter().filter(|sym| {
+        matches!(
+            sym.kind,
+            php_lsp_types::PhpSymbolKind::Class
+                | php_lsp_types::PhpSymbolKind::Interface
+                | php_lsp_types::PhpSymbolKind::Trait
+        )
+    }) {
+        let child_methods: Vec<_> = file_symbols
+            .symbols
+            .iter()
+            .filter(|sym| {
+                sym.kind == php_lsp_types::PhpSymbolKind::Method
+                    && sym.parent_fqn.as_deref() == Some(class_sym.fqn.as_str())
+            })
+            .collect();
+
+        for child_method in child_methods {
+            let mut reported = false;
+            for parent_fqn in class_sym.extends.iter().chain(class_sym.implements.iter()) {
+                let parent_member_fqn = format!("{}::{}", parent_fqn, child_method.name);
+                let Some(parent_method) = index.resolve_fqn(&parent_member_fqn) else {
+                    continue;
+                };
+                if parent_method.kind != php_lsp_types::PhpSymbolKind::Method {
+                    continue;
+                }
+                if !override_signatures_are_compatible(child_method, &parent_method) {
+                    diagnostics.push(diagnostic_at_byte_range(
+                        child_method.selection_range,
+                        utf16_index,
+                        format!(
+                            "Incompatible override signature: {} differs from {}",
+                            child_method.fqn, parent_method.fqn
+                        ),
+                    ));
+                    reported = true;
+                    break;
+                }
+            }
+            if reported {
+                continue;
+            }
+        }
+    }
+
+    diagnostics
+}
+
+fn override_signatures_are_compatible(
+    child_method: &php_lsp_types::SymbolInfo,
+    parent_method: &php_lsp_types::SymbolInfo,
+) -> bool {
+    let (Some(child_sig), Some(parent_sig)) = (
+        child_method.signature.as_ref(),
+        parent_method.signature.as_ref(),
+    ) else {
+        return true;
+    };
+
+    if child_sig.params.len() != parent_sig.params.len() {
+        return false;
+    }
+
+    for (child_param, parent_param) in child_sig.params.iter().zip(parent_sig.params.iter()) {
+        if child_param.is_variadic != parent_param.is_variadic
+            || child_param.is_by_ref != parent_param.is_by_ref
+            || (parent_param.default_value.is_some() && child_param.default_value.is_none())
+            || child_param.type_info != parent_param.type_info
+        {
+            return false;
+        }
+    }
+
+    match (&child_sig.return_type, &parent_sig.return_type) {
+        (Some(child_return), Some(parent_return)) => child_return == parent_return,
+        (None, Some(_)) => false,
+        _ => true,
+    }
+}
+
+fn php_version_type_diagnostics(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    php_version: PhpVersion,
+    utf16_index: &Utf16LineIndex,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    walk_php_version_type_diagnostics(
+        tree.root_node(),
+        source,
+        php_version,
+        utf16_index,
+        &mut diagnostics,
+    );
+    diagnostics
+}
+
+fn walk_php_version_type_diagnostics(
+    node: tree_sitter::Node,
+    source: &str,
+    php_version: PhpVersion,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (field_name, is_return_type) in [("type", false), ("return_type", true)] {
+        if let Some(type_node) = node.child_by_field_name(field_name) {
+            check_declared_type_php_version(
+                type_node,
+                source,
+                php_version,
+                is_return_type,
+                utf16_index,
+                diagnostics,
+            );
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_php_version_type_diagnostics(child, source, php_version, utf16_index, diagnostics);
+    }
+}
+
+fn check_declared_type_php_version(
+    type_node: tree_sitter::Node,
+    source: &str,
+    php_version: PhpVersion,
+    is_return_type: bool,
+    utf16_index: &Utf16LineIndex,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let type_text = source[type_node.byte_range()].trim();
+    if declared_type_hint_is_supported(type_text, php_version, is_return_type) {
+        return;
+    }
+
+    diagnostics.push(diagnostic_at_byte_range(
+        node_range_node(type_node),
+        utf16_index,
+        format!(
+            "Type is not supported by PHP {}: {}",
+            php_version_label(php_version),
+            type_text
+        ),
+    ));
+}
+
+fn declared_type_hint_is_supported(
+    type_text: &str,
+    php_version: PhpVersion,
+    is_return_type: bool,
+) -> bool {
+    let trimmed = type_text.trim();
+    if let Some(inner) = trimmed.strip_prefix('?') {
+        return php_version.at_least(7, 1)
+            && !inner.contains(['|', '&'])
+            && simple_declared_type_hint_is_supported(inner, php_version, false, is_return_type);
+    }
+
+    if trimmed.contains('|') {
+        return php_version.at_least(8, 0)
+            && trimmed.split('|').all(|part| {
+                let part = part.trim();
+                !matches!(part.to_ascii_lowercase().as_str(), "void" | "never")
+                    && simple_declared_type_hint_is_supported(
+                        part,
+                        php_version,
+                        true,
+                        is_return_type,
+                    )
+            });
+    }
+
+    if trimmed.contains('&') {
+        return php_version.at_least(8, 1)
+            && trimmed
+                .split('&')
+                .all(|part| intersection_declared_type_hint_is_supported(part.trim()));
+    }
+
+    simple_declared_type_hint_is_supported(trimmed, php_version, false, is_return_type)
+}
+
+fn simple_declared_type_hint_is_supported(
+    type_text: &str,
+    php_version: PhpVersion,
+    in_union: bool,
+    is_return_type: bool,
+) -> bool {
+    let lower = type_text
+        .trim()
+        .trim_start_matches('\\')
+        .to_ascii_lowercase();
+    match lower.as_str() {
+        "" => false,
+        "void" => is_return_type && php_version.at_least(7, 1),
+        "never" => is_return_type && php_version.at_least(8, 1),
+        "mixed" => php_version.at_least(8, 0),
+        "static" => is_return_type && php_version.at_least(8, 0),
+        "false" | "null" => {
+            if in_union {
+                php_version.at_least(8, 0)
+            } else {
+                php_version.at_least(8, 2)
+            }
+        }
+        "true" => php_version.at_least(8, 2),
+        "resource" => false,
+        _ => true,
+    }
+}
+
+fn intersection_declared_type_hint_is_supported(type_text: &str) -> bool {
+    let lower = type_text
+        .trim()
+        .trim_start_matches('\\')
+        .to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "" | "array"
+            | "bool"
+            | "callable"
+            | "false"
+            | "float"
+            | "int"
+            | "iterable"
+            | "mixed"
+            | "never"
+            | "null"
+            | "object"
+            | "resource"
+            | "string"
+            | "true"
+            | "void"
+    )
+}
+
+fn php_version_label(php_version: PhpVersion) -> String {
+    format!("{}.{}", php_version.major, php_version.minor)
+}
+
+fn workspace_duplicate_symbol_diagnostics(
+    uri_str: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    utf16_index: &Utf16LineIndex,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for sym in &file_symbols.symbols {
+        if sym.modifiers.is_builtin || !is_duplicate_checked_symbol_kind(sym.kind) {
+            continue;
+        }
+
+        let has_duplicate = index.file_symbols.iter().any(|entry| {
+            entry.value().symbols.iter().any(|other| {
+                other.kind == sym.kind
+                    && other.fqn == sym.fqn
+                    && !other.modifiers.is_builtin
+                    && (entry.key().as_str() != uri_str
+                        || other.selection_range != sym.selection_range)
+            })
+        });
+
+        if has_duplicate {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(
+                        sym.selection_range.0,
+                        utf16_index.byte_col_to_utf16(sym.selection_range.0, sym.selection_range.1),
+                    ),
+                    end: Position::new(
+                        sym.selection_range.2,
+                        utf16_index.byte_col_to_utf16(sym.selection_range.2, sym.selection_range.3),
+                    ),
+                },
+                severity: Some(DiagnosticSeverity::WARNING),
+                source: Some("php-lsp".to_string()),
+                message: format!("Duplicate symbol: {}", sym.fqn),
+                ..Default::default()
+            });
+        }
+    }
+
+    diagnostics
+}
+
+fn is_duplicate_checked_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
+    matches!(
+        kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+            | php_lsp_types::PhpSymbolKind::Function
+            | php_lsp_types::PhpSymbolKind::GlobalConstant
+    )
+}
+
+fn resolve_member_type_from_index(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+) -> Option<String> {
+    let member_fqn = format!("{}::{}", class_fqn, member_name);
+    tracing::debug!("resolve_member_type: looking up {}", member_fqn);
+
+    let sym = match index.resolve_fqn(&member_fqn) {
+        Some(s) => s,
+        None => {
+            tracing::debug!("resolve_member_type: {} not found in index", member_fqn);
+            return None;
+        }
+    };
+
+    let sig = sym.signature.as_ref()?;
+    let ret = sig.return_type.as_ref()?;
+    let type_str = ret.to_string();
+    tracing::debug!(
+        "resolve_member_type: {} -> return type '{}'",
+        member_fqn,
+        type_str
+    );
+
+    if type_str.is_empty() || type_str == "mixed" {
+        return None;
+    }
+
+    let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
+    if base_type == "self" || base_type == "static" || base_type == "$this" {
+        return Some(class_fqn.to_string());
+    }
+    if base_type.contains('\\') {
+        return Some(base_type.to_string());
+    }
+
+    if let Some(file_syms) = index.file_symbols.get(&sym.uri) {
+        Some(php_lsp_parser::resolve::resolve_class_name(
+            base_type, &file_syms,
+        ))
+    } else {
+        Some(base_type.to_string())
+    }
 }
 
 /// Collect all .php files from the given directories.
@@ -3133,6 +4350,7 @@ impl LanguageServer for PhpLspBackend {
             let reindex_index = self.index.clone();
             let reindex_client = self.client.clone();
             let diagnostics_mode = *self.diagnostics_mode.lock().await;
+            let php_version = *self.php_version.lock().await;
             tokio::spawn(async move {
                 if let Err(e) =
                     index_workspace(&client, &index, &root, ns_map_storage.as_ref()).await
@@ -3148,8 +4366,13 @@ impl LanguageServer for PhpLspBackend {
                 for entry in open_files.iter() {
                     let uri_str = entry.key().clone();
                     if let Ok(uri) = uri_str.parse::<Uri>() {
-                        let diags =
-                            compute_diagnostics(&uri_str, &entry, &reindex_index, diagnostics_mode);
+                        let diags = compute_diagnostics(
+                            &uri_str,
+                            &entry,
+                            &reindex_index,
+                            diagnostics_mode,
+                            php_version,
+                        );
                         reindex_client.publish_diagnostics(uri, diags, None).await;
                     }
                 }
@@ -4957,10 +6180,16 @@ impl LanguageServer for PhpLspBackend {
                 None => return Ok(Some(vec![])),
             };
             let diagnostics_mode = *self.diagnostics_mode.lock().await;
-            compute_diagnostics(&uri_str, &parser, &self.index, diagnostics_mode)
-                .into_iter()
-                .filter(|diag| range_overlaps(diag.range, params.range))
-                .collect()
+            compute_diagnostics(
+                &uri_str,
+                &parser,
+                &self.index,
+                diagnostics_mode,
+                php_version,
+            )
+            .into_iter()
+            .filter(|diag| range_overlaps(diag.range, params.range))
+            .collect()
         } else {
             params.context.diagnostics
         };
@@ -5498,6 +6727,222 @@ mod tests {
         // Search for "xyz" should find nothing
         let results = index.search("xyz");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_compute_diagnostics_reports_duplicate_workspace_symbols() {
+        let uri1 = "file:///one.php";
+        let uri2 = "file:///two.php";
+        let code1 = "<?php\nnamespace App;\nclass Duplicate {}\n";
+        let code2 = "<?php\nnamespace App;\nclass Duplicate {}\n";
+
+        let mut parser1 = FileParser::new();
+        parser1.parse_full(code1);
+        let mut parser2 = FileParser::new();
+        parser2.parse_full(code2);
+
+        let index = WorkspaceIndex::new();
+        let symbols1 = extract_file_symbols(parser1.tree().unwrap(), code1, uri1);
+        let symbols2 = extract_file_symbols(parser2.tree().unwrap(), code2, uri2);
+        index.update_file(uri1, symbols1);
+        index.update_file(uri2, symbols2);
+
+        let diagnostics = compute_diagnostics(
+            uri1,
+            &parser1,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.message == "Duplicate symbol: App\\Duplicate"),
+            "Expected duplicate workspace symbol diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn test_compute_diagnostics_reports_member_access_errors() {
+        let uri = "file:///members.php";
+        let code = r#"<?php
+namespace App;
+
+class Service {
+    public string $name;
+    public static string $count;
+    private function hidden(): void {}
+    public static function stat(): void {}
+    public function inst(): void {}
+    public const OK = 'ok';
+}
+
+class Demo {
+    public function run(Service $service): void {
+        $service->missing();
+        echo $service->missingProp;
+        echo Service::MISSING;
+        $service->stat();
+        Service::inst();
+        echo $service->count;
+        echo Service::$name;
+        $service->hidden();
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for expected in [
+            "Unknown method: App\\Service::missing",
+            "Unknown property: App\\Service::$missingProp",
+            "Unknown class constant: App\\Service::MISSING",
+            "Static method called as instance method: App\\Service::stat",
+            "Instance method called statically: App\\Service::inst",
+            "Static property accessed as instance property: App\\Service::$count",
+            "Instance property accessed statically: App\\Service::$name",
+            "Private member is not accessible here: App\\Service::hidden",
+        ] {
+            assert!(
+                messages.contains(&expected),
+                "Expected `{}` in diagnostics, got: {:?}",
+                expected,
+                messages
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_reports_basic_type_mismatches() {
+        let uri = "file:///types.php";
+        let code = r#"<?php
+namespace App;
+
+function takesInt(int $value): void {}
+
+function returnsInt(): int {
+    return "bad";
+}
+
+class Box {
+    public int $count;
+
+    public function set(string $name): void {}
+}
+
+function run(Box $box): void {
+    takesInt("bad");
+    $box->set(123);
+    $box->count = "bad";
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for expected in [
+            "Type mismatch for App\\takesInt argument $value: expected int, got string",
+            "Return type mismatch in App\\returnsInt: expected int, got string",
+            "Type mismatch for App\\Box::set argument $name: expected string, got int",
+            "Property assignment type mismatch for App\\Box::$count: expected int, got string",
+        ] {
+            assert!(
+                messages.contains(&expected),
+                "Expected `{}` in diagnostics, got: {:?}",
+                expected,
+                messages
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_reports_override_and_php_version_errors() {
+        let uri = "file:///override.php";
+        let code = r#"<?php
+namespace App;
+
+class Base {
+    public function value(int $id): string {
+        return "";
+    }
+}
+
+class Child extends Base {
+    public function value(string $id): int {
+        return 1;
+    }
+}
+
+function nullableUnion(): string|null {
+    return null;
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion { major: 7, minor: 4 },
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for expected in [
+            "Incompatible override signature: App\\Child::value differs from App\\Base::value",
+            "Type is not supported by PHP 7.4: string|null",
+        ] {
+            assert!(
+                messages.contains(&expected),
+                "Expected `{}` in diagnostics, got: {:?}",
+                expected,
+                messages
+            );
+        }
     }
 
     #[test]

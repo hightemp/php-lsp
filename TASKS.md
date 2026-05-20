@@ -537,13 +537,13 @@
 
 ### Diagnostics parity
 
-- [ ] **V1-025** Расширить базовые diagnostics
+- [x] **V1-025** Расширить базовые diagnostics *(done 2026-05-20)*
   - Undefined variables
   - Unused imports
   - Unused local variables/parameters
   - Duplicate symbols в workspace
 
-- [ ] **V1-026** Type/member diagnostics
+- [x] **V1-026** Type/member diagnostics *(done 2026-05-20)*
   - Unknown method/property/class constant
   - Visibility violations: private/protected access
   - Static/instance misuse
@@ -686,8 +686,8 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-016 / V1-022** `workspace/didChangeWatchedFiles` and incremental reindex
 - [x] **LP-017 / V1-023** `workspace/didChangeConfiguration` and real config application
 - [x] **LP-018 / V1-024** Workspace file operations: create, rename, delete
-- [ ] **LP-019 / V1-025** Basic diagnostics parity: undefined/unused/duplicate symbols
-- [ ] **LP-020 / V1-026** Type/member diagnostics: unknown members, visibility, static misuse, type compatibility
+- [x] **LP-019 / V1-025** Basic diagnostics parity: undefined/unused/duplicate symbols
+- [x] **LP-020 / V1-026** Type/member diagnostics: unknown members, visibility, static misuse, type compatibility
 - [ ] **LP-021 / VN-001** `textDocument/inlayHint`
 - [ ] **LP-022 / VN-002** `textDocument/prepareCallHierarchy` + incoming/outgoing calls
 - [ ] **LP-023 / VN-003** `textDocument/prepareTypeHierarchy` + supertypes/subtypes
@@ -728,3 +728,5 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-19** Реализовать `LP-016 / V1-022` `workspace/didChangeWatchedFiles`.
 - [x] **T-2026-05-19** Реализовать `LP-017 / V1-023` `workspace/didChangeConfiguration`.
 - [x] **T-2026-05-19** Реализовать `LP-018 / V1-024` Workspace file operations.
+- [x] **T-2026-05-20** Реализовать `LP-019 / V1-025` Basic diagnostics parity.
+- [x] **T-2026-05-20** Реализовать `LP-020 / V1-026` Type/member diagnostics.

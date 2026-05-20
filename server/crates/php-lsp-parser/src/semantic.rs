@@ -4,6 +4,7 @@
 //! against a resolver function (typically backed by the workspace index).
 
 use php_lsp_types::{FileSymbols, SymbolInfo, UseKind};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Tree;
 
@@ -29,6 +30,16 @@ pub enum SemanticDiagnosticKind {
     UnresolvedUse,
     /// Wrong number of arguments in a call.
     ArgumentCountMismatch,
+    /// Variable is read before it is declared in the current scope.
+    UndefinedVariable,
+    /// Imported symbol is not used in the file.
+    UnusedImport,
+    /// Local variable is declared but not read.
+    UnusedVariable,
+    /// Function/method parameter is declared but not read.
+    UnusedParameter,
+    /// Symbol is declared more than once in the same file.
+    DuplicateSymbol,
 }
 
 /// Names that should not be reported as unknown (PHP built-in types, special names).
@@ -58,6 +69,9 @@ where
 
     // Walk CST for class and function references
     walk_node_for_diagnostics(root, source, file_symbols, &resolver, &mut diagnostics);
+    check_unused_imports(root, source, file_symbols, &mut diagnostics);
+    check_variable_diagnostics(root, source, &mut diagnostics);
+    check_duplicate_symbols_in_file(file_symbols, &mut diagnostics);
 
     diagnostics
 }
@@ -528,6 +542,375 @@ fn count_arguments(node: tree_sitter::Node) -> usize {
         }
     }
     0
+}
+
+fn check_unused_imports(
+    root: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) {
+    for use_stmt in &file_symbols.use_statements {
+        let imported_name = use_stmt
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+
+        if imported_name.is_empty() {
+            continue;
+        }
+
+        if !import_name_is_used(root, source, imported_name, use_stmt.range) {
+            diagnostics.push(SemanticDiagnostic {
+                range: use_stmt.range,
+                message: format!("Unused import: {}", use_stmt.fqn),
+                kind: SemanticDiagnosticKind::UnusedImport,
+            });
+        }
+    }
+}
+
+fn import_name_is_used(
+    node: tree_sitter::Node,
+    source: &str,
+    imported_name: &str,
+    import_range: (u32, u32, u32, u32),
+) -> bool {
+    if range_contains(import_range, node_range(&node)) {
+        return false;
+    }
+
+    if matches!(node.kind(), "name" | "qualified_name" | "namespace_name") {
+        let text = &source[node.byte_range()];
+        if first_name_segment(text) == imported_name {
+            return true;
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if import_name_is_used(child, source, imported_name, import_range) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn first_name_segment(name: &str) -> &str {
+    name.trim_start_matches('\\')
+        .split('\\')
+        .next()
+        .unwrap_or(name)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VariableDeclarationKind {
+    Parameter,
+    Variable,
+    ClosureUse,
+}
+
+#[derive(Debug, Clone)]
+struct VariableOccurrence {
+    name: String,
+    range: (u32, u32, u32, u32),
+    start_byte: usize,
+    declaration_kind: Option<VariableDeclarationKind>,
+}
+
+type ByteRange = (u32, u32, u32, u32);
+type SymbolKey<'a> = (php_lsp_types::PhpSymbolKind, &'a str);
+
+fn check_variable_diagnostics(
+    root: tree_sitter::Node,
+    source: &str,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) {
+    check_variables_in_scope(root, source, diagnostics);
+}
+
+fn check_variables_in_scope(
+    scope: tree_sitter::Node,
+    source: &str,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) {
+    let mut occurrences = Vec::new();
+    collect_variable_occurrences(scope, scope.id(), source, &mut occurrences);
+    report_variable_diagnostics(&occurrences, is_variable_scope(scope), diagnostics);
+
+    let mut cursor = scope.walk();
+    for child in scope.named_children(&mut cursor) {
+        walk_nested_scopes(child, source, diagnostics);
+    }
+}
+
+fn walk_nested_scopes(
+    node: tree_sitter::Node,
+    source: &str,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) {
+    if is_variable_scope(node) {
+        check_variables_in_scope(node, source, diagnostics);
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_nested_scopes(child, source, diagnostics);
+    }
+}
+
+fn collect_variable_occurrences(
+    node: tree_sitter::Node,
+    scope_id: usize,
+    source: &str,
+    occurrences: &mut Vec<VariableOccurrence>,
+) {
+    if node.id() != scope_id && is_variable_scope(node) {
+        return;
+    }
+
+    if node.kind() == "variable_name" && !is_non_local_variable_context(node) {
+        let name = normalize_var_name(&source[node.byte_range()]);
+        if !is_ignorable_variable(&name) {
+            occurrences.push(VariableOccurrence {
+                name: name.clone(),
+                range: node_range(&node),
+                start_byte: node.start_byte(),
+                declaration_kind: variable_declaration_kind(node, source, &name),
+            });
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_variable_occurrences(child, scope_id, source, occurrences);
+    }
+}
+
+fn is_non_local_variable_context(node: tree_sitter::Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "property_declaration"
+            | "property_element"
+            | "scoped_property_access_expression"
+            | "member_access_expression" => return true,
+            "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function"
+            | "anonymous_function_creation_expression"
+            | "program" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
+}
+
+fn report_variable_diagnostics(
+    occurrences: &[VariableOccurrence],
+    report_unused_declarations: bool,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) {
+    let mut declared_by_name: HashMap<&str, Vec<&VariableOccurrence>> = HashMap::new();
+    let mut used_by_name: HashMap<&str, Vec<&VariableOccurrence>> = HashMap::new();
+
+    for occurrence in occurrences {
+        if occurrence.declaration_kind.is_some() {
+            declared_by_name
+                .entry(&occurrence.name)
+                .or_default()
+                .push(occurrence);
+        } else {
+            used_by_name
+                .entry(&occurrence.name)
+                .or_default()
+                .push(occurrence);
+        }
+    }
+
+    let mut reported_undefined = HashSet::new();
+    for occurrence in occurrences
+        .iter()
+        .filter(|occurrence| occurrence.declaration_kind.is_none())
+    {
+        let declared_before = declared_by_name
+            .get(occurrence.name.as_str())
+            .map(|decls| {
+                decls
+                    .iter()
+                    .any(|decl| decl.start_byte < occurrence.start_byte)
+            })
+            .unwrap_or(false);
+
+        if !declared_before && reported_undefined.insert(occurrence.name.clone()) {
+            diagnostics.push(SemanticDiagnostic {
+                range: occurrence.range,
+                message: format!("Undefined variable: {}", occurrence.name),
+                kind: SemanticDiagnosticKind::UndefinedVariable,
+            });
+        }
+    }
+
+    if !report_unused_declarations {
+        return;
+    }
+
+    for (name, declarations) in declared_by_name {
+        if name == "$this" {
+            continue;
+        }
+        let has_read = used_by_name.get(name).is_some_and(|uses| !uses.is_empty());
+        if has_read {
+            continue;
+        }
+
+        let Some(first_declaration) = declarations.first() else {
+            continue;
+        };
+        match first_declaration.declaration_kind {
+            Some(VariableDeclarationKind::Parameter) => diagnostics.push(SemanticDiagnostic {
+                range: first_declaration.range,
+                message: format!("Unused parameter: {}", first_declaration.name),
+                kind: SemanticDiagnosticKind::UnusedParameter,
+            }),
+            Some(VariableDeclarationKind::Variable) => diagnostics.push(SemanticDiagnostic {
+                range: first_declaration.range,
+                message: format!("Unused variable: {}", first_declaration.name),
+                kind: SemanticDiagnosticKind::UnusedVariable,
+            }),
+            Some(VariableDeclarationKind::ClosureUse) | None => {}
+        }
+    }
+}
+
+fn is_variable_scope(node: tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function"
+            | "anonymous_function_creation_expression"
+    )
+}
+
+fn variable_declaration_kind(
+    node: tree_sitter::Node,
+    source: &str,
+    var_name: &str,
+) -> Option<VariableDeclarationKind> {
+    let parent = node.parent()?;
+
+    match parent.kind() {
+        "simple_parameter" | "property_promotion_parameter" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id())
+            .then_some(VariableDeclarationKind::Parameter),
+        "assignment_expression" => parent
+            .child_by_field_name("left")
+            .is_some_and(|left| left.id() == node.id() || node_contains(left, node))
+            .then_some(VariableDeclarationKind::Variable),
+        "foreach_statement" => ["key", "value"]
+            .iter()
+            .any(|field| {
+                parent
+                    .child_by_field_name(field)
+                    .is_some_and(|field_node| field_node.id() == node.id())
+            })
+            .then_some(VariableDeclarationKind::Variable),
+        "catch_clause" => ["name", "variable"]
+            .iter()
+            .any(|field| {
+                parent
+                    .child_by_field_name(field)
+                    .is_some_and(|field_node| field_node.id() == node.id())
+            })
+            .then_some(VariableDeclarationKind::Variable),
+        "global_declaration" | "static_variable_declaration" => {
+            Some(VariableDeclarationKind::Variable)
+        }
+        "anonymous_function_use_clause" => Some(VariableDeclarationKind::ClosureUse),
+        _ if normalize_var_name(&source[parent.byte_range()]) == var_name
+            && matches!(
+                parent.kind(),
+                "assignment_expression" | "by_ref_assignment_expression"
+            ) =>
+        {
+            Some(VariableDeclarationKind::Variable)
+        }
+        _ => None,
+    }
+}
+
+fn node_contains(parent: tree_sitter::Node, child: tree_sitter::Node) -> bool {
+    parent.start_byte() <= child.start_byte() && parent.end_byte() >= child.end_byte()
+}
+
+fn normalize_var_name(text: &str) -> String {
+    if text.starts_with('$') {
+        text.to_string()
+    } else {
+        format!("${}", text)
+    }
+}
+
+fn is_ignorable_variable(name: &str) -> bool {
+    name == "$this"
+        || name == "$_"
+        || name.starts_with("$_")
+        || matches!(
+            name,
+            "$GLOBALS" | "$argc" | "$argv" | "$http_response_header" | "$HTTP_RAW_POST_DATA"
+        )
+}
+
+fn check_duplicate_symbols_in_file(
+    file_symbols: &FileSymbols,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) {
+    let mut seen: HashMap<SymbolKey<'_>, Vec<ByteRange>> = HashMap::new();
+
+    for sym in &file_symbols.symbols {
+        if !is_duplicate_checked_symbol(sym.kind) {
+            continue;
+        }
+        seen.entry((sym.kind, sym.fqn.as_str()))
+            .or_default()
+            .push(sym.selection_range);
+    }
+
+    for ((_, fqn), ranges) in seen {
+        if ranges.len() <= 1 {
+            continue;
+        }
+        for range in ranges {
+            diagnostics.push(SemanticDiagnostic {
+                range,
+                message: format!("Duplicate symbol: {}", fqn),
+                kind: SemanticDiagnosticKind::DuplicateSymbol,
+            });
+        }
+    }
+}
+
+fn is_duplicate_checked_symbol(kind: php_lsp_types::PhpSymbolKind) -> bool {
+    matches!(
+        kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+            | php_lsp_types::PhpSymbolKind::Function
+            | php_lsp_types::PhpSymbolKind::GlobalConstant
+    )
+}
+
+fn range_contains(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {
+    (inner.0 > outer.0 || (inner.0 == outer.0 && inner.1 >= outer.1))
+        && (inner.2 < outer.2 || (inner.2 == outer.2 && inner.3 <= outer.3))
 }
 
 /// Get range tuple from a node.
@@ -1054,5 +1437,100 @@ preg_replace_callback('/x/', function(){}, 'input');
             "Expected NO argument-count diagnostic for 3 args to preg_replace_callback (required prefix = 3), got: {:?}",
             arg_diags
         );
+    }
+
+    #[test]
+    fn test_unused_import_reports_only_unreferenced_alias() {
+        let code = r#"<?php
+namespace App;
+
+use Vendor\UsedService;
+use Vendor\UnusedService;
+
+new UsedService();
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+        let unused_imports: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::UnusedImport)
+            .collect();
+
+        assert_eq!(
+            unused_imports.len(),
+            1,
+            "Expected one unused import, got: {:?}",
+            unused_imports
+        );
+        assert!(unused_imports[0].message.contains("Vendor\\UnusedService"));
+    }
+
+    #[test]
+    fn test_undefined_variable_and_unused_local_diagnostics() {
+        let code = r#"<?php
+function run(string $used, string $unusedParam): void {
+    echo $missing;
+    $unusedLocal = 1;
+    $usedLocal = 2;
+    echo $used;
+    echo $usedLocal;
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && d.message.contains("$missing")
+            }),
+            "Expected undefined variable diagnostic, got: {:?}",
+            diags
+        );
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedParameter
+                    && d.message.contains("$unusedParam")
+            }),
+            "Expected unused parameter diagnostic, got: {:?}",
+            diags
+        );
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedVariable
+                    && d.message.contains("$unusedLocal")
+            }),
+            "Expected unused local diagnostic, got: {:?}",
+            diags
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("$usedLocal"))
+                && !diags.iter().any(|d| d.message.contains("$used")),
+            "Used variables/params should not be reported, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_duplicate_symbols_in_same_file() {
+        let code = r#"<?php
+namespace App;
+
+class Duplicate {}
+class Duplicate {}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+        let duplicates: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::DuplicateSymbol)
+            .collect();
+
+        assert_eq!(
+            duplicates.len(),
+            2,
+            "Expected both duplicate declarations to be reported, got: {:?}",
+            duplicates
+        );
+        assert!(duplicates
+            .iter()
+            .all(|d| d.message.contains("App\\Duplicate")));
     }
 }
