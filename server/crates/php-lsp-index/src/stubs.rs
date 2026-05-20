@@ -30,6 +30,7 @@ pub const DEFAULT_EXTENSIONS: &[&str] = &[
     "fileinfo",
     "pdo",
     "Reflection",
+    "random",
     "intl",
     "openssl",
     "zlib",

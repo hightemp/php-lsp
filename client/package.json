@@ -92,6 +92,7 @@
             "hash",
             "session",
             "Reflection",
+            "random",
             "intl",
             "fileinfo",
             "openssl",

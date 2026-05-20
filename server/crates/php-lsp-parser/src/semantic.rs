@@ -560,7 +560,9 @@ fn check_unused_imports(
             continue;
         }
 
-        if !import_name_is_used(root, source, imported_name, use_stmt.range) {
+        if !import_name_is_used(root, source, imported_name, use_stmt.range)
+            && !import_name_is_used_in_phpdoc(source, imported_name)
+        {
             diagnostics.push(SemanticDiagnostic {
                 range: use_stmt.range,
                 message: format!("Unused import: {}", use_stmt.fqn),
@@ -597,6 +599,43 @@ fn import_name_is_used(
     false
 }
 
+fn import_name_is_used_in_phpdoc(source: &str, imported_name: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(relative_start) = source[offset..].find("/**") {
+        let start = offset + relative_start;
+        let Some(relative_end) = source[start..].find("*/") else {
+            break;
+        };
+        let end = start + relative_end + 2;
+        if contains_identifier(&source[start..end], imported_name) {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+fn contains_identifier(source: &str, name: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(relative) = source[offset..].find(name) {
+        let start = offset + relative;
+        let end = start + name.len();
+        let before_ok = source[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_identifier_char(ch));
+        let after_ok = source[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_identifier_char(ch));
+        if before_ok && after_ok {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
 fn first_name_segment(name: &str) -> &str {
     name.trim_start_matches('\\')
         .split('\\')
@@ -618,6 +657,7 @@ struct VariableOccurrence {
     range: (u32, u32, u32, u32),
     start_byte: usize,
     declaration_kind: Option<VariableDeclarationKind>,
+    null_coalesce_probe: bool,
 }
 
 type ByteRange = (u32, u32, u32, u32);
@@ -638,7 +678,13 @@ fn check_variables_in_scope(
 ) {
     let mut occurrences = Vec::new();
     collect_variable_occurrences(scope, scope.id(), source, &mut occurrences);
-    report_variable_diagnostics(&occurrences, is_variable_scope(scope), diagnostics);
+    report_variable_diagnostics(
+        &occurrences,
+        scope,
+        source,
+        should_report_unused_declarations(scope),
+        diagnostics,
+    );
 
     let mut cursor = scope.walk();
     for child in scope.named_children(&mut cursor) {
@@ -681,6 +727,7 @@ fn collect_variable_occurrences(
                 range: node_range(&node),
                 start_byte: node.start_byte(),
                 declaration_kind: variable_declaration_kind(node, source, &name),
+                null_coalesce_probe: is_null_coalesce_probe(node, source),
             });
         }
     }
@@ -724,6 +771,7 @@ fn collect_variable_reads_in_node(
                 range: node_range(&node),
                 start_byte: node.start_byte(),
                 declaration_kind: None,
+                null_coalesce_probe: false,
             });
         }
     }
@@ -738,10 +786,9 @@ fn is_non_local_variable_context(node: tree_sitter::Node) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
         match parent.kind() {
-            "property_declaration"
-            | "property_element"
-            | "scoped_property_access_expression"
-            | "member_access_expression" => return true,
+            "property_declaration" | "property_element" | "scoped_property_access_expression" => {
+                return true
+            }
             "method_declaration"
             | "function_definition"
             | "arrow_function"
@@ -754,8 +801,36 @@ fn is_non_local_variable_context(node: tree_sitter::Node) -> bool {
     false
 }
 
+fn is_null_coalesce_probe(node: tree_sitter::Node, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "method_declaration"
+                | "function_definition"
+                | "arrow_function"
+                | "anonymous_function"
+                | "anonymous_function_creation_expression"
+                | "program"
+        ) {
+            return false;
+        }
+
+        let text = &source[parent.byte_range()];
+        if let Some(operator_offset) = text.find("??") {
+            let node_offset = node.start_byte().saturating_sub(parent.start_byte());
+            return node_offset < operator_offset;
+        }
+
+        current = parent.parent();
+    }
+    false
+}
+
 fn report_variable_diagnostics(
     occurrences: &[VariableOccurrence],
+    scope: tree_sitter::Node,
+    source: &str,
     report_unused_declarations: bool,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) {
@@ -781,6 +856,13 @@ fn report_variable_diagnostics(
         .iter()
         .filter(|occurrence| occurrence.declaration_kind.is_none())
     {
+        if occurrence.name == "$this" {
+            continue;
+        }
+        if occurrence.null_coalesce_probe {
+            continue;
+        }
+
         let declared_before = declared_by_name
             .get(occurrence.name.as_str())
             .map(|decls| {
@@ -816,11 +898,16 @@ fn report_variable_diagnostics(
             continue;
         };
         match first_declaration.declaration_kind {
-            Some(VariableDeclarationKind::Parameter) => diagnostics.push(SemanticDiagnostic {
-                range: first_declaration.range,
-                message: format!("Unused parameter: {}", first_declaration.name),
-                kind: SemanticDiagnosticKind::UnusedParameter,
-            }),
+            Some(VariableDeclarationKind::Parameter) => {
+                if should_suppress_unused_parameter(scope, source, &first_declaration.name) {
+                    continue;
+                }
+                diagnostics.push(SemanticDiagnostic {
+                    range: first_declaration.range,
+                    message: format!("Unused parameter: {}", first_declaration.name),
+                    kind: SemanticDiagnosticKind::UnusedParameter,
+                });
+            }
             Some(VariableDeclarationKind::Variable) => diagnostics.push(SemanticDiagnostic {
                 range: first_declaration.range,
                 message: format!("Unused variable: {}", first_declaration.name),
@@ -844,6 +931,60 @@ fn is_variable_scope(node: tree_sitter::Node) -> bool {
     )
 }
 
+fn should_report_unused_declarations(scope: tree_sitter::Node) -> bool {
+    is_variable_scope(scope) && !is_bodyless_method_scope(scope)
+}
+
+fn is_bodyless_method_scope(scope: tree_sitter::Node) -> bool {
+    if scope.kind() != "method_declaration" {
+        return false;
+    }
+
+    let mut cursor = scope.walk();
+    let has_body = scope
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "compound_statement");
+    !has_body
+}
+
+fn should_suppress_unused_parameter(scope: tree_sitter::Node, source: &str, name: &str) -> bool {
+    if scope.kind() != "method_declaration" {
+        return false;
+    }
+
+    if method_has_override_attribute(scope, source) {
+        return true;
+    }
+
+    let Some(method_name) = method_name(scope, source) else {
+        return false;
+    };
+
+    matches!(
+        (method_name.as_str(), name),
+        ("buildForm", "$options") | ("voteOnAttribute", "$vote")
+    )
+}
+
+fn method_has_override_attribute(scope: tree_sitter::Node, source: &str) -> bool {
+    let text = &source[scope.byte_range()];
+    text.contains("#[Override") || text.contains("#[\\Override")
+}
+
+fn method_name(scope: tree_sitter::Node, source: &str) -> Option<String> {
+    let name_node = if let Some(name_node) = scope.child_by_field_name("name") {
+        Some(name_node)
+    } else {
+        let mut cursor = scope.walk();
+        let found = scope
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "name");
+        found
+    };
+
+    name_node.map(|node| source[node.byte_range()].to_string())
+}
+
 fn variable_declaration_kind(
     node: tree_sitter::Node,
     source: &str,
@@ -856,6 +997,9 @@ fn variable_declaration_kind(
         return Some(VariableDeclarationKind::Variable);
     }
     if ancestor_field_contains(node, "catch_clause", &["name", "variable"]) {
+        return Some(VariableDeclarationKind::Variable);
+    }
+    if is_by_ref_output_argument_variable(node, source) {
         return Some(VariableDeclarationKind::Variable);
     }
     if has_ancestor_before_scope(node, "anonymous_function_use_clause") {
@@ -932,6 +1076,105 @@ fn has_ancestor_before_scope(node: tree_sitter::Node, ancestor_kind: &str) -> bo
         current = parent.parent();
     }
     false
+}
+
+fn is_by_ref_output_argument_variable(node: tree_sitter::Node, source: &str) -> bool {
+    let Some(argument) = ancestor_before_scope(node, "argument") else {
+        return false;
+    };
+    let Some(arguments) = argument
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")
+    else {
+        return false;
+    };
+    let Some(call) = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "function_call_expression")
+    else {
+        return false;
+    };
+    let Some(function_node) = call
+        .child_by_field_name("function")
+        .or_else(|| call.named_child(0))
+    else {
+        return false;
+    };
+
+    let function_name = source[function_node.byte_range()]
+        .trim()
+        .trim_start_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if !matches!(function_name.as_str(), "preg_match" | "preg_match_all") {
+        return false;
+    }
+
+    argument_name(argument, source).is_some_and(|name| name == "matches")
+        || argument_index(arguments, argument).is_some_and(|index| index == 2)
+}
+
+fn ancestor_before_scope<'tree>(
+    node: tree_sitter::Node<'tree>,
+    ancestor_kind: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == ancestor_kind {
+            return Some(parent);
+        }
+        if matches!(
+            parent.kind(),
+            "method_declaration"
+                | "function_definition"
+                | "anonymous_function"
+                | "anonymous_function_creation_expression"
+                | "program"
+        ) {
+            return None;
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn argument_index(arguments: tree_sitter::Node, argument: tree_sitter::Node) -> Option<usize> {
+    let mut cursor = arguments.walk();
+    let index = arguments
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+        .position(|child| child.id() == argument.id());
+    index
+}
+
+fn argument_name(argument: tree_sitter::Node, source: &str) -> Option<String> {
+    if let Some(name_node) = argument.child_by_field_name("name") {
+        return Some(normalize_argument_name(&source[name_node.byte_range()]));
+    }
+
+    let text = &source[argument.byte_range()];
+    let colon_index = text.find(':')?;
+    let value_start = argument
+        .child_by_field_name("value")
+        .or_else(|| {
+            let mut cursor = argument.walk();
+            argument.named_children(&mut cursor).last()
+        })
+        .map(|value| value.start_byte().saturating_sub(argument.start_byte()))
+        .unwrap_or(text.len());
+
+    (colon_index < value_start).then(|| normalize_argument_name(&text[..colon_index]))
+}
+
+fn normalize_argument_name(name: &str) -> String {
+    name.trim()
+        .trim_start_matches('$')
+        .trim_end_matches(':')
+        .trim()
+        .to_string()
 }
 
 fn is_foreach_header_declared_variable(node: tree_sitter::Node, source: &str) -> bool {
@@ -1604,6 +1847,33 @@ new UsedService();
     }
 
     #[test]
+    fn test_phpdoc_reference_counts_import_as_used() {
+        let code = r#"<?php
+namespace App;
+
+use Random\RandomException;
+
+class Generator {
+    /**
+     * @throws RandomException
+     */
+    public function run(): void {
+    }
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedImport
+                    && d.message.contains("Random\\RandomException")
+            }),
+            "PHPDoc type references should count as import usage, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
     fn test_undefined_variable_and_unused_local_diagnostics() {
         let code = r#"<?php
 function run(string $used, string $unusedParam): void {
@@ -1644,6 +1914,25 @@ function run(string $used, string $unusedParam): void {
             !diags.iter().any(|d| d.message.contains("$usedLocal"))
                 && !diags.iter().any(|d| d.message.contains("$used")),
             "Used variables/params should not be reported, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_null_coalesce_probe_does_not_report_undefined_variable() {
+        let code = r#"<?php
+function run(): bool {
+    return $workflowSuccess ?? false;
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && d.message.contains("$workflowSuccess")
+            }),
+            "Null coalesce left operand should not be reported as undefined, got: {:?}",
             diags
         );
     }
@@ -1693,6 +1982,117 @@ function run(array $requests): void {
                 d.kind == SemanticDiagnosticKind::UndefinedVariable && d.message.contains("$index")
             }),
             "foreach key variable should be declared, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_member_access_counts_variable_as_read() {
+        let code = r#"<?php
+function run(array $items): void {
+    foreach ($items as $item) {
+        echo $item->value;
+    }
+    $names = array_map(static fn ($case) => $case->name, $items);
+    echo $names[0] ?? null;
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        for unexpected in ["$item", "$case"] {
+            assert!(
+                !diags.iter().any(|d| {
+                    (d.kind == SemanticDiagnosticKind::UnusedVariable
+                        || d.kind == SemanticDiagnosticKind::UnusedParameter)
+                        && d.message.contains(unexpected)
+                }),
+                "Member access receiver `{}` should count as a read, got: {:?}",
+                unexpected,
+                diags
+            );
+        }
+    }
+
+    #[test]
+    fn test_bodyless_method_parameters_are_not_unused() {
+        let code = r#"<?php
+interface Notifier {
+    public function send(string $message, int $priority): void;
+}
+
+abstract class BaseHandler {
+    abstract public function handle(object $message): array;
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.kind == SemanticDiagnosticKind::UnusedParameter),
+            "Interface/abstract declarations should not report unused params, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_framework_override_unused_parameters_are_not_reported() {
+        let code = r#"<?php
+namespace App\Form;
+
+use Symfony\Component\Form\FormBuilderInterface;
+use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+use Symfony\Component\Security\Core\Authorization\Voter\Vote;
+
+class UserType {
+    public function buildForm(FormBuilderInterface $builder, array $options = []): void {
+        $builder->add('email');
+    }
+
+    protected function voteOnAttribute(
+        string $attribute,
+        mixed $subject,
+        TokenInterface $token,
+        ?Vote $vote = null
+    ): bool {
+        echo $attribute;
+        echo $subject;
+        echo $token;
+        return true;
+    }
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        for unexpected in ["$options", "$vote"] {
+            assert!(
+                !diags.iter().any(|d| {
+                    d.kind == SemanticDiagnosticKind::UnusedParameter
+                        && d.message.contains(unexpected)
+                }),
+                "Framework override parameter `{}` should not be reported, got: {:?}",
+                unexpected,
+                diags
+            );
+        }
+    }
+
+    #[test]
+    fn test_preg_match_output_argument_declares_variable() {
+        let code = r#"<?php
+function run(string $content): void {
+    if (preg_match('/<id>(\d+)<\/id>/', $content, $m)) {
+        echo $m[1];
+    }
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UndefinedVariable && d.message.contains("$m")
+            }),
+            "preg_match output variable should be declared, got: {:?}",
             diags
         );
     }

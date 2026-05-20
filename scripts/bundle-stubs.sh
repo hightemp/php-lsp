@@ -23,7 +23,7 @@ DEFAULT_EXTENSIONS=(
     mbstring ctype tokenizer dom SimpleXML
     PDO curl filter hash session
     Reflection intl fileinfo openssl phar
-    xml xmlreader xmlwriter zip zlib
+    random xml xmlreader xmlwriter zip zlib
     bcmath gd iconv mysqli sodium
 )
 

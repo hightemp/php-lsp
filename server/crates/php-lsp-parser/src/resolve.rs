@@ -1146,6 +1146,13 @@ fn find_variable_inference_before_usage(
             continue;
         }
 
+        if let Some(guard_info) =
+            instanceof_guard_inference(stmt, var_name, usage_start, source, file_symbols)
+        {
+            inferred = Some((stmt.start_byte(), guard_info));
+            continue;
+        }
+
         // Assignment inference: $var = <expr>;
         if let Some(right) = assignment_rhs {
             if let Some(resolved) = try_resolve_object_type(right, source, file_symbols, resolver) {
@@ -1162,6 +1169,77 @@ fn find_variable_inference_before_usage(
     }
 
     inferred.map(|(_, info)| info)
+}
+
+fn instanceof_guard_inference(
+    stmt: Node,
+    var_name: &str,
+    usage_start: usize,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<VariableInference> {
+    if stmt.kind() != "if_statement" || stmt.end_byte() > usage_start {
+        return None;
+    }
+
+    let condition = if_condition_text(stmt, source)?;
+    if !negative_instanceof_guard_for_var(condition, var_name)
+        || !if_then_branch_exits(stmt, source)
+    {
+        return None;
+    }
+
+    let class_name = class_name_after_instanceof(condition)?;
+    let resolved = resolve_class_name(&class_name, file_symbols);
+    Some(VariableInference {
+        type_display: Some(class_name),
+        resolved_type_fqn: Some(resolved),
+        phpdoc_comment: None,
+    })
+}
+
+fn if_condition_text<'a>(stmt: Node, source: &'a str) -> Option<&'a str> {
+    let text = &source[stmt.byte_range()];
+    let start = text.find('(')?;
+    let mut depth = 0usize;
+    for (offset, ch) in text[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&text[start + 1..start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn negative_instanceof_guard_for_var(condition: &str, var_name: &str) -> bool {
+    let compact: String = condition.chars().filter(|ch| !ch.is_whitespace()).collect();
+    compact.starts_with(&format!("!{}instanceof", var_name))
+        || compact.starts_with(&format!("!({}instanceof", var_name))
+}
+
+fn if_then_branch_exits(stmt: Node, source: &str) -> bool {
+    let text = &source[stmt.byte_range()];
+    let then_text = text.split("else").next().unwrap_or(text);
+    then_text.contains("throw ")
+        || then_text.contains("return")
+        || then_text.contains("exit")
+        || then_text.contains("die(")
+}
+
+fn class_name_after_instanceof(condition: &str) -> Option<String> {
+    let (_, after) = condition.split_once("instanceof")?;
+    let class_name: String = after
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '\\')
+        .collect();
+    (!class_name.is_empty()).then_some(class_name)
 }
 
 fn assignment_rhs_for_var<'a>(stmt: Node<'a>, var_name: &str, source: &str) -> Option<Node<'a>> {
@@ -1833,6 +1911,30 @@ mod tests {
         let sym = result.unwrap();
         assert_eq!(sym.ref_kind, RefKind::FunctionCall);
         assert_eq!(sym.fqn, "App\\Utils\\helper");
+    }
+
+    #[test]
+    fn test_infer_variable_type_after_negative_instanceof_guard() {
+        let code = r#"<?php
+namespace App\Repository;
+
+use App\Entity\User;
+use Symfony\Component\Security\Core\User\PasswordAuthenticatedUserInterface;
+
+class UserRepository {
+    public function upgradePassword(PasswordAuthenticatedUserInterface $user): void {
+        if (!$user instanceof User) {
+            throw new \LogicException();
+        }
+
+        $user->setPassword('secret');
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "setPassword");
+        let result = parse_and_infer_var_type_at(code, line, col, "$user");
+
+        assert_eq!(result.as_deref(), Some("App\\Entity\\User"));
     }
 
     #[test]

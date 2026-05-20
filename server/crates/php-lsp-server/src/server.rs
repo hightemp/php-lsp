@@ -3426,8 +3426,8 @@ fn add_call_argument_inlay_hints(
         return;
     };
 
-    for (arg_index, argument) in call_argument_nodes(call_node).into_iter().enumerate() {
-        if argument_has_explicit_name(argument, source) {
+    for (arg_index, argument) in call_arguments(call_node, source).into_iter().enumerate() {
+        if argument.name.is_some() {
             continue;
         }
         let Some(param) = signature_param_for_arg(signature, arg_index) else {
@@ -3436,11 +3436,11 @@ fn add_call_argument_inlay_hints(
         if param.name.is_empty() {
             continue;
         }
-        let arg_range = node_range_node(argument);
+        let arg_range = node_range_node(argument.value_node);
         if !byte_ranges_overlap(arg_range, requested_range) {
             continue;
         }
-        let start = argument.start_position();
+        let start = argument.value_node.start_position();
         hints.push(InlayHint {
             position: Position::new(
                 start.row as u32,
@@ -3455,20 +3455,6 @@ fn add_call_argument_inlay_hints(
             data: None,
         });
     }
-}
-
-fn argument_has_explicit_name(argument: tree_sitter::Node, source: &str) -> bool {
-    if argument.child_by_field_name("name").is_some() {
-        return true;
-    }
-    let text = node_text(source, argument);
-    let Some(colon_index) = text.find(':') else {
-        return false;
-    };
-    let value_text = argument_value_node(argument)
-        .map(|node| node_text(source, node))
-        .unwrap_or(text);
-    colon_index < text.find(value_text).unwrap_or(text.len())
 }
 
 fn collect_phpdoc_parameter_type_inlay_hints(
@@ -4428,6 +4414,8 @@ fn check_member_access_node(
     let Some(resolved) = resolve_member_for_ref_kind(index, &sym_at_pos) else {
         if is_phpunit_testcase_helper_call(&sym_at_pos, file_symbols, index)
             || is_phpunit_test_double_api_call(tree, source, file_symbols, index, &sym_at_pos)
+            || is_missing_parent_constructor_call(&sym_at_pos)
+            || is_enum_builtin_method_call(index, &sym_at_pos)
             || is_dynamic_member_access(index, &sym_at_pos)
         {
             return;
@@ -4644,6 +4632,11 @@ fn is_dynamic_member_access(index: &WorkspaceIndex, sym_at_pos: &SymbolAtPositio
         return true;
     }
 
+    if sym_at_pos.ref_kind == RefKind::MethodCall {
+        return is_doctrine_repository_dynamic_method(class_fqn, member_name)
+            || is_known_vendor_method(class_fqn, member_name);
+    }
+
     if sym_at_pos.ref_kind != RefKind::PropertyAccess {
         return false;
     }
@@ -4658,6 +4651,55 @@ fn is_dynamic_member_access(index: &WorkspaceIndex, sym_at_pos: &SymbolAtPositio
             .types
             .get(class_fqn.trim_start_matches('\\'))
             .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
+}
+
+fn is_missing_parent_constructor_call(sym_at_pos: &SymbolAtPosition) -> bool {
+    sym_at_pos.ref_kind == RefKind::MethodCall
+        && sym_at_pos.name == "__construct"
+        && sym_at_pos.object_expr.as_deref() == Some("parent")
+}
+
+fn is_enum_builtin_method_call(index: &WorkspaceIndex, sym_at_pos: &SymbolAtPosition) -> bool {
+    if sym_at_pos.ref_kind != RefKind::MethodCall
+        || !matches!(sym_at_pos.name.as_str(), "cases" | "from" | "tryFrom")
+    {
+        return false;
+    }
+
+    let Some((class_fqn, _)) = sym_at_pos.fqn.rsplit_once("::") else {
+        return false;
+    };
+
+    index
+        .types
+        .get(class_fqn.trim_start_matches('\\'))
+        .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
+}
+
+fn is_doctrine_repository_dynamic_method(class_fqn: &str, member_name: &str) -> bool {
+    fqn_matches(class_fqn, "Doctrine\\ORM\\EntityRepository")
+        && (member_name.starts_with("findBy")
+            || member_name.starts_with("findOneBy")
+            || member_name.starts_with("countBy"))
+}
+
+fn is_known_vendor_method(class_fqn: &str, member_name: &str) -> bool {
+    (fqn_matches(class_fqn, "Doctrine\\DBAL\\Result")
+        && matches!(
+            member_name,
+            "fetchOne"
+                | "fetchAllAssociative"
+                | "fetchAllAssociativeIndexed"
+                | "fetchNumeric"
+                | "fetchAssociative"
+                | "rowCount"
+                | "columnCount"
+                | "free"
+        ))
+        || (fqn_matches(
+            class_fqn,
+            "SymfonyCasts\\Bundle\\VerifyEmail\\VerifyEmailHelperInterface",
+        ) && member_name == "validateEmailConfirmationFromRequest")
 }
 
 fn is_generic_object_type_name(class_fqn: &str) -> bool {
@@ -5203,15 +5245,16 @@ fn check_call_argument_types(
         .map(|entry| entry.value())
         .unwrap_or(file_symbols);
 
-    let arguments = call_argument_nodes(call_node);
-    for (arg_index, arg_node) in arguments.into_iter().enumerate() {
-        let Some(param) = signature_param_for_arg(signature, arg_index) else {
+    let arguments = call_arguments(call_node, source);
+    for (arg_index, arg) in arguments.into_iter().enumerate() {
+        let Some(param) = signature_param_for_call_arg(signature, arg_index, arg.name.as_deref())
+        else {
             continue;
         };
         let Some(expected) = param.type_info.as_ref() else {
             continue;
         };
-        let Some(actual) = infer_expression_type(arg_node, source, file_symbols) else {
+        let Some(actual) = infer_expression_type(arg.value_node, source, file_symbols) else {
             continue;
         };
 
@@ -5365,7 +5408,16 @@ fn resolve_reference_symbol_at_node(
     Some((sym_at_pos, resolved))
 }
 
-fn call_argument_nodes(call_node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
+#[derive(Debug, Clone)]
+struct CallArgument<'tree> {
+    value_node: tree_sitter::Node<'tree>,
+    name: Option<String>,
+}
+
+fn call_arguments<'tree>(
+    call_node: tree_sitter::Node<'tree>,
+    source: &str,
+) -> Vec<CallArgument<'tree>> {
     let Some(arguments) = call_node.child_by_field_name("arguments").or_else(|| {
         let mut cursor = call_node.walk();
         let arguments = call_node
@@ -5380,7 +5432,10 @@ fn call_argument_nodes(call_node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
     let mut cursor = arguments.walk();
     for child in arguments.named_children(&mut cursor) {
         if child.kind() == "argument" {
-            result.push(argument_value_node(child).unwrap_or(child));
+            result.push(CallArgument {
+                value_node: argument_value_node(child).unwrap_or(child),
+                name: argument_name(child, source),
+            });
         }
     }
     result
@@ -5393,6 +5448,28 @@ fn argument_value_node(argument: tree_sitter::Node) -> Option<tree_sitter::Node>
     })
 }
 
+fn argument_name(argument: tree_sitter::Node, source: &str) -> Option<String> {
+    if let Some(name_node) = argument.child_by_field_name("name") {
+        return Some(normalize_argument_name(node_text(source, name_node)));
+    }
+
+    let text = node_text(source, argument);
+    let colon_index = text.find(':')?;
+    let value_start = argument_value_node(argument)
+        .map(|value| value.start_byte().saturating_sub(argument.start_byte()))
+        .unwrap_or(text.len());
+
+    (colon_index < value_start).then(|| normalize_argument_name(&text[..colon_index]))
+}
+
+fn normalize_argument_name(name: &str) -> String {
+    name.trim()
+        .trim_start_matches('$')
+        .trim_end_matches(':')
+        .trim()
+        .to_string()
+}
+
 fn signature_param_for_arg(
     signature: &php_lsp_types::Signature,
     arg_index: usize,
@@ -5401,6 +5478,23 @@ fn signature_param_for_arg(
         .params
         .get(arg_index)
         .or_else(|| signature.params.last().filter(|param| param.is_variadic))
+}
+
+fn signature_param_for_call_arg<'a>(
+    signature: &'a php_lsp_types::Signature,
+    arg_index: usize,
+    name: Option<&str>,
+) -> Option<&'a php_lsp_types::ParamInfo> {
+    if let Some(name) = name {
+        return signature.params.iter().find(|param| {
+            param
+                .name
+                .trim_start_matches('$')
+                .eq_ignore_ascii_case(name)
+        });
+    }
+
+    signature_param_for_arg(signature, arg_index)
 }
 
 fn return_expression_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
@@ -5450,6 +5544,10 @@ fn infer_expression_type(
     let lower = raw.to_ascii_lowercase();
     let kind = node.kind();
     let range = node_range_node(node);
+
+    if kind.contains("conditional") || raw.contains(" ? ") {
+        return None;
+    }
 
     if kind == "object_creation_expression" {
         let class_node = object_creation_class_node(node)?;
@@ -5622,6 +5720,10 @@ fn override_signature_diagnostics(
             .collect();
 
         for child_method in child_methods {
+            if child_method.name == "__construct" {
+                continue;
+            }
+
             let mut reported = false;
             for parent_fqn in class_sym.extends.iter().chain(class_sym.implements.iter()) {
                 let parent_member_fqn = format!("{}::{}", parent_fqn, child_method.name);
@@ -5631,7 +5733,19 @@ fn override_signature_diagnostics(
                 if parent_method.kind != php_lsp_types::PhpSymbolKind::Method {
                     continue;
                 }
-                if !override_signatures_are_compatible(child_method, &parent_method) {
+                let parent_file_symbols_guard = index.file_symbols.get(&parent_method.uri);
+                let parent_file_symbols: &php_lsp_types::FileSymbols =
+                    match parent_file_symbols_guard.as_ref() {
+                        Some(entry) => entry.value(),
+                        None => file_symbols,
+                    };
+                if !override_signatures_are_compatible(
+                    child_method,
+                    &parent_method,
+                    file_symbols,
+                    parent_file_symbols,
+                    index,
+                ) {
                     diagnostics.push(diagnostic_at_byte_range(
                         child_method.selection_range,
                         utf16_index,
@@ -5656,6 +5770,9 @@ fn override_signature_diagnostics(
 fn override_signatures_are_compatible(
     child_method: &php_lsp_types::SymbolInfo,
     parent_method: &php_lsp_types::SymbolInfo,
+    child_file_symbols: &php_lsp_types::FileSymbols,
+    parent_file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
 ) -> bool {
     let (Some(child_sig), Some(parent_sig)) = (
         child_method.signature.as_ref(),
@@ -5664,7 +5781,15 @@ fn override_signatures_are_compatible(
         return true;
     };
 
-    if child_sig.params.len() != parent_sig.params.len() {
+    if child_sig.params.len() < parent_sig.params.len() {
+        return false;
+    }
+    if child_sig
+        .params
+        .iter()
+        .skip(parent_sig.params.len())
+        .any(|param| !signature_param_is_optional(param))
+    {
         return false;
     }
 
@@ -5672,16 +5797,195 @@ fn override_signatures_are_compatible(
         if child_param.is_variadic != parent_param.is_variadic
             || child_param.is_by_ref != parent_param.is_by_ref
             || (parent_param.default_value.is_some() && child_param.default_value.is_none())
-            || child_param.type_info != parent_param.type_info
+            || !override_param_type_is_compatible(
+                child_param.type_info.as_ref(),
+                parent_param.type_info.as_ref(),
+                child_file_symbols,
+                parent_file_symbols,
+                child_method.parent_fqn.as_deref(),
+                parent_method.parent_fqn.as_deref(),
+                index,
+            )
         {
             return false;
         }
     }
 
     match (&child_sig.return_type, &parent_sig.return_type) {
-        (Some(child_return), Some(parent_return)) => child_return == parent_return,
+        (Some(child_return), Some(parent_return)) => override_return_type_is_compatible(
+            child_return,
+            parent_return,
+            child_file_symbols,
+            parent_file_symbols,
+            child_method.parent_fqn.as_deref(),
+            parent_method.parent_fqn.as_deref(),
+            index,
+        ),
         (None, Some(_)) => false,
         _ => true,
+    }
+}
+
+fn signature_param_is_optional(param: &php_lsp_types::ParamInfo) -> bool {
+    param.default_value.is_some() || param.is_variadic
+}
+
+fn override_param_type_is_compatible(
+    child_type: Option<&php_lsp_types::TypeInfo>,
+    parent_type: Option<&php_lsp_types::TypeInfo>,
+    child_file_symbols: &php_lsp_types::FileSymbols,
+    parent_file_symbols: &php_lsp_types::FileSymbols,
+    child_owner_fqn: Option<&str>,
+    parent_owner_fqn: Option<&str>,
+    _index: &WorkspaceIndex,
+) -> bool {
+    match (child_type, parent_type) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(child_type), Some(parent_type)) => {
+            type_info_is_mixed(child_type)
+                || normalized_type_info_for_override(
+                    child_type,
+                    child_file_symbols,
+                    child_owner_fqn,
+                ) == normalized_type_info_for_override(
+                    parent_type,
+                    parent_file_symbols,
+                    parent_owner_fqn,
+                )
+        }
+    }
+}
+
+fn override_return_type_is_compatible(
+    child_type: &php_lsp_types::TypeInfo,
+    parent_type: &php_lsp_types::TypeInfo,
+    child_file_symbols: &php_lsp_types::FileSymbols,
+    parent_file_symbols: &php_lsp_types::FileSymbols,
+    child_owner_fqn: Option<&str>,
+    parent_owner_fqn: Option<&str>,
+    index: &WorkspaceIndex,
+) -> bool {
+    if type_info_is_mixed(parent_type) {
+        return true;
+    }
+
+    let child_normalized =
+        normalized_type_info_for_override(child_type, child_file_symbols, child_owner_fqn);
+    let parent_normalized =
+        normalized_type_info_for_override(parent_type, parent_file_symbols, parent_owner_fqn);
+    if child_normalized == parent_normalized {
+        return true;
+    }
+
+    match (
+        simple_class_fqn_for_override(child_type, child_file_symbols, child_owner_fqn),
+        simple_class_fqn_for_override(parent_type, parent_file_symbols, parent_owner_fqn),
+    ) {
+        (Some(child_fqn), Some(parent_fqn)) => {
+            class_extends_or_implements(index, &child_fqn, &parent_fqn, &mut Vec::new())
+        }
+        _ => false,
+    }
+}
+
+fn type_info_is_mixed(type_info: &php_lsp_types::TypeInfo) -> bool {
+    match type_info {
+        php_lsp_types::TypeInfo::Mixed => true,
+        php_lsp_types::TypeInfo::Simple(name) => name.eq_ignore_ascii_case("mixed"),
+        _ => false,
+    }
+}
+
+fn normalized_type_info_for_override(
+    type_info: &php_lsp_types::TypeInfo,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: Option<&str>,
+) -> String {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            normalized_simple_type_for_override(name, file_symbols, owner_fqn)
+        }
+        php_lsp_types::TypeInfo::Union(types) => {
+            let mut parts: Vec<_> = types
+                .iter()
+                .map(|type_info| {
+                    normalized_type_info_for_override(type_info, file_symbols, owner_fqn)
+                })
+                .collect();
+            parts.sort();
+            format!("union({})", parts.join("|"))
+        }
+        php_lsp_types::TypeInfo::Intersection(types) => {
+            let mut parts: Vec<_> = types
+                .iter()
+                .map(|type_info| {
+                    normalized_type_info_for_override(type_info, file_symbols, owner_fqn)
+                })
+                .collect();
+            parts.sort();
+            format!("intersection({})", parts.join("&"))
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => format!(
+            "?{}",
+            normalized_type_info_for_override(inner, file_symbols, owner_fqn)
+        ),
+        php_lsp_types::TypeInfo::Void => "void".to_string(),
+        php_lsp_types::TypeInfo::Never => "never".to_string(),
+        php_lsp_types::TypeInfo::Mixed => "mixed".to_string(),
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => owner_fqn
+            .map(|owner| owner.trim_start_matches('\\').to_string())
+            .unwrap_or_else(|| type_info.to_string()),
+        php_lsp_types::TypeInfo::Parent_ => "parent".to_string(),
+    }
+}
+
+fn normalized_simple_type_for_override(
+    name: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: Option<&str>,
+) -> String {
+    let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+    if matches!(lower.as_str(), "self" | "static") {
+        return owner_fqn
+            .map(|owner| owner.trim_start_matches('\\').to_string())
+            .unwrap_or(lower);
+    }
+    if lower == "parent" {
+        return lower;
+    }
+    if is_builtin_type_name(name) {
+        return lower;
+    }
+    resolve_class_name_pub(name, file_symbols)
+        .trim_start_matches('\\')
+        .to_string()
+}
+
+fn simple_class_fqn_for_override(
+    type_info: &php_lsp_types::TypeInfo,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: Option<&str>,
+) -> Option<String> {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) if !is_builtin_type_name(name) => {
+            let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+            if matches!(lower.as_str(), "self" | "static") {
+                return owner_fqn.map(|owner| owner.trim_start_matches('\\').to_string());
+            }
+            if lower == "parent" {
+                return None;
+            }
+            Some(
+                resolve_class_name_pub(name, file_symbols)
+                    .trim_start_matches('\\')
+                    .to_string(),
+            )
+        }
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
+            owner_fqn.map(|owner| owner.trim_start_matches('\\').to_string())
+        }
+        _ => None,
     }
 }
 
@@ -10753,6 +11057,52 @@ function run(Box $box): void {
     }
 
     #[test]
+    fn test_compute_diagnostics_skips_uncertain_ternary_return_type() {
+        let uri = "file:///ternary-return.php";
+        let code = r#"<?php
+namespace App;
+
+class SFTPService {}
+
+class Controller {
+    private SFTPService $downloadSftp;
+    private SFTPService $uploadSftp;
+
+    private function getService(string $account): SFTPService {
+        return 'download' === $account ? $this->downloadSftp : $this->uploadSftp;
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert!(
+            !messages.iter().any(|message| {
+                message.contains("Return type mismatch in App\\Controller::getService")
+            }),
+            "Uncertain ternary return should not be inferred from its condition, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
     fn test_compute_diagnostics_reports_override_and_php_version_errors() {
         let uri = "file:///override.php";
         let code = r#"<?php
@@ -10802,6 +11152,218 @@ function nullableUnion(): string|null {
                 messages.contains(&expected),
                 "Expected `{}` in diagnostics, got: {:?}",
                 expected,
+                messages
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_named_arguments() {
+        let uri = "file:///named-args.php";
+        let code = r#"<?php
+namespace Symfony\Component\Validator\Constraints;
+
+class NotBlank {
+    public function __construct(?array $options = null, ?string $message = null) {}
+}
+
+class Length {
+    public function __construct(?array $options = null, ?int $min = null, ?int $max = null, ?string $minMessage = null, ?string $maxMessage = null) {}
+}
+
+namespace App;
+
+use Symfony\Component\Validator\Constraints\Length;
+use Symfony\Component\Validator\Constraints\NotBlank;
+
+function run(): void {
+    new NotBlank(message: 'Required');
+    new Length(max: 255, maxMessage: 'Too long');
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("Type mismatch")),
+            "Named arguments should be matched by parameter name, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_enum_builtin_methods_and_parent_constructor() {
+        let uri = "file:///enum-parent.php";
+        let code = r#"<?php
+namespace App;
+
+enum TimerType: string {
+    case Tccp = 'tccp';
+}
+
+class BaseCommand {
+    public function __construct(?string $name = null) {}
+}
+
+class SendCommand extends BaseCommand {
+    public function __construct(private TimerType $timerType) {
+        parent::__construct();
+    }
+
+    public function run(): void {
+        TimerType::cases();
+        TimerType::tryFrom('tccp');
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Unknown method: App\\TimerType::cases",
+            "Unknown method: App\\TimerType::tryFrom",
+            "Unknown method: parent::__construct",
+            "Incompatible override signature: App\\SendCommand::__construct differs from App\\BaseCommand::__construct",
+        ] {
+            assert!(
+                !messages.contains(&unexpected),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
+                messages
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_alias_and_mixed_override_signatures() {
+        let scheduler_uri = "file:///scheduler-overrides.php";
+        let scheduler_code = r#"<?php
+namespace Symfony\Component\Scheduler;
+
+class Schedule {}
+
+interface ScheduleProviderInterface {
+    public function getSchedule(): Schedule;
+}
+"#;
+
+        let voter_uri = "file:///voter-overrides.php";
+        let voter_code = r#"<?php
+namespace Symfony\Component\Security\Core\Authorization\Voter;
+
+abstract class Voter {
+    protected function supports(string $attribute, mixed $subject): bool {
+        echo $attribute;
+        echo $subject;
+        return true;
+    }
+}
+"#;
+
+        let app_uri = "file:///app-overrides.php";
+        let app_code = r#"<?php
+namespace App;
+
+use Symfony\Component\Scheduler\Schedule as SymfonySchedule;
+use Symfony\Component\Scheduler\ScheduleProviderInterface;
+use Symfony\Component\Security\Core\Authorization\Voter\Voter;
+
+class Schedule implements ScheduleProviderInterface {
+    public function getSchedule(): SymfonySchedule {
+        return new SymfonySchedule();
+    }
+}
+
+class UserVoter extends Voter {
+    protected function supports(string $attribute, $subject): bool {
+        echo $attribute;
+        echo $subject;
+        return true;
+    }
+}
+"#;
+
+        let mut scheduler_parser = FileParser::new();
+        scheduler_parser.parse_full(scheduler_code);
+        let mut voter_parser = FileParser::new();
+        voter_parser.parse_full(voter_code);
+        let mut app_parser = FileParser::new();
+        app_parser.parse_full(app_code);
+
+        let index = WorkspaceIndex::new();
+        index.update_file(
+            scheduler_uri,
+            extract_file_symbols(
+                scheduler_parser.tree().unwrap(),
+                scheduler_code,
+                scheduler_uri,
+            ),
+        );
+        index.update_file(
+            voter_uri,
+            extract_file_symbols(voter_parser.tree().unwrap(), voter_code, voter_uri),
+        );
+        index.update_file(
+            app_uri,
+            extract_file_symbols(app_parser.tree().unwrap(), app_code, app_uri),
+        );
+
+        let diagnostics = compute_diagnostics(
+            app_uri,
+            &app_parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Incompatible override signature: App\\Schedule::getSchedule differs from Symfony\\Component\\Scheduler\\ScheduleProviderInterface::getSchedule",
+            "Incompatible override signature: App\\UserVoter::supports differs from Symfony\\Component\\Security\\Core\\Authorization\\Voter\\Voter::supports",
+        ] {
+            assert!(
+                !messages.contains(&unexpected),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
                 messages
             );
         }
