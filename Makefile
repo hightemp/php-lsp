@@ -7,7 +7,7 @@
 #   make package    — produce .vsix (depends on all above)
 #   make server-all — cross-compile server for all 6 platforms
 #   make package-all— universal .vsix with all platform binaries
-#   make release    — bump versions from VERSION, build all, tag & push to GitHub
+#   make release    — bump versions from VERSION, commit, tag & push to GitHub
 #   make clean      — remove build artefacts
 #   make check      — run all lints and tests
 
@@ -137,7 +137,7 @@ clean:
 
 # ─── Release ─────────────────────────────────────────────────────
 # Reads version from VERSION file, patches package.json and Cargo.toml,
-# builds a universal .vsix, creates/force-updates the git tag and pushes.
+# commits version files, creates/force-updates the git tag and pushes.
 release:
 	@if [[ -z "$(VERSION)" ]]; then echo "ERROR: VERSION file is empty"; exit 1; fi
 	@if ! echo "$(VERSION)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then \

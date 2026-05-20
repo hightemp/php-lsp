@@ -32,6 +32,9 @@ phpstorm-stubs support.
   properties, and member calls.
 - Override signature and PHP-version compatibility diagnostics.
 - Optional PHPStan and Psalm diagnostics through configured external commands.
+- Test-friendly diagnostics for common PHPUnit patterns, including assertion
+  helpers, test doubles, trait-based test helpers, anonymous classes, and
+  closure/destructuring variable scopes.
 - Hover for symbols, signatures, types, and PHPDoc.
 - Completion for classes, interfaces, traits, enums, functions, constants,
   methods, properties, variables, namespaces, keywords, and snippets.
@@ -68,6 +71,7 @@ phpstorm-stubs support.
 ### Workspace Support
 
 - Composer autoload support for PSR-4, PSR-0, classmap, and files entries.
+- Additional include paths from extension configuration.
 - Built-in phpstorm-stubs bundle with configurable extension stubs.
 - Lazy `vendor/` indexing.
 - Multi-root workspace support.
@@ -80,6 +84,9 @@ phpstorm-stubs support.
   references and rename are local-scope oriented.
 - Type inference is useful but still shallow compared with mature PHP static
   analyzers.
+- Diagnostics are optimized for editor feedback: file changes publish fast
+  in-process diagnostics, while full diagnostics and optional external analyzer
+  runs are used on open/save and reconfiguration.
 - External PHPStan/Psalm diagnostics require those tools to be installed and
   configured by the workspace.
 - Formatting is delegated to external tools; php-lsp does not implement a native
@@ -94,6 +101,7 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.enable` | `true` | Enable the language server. |
 | `phpLsp.phpVersion` | `8.2` | Target PHP version for diagnostics and version-aware refactors (`7.4`-`8.4`). |
 | `phpLsp.serverPath` | `""` | Custom server binary path. Empty uses the bundled binary. |
+| `phpLsp.includePaths` | `[]` | Additional directories to include in workspace indexing. |
 | `phpLsp.stubs.extensions` | Common extensions | PHP stub extension set to index from the bundled stubs. |
 | `phpLsp.composer.enabled` | `true` | Enable `composer.json` autoload indexing. |
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
@@ -147,26 +155,49 @@ Example external formatting setup:
 ```bash
 make            # build server + client + stubs → .vsix
 make install    # build + install extension into VS Code
+make check      # run Rust/TypeScript checks
 ```
 
-All available targets:
+`make` uses the host Rust target detected from `rustc -vV`, builds a release
+server binary into `client/bin/<platform>/`, bundles phpstorm-stubs into
+`client/stubs/`, builds the TypeScript extension, and packages a `.vsix`.
+
+Available targets:
 
 | Command | Description |
 |---|---|
-| `make` / `make package` | Full build: server + client + stubs → `.vsix` |
+| `make` / `make all` / `make package` | Full build: server + client + stubs → `.vsix` |
 | `make install` | Build and install `.vsix` into VS Code |
-| `make server` | Build Rust binary for host platform |
-| `make server-all` | Cross-compile server for all configured targets |
-| `make package-all` | Universal `.vsix` with all platform binaries |
+| `make server` | Build a release Rust binary for the detected host platform and copy it to `client/bin/<platform>/` |
+| `make server-all` | Cross-compile server binaries for all configured targets |
+| `make package-all` | Universal `.vsix` with all configured platform binaries |
 | `make client` | `npm ci` + build extension JS |
 | `make stubs` | Init submodule + bundle phpstorm-stubs |
 | `make check` | Lint + test (Rust & TypeScript) |
 | `make test` | Run Rust tests |
 | `make lint` | `cargo fmt --check`, `clippy`, `tsc --noEmit` |
 | `make fmt` | Auto-format Rust code |
+| `make release` | Read `VERSION`, patch package/Cargo versions, commit, force-update the release tag, and push |
 | `make clean` | Remove all build artefacts |
 
 Stubs submodule (`server/data/stubs`) is pulled automatically on first build if not initialized.
+
+`make server-all` and `make package-all` use `scripts/build-server.sh --all`
+for these VS Code platform directories:
+
+- `linux-x64`
+- `linux-arm64`
+- `darwin-x64`
+- `darwin-arm64`
+- `win32-x64`
+- `win32-arm64`
+
+`make release` requires a clean working tree, reads the semver value from
+`VERSION`, updates `client/package.json`, `client/package-lock.json`,
+`server/Cargo.toml`, and `server/Cargo.lock`, commits those version changes
+when needed, creates or updates tag `v<VERSION>`, then pushes `main` and the
+tag to GitHub. Build the universal package with `make package-all` before
+publishing release artefacts.
 
 ### Manual steps
 
@@ -196,7 +227,7 @@ npm run build
 
 # 3. Package VSIX
 cd client
-npx @vscode/vsce package
+npx @vscode/vsce package --no-dependencies
 ```
 
 #### Cross-compilation
@@ -220,9 +251,9 @@ php-lsp/
 │       ├── php-lsp-completion/  # Completion engine
 │       └── php-lsp-types/       # Shared types
 ├── client/          # VS Code extension (TypeScript)
+├── images/          # README and marketplace media
 ├── scripts/         # Build helpers (build-server.sh, bundle-stubs.sh)
-├── test-fixtures/   # Test PHP projects
-└── docs/            # Documentation
+└── test-fixtures/   # Test PHP projects
 ```
 
 ## License
