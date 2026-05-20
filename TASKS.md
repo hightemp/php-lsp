@@ -580,7 +580,7 @@
 ## Этап vNext (ongoing)
 
 - [x] **VN-001** textDocument/inlayHint — типы параметров, return types inline *(done 2026-05-20)*
-- [ ] **VN-002** textDocument/prepareCallHierarchy + incoming/outgoing
+- [x] **VN-002** textDocument/prepareCallHierarchy + incoming/outgoing *(done 2026-05-20)*
 - [ ] **VN-003** textDocument/prepareTypeHierarchy + supertypes/subtypes
 - [ ] **VN-004** textDocument/implementation (interface → concrete)
 - [ ] **VN-005** Multi-root workspace поддержка
@@ -689,7 +689,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-019 / V1-025** Basic diagnostics parity: undefined/unused/duplicate symbols
 - [x] **LP-020 / V1-026** Type/member diagnostics: unknown members, visibility, static misuse, type compatibility
 - [x] **LP-021 / VN-001** `textDocument/inlayHint`
-- [ ] **LP-022 / VN-002** `textDocument/prepareCallHierarchy` + incoming/outgoing calls
+- [x] **LP-022 / VN-002** `textDocument/prepareCallHierarchy` + incoming/outgoing calls
 - [ ] **LP-023 / VN-003** `textDocument/prepareTypeHierarchy` + supertypes/subtypes
 - [ ] **LP-024 / VN-004** `textDocument/implementation`
 - [ ] **LP-025 / VN-005** Multi-root workspace support
@@ -731,3 +731,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Реализовать `LP-019 / V1-025` Basic diagnostics parity.
 - [x] **T-2026-05-20** Реализовать `LP-020 / V1-026` Type/member diagnostics.
 - [x] **T-2026-05-20** Реализовать `LP-021 / VN-001` `textDocument/inlayHint`.
+- [x] **T-2026-05-20** Реализовать `LP-022 / VN-002` call hierarchy.

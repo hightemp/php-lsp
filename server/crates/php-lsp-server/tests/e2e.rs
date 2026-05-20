@@ -237,6 +237,30 @@ fn inlay_hint_request(
         .finish()
 }
 
+fn prepare_call_hierarchy_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
+    Request::build("textDocument/prepareCallHierarchy")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+        .id(id)
+        .finish()
+}
+
+fn incoming_calls_request(id: i64, item: serde_json::Value) -> Request {
+    Request::build("callHierarchy/incomingCalls")
+        .params(json!({ "item": item }))
+        .id(id)
+        .finish()
+}
+
+fn outgoing_calls_request(id: i64, item: serde_json::Value) -> Request {
+    Request::build("callHierarchy/outgoingCalls")
+        .params(json!({ "item": item }))
+        .id(id)
+        .finish()
+}
+
 fn formatting_request(id: i64, uri: &str) -> Request {
     Request::build("textDocument/formatting")
         .params(json!({
@@ -632,6 +656,14 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected linkedEditingRangeProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("callHierarchyProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected callHierarchyProvider capability"
     );
     assert!(
         result
@@ -2111,6 +2143,153 @@ function run(Formatter $formatter): void {
             .any(|hint| hint.get("kind").and_then(|kind| kind.as_u64()) == Some(1)),
         "expected type hint kind, got: {}",
         result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_call_hierarchy_prepare_incoming_and_outgoing() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+function helper(): void {}
+
+function caller(): void {
+    helper();
+}
+
+class Service {
+    public function target(): void {}
+
+    public function entry(): void {
+        $this->target();
+        helper();
+    }
+}
+
+function run(Service $service): void {
+    caller();
+    $service->entry();
+}
+"#;
+    let uri = "file:///test/call-hierarchy.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let entry_prepare = service
+        .ready()
+        .await
+        .unwrap()
+        .call(prepare_call_hierarchy_request(2, uri, 12, 22))
+        .await
+        .unwrap();
+    let entry_result = extract_result(entry_prepare);
+    let entry_items = entry_result
+        .as_array()
+        .expect("expected prepareCallHierarchy item array");
+    let entry_item = entry_items[0].clone();
+    assert_eq!(entry_item["name"].as_str(), Some("entry"));
+    assert_eq!(
+        entry_item["data"]["fqn"].as_str(),
+        Some("App\\Service::entry"),
+        "expected call hierarchy item data, got: {}",
+        entry_item
+    );
+
+    let outgoing_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(outgoing_calls_request(3, entry_item))
+        .await
+        .unwrap();
+    let outgoing_result = extract_result(outgoing_resp);
+    let outgoing = outgoing_result
+        .as_array()
+        .expect("expected outgoing call array");
+    let outgoing_names: Vec<&str> = outgoing
+        .iter()
+        .filter_map(|call| call["to"]["name"].as_str())
+        .collect();
+    assert!(
+        outgoing_names.contains(&"target") && outgoing_names.contains(&"helper"),
+        "expected outgoing target/helper calls, got: {}",
+        outgoing_result
+    );
+    assert!(
+        outgoing.iter().any(|call| call["fromRanges"]
+            .as_array()
+            .is_some_and(|ranges| !ranges.is_empty())),
+        "expected outgoing call ranges, got: {}",
+        outgoing_result
+    );
+
+    let helper_prepare = service
+        .ready()
+        .await
+        .unwrap()
+        .call(prepare_call_hierarchy_request(4, uri, 3, 10))
+        .await
+        .unwrap();
+    let helper_result = extract_result(helper_prepare);
+    let helper_item = helper_result
+        .as_array()
+        .expect("expected helper prepare item array")[0]
+        .clone();
+    assert_eq!(helper_item["name"].as_str(), Some("helper"));
+
+    let incoming_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(incoming_calls_request(5, helper_item))
+        .await
+        .unwrap();
+    let incoming_result = extract_result(incoming_resp);
+    let incoming = incoming_result
+        .as_array()
+        .expect("expected incoming call array");
+    let incoming_names: Vec<&str> = incoming
+        .iter()
+        .filter_map(|call| call["from"]["name"].as_str())
+        .collect();
+    assert!(
+        incoming_names.contains(&"caller") && incoming_names.contains(&"entry"),
+        "expected incoming caller/entry calls, got: {}",
+        incoming_result
     );
 
     service
