@@ -582,7 +582,7 @@
 - [x] **VN-001** textDocument/inlayHint — типы параметров, return types inline *(done 2026-05-20)*
 - [x] **VN-002** textDocument/prepareCallHierarchy + incoming/outgoing *(done 2026-05-20)*
 - [x] **VN-003** textDocument/prepareTypeHierarchy + supertypes/subtypes *(done 2026-05-20)*
-- [ ] **VN-004** textDocument/implementation (interface → concrete)
+- [x] **VN-004** textDocument/implementation (interface → concrete) *(done 2026-05-20)*
 - [ ] **VN-005** Multi-root workspace поддержка
   - Использовать `workspaceFolders` вместо одного `rootUri`
   - Отдельные composer namespace maps и индексы по workspace folder
@@ -691,7 +691,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-021 / VN-001** `textDocument/inlayHint`
 - [x] **LP-022 / VN-002** `textDocument/prepareCallHierarchy` + incoming/outgoing calls
 - [x] **LP-023 / VN-003** `textDocument/prepareTypeHierarchy` + supertypes/subtypes
-- [ ] **LP-024 / VN-004** `textDocument/implementation`
+- [x] **LP-024 / VN-004** `textDocument/implementation`
 - [ ] **LP-025 / VN-005** Multi-root workspace support
 - [ ] **LP-026 / VN-006** PHPStan diagnostics integration
 - [ ] **LP-027 / VN-007** Psalm diagnostics integration
@@ -733,3 +733,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Реализовать `LP-021 / VN-001` `textDocument/inlayHint`.
 - [x] **T-2026-05-20** Реализовать `LP-022 / VN-002` call hierarchy.
 - [x] **T-2026-05-20** Реализовать `LP-023 / VN-003` type hierarchy.
+- [x] **T-2026-05-20** Реализовать `LP-024 / VN-004` `textDocument/implementation`.

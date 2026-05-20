@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
 use tower_lsp::jsonrpc::Result;
+use tower_lsp::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp::ls_types::*;
 use tower_lsp::{Client, LanguageServer};
 
@@ -2771,6 +2772,111 @@ fn direct_type_parent_fqns(sym: &php_lsp_types::SymbolInfo) -> Vec<String> {
         .collect()
 }
 
+fn symbol_location(sym: &php_lsp_types::SymbolInfo) -> Option<Location> {
+    Some(Location {
+        uri: sym.uri.parse::<Uri>().ok()?,
+        range: range_from_tuple(sym.selection_range),
+    })
+}
+
+fn direct_symbol_by_fqn(
+    index: &WorkspaceIndex,
+    fqn: &str,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    index.file_symbols.iter().find_map(|entry| {
+        entry
+            .value()
+            .symbols
+            .iter()
+            .find(|sym| sym.fqn == fqn)
+            .cloned()
+            .map(Arc::new)
+    })
+}
+
+fn implementation_type_descendants(
+    index: &WorkspaceIndex,
+    target_fqn: &str,
+) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
+    let mut visited = HashSet::new();
+    let mut result = Vec::new();
+    collect_implementation_type_descendants(index, target_fqn, &mut visited, &mut result);
+    result.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+    result
+}
+
+fn collect_implementation_type_descendants(
+    index: &WorkspaceIndex,
+    target_fqn: &str,
+    visited: &mut HashSet<String>,
+    result: &mut Vec<Arc<php_lsp_types::SymbolInfo>>,
+) {
+    if !visited.insert(target_fqn.to_string()) {
+        return;
+    }
+
+    for subtype in direct_type_subtypes(index, target_fqn) {
+        if matches!(
+            subtype.kind,
+            php_lsp_types::PhpSymbolKind::Class | php_lsp_types::PhpSymbolKind::Enum
+        ) {
+            result.push(subtype.clone());
+        }
+        collect_implementation_type_descendants(index, &subtype.fqn, visited, result);
+    }
+}
+
+fn implementation_locations_for_type(
+    index: &WorkspaceIndex,
+    target: &php_lsp_types::SymbolInfo,
+) -> Vec<Location> {
+    implementation_type_descendants(index, &target.fqn)
+        .into_iter()
+        .filter(|sym| !sym.modifiers.is_abstract)
+        .filter_map(|sym| symbol_location(&sym))
+        .collect()
+}
+
+fn implementation_locations_for_method(
+    index: &WorkspaceIndex,
+    target: &php_lsp_types::SymbolInfo,
+) -> Vec<Location> {
+    let Some(parent_fqn) = target.parent_fqn.as_deref() else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut locations = Vec::new();
+
+    for subtype in implementation_type_descendants(index, parent_fqn) {
+        let member_fqn = format!("{}::{}", subtype.fqn, target.name);
+        let Some(method) = direct_symbol_by_fqn(index, &member_fqn) else {
+            continue;
+        };
+        if method.kind != php_lsp_types::PhpSymbolKind::Method || method.fqn == target.fqn {
+            continue;
+        }
+        if seen.insert(method.fqn.clone()) {
+            if let Some(location) = symbol_location(&method) {
+                locations.push(location);
+            }
+        }
+    }
+
+    locations.sort_by(|left, right| {
+        (
+            left.uri.as_str(),
+            left.range.start.line,
+            left.range.start.character,
+        )
+            .cmp(&(
+                right.uri.as_str(),
+                right.range.start.line,
+                right.range.start.character,
+            ))
+    });
+    locations
+}
+
 fn call_hierarchy_symbol_from_item(
     index: &WorkspaceIndex,
     item: &CallHierarchyItem,
@@ -4871,6 +4977,7 @@ impl LanguageServer for PhpLspBackend {
                 definition_provider: Some(OneOf::Left(true)),
                 declaration_provider: Some(DeclarationCapability::Simple(true)),
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
@@ -5751,6 +5858,122 @@ impl LanguageServer for PhpLspBackend {
             .location_for_type_fqn(&type_fqn)
             .await
             .map(GotoDefinitionResponse::Scalar))
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: GotoImplementationParams,
+    ) -> Result<Option<GotoImplementationResponse>> {
+        let uri_str = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .as_str()
+            .to_string();
+        let pos = params.text_document_position_params.position;
+        tracing::debug!(
+            "gotoImplementation: {}:{}:{}",
+            uri_str,
+            pos.line,
+            pos.character
+        );
+
+        let (candidate, local_candidate) = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            let tree = match parser.tree() {
+                Some(tree) => tree,
+                None => return Ok(None),
+            };
+            let source = parser.source();
+            let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let file_symbols = self
+                .index
+                .file_symbols
+                .get(&uri_str)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
+            let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+                self.resolve_member_type(class_fqn, member_name)
+            };
+            let Some(sym_at_pos) = symbol_at_position_with_resolver(
+                tree,
+                &source,
+                pos.line,
+                byte_col,
+                &file_symbols,
+                Some(&resolver),
+            ) else {
+                return Ok(None);
+            };
+
+            let candidate = match sym_at_pos.ref_kind {
+                RefKind::ClassName => Some((
+                    sym_at_pos.fqn.clone(),
+                    php_lsp_types::PhpSymbolKind::Class,
+                    RefKind::ClassName,
+                )),
+                RefKind::Constructor => {
+                    let class_fqn = sym_at_pos
+                        .fqn
+                        .strip_suffix("::__construct")
+                        .unwrap_or(&sym_at_pos.fqn)
+                        .to_string();
+                    Some((
+                        class_fqn,
+                        php_lsp_types::PhpSymbolKind::Class,
+                        RefKind::ClassName,
+                    ))
+                }
+                RefKind::MethodCall => Some((
+                    sym_at_pos.fqn.clone(),
+                    php_lsp_types::PhpSymbolKind::Method,
+                    RefKind::MethodCall,
+                )),
+                _ => None,
+            };
+
+            let local_candidate = candidate.as_ref().and_then(|(fqn, kind, _)| {
+                file_symbols
+                    .symbols
+                    .iter()
+                    .find(|sym| sym.fqn == *fqn && sym.kind == *kind)
+                    .cloned()
+            });
+            (candidate, local_candidate)
+        };
+
+        let Some((target_fqn, _, ref_kind)) = candidate else {
+            return Ok(None);
+        };
+        let target = self
+            .resolve_fqn_lazy_with_fallback(&target_fqn, ref_kind)
+            .await
+            .or_else(|| local_candidate.map(Arc::new));
+        let Some(target) = target else {
+            return Ok(None);
+        };
+
+        let locations = match target.kind {
+            php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum => {
+                implementation_locations_for_type(&self.index, &target)
+            }
+            php_lsp_types::PhpSymbolKind::Method => {
+                implementation_locations_for_method(&self.index, &target)
+            }
+            _ => Vec::new(),
+        };
+
+        if locations.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(GotoImplementationResponse::Array(locations)))
+        }
     }
 
     async fn goto_definition(

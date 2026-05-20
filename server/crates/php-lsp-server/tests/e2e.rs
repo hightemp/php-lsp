@@ -163,6 +163,16 @@ fn type_definition_request(id: i64, uri: &str, line: u32, character: u32) -> Req
         .finish()
 }
 
+fn implementation_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
+    Request::build("textDocument/implementation")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn document_highlight_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/documentHighlight")
         .params(json!({
@@ -656,6 +666,14 @@ async fn test_initialize_and_shutdown() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "expected typeDefinitionProvider capability"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("implementationProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected implementationProvider capability"
     );
     assert!(
         result
@@ -2463,6 +2481,151 @@ class Other implements Contract {}
         contract_subtype_names.contains(&"Child") && contract_subtype_names.contains(&"Other"),
         "expected Child and Other contract subtypes, got: {}",
         contract_subtypes_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_goto_implementation_for_types_and_methods() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+interface Contract {
+    public function work(): void;
+}
+
+class Base {
+    public function run(): void {}
+}
+
+class Impl extends Base implements Contract {
+    public function work(): void {}
+    public function run(): void {}
+}
+
+class Other implements Contract {
+    public function work(): void {}
+}
+
+function useIt(Contract $contract, Base $base): void {
+    $contract->work();
+    $base->run();
+}
+"#;
+    let uri = "file:///test/implementation.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let type_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(implementation_request(2, uri, 3, 12))
+        .await
+        .unwrap();
+    let type_result = extract_result(type_response);
+    let type_impls = type_result
+        .as_array()
+        .expect("expected implementation locations for Contract");
+    let type_lines: Vec<u64> = type_impls
+        .iter()
+        .filter_map(|location| location["range"]["start"]["line"].as_u64())
+        .collect();
+    assert!(
+        type_lines.contains(&11) && type_lines.contains(&16),
+        "expected Impl and Other implementation locations, got: {}",
+        type_result
+    );
+
+    let method_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(implementation_request(3, uri, 4, 22))
+        .await
+        .unwrap();
+    let method_result = extract_result(method_response);
+    let method_impls = method_result
+        .as_array()
+        .expect("expected implementation locations for Contract::work");
+    let method_lines: Vec<u64> = method_impls
+        .iter()
+        .filter_map(|location| location["range"]["start"]["line"].as_u64())
+        .collect();
+    assert!(
+        method_lines.contains(&12) && method_lines.contains(&17),
+        "expected Impl::work and Other::work implementation locations, got: {}",
+        method_result
+    );
+
+    let call_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(implementation_request(4, uri, 21, 17))
+        .await
+        .unwrap();
+    let call_result = extract_result(call_response);
+    let call_impls = call_result
+        .as_array()
+        .expect("expected implementation locations for call-site Contract::work");
+    assert_eq!(
+        call_impls.len(),
+        2,
+        "expected two call-site implementations, got: {}",
+        call_result
+    );
+
+    let override_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(implementation_request(5, uri, 8, 21))
+        .await
+        .unwrap();
+    let override_result = extract_result(override_response);
+    let override_impls = override_result
+        .as_array()
+        .expect("expected implementation locations for Base::run");
+    assert!(
+        override_impls
+            .iter()
+            .any(|location| location["range"]["start"]["line"].as_u64() == Some(13)),
+        "expected Impl::run override location, got: {}",
+        override_result
     );
 
     service
