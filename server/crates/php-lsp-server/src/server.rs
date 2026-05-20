@@ -4416,7 +4416,7 @@ fn check_member_access_node(
             || is_phpunit_test_double_api_call(tree, source, file_symbols, index, &sym_at_pos)
             || is_missing_parent_constructor_call(&sym_at_pos)
             || is_enum_builtin_method_call(index, &sym_at_pos)
-            || is_dynamic_member_access(index, &sym_at_pos)
+            || is_dynamic_member_access(index, file_symbols, &sym_at_pos)
         {
             return;
         }
@@ -4623,7 +4623,11 @@ fn phpunit_test_double_type_has_method(class_fqn: &str, member_name: &str) -> bo
     is_phpunit_test_double_type(class_fqn) && phpunit_test_double_api_method(member_name)
 }
 
-fn is_dynamic_member_access(index: &WorkspaceIndex, sym_at_pos: &SymbolAtPosition) -> bool {
+fn is_dynamic_member_access(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    sym_at_pos: &SymbolAtPosition,
+) -> bool {
     let Some((class_fqn, member_name)) = sym_at_pos.fqn.rsplit_once("::") else {
         return false;
     };
@@ -4634,7 +4638,7 @@ fn is_dynamic_member_access(index: &WorkspaceIndex, sym_at_pos: &SymbolAtPositio
 
     if sym_at_pos.ref_kind == RefKind::MethodCall {
         return is_doctrine_repository_dynamic_method(class_fqn, member_name)
-            || is_known_vendor_method(class_fqn, member_name);
+            || is_unindexed_imported_type(index, file_symbols, class_fqn);
     }
 
     if sym_at_pos.ref_kind != RefKind::PropertyAccess {
@@ -4683,23 +4687,20 @@ fn is_doctrine_repository_dynamic_method(class_fqn: &str, member_name: &str) -> 
             || member_name.starts_with("countBy"))
 }
 
-fn is_known_vendor_method(class_fqn: &str, member_name: &str) -> bool {
-    (fqn_matches(class_fqn, "Doctrine\\DBAL\\Result")
-        && matches!(
-            member_name,
-            "fetchOne"
-                | "fetchAllAssociative"
-                | "fetchAllAssociativeIndexed"
-                | "fetchNumeric"
-                | "fetchAssociative"
-                | "rowCount"
-                | "columnCount"
-                | "free"
-        ))
-        || (fqn_matches(
-            class_fqn,
-            "SymfonyCasts\\Bundle\\VerifyEmail\\VerifyEmailHelperInterface",
-        ) && member_name == "validateEmailConfirmationFromRequest")
+fn is_unindexed_imported_type(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    class_fqn: &str,
+) -> bool {
+    let normalized = class_fqn.trim_start_matches('\\');
+    if index.types.contains_key(normalized) {
+        return false;
+    }
+
+    file_symbols.use_statements.iter().any(|use_statement| {
+        matches!(use_statement.kind, php_lsp_types::UseKind::Class)
+            && use_statement.fqn.trim_start_matches('\\') == normalized
+    })
 }
 
 fn is_generic_object_type_name(class_fqn: &str) -> bool {
@@ -10622,6 +10623,47 @@ class Demo {
     }
 
     #[test]
+    fn test_compute_diagnostics_skips_members_on_unindexed_imported_types() {
+        let uri = "file:///external-client.php";
+        let code = r#"<?php
+namespace App;
+
+use Vendor\Package\Client;
+
+class Demo {
+    public function run(Client $client): void {
+        $client->send();
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert!(
+            !messages.contains(&"Unknown method: Vendor\\Package\\Client::send"),
+            "Unindexed imported types should not get guessed member diagnostics: {:?}",
+            messages
+        );
+    }
+
+    #[test]
     fn test_compute_diagnostics_allows_magic_class_and_late_bound_self_calls() {
         let uri = "file:///phpunit-patterns.php";
         let code = r#"<?php
@@ -11062,14 +11104,14 @@ function run(Box $box): void {
         let code = r#"<?php
 namespace App;
 
-class SFTPService {}
+class RemoteFileService {}
 
 class Controller {
-    private SFTPService $downloadSftp;
-    private SFTPService $uploadSftp;
+    private RemoteFileService $primaryFileService;
+    private RemoteFileService $secondaryFileService;
 
-    private function getService(string $account): SFTPService {
-        return 'download' === $account ? $this->downloadSftp : $this->uploadSftp;
+    private function getService(string $name): RemoteFileService {
+        return 'primary' === $name ? $this->primaryFileService : $this->secondaryFileService;
     }
 }
 "#;

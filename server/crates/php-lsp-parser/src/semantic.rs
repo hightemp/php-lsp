@@ -2037,7 +2037,7 @@ function run(string $used, string $unusedParam): void {
     fn test_null_coalesce_probe_does_not_report_undefined_variable() {
         let code = r#"<?php
 function run(): bool {
-    return $workflowSuccess ?? false;
+    return $maybeResult ?? false;
 }
 "#;
         let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
@@ -2045,7 +2045,7 @@ function run(): bool {
         assert!(
             !diags.iter().any(|d| {
                 d.kind == SemanticDiagnosticKind::UndefinedVariable
-                    && d.message.contains("$workflowSuccess")
+                    && d.message.contains("$maybeResult")
             }),
             "Null coalesce left operand should not be reported as undefined, got: {:?}",
             diags

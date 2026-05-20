@@ -9,10 +9,53 @@ import time
 
 SERVER_BIN = os.path.join(os.path.dirname(__file__), '..', 'client', 'bin', 'linux-x64', 'php-lsp')
 STUBS_PATH = os.path.join(os.path.dirname(__file__), '..', 'client', 'stubs')
-# Use parent dir (bdpn-ui/) not app/ to test composer.json auto-discovery
-WORKSPACE_ROOT = '/home/apanov/Projects/bdpn-ui'
-PROJECT_ROOT = '/home/apanov/Projects/bdpn-ui/app'
-TEST_FILE = os.path.join(PROJECT_ROOT, 'tests', 'Soap', 'SoapHandlerTest.php')
+DEFAULT_TEST_FILE = os.environ.get('PHP_LSP_TEST_DEFAULT_FILE', 'index.php')
+
+
+def resolve_project_paths(default_test_file):
+    workspace_root = os.environ.get('PHP_LSP_TEST_WORKSPACE_ROOT')
+    project_root = os.environ.get('PHP_LSP_TEST_PROJECT_ROOT')
+    test_file = os.environ.get('PHP_LSP_TEST_FILE')
+
+    if not workspace_root or not project_root:
+        print(
+            'Set PHP_LSP_TEST_WORKSPACE_ROOT and PHP_LSP_TEST_PROJECT_ROOT '
+            'before running this script.'
+        )
+        sys.exit(2)
+
+    if not test_file:
+        test_file = os.path.join(project_root, default_test_file)
+    elif not os.path.isabs(test_file):
+        test_file = os.path.join(project_root, test_file)
+
+    return (
+        os.path.realpath(workspace_root),
+        os.path.realpath(project_root),
+        os.path.realpath(test_file),
+    )
+
+
+def load_test_cases():
+    cases_file = os.environ.get('PHP_LSP_TEST_CASES_FILE')
+    if not cases_file:
+        return []
+
+    with open(cases_file, 'r') as f:
+        raw_cases = json.load(f)
+
+    cases = []
+    for raw_case in raw_cases:
+        if isinstance(raw_case, dict):
+            description = raw_case['description']
+            line = raw_case['line']
+            character = raw_case['character']
+        else:
+            description, line, character = raw_case
+        cases.append((description, int(line), int(character)))
+
+    return cases
+
 
 def send_request(proc, method, params, req_id):
     msg = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
@@ -76,9 +119,13 @@ def wait_for_response(proc, expected_id, timeout=60):
 def main():
     server_path = os.path.realpath(SERVER_BIN)
     stubs_path = os.path.realpath(STUBS_PATH)
+    workspace_root, project_root, test_file = resolve_project_paths(DEFAULT_TEST_FILE)
 
     if not os.path.exists(server_path):
         print(f"Server not found at {server_path}")
+        sys.exit(1)
+    if not os.path.exists(test_file):
+        print(f"Test file not found at {test_file}")
         sys.exit(1)
 
     print(f"Starting server: {server_path}")
@@ -92,11 +139,11 @@ def main():
         env=env,
     )
 
-    root_uri = f"file://{WORKSPACE_ROOT}"
-    test_file_uri = f"file://{TEST_FILE}"
+    root_uri = f"file://{workspace_root}"
+    test_file_uri = f"file://{test_file}"
 
     # Read the test file
-    with open(TEST_FILE, 'r') as f:
+    with open(test_file, 'r') as f:
         test_content = f.read()
 
     req_id = 1
@@ -126,7 +173,7 @@ def main():
     time.sleep(15)  # Wait for indexing to complete (4000+ files)
 
     # Open the test file
-    print(f"\nOpening {TEST_FILE}")
+    print(f"\nOpening {test_file}")
     send_notification(proc, "textDocument/didOpen", {
         "textDocument": {
             "uri": test_file_uri,
@@ -160,75 +207,16 @@ def main():
         print(f"\n  Diagnostics: 0 (clean)")
 
 
-    # Define test cases: (description, line_0based, character_0based)
-    test_cases = [
-        # Line 35: $this->logger = $this->createStub(LoggerInterface::class);
-        ("createStub (inherited from TestCase)", 34, 31),  # col 31 = 'c' in createStub
-
-        # Line 35: $this->logger = $this->createStub(LoggerInterface::class);
-        ("LoggerInterface::class", 34, 42),  # col 42 = 'L' in LoggerInterface
-
-        # Line 25: final class SoapHandlerTest extends TestCase
-        ("TestCase in extends", 24, 36),  # col 36 = 'T' in TestCase
-
-        # Line 58: $result = $handler->callOkResponse();
-        ("callOkResponse (same file)", 57, 28),  # col 28 = 'c' in callOkResponse
-
-        # Line 60: self::assertSame(1001, $result['StatusCode']);
-        ("self::assertSame (static method)", 59, 14),  # col 14 = 'a' in assertSame
-
-        # Line 30: private TimerService $timerService;
-        ("TimerService type hint", 29, 12),  # col 12 = 'T' in TimerService
-
-        # Line 133: $repo->method('findOneBy')->willReturn($request);
-        ("method on $repo (stub method)", 132, 16),  # col 16 = 'm' (after $repo->)
-
-        # Line 133: $repo->method('findOneBy')->willReturn($request);
-        ("willReturn chained", 132, 36),  # col 36 = 'w' in willReturn
-
-        # Line 160: $qb->method('join')->willReturnSelf();
-        ("method on $qb", 159, 13),  # col 13 = 'm' in method
-
-        # Line 44: return new TestConcreteSoapHandler(
-        ("TestConcreteSoapHandler (same file)", 43, 19),  # col 19 = 'T'
-
-        # --- Property assignment fallback cases ---
-
-        # Line 134: $this->em->method('getRepository')->willReturn($repo);
-        ("method on $this->em (assignment fallback)", 133, 19),  # col 19 = 'm' after $this->em->
-
-        # Line 134: $this->em->method('getRepository')->willReturn($repo);
-        ("willReturn on $this->em chain", 133, 44),  # col 44 = 'w' in willReturn
-
-        # Line 226: $this->workflowService->method('createOrGetDonorProcess')->willReturn($newProcess);
-        ("method on $this->workflowService", 225, 32),  # col 32 = 'm' in method
-
-        # Line 226: ...->willReturn($newProcess);
-        ("willReturn on workflowService chain", 225, 67),  # col 67 = 'w' in willReturn
-
-        # Line 317: $this->timerService->expects(self::once())
-        ("expects on timerService", 316, 29),  # col 29 = 'e' in expects
-
-        # Line 328: $this->timerService->method('start')
-        ("method on timerService stub", 327, 29),  # col 29 = 'm' in method
-
-        # --- Use statement go-to-definition ---
-
-        # Line 15: use Doctrine\ORM\EntityManagerInterface;
-        ("use Doctrine\\ORM\\EntityManagerInterface", 14, 30),  # col 30 = 'E' in EntityManagerInterface
-
-        # Line 19: use PHPUnit\Framework\TestCase;
-        ("use PHPUnit\\Framework\\TestCase", 18, 23),  # col 23 = 'T' in TestCase
-
-        # Line 20: use Psr\Log\LoggerInterface;
-        ("use Psr\\Log\\LoggerInterface", 19, 15),  # col 15 = 'L' in LoggerInterface
-    ]
+    test_cases = load_test_cases()
 
     print(f"\n{'='*80}")
-    print(f"Testing go-to-definition on SoapHandlerTest.php")
+    print(f"Testing go-to-definition on {os.path.basename(test_file)}")
     print(f"{'='*80}\n")
 
     results = []
+    if not test_cases:
+        print("No go-to-definition cases configured.")
+
     for desc, line, char in test_cases:
         send_request(proc, "textDocument/definition", {
             "textDocument": {"uri": test_file_uri},
@@ -247,7 +235,7 @@ def main():
                     rng = loc.get("range", {}).get("start", {})
                     target_line = rng.get("line", "?")
                     # Shorten URI for display
-                    short_uri = uri.replace(f"file://{PROJECT_ROOT}/", "")
+                    short_uri = uri.replace(f"file://{project_root}/", "")
                     status = f"✓ → {short_uri}:{target_line + 1}"
                 else:
                     status = "✗ empty result"
@@ -255,7 +243,7 @@ def main():
                 uri = result.get("uri", "")
                 rng = result.get("range", {}).get("start", {})
                 target_line = rng.get("line", "?")
-                short_uri = uri.replace(f"file://{PROJECT_ROOT}/", "")
+                short_uri = uri.replace(f"file://{project_root}/", "")
                 status = f"✓ → {short_uri}:{target_line + 1}"
             else:
                 status = f"✗ unexpected: {result}"

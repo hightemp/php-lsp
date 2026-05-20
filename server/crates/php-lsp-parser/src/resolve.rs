@@ -2320,12 +2320,12 @@ class Foo {
         let code = r#"<?php
 namespace App\Form;
 
-use App\Repository\PortingRequestTypesRepository;
+use App\Repository\CatalogRepository;
 
 class Foo {
     public function build(): void {
-        $fn = static function (PortingRequestTypesRepository $er) {
-            return $er->createQueryBuilder('prt');
+        $fn = static function (CatalogRepository $repository) {
+            return $repository->createQueryBuilder('item');
         };
     }
 }
@@ -2335,7 +2335,7 @@ class Foo {
         let result = parse_and_resolve(code, l1, c1).unwrap();
         assert_eq!(
             result.fqn,
-            "App\\Repository\\PortingRequestTypesRepository::createQueryBuilder"
+            "App\\Repository\\CatalogRepository::createQueryBuilder"
         );
         assert_eq!(result.ref_kind, RefKind::MethodCall);
     }

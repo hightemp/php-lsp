@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-r"""LSP test: comprehensive go-to-definition and diagnostics for PortingRequestType.php.
-
-Tests:
- - use statement go-to-def (including aliased `use ... as Assert`)
- - new Assert\NotBlank -- aliased qualified name in object_creation_expression
- - closure parameter type resolution ($er->createQueryBuilder, $subscriber->getLastName)
- - class references (extends, ::class, type hints)
- - diagnostics (no unresolved use statements)
-"""
+"""Generic LSP diagnostics and go-to-definition runner for a real PHP file."""
 
 import json
 import subprocess
@@ -17,9 +9,52 @@ import time
 
 SERVER_BIN = os.path.join(os.path.dirname(__file__), '..', 'client', 'bin', 'linux-x64', 'php-lsp')
 STUBS_PATH = os.path.join(os.path.dirname(__file__), '..', 'client', 'stubs')
-WORKSPACE_ROOT = '/home/apanov/Projects/bdpn-ui'
-PROJECT_ROOT = '/home/apanov/Projects/bdpn-ui/app'
-TEST_FILE = os.path.join(PROJECT_ROOT, 'src', 'Form', 'PortingRequestType.php')
+DEFAULT_TEST_FILE = os.environ.get('PHP_LSP_TEST_DEFAULT_FILE', 'index.php')
+
+
+def resolve_project_paths(default_test_file):
+    workspace_root = os.environ.get('PHP_LSP_TEST_WORKSPACE_ROOT')
+    project_root = os.environ.get('PHP_LSP_TEST_PROJECT_ROOT')
+    test_file = os.environ.get('PHP_LSP_TEST_FILE')
+
+    if not workspace_root or not project_root:
+        print(
+            'Set PHP_LSP_TEST_WORKSPACE_ROOT and PHP_LSP_TEST_PROJECT_ROOT '
+            'before running this script.'
+        )
+        sys.exit(2)
+
+    if not test_file:
+        test_file = os.path.join(project_root, default_test_file)
+    elif not os.path.isabs(test_file):
+        test_file = os.path.join(project_root, test_file)
+
+    return (
+        os.path.realpath(workspace_root),
+        os.path.realpath(project_root),
+        os.path.realpath(test_file),
+    )
+
+
+def load_test_cases():
+    cases_file = os.environ.get('PHP_LSP_TEST_CASES_FILE')
+    if not cases_file:
+        return []
+
+    with open(cases_file, 'r') as f:
+        raw_cases = json.load(f)
+
+    cases = []
+    for raw_case in raw_cases:
+        if isinstance(raw_case, dict):
+            description = raw_case['description']
+            line = raw_case['line']
+            character = raw_case['character']
+        else:
+            description, line, character = raw_case
+        cases.append((description, int(line), int(character)))
+
+    return cases
 
 
 def send_request(proc, method, params, req_id):
@@ -86,9 +121,13 @@ def wait_for_response(proc, expected_id, timeout=60):
 def main():
     server_path = os.path.realpath(SERVER_BIN)
     stubs_path = os.path.realpath(STUBS_PATH)
+    workspace_root, project_root, test_file = resolve_project_paths(DEFAULT_TEST_FILE)
 
     if not os.path.exists(server_path):
         print(f"Server not found at {server_path}")
+        sys.exit(1)
+    if not os.path.exists(test_file):
+        print(f"Test file not found at {test_file}")
         sys.exit(1)
 
     print(f"Starting server: {server_path}")
@@ -101,10 +140,10 @@ def main():
         env=os.environ.copy(),
     )
 
-    root_uri = f"file://{WORKSPACE_ROOT}"
-    test_file_uri = f"file://{TEST_FILE}"
+    root_uri = f"file://{workspace_root}"
+    test_file_uri = f"file://{test_file}"
 
-    with open(TEST_FILE, 'r') as f:
+    with open(test_file, 'r') as f:
         test_content = f.read()
 
     req_id = 1
@@ -133,7 +172,7 @@ def main():
     time.sleep(15)  # Wait for indexing
 
     # Open test file
-    print(f"\nOpening {TEST_FILE}")
+    print(f"\nOpening {test_file}")
     send_notification(proc, "textDocument/didOpen", {
         "textDocument": {
             "uri": test_file_uri,
@@ -165,59 +204,16 @@ def main():
     else:
         print(f"\n  Diagnostics: 0 (clean)")
 
-    # All line numbers below are 0-based
-    test_cases = [
-        # === Use statement go-to-definition ===
-        ("use App\\Entity\\Operator", 6, 15),              # L7: Operator
-        ("use App\\Entity\\PortingRequest", 7, 15),         # L8: PortingRequest
-        ("use App\\Entity\\PortingRequestTypes", 8, 15),    # L9: PortingRequestTypes
-        ("use App\\Entity\\Subscriber", 9, 15),             # L10: Subscriber
-        ("use App\\Repository\\PortingRequestTypesRepository", 10, 19),  # L11
-        ("use Doctrine\\ORM\\EntityRepository", 11, 17),    # L12
-        ("use Symfony\\...\\EntityType", 12, 38),            # L13
-        ("use Symfony\\...\\AbstractType", 13, 27),          # L14
-        ("use Symfony\\...\\FormBuilderInterface", 19, 27),  # L20
-        ("use Symfony\\...\\OptionsResolver", 20, 22),       # L21
-
-        # === Extends / type hints ===
-        ("extends AbstractType", 23, 39),                    # L24
-        ("FormBuilderInterface type hint", 25, 30),          # L26
-        ("OptionsResolver type hint", 198, 37),              # L199
-
-        # === Class::class references ===
-        ("EntityType::class", 28, 33),                       # L29
-        ("PortingRequestTypes::class", 29, 27),              # L30
-        ("Subscriber::class", 50, 27),                       # L51
-        ("PortingRequest::class", 201, 28),                  # L202
-
-        # === Aliased use: new Assert\NotBlank ===
-        ("new Assert\\NotBlank L39 (NotBlank)", 38, 31),     # L39
-        ("new Assert\\NotBlank L39 (Assert)", 38, 24),       # L39 cursor on Assert
-        ("new Assert\\NotBlank L71", 70, 31),                # L71
-        ("new Assert\\NotBlank L179", 178, 31),              # L179
-        ("new Assert\\Length L191", 190, 31),                 # L191
-
-        # === Closure parameter type hints ===
-        ("PortingRequestTypesRepository param L41", 40, 52), # L41
-        ("PortingRequestTypes param L45", 44, 50),           # L45
-        ("Subscriber param L52", 51, 51),                    # L52
-        ("EntityRepository param L73", 72, 52),              # L73
-
-        # === Method calls on closure params ===
-        ("$er->createQueryBuilder L42", 41, 32),             # L42
-        ("$type->getProcessTypeCode L46", 45, 63),           # L46
-        ("$subscriber->getType L53", 52, 51),                # L53
-        ("$subscriber->getOrganizationName L53", 52, 77),    # L53
-        ("$subscriber->getLastName L59", 58, 37),            # L59
-        ("$subscriber->getFirstName L60", 59, 37),           # L60
-        ("$er->createQueryBuilder L74", 73, 32),             # L74
-    ]
+    test_cases = load_test_cases()
 
     print(f"\n{'='*80}")
-    print(f"Testing go-to-definition on PortingRequestType.php ({len(test_cases)} cases)")
+    print(f"Testing go-to-definition on {os.path.basename(test_file)} ({len(test_cases)} cases)")
     print(f"{'='*80}\n")
 
     results = []
+    if not test_cases:
+        print("No go-to-definition cases configured.")
+
     for desc, line, char in test_cases:
         send_request(proc, "textDocument/definition", {
             "textDocument": {"uri": test_file_uri},
@@ -235,7 +231,7 @@ def main():
                     uri = loc.get("uri", "")
                     rng = loc.get("range", {}).get("start", {})
                     target_line = rng.get("line", "?")
-                    short_uri = uri.replace(f"file://{PROJECT_ROOT}/", "")
+                    short_uri = uri.replace(f"file://{project_root}/", "")
                     status = f"✓ → {short_uri}:{target_line + 1}"
                 else:
                     status = "✗ empty result"
@@ -243,7 +239,7 @@ def main():
                 uri = result.get("uri", "")
                 rng = result.get("range", {}).get("start", {})
                 target_line = rng.get("line", "?")
-                short_uri = uri.replace(f"file://{PROJECT_ROOT}/", "")
+                short_uri = uri.replace(f"file://{project_root}/", "")
                 status = f"✓ → {short_uri}:{target_line + 1}"
             else:
                 status = f"✗ unexpected: {result}"
