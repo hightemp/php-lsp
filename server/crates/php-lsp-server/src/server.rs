@@ -1145,7 +1145,6 @@ impl PhpLspBackend {
                 .iter()
                 .filter(|u| u.kind == php_lsp_types::UseKind::Class)
                 .filter(|u| u.fqn.contains('\\'))
-                .filter(|u| !self.index.types.contains_key(u.fqn.as_str()))
                 .map(|u| u.fqn.clone())
                 .collect();
             drop(fs); // release DashMap ref before async calls
@@ -4109,6 +4108,9 @@ fn check_member_access_node(
     let Some(name_node) = member_reference_name_node(node) else {
         return;
     };
+    if is_magic_class_constant_access(node, name_node, source) {
+        return;
+    }
     let pos = name_node.start_position();
     let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         resolve_member_type_from_index(index, class_fqn, member_name)
@@ -4144,7 +4146,7 @@ fn check_member_access_node(
         return;
     };
 
-    if let Some(message) = static_instance_misuse_message(node.kind(), &resolved) {
+    if let Some(message) = static_instance_misuse_message(node.kind(), &sym_at_pos, &resolved) {
         diagnostics.push(member_diagnostic(&sym_at_pos, utf16_index, message));
     }
 
@@ -4163,6 +4165,15 @@ fn member_reference_name_node(node: tree_sitter::Node) -> Option<tree_sitter::No
             None
         }
     })
+}
+
+fn is_magic_class_constant_access(
+    node: tree_sitter::Node,
+    name_node: tree_sitter::Node,
+    source: &str,
+) -> bool {
+    node.kind() == "class_constant_access_expression"
+        && source[name_node.byte_range()].eq_ignore_ascii_case("class")
 }
 
 fn member_diagnostic(
@@ -4227,14 +4238,28 @@ fn unknown_member_message(sym_at_pos: &SymbolAtPosition) -> String {
 
 fn static_instance_misuse_message(
     node_kind: &str,
+    sym_at_pos: &SymbolAtPosition,
     sym: &php_lsp_types::SymbolInfo,
 ) -> Option<String> {
     match sym.kind {
         php_lsp_types::PhpSymbolKind::Method => match (node_kind, sym.modifiers.is_static) {
+            ("member_call_expression", true)
+                if sym_at_pos.object_expr.as_deref() == Some("$this") =>
+            {
+                None
+            }
             ("member_call_expression", true) => Some(format!(
                 "Static method called as instance method: {}",
                 sym.fqn
             )),
+            ("scoped_call_expression", false)
+                if matches!(
+                    sym_at_pos.object_expr.as_deref(),
+                    Some("self" | "static" | "parent")
+                ) =>
+            {
+                None
+            }
             ("scoped_call_expression", false) => {
                 Some(format!("Instance method called statically: {}", sym.fqn))
             }
@@ -9392,6 +9417,63 @@ class Demo {
             "Method calls must not resolve to same-named properties: {:?}",
             messages
         );
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_magic_class_and_late_bound_self_calls() {
+        let uri = "file:///phpunit-patterns.php";
+        let code = r#"<?php
+namespace App;
+
+class Foo {}
+
+class Base {
+    protected function once(): void {}
+    protected static function createStub(string $type): object { return new Foo(); }
+    public static function callback(callable $callback): bool { return true; }
+}
+
+class Demo extends Base {
+    public function run(): void {
+        echo Foo::class;
+        self::once();
+        self::callback(static fn (): bool => true);
+        $this->createStub(Foo::class);
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Unknown class constant: App\\Foo::class",
+            "Instance method called statically: App\\Base::once",
+            "Static method called as instance method: App\\Base::createStub",
+        ] {
+            assert!(
+                !messages.contains(&unexpected),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
+                messages
+            );
+        }
     }
 
     #[test]

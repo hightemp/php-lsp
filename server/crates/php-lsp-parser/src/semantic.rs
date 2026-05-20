@@ -791,7 +791,6 @@ fn is_variable_scope(node: tree_sitter::Node) -> bool {
         node.kind(),
         "method_declaration"
             | "function_definition"
-            | "arrow_function"
             | "anonymous_function"
             | "anonymous_function_creation_expression"
     )
@@ -1507,6 +1506,26 @@ function run(string $used, string $unusedParam): void {
             !diags.iter().any(|d| d.message.contains("$usedLocal"))
                 && !diags.iter().any(|d| d.message.contains("$used")),
             "Used variables/params should not be reported, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_arrow_function_auto_captures_outer_variables() {
+        let code = r#"<?php
+function run(): void {
+    $npId = 'NP-1';
+    $callback = static fn (array $context): bool => ($context['npId'] ?? null) === $npId;
+    $callback([]);
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UndefinedVariable && d.message.contains("$npId")
+            }),
+            "Arrow functions should auto-capture outer variables, got: {:?}",
             diags
         );
     }
