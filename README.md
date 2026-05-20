@@ -63,6 +63,9 @@ phpstorm-stubs support.
 
 ### Editor UI
 
+- Status bar popup with indexing status, file/percentage progress, symbol count,
+  stubs information, active diagnostics/analyzers, formatter, include paths, and
+  server binary details.
 - Semantic tokens with full and delta updates.
 - Inlay hints for call arguments and PHPDoc-inferred parameter/return types.
 - Code lenses with reference counts.

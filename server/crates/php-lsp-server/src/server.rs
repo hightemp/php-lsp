@@ -29,12 +29,30 @@ use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineInd
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp::ls_types::*;
 use tower_lsp::{Client, LanguageServer};
+
+struct PhpLspIndexingStatusNotification;
+
+impl tower_lsp::ls_types::notification::Notification for PhpLspIndexingStatusNotification {
+    type Params = serde_json::Value;
+
+    const METHOD: &'static str = "phpLsp/indexingStatus";
+}
+
+async fn send_indexing_status(client: &Client, params: serde_json::Value) {
+    client
+        .send_notification::<PhpLspIndexingStatusNotification>(params)
+        .await;
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PhpVersion {
@@ -476,15 +494,37 @@ impl PhpLspBackend {
         let Some(root) = self.workspace_root.lock().await.clone() else {
             return;
         };
+        let root_label = root.display().to_string();
         let index = self.index.clone();
         let client_stubs_path = self.stubs_path.lock().await.clone();
         let stub_extensions = self.stub_extensions.lock().await.clone();
+
+        send_indexing_status(
+            &self.client,
+            serde_json::json!({
+                "phase": "loadingStubs",
+                "root": root_label,
+                "message": "Reloading PHP stubs"
+            }),
+        )
+        .await;
 
         let loaded = tokio::task::spawn_blocking(move || {
             load_configured_stubs(&index, &root, client_stubs_path, stub_extensions, true)
         })
         .await
         .unwrap_or(0);
+
+        send_indexing_status(
+            &self.client,
+            serde_json::json!({
+                "phase": "stubsLoaded",
+                "root": root_label,
+                "message": format!("Reloaded {} stub files", loaded),
+                "stubFiles": loaded
+            }),
+        )
+        .await;
 
         self.client
             .log_message(
@@ -6238,6 +6278,22 @@ async fn index_workspace(
     namespace_map: Option<&NamespaceMap>,
     work_done_progress_supported: bool,
 ) -> std::result::Result<(), String> {
+    let root_label = root.display().to_string();
+    let started_at = Instant::now();
+
+    send_indexing_status(
+        client,
+        serde_json::json!({
+            "phase": "discovering",
+            "root": root_label,
+            "message": "Discovering PHP files",
+            "indexedFiles": 0,
+            "indexedSymbols": 0,
+            "percentage": 0
+        }),
+    )
+    .await;
+
     // Create progress token
     let progress_token = ProgressToken::String(format!("php-lsp-indexing-{}", root.display()));
 
@@ -6295,6 +6351,21 @@ async fn index_workspace(
     let total = all_files.len();
     tracing::info!("Indexing {} PHP files", total);
 
+    send_indexing_status(
+        client,
+        serde_json::json!({
+            "phase": "indexing",
+            "root": root_label,
+            "message": format!("Indexing {} PHP files", total),
+            "indexedFiles": 0,
+            "totalFiles": total,
+            "indexedSymbols": 0,
+            "percentage": 0,
+            "elapsedMs": elapsed_ms(started_at)
+        }),
+    )
+    .await;
+
     if let Some(ref p) = ongoing {
         p.report_with_message(format!("Indexing {} files...", total), 0)
             .await;
@@ -6303,12 +6374,29 @@ async fn index_workspace(
     // Parse files with limited concurrency via semaphore
     let semaphore = Arc::new(Semaphore::new(4));
     let indexed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut indexed_symbols = 0usize;
 
     for (i, file_path) in all_files.iter().enumerate() {
-        let _permit = semaphore
-            .acquire()
-            .await
-            .map_err(|e| format!("Semaphore error: {}", e))?;
+        let _permit = match semaphore.acquire().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                let message = format!("Semaphore error: {}", e);
+                send_indexing_status(
+                    client,
+                    serde_json::json!({
+                        "phase": "error",
+                        "root": root_label,
+                        "message": message,
+                        "indexedFiles": indexed.load(std::sync::atomic::Ordering::Relaxed),
+                        "totalFiles": total,
+                        "indexedSymbols": indexed_symbols,
+                        "elapsedMs": elapsed_ms(started_at)
+                    }),
+                )
+                .await;
+                return Err(message);
+            }
+        };
 
         // Read and parse file
         match std::fs::read_to_string(file_path) {
@@ -6322,6 +6410,7 @@ async fn index_workspace(
 
                     let sym_count = file_symbols.symbols.len();
                     index.update_file(&uri, file_symbols);
+                    indexed_symbols += sym_count;
 
                     if sym_count > 0 {
                         tracing::debug!("Indexed {}: {} symbols", file_path.display(), sym_count);
@@ -6347,6 +6436,27 @@ async fn index_workspace(
                     .await;
             }
         }
+        if done % 10 == 0 || done == total {
+            let percentage = if total > 0 {
+                ((done as f64 / total as f64) * 100.0) as u32
+            } else {
+                100
+            };
+            send_indexing_status(
+                client,
+                serde_json::json!({
+                    "phase": "indexing",
+                    "root": root_label,
+                    "message": format!("Indexed {}/{} files", done, total),
+                    "indexedFiles": done,
+                    "totalFiles": total,
+                    "indexedSymbols": indexed_symbols,
+                    "percentage": percentage,
+                    "elapsedMs": elapsed_ms(started_at)
+                }),
+            )
+            .await;
+        }
 
         // Yield to allow other tasks to run
         if i % 50 == 0 {
@@ -6359,6 +6469,21 @@ async fn index_workspace(
         p.finish_with_message(format!("Indexed {} files", total))
             .await;
     }
+
+    send_indexing_status(
+        client,
+        serde_json::json!({
+            "phase": "ready",
+            "root": root_label,
+            "message": format!("Indexed {} PHP files", total),
+            "indexedFiles": total,
+            "totalFiles": total,
+            "indexedSymbols": indexed_symbols,
+            "percentage": 100,
+            "elapsedMs": elapsed_ms(started_at)
+        }),
+    )
+    .await;
 
     client
         .log_message(
@@ -6525,6 +6650,18 @@ impl LanguageServer for PhpLspBackend {
 
         if roots.is_empty() {
             tracing::warn!("No workspace root, skipping indexing");
+            send_indexing_status(
+                &self.client,
+                serde_json::json!({
+                    "phase": "ready",
+                    "message": "No workspace root",
+                    "indexedFiles": 0,
+                    "totalFiles": 0,
+                    "indexedSymbols": 0,
+                    "percentage": 100
+                }),
+            )
+            .await;
             return;
         }
 
@@ -6553,19 +6690,42 @@ impl LanguageServer for PhpLspBackend {
             .first()
             .map(|config| config.root.clone())
             .unwrap_or_default();
+        let stubs_root_label = stubs_root.display().to_string();
         let client_stubs_path = self.stubs_path.lock().await.clone();
         let stub_extensions = self.stub_extensions.lock().await.clone();
-        tokio::task::spawn_blocking(move || {
+
+        send_indexing_status(
+            &self.client,
+            serde_json::json!({
+                "phase": "loadingStubs",
+                "root": stubs_root_label,
+                "message": "Loading PHP stubs"
+            }),
+        )
+        .await;
+
+        let loaded_stubs = tokio::task::spawn_blocking(move || {
             load_configured_stubs(
                 &stubs_index,
                 &stubs_root,
                 client_stubs_path,
                 stub_extensions,
                 false,
-            );
+            )
         })
         .await
-        .ok();
+        .unwrap_or(0);
+
+        send_indexing_status(
+            &self.client,
+            serde_json::json!({
+                "phase": "stubsLoaded",
+                "root": stubs_root_label,
+                "message": format!("Loaded {} stub files", loaded_stubs),
+                "stubFiles": loaded_stubs
+            }),
+        )
+        .await;
 
         let client = self.client.clone();
         let index = self.index.clone();
@@ -6587,6 +6747,15 @@ impl LanguageServer for PhpLspBackend {
                 .await
                 {
                     tracing::error!("Background indexing failed: {}", e);
+                    send_indexing_status(
+                        &client,
+                        serde_json::json!({
+                            "phase": "error",
+                            "root": config.root.display().to_string(),
+                            "message": format!("Indexing failed: {}", e)
+                        }),
+                    )
+                    .await;
                     client
                         .log_message(MessageType::ERROR, format!("Indexing failed: {}", e))
                         .await;
@@ -6715,6 +6884,15 @@ impl LanguageServer for PhpLspBackend {
                 .await
                 {
                     tracing::error!("Workspace folder indexing failed: {}", e);
+                    send_indexing_status(
+                        &client,
+                        serde_json::json!({
+                            "phase": "error",
+                            "root": config.root.display().to_string(),
+                            "message": format!("Workspace folder indexing failed: {}", e)
+                        }),
+                    )
+                    .await;
                     client
                         .log_message(
                             MessageType::ERROR,

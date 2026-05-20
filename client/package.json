@@ -222,6 +222,11 @@
         "command": "phpLsp.restartServer",
         "title": "Restart Language Server",
         "category": "PHP"
+      },
+      {
+        "command": "phpLsp.showStatus",
+        "title": "Show Language Server Status",
+        "category": "PHP"
       }
     ]
   },
