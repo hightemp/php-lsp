@@ -272,6 +272,15 @@ fn inlay_hint_request(
         .finish()
 }
 
+fn folding_range_request(id: i64, uri: &str) -> Request {
+    Request::build("textDocument/foldingRange")
+        .params(json!({
+            "textDocument": { "uri": uri }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn prepare_call_hierarchy_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/prepareCallHierarchy")
         .params(json!({
@@ -767,6 +776,14 @@ async fn test_initialize_and_shutdown() {
         Some(false),
         "expected codeLensProvider without resolve, got: {}",
         result
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("foldingRangeProvider"))
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "expected foldingRangeProvider capability"
     );
     let file_operations = result
         .get("capabilities")
@@ -2237,6 +2254,114 @@ function run(Formatter $formatter): void {
             .iter()
             .any(|hint| hint.get("kind").and_then(|kind| kind.as_u64()) == Some(1)),
         "expected type hint kind, got: {}",
+        result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_folding_ranges_for_php_structures() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App {
+
+/**
+ * Demo service.
+ * @return void
+ */
+class Demo {
+    public function run(): void {
+        if (true) {
+            $items = [
+                'one',
+                'two',
+            ];
+        }
+    }
+}
+}
+"#;
+    let uri = "file:///test/Folding.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(folding_range_request(2, uri))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let ranges = result.as_array().expect("folding range array");
+
+    let has_range = |start_line: u64, end_line: u64, kind: Option<&str>| {
+        ranges.iter().any(|range| {
+            range["startLine"].as_u64() == Some(start_line)
+                && range["endLine"].as_u64() == Some(end_line)
+                && kind.is_none_or(|kind| range["kind"].as_str() == Some(kind))
+        })
+    };
+
+    assert!(
+        has_range(1, 17, None),
+        "expected namespace folding range, got: {}",
+        result
+    );
+    assert!(
+        has_range(3, 6, Some("comment")),
+        "expected PHPDoc comment folding range, got: {}",
+        result
+    );
+    assert!(
+        has_range(7, 16, None),
+        "expected class folding range, got: {}",
+        result
+    );
+    assert!(
+        has_range(8, 15, None),
+        "expected method folding range, got: {}",
+        result
+    );
+    assert!(
+        has_range(9, 14, Some("region")),
+        "expected block folding range, got: {}",
+        result
+    );
+    assert!(
+        has_range(10, 13, Some("region")),
+        "expected array folding range, got: {}",
         result
     );
 

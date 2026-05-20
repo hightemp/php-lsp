@@ -592,7 +592,7 @@
 - [x] **VN-008** Code Lens — количество ссылок на класс/метод *(done 2026-05-20)*
   - references count
   - test/run/debug codelens где применимо
-- [ ] **VN-009** Folding Range — складывание функций, классов, PHPDoc
+- [x] **VN-009** Folding Range — складывание функций, классов, PHPDoc *(done 2026-05-20)*
   - textDocument/foldingRange capability
   - Функции, методы, классы, namespaces, PHPDoc, массивы/blocks
 - [x] **VN-010** Release pipeline — cross-platform VSIX сборка + публикация в Marketplace *(done 2026-02-15)*
@@ -696,7 +696,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **LP-026 / VN-006** PHPStan diagnostics integration
 - [x] **LP-027 / VN-007** Psalm diagnostics integration
 - [x] **LP-028 / VN-008** `textDocument/codeLens`
-- [ ] **LP-029 / VN-009** `textDocument/foldingRange`
+- [x] **LP-029 / VN-009** `textDocument/foldingRange`
 
 ---
 
@@ -738,3 +738,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Реализовать `LP-026 / VN-006` PHPStan diagnostics integration.
 - [x] **T-2026-05-20** Реализовать `LP-027 / VN-007` Psalm diagnostics integration.
 - [x] **T-2026-05-20** Реализовать `LP-028 / VN-008` `textDocument/codeLens`.
+- [x] **T-2026-05-20** Реализовать `LP-029 / VN-009` `textDocument/foldingRange`.
