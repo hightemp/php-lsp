@@ -761,3 +761,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Исправить ложные diagnostics, найденные прогоном `/home/apanov/Projects/bdpn-ui/app/src`.
 - [x] **T-2026-05-20** Убрать hardcode имен framework methods из suppress unused-parameter diagnostics.
 - [x] **T-2026-05-20** Проверить production-код на project-specific hardcode и убрать найденное.
+- [x] **T-2026-05-21** Исправить GitHub downloads badge в README.

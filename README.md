@@ -4,7 +4,7 @@
 [![CI](https://github.com/hightemp/php-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/hightemp/php-lsp/actions/workflows/ci.yml)
 [![Release](https://github.com/hightemp/php-lsp/actions/workflows/release.yml/badge.svg)](https://github.com/hightemp/php-lsp/actions/workflows/release.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/hightemp/php-lsp?label=github%20release)](https://github.com/hightemp/php-lsp/releases)
-[![GitHub Downloads](https://img.shields.io/github/downloads/hightemp/php-lsp/total?label=github%20downloads)](https://github.com/hightemp/php-lsp/releases)
+[![Release Downloads](https://img.shields.io/github/downloads/hightemp/php-lsp/total.svg?label=release%20downloads&logo=github)](https://github.com/hightemp/php-lsp/releases)
 [![VS Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/php-lsp.php-lsp?label=marketplace)](https://marketplace.visualstudio.com/items?itemName=php-lsp.php-lsp)
 [![VS Marketplace Downloads](https://img.shields.io/visual-studio-marketplace/d/php-lsp.php-lsp?label=marketplace%20downloads)](https://marketplace.visualstudio.com/items?itemName=php-lsp.php-lsp)
 [![VS Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/php-lsp.php-lsp?label=installs)](https://marketplace.visualstudio.com/items?itemName=php-lsp.php-lsp)
