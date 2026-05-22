@@ -726,11 +726,17 @@
   - Regression: e2e `test_cancel_request_cancels_references_request` проверяет `RequestCancelled` (`-32800`) для большого `references` запроса.
   - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **PR-022** Убрать full reparse workspace из references/rename/codeLens
+- [x] **PR-022** Убрать full reparse workspace из references/rename/codeLens *(completed 2026-05-22)*
   - Построить reference index или per-file lightweight occurrence index при индексации.
   - Инвалидировать occurrence данные при didChange/didSave/watched files.
   - `references` должен читать готовые occurrence данные и парсить только открытый dirty buffer.
   - `rename` должен использовать те же ranges и валидировать конфликт имен до WorkspaceEdit.
+  - Добавлен `SymbolReference` и `WorkspaceIndex::file_references`; occurrence данные строятся при workspace indexing, lazy vendor/stub indexing, didOpen/didChange и file watcher reindex.
+  - Disk cache schema v3 сохраняет/загружает per-file references вместе с `FileSymbols`.
+  - `references`, `rename` и `codeLens` используют `file_references`; для open buffer ссылки пересобираются из текущего parser state, закрытые файлы не читаются и не парсятся заново.
+  - Property rename использует сохраненный `starts_with_dollar`, чтобы корректно различать declaration/static `$prop` и object `->prop`.
+  - Regression: parser unit на occurrence collection, cache roundtrip для references, e2e на references из закрытого indexed file.
+  - Validation: `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`.
 
 - [ ] **PR-023** Перевести sync file IO в тяжелых paths на blocking/background
   - Не делать `std::fs::read_to_string` в async handler hot path.

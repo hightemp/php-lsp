@@ -10,7 +10,10 @@ use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::diagnostics::extract_syntax_errors;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
-use php_lsp_parser::references::{find_references_in_file, find_variable_references_at_position};
+use php_lsp_parser::references::{
+    collect_symbol_references_in_file, find_references_in_file,
+    find_variable_references_at_position,
+};
 use php_lsp_parser::resolve::{
     infer_property_type_from_assignments, infer_variable_type_at_position, resolve_class_name_pub,
     symbol_at_position, symbol_at_position_with_resolver, variable_definition_at_position,
@@ -282,6 +285,7 @@ struct WorkspaceParseResult {
     path: PathBuf,
     uri: String,
     file_symbols: Option<php_lsp_types::FileSymbols>,
+    references: Vec<php_lsp_types::SymbolReference>,
     symbol_count: usize,
     error: Option<String>,
 }
@@ -1604,59 +1608,17 @@ impl PhpLspBackend {
         include_declaration: bool,
     ) -> Vec<Location> {
         let mut locations = Vec::new();
+        let indexed_references: Vec<_> = self
+            .index
+            .file_references
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
 
-        for entry in self.index.file_symbols.iter() {
-            let file_uri = entry.key().clone();
-            let file_syms = entry.value().clone();
-
-            let refs = if let Some(parser) = self.open_files.get(&file_uri) {
-                let Some(tree) = parser.tree() else {
-                    continue;
-                };
-                let source = parser.source();
-                find_references_in_file(
-                    tree,
-                    &source,
-                    &file_syms,
-                    target_fqn,
-                    target_kind,
-                    include_declaration,
-                )
-                .into_iter()
-                .map(|mut reference| {
-                    reference.range = range_byte_to_utf16(&source, reference.range);
-                    reference
-                })
-                .collect::<Vec<_>>()
-            } else {
-                let Some(path) = uri_to_path(&file_uri) else {
-                    continue;
-                };
-                let Ok(source) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let mut parser = FileParser::new();
-                parser.parse_full(&source);
-                let Some(tree) = parser.tree() else {
-                    continue;
-                };
-                find_references_in_file(
-                    tree,
-                    &source,
-                    &file_syms,
-                    target_fqn,
-                    target_kind,
-                    include_declaration,
-                )
-                .into_iter()
-                .map(|mut reference| {
-                    reference.range = range_byte_to_utf16(&source, reference.range);
-                    reference
-                })
-                .collect::<Vec<_>>()
-            };
-
-            for reference in refs {
+        for file_uri in indexed_references {
+            for reference in
+                self.references_for_file(&file_uri, target_fqn, target_kind, include_declaration)
+            {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     locations.push(Location {
                         uri,
@@ -1764,6 +1726,28 @@ impl PhpLspBackend {
                 vec![]
             }
         }
+    }
+
+    fn references_for_file(
+        &self,
+        file_uri: &str,
+        target_fqn: &str,
+        target_kind: php_lsp_types::PhpSymbolKind,
+        include_declaration: bool,
+    ) -> Vec<php_lsp_types::SymbolReference> {
+        let mut refs = if let Some(parser) = self.open_files.get(file_uri) {
+            current_parser_symbol_references(file_uri, &parser)
+        } else {
+            self.index
+                .file_references
+                .get(file_uri)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default()
+        };
+        refs.retain(|reference| {
+            symbol_reference_matches(reference, target_fqn, target_kind, include_declaration)
+        });
+        refs
     }
 
     /// Publish diagnostics for a file.
@@ -1898,12 +1882,15 @@ impl PhpLspBackend {
             self.open_files.get(&uri_str).and_then(|parser| {
                 let tree = parser.tree()?;
                 let source = parser.source();
-                Some(extract_file_symbols(tree, &source, &uri_str))
+                let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+                let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
+                Some((file_symbols, references))
             })
         };
 
-        if let Some(file_symbols) = open_file_symbols {
-            self.index.update_file(&uri_str, file_symbols);
+        if let Some((file_symbols, references)) = open_file_symbols {
+            self.index
+                .update_file_with_references(&uri_str, file_symbols, references);
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
             self.publish_diagnostics(uri).await;
             return;
@@ -1919,7 +1906,10 @@ impl PhpLspBackend {
                 parser.parse_full(&source);
                 if let Some(tree) = parser.tree() {
                     let file_symbols = extract_file_symbols(tree, &source, &uri_str);
-                    self.index.update_file(&uri_str, file_symbols);
+                    let references =
+                        collect_symbol_references_in_file(tree, &source, &file_symbols);
+                    self.index
+                        .update_file_with_references(&uri_str, file_symbols, references);
                 } else {
                     self.index.remove_file(&uri_str);
                 }
@@ -2015,7 +2005,9 @@ impl PhpLspBackend {
             if let Some(tree) = parser.tree() {
                 let source = parser.source();
                 let file_symbols = extract_file_symbols(tree, &source, &new_uri_str);
-                self.index.update_file(&new_uri_str, file_symbols);
+                let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
+                self.index
+                    .update_file_with_references(&new_uri_str, file_symbols, references);
             }
             self.open_files.insert(new_uri_str.clone(), parser);
             if let Some(version) = moved_version {
@@ -2088,17 +2080,6 @@ fn line_byte_col_to_byte(source: &str, line: u32, byte_col: u32) -> Option<usize
     }
 
     None
-}
-
-fn range_starts_with_dollar(source: &str, range: (u32, u32, u32, u32)) -> bool {
-    let Some(start) = line_byte_col_to_byte(source, range.0, range.1) else {
-        return false;
-    };
-    source
-        .as_bytes()
-        .get(start)
-        .map(|b| *b == b'$')
-        .unwrap_or(false)
 }
 
 fn starts_with_assignment_operator(text: &str) -> bool {
@@ -4660,6 +4641,71 @@ fn compute_open_file_diagnostics(
     } else {
         vec![]
     }
+}
+
+fn current_parser_symbol_references(
+    uri_str: &str,
+    parser: &FileParser,
+) -> Vec<php_lsp_types::SymbolReference> {
+    let Some(tree) = parser.tree() else {
+        return Vec::new();
+    };
+    let source = parser.source();
+    let file_symbols = extract_file_symbols(tree, &source, uri_str);
+    collect_symbol_references_in_file(tree, &source, &file_symbols)
+}
+
+fn symbol_reference_matches(
+    reference: &php_lsp_types::SymbolReference,
+    target_fqn: &str,
+    target_kind: php_lsp_types::PhpSymbolKind,
+    include_declaration: bool,
+) -> bool {
+    if reference.is_declaration && !include_declaration {
+        return false;
+    }
+
+    if reference.target_fqn == target_fqn
+        && reference_kind_matches(reference.target_kind, target_kind)
+    {
+        return true;
+    }
+
+    if reference.is_declaration || !reference_kind_matches(reference.target_kind, target_kind) {
+        return false;
+    }
+
+    let Some(member_name) = target_fqn.rsplit_once("::").map(|(_, member)| member) else {
+        return false;
+    };
+    matches!(
+        target_kind,
+        php_lsp_types::PhpSymbolKind::Method
+            | php_lsp_types::PhpSymbolKind::Property
+            | php_lsp_types::PhpSymbolKind::ClassConstant
+            | php_lsp_types::PhpSymbolKind::EnumCase
+    ) && reference.target_fqn == format!("::{}", member_name)
+}
+
+fn reference_kind_matches(
+    reference_kind: php_lsp_types::PhpSymbolKind,
+    target_kind: php_lsp_types::PhpSymbolKind,
+) -> bool {
+    if reference_kind == target_kind {
+        return true;
+    }
+
+    is_class_like_kind(reference_kind) && is_class_like_kind(target_kind)
+}
+
+fn is_class_like_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
+    matches!(
+        kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+    )
 }
 
 fn compute_diagnostics(
@@ -7677,7 +7723,8 @@ fn parse_and_index_php_file(index: &WorkspaceIndex, file_path: &Path) -> bool {
 
     let uri = path_to_uri(file_path);
     let file_symbols = extract_file_symbols(tree, &source, &uri);
-    index.update_file(&uri, file_symbols);
+    let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
+    index.update_file_with_references(&uri, file_symbols, references);
     true
 }
 
@@ -7690,6 +7737,7 @@ fn parse_workspace_file_for_index(file_path: PathBuf) -> WorkspaceParseResult {
                 path: file_path,
                 uri,
                 file_symbols: None,
+                references: Vec::new(),
                 symbol_count: 0,
                 error: Some(format!("failed to read file: {}", err)),
             };
@@ -7703,17 +7751,20 @@ fn parse_workspace_file_for_index(file_path: PathBuf) -> WorkspaceParseResult {
             path: file_path,
             uri,
             file_symbols: None,
+            references: Vec::new(),
             symbol_count: 0,
             error: Some("parser did not produce a syntax tree".to_string()),
         };
     };
 
     let file_symbols = extract_file_symbols(tree, &source, &uri);
+    let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
     let symbol_count = file_symbols.symbols.len();
     WorkspaceParseResult {
         path: file_path,
         uri,
         file_symbols: Some(file_symbols),
+        references,
         symbol_count,
         error: None,
     }
@@ -8039,7 +8090,7 @@ async fn index_workspace(
         };
 
         if let Some(file_symbols) = parsed.file_symbols {
-            index.update_file(&parsed.uri, file_symbols);
+            index.update_file_with_references(&parsed.uri, file_symbols, parsed.references);
             indexed_symbols += parsed.symbol_count;
 
             if parsed.symbol_count > 0 {
@@ -8698,8 +8749,10 @@ impl LanguageServer for PhpLspBackend {
         if !excluded {
             if let Some(tree) = parser.tree() {
                 let file_symbols = extract_file_symbols(tree, text, &uri_str);
+                let references = collect_symbol_references_in_file(tree, text, &file_symbols);
                 let sym_count = file_symbols.symbols.len();
-                self.index.update_file(&uri_str, file_symbols);
+                self.index
+                    .update_file_with_references(&uri_str, file_symbols, references);
                 self.log_trace(&format!("Indexed {} symbols from {}", sym_count, uri_str))
                     .await;
             }
@@ -8751,7 +8804,9 @@ impl LanguageServer for PhpLspBackend {
             } else if let Some(tree) = parser.tree() {
                 let source = parser.source();
                 let file_symbols = extract_file_symbols(tree, &source, &uri_str);
-                self.index.update_file(&uri_str, file_symbols);
+                let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
+                self.index
+                    .update_file_with_references(&uri_str, file_symbols, references);
             }
         }
 
@@ -10281,69 +10336,17 @@ impl LanguageServer for PhpLspBackend {
         let mut locations = Vec::new();
         let indexed_files: Vec<_> = self
             .index
-            .file_symbols
+            .file_references
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|entry| entry.key().clone())
             .collect();
 
-        for (scanned_files, (file_uri, file_syms)) in indexed_files.into_iter().enumerate() {
+        for (scanned_files, file_uri) in indexed_files.into_iter().enumerate() {
             cooperative_heavy_request_yield(scanned_files).await;
 
-            // We need to parse the file to walk the CST
-            // First check if it's an open file
-            let refs = if let Some(parser) = self.open_files.get(&file_uri) {
-                if let Some(tree) = parser.tree() {
-                    let source = parser.source();
-                    let raw = find_references_in_file(
-                        tree,
-                        &source,
-                        &file_syms,
-                        &target_fqn,
-                        target_kind,
-                        include_declaration,
-                    );
-                    raw.into_iter()
-                        .map(|mut r| {
-                            r.range = range_byte_to_utf16(&source, r.range);
-                            r
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    continue;
-                }
-            } else {
-                // For non-open files, we need to re-parse
-                let path = match uri_to_path(&file_uri) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let source = match std::fs::read_to_string(&path) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let mut parser = FileParser::new();
-                parser.parse_full(&source);
-                let tree = match parser.tree() {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let raw = find_references_in_file(
-                    tree,
-                    &source,
-                    &file_syms,
-                    &target_fqn,
-                    target_kind,
-                    include_declaration,
-                );
-                raw.into_iter()
-                    .map(|mut r| {
-                        r.range = range_byte_to_utf16(&source, r.range);
-                        r
-                    })
-                    .collect::<Vec<_>>()
-            };
-
-            for r in refs {
+            for r in
+                self.references_for_file(&file_uri, &target_fqn, target_kind, include_declaration)
+            {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     locations.push(Location {
                         uri,
@@ -10587,79 +10590,36 @@ impl LanguageServer for PhpLspBackend {
             std::collections::HashMap::new();
         let indexed_files: Vec<_> = self
             .index
-            .file_symbols
+            .file_references
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|entry| entry.key().clone())
             .collect();
 
-        for (scanned_files, (file_uri, file_syms)) in indexed_files.into_iter().enumerate() {
+        for (scanned_files, file_uri) in indexed_files.into_iter().enumerate() {
             cooperative_heavy_request_yield(scanned_files).await;
-
-            let (refs, source_text) = if let Some(parser) = self.open_files.get(&file_uri) {
-                if let Some(tree) = parser.tree() {
-                    let source = parser.source();
-                    let refs = find_references_in_file(
-                        tree,
-                        &source,
-                        &file_syms,
-                        &target_fqn,
-                        target_kind,
-                        true, // include declaration
-                    );
-                    (refs, source)
-                } else {
-                    continue;
-                }
-            } else {
-                let path = match uri_to_path(&file_uri) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let source = match std::fs::read_to_string(&path) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let mut parser = FileParser::new();
-                parser.parse_full(&source);
-                let tree = match parser.tree() {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let refs = find_references_in_file(
-                    tree,
-                    &source,
-                    &file_syms,
-                    &target_fqn,
-                    target_kind,
-                    true,
-                );
-                (refs, source)
-            };
+            let refs = self.references_for_file(&file_uri, &target_fqn, target_kind, true);
 
             if !refs.is_empty() {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     let edits: Vec<TextEdit> = refs
                         .into_iter()
-                        .map(|r| {
-                            let rng = range_byte_to_utf16(&source_text, r.range);
-                            TextEdit {
-                                range: Range {
-                                    start: Position::new(rng.0, rng.1),
-                                    end: Position::new(rng.2, rng.3),
-                                },
-                                new_text: if target_kind == php_lsp_types::PhpSymbolKind::Property
-                                    && range_starts_with_dollar(&source_text, r.range)
-                                {
-                                    format!(
-                                        "${}",
-                                        property_new_name
-                                            .as_deref()
-                                            .unwrap_or(new_name.trim_start_matches('$'))
-                                    )
-                                } else {
-                                    property_new_name.as_deref().unwrap_or(new_name).to_string()
-                                },
-                            }
+                        .map(|r| TextEdit {
+                            range: Range {
+                                start: Position::new(r.range.0, r.range.1),
+                                end: Position::new(r.range.2, r.range.3),
+                            },
+                            new_text: if target_kind == php_lsp_types::PhpSymbolKind::Property
+                                && r.starts_with_dollar
+                            {
+                                format!(
+                                    "${}",
+                                    property_new_name
+                                        .as_deref()
+                                        .unwrap_or(new_name.trim_start_matches('$'))
+                                )
+                            } else {
+                                property_new_name.as_deref().unwrap_or(new_name).to_string()
+                            },
                         })
                         .collect();
                     changes.entry(uri).or_default().extend(edits);

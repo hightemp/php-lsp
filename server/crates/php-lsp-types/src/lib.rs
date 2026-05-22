@@ -217,6 +217,18 @@ pub struct FileSymbols {
     pub symbols: Vec<SymbolInfo>,
 }
 
+/// A precomputed symbol occurrence used by references/rename/code lens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolReference {
+    pub target_fqn: String,
+    pub target_kind: PhpSymbolKind,
+    /// LSP UTF-16 range: start line/character, end line/character.
+    pub range: (u32, u32, u32, u32),
+    pub is_declaration: bool,
+    /// True when the edited text itself starts with `$` (`$prop`, `Class::$prop`).
+    pub starts_with_dollar: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 //! Disk cache for workspace index snapshots.
 
 use crate::workspace::WorkspaceIndex;
-use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo};
+use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo, SymbolReference};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 2;
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,7 @@ pub struct CachedFile {
     pub relative_path: String,
     pub metadata: CachedFileMetadata,
     pub file_symbols: FileSymbols,
+    pub references: Vec<SymbolReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,7 +287,11 @@ pub fn load_valid_cached_sources(
                 if metadata == cached_file.metadata && cached_file.uri == current_source.uri =>
             {
                 report.indexed_symbols += cached_file.file_symbols.symbols.len();
-                index.update_file(&cached_file.uri, cached_file.file_symbols);
+                index.update_file_with_references(
+                    &cached_file.uri,
+                    cached_file.file_symbols,
+                    cached_file.references,
+                );
                 loaded_relatives.insert(cached_file.relative_path);
                 report.loaded_files += 1;
             }
@@ -352,6 +357,11 @@ pub fn build_cache_from_sources(
             relative_path: source.relative_path.clone(),
             metadata,
             file_symbols,
+            references: index
+                .file_references
+                .get(&source.uri)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default(),
         });
     }
 
@@ -584,6 +594,59 @@ mod tests {
         assert_eq!(report.loaded_files, 1);
         assert!(report.parse_files.is_empty());
         assert!(loaded.resolve_fqn("App\\Foo").is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_roundtrip_loads_file_references() {
+        let root = unique_temp_dir("references");
+        let file = root.join("Foo.php");
+        fs::write(&file, "<?php class Foo {}").unwrap();
+        let uri = path_to_uri(&file);
+        let references = vec![SymbolReference {
+            target_fqn: "App\\Foo".to_string(),
+            target_kind: PhpSymbolKind::Class,
+            range: (3, 12, 3, 15),
+            is_declaration: false,
+            starts_with_dollar: false,
+        }];
+
+        let index = WorkspaceIndex::new();
+        index.update_file_with_references(
+            &uri,
+            FileSymbols {
+                namespace: None,
+                use_statements: vec![],
+                symbols: vec![make_symbol(&uri)],
+            },
+            references.clone(),
+        );
+
+        let config = test_config();
+        let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+        assert_eq!(cache.files[0].references, references);
+
+        let cache_path = root.join("index.bin");
+        save_cache_atomic(&cache_path, &cache).unwrap();
+
+        let loaded = WorkspaceIndex::new();
+        let report = load_valid_cached_files(
+            &loaded,
+            &cache_path,
+            &root,
+            std::slice::from_ref(&file),
+            &config,
+        );
+        assert_eq!(report.loaded_files, 1);
+        assert_eq!(
+            loaded
+                .file_references
+                .get(&uri)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default(),
+            references
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -3,7 +3,8 @@
 //! Given a target FQN and the file's CST + symbols, returns all locations
 //! in the file that reference the target.
 
-use php_lsp_types::{FileSymbols, PhpSymbolKind, UseKind};
+use crate::utf16::range_byte_to_utf16;
+use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolReference, UseKind};
 use tree_sitter::{Node, Point, Tree};
 
 /// A location within a file where a reference was found.
@@ -141,6 +142,361 @@ pub fn find_references_in_file(
     }
 
     results
+}
+
+/// Collect non-local symbol occurrences in a file for workspace-level references.
+///
+/// Local variables remain scope-sensitive and are intentionally handled from the
+/// current open buffer instead of being stored in the workspace occurrence index.
+pub fn collect_symbol_references_in_file(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Vec<SymbolReference> {
+    let mut references = Vec::new();
+
+    for symbol in &file_symbols.symbols {
+        if symbol.kind == PhpSymbolKind::Namespace {
+            continue;
+        }
+        references.push(SymbolReference {
+            target_fqn: symbol.fqn.clone(),
+            target_kind: symbol.kind,
+            range: range_byte_to_utf16(source, symbol.selection_range),
+            is_declaration: true,
+            starts_with_dollar: symbol.kind == PhpSymbolKind::Property,
+        });
+    }
+
+    collect_symbol_references_walk(tree.root_node(), source, file_symbols, &mut references);
+    references.sort_by(|left, right| {
+        left.target_fqn
+            .cmp(&right.target_fqn)
+            .then_with(|| left.range.cmp(&right.range))
+            .then_with(|| left.is_declaration.cmp(&right.is_declaration))
+    });
+    references.dedup_by(|left, right| {
+        left.target_fqn == right.target_fqn
+            && left.target_kind == right.target_kind
+            && left.range == right.range
+            && left.is_declaration == right.is_declaration
+            && left.starts_with_dollar == right.starts_with_dollar
+    });
+    references
+}
+
+fn collect_symbol_references_walk(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    references: &mut Vec<SymbolReference>,
+) {
+    match node.kind() {
+        "object_creation_expression" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "name" || child.kind() == "qualified_name" {
+                    push_class_reference(child, source, file_symbols, references);
+                    break;
+                }
+            }
+        }
+        "scoped_call_expression" => {
+            if let Some(scope_node) = node.child_by_field_name("scope") {
+                push_class_reference(scope_node, source, file_symbols, references);
+            }
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let member_name = &source[name_node.byte_range()];
+                if let Some(scope_fqn) = scoped_member_reference_class(node, source, file_symbols) {
+                    push_symbol_reference(
+                        references,
+                        format!("{}::{}", scope_fqn, member_name),
+                        PhpSymbolKind::Method,
+                        reference_range(source, name_node),
+                        false,
+                        false,
+                    );
+                } else {
+                    push_symbol_reference(
+                        references,
+                        format!("::{}", member_name),
+                        PhpSymbolKind::Method,
+                        reference_range(source, name_node),
+                        false,
+                        false,
+                    );
+                }
+            }
+        }
+        "scoped_property_access_expression" => {
+            if let Some(scope_node) = node.child_by_field_name("scope") {
+                push_class_reference(scope_node, source, file_symbols, references);
+            }
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let raw_name = &source[name_node.byte_range()];
+                let bare_name = raw_name.trim_start_matches('$');
+                let kind = if raw_name.starts_with('$') {
+                    PhpSymbolKind::Property
+                } else {
+                    PhpSymbolKind::ClassConstant
+                };
+                let member = if kind == PhpSymbolKind::Property {
+                    format!("${}", bare_name)
+                } else {
+                    bare_name.to_string()
+                };
+                if let Some(scope_fqn) = scoped_member_reference_class(node, source, file_symbols) {
+                    push_symbol_reference(
+                        references,
+                        format!("{}::{}", scope_fqn, member),
+                        kind,
+                        reference_range(source, name_node),
+                        false,
+                        raw_name.starts_with('$'),
+                    );
+                } else {
+                    push_symbol_reference(
+                        references,
+                        format!("::{}", member),
+                        kind,
+                        reference_range(source, name_node),
+                        false,
+                        raw_name.starts_with('$'),
+                    );
+                }
+            }
+        }
+        "member_access_expression" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let text = &source[name_node.byte_range()];
+                push_symbol_reference(
+                    references,
+                    format!("::${}", text.trim_start_matches('$')),
+                    PhpSymbolKind::Property,
+                    reference_range(source, name_node),
+                    false,
+                    false,
+                );
+            }
+        }
+        "member_call_expression" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let text = &source[name_node.byte_range()];
+                push_symbol_reference(
+                    references,
+                    format!("::{}", text),
+                    PhpSymbolKind::Method,
+                    reference_range(source, name_node),
+                    false,
+                    false,
+                );
+            }
+        }
+        "class_constant_access_expression" => {
+            if let (Some(scope_node), Some(name_node)) = (node.named_child(0), node.named_child(1))
+            {
+                push_class_reference(scope_node, source, file_symbols, references);
+                let text = &source[name_node.byte_range()];
+                let scope_text = &source[scope_node.byte_range()];
+                let scope_fqn = resolve_name_to_fqn(scope_text, file_symbols);
+                let target = if matches!(scope_text, "self" | "static" | "parent") {
+                    format!("::{}", text)
+                } else {
+                    format!("{}::{}", scope_fqn, text)
+                };
+                push_symbol_reference(
+                    references,
+                    target,
+                    PhpSymbolKind::ClassConstant,
+                    reference_range(source, name_node),
+                    false,
+                    false,
+                );
+            }
+        }
+        "function_call_expression" => {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                let text = &source[func_node.byte_range()];
+                push_symbol_reference(
+                    references,
+                    resolve_function_name_to_fqn(text, file_symbols),
+                    PhpSymbolKind::Function,
+                    reference_range(source, func_node),
+                    false,
+                    false,
+                );
+            }
+        }
+        "named_type" | "base_clause" | "class_interface_clause" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "name" || child.kind() == "qualified_name" {
+                    push_class_reference(child, source, file_symbols, references);
+                }
+            }
+            if node.named_child_count() == 0
+                && (node.kind() == "name" || node.kind() == "qualified_name")
+            {
+                push_class_reference(node, source, file_symbols, references);
+            }
+        }
+        "instanceof_expression" => {
+            if let Some(right) = node.child_by_field_name("right") {
+                push_class_reference(right, source, file_symbols, references);
+            }
+        }
+        "trait_use_clause" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "name" || child.kind() == "qualified_name" {
+                    push_class_reference(child, source, file_symbols, references);
+                }
+            }
+        }
+        "catch_clause" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                let mut cursor = type_node.walk();
+                for child in type_node.named_children(&mut cursor) {
+                    if child.kind() == "name" || child.kind() == "qualified_name" {
+                        push_class_reference(child, source, file_symbols, references);
+                    }
+                }
+                if type_node.kind() == "name" || type_node.kind() == "qualified_name" {
+                    push_class_reference(type_node, source, file_symbols, references);
+                }
+            }
+        }
+        "name" | "qualified_name" => {
+            push_constant_reference_if_plain_name(node, source, file_symbols, references);
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_symbol_references_walk(child, source, file_symbols, references);
+    }
+}
+
+fn push_class_reference(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    references: &mut Vec<SymbolReference>,
+) {
+    let text = &source[node.byte_range()];
+    let resolved = resolve_name_to_fqn(text, file_symbols);
+    if is_builtin_or_relative_class_name(&resolved) {
+        return;
+    }
+    push_symbol_reference(
+        references,
+        resolved,
+        PhpSymbolKind::Class,
+        reference_range(source, node),
+        false,
+        false,
+    );
+}
+
+fn scoped_member_reference_class(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    let scope_node = node.child_by_field_name("scope")?;
+    let scope_text = &source[scope_node.byte_range()];
+    if matches!(scope_text, "self" | "static" | "parent") {
+        return None;
+    }
+    Some(resolve_name_to_fqn(scope_text, file_symbols))
+}
+
+fn push_constant_reference_if_plain_name(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    references: &mut Vec<SymbolReference>,
+) {
+    let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+    if matches!(
+        parent_kind,
+        "function_call_expression"
+            | "object_creation_expression"
+            | "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+            | "function_definition"
+            | "named_type"
+            | "use_declaration"
+            | "namespace_use_clause"
+            | "scoped_call_expression"
+            | "scoped_property_access_expression"
+            | "class_constant_access_expression"
+            | "member_access_expression"
+            | "member_call_expression"
+    ) {
+        return;
+    }
+
+    let text = &source[node.byte_range()];
+    if is_builtin_or_relative_class_name(text) {
+        return;
+    }
+    push_symbol_reference(
+        references,
+        resolve_name_to_fqn(text, file_symbols),
+        PhpSymbolKind::GlobalConstant,
+        reference_range(source, node),
+        false,
+        false,
+    );
+}
+
+fn is_builtin_or_relative_class_name(name: &str) -> bool {
+    matches!(
+        name,
+        "self"
+            | "static"
+            | "parent"
+            | "$this"
+            | "string"
+            | "int"
+            | "float"
+            | "bool"
+            | "array"
+            | "callable"
+            | "iterable"
+            | "object"
+            | "mixed"
+            | "void"
+            | "never"
+            | "null"
+            | "false"
+            | "true"
+    )
+}
+
+fn push_symbol_reference(
+    references: &mut Vec<SymbolReference>,
+    target_fqn: String,
+    target_kind: PhpSymbolKind,
+    range: (u32, u32, u32, u32),
+    is_declaration: bool,
+    starts_with_dollar: bool,
+) {
+    references.push(SymbolReference {
+        target_fqn,
+        target_kind,
+        range,
+        is_declaration,
+        starts_with_dollar,
+    });
+}
+
+fn reference_range(source: &str, node: Node) -> (u32, u32, u32, u32) {
+    range_byte_to_utf16(source, node_range(node))
 }
 
 /// Find all references to a class/interface/trait/enum in a file.
@@ -802,6 +1158,14 @@ mod tests {
         find_references_in_file(tree, code, &file_symbols, target_fqn, kind, true)
     }
 
+    fn collect_refs(code: &str) -> Vec<SymbolReference> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        collect_symbol_references_in_file(tree, code, &file_symbols)
+    }
+
     fn find_var_refs_at(
         code: &str,
         line: u32,
@@ -936,6 +1300,71 @@ echo RenameTarget::STATE_ACTIVE;
         );
         // declaration + 2 usages
         assert_eq!(refs.len(), 3, "Should find declaration + 2 constant usages");
+    }
+
+    #[test]
+    fn test_collect_symbol_references_for_workspace_index() {
+        let code = r#"<?php
+namespace App;
+
+use App\Model\User;
+
+const FLAG = true;
+function helper(): void {}
+
+class Service {
+    public const STATE = 'ok';
+    public string $name = '';
+
+    public function run(User $user): void {
+        helper();
+        echo self::STATE;
+        echo $this->name;
+        echo FLAG;
+    }
+}
+
+$service = new Service();
+"#;
+
+        let refs = collect_refs(code);
+
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == "App\\Service"
+                && reference.target_kind == PhpSymbolKind::Class
+                && reference.is_declaration
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == "App\\Service"
+                && reference.target_kind == PhpSymbolKind::Class
+                && !reference.is_declaration
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == "App\\Model\\User"
+                && reference.target_kind == PhpSymbolKind::Class
+                && !reference.is_declaration
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == "App\\helper"
+                && reference.target_kind == PhpSymbolKind::Function
+                && !reference.is_declaration
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == "::STATE"
+                && reference.target_kind == PhpSymbolKind::ClassConstant
+                && !reference.is_declaration
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == "::$name"
+                && reference.target_kind == PhpSymbolKind::Property
+                && !reference.is_declaration
+                && !reference.starts_with_dollar
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == "App\\FLAG"
+                && reference.target_kind == PhpSymbolKind::GlobalConstant
+                && !reference.is_declaration
+        }));
     }
 
     #[test]

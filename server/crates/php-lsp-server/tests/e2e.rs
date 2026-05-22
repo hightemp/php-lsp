@@ -4007,6 +4007,126 @@ function boot(): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_workspace_references_use_indexed_closed_files() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-indexed-refs-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&tmp_root).unwrap();
+
+    let target_path = tmp_root.join("Target.php");
+    let use_path = tmp_root.join("Use.php");
+    let target_code = "<?php\nnamespace App;\n\nclass Target {}\n";
+    fs::write(&target_path, target_code).unwrap();
+    fs::write(
+        &use_path,
+        "<?php\nnamespace App;\n\nfunction consume(): void {\n    new Target();\n}\n",
+    )
+    .unwrap();
+
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let target_uri = format!("file://{}", target_path.to_string_lossy());
+    let use_uri = format!("file://{}", use_path.to_string_lossy());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let mut target_indexed = false;
+    let mut use_indexed = false;
+    for attempt in 0..50 {
+        let target_resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(workspace_symbol_request(10 + attempt * 2, "Target"))
+            .await
+            .unwrap();
+        let target_result = extract_result(target_resp);
+        target_indexed = workspace_symbol_uris(&target_result)
+            .iter()
+            .any(|uri| uri == &target_uri);
+
+        let use_resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(workspace_symbol_request(11 + attempt * 2, "consume"))
+            .await
+            .unwrap();
+        let use_result = extract_result(use_resp);
+        use_indexed = workspace_symbol_uris(&use_result)
+            .iter()
+            .any(|uri| uri == &use_uri);
+
+        if target_indexed && use_indexed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        target_indexed && use_indexed,
+        "workspace index should include both files before references request"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&target_uri, target_code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(200, &target_uri, 3, 8, false))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let locations = result.as_array().expect("references result array");
+    assert!(
+        locations.iter().any(|location| {
+            location.get("uri").and_then(|value| value.as_str()) == Some(use_uri.as_str())
+        }),
+        "references should include closed indexed usage file, got: {}",
+        result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_watched_files_incrementally_reindex_created_changed_deleted_php_files() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

@@ -1,7 +1,7 @@
 //! Global workspace symbol index.
 
 use dashmap::DashMap;
-use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo};
+use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo, SymbolReference};
 use std::sync::Arc;
 
 /// Global index of all symbols in the workspace.
@@ -17,6 +17,9 @@ pub struct WorkspaceIndex {
 
     /// File URI → extracted symbols for that file
     pub file_symbols: DashMap<String, FileSymbols>,
+
+    /// File URI → precomputed non-local symbol references for that file
+    pub file_references: DashMap<String, Vec<SymbolReference>>,
 }
 
 impl WorkspaceIndex {
@@ -27,11 +30,22 @@ impl WorkspaceIndex {
             functions: DashMap::new(),
             constants: DashMap::new(),
             file_symbols: DashMap::new(),
+            file_references: DashMap::new(),
         }
     }
 
     /// Update symbols from a single file. Removes old symbols, adds new ones.
     pub fn update_file(&self, uri: &str, file_symbols: FileSymbols) {
+        self.update_file_with_references(uri, file_symbols, Vec::new());
+    }
+
+    /// Update symbols and precomputed references from a single file.
+    pub fn update_file_with_references(
+        &self,
+        uri: &str,
+        file_symbols: FileSymbols,
+        file_references: Vec<SymbolReference>,
+    ) {
         // Remove old symbols for this file
         self.remove_file(uri);
 
@@ -59,10 +73,13 @@ impl WorkspaceIndex {
 
         // Store file symbols
         self.file_symbols.insert(uri.to_string(), file_symbols);
+        self.file_references
+            .insert(uri.to_string(), file_references);
     }
 
     /// Remove all symbols from a file.
     pub fn remove_file(&self, uri: &str) {
+        self.file_references.remove(uri);
         if let Some((_, old_symbols)) = self.file_symbols.remove(uri) {
             for sym in &old_symbols.symbols {
                 match sym.kind {
