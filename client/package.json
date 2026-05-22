@@ -2,7 +2,7 @@
   "name": "php-lsp",
   "displayName": "PHP Language Server",
   "description": "PHP language support powered by php-lsp (Rust)",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "publisher": "php-lsp",
   "repository": {
     "type": "git",
