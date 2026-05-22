@@ -109,3 +109,21 @@ For real-project latency runs:
 ```bash
 scripts/benchmark-lsp-latency.sh --iterations 10 --scenario laravel=/path/to/laravel --scenario symfony=/path/to/symfony
 ```
+
+## Disk Cache Smoke Run
+
+Command:
+
+```bash
+rm -rf target/php-lsp-profile/cache-smoke
+XDG_CACHE_HOME="$PWD/target/php-lsp-profile/cache-smoke" scripts/profile-workspace.sh --scenario small-cache-smoke=test-fixtures/basic --timeout 60
+XDG_CACHE_HOME="$PWD/target/php-lsp-profile/cache-smoke" scripts/profile-workspace.sh --scenario small-cache-smoke=test-fixtures/basic --timeout 60
+```
+
+Second run result:
+
+| Scenario | Cache path | Cache files loaded | Indexed files | Symbols | Ready time |
+|----------|------------|--------------------|---------------|---------|------------|
+| `small-cache-smoke` | `target/php-lsp-profile/cache-smoke/php-lsp/0da0d009104fa203/index.bin` | 4 | 4 | 14 | 285.43 ms |
+
+This validates the `PR-010` workspace cache path and mtime/size-valid file-symbol loading on a small fixture. Large-project acceptance is still tracked by the milestone exit criteria and should be measured with the same command against 5k-10k PHP files.

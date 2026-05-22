@@ -9,34 +9,36 @@ Scope: production-readiness milestone, weeks 1-6.
 
 | ID | Area | Severity | Owner task | Status |
 |----|------|----------|------------|--------|
-| R-001 | Disk cache отсутствует | High | `PR-010`, `PR-011` | Open |
+| R-001 | Disk cache maturity | High | `PR-010`, `PR-011` | Partially mitigated |
 | R-002 | `references`/`rename`/`codeLens` делают workspace scan | High | `PR-022`, `PR-021` | Open |
 | R-003 | Индексация фактически последовательная | High | `PR-013`, `PR-023` | Open |
 | R-004 | Sync file IO в async/hot paths | High | `PR-023` | Open |
 | R-005 | Нет request cancellation для тяжелых операций | High | `PR-021`, `PR-050` | Open |
 | R-006 | `didChange` без debounce/version ordering | High | `PR-020`, `PR-050` | Open |
-| R-007 | Stubs грузятся на старте без disk cache/version filtering | Medium | `PR-030`, `PR-010`, `PR-011` | Open |
+| R-007 | Stubs грузятся на старте без separate cache/version filtering | Medium | `PR-030`, `PR-011` | Open |
 | R-008 | Lazy vendor indexing без metadata/LRU cache | Medium | `PR-012` | Open |
 | R-009 | PHPDoc/type model shallow для production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041` | Open |
 | R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052` | Open |
 
 ## Risks
 
-### R-001: Disk cache отсутствует
+### R-001: Disk cache maturity
 
 Current evidence:
 
-- `WorkspaceIndex` живет в памяти; baseline пока не сохраняет `FileSymbols`/maps между рестартами.
-- `docs/production-baseline.md` фиксирует только build/test/package baseline; cache readiness еще не измеряется.
+- `PR-010` добавил schema-versioned workspace disk cache for file symbols/top-level snapshots.
+- Cache path: `~/.cache/php-lsp/{workspace-hash}/index.bin`.
+- Cache invalidates by file mtime/size, php-lsp version, PHP version, include/exclude paths, stub extension set and stubs hash.
+- Fixture smoke run shows cached workspace file symbols loading on second start.
 
 Impact:
 
-- Повторный запуск на 5k-10k PHP файлов не может уложиться в production target `< 5s до готового индекса из disk cache`.
-- Настройки stubs/vendor/workspace будут заново пересобирать индекс.
+- Повторный запуск на 5k-10k PHP файлов still needs acceptance validation against the production target `< 5s до готового индекса из disk cache`.
+- Stubs/vendor are not split into separate cache namespaces yet, so startup still includes stub loading.
 
 Mitigation:
 
-- `PR-010`: schema-versioned disk cache с mtime/size/config/stubs hash invalidation.
+- `PR-010`: implemented workspace index disk cache with mtime/size/config/stubs hash invalidation.
 - `PR-011`: отдельные cache namespaces для workspace/stubs/vendor.
 
 Exit signal:
@@ -155,12 +157,12 @@ Exit signal:
 - Only latest document version publishes diagnostics after a burst.
 - No stale diagnostics overwrite newer diagnostics.
 
-### R-007: Stubs грузятся на старте без disk cache/version filtering
+### R-007: Stubs грузятся на старте без separate cache/version filtering
 
 Current evidence:
 
 - `load_configured_stubs()` reads bundled phpstorm-stubs and loads configured extensions into the main index.
-- `stubs::load_stubs()` parses stub files and marks symbols builtin, but does not persist a stubs cache.
+- `stubs::load_stubs()` parses stub files and marks symbols builtin, but stubs are not yet stored in a dedicated cache namespace.
 - `phpLsp.phpVersion` affects diagnostics/refactors in server logic, but built-in symbol availability is not yet filtered from version-gated stub metadata.
 
 Impact:
@@ -171,7 +173,7 @@ Impact:
 Mitigation:
 
 - `PR-030`: parse version-gated stub attributes and filter symbols/signatures by `phpLsp.phpVersion`.
-- `PR-010`/`PR-011`: separate stubs cache keyed by php-lsp version, PHP version, extension list and stubs hash.
+- `PR-011`: separate stubs cache keyed by php-lsp version, PHP version, extension list and stubs hash.
 
 Exit signal:
 

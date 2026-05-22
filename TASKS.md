@@ -553,7 +553,7 @@
 
 ### Disk Cache
 
-- [ ] **V1-009** Кэш индекса на диск
+- [x] **V1-009** Кэш индекса на диск *(done 2026-05-22)*
   - Формат: bincode
   - Путь: ~/.cache/php-lsp/{workspace-hash}/index.bin
   - Инвалидация: mtime + size файлов
@@ -655,7 +655,7 @@
 
 ### Неделя 2: Disk cache и индексирование (2026-05-28 → 2026-06-03)
 
-- [ ] **PR-010 / V1-009** Реализовать disk cache индекса
+- [x] **PR-010 / V1-009** Реализовать disk cache индекса *(done 2026-05-22)*
   - Формат: `bincode` или другой компактный бинарный формат.
   - Путь: `~/.cache/php-lsp/{workspace-hash}/index.bin`.
   - Хранить: `FileSymbols`, top-level maps, версию schema, версию php-lsp, PHP version, stub extensions, include/exclude paths.

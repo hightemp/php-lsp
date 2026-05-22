@@ -396,6 +396,9 @@ def profile_workspace(args: argparse.Namespace) -> dict[str, Any]:
             "indexedFiles": indexed_files,
             "indexedSymbols": indexed_symbols,
             "stubFiles": stub_files,
+            "cacheFilesLoaded": (ready_status or {}).get("cacheFilesLoaded"),
+            "cacheFilesStale": (ready_status or {}).get("cacheFilesStale"),
+            "cacheFilesMissing": (ready_status or {}).get("cacheFilesMissing"),
         },
         "timingsMs": {
             "processStartToInitializeResponse": round(initialize_response_ms - start_ms, 2),

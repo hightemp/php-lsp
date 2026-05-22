@@ -3,6 +3,7 @@
 use dashmap::DashMap;
 use php_lsp_completion::context::detect_context;
 use php_lsp_completion::provider::provide_completions;
+use php_lsp_index::cache::{self, IndexCacheConfig};
 use php_lsp_index::composer::{parse_composer_json, NamespaceMap};
 use php_lsp_index::stubs;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -176,6 +177,14 @@ struct AppliedConfiguration {
     diagnostics_changed: bool,
     stubs_changed: bool,
     indexing_changed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceIndexingOptions {
+    include_paths: Vec<PathBuf>,
+    exclude_paths: Vec<PathBuf>,
+    cache_config: IndexCacheConfig,
+    work_done_progress_supported: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -647,6 +656,22 @@ impl PhpLspBackend {
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let include_paths = self.include_paths.lock().await.clone();
         let exclude_paths = self.exclude_paths.lock().await.clone();
+        let stub_extensions = self.stub_extensions.lock().await.clone();
+        let client_stubs_path = self.stubs_path.lock().await.clone();
+        let cache_config = workspace_index_cache_config(
+            configs.first().map(|config| config.root.as_path()),
+            php_version,
+            &include_paths,
+            &exclude_paths,
+            &stub_extensions,
+            client_stubs_path.as_deref(),
+        );
+        let indexing_options = WorkspaceIndexingOptions {
+            include_paths,
+            exclude_paths,
+            cache_config,
+            work_done_progress_supported,
+        };
         tokio::spawn(async move {
             for config in &configs {
                 if let Err(e) = index_workspace(
@@ -654,9 +679,7 @@ impl PhpLspBackend {
                     &index,
                     &config.root,
                     config.namespace_map.as_ref(),
-                    &include_paths,
-                    &exclude_paths,
-                    work_done_progress_supported,
+                    &indexing_options,
                 )
                 .await
                 {
@@ -6851,6 +6874,113 @@ fn candidate_stubs_paths(root: &Path, client_stubs_path: Option<PathBuf>) -> Vec
     candidate_paths
 }
 
+fn workspace_index_cache_config(
+    root: Option<&Path>,
+    php_version: PhpVersion,
+    include_paths: &[PathBuf],
+    exclude_paths: &[PathBuf],
+    stub_extensions: &[String],
+    client_stubs_path: Option<&Path>,
+) -> IndexCacheConfig {
+    let root = root.unwrap_or_else(|| Path::new(""));
+    IndexCacheConfig {
+        php_lsp_version: env!("CARGO_PKG_VERSION").to_string(),
+        php_version: php_version_label(php_version),
+        include_paths: include_paths
+            .iter()
+            .map(|path| cache_path_label(path))
+            .collect(),
+        exclude_paths: exclude_paths
+            .iter()
+            .map(|path| cache_path_label(path))
+            .collect(),
+        stub_extensions: effective_stub_extensions(stub_extensions),
+        stubs_hash: stubs_cache_hash(root, client_stubs_path, stub_extensions),
+    }
+}
+
+fn cache_path_label(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn effective_stub_extensions(stub_extensions: &[String]) -> Vec<String> {
+    if stub_extensions.is_empty() {
+        stubs::DEFAULT_EXTENSIONS
+            .iter()
+            .map(|ext| (*ext).to_string())
+            .collect()
+    } else {
+        stub_extensions.to_vec()
+    }
+}
+
+fn stubs_cache_hash(
+    root: &Path,
+    client_stubs_path: Option<&Path>,
+    stub_extensions: &[String],
+) -> u64 {
+    let client_stubs_path = client_stubs_path.map(Path::to_path_buf);
+    let mut parts = vec!["stubs-cache-v1".to_string()];
+    let extensions = effective_stub_extensions(stub_extensions);
+
+    if let Some(stubs_root) = candidate_stubs_paths(root, client_stubs_path)
+        .into_iter()
+        .find(|path| path.is_dir())
+    {
+        parts.push(format!(
+            "root={}",
+            stubs_root.to_string_lossy().replace('\\', "/")
+        ));
+        for file_name in ["composer.lock", "composer.json", "PhpStormStubsMap.php"] {
+            let path = stubs_root.join(file_name);
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| {
+                        format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos())
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                parts.push(format!(
+                    "file={}:{}:{}",
+                    file_name,
+                    metadata.len(),
+                    modified
+                ));
+            }
+        }
+        for extension in extensions {
+            let path = stubs_root.join(&extension);
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| {
+                        format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos())
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                parts.push(format!(
+                    "extension={}:{}:{}",
+                    extension,
+                    metadata.len(),
+                    modified
+                ));
+            } else {
+                parts.push(format!("extension={}:missing", extension));
+            }
+        }
+    } else {
+        parts.push("root=missing".to_string());
+        for extension in extensions {
+            parts.push(format!("extension={}:unknown", extension));
+        }
+    }
+
+    cache::stable_hash_strings(parts.iter().map(String::as_str))
+}
+
 fn load_configured_stubs(
     index: &WorkspaceIndex,
     root: &Path,
@@ -6889,9 +7019,7 @@ async fn index_workspace(
     index: &WorkspaceIndex,
     root: &Path,
     namespace_map: Option<&NamespaceMap>,
-    include_paths: &[PathBuf],
-    exclude_paths: &[PathBuf],
-    work_done_progress_supported: bool,
+    options: &WorkspaceIndexingOptions,
 ) -> std::result::Result<(), String> {
     let root_label = root.display().to_string();
     let started_at = Instant::now();
@@ -6913,7 +7041,7 @@ async fn index_workspace(
     let progress_token = ProgressToken::String(format!("php-lsp-indexing-{}", root.display()));
 
     // Request progress support from client (with timeout to avoid hanging if client doesn't respond)
-    let progress_supported = if work_done_progress_supported {
+    let progress_supported = if options.work_done_progress_supported {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.create_work_done_progress(progress_token.clone()),
@@ -6937,8 +7065,8 @@ async fn index_workspace(
     };
 
     // Collect PHP files
-    let source_dirs = workspace_index_directories(root, namespace_map, include_paths);
-    let php_files = collect_php_files(&source_dirs, root, exclude_paths);
+    let source_dirs = workspace_index_directories(root, namespace_map, &options.include_paths);
+    let php_files = collect_php_files(&source_dirs, root, &options.exclude_paths);
 
     // Also add explicit files from composer.json
     let mut all_files = php_files;
@@ -6950,28 +7078,64 @@ async fn index_workspace(
                 root.join(file_path)
             };
             if abs.exists()
-                && !path_is_excluded(&abs, root, exclude_paths)
+                && !path_is_excluded(&abs, root, &options.exclude_paths)
                 && !all_files.contains(&abs)
             {
                 all_files.push(abs);
             }
         }
     }
+    all_files.sort();
 
     let total = all_files.len();
     tracing::info!("Indexing {} PHP files", total);
+
+    let cache_path = cache::cache_file_path(root);
+    let cache_report =
+        cache::load_valid_cached_files(index, &cache_path, root, &all_files, &options.cache_config);
+    if let Some(reason) = cache_report.miss_reason.as_deref() {
+        tracing::debug!(
+            "Workspace index cache miss for {}: {}",
+            root.display(),
+            reason
+        );
+    } else if cache_report.loaded_files > 0 {
+        tracing::info!(
+            "Loaded {} PHP files from workspace index cache for {}",
+            cache_report.loaded_files,
+            root.display()
+        );
+    }
+    let files_to_parse = cache_report.parse_files.clone();
+    let loaded_from_cache = cache_report.loaded_files;
+    let mut indexed_symbols = cache_report.indexed_symbols;
 
     send_indexing_status(
         client,
         serde_json::json!({
             "phase": "indexing",
             "root": root_label,
-            "message": format!("Indexing {} PHP files", total),
-            "indexedFiles": 0,
+            "message": if loaded_from_cache > 0 {
+                format!(
+                    "Loaded {} files from cache; indexing {} changed/missing files",
+                    loaded_from_cache,
+                    files_to_parse.len()
+                )
+            } else {
+                format!("Indexing {} PHP files", total)
+            },
+            "indexedFiles": loaded_from_cache,
             "totalFiles": total,
-            "indexedSymbols": 0,
-            "percentage": 0,
-            "elapsedMs": elapsed_ms(started_at)
+            "indexedSymbols": indexed_symbols,
+            "percentage": if total > 0 {
+                ((loaded_from_cache as f64 / total as f64) * 100.0) as u32
+            } else {
+                100
+            },
+            "elapsedMs": elapsed_ms(started_at),
+            "cacheFilesLoaded": loaded_from_cache,
+            "cacheFilesStale": cache_report.stale_files,
+            "cacheFilesMissing": cache_report.missing_files
         }),
     )
     .await;
@@ -6983,10 +7147,9 @@ async fn index_workspace(
 
     // Parse files with limited concurrency via semaphore
     let semaphore = Arc::new(Semaphore::new(4));
-    let indexed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut indexed_symbols = 0usize;
+    let indexed = Arc::new(std::sync::atomic::AtomicUsize::new(loaded_from_cache));
 
-    for (i, file_path) in all_files.iter().enumerate() {
+    for (i, file_path) in files_to_parse.iter().enumerate() {
         let _permit = match semaphore.acquire().await {
             Ok(permit) => permit,
             Err(e) => {
@@ -7080,6 +7243,16 @@ async fn index_workspace(
             .await;
     }
 
+    let cache_to_save =
+        cache::build_cache_from_index(index, root, &all_files, &options.cache_config);
+    if let Err(e) = cache::save_cache_atomic(&cache_path, &cache_to_save) {
+        tracing::warn!(
+            "Failed to save workspace index cache at {}: {}",
+            cache_path.display(),
+            e
+        );
+    }
+
     send_indexing_status(
         client,
         serde_json::json!({
@@ -7090,7 +7263,11 @@ async fn index_workspace(
             "totalFiles": total,
             "indexedSymbols": indexed_symbols,
             "percentage": 100,
-            "elapsedMs": elapsed_ms(started_at)
+            "elapsedMs": elapsed_ms(started_at),
+            "cacheFilesLoaded": loaded_from_cache,
+            "cacheFilesStale": cache_report.stale_files,
+            "cacheFilesMissing": cache_report.missing_files,
+            "cachePath": cache_path.display().to_string()
         }),
     )
     .await;
@@ -7314,12 +7491,14 @@ impl LanguageServer for PhpLspBackend {
         )
         .await;
 
+        let load_client_stubs_path = client_stubs_path.clone();
+        let load_stub_extensions = stub_extensions.clone();
         let loaded_stubs = tokio::task::spawn_blocking(move || {
             load_configured_stubs(
                 &stubs_index,
                 &stubs_root,
-                client_stubs_path,
-                stub_extensions,
+                load_client_stubs_path,
+                load_stub_extensions,
                 false,
             )
         })
@@ -7347,6 +7526,20 @@ impl LanguageServer for PhpLspBackend {
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let include_paths = self.include_paths.lock().await.clone();
         let exclude_paths = self.exclude_paths.lock().await.clone();
+        let cache_config = workspace_index_cache_config(
+            configs.first().map(|config| config.root.as_path()),
+            php_version,
+            &include_paths,
+            &exclude_paths,
+            &stub_extensions,
+            client_stubs_path.as_deref(),
+        );
+        let indexing_options = WorkspaceIndexingOptions {
+            include_paths,
+            exclude_paths,
+            cache_config,
+            work_done_progress_supported,
+        };
         tokio::spawn(async move {
             for config in &configs {
                 if let Err(e) = index_workspace(
@@ -7354,9 +7547,7 @@ impl LanguageServer for PhpLspBackend {
                     &index,
                     &config.root,
                     config.namespace_map.as_ref(),
-                    &include_paths,
-                    &exclude_paths,
-                    work_done_progress_supported,
+                    &indexing_options,
                 )
                 .await
                 {
@@ -7488,6 +7679,23 @@ impl LanguageServer for PhpLspBackend {
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let include_paths = self.include_paths.lock().await.clone();
         let exclude_paths = self.exclude_paths.lock().await.clone();
+        let php_version = *self.php_version.lock().await;
+        let stub_extensions = self.stub_extensions.lock().await.clone();
+        let client_stubs_path = self.stubs_path.lock().await.clone();
+        let cache_config = workspace_index_cache_config(
+            added_configs.first().map(|config| config.root.as_path()),
+            php_version,
+            &include_paths,
+            &exclude_paths,
+            &stub_extensions,
+            client_stubs_path.as_deref(),
+        );
+        let indexing_options = WorkspaceIndexingOptions {
+            include_paths,
+            exclude_paths,
+            cache_config,
+            work_done_progress_supported,
+        };
         tokio::spawn(async move {
             for config in &added_configs {
                 if let Err(e) = index_workspace(
@@ -7495,9 +7703,7 @@ impl LanguageServer for PhpLspBackend {
                     &index,
                     &config.root,
                     config.namespace_map.as_ref(),
-                    &include_paths,
-                    &exclude_paths,
-                    work_done_progress_supported,
+                    &indexing_options,
                 )
                 .await
                 {
