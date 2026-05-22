@@ -611,6 +611,192 @@
 
 ---
 
+## Milestone: Production Readiness (6 недель)
+
+**Срок:** 2026-05-21 → 2026-07-01  
+**Цель:** довести текущий feature-complete LSP до состояния, где его можно уверенно ставить на крупные PHP/Composer проекты без постоянных false positives, долгих cold starts и зависаний тяжелых запросов.
+
+### Exit criteria
+
+- Cold start на проекте 5k-10k PHP файлов после первого запуска: < 5 секунд до готового индекса из disk cache.
+- Первый полный индекс на проекте 5k-10k PHP файлов: измерен, задокументирован, без блокировки hover/completion.
+- p95 latency для hover/completion/definition на прогретом индексе: < 50 мс на контрольной фикстуре.
+- `references`, `rename`, `codeLens` работают через индекс ссылок или другой инкрементальный механизм, без полного reparse workspace на каждый запрос.
+- `didChange` устойчив к быстрому набору: debounce, version ordering, отмена устаревших diagnostics.
+- `$/cancelRequest` или эквивалентная отмена применяется к тяжелым операциям: indexing, references, rename, external analyzers.
+- `phpLsp.phpVersion` влияет не только на syntax/type diagnostics, но и на built-in stubs/completion/definition.
+- PHPDoc generics/callable/array-shape-like типы не ломают parser и используются в hover/completion/type inference best-effort.
+- Release workflow собирает все заявленные платформы и готов к публикации VS Marketplace.
+- Есть `docs/architecture.md`, `docs/lsp-features.md`, troubleshooting и публичный список known limitations.
+
+### Неделя 1: Baseline, профилирование, план стабилизации (2026-05-21 → 2026-05-27)
+
+- [x] **PR-001** Зафиксировать production baseline *(done 2026-05-21)*
+  - Прогнать `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`.
+  - Прогнать `npm run lint` и `npm run build` в `client/`.
+  - Зафиксировать текущие числа: количество тестов, время CI локально, размер VSIX, размер server binary.
+  - Сохранить baseline в `docs/production-baseline.md`.
+
+- [x] **PR-002** Добавить perf harness для реальных проектов *(done 2026-05-21)*
+  - Скрипт `scripts/profile-workspace.sh` или Rust test harness для замера cold start, indexing time, memory RSS.
+  - Сценарии: small fixture, Symfony/Laravel-like project, vendor-heavy project.
+  - Метрики: files/sec, symbols/sec, peak RSS, stubs load time, first diagnostics time.
+  - Результаты складывать в `target/php-lsp-profile/*.json`.
+
+- [ ] **PR-003** Добавить latency benchmarks для LSP requests
+  - Скрипт LSP-клиента для batch-запросов: hover, completion, definition, references, rename dry-run.
+  - Измерять p50/p95/p99 на прогретом и холодном индексе.
+  - Отдельно измерять открытый файл и неоткрытый файл.
+
+- [ ] **PR-004** Составить risk register production gaps
+  - Документировать known bottlenecks: full workspace scan в references/rename/codeLens, sync file reads, stubs load, vendor resolve.
+  - Для каждого риска указать mitigation и owner task.
+  - Обновить `README.md` known limitations без завышения текущих возможностей.
+
+### Неделя 2: Disk cache и индексирование (2026-05-28 → 2026-06-03)
+
+- [ ] **PR-010 / V1-009** Реализовать disk cache индекса
+  - Формат: `bincode` или другой компактный бинарный формат.
+  - Путь: `~/.cache/php-lsp/{workspace-hash}/index.bin`.
+  - Хранить: `FileSymbols`, top-level maps, версию schema, версию php-lsp, PHP version, stub extensions, include/exclude paths.
+  - Инвалидация: mtime + size + config hash + stubs hash.
+  - На старте сначала грузить cache, затем фоново доиндексировать changed files.
+
+- [ ] **PR-011** Разделить project index, stub index и vendor index
+  - Отдельные cache namespaces: `workspace`, `stubs`, `vendor`.
+  - Не удалять stubs при workspace reindex.
+  - Ускорить reload настроек, затрагивающих только stubs или только workspace.
+
+- [ ] **PR-012 / V1-011** Оптимизировать lazy vendor indexing
+  - Кэшировать parsed composer installed/autoload metadata.
+  - Добавить LRU для vendor file symbols.
+  - Предзагружать часто используемые vendor entrypoints после ready, без блокировки быстрых запросов.
+
+- [ ] **PR-013** Сделать indexing реально параллельным
+  - Заменить последовательный loop с semaphore на task queue / `JoinSet`.
+  - Ограничить concurrency конфигурацией или CPU-aware default.
+  - Стабильно агрегировать progress и errors.
+  - Проверить отсутствие гонок в `WorkspaceIndex::update_file`.
+
+### Неделя 3: Responsiveness, debounce, cancellation (2026-06-04 → 2026-06-10)
+
+- [ ] **PR-020** Очередь `didChange` с debounce и version ordering
+  - Хранить document version из LSP events.
+  - Debounce diagnostics 150-250 мс.
+  - Отменять устаревшие diagnostic tasks при новом изменении файла.
+  - Гарантировать, что старый результат diagnostics не перетрет новый.
+
+- [ ] **PR-021** Поддержать cancellation для тяжелых операций
+  - Ввести `CancellationToken`/task registry для indexing, references, rename, external analyzer runs.
+  - Проверить `$/cancelRequest` для `references` на большой фикстуре.
+  - Возвращать LSP `RequestCancelled` там, где клиент явно отменил запрос.
+
+- [ ] **PR-022** Убрать full reparse workspace из references/rename/codeLens
+  - Построить reference index или per-file lightweight occurrence index при индексации.
+  - Инвалидировать occurrence данные при didChange/didSave/watched files.
+  - `references` должен читать готовые occurrence данные и парсить только открытый dirty buffer.
+  - `rename` должен использовать те же ranges и валидировать конфликт имен до WorkspaceEdit.
+
+- [ ] **PR-023** Перевести sync file IO в тяжелых paths на blocking/background
+  - Не делать `std::fs::read_to_string` в async handler hot path.
+  - Использовать `spawn_blocking` или отдельный file IO worker для bulk reads.
+  - Добавить timeout/error telemetry для медленных файловых операций.
+
+### Неделя 4: PHP version, stubs, PHPDoc (2026-06-11 → 2026-06-17)
+
+- [ ] **PR-030 / H-006** Version-aware stubs
+  - Парсить/учитывать `PhpStormStubsElementAvailable` и другие version-gated атрибуты из phpstorm-stubs.
+  - Фильтровать built-in symbols/signatures под `phpLsp.phpVersion`.
+  - При смене версии через `didChangeConfiguration` обновлять stubs cache и diagnostics без restart.
+  - E2E: API доступен в PHP 8.2 и недоступен в PHP 8.1.
+
+- [ ] **PR-031 / H-008** Переписать PHPDoc type parser
+  - Поддержать `array<int, User>`, `list<User>`, `class-string<T>`, `(A&B)|null`, `callable(A): B`.
+  - Не обрезать type expression через `first_word`.
+  - Безопасно игнорировать malformed tags.
+  - Добавить unit tests для пробелов внутри generics и nested скобок.
+
+- [ ] **PR-032 / H-009** Разделить модель `@property`, `@property-read`, `@property-write`
+  - Добавить access mode в `PhpDocProperty`.
+  - Учесть read/write режим в completion, diagnostics и future rename guards.
+  - Сохранить обратную совместимость сериализации cache schema через schema version.
+
+- [ ] **PR-033 / H-010 / H-012** PHPDoc virtual members в LSP UI
+  - Показывать `@throws`, `@var`, `@property*`, `@method` в hover и completion resolve.
+  - Добавить virtual properties/methods в `$obj->` completion.
+  - Definition по virtual member возвращает range в doc-comment.
+  - Rename для virtual members: явно запретить или реализовать локальный doc-comment edit.
+
+- [ ] **PR-034 / H-013** E2E покрытие PHPDoc behavior
+  - Fixture-driven tests по `test-fixtures/lsp-cases/src/PhpDoc/*`.
+  - Отдельно проверить hover, completionItem/resolve, definition, diagnostics no-crash.
+  - Обновить `test-fixtures/lsp-cases/README.md` фактической матрицей поддержки.
+
+### Неделя 5: Type engine и LSP polish (2026-06-18 → 2026-06-24)
+
+- [ ] **PR-040** Расширить `TypeInfo` для production PHPDoc/PHP типов
+  - Generic types, array/list shapes best-effort, callable signatures, class-string, literal scalar types.
+  - Нормализация FQN внутри типов с учетом namespace/use.
+  - Сохранить graceful fallback для неизвестных type forms.
+
+- [ ] **PR-041** Улучшить inference для переменных и expressions
+  - Возврат методов через PHPDoc generics, iterable foreach value type, array access best-effort.
+  - `instanceof` narrowing для positive/negative branches.
+  - Типы свойств из constructor promotion, assignments и `@var` объединять с приоритетами.
+
+- [ ] **PR-042** Снизить false positives diagnostics на framework-heavy коде
+  - Добавить regression corpus для Symfony/Laravel/PHPUnit patterns без project-specific hardcode.
+  - Пересмотреть suppressions: они должны опираться на типы/наследование/known library metadata, а не имена конкретного проекта.
+  - Ввести severity/category controls для noisy diagnostics.
+
+- [ ] **PR-043** Закрыть LSP polish gaps
+  - Добавить `textDocument/semanticTokens/range` или явно документировать отсутствие.
+  - Улучшить `workspace/symbol`: fuzzy scoring, container ranking, kind filters where possible.
+  - Реализовать meaningful `willRenameFiles` для namespace/class path refactors или убрать завышенное ожидание из capabilities.
+  - Проверить корректность UTF-16 ranges во всех новых edits.
+
+### Неделя 6: Release hardening, docs, acceptance (2026-06-25 → 2026-07-01)
+
+- [ ] **PR-050** Stress и soak testing
+  - 100 didChange за 1 секунду на файле с non-ASCII.
+  - Одновременные hover/completion во время full indexing.
+  - Cancel references/rename на большом workspace.
+  - External analyzer timeout и malformed JSON без зависаний.
+
+- [ ] **PR-051** Release workflow production-ready
+  - Синхронизировать `.github/workflows/release.yml` со всеми заявленными платформами.
+  - Добавить `darwin-x64`, проверить linux musl/alpine решение или убрать из обещаний.
+  - Включить Marketplace publish job за `VSCE_PAT`.
+  - Добавить smoke test packaged VSIX: binary exists, stubs exist, extension activates.
+
+- [ ] **PR-052** Документация production-ready
+  - `docs/architecture.md`: data flow, indexing/cache model, diagnostics pipeline.
+  - `docs/lsp-features.md`: таблица supported/partial/unsupported.
+  - `docs/performance.md`: baseline, методика измерений, known bottlenecks.
+  - README: установка, настройки, troubleshooting, external analyzers, formatter setup.
+
+- [ ] **PR-053** Финальный acceptance прогон
+  - Все unit/e2e tests проходят.
+  - Perf numbers внесены в docs.
+  - Known limitations актуальны.
+  - `TASKS.md` обновлен: завершенные PR tasks отмечены, оставшиеся перенесены в следующий milestone.
+
+### Production Readiness Dependencies
+
+```
+PR-001 ─→ PR-002 ─→ PR-010 ─→ PR-013
+PR-002 ─→ PR-003 ─→ PR-020 ─→ PR-021 ─→ PR-022
+PR-010 ─→ PR-011 ─→ PR-012
+PR-030 ─→ PR-033
+PR-031 ─→ PR-032 ─→ PR-033 ─→ PR-034
+PR-040 ─→ PR-041 ─→ PR-042
+PR-022 ─→ PR-043
+PR-050 ─→ PR-051 ─→ PR-053
+PR-052 ─→ PR-053
+```
+
+---
+
 ## Зависимости между задачами
 
 ```
@@ -762,3 +948,5 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-20** Убрать hardcode имен framework methods из suppress unused-parameter diagnostics.
 - [x] **T-2026-05-20** Проверить production-код на project-specific hardcode и убрать найденное.
 - [x] **T-2026-05-21** Исправить GitHub downloads badge в README.
+- [x] **T-2026-05-21** Изучить код проекта и составить список недостающих работ для production LSP сервера.
+- [x] **T-2026-05-21** Добавить milestone production-readiness с подробным расписанием задач.
