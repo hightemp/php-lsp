@@ -93,8 +93,8 @@ phpstorm-stubs support.
 - `references`, `rename`, and reference-count code lenses can still scan and
   reparse indexed workspace files. They are functional, but not yet optimized
   for very large repositories.
-- Workspace indexing uses bounded progress reporting, but file parsing is not
-  yet a fully parallel task queue.
+- Workspace indexing parses files through a bounded CPU-aware task queue;
+  large-project acceptance thresholds are still being measured.
 - Heavy operations do not yet have general LSP request cancellation support.
 - Rapid `didChange` bursts are handled synchronously without a debounce/version
   queue for diagnostics.

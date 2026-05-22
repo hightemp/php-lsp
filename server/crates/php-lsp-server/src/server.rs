@@ -31,7 +31,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp::ls_types::*;
@@ -53,6 +54,13 @@ async fn send_indexing_status(client: &Client, params: serde_json::Value) {
 
 fn elapsed_ms(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn indexing_parse_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(1, MAX_INDEXING_PARSE_CONCURRENCY)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -207,6 +215,7 @@ struct WorkspaceRootConfig {
 
 const VENDOR_FILE_LRU_CAPACITY: usize = 512;
 const VENDOR_PRELOAD_ENTRYPOINT_LIMIT: usize = 16;
+const MAX_INDEXING_PARSE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
 struct VendorPsr4Mapping {
@@ -218,6 +227,15 @@ struct VendorPsr4Mapping {
 struct VendorAutoloadMap {
     psr4: Vec<VendorPsr4Mapping>,
     files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct WorkspaceParseResult {
+    path: PathBuf,
+    uri: String,
+    file_symbols: Option<php_lsp_types::FileSymbols>,
+    symbol_count: usize,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -7390,6 +7408,44 @@ fn parse_and_index_php_file(index: &WorkspaceIndex, file_path: &Path) -> bool {
     true
 }
 
+fn parse_workspace_file_for_index(file_path: PathBuf) -> WorkspaceParseResult {
+    let uri = path_to_uri(&file_path);
+    let source = match std::fs::read_to_string(&file_path) {
+        Ok(source) => source,
+        Err(err) => {
+            return WorkspaceParseResult {
+                path: file_path,
+                uri,
+                file_symbols: None,
+                symbol_count: 0,
+                error: Some(format!("failed to read file: {}", err)),
+            };
+        }
+    };
+
+    let mut parser = FileParser::new();
+    parser.parse_full(&source);
+    let Some(tree) = parser.tree() else {
+        return WorkspaceParseResult {
+            path: file_path,
+            uri,
+            file_symbols: None,
+            symbol_count: 0,
+            error: Some("parser did not produce a syntax tree".to_string()),
+        };
+    };
+
+    let file_symbols = extract_file_symbols(tree, &source, &uri);
+    let symbol_count = file_symbols.symbols.len();
+    WorkspaceParseResult {
+        path: file_path,
+        uri,
+        file_symbols: Some(file_symbols),
+        symbol_count,
+        error: None,
+    }
+}
+
 fn load_cached_vendor_file(
     index: &WorkspaceIndex,
     root: &Path,
@@ -7634,7 +7690,8 @@ async fn index_workspace(
             "elapsedMs": elapsed_ms(started_at),
             "cacheFilesLoaded": loaded_from_cache,
             "cacheFilesStale": cache_report.stale_files,
-            "cacheFilesMissing": cache_report.missing_files
+            "cacheFilesMissing": cache_report.missing_files,
+            "parseConcurrency": indexing_parse_concurrency()
         }),
     )
     .await;
@@ -7644,22 +7701,30 @@ async fn index_workspace(
             .await;
     }
 
-    // Parse files with limited concurrency via semaphore
-    let semaphore = Arc::new(Semaphore::new(4));
-    let indexed = Arc::new(std::sync::atomic::AtomicUsize::new(loaded_from_cache));
+    let parse_concurrency = indexing_parse_concurrency();
+    let mut pending_files = files_to_parse.into_iter();
+    let mut parse_tasks = JoinSet::new();
+    while parse_tasks.len() < parse_concurrency {
+        let Some(file_path) = pending_files.next() else {
+            break;
+        };
+        parse_tasks.spawn_blocking(move || parse_workspace_file_for_index(file_path));
+    }
 
-    for (i, file_path) in files_to_parse.iter().enumerate() {
-        let _permit = match semaphore.acquire().await {
-            Ok(permit) => permit,
-            Err(e) => {
-                let message = format!("Semaphore error: {}", e);
+    let mut done = loaded_from_cache;
+    let mut parse_errors = 0usize;
+    while let Some(result) = parse_tasks.join_next().await {
+        let parsed = match result {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let message = format!("Workspace indexing task failed: {}", err);
                 send_indexing_status(
                     client,
                     serde_json::json!({
                         "phase": "error",
                         "root": root_label,
                         "message": message,
-                        "indexedFiles": indexed.load(std::sync::atomic::Ordering::Relaxed),
+                        "indexedFiles": done,
                         "totalFiles": total,
                         "indexedSymbols": indexed_symbols,
                         "elapsedMs": elapsed_ms(started_at)
@@ -7670,33 +7735,31 @@ async fn index_workspace(
             }
         };
 
-        // Read and parse file
-        match std::fs::read_to_string(file_path) {
-            Ok(source) => {
-                let mut parser = FileParser::new();
-                parser.parse_full(&source);
+        if let Some(file_symbols) = parsed.file_symbols {
+            index.update_file(&parsed.uri, file_symbols);
+            indexed_symbols += parsed.symbol_count;
 
-                if let Some(tree) = parser.tree() {
-                    let uri = path_to_uri(file_path);
-                    let file_symbols = extract_file_symbols(tree, &source, &uri);
-
-                    let sym_count = file_symbols.symbols.len();
-                    index.update_file(&uri, file_symbols);
-                    indexed_symbols += sym_count;
-
-                    if sym_count > 0 {
-                        tracing::debug!("Indexed {}: {} symbols", file_path.display(), sym_count);
-                    }
-                }
+            if parsed.symbol_count > 0 {
+                tracing::debug!(
+                    "Indexed {}: {} symbols",
+                    parsed.path.display(),
+                    parsed.symbol_count
+                );
             }
-            Err(e) => {
-                tracing::warn!("Failed to read {}: {}", file_path.display(), e);
-            }
+        } else if let Some(error) = parsed.error {
+            parse_errors += 1;
+            tracing::warn!("Failed to index {}: {}", parsed.path.display(), error);
         }
 
-        let done = indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        done += 1;
 
-        // Report progress every 10 files or on last file
+        while parse_tasks.len() < parse_concurrency {
+            let Some(file_path) = pending_files.next() else {
+                break;
+            };
+            parse_tasks.spawn_blocking(move || parse_workspace_file_for_index(file_path));
+        }
+
         if let Some(ref p) = ongoing {
             if done % 10 == 0 || done == total {
                 let percentage = if total > 0 {
@@ -7723,15 +7786,16 @@ async fn index_workspace(
                     "indexedFiles": done,
                     "totalFiles": total,
                     "indexedSymbols": indexed_symbols,
+                    "indexingErrors": parse_errors,
                     "percentage": percentage,
-                    "elapsedMs": elapsed_ms(started_at)
+                    "elapsedMs": elapsed_ms(started_at),
+                    "parseConcurrency": parse_concurrency
                 }),
             )
             .await;
         }
 
-        // Yield to allow other tasks to run
-        if i % 50 == 0 {
+        if done % 50 == 0 {
             tokio::task::yield_now().await;
         }
     }
@@ -7766,6 +7830,8 @@ async fn index_workspace(
             "cacheFilesLoaded": loaded_from_cache,
             "cacheFilesStale": cache_report.stale_files,
             "cacheFilesMissing": cache_report.missing_files,
+            "indexingErrors": parse_errors,
+            "parseConcurrency": parse_concurrency,
             "cachePath": cache_path.display().to_string()
         }),
     )
@@ -11293,6 +11359,42 @@ mod tests {
         assert!(index.resolve_fqn("App\\Foo").is_none());
         assert!(index.resolve_fqn("Vendor\\Pkg\\Bar").is_some());
         assert!(index.resolve_fqn("stdClass").is_some());
+    }
+
+    #[test]
+    fn test_workspace_index_parallel_updates_are_safe() {
+        let index = Arc::new(WorkspaceIndex::new());
+        let mut handles = Vec::new();
+
+        for i in 0..32 {
+            let index = index.clone();
+            handles.push(std::thread::spawn(move || {
+                let uri = format!("file:///tmp/project/src/Foo{}.php", i);
+                let fqn = format!("App\\Foo{}", i);
+                index.update_file(
+                    &uri,
+                    FileSymbols {
+                        namespace: Some("App".to_string()),
+                        use_statements: vec![],
+                        symbols: vec![make_symbol(
+                            &format!("Foo{}", i),
+                            &fqn,
+                            PhpSymbolKind::Class,
+                            (0, 0, 1, 0),
+                            None,
+                        )],
+                    },
+                );
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for i in 0..32 {
+            assert!(index.resolve_fqn(&format!("App\\Foo{}", i)).is_some());
+        }
     }
 
     #[test]

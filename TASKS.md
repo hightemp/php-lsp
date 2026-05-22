@@ -680,11 +680,16 @@
   - LRU удерживает до 512 lazy-indexed vendor files в symbol index; вытесненные файлы могут быть восстановлены из `vendor/index.bin`.
   - После workspace ready фоново предзагружаются до 16 `autoload.files` entrypoints.
 
-- [ ] **PR-013** Сделать indexing реально параллельным
+- [x] **PR-013** Сделать indexing реально параллельным *(done 2026-05-22)*
   - Заменить последовательный loop с semaphore на task queue / `JoinSet`.
   - Ограничить concurrency конфигурацией или CPU-aware default.
   - Стабильно агрегировать progress и errors.
   - Проверить отсутствие гонок в `WorkspaceIndex::update_file`.
+  - `index_workspace()` теперь использует `JoinSet::spawn_blocking` для read/parse файлов.
+  - Default concurrency: `available_parallelism()` capped at 8.
+  - Progress payload включает `parseConcurrency` и `indexingErrors`.
+  - Добавлен regression test на concurrent `WorkspaceIndex::update_file()`.
+  - Smoke `parallel-pr013=test-fixtures/basic`: первый run indexed 4 files за 304.47 ms до ready; второй run из cache — 28.09 ms.
 
 ### Неделя 3: Responsiveness, debounce, cancellation (2026-06-04 → 2026-06-10)
 

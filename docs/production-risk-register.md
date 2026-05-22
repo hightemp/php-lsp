@@ -11,7 +11,7 @@ Scope: production-readiness milestone, weeks 1-6.
 |----|------|----------|------------|--------|
 | R-001 | Disk cache maturity | High | `PR-010`, `PR-011` | Partially mitigated |
 | R-002 | `references`/`rename`/`codeLens` делают workspace scan | High | `PR-022`, `PR-021` | Open |
-| R-003 | Индексация фактически последовательная | High | `PR-013`, `PR-023` | Open |
+| R-003 | Parallel indexing acceptance | High | `PR-013`, `PR-023` | Partially mitigated |
 | R-004 | Sync file IO в async/hot paths | High | `PR-023` | Open |
 | R-005 | Нет request cancellation для тяжелых операций | High | `PR-021`, `PR-050` | Open |
 | R-006 | `didChange` без debounce/version ordering | High | `PR-020`, `PR-050` | Open |
@@ -71,22 +71,23 @@ Exit signal:
 - Warm p95 `references`/`renameDryRun` на large fixture перестает зависеть от полного reparse workspace.
 - `codeLens` не делает full references scan на каждый visible document refresh.
 
-### R-003: Индексация фактически последовательная
+### R-003: Parallel indexing acceptance
 
 Current evidence:
 
-- `index_workspace()` создает `Semaphore::new(4)`, но затем идет обычный `for` loop и держит один permit внутри каждой итерации.
-- File read/parse/update выполняются inline в этой async task.
+- `PR-013` replaced the sequential indexing loop with a bounded `JoinSet::spawn_blocking` task queue.
+- Parse concurrency uses a CPU-aware default capped at 8 workers.
+- `WorkspaceIndex::update_file()` is still centralized after each parse task completes, and a regression test covers concurrent index updates.
 
 Impact:
 
-- CPU cores простаивают на первом full index.
-- На больших проектах startup и reindex будут линейно расти по числу PHP files.
+- Large-project speedup and memory profile still need acceptance measurement on 5k-10k PHP files.
+- Other sync file IO hot paths are still tracked by `R-004`/`PR-023`.
 
 Mitigation:
 
-- `PR-013`: заменить sequential loop на bounded task queue или `JoinSet`.
-- `PR-023`: вынести blocking file IO/parse work из hot async path.
+- `PR-013`: implemented bounded parallel parse queue with stable progress/error aggregation.
+- `PR-023`: continue moving remaining blocking file IO/parse work out of hot async request paths.
 
 Exit signal:
 
