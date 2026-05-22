@@ -791,17 +791,27 @@
   - Regression: completion unit tests для direct/inherited virtual members; server unit tests для markdown sections и doc-comment range.
   - Validation: `cargo fmt --all --check`, targeted `phpdoc_virtual`/`phpdoc_extra` tests, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **PR-034 / H-013** E2E покрытие PHPDoc behavior
+- [x] **PR-034 / H-013** E2E покрытие PHPDoc behavior *(completed 2026-05-22)*
   - Fixture-driven tests по `test-fixtures/lsp-cases/src/PhpDoc/*`.
   - Отдельно проверить hover, completionItem/resolve, definition, diagnostics no-crash.
   - Обновить `test-fixtures/lsp-cases/README.md` фактической матрицей поддержки.
+  - Added: `VirtualMembers.php` fixture для usage sites class-level PHPDoc virtual members.
+  - E2E: hover по class/method/virtual property, `$obj->` completion, `completionItem/resolve`, definition на doc-comment tag, rename guard, diagnostics no-crash для `EdgeCases.php`.
+  - Docs: README обновлен PHPDoc behavior matrix.
+  - Validation: `cargo fmt --all --check`, targeted `test_phpdoc_fixture_hover_completion_definition_and_diagnostics`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
 ### Неделя 5: Type engine и LSP polish (2026-06-18 → 2026-06-24)
 
-- [ ] **PR-040** Расширить `TypeInfo` для production PHPDoc/PHP типов
+- [x] **PR-040** Расширить `TypeInfo` для production PHPDoc/PHP типов *(completed 2026-05-22)*
   - Generic types, array/list shapes best-effort, callable signatures, class-string, literal scalar types.
   - Нормализация FQN внутри типов с учетом namespace/use.
   - Сохранить graceful fallback для неизвестных type forms.
+  - Implemented: `Generic`, `ArrayShape`, `Callable`, `ClassString`, literal string/int/float/bool/null variants with stable `Display`.
+  - Parser: PHPDoc generics, nested generics, array shapes, callable signatures, class-string and literal scalar types now produce structured `TypeInfo`.
+  - Consumers: type definition, member return resolution, override normalization, return-type code actions and diagnostics handle new variants with conservative fallback.
+  - Cache: `CACHE_SCHEMA_VERSION` поднят до 6.
+  - Regression: parser tests for generic/class-string/callable/array-shape/literals and `TypeInfo` display tests.
+  - Validation: `cargo fmt --all --check`, targeted PHPDoc/type display tests, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
 - [ ] **PR-041** Улучшить inference для переменных и expressions
   - Возврат методов через PHPDoc generics, iterable foreach value type, array access best-effort.

@@ -306,6 +306,13 @@ fn completion_request(id: i64, uri: &str, line: u32, character: u32) -> Request 
         .finish()
 }
 
+fn completion_resolve_request(id: i64, item: serde_json::Value) -> Request {
+    Request::build("completionItem/resolve")
+        .params(item)
+        .id(id)
+        .finish()
+}
+
 fn signature_help_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/signatureHelp")
         .params(json!({
@@ -604,6 +611,24 @@ fn extract_error_message(response: Option<tower_lsp::jsonrpc::Response>) -> Opti
 
 fn extract_error_code(response: Option<tower_lsp::jsonrpc::Response>) -> Option<i64> {
     response?.error().map(|error| error.code.code())
+}
+
+fn hover_markdown_value(result: &serde_json::Value) -> String {
+    result
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn documentation_markdown_value(result: &serde_json::Value) -> String {
+    result
+        .get("documentation")
+        .and_then(|documentation| documentation.get("value"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn selection_range_chain(value: &serde_json::Value) -> Vec<(u64, u64, u64, u64)> {
@@ -5643,9 +5668,288 @@ class Repo {
         .unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let fixture_root = lsp_cases_fixture_root();
+    let root_uri = format!("file://{}", fixture_root.display());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let supported_path = fixture_root.join("src/PhpDoc/SupportedTags.php");
+    let supported_uri = format!("file://{}", supported_path.display());
+    let supported_content = fs::read_to_string(&supported_path).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&supported_uri, &supported_content))
+        .await
+        .unwrap();
+
+    let usage_path = fixture_root.join("src/PhpDoc/VirtualMembers.php");
+    let usage_uri = format!("file://{}", usage_path.display());
+    let usage_content = fs::read_to_string(&usage_path).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&usage_uri, &usage_content))
+        .await
+        .unwrap();
+
+    let class_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, &supported_uri, 18, 8))
+        .await
+        .unwrap();
+    let class_hover_result = extract_result(class_hover);
+    let class_hover_text = hover_markdown_value(&class_hover_result);
+    assert!(
+        class_hover_text.contains("Class-level PHPDoc")
+            && class_hover_text.contains("@property-read int $version")
+            && class_hover_text.contains("@method User findById()"),
+        "class hover should include PHPDoc summary and virtual members, got: {}",
+        class_hover_text
+    );
+
+    let method_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, &supported_uri, 35, 22))
+        .await
+        .unwrap();
+    let method_hover_result = extract_result(method_hover);
+    let method_hover_text = hover_markdown_value(&method_hover_result);
+    assert!(
+        method_hover_text.contains("**Throws:**")
+            && method_hover_text.contains("\\InvalidArgumentException")
+            && method_hover_text.contains("Deprecated")
+            && method_hover_text.contains("Use buildFromPayload() instead"),
+        "method hover should include @throws and @deprecated, got: {}",
+        method_hover_text
+    );
+
+    let completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(4, &usage_uri, 11, 23))
+        .await
+        .unwrap();
+    let completion_result = extract_result(completion);
+    let items = completion_items_from_result(&completion_result);
+    let label_item = items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("label"))
+        .cloned()
+        .expect("completion should include @property $label");
+    let find_by_id_item = items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("findById"))
+        .cloned()
+        .expect("completion should include @method findById");
+    assert!(
+        items.iter().any(|item| {
+            item.get("label").and_then(|value| value.as_str()) == Some("version")
+                && item.get("detail").and_then(|value| value.as_str()) == Some("@property-read int")
+        }),
+        "completion should include @property-read detail, got: {}",
+        completion_result
+    );
+    assert!(
+        items.iter().any(|item| {
+            item.get("label").and_then(|value| value.as_str()) == Some("dirty")
+                && item.get("detail").and_then(|value| value.as_str())
+                    == Some("@property-write bool")
+        }),
+        "completion should include @property-write detail, got: {}",
+        completion_result
+    );
+
+    let resolved_label = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_resolve_request(5, label_item))
+        .await
+        .unwrap();
+    let resolved_label_result = extract_result(resolved_label);
+    let resolved_label_doc = documentation_markdown_value(&resolved_label_result);
+    assert!(
+        resolved_label_doc.contains("@property string $label")
+            && resolved_label_doc.contains("Human-readable label"),
+        "completionItem/resolve should document virtual property, got: {}",
+        resolved_label_result
+    );
+
+    let resolved_method = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_resolve_request(6, find_by_id_item))
+        .await
+        .unwrap();
+    let resolved_method_result = extract_result(resolved_method);
+    let resolved_method_doc = documentation_markdown_value(&resolved_method_result);
+    assert!(
+        resolved_method_doc.contains("@method User findById()"),
+        "completionItem/resolve should document virtual method, got: {}",
+        resolved_method_result
+    );
+
+    let virtual_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(7, &usage_uri, 11, 25))
+        .await
+        .unwrap();
+    let virtual_hover_result = extract_result(virtual_hover);
+    let virtual_hover_text = hover_markdown_value(&virtual_hover_result);
+    assert!(
+        virtual_hover_text.contains("@property string $label")
+            && virtual_hover_text.contains("Human-readable label"),
+        "hover on virtual property should use class PHPDoc tag, got: {}",
+        virtual_hover_text
+    );
+
+    let property_definition = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(8, &usage_uri, 11, 25))
+        .await
+        .unwrap();
+    let property_definition_result = extract_result(property_definition);
+    assert_eq!(
+        property_definition_result
+            .get("uri")
+            .and_then(|value| value.as_str()),
+        Some(supported_uri.as_str()),
+        "virtual property definition should point to SupportedTags.php, got: {}",
+        property_definition_result
+    );
+    assert_eq!(
+        property_definition_result["range"]["start"]["line"].as_u64(),
+        Some(12),
+        "virtual property definition should point at @property tag name, got: {}",
+        property_definition_result
+    );
+
+    let method_definition = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(9, &usage_uri, 12, 24))
+        .await
+        .unwrap();
+    let method_definition_result = extract_result(method_definition);
+    assert_eq!(
+        method_definition_result
+            .get("uri")
+            .and_then(|value| value.as_str()),
+        Some(supported_uri.as_str()),
+        "virtual method definition should point to SupportedTags.php, got: {}",
+        method_definition_result
+    );
+    assert_eq!(
+        method_definition_result["range"]["start"]["line"].as_u64(),
+        Some(15),
+        "virtual method definition should point at @method tag name, got: {}",
+        method_definition_result
+    );
+
+    let prepare_rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(prepare_rename_request(10, &usage_uri, 11, 25))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(prepare_rename).is_null(),
+        "prepareRename should reject PHPDoc virtual members"
+    );
+
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(11, &usage_uri, 11, 25, "caption"))
+        .await
+        .unwrap();
+    let rename_error = extract_error_message(rename).unwrap_or_default();
+    assert!(
+        rename_error.contains("Cannot rename PHPDoc virtual members"),
+        "rename should explicitly reject PHPDoc virtual members, got: {}",
+        rename_error
+    );
+
+    let edge_path = fixture_root.join("src/PhpDoc/EdgeCases.php");
+    let edge_uri = format!("file://{}", edge_path.display());
+    let edge_content = fs::read_to_string(&edge_path).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&edge_uri, &edge_content))
+        .await
+        .unwrap();
+    let edge_diagnostics =
+        next_publish_diagnostics(&mut notifications, &edge_uri, Duration::from_secs(2)).await;
+    assert!(
+        edge_diagnostics
+            .get("diagnostics")
+            .and_then(|value| value.as_array())
+            .is_some(),
+        "PHPDoc edge-case fixture should publish diagnostics without crashing, got: {}",
+        edge_diagnostics
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Vendor resolution / cross-file type resolution tests (H-015)
 // ---------------------------------------------------------------------------
+
+/// Helper: resolve the path to `test-fixtures/lsp-cases` directory.
+fn lsp_cases_fixture_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../test-fixtures/lsp-cases")
+        .canonicalize()
+        .expect("test-fixtures/lsp-cases must exist")
+}
 
 /// Helper: resolve the path to `test-fixtures/vendor-resolve` directory.
 fn vendor_resolve_fixture_root() -> std::path::PathBuf {

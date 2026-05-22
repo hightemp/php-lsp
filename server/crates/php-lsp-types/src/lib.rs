@@ -64,6 +64,21 @@ pub struct SymbolModifiers {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TypeInfo {
     Simple(String),
+    Generic {
+        base: String,
+        args: Vec<TypeInfo>,
+    },
+    ArrayShape(Vec<ArrayShapeItem>),
+    Callable {
+        params: Vec<TypeInfo>,
+        return_type: Option<Box<TypeInfo>>,
+    },
+    ClassString(Option<Box<TypeInfo>>),
+    LiteralString(String),
+    LiteralInt(String),
+    LiteralFloat(String),
+    LiteralBool(bool),
+    LiteralNull,
     Union(Vec<TypeInfo>),
     Intersection(Vec<TypeInfo>),
     Nullable(Box<TypeInfo>),
@@ -79,6 +94,32 @@ impl std::fmt::Display for TypeInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TypeInfo::Simple(name) => write!(f, "{}", name),
+            TypeInfo::Generic { base, args } => {
+                let parts: Vec<String> = args.iter().map(|t| t.to_string()).collect();
+                write!(f, "{}<{}>", base, parts.join(", "))
+            }
+            TypeInfo::ArrayShape(items) => {
+                let parts: Vec<String> = items.iter().map(|item| item.to_string()).collect();
+                write!(f, "array{{{}}}", parts.join(", "))
+            }
+            TypeInfo::Callable {
+                params,
+                return_type,
+            } => {
+                let parts: Vec<String> = params.iter().map(|t| t.to_string()).collect();
+                write!(f, "callable({})", parts.join(", "))?;
+                if let Some(return_type) = return_type {
+                    write!(f, ": {}", return_type)?;
+                }
+                Ok(())
+            }
+            TypeInfo::ClassString(Some(inner)) => write!(f, "class-string<{}>", inner),
+            TypeInfo::ClassString(None) => write!(f, "class-string"),
+            TypeInfo::LiteralString(value) => write!(f, "{}", value),
+            TypeInfo::LiteralInt(value) => write!(f, "{}", value),
+            TypeInfo::LiteralFloat(value) => write!(f, "{}", value),
+            TypeInfo::LiteralBool(value) => write!(f, "{}", value),
+            TypeInfo::LiteralNull => write!(f, "null"),
             TypeInfo::Union(types) => {
                 let parts: Vec<String> = types.iter().map(|t| t.to_string()).collect();
                 write!(f, "{}", parts.join("|"))
@@ -94,6 +135,28 @@ impl std::fmt::Display for TypeInfo {
             TypeInfo::Self_ => write!(f, "self"),
             TypeInfo::Static_ => write!(f, "static"),
             TypeInfo::Parent_ => write!(f, "parent"),
+        }
+    }
+}
+
+/// One item inside an array shape PHPDoc type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ArrayShapeItem {
+    pub key: Option<String>,
+    pub optional: bool,
+    pub value: TypeInfo,
+}
+
+impl std::fmt::Display for ArrayShapeItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(ref key) = self.key {
+            if self.optional {
+                write!(f, "{}?: {}", key, self.value)
+            } else {
+                write!(f, "{}: {}", key, self.value)
+            }
+        } else {
+            write!(f, "{}", self.value)
         }
     }
 }
@@ -273,6 +336,29 @@ mod tests {
         assert_eq!(
             TypeInfo::Nullable(Box::new(TypeInfo::Simple("Foo".into()))).to_string(),
             "?Foo"
+        );
+        assert_eq!(
+            TypeInfo::Generic {
+                base: "array".into(),
+                args: vec![
+                    TypeInfo::Simple("int".into()),
+                    TypeInfo::Simple("User".into())
+                ],
+            }
+            .to_string(),
+            "array<int, User>"
+        );
+        assert_eq!(
+            TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple("User".into())))).to_string(),
+            "class-string<User>"
+        );
+        assert_eq!(
+            TypeInfo::Callable {
+                params: vec![TypeInfo::Simple("A".into())],
+                return_type: Some(Box::new(TypeInfo::Simple("B".into()))),
+            }
+            .to_string(),
+            "callable(A): B"
         );
     }
 

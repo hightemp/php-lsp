@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 5;
+pub const CACHE_SCHEMA_VERSION: u32 = 6;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

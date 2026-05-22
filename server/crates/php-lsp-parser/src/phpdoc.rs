@@ -4,7 +4,8 @@
 //! Supports: @param, @return, @var, @throws, @deprecated, @property, @method.
 
 use php_lsp_types::{
-    PhpDoc, PhpDocMethod, PhpDocParam, PhpDocProperty, PhpDocPropertyAccess, TypeInfo,
+    ArrayShapeItem, PhpDoc, PhpDocMethod, PhpDocParam, PhpDocProperty, PhpDocPropertyAccess,
+    TypeInfo,
 };
 
 /// Parse a PHPDoc comment string into structured data.
@@ -423,8 +424,8 @@ fn find_phpdoc_variable_token(rest: &str) -> Option<(usize, usize)> {
 fn parse_type_string(s: &str) -> TypeInfo {
     let s = s.trim();
 
-    if is_callable_signature(s) {
-        return TypeInfo::Simple(s.to_string());
+    if let Some(callable) = parse_callable_signature(s) {
+        return callable;
     }
 
     if let Some(parts) = split_top_level(s, '|') {
@@ -445,6 +446,18 @@ fn parse_type_string(s: &str) -> TypeInfo {
         return parse_type_string(inner);
     }
 
+    if let Some(shape) = parse_array_shape_type(s) {
+        return shape;
+    }
+
+    if let Some(generic) = parse_generic_type(s) {
+        return generic;
+    }
+
+    if let Some(literal) = parse_literal_type(s) {
+        return literal;
+    }
+
     match s.to_lowercase().as_str() {
         "void" => TypeInfo::Void,
         "never" => TypeInfo::Never,
@@ -452,8 +465,222 @@ fn parse_type_string(s: &str) -> TypeInfo {
         "self" => TypeInfo::Self_,
         "static" => TypeInfo::Static_,
         "parent" => TypeInfo::Parent_,
+        "class-string" => TypeInfo::ClassString(None),
         _ => TypeInfo::Simple(s.to_string()),
     }
+}
+
+fn parse_generic_type(s: &str) -> Option<TypeInfo> {
+    let (base, args) = split_generic_type(s)?;
+    let parsed_args: Vec<TypeInfo> = split_top_level(args, ',')
+        .unwrap_or_else(|| vec![args.trim()])
+        .into_iter()
+        .filter(|arg| !arg.trim().is_empty())
+        .map(parse_type_string)
+        .collect();
+
+    if parsed_args.is_empty() {
+        return None;
+    }
+
+    if base.eq_ignore_ascii_case("class-string") {
+        return Some(TypeInfo::ClassString(
+            parsed_args.into_iter().next().map(Box::new),
+        ));
+    }
+
+    Some(TypeInfo::Generic {
+        base: base.to_string(),
+        args: parsed_args,
+    })
+}
+
+fn split_generic_type(s: &str) -> Option<(&str, &str)> {
+    let open = find_top_level_char(s, '<')?;
+    if !s.ends_with('>') {
+        return None;
+    }
+
+    let base = s[..open].trim();
+    if base.is_empty() {
+        return None;
+    }
+
+    let mut angle_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in s[open..].char_indices() {
+        let idx = open + idx;
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => {
+                angle_depth = angle_depth.saturating_sub(1);
+                if angle_depth == 0 && idx + ch.len_utf8() != s.len() {
+                    return None;
+                }
+            }
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    if angle_depth == 0 && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+        Some((base, s[open + 1..s.len() - 1].trim()))
+    } else {
+        None
+    }
+}
+
+fn parse_array_shape_type(s: &str) -> Option<TypeInfo> {
+    let body = s
+        .strip_prefix("array{")
+        .and_then(|body| body.strip_suffix('}'))?;
+    let items = split_top_level(body, ',')
+        .unwrap_or_else(|| vec![body.trim()])
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .map(parse_array_shape_item)
+        .collect::<Vec<_>>();
+
+    Some(TypeInfo::ArrayShape(items))
+}
+
+fn parse_array_shape_item(s: &str) -> ArrayShapeItem {
+    let s = s.trim();
+    if let Some(colon) = find_top_level_char(s, ':') {
+        let mut key = s[..colon].trim().to_string();
+        let optional = key.ends_with('?');
+        if optional {
+            key.pop();
+            key = key.trim_end().to_string();
+        }
+        ArrayShapeItem {
+            key: (!key.is_empty()).then_some(key),
+            optional,
+            value: parse_type_string(&s[colon + 1..]),
+        }
+    } else {
+        ArrayShapeItem {
+            key: None,
+            optional: false,
+            value: parse_type_string(s),
+        }
+    }
+}
+
+fn parse_callable_signature(s: &str) -> Option<TypeInfo> {
+    let lower = s.to_ascii_lowercase();
+    let prefix_len = if lower.starts_with("callable") {
+        "callable".len()
+    } else if lower.starts_with("\\closure") {
+        "\\closure".len()
+    } else if lower.starts_with("closure") {
+        "closure".len()
+    } else {
+        return None;
+    };
+
+    let after_prefix = &s[prefix_len..];
+    let leading_ws = after_prefix
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or(after_prefix.len());
+    let open_paren = prefix_len + leading_ws;
+    if !s[open_paren..].starts_with('(') {
+        return None;
+    }
+
+    let close_paren = find_matching_paren(s, open_paren)?;
+    let after_paren = s[close_paren + 1..].trim_start();
+    let return_type = after_paren
+        .strip_prefix(':')
+        .map(str::trim)
+        .filter(|return_type| !return_type.is_empty())
+        .map(parse_type_string)
+        .map(Box::new);
+    if return_type.is_none() && !after_paren.is_empty() {
+        return None;
+    }
+
+    let params_body = &s[open_paren + 1..close_paren];
+    let params = split_top_level(params_body, ',')
+        .unwrap_or_else(|| {
+            if params_body.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![params_body.trim()]
+            }
+        })
+        .into_iter()
+        .filter_map(parse_callable_param_type)
+        .collect();
+
+    Some(TypeInfo::Callable {
+        params,
+        return_type,
+    })
+}
+
+fn parse_callable_param_type(s: &str) -> Option<TypeInfo> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some((name_start, _)) = find_phpdoc_variable_token(s) {
+        let type_part = s[..name_start].trim();
+        if !type_part.is_empty() {
+            return Some(parse_type_string(type_part));
+        }
+    }
+    Some(parse_type_string(s))
+}
+
+fn parse_literal_type(s: &str) -> Option<TypeInfo> {
+    let lower = s.to_ascii_lowercase();
+    match lower.as_str() {
+        "true" => return Some(TypeInfo::LiteralBool(true)),
+        "false" => return Some(TypeInfo::LiteralBool(false)),
+        "null" => return Some(TypeInfo::LiteralNull),
+        _ => {}
+    }
+
+    if is_quoted_literal(s) {
+        return Some(TypeInfo::LiteralString(s.to_string()));
+    }
+    if is_int_literal(s) {
+        return Some(TypeInfo::LiteralInt(s.to_string()));
+    }
+    if is_float_literal(s) {
+        return Some(TypeInfo::LiteralFloat(s.to_string()));
+    }
+
+    None
 }
 
 fn split_top_level(s: &str, delimiter: char) -> Option<Vec<&str>> {
@@ -521,6 +748,52 @@ fn split_top_level(s: &str, delimiter: char) -> Option<Vec<&str>> {
     Some(parts)
 }
 
+fn find_top_level_char(s: &str, needle: char) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in s.char_indices() {
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        let nested = paren_depth > 0 || angle_depth > 0 || bracket_depth > 0 || brace_depth > 0;
+        if ch == needle && !nested {
+            return Some(idx);
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn strip_enclosing_parentheses(s: &str) -> Option<&str> {
     if !s.starts_with('(') || !s.ends_with(')') {
         return None;
@@ -563,36 +836,6 @@ fn strip_enclosing_parentheses(s: &str) -> Option<&str> {
     }
 
     None
-}
-
-fn is_callable_signature(s: &str) -> bool {
-    let lower = s.to_ascii_lowercase();
-    let prefix_len = if lower.starts_with("callable") {
-        "callable".len()
-    } else if lower.starts_with("\\closure") {
-        "\\closure".len()
-    } else if lower.starts_with("closure") {
-        "closure".len()
-    } else {
-        return false;
-    };
-
-    let after_prefix = &s[prefix_len..];
-    let leading_ws = after_prefix
-        .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
-        .map(|(idx, _)| idx)
-        .unwrap_or(after_prefix.len());
-    let open_paren = prefix_len + leading_ws;
-    if !s[open_paren..].starts_with('(') {
-        return false;
-    }
-
-    let Some(close_paren) = find_matching_paren(s, open_paren) else {
-        return false;
-    };
-
-    s[close_paren + 1..].trim_start().starts_with(':')
 }
 
 fn find_matching_paren(s: &str, open_paren: usize) -> Option<usize> {
@@ -640,6 +883,37 @@ fn next_non_whitespace(s: &str, start: usize) -> Option<char> {
 
 fn is_php_identifier_char(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric() || !ch.is_ascii()
+}
+
+fn is_quoted_literal(s: &str) -> bool {
+    if s.len() < 2 {
+        return false;
+    }
+    (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"'))
+}
+
+fn is_int_literal(s: &str) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_float_literal(s: &str) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    if digits.is_empty() || !digits.contains('.') {
+        return false;
+    }
+    let mut dot_seen = false;
+    let mut digit_seen = false;
+    for ch in digits.chars() {
+        if ch == '.' && !dot_seen {
+            dot_seen = true;
+        } else if ch.is_ascii_digit() {
+            digit_seen = true;
+        } else {
+            return false;
+        }
+    }
+    dot_seen && digit_seen
 }
 
 #[cfg(test)]
@@ -756,9 +1030,16 @@ mod tests {
         let doc = parse_phpdoc("/**\n * @param array<int, User> $users The users\n */");
         assert_eq!(doc.params.len(), 1);
         assert_eq!(doc.params[0].name, "users");
+        let Some(TypeInfo::Generic { base, args }) = &doc.params[0].type_info else {
+            panic!("expected generic type");
+        };
+        assert_eq!(base, "array");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], TypeInfo::Simple("int".to_string()));
+        assert_eq!(args[1], TypeInfo::Simple("User".to_string()));
         assert_eq!(
-            doc.params[0].type_info,
-            Some(TypeInfo::Simple("array<int, User>".to_string()))
+            doc.params[0].type_info.as_ref().unwrap().to_string(),
+            "array<int, User>"
         );
         assert_eq!(doc.params[0].description.as_deref(), Some("The users"));
     }
@@ -767,11 +1048,13 @@ mod tests {
     fn test_parse_nested_generic_type_with_spaces() {
         let doc =
             parse_phpdoc("/**\n * @param array<int, array<string, User>> $users Nested users\n */");
-        assert_eq!(
+        assert!(matches!(
             doc.params[0].type_info,
-            Some(TypeInfo::Simple(
-                "array<int, array<string, User>>".to_string()
-            ))
+            Some(TypeInfo::Generic { .. })
+        ));
+        assert_eq!(
+            doc.params[0].type_info.as_ref().unwrap().to_string(),
+            "array<int, array<string, User>>"
         );
         assert_eq!(doc.params[0].description.as_deref(), Some("Nested users"));
     }
@@ -781,7 +1064,10 @@ mod tests {
         let doc = parse_phpdoc("/**\n * @return list<User> Users\n */");
         assert_eq!(
             doc.return_type,
-            Some(TypeInfo::Simple("list<User>".to_string()))
+            Some(TypeInfo::Generic {
+                base: "list".to_string(),
+                args: vec![TypeInfo::Simple("User".to_string())],
+            })
         );
     }
 
@@ -790,7 +1076,9 @@ mod tests {
         let doc = parse_phpdoc("/** @var class-string<T> $class */");
         assert_eq!(
             doc.var_type,
-            Some(TypeInfo::Simple("class-string<T>".to_string()))
+            Some(TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple(
+                "T".to_string()
+            )))))
         );
     }
 
@@ -802,7 +1090,7 @@ mod tests {
         };
         assert_eq!(parts.len(), 2);
         assert!(matches!(parts[0], TypeInfo::Intersection(_)));
-        assert_eq!(parts[1], TypeInfo::Simple("null".to_string()));
+        assert_eq!(parts[1], TypeInfo::LiteralNull);
     }
 
     #[test]
@@ -810,7 +1098,10 @@ mod tests {
         let doc = parse_phpdoc("/**\n * @return callable(A): B Handler\n */");
         assert_eq!(
             doc.return_type,
-            Some(TypeInfo::Simple("callable(A): B".to_string()))
+            Some(TypeInfo::Callable {
+                params: vec![TypeInfo::Simple("A".to_string())],
+                return_type: Some(Box::new(TypeInfo::Simple("B".to_string()))),
+            })
         );
     }
 
@@ -821,7 +1112,10 @@ mod tests {
         assert_eq!(doc.params[0].name, "callback");
         assert_eq!(
             doc.params[0].type_info,
-            Some(TypeInfo::Simple("callable($value): string".to_string()))
+            Some(TypeInfo::Callable {
+                params: vec![TypeInfo::Simple("$value".to_string())],
+                return_type: Some(Box::new(TypeInfo::Simple("string".to_string()))),
+            })
         );
         assert_eq!(doc.params[0].description.as_deref(), Some("Callback"));
     }
@@ -833,8 +1127,29 @@ mod tests {
         assert_eq!(doc.methods[0].name, "handle");
         assert_eq!(
             doc.methods[0].return_type,
-            Some(TypeInfo::Simple("callable(A): B".to_string()))
+            Some(TypeInfo::Callable {
+                params: vec![TypeInfo::Simple("A".to_string())],
+                return_type: Some(Box::new(TypeInfo::Simple("B".to_string()))),
+            })
         );
+    }
+
+    #[test]
+    fn test_parse_array_shape_and_literal_types() {
+        let doc = parse_phpdoc(
+            "/**\n * @return array{status: 'ok', count?: 1, active: true, ratio: 1.5}\n */",
+        );
+        let Some(TypeInfo::ArrayShape(items)) = doc.return_type else {
+            panic!("expected array shape");
+        };
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].key.as_deref(), Some("status"));
+        assert_eq!(items[0].value, TypeInfo::LiteralString("'ok'".to_string()));
+        assert_eq!(items[1].key.as_deref(), Some("count"));
+        assert!(items[1].optional);
+        assert_eq!(items[1].value, TypeInfo::LiteralInt("1".to_string()));
+        assert_eq!(items[2].value, TypeInfo::LiteralBool(true));
+        assert_eq!(items[3].value, TypeInfo::LiteralFloat("1.5".to_string()));
     }
 
     #[test]

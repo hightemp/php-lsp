@@ -41,8 +41,20 @@ This fixture set is designed for manual and automated checks of `php-lsp`.
   namespace tree with const/function/interface/trait/enum/class + members.
 - `src/PhpDoc/SupportedTags.php`:
   supported phpDoc tags coverage (`@param`, `@return`, `@var`, `@throws`, `@deprecated`, `@property*`, `@method`) on class/method/property/function.
+- `src/PhpDoc/VirtualMembers.php`:
+  usage sites for class-level PHPDoc virtual properties/methods, used by e2e completion, hover, definition, and rename-guard checks.
 - `src/PhpDoc/EdgeCases.php`:
   unsupported/malformed tags that should be ignored safely, bare `@deprecated`, multiline summary, inline `@var`, nullable and intersection type examples.
+
+## PHPDoc Behavior Matrix
+- Parser: `@param`, `@return`, `@var`, `@throws`, `@deprecated`, `@property`, `@property-read`, `@property-write`, `@method`.
+- Type expressions: nested generics, nullable, union/intersection, parenthesized type groups, callable return syntax are preserved best-effort.
+- Hover: summaries, params, return, throws, var, deprecated, class-level virtual properties/methods.
+- Completion: `$obj->` includes real members plus inherited PHPDoc virtual properties/methods.
+- Completion resolve: virtual members return PHPDoc markdown from their declaring class.
+- Definition: unresolved PHPDoc virtual members jump to the declaring doc-comment tag name.
+- Rename: PHPDoc virtual members are intentionally rejected instead of editing doc-comments implicitly.
+- Diagnostics: malformed PHPDoc tags are ignored safely and must not crash diagnostics.
 
 ## Notes
 - Some files are intentionally invalid while typing (especially completion fixtures).

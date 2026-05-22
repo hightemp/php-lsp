@@ -1434,7 +1434,24 @@ fn resolve_phpdoc_var_type(
             find_parent_class_fqn(context_node, source, file_symbols)
         }
         TypeInfo::Parent_ => None,
-        TypeInfo::Void | TypeInfo::Never | TypeInfo::Mixed => None,
+        TypeInfo::Generic { base, .. } => {
+            if is_builtin_non_object_type(base) {
+                None
+            } else {
+                Some(resolve_class_name(base, file_symbols))
+            }
+        }
+        TypeInfo::ClassString(_)
+        | TypeInfo::ArrayShape(_)
+        | TypeInfo::Callable { .. }
+        | TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed => None,
     }
 }
 

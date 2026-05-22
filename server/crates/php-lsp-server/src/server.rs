@@ -2583,6 +2583,31 @@ fn first_type_definition_fqn(
                 .iter()
                 .find_map(|ty| first_type_definition_fqn(ty, file_symbols, current_class_fqn))
         }
+        php_lsp_types::TypeInfo::Generic { base, args } => {
+            if !is_builtin_type_name(base) {
+                Some(resolve_class_name_pub(base, file_symbols))
+            } else {
+                args.iter()
+                    .find_map(|ty| first_type_definition_fqn(ty, file_symbols, current_class_fqn))
+            }
+        }
+        php_lsp_types::TypeInfo::ClassString(Some(inner)) => {
+            first_type_definition_fqn(inner, file_symbols, current_class_fqn)
+        }
+        php_lsp_types::TypeInfo::ArrayShape(items) => items.iter().find_map(|item| {
+            first_type_definition_fqn(&item.value, file_symbols, current_class_fqn)
+        }),
+        php_lsp_types::TypeInfo::Callable {
+            params,
+            return_type,
+        } => return_type
+            .as_deref()
+            .and_then(|ty| first_type_definition_fqn(ty, file_symbols, current_class_fqn))
+            .or_else(|| {
+                params
+                    .iter()
+                    .find_map(|ty| first_type_definition_fqn(ty, file_symbols, current_class_fqn))
+            }),
         php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
             current_class_fqn.map(str::to_string)
         }
@@ -2595,7 +2620,13 @@ fn first_type_definition_fqn(
         }),
         php_lsp_types::TypeInfo::Void
         | php_lsp_types::TypeInfo::Never
-        | php_lsp_types::TypeInfo::Mixed => None,
+        | php_lsp_types::TypeInfo::Mixed
+        | php_lsp_types::TypeInfo::ClassString(None)
+        | php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull => None,
     }
 }
 
@@ -3044,6 +3075,21 @@ fn return_type_hint_is_supported(
         php_lsp_types::TypeInfo::Mixed => php_version.at_least(8, 0),
         php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Parent_ => true,
         php_lsp_types::TypeInfo::Static_ => php_version.at_least(8, 0),
+        php_lsp_types::TypeInfo::LiteralBool(value) => simple_return_type_hint_is_supported(
+            if *value { "true" } else { "false" },
+            php_version,
+            in_union,
+        ),
+        php_lsp_types::TypeInfo::LiteralNull => {
+            simple_return_type_hint_is_supported("null", php_version, in_union)
+        }
+        php_lsp_types::TypeInfo::Generic { .. }
+        | php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::Callable { .. }
+        | php_lsp_types::TypeInfo::ClassString(_)
+        | php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_) => false,
     }
 }
 
@@ -6254,6 +6300,19 @@ fn type_info_accepts_inferred_type(
         php_lsp_types::TypeInfo::Simple(name) => {
             simple_type_accepts_inferred_type(name, actual, file_symbols, index)
         }
+        php_lsp_types::TypeInfo::Generic { base, .. } => {
+            simple_type_accepts_inferred_type(base, actual, file_symbols, index)
+        }
+        php_lsp_types::TypeInfo::ArrayShape(_) => actual.comparable == "array",
+        php_lsp_types::TypeInfo::Callable { .. } => actual.comparable == "callable",
+        php_lsp_types::TypeInfo::ClassString(_) => actual.comparable == "string",
+        php_lsp_types::TypeInfo::LiteralString(value)
+        | php_lsp_types::TypeInfo::LiteralInt(value)
+        | php_lsp_types::TypeInfo::LiteralFloat(value) => actual.comparable == value.as_str(),
+        php_lsp_types::TypeInfo::LiteralBool(value) => {
+            actual.comparable == if *value { "true" } else { "false" }
+        }
+        php_lsp_types::TypeInfo::LiteralNull => actual.comparable == "null",
         php_lsp_types::TypeInfo::Self_
         | php_lsp_types::TypeInfo::Static_
         | php_lsp_types::TypeInfo::Parent_ => true,
@@ -6553,6 +6612,25 @@ fn normalized_type_info_for_override(
             "?{}",
             normalized_type_info_for_override(inner, file_symbols, owner_fqn)
         ),
+        php_lsp_types::TypeInfo::Generic { base, args } => {
+            let base = normalized_simple_type_for_override(base, file_symbols, owner_fqn);
+            let args = args
+                .iter()
+                .map(|type_info| {
+                    normalized_type_info_for_override(type_info, file_symbols, owner_fqn)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}<{}>", base, args)
+        }
+        php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::Callable { .. }
+        | php_lsp_types::TypeInfo::ClassString(_)
+        | php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull => type_info.to_string(),
         php_lsp_types::TypeInfo::Void => "void".to_string(),
         php_lsp_types::TypeInfo::Never => "never".to_string(),
         php_lsp_types::TypeInfo::Mixed => "mixed".to_string(),
@@ -6608,6 +6686,11 @@ fn simple_class_fqn_for_override(
         php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
             owner_fqn.map(|owner| owner.trim_start_matches('\\').to_string())
         }
+        php_lsp_types::TypeInfo::Generic { base, .. } if !is_builtin_type_name(base) => Some(
+            resolve_class_name_pub(base, file_symbols)
+                .trim_start_matches('\\')
+                .to_string(),
+        ),
         _ => None,
     }
 }
@@ -7149,34 +7232,62 @@ fn symbol_return_type_fqn(
 ) -> Option<String> {
     let sig = sym.signature.as_ref()?;
     let ret = sig.return_type.as_ref()?;
-    let type_str = ret.to_string();
-    tracing::debug!(
-        "resolve_member_type: {} -> return type '{}'",
-        sym.fqn,
-        type_str
-    );
+    tracing::debug!("resolve_member_type: {} -> return type '{}'", sym.fqn, ret);
 
-    if type_str.is_empty() || type_str == "mixed" {
+    type_info_fqn_from_index(index, owner_fqn, &sym.uri, ret)
+}
+
+fn type_info_fqn_from_index(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> Option<String> {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => simple_type_fqn_from_index(index, uri, name),
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            type_info_fqn_from_index(index, owner_fqn, uri, inner)
+        }
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
+            Some(owner_fqn.to_string())
+        }
+        php_lsp_types::TypeInfo::Generic { base, .. } if !is_builtin_type_name(base) => {
+            simple_type_fqn_from_index(index, uri, base)
+        }
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            types
+                .iter()
+                .find_map(|type_info| type_info_fqn_from_index(index, owner_fqn, uri, type_info))
+        }
+        php_lsp_types::TypeInfo::ClassString(Some(inner)) => {
+            type_info_fqn_from_index(index, owner_fqn, uri, inner)
+        }
+        _ => None,
+    }
+}
+
+fn simple_type_fqn_from_index(
+    index: &WorkspaceIndex,
+    uri: &str,
+    type_name: &str,
+) -> Option<String> {
+    let type_name = type_name.trim();
+    if type_name.is_empty() || type_name == "mixed" || is_builtin_type_name(type_name) {
         return None;
     }
-
-    let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
-    if base_type.contains('|') || base_type.contains('&') {
+    if type_name.contains(['|', '&', '<', '>', '{', '}', '(', ')', ',', ' ']) {
         return None;
     }
-    if base_type == "self" || base_type == "static" || base_type == "$this" {
-        return Some(owner_fqn.to_string());
-    }
-    if base_type.contains('\\') {
-        return Some(base_type.trim_start_matches('\\').to_string());
+    if type_name.contains('\\') {
+        return Some(type_name.trim_start_matches('\\').to_string());
     }
 
-    if let Some(file_syms) = index.file_symbols.get(&sym.uri) {
+    if let Some(file_syms) = index.file_symbols.get(uri) {
         Some(php_lsp_parser::resolve::resolve_class_name(
-            base_type, &file_syms,
+            type_name, &file_syms,
         ))
     } else {
-        Some(base_type.to_string())
+        Some(type_name.to_string())
     }
 }
 
