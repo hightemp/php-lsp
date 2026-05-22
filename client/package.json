@@ -134,10 +134,120 @@
           "enumDescriptions": [
             "No diagnostics",
             "Only syntax errors from parser",
-            "Syntax errors + unknown class/function detection"
+            "Syntax errors + built-in php-lsp semantic diagnostics"
           ],
           "scope": "resource",
           "description": "Diagnostics mode"
+        },
+        "phpLsp.diagnostics.severity": {
+          "type": "object",
+          "default": {
+            "unknownSymbols": "warning",
+            "unused": "warning",
+            "duplicateSymbols": "warning",
+            "members": "warning",
+            "typeCompatibility": "warning",
+            "overrideSignatures": "warning",
+            "phpVersion": "warning"
+          },
+          "properties": {
+            "unknownSymbols": {
+              "type": "string",
+              "enum": [
+                "off",
+                "error",
+                "warning",
+                "information",
+                "hint"
+              ],
+              "default": "warning",
+              "description": "Severity for unresolved classes, functions, imports, and variables."
+            },
+            "unused": {
+              "type": "string",
+              "enum": [
+                "off",
+                "error",
+                "warning",
+                "information",
+                "hint"
+              ],
+              "default": "warning",
+              "description": "Severity for unused imports, variables, and parameters."
+            },
+            "duplicateSymbols": {
+              "type": "string",
+              "enum": [
+                "off",
+                "error",
+                "warning",
+                "information",
+                "hint"
+              ],
+              "default": "warning",
+              "description": "Severity for duplicate symbol diagnostics."
+            },
+            "members": {
+              "type": "string",
+              "enum": [
+                "off",
+                "error",
+                "warning",
+                "information",
+                "hint"
+              ],
+              "default": "warning",
+              "description": "Severity for unknown member, static/instance misuse, and visibility diagnostics."
+            },
+            "typeCompatibility": {
+              "type": "string",
+              "enum": [
+                "off",
+                "error",
+                "warning",
+                "information",
+                "hint"
+              ],
+              "default": "warning",
+              "description": "Severity for argument count and type compatibility diagnostics."
+            },
+            "overrideSignatures": {
+              "type": "string",
+              "enum": [
+                "off",
+                "error",
+                "warning",
+                "information",
+                "hint"
+              ],
+              "default": "warning",
+              "description": "Severity for incompatible override signature diagnostics."
+            },
+            "phpVersion": {
+              "type": "string",
+              "enum": [
+                "off",
+                "error",
+                "warning",
+                "information",
+                "hint"
+              ],
+              "default": "warning",
+              "description": "Severity for PHP-version-specific diagnostics."
+            }
+          },
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "off",
+              "error",
+              "warning",
+              "information",
+              "hint"
+            ]
+          },
+          "scope": "resource",
+          "description": "Per-category severity for php-lsp diagnostics. Use off to suppress a noisy category without disabling all diagnostics."
         },
         "phpLsp.formatting.provider": {
           "type": "string",

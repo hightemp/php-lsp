@@ -25,6 +25,8 @@ This fixture set is designed for manual and automated checks of `php-lsp`.
   constructor arity errors (too few/too many) and variadic no-false-positive.
 - `src/Diagnostics/BuiltinNoFalsePositive.php`:
   built-in classes/functions and special type names that should not be reported.
+- `src/Diagnostics/FrameworkNoFalsePositive.php`:
+  Symfony controller helpers and Laravel Eloquent dynamic members that should not produce framework-heavy false positives.
 - `src/Syntax/MissingParen.php`, `src/Syntax/MissingExpression.php`, `src/Syntax/BrokenMixedPhpHtml.php`:
   parser recovery and multiple syntax diagnostic forms.
 - `src/Lsp/HoverDefinition.php`:

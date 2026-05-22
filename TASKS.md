@@ -826,10 +826,15 @@
   - Regression: parser tests для foreach generic value, generic method return array access, array shape access, completion-style `$users[0]`, positive/negative `instanceof`, property `@var`; completion context tests для array access object expr.
   - Validation: `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **PR-042** Снизить false positives diagnostics на framework-heavy коде
+- [x] **PR-042** Снизить false positives diagnostics на framework-heavy коде *(completed 2026-05-22)*
   - Добавить regression corpus для Symfony/Laravel/PHPUnit patterns без project-specific hardcode.
   - Пересмотреть suppressions: они должны опираться на типы/наследование/known library metadata, а не имена конкретного проекта.
   - Ввести severity/category controls для noisy diagnostics.
+  - Implemented: `phpLsp.diagnostics.severity` с категориями `unknownSymbols`, `unused`, `duplicateSymbols`, `members`, `typeCompatibility`, `overrideSignatures`, `phpVersion`; значения `off/error/warning/information/hint` применяются через initializationOptions и `didChangeConfiguration`.
+  - Implemented: внутренние `php-lsp` diagnostics теперь получают category/code metadata и могут быть выключены/понижены по категории без отключения всего semantic mode.
+  - Implemented: framework suppressions опираются на наследование/known library metadata: Symfony `AbstractController` helpers, Laravel Eloquent Model/Builder dynamic members, Doctrine repository descendants, классы с неиндексированным ancestor.
+  - Regression: добавлен fixture `test-fixtures/lsp-cases/src/Diagnostics/FrameworkNoFalsePositive.php` и server tests для Symfony/Laravel patterns плюс severity controls.
+  - Validation: `cargo fmt --all --check`, targeted `cargo test -p php-lsp-server compute_diagnostics_`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `npm run lint`, `npm run build`, `git diff --check`.
 
 - [ ] **PR-043** Закрыть LSP polish gaps
   - Добавить `textDocument/semanticTokens/range` или явно документировать отсутствие.

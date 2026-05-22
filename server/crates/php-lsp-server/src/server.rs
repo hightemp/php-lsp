@@ -22,8 +22,10 @@ use php_lsp_parser::resolve::{
 use php_lsp_parser::return_type::{
     find_missing_return_type_candidates, MissingReturnTypeCandidate,
 };
-use php_lsp_parser::semantic::collect_aliased_class_fqns;
-use php_lsp_parser::semantic::extract_semantic_diagnostics;
+use php_lsp_parser::semantic::{
+    collect_aliased_class_fqns, extract_semantic_diagnostics, SemanticDiagnostic,
+    SemanticDiagnosticKind,
+};
 use php_lsp_parser::semantic_tokens::{
     extract_semantic_tokens, SEMANTIC_TOKEN_MODIFIERS, SEMANTIC_TOKEN_TYPES,
 };
@@ -293,6 +295,154 @@ impl DiagnosticsMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticCategory {
+    UnknownSymbols,
+    Unused,
+    DuplicateSymbols,
+    Members,
+    TypeCompatibility,
+    OverrideSignatures,
+    PhpVersion,
+}
+
+impl DiagnosticCategory {
+    fn code(self) -> &'static str {
+        match self {
+            Self::UnknownSymbols => "php-lsp.unknownSymbols",
+            Self::Unused => "php-lsp.unused",
+            Self::DuplicateSymbols => "php-lsp.duplicateSymbols",
+            Self::Members => "php-lsp.members",
+            Self::TypeCompatibility => "php-lsp.typeCompatibility",
+            Self::OverrideSignatures => "php-lsp.overrideSignatures",
+            Self::PhpVersion => "php-lsp.phpVersion",
+        }
+    }
+
+    fn parse(key: &str) -> Option<Self> {
+        match key
+            .chars()
+            .filter(|ch| *ch != '-' && *ch != '_' && *ch != '.')
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+            .as_str()
+        {
+            "unknownsymbols" | "symbols" => Some(Self::UnknownSymbols),
+            "unused" | "unusedcode" => Some(Self::Unused),
+            "duplicatesymbols" | "duplicates" => Some(Self::DuplicateSymbols),
+            "members" | "memberaccess" => Some(Self::Members),
+            "typecompatibility" | "types" => Some(Self::TypeCompatibility),
+            "overridesignatures" | "overrides" => Some(Self::OverrideSignatures),
+            "phpversion" | "version" => Some(Self::PhpVersion),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiagnosticLevel(Option<DiagnosticSeverity>);
+
+impl DiagnosticLevel {
+    fn parse(value: &serde_json::Value) -> Option<Self> {
+        let raw = value.as_str()?.trim().to_ascii_lowercase();
+        match raw.as_str() {
+            "off" | "none" | "disabled" => Some(Self(None)),
+            "error" => Some(Self(Some(DiagnosticSeverity::ERROR))),
+            "warning" | "warn" => Some(Self(Some(DiagnosticSeverity::WARNING))),
+            "information" | "info" => Some(Self(Some(DiagnosticSeverity::INFORMATION))),
+            "hint" => Some(Self(Some(DiagnosticSeverity::HINT))),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiagnosticSeverityConfig {
+    unknown_symbols: DiagnosticLevel,
+    unused: DiagnosticLevel,
+    duplicate_symbols: DiagnosticLevel,
+    members: DiagnosticLevel,
+    type_compatibility: DiagnosticLevel,
+    override_signatures: DiagnosticLevel,
+    php_version: DiagnosticLevel,
+}
+
+impl Default for DiagnosticSeverityConfig {
+    fn default() -> Self {
+        let warning = DiagnosticLevel(Some(DiagnosticSeverity::WARNING));
+        Self {
+            unknown_symbols: warning,
+            unused: warning,
+            duplicate_symbols: warning,
+            members: warning,
+            type_compatibility: warning,
+            override_signatures: warning,
+            php_version: warning,
+        }
+    }
+}
+
+impl DiagnosticSeverityConfig {
+    fn parse(value: &serde_json::Value) -> Option<Self> {
+        if let Some(level) = DiagnosticLevel::parse(value) {
+            return Some(Self::all(level));
+        }
+
+        let object = value.as_object()?;
+        let mut config = Self::default();
+        for (key, value) in object {
+            let Some(category) = DiagnosticCategory::parse(key) else {
+                continue;
+            };
+            let Some(level) = DiagnosticLevel::parse(value) else {
+                continue;
+            };
+            config.set(category, level);
+        }
+        Some(config)
+    }
+
+    fn all(level: DiagnosticLevel) -> Self {
+        Self {
+            unknown_symbols: level,
+            unused: level,
+            duplicate_symbols: level,
+            members: level,
+            type_compatibility: level,
+            override_signatures: level,
+            php_version: level,
+        }
+    }
+
+    fn set(&mut self, category: DiagnosticCategory, level: DiagnosticLevel) {
+        match category {
+            DiagnosticCategory::UnknownSymbols => self.unknown_symbols = level,
+            DiagnosticCategory::Unused => self.unused = level,
+            DiagnosticCategory::DuplicateSymbols => self.duplicate_symbols = level,
+            DiagnosticCategory::Members => self.members = level,
+            DiagnosticCategory::TypeCompatibility => self.type_compatibility = level,
+            DiagnosticCategory::OverrideSignatures => self.override_signatures = level,
+            DiagnosticCategory::PhpVersion => self.php_version = level,
+        }
+    }
+
+    fn level(self, category: DiagnosticCategory) -> DiagnosticLevel {
+        match category {
+            DiagnosticCategory::UnknownSymbols => self.unknown_symbols,
+            DiagnosticCategory::Unused => self.unused,
+            DiagnosticCategory::DuplicateSymbols => self.duplicate_symbols,
+            DiagnosticCategory::Members => self.members,
+            DiagnosticCategory::TypeCompatibility => self.type_compatibility,
+            DiagnosticCategory::OverrideSignatures => self.override_signatures,
+            DiagnosticCategory::PhpVersion => self.php_version,
+        }
+    }
+
+    fn severity(self, category: DiagnosticCategory) -> Option<DiagnosticSeverity> {
+        self.level(category).0
+    }
+}
+
 #[derive(Debug, Default)]
 struct AppliedConfiguration {
     diagnostics_changed: bool,
@@ -551,6 +701,8 @@ pub struct PhpLspBackend {
     php_version: Mutex<PhpVersion>,
     /// Diagnostics level from phpLsp.diagnostics.mode.
     diagnostics_mode: Mutex<DiagnosticsMode>,
+    /// Per-category severity controls for php-lsp diagnostics.
+    diagnostic_severity: Mutex<DiagnosticSeverityConfig>,
     /// PHPStan subprocess diagnostics configuration.
     phpstan_config: Mutex<PhpStanConfig>,
     /// Psalm subprocess diagnostics configuration.
@@ -597,6 +749,7 @@ impl PhpLspBackend {
             stubs_path: Mutex::new(None),
             php_version: Mutex::new(PhpVersion::DEFAULT),
             diagnostics_mode: Mutex::new(DiagnosticsMode::default()),
+            diagnostic_severity: Mutex::new(DiagnosticSeverityConfig::default()),
             phpstan_config: Mutex::new(PhpStanConfig::default()),
             psalm_config: Mutex::new(PsalmConfig::default()),
             composer_enabled: Mutex::new(true),
@@ -692,6 +845,7 @@ impl PhpLspBackend {
         let document_versions = self.document_versions.clone();
         let index = self.index.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let php_version = *self.php_version.lock().await;
         let debounce = Duration::from_millis(DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS);
         let task_uri_str = uri_str.clone();
@@ -708,6 +862,7 @@ impl PhpLspBackend {
                 &open_files,
                 &index,
                 diagnostics_mode,
+                diagnostic_severity,
                 php_version,
             );
 
@@ -759,6 +914,22 @@ impl PhpLspBackend {
                 }
             } else {
                 tracing::warn!("Ignoring invalid diagnostics mode: {}", raw_mode);
+            }
+        }
+
+        if let Some(raw_severity) = settings_value(
+            settings,
+            "diagnosticsSeverity",
+            &["diagnostics", "severity"],
+        ) {
+            if let Some(parsed) = DiagnosticSeverityConfig::parse(raw_severity) {
+                let mut diagnostic_severity = self.diagnostic_severity.lock().await;
+                if *diagnostic_severity != parsed {
+                    *diagnostic_severity = parsed;
+                    applied.diagnostics_changed = true;
+                }
+            } else {
+                tracing::warn!("Ignoring invalid diagnostics severity settings: {raw_severity}");
             }
         }
 
@@ -1016,6 +1187,7 @@ impl PhpLspBackend {
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let php_version = *self.php_version.lock().await;
         let index_vendor = *self.index_vendor.lock().await;
         let vendor_autoload_cache = self.vendor_autoload_cache.clone();
@@ -1099,11 +1271,12 @@ impl PhpLspBackend {
                     let version = reindex_document_versions
                         .get(&uri_str)
                         .map(|current| *current);
-                    let diags = compute_diagnostics(
+                    let diags = compute_diagnostics_with_config(
                         &uri_str,
                         &entry,
                         &reindex_index,
                         diagnostics_mode,
+                        diagnostic_severity,
                         php_version,
                     );
                     if reindex_document_versions
@@ -1869,12 +2042,14 @@ impl PhpLspBackend {
         }
 
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let php_version = *self.php_version.lock().await;
         let mut diagnostics = compute_open_file_diagnostics(
             &uri_str,
             &self.open_files,
             &self.index,
             diagnostics_mode,
+            diagnostic_severity,
             php_version,
         );
 
@@ -4768,10 +4943,18 @@ fn compute_open_file_diagnostics(
     open_files: &DashMap<String, FileParser>,
     index: &WorkspaceIndex,
     diagnostics_mode: DiagnosticsMode,
+    diagnostic_severity: DiagnosticSeverityConfig,
     php_version: PhpVersion,
 ) -> Vec<Diagnostic> {
     if let Some(parser) = open_files.get(uri_str) {
-        compute_diagnostics(uri_str, &parser, index, diagnostics_mode, php_version)
+        compute_diagnostics_with_config(
+            uri_str,
+            &parser,
+            index,
+            diagnostics_mode,
+            diagnostic_severity,
+            php_version,
+        )
     } else {
         vec![]
     }
@@ -4842,11 +5025,30 @@ fn is_class_like_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
     )
 }
 
+#[cfg(test)]
 fn compute_diagnostics(
     uri_str: &str,
     parser: &FileParser,
     index: &WorkspaceIndex,
     diagnostics_mode: DiagnosticsMode,
+    php_version: PhpVersion,
+) -> Vec<Diagnostic> {
+    compute_diagnostics_with_config(
+        uri_str,
+        parser,
+        index,
+        diagnostics_mode,
+        DiagnosticSeverityConfig::default(),
+        php_version,
+    )
+}
+
+fn compute_diagnostics_with_config(
+    uri_str: &str,
+    parser: &FileParser,
+    index: &WorkspaceIndex,
+    diagnostics_mode: DiagnosticsMode,
+    diagnostic_severity: DiagnosticSeverityConfig,
     php_version: PhpVersion,
 ) -> Vec<Diagnostic> {
     if diagnostics_mode == DiagnosticsMode::Off {
@@ -4902,57 +5104,126 @@ fn compute_diagnostics(
         extract_semantic_diagnostics(tree, &source, &file_symbols, |fqn| index.resolve_fqn(fqn));
 
     for sd in sem_diags {
-        diagnostics.push(Diagnostic {
-            range: Range {
-                start: Position::new(
-                    sd.range.0,
-                    utf16_index.byte_col_to_utf16(sd.range.0, sd.range.1),
-                ),
-                end: Position::new(
-                    sd.range.2,
-                    utf16_index.byte_col_to_utf16(sd.range.2, sd.range.3),
-                ),
-            },
-            severity: Some(DiagnosticSeverity::WARNING),
-            source: Some("php-lsp".to_string()),
-            message: sd.message,
-            ..Default::default()
-        });
+        if let Some(diagnostic) = semantic_diagnostic_to_lsp(sd, &utf16_index, diagnostic_severity)
+        {
+            diagnostics.push(diagnostic);
+        }
     }
 
-    diagnostics.extend(workspace_duplicate_symbol_diagnostics(
-        uri_str,
-        &file_symbols,
-        index,
-        &utf16_index,
+    diagnostics.extend(apply_diagnostic_category(
+        workspace_duplicate_symbol_diagnostics(uri_str, &file_symbols, index, &utf16_index),
+        DiagnosticCategory::DuplicateSymbols,
+        diagnostic_severity,
     ));
-    diagnostics.extend(member_access_diagnostics(
-        tree,
-        &source,
-        &file_symbols,
-        index,
-        &utf16_index,
+    if diagnostic_severity
+        .severity(DiagnosticCategory::Members)
+        .is_some()
+    {
+        diagnostics.extend(apply_diagnostic_category(
+            member_access_diagnostics(tree, &source, &file_symbols, index, &utf16_index),
+            DiagnosticCategory::Members,
+            diagnostic_severity,
+        ));
+    }
+    if diagnostic_severity
+        .severity(DiagnosticCategory::TypeCompatibility)
+        .is_some()
+    {
+        diagnostics.extend(apply_diagnostic_category(
+            type_compatibility_diagnostics(tree, &source, &file_symbols, index, &utf16_index),
+            DiagnosticCategory::TypeCompatibility,
+            diagnostic_severity,
+        ));
+    }
+    diagnostics.extend(apply_diagnostic_category(
+        override_signature_diagnostics(&file_symbols, index, &utf16_index),
+        DiagnosticCategory::OverrideSignatures,
+        diagnostic_severity,
     ));
-    diagnostics.extend(type_compatibility_diagnostics(
-        tree,
-        &source,
-        &file_symbols,
-        index,
-        &utf16_index,
-    ));
-    diagnostics.extend(override_signature_diagnostics(
-        &file_symbols,
-        index,
-        &utf16_index,
-    ));
-    diagnostics.extend(php_version_type_diagnostics(
-        tree,
-        &source,
-        php_version,
-        &utf16_index,
+    diagnostics.extend(apply_diagnostic_category(
+        php_version_type_diagnostics(tree, &source, php_version, &utf16_index),
+        DiagnosticCategory::PhpVersion,
+        diagnostic_severity,
     ));
 
     diagnostics
+}
+
+fn semantic_diagnostic_to_lsp(
+    diagnostic: SemanticDiagnostic,
+    utf16_index: &Utf16LineIndex,
+    severity_config: DiagnosticSeverityConfig,
+) -> Option<Diagnostic> {
+    let category = semantic_diagnostic_category(&diagnostic.kind);
+    let severity = severity_config.severity(category)?;
+    Some(Diagnostic {
+        range: Range {
+            start: Position::new(
+                diagnostic.range.0,
+                utf16_index.byte_col_to_utf16(diagnostic.range.0, diagnostic.range.1),
+            ),
+            end: Position::new(
+                diagnostic.range.2,
+                utf16_index.byte_col_to_utf16(diagnostic.range.2, diagnostic.range.3),
+            ),
+        },
+        severity: Some(severity),
+        code: Some(NumberOrString::String(
+            semantic_diagnostic_code(&diagnostic.kind).to_string(),
+        )),
+        source: Some("php-lsp".to_string()),
+        message: diagnostic.message,
+        ..Default::default()
+    })
+}
+
+fn semantic_diagnostic_category(kind: &SemanticDiagnosticKind) -> DiagnosticCategory {
+    match kind {
+        SemanticDiagnosticKind::UnknownClass
+        | SemanticDiagnosticKind::UnknownFunction
+        | SemanticDiagnosticKind::UnresolvedUse => DiagnosticCategory::UnknownSymbols,
+        SemanticDiagnosticKind::ArgumentCountMismatch => DiagnosticCategory::TypeCompatibility,
+        SemanticDiagnosticKind::UndefinedVariable => DiagnosticCategory::UnknownSymbols,
+        SemanticDiagnosticKind::UnusedImport
+        | SemanticDiagnosticKind::UnusedVariable
+        | SemanticDiagnosticKind::UnusedParameter => DiagnosticCategory::Unused,
+        SemanticDiagnosticKind::DuplicateSymbol => DiagnosticCategory::DuplicateSymbols,
+    }
+}
+
+fn semantic_diagnostic_code(kind: &SemanticDiagnosticKind) -> &'static str {
+    match kind {
+        SemanticDiagnosticKind::UnknownClass => "php-lsp.unknownClass",
+        SemanticDiagnosticKind::UnknownFunction => "php-lsp.unknownFunction",
+        SemanticDiagnosticKind::UnresolvedUse => "php-lsp.unresolvedUse",
+        SemanticDiagnosticKind::ArgumentCountMismatch => "php-lsp.argumentCountMismatch",
+        SemanticDiagnosticKind::UndefinedVariable => "php-lsp.undefinedVariable",
+        SemanticDiagnosticKind::UnusedImport => "php-lsp.unusedImport",
+        SemanticDiagnosticKind::UnusedVariable => "php-lsp.unusedVariable",
+        SemanticDiagnosticKind::UnusedParameter => "php-lsp.unusedParameter",
+        SemanticDiagnosticKind::DuplicateSymbol => "php-lsp.duplicateSymbol",
+    }
+}
+
+fn apply_diagnostic_category(
+    diagnostics: Vec<Diagnostic>,
+    category: DiagnosticCategory,
+    severity_config: DiagnosticSeverityConfig,
+) -> Vec<Diagnostic> {
+    let Some(severity) = severity_config.severity(category) else {
+        return Vec::new();
+    };
+
+    diagnostics
+        .into_iter()
+        .map(|mut diagnostic| {
+            diagnostic.severity = Some(severity);
+            if diagnostic.code.is_none() {
+                diagnostic.code = Some(NumberOrString::String(category.code().to_string()));
+            }
+            diagnostic
+        })
+        .collect()
 }
 
 fn diagnostic_at_byte_range(
@@ -5304,8 +5575,19 @@ fn is_dynamic_member_access(
         return true;
     }
 
+    if class_has_unindexed_ancestor(index, class_fqn, &mut Vec::new()) {
+        return true;
+    }
+
     if sym_at_pos.ref_kind == RefKind::MethodCall {
-        return is_doctrine_repository_dynamic_method(class_fqn, member_name)
+        return is_doctrine_repository_dynamic_method(index, class_fqn, member_name)
+            || is_laravel_eloquent_dynamic_member(
+                index,
+                class_fqn,
+                member_name,
+                sym_at_pos.ref_kind,
+            )
+            || is_symfony_controller_helper_method(index, class_fqn, member_name)
             || is_unindexed_imported_type(index, file_symbols, class_fqn);
     }
 
@@ -5314,6 +5596,10 @@ fn is_dynamic_member_access(
     }
 
     if fqn_matches(class_fqn, "stdClass") || is_phpunit_test_double_type(class_fqn) {
+        return true;
+    }
+
+    if is_laravel_eloquent_dynamic_member(index, class_fqn, member_name, sym_at_pos.ref_kind) {
         return true;
     }
 
@@ -5348,11 +5634,157 @@ fn is_enum_builtin_method_call(index: &WorkspaceIndex, sym_at_pos: &SymbolAtPosi
         .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
 }
 
-fn is_doctrine_repository_dynamic_method(class_fqn: &str, member_name: &str) -> bool {
-    fqn_matches(class_fqn, "Doctrine\\ORM\\EntityRepository")
+fn is_doctrine_repository_dynamic_method(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+) -> bool {
+    class_is_or_extends(index, class_fqn, "Doctrine\\ORM\\EntityRepository")
         && (member_name.starts_with("findBy")
             || member_name.starts_with("findOneBy")
             || member_name.starts_with("countBy"))
+}
+
+fn is_symfony_controller_helper_method(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+) -> bool {
+    if !class_is_or_extends(
+        index,
+        class_fqn,
+        "Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController",
+    ) {
+        return false;
+    }
+
+    matches!(
+        member_name.to_ascii_lowercase().as_str(),
+        "render"
+            | "renderform"
+            | "json"
+            | "redirect"
+            | "redirecttoroute"
+            | "redirecttourl"
+            | "forward"
+            | "generateurl"
+            | "addflash"
+            | "getuser"
+            | "isgranted"
+            | "denyaccessunlessgranted"
+            | "createform"
+            | "createformbuilder"
+            | "getparameter"
+    )
+}
+
+fn is_laravel_eloquent_dynamic_member(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+    ref_kind: RefKind,
+) -> bool {
+    let is_model = class_is_or_extends(index, class_fqn, "Illuminate\\Database\\Eloquent\\Model");
+    let is_builder =
+        class_is_or_extends(index, class_fqn, "Illuminate\\Database\\Eloquent\\Builder")
+            || class_is_or_extends(index, class_fqn, "Illuminate\\Database\\Query\\Builder")
+            || class_is_or_extends(
+                index,
+                class_fqn,
+                "Illuminate\\Database\\Eloquent\\Relations\\Relation",
+            );
+
+    match ref_kind {
+        RefKind::MethodCall => {
+            (is_model || is_builder) && is_laravel_eloquent_dynamic_method(member_name)
+        }
+        RefKind::PropertyAccess => is_model,
+        _ => false,
+    }
+}
+
+fn is_laravel_eloquent_dynamic_method(member_name: &str) -> bool {
+    let lower = member_name.to_ascii_lowercase();
+    lower.starts_with("where")
+        || lower.starts_with("orwhere")
+        || lower.starts_with("wherehas")
+        || lower.starts_with("orwherehas")
+        || lower.starts_with("withwherehas")
+        || lower.starts_with("doesnthave")
+        || lower.starts_with("ordoesnthave")
+        || matches!(
+            lower.as_str(),
+            "query"
+                | "newquery"
+                | "newmodelquery"
+                | "newquerywithoutrelationships"
+                | "find"
+                | "findorfail"
+                | "findmany"
+                | "first"
+                | "firstorfail"
+                | "firstornew"
+                | "firstorcreate"
+                | "updateorcreate"
+                | "create"
+                | "forcecreate"
+                | "save"
+                | "push"
+                | "update"
+                | "delete"
+                | "destroy"
+                | "restore"
+                | "with"
+                | "without"
+                | "load"
+                | "loadmissing"
+                | "pluck"
+                | "count"
+                | "exists"
+                | "paginate"
+                | "simplepaginate"
+        )
+}
+
+fn class_is_or_extends(index: &WorkspaceIndex, class_fqn: &str, target_class: &str) -> bool {
+    fqn_matches(class_fqn, target_class)
+        || class_extends_or_implements(index, class_fqn, target_class, &mut Vec::new())
+}
+
+fn class_has_unindexed_ancestor(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    visited: &mut Vec<String>,
+) -> bool {
+    let class_fqn = class_fqn.trim_start_matches('\\');
+    if visited
+        .iter()
+        .any(|visited| fqn_matches(visited, class_fqn))
+    {
+        return false;
+    }
+    visited.push(class_fqn.to_string());
+
+    let Some(class_sym) = index
+        .types
+        .get(class_fqn)
+        .map(|entry| entry.value().clone())
+    else {
+        return false;
+    };
+
+    class_sym
+        .extends
+        .iter()
+        .chain(class_sym.implements.iter())
+        .any(|parent| {
+            let parent = parent.trim_start_matches('\\');
+            if parent.is_empty() || fqn_matches(parent, class_fqn) {
+                return false;
+            }
+            !index.types.contains_key(parent)
+                || class_has_unindexed_ancestor(index, parent, visited)
+        })
 }
 
 fn is_unindexed_imported_type(
@@ -9061,6 +9493,7 @@ impl LanguageServer for PhpLspBackend {
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let index_vendor = *self.index_vendor.lock().await;
         let vendor_autoload_cache = self.vendor_autoload_cache.clone();
         let vendor_file_lru = self.vendor_file_lru.clone();
@@ -9139,11 +9572,12 @@ impl LanguageServer for PhpLspBackend {
                     let version = reindex_document_versions
                         .get(&uri_str)
                         .map(|current| *current);
-                    let diags = compute_diagnostics(
+                    let diags = compute_diagnostics_with_config(
                         &uri_str,
                         &entry,
                         &reindex_index,
                         diagnostics_mode,
+                        diagnostic_severity,
                         php_version,
                     );
                     if reindex_document_versions
@@ -11731,11 +12165,13 @@ impl LanguageServer for PhpLspBackend {
                 None => return Ok(Some(vec![])),
             };
             let diagnostics_mode = *self.diagnostics_mode.lock().await;
-            compute_diagnostics(
+            let diagnostic_severity = *self.diagnostic_severity.lock().await;
+            compute_diagnostics_with_config(
                 &uri_str,
                 &parser,
                 &self.index,
                 diagnostics_mode,
+                diagnostic_severity,
                 php_version,
             )
             .into_iter()
@@ -12778,6 +13214,149 @@ class Demo {
             !messages.contains(&"Unknown method: Vendor\\Package\\Client::send"),
             "Unindexed imported types should not get guessed member diagnostics: {:?}",
             messages
+        );
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_framework_heavy_dynamic_patterns() {
+        let uri = "file:///framework-heavy.php";
+        let code = r#"<?php
+namespace Symfony\Bundle\FrameworkBundle\Controller;
+abstract class AbstractController {}
+
+namespace Illuminate\Database\Eloquent;
+class Model {}
+class Builder {}
+
+namespace App\Models;
+class User extends \Illuminate\Database\Eloquent\Model {}
+
+namespace App\Controller;
+
+use App\Models\User;
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+
+final class DashboardController extends AbstractController
+{
+    public function index(User $user): void
+    {
+        $this->render('dashboard.html.twig');
+        $this->json(['ok' => true]);
+        $this->redirectToRoute('dashboard');
+
+        echo $user->email;
+        User::whereEmail('demo@example.com')->firstOrFail();
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Unknown method: App\\Controller\\DashboardController::render",
+            "Unknown method: App\\Controller\\DashboardController::json",
+            "Unknown method: App\\Controller\\DashboardController::redirectToRoute",
+            "Unknown property: App\\Models\\User::$email",
+            "Unknown method: App\\Models\\User::whereEmail",
+        ] {
+            assert!(
+                !messages.iter().any(|message| message.contains(unexpected)),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
+                messages
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_applies_category_severity_controls() {
+        let uri = "file:///severity-controls.php";
+        let code = r#"<?php
+namespace App;
+
+class Service {}
+
+function run(Service $service): void
+{
+    $unused = 1;
+    $service->missing();
+    new MissingClass();
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let mut severity = DiagnosticSeverityConfig::default();
+        severity.set(DiagnosticCategory::Members, DiagnosticLevel(None));
+        severity.set(
+            DiagnosticCategory::UnknownSymbols,
+            DiagnosticLevel(Some(DiagnosticSeverity::INFORMATION)),
+        );
+        severity.set(
+            DiagnosticCategory::Unused,
+            DiagnosticLevel(Some(DiagnosticSeverity::HINT)),
+        );
+
+        let diagnostics = compute_diagnostics_with_config(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            severity,
+            PhpVersion::DEFAULT,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "Unknown method: App\\Service::missing"),
+            "Member category is off, got diagnostics: {:?}",
+            diagnostics
+        );
+
+        let unknown_class = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == "Unknown class: App\\MissingClass")
+            .expect("Expected unknown class diagnostic");
+        assert_eq!(
+            unknown_class.severity,
+            Some(DiagnosticSeverity::INFORMATION)
+        );
+        assert_eq!(
+            unknown_class.code,
+            Some(NumberOrString::String("php-lsp.unknownClass".to_string()))
+        );
+
+        let unused_variable = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == "Unused variable: $unused")
+            .expect("Expected unused variable diagnostic");
+        assert_eq!(unused_variable.severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(
+            unused_variable.code,
+            Some(NumberOrString::String("php-lsp.unusedVariable".to_string()))
         );
     }
 

@@ -503,6 +503,7 @@ function createLanguageClient(context: ExtensionContext): LanguageClient {
     initializationOptions: {
       phpVersion: config.get<string>("phpVersion", "8.2"),
       diagnosticsMode: config.get<string>("diagnostics.mode", "basic-semantic"),
+      diagnosticsSeverity: config.get<Record<string, string>>("diagnostics.severity", {}),
       composerEnabled: config.get<boolean>("composer.enabled", true),
       indexVendor: config.get<boolean>("indexVendor", true),
       includePaths: config.get<string[]>("includePaths", []),
