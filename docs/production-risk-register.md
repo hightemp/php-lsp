@@ -15,8 +15,8 @@ Scope: production-readiness milestone, weeks 1-6.
 | R-004 | Sync file IO в async/hot paths | High | `PR-023` | Open |
 | R-005 | Нет request cancellation для тяжелых операций | High | `PR-021`, `PR-050` | Open |
 | R-006 | `didChange` без debounce/version ordering | High | `PR-020`, `PR-050` | Open |
-| R-007 | Stubs грузятся на старте без separate cache/version filtering | Medium | `PR-030`, `PR-011` | Open |
-| R-008 | Lazy vendor indexing без metadata/LRU cache | Medium | `PR-012` | Open |
+| R-007 | Stubs грузятся на старте без PHP-version filtering | Medium | `PR-030`, `PR-011` | Partially mitigated |
+| R-008 | Lazy vendor indexing без metadata/LRU cache | Medium | `PR-012`, `PR-011` | Partially mitigated |
 | R-009 | PHPDoc/type model shallow для production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041` | Open |
 | R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052` | Open |
 
@@ -27,19 +27,20 @@ Scope: production-readiness milestone, weeks 1-6.
 Current evidence:
 
 - `PR-010` добавил schema-versioned workspace disk cache for file symbols/top-level snapshots.
-- Cache path: `~/.cache/php-lsp/{workspace-hash}/index.bin`.
+- `PR-011` split cache files into `workspace`, `stubs`, and `vendor` namespace directories.
+- Cache path: `~/.cache/php-lsp/{workspace-hash}/{namespace}/index.bin`.
 - Cache invalidates by file mtime/size, php-lsp version, PHP version, include/exclude paths, stub extension set and stubs hash.
 - Fixture smoke run shows cached workspace file symbols loading on second start.
 
 Impact:
 
 - Повторный запуск на 5k-10k PHP файлов still needs acceptance validation against the production target `< 5s до готового индекса из disk cache`.
-- Stubs/vendor are not split into separate cache namespaces yet, so startup still includes stub loading.
+- Vendor composer metadata cache/LRU is still separate hardening work under `PR-012`.
 
 Mitigation:
 
 - `PR-010`: implemented workspace index disk cache with mtime/size/config/stubs hash invalidation.
-- `PR-011`: отдельные cache namespaces для workspace/stubs/vendor.
+- `PR-011`: implemented separate cache namespaces for workspace/stubs/vendor and preserved stub/vendor symbols across workspace reindex.
 
 Exit signal:
 
@@ -157,23 +158,23 @@ Exit signal:
 - Only latest document version publishes diagnostics after a burst.
 - No stale diagnostics overwrite newer diagnostics.
 
-### R-007: Stubs грузятся на старте без separate cache/version filtering
+### R-007: Stubs грузятся на старте без PHP-version filtering
 
 Current evidence:
 
 - `load_configured_stubs()` reads bundled phpstorm-stubs and loads configured extensions into the main index.
-- `stubs::load_stubs()` parses stub files and marks symbols builtin, but stubs are not yet stored in a dedicated cache namespace.
+- `PR-011` stores stubs in a dedicated `stubs` cache namespace and reloads changed/missing stub files by mtime/size/config hash.
 - `phpLsp.phpVersion` affects diagnostics/refactors in server logic, but built-in symbol availability is not yet filtered from version-gated stub metadata.
 
 Impact:
 
-- Startup includes repeated stub parse/load cost.
+- First startup still parses configured stubs; repeated startup/reload can load unchanged stub files from cache.
 - Completion/definition can expose built-ins that are not available for the configured PHP version.
 
 Mitigation:
 
 - `PR-030`: parse version-gated stub attributes and filter symbols/signatures by `phpLsp.phpVersion`.
-- `PR-011`: separate stubs cache keyed by php-lsp version, PHP version, extension list and stubs hash.
+- `PR-011`: implemented separate stubs cache keyed by php-lsp version, PHP version, extension list and stubs hash.
 
 Exit signal:
 
@@ -185,7 +186,8 @@ Exit signal:
 Current evidence:
 
 - Lazy class resolution checks composer namespace maps and can parse `vendor/composer/installed.json`.
-- Vendor metadata and file symbols are not cached as a dedicated layer.
+- `PR-011` caches lazy-indexed vendor file symbols in a dedicated `vendor` cache namespace.
+- Vendor composer metadata resolution and an LRU policy are not cached yet.
 
 Impact:
 

@@ -555,7 +555,7 @@
 
 - [x] **V1-009** Кэш индекса на диск *(done 2026-05-22)*
   - Формат: bincode
-  - Путь: ~/.cache/php-lsp/{workspace-hash}/index.bin
+  - Путь: ~/.cache/php-lsp/{workspace-hash}/{namespace}/index.bin
   - Инвалидация: mtime + size файлов
   - Ускорение повторного запуска
 
@@ -657,15 +657,18 @@
 
 - [x] **PR-010 / V1-009** Реализовать disk cache индекса *(done 2026-05-22)*
   - Формат: `bincode` или другой компактный бинарный формат.
-  - Путь: `~/.cache/php-lsp/{workspace-hash}/index.bin`.
+  - Путь: `~/.cache/php-lsp/{workspace-hash}/workspace/index.bin`.
   - Хранить: `FileSymbols`, top-level maps, версию schema, версию php-lsp, PHP version, stub extensions, include/exclude paths.
   - Инвалидация: mtime + size + config hash + stubs hash.
   - На старте сначала грузить cache, затем фоново доиндексировать changed files.
 
-- [ ] **PR-011** Разделить project index, stub index и vendor index
+- [x] **PR-011** Разделить project index, stub index и vendor index *(done 2026-05-22)*
   - Отдельные cache namespaces: `workspace`, `stubs`, `vendor`.
   - Не удалять stubs при workspace reindex.
   - Ускорить reload настроек, затрагивающих только stubs или только workspace.
+  - `workspace`: `~/.cache/php-lsp/{workspace-hash}/workspace/index.bin`.
+  - `stubs`: cache keyed by php-lsp version, PHP version, extension list and stubs hash; повторный smoke load: 85 stub files за 23.23 ms.
+  - `vendor`: lazy-indexed vendor file symbols сохраняются в `vendor/index.bin` после первого парсинга vendor файла.
 
 - [ ] **PR-012 / V1-011** Оптимизировать lazy vendor indexing
   - Кэшировать parsed composer installed/autoload metadata.

@@ -52,58 +52,79 @@ pub fn load_stubs(index: &WorkspaceIndex, stubs_path: &Path, extensions: &[&str]
     let mut loaded_files = 0;
 
     for ext_name in extensions {
-        let ext_dir = stubs_path.join(ext_name);
-        if !ext_dir.is_dir() {
-            tracing::debug!("Stubs extension directory not found: {}", ext_dir.display());
+        let php_files = collect_extension_stub_files(stubs_path, ext_name);
+        if php_files.is_empty() && !stubs_path.join(ext_name).is_dir() {
+            tracing::debug!(
+                "Stubs extension directory not found: {}",
+                stubs_path.join(ext_name).display()
+            );
             continue;
         }
 
-        let php_files = collect_stub_files(&ext_dir);
         for file_path in &php_files {
-            match std::fs::read_to_string(file_path) {
-                Ok(source) => {
-                    let mut parser = FileParser::new();
-                    parser.parse_full(&source);
-
-                    if let Some(tree) = parser.tree() {
-                        let uri = format!(
-                            "phpstub://{}/{}",
-                            ext_name,
-                            file_path.file_name().unwrap_or_default().to_string_lossy()
-                        );
-                        let mut file_symbols = extract_file_symbols(tree, &source, &uri);
-
-                        // Mark all symbols as built-in
-                        for sym in &mut file_symbols.symbols {
-                            sym.modifiers = SymbolModifiers {
-                                is_builtin: true,
-                                ..sym.modifiers
-                            };
-                        }
-
-                        let sym_count = file_symbols.symbols.len();
-                        index.update_file(&uri, file_symbols);
-
-                        if sym_count > 0 {
-                            tracing::debug!(
-                                "Loaded stubs {}/{}: {} symbols",
-                                ext_name,
-                                file_path.file_name().unwrap_or_default().to_string_lossy(),
-                                sym_count
-                            );
-                        }
-
-                        loaded_files += 1;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to read stub file {}: {}", file_path.display(), e);
-                }
+            if load_stub_file(index, ext_name, file_path).is_some() {
+                loaded_files += 1;
             }
         }
     }
 
     loaded_files
+}
+
+/// Build the stable pseudo-URI used for a phpstorm-stubs file.
+pub fn stub_file_uri(ext_name: &str, file_path: &Path) -> String {
+    format!(
+        "phpstub://{}/{}",
+        ext_name,
+        file_path.file_name().unwrap_or_default().to_string_lossy()
+    )
+}
+
+/// Collect all .php files from a stubs extension directory (non-recursive).
+pub fn collect_extension_stub_files(stubs_path: &Path, ext_name: &str) -> Vec<PathBuf> {
+    collect_stub_files(&stubs_path.join(ext_name))
+}
+
+/// Parse one stub file, mark its symbols as built-in and update the workspace index.
+///
+/// Returns the number of symbols in the parsed file, or `None` if the file could
+/// not be read or parsed.
+pub fn load_stub_file(index: &WorkspaceIndex, ext_name: &str, file_path: &Path) -> Option<usize> {
+    match std::fs::read_to_string(file_path) {
+        Ok(source) => {
+            let mut parser = FileParser::new();
+            parser.parse_full(&source);
+
+            let tree = parser.tree()?;
+            let uri = stub_file_uri(ext_name, file_path);
+            let mut file_symbols = extract_file_symbols(tree, &source, &uri);
+
+            for sym in &mut file_symbols.symbols {
+                sym.modifiers = SymbolModifiers {
+                    is_builtin: true,
+                    ..sym.modifiers
+                };
+            }
+
+            let sym_count = file_symbols.symbols.len();
+            index.update_file(&uri, file_symbols);
+
+            if sym_count > 0 {
+                tracing::debug!(
+                    "Loaded stubs {}/{}: {} symbols",
+                    ext_name,
+                    file_path.file_name().unwrap_or_default().to_string_lossy(),
+                    sym_count
+                );
+            }
+
+            Some(sym_count)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to read stub file {}: {}", file_path.display(), e);
+            None
+        }
+    }
 }
 
 /// Collect all .php files from a stubs extension directory (non-recursive).

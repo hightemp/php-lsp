@@ -115,15 +115,15 @@ scripts/benchmark-lsp-latency.sh --iterations 10 --scenario laravel=/path/to/lar
 Command:
 
 ```bash
-rm -rf target/php-lsp-profile/cache-smoke
-XDG_CACHE_HOME="$PWD/target/php-lsp-profile/cache-smoke" scripts/profile-workspace.sh --scenario small-cache-smoke=test-fixtures/basic --timeout 60
-XDG_CACHE_HOME="$PWD/target/php-lsp-profile/cache-smoke" scripts/profile-workspace.sh --scenario small-cache-smoke=test-fixtures/basic --timeout 60
+rm -rf target/php-lsp-profile/cache-smoke-pr011
+XDG_CACHE_HOME="$PWD/target/php-lsp-profile/cache-smoke-pr011" scripts/profile-workspace.sh --scenario small-cache-smoke-pr011=test-fixtures/basic --timeout 60
+XDG_CACHE_HOME="$PWD/target/php-lsp-profile/cache-smoke-pr011" scripts/profile-workspace.sh --scenario small-cache-smoke-pr011=test-fixtures/basic --timeout 60
 ```
 
 Second run result:
 
 | Scenario | Cache path | Cache files loaded | Indexed files | Symbols | Ready time |
 |----------|------------|--------------------|---------------|---------|------------|
-| `small-cache-smoke` | `target/php-lsp-profile/cache-smoke/php-lsp/0da0d009104fa203/index.bin` | 4 | 4 | 14 | 285.43 ms |
+| `small-cache-smoke-pr011` | `target/php-lsp-profile/cache-smoke-pr011/php-lsp/0da0d009104fa203/workspace/index.bin` | 4 | 4 | 14 | 26.71 ms |
 
-This validates the `PR-010` workspace cache path and mtime/size-valid file-symbol loading on a small fixture. Large-project acceptance is still tracked by the milestone exit criteria and should be measured with the same command against 5k-10k PHP files.
+This validates the `PR-010` workspace cache path and mtime/size-valid file-symbol loading on a small fixture. After `PR-011`, workspace/stubs/vendor snapshots live under separate namespace directories below the same workspace hash; this smoke run created `workspace/index.bin` and `stubs/index.bin`, with second-run stubs load at 23.23 ms. Large-project acceptance is still tracked by the milestone exit criteria and should be measured with the same command against 5k-10k PHP files.

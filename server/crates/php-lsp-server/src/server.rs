@@ -3,7 +3,7 @@
 use dashmap::DashMap;
 use php_lsp_completion::context::detect_context;
 use php_lsp_completion::provider::provide_completions;
-use php_lsp_index::cache::{self, IndexCacheConfig};
+use php_lsp_index::cache::{self, CacheNamespace, CacheSourceFile, IndexCacheConfig};
 use php_lsp_index::composer::{parse_composer_json, NamespaceMap};
 use php_lsp_index::stubs;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -403,6 +403,7 @@ impl PhpLspBackend {
                 if *php_version != parsed {
                     *php_version = parsed;
                     applied.diagnostics_changed = true;
+                    applied.stubs_changed = true;
                 }
             } else {
                 tracing::warn!("Ignoring invalid phpVersion: {}", raw_php_version);
@@ -574,6 +575,7 @@ impl PhpLspBackend {
         let index = self.index.clone();
         let client_stubs_path = self.stubs_path.lock().await.clone();
         let stub_extensions = self.stub_extensions.lock().await.clone();
+        let php_version = *self.php_version.lock().await;
 
         send_indexing_status(
             &self.client,
@@ -586,7 +588,14 @@ impl PhpLspBackend {
         .await;
 
         let loaded = tokio::task::spawn_blocking(move || {
-            load_configured_stubs(&index, &root, client_stubs_path, stub_extensions, true)
+            load_configured_stubs(
+                &index,
+                &root,
+                client_stubs_path,
+                stub_extensions,
+                php_version,
+                true,
+            )
         })
         .await
         .unwrap_or(0);
@@ -629,13 +638,13 @@ impl PhpLspBackend {
         if let Some(first_root) = effective_roots.first() {
             *self.workspace_root.lock().await = Some(first_root.clone());
         }
-        *self.workspace_roots.lock().await = effective_roots;
+        *self.workspace_roots.lock().await = effective_roots.clone();
         *self.workspace_configs.lock().await = configs.clone();
         *self.namespace_map.lock().await = configs
             .iter()
             .find_map(|config| config.namespace_map.clone());
 
-        let removed = remove_indexed_file_symbols(&self.index);
+        let removed = remove_indexed_file_symbols(&self.index, &effective_roots);
         self.client
             .log_message(
                 MessageType::INFO,
@@ -903,6 +912,7 @@ impl PhpLspBackend {
         let index_vendor = *self.index_vendor.lock().await;
         let mut configs = self.workspace_configs.lock().await.clone();
         let exclude_paths = self.exclude_paths.lock().await.clone();
+        let php_version = *self.php_version.lock().await;
         if configs.is_empty() {
             let root = self.workspace_root.lock().await.clone();
             let namespace_map = self.namespace_map.lock().await.clone();
@@ -942,6 +952,16 @@ impl PhpLspBackend {
                     continue;
                 }
 
+                let is_vendor_file = abs.starts_with(config.root.join("vendor"));
+                let vendor_cache_config = is_vendor_file
+                    .then(|| vendor_index_cache_config(&config.root, php_version, &exclude_paths));
+                if let Some(cache_config) = vendor_cache_config.as_ref() {
+                    if load_cached_vendor_file(&self.index, &config.root, &abs, cache_config) {
+                        tracing::debug!("Lazy-indexed vendor file from cache: {}", abs.display());
+                        return true;
+                    }
+                }
+
                 if abs.exists() {
                     if let Ok(source) = std::fs::read_to_string(&abs) {
                         let mut parser = FileParser::new();
@@ -950,6 +970,9 @@ impl PhpLspBackend {
                             let uri = path_to_uri(&abs);
                             let file_symbols = extract_file_symbols(tree, &source, &uri);
                             self.index.update_file(&uri, file_symbols);
+                            if let Some(cache_config) = vendor_cache_config.as_ref() {
+                                save_vendor_index_cache(&self.index, &config.root, cache_config);
+                            }
                             tracing::debug!("Lazy-indexed file: {}", abs.display());
                             return true;
                         }
@@ -6554,11 +6577,16 @@ fn remove_indexed_files_under_roots(index: &WorkspaceIndex, roots: &[PathBuf]) -
     removed
 }
 
-fn remove_indexed_file_symbols(index: &WorkspaceIndex) -> usize {
+fn remove_indexed_file_symbols(index: &WorkspaceIndex, roots: &[PathBuf]) -> usize {
     let uris: Vec<String> = index
         .file_symbols
         .iter()
-        .filter(|entry| entry.key().starts_with("file://"))
+        .filter(|entry| {
+            entry.key().starts_with("file://")
+                && uri_to_path(entry.key())
+                    .map(|path| !path_is_under_vendor_roots(&path, roots))
+                    .unwrap_or(true)
+        })
         .map(|entry| entry.key().clone())
         .collect();
 
@@ -6568,6 +6596,12 @@ fn remove_indexed_file_symbols(index: &WorkspaceIndex) -> usize {
     }
 
     removed
+}
+
+fn path_is_under_vendor_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| path.starts_with(root.join("vendor")))
 }
 
 /// Find composer.json in the workspace root or immediate subdirectories.
@@ -6884,6 +6918,7 @@ fn workspace_index_cache_config(
 ) -> IndexCacheConfig {
     let root = root.unwrap_or_else(|| Path::new(""));
     IndexCacheConfig {
+        namespace: CacheNamespace::Workspace,
         php_lsp_version: env!("CARGO_PKG_VERSION").to_string(),
         php_version: php_version_label(php_version),
         include_paths: include_paths
@@ -6896,6 +6931,41 @@ fn workspace_index_cache_config(
             .collect(),
         stub_extensions: effective_stub_extensions(stub_extensions),
         stubs_hash: stubs_cache_hash(root, client_stubs_path, stub_extensions),
+    }
+}
+
+fn stubs_index_cache_config(
+    stubs_path: &Path,
+    php_version: PhpVersion,
+    stub_extensions: &[String],
+) -> IndexCacheConfig {
+    IndexCacheConfig {
+        namespace: CacheNamespace::Stubs,
+        php_lsp_version: env!("CARGO_PKG_VERSION").to_string(),
+        php_version: php_version_label(php_version),
+        include_paths: vec![cache_path_label(stubs_path)],
+        exclude_paths: Vec::new(),
+        stub_extensions: effective_stub_extensions(stub_extensions),
+        stubs_hash: stubs_cache_hash_for_path(stubs_path, stub_extensions),
+    }
+}
+
+fn vendor_index_cache_config(
+    root: &Path,
+    php_version: PhpVersion,
+    exclude_paths: &[PathBuf],
+) -> IndexCacheConfig {
+    IndexCacheConfig {
+        namespace: CacheNamespace::Vendor,
+        php_lsp_version: env!("CARGO_PKG_VERSION").to_string(),
+        php_version: php_version_label(php_version),
+        include_paths: vec![cache_path_label(&root.join("vendor"))],
+        exclude_paths: exclude_paths
+            .iter()
+            .map(|path| cache_path_label(path))
+            .collect(),
+        stub_extensions: Vec::new(),
+        stubs_hash: vendor_cache_hash(root),
     }
 }
 
@@ -6920,65 +6990,77 @@ fn stubs_cache_hash(
     stub_extensions: &[String],
 ) -> u64 {
     let client_stubs_path = client_stubs_path.map(Path::to_path_buf);
-    let mut parts = vec!["stubs-cache-v1".to_string()];
-    let extensions = effective_stub_extensions(stub_extensions);
-
     if let Some(stubs_root) = candidate_stubs_paths(root, client_stubs_path)
         .into_iter()
         .find(|path| path.is_dir())
     {
-        parts.push(format!(
-            "root={}",
-            stubs_root.to_string_lossy().replace('\\', "/")
-        ));
-        for file_name in ["composer.lock", "composer.json", "PhpStormStubsMap.php"] {
-            let path = stubs_root.join(file_name);
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                let modified = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| {
-                        format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos())
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
-                parts.push(format!(
-                    "file={}:{}:{}",
-                    file_name,
-                    metadata.len(),
-                    modified
-                ));
-            }
-        }
-        for extension in extensions {
-            let path = stubs_root.join(&extension);
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                let modified = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| {
-                        format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos())
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
-                parts.push(format!(
-                    "extension={}:{}:{}",
-                    extension,
-                    metadata.len(),
-                    modified
-                ));
-            } else {
-                parts.push(format!("extension={}:missing", extension));
-            }
-        }
-    } else {
-        parts.push("root=missing".to_string());
-        for extension in extensions {
-            parts.push(format!("extension={}:unknown", extension));
+        return stubs_cache_hash_for_path(&stubs_root, stub_extensions);
+    }
+
+    let mut parts = vec!["stubs-cache-v1".to_string(), "root=missing".to_string()];
+    for extension in effective_stub_extensions(stub_extensions) {
+        parts.push(format!("extension={}:unknown", extension));
+    }
+    cache::stable_hash_strings(parts.iter().map(String::as_str))
+}
+
+fn stubs_cache_hash_for_path(stubs_root: &Path, stub_extensions: &[String]) -> u64 {
+    let mut parts = vec![
+        "stubs-cache-v1".to_string(),
+        format!("root={}", cache_path_label(stubs_root)),
+    ];
+
+    for file_name in ["composer.lock", "composer.json", "PhpStormStubsMap.php"] {
+        push_metadata_hash_part(&mut parts, "file", file_name, &stubs_root.join(file_name));
+    }
+
+    for extension in effective_stub_extensions(stub_extensions) {
+        let path = stubs_root.join(&extension);
+        if path.exists() {
+            push_metadata_hash_part(&mut parts, "extension", &extension, &path);
+        } else {
+            parts.push(format!("extension={}:missing", extension));
         }
     }
 
     cache::stable_hash_strings(parts.iter().map(String::as_str))
+}
+
+fn vendor_cache_hash(root: &Path) -> u64 {
+    let mut parts = vec![
+        "vendor-cache-v1".to_string(),
+        format!("root={}", cache_path_label(root)),
+    ];
+    for relative in [
+        "composer.json",
+        "composer.lock",
+        "vendor/composer/installed.json",
+        "vendor/composer/autoload_psr4.php",
+    ] {
+        push_metadata_hash_part(&mut parts, "file", relative, &root.join(relative));
+    }
+    cache::stable_hash_strings(parts.iter().map(String::as_str))
+}
+
+fn push_metadata_hash_part(parts: &mut Vec<String>, kind: &str, label: &str, path: &Path) {
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos()))
+                .unwrap_or_else(|| "unknown".to_string());
+            parts.push(format!(
+                "{}={}:{}:{}",
+                kind,
+                label,
+                metadata.len(),
+                modified
+            ));
+        }
+        Err(_) => parts.push(format!("{}={}:missing", kind, label)),
+    }
 }
 
 fn load_configured_stubs(
@@ -6986,6 +7068,7 @@ fn load_configured_stubs(
     root: &Path,
     client_stubs_path: Option<PathBuf>,
     stub_extensions: Vec<String>,
+    php_version: PhpVersion,
     clear_existing: bool,
 ) -> usize {
     if clear_existing {
@@ -6995,20 +7078,135 @@ fn load_configured_stubs(
     for stubs_path in candidate_stubs_paths(root, client_stubs_path) {
         if stubs_path.is_dir() {
             tracing::info!("Loading phpstorm-stubs from {}", stubs_path.display());
-            let loaded = if stub_extensions.is_empty() {
-                stubs::load_stubs(index, &stubs_path, stubs::DEFAULT_EXTENSIONS)
-            } else {
-                let extension_refs: Vec<&str> =
-                    stub_extensions.iter().map(String::as_str).collect();
-                stubs::load_stubs(index, &stubs_path, &extension_refs)
-            };
-            tracing::info!("Loaded {} stub files", loaded);
+            let extensions = effective_stub_extensions(&stub_extensions);
+            let cache_sources = collect_stub_cache_sources(&stubs_path, &extensions);
+            let cache_path = cache::cache_file_path_for_namespace(root, CacheNamespace::Stubs);
+            let cache_config = stubs_index_cache_config(&stubs_path, php_version, &stub_extensions);
+            let cache_report = cache::load_valid_cached_sources(
+                index,
+                &cache_path,
+                &stubs_path,
+                &cache_sources,
+                &cache_config,
+            );
+            if let Some(reason) = cache_report.miss_reason.as_deref() {
+                tracing::debug!("Stubs index cache miss: {}", reason);
+            }
+
+            let mut parsed = 0;
+            for source in &cache_report.parse_sources {
+                let Some(ext_name) = source.relative_path.split('/').next() else {
+                    continue;
+                };
+                if stubs::load_stub_file(index, ext_name, &source.path).is_some() {
+                    parsed += 1;
+                }
+            }
+
+            let cache_to_save =
+                cache::build_cache_from_sources(index, &stubs_path, &cache_sources, &cache_config);
+            if let Err(e) = cache::save_cache_atomic(&cache_path, &cache_to_save) {
+                tracing::warn!(
+                    "Failed to save stubs index cache at {}: {}",
+                    cache_path.display(),
+                    e
+                );
+            }
+
+            let loaded = cache_report.loaded_files + parsed;
+            tracing::info!(
+                "Loaded {} stub files ({} from cache, {} parsed)",
+                loaded,
+                cache_report.loaded_files,
+                parsed
+            );
             return loaded;
         }
     }
 
     tracing::warn!("phpstorm-stubs not found, built-in completions will be limited");
     0
+}
+
+fn collect_stub_cache_sources(stubs_path: &Path, extensions: &[String]) -> Vec<CacheSourceFile> {
+    let mut sources = Vec::new();
+    for extension in extensions {
+        for path in stubs::collect_extension_stub_files(stubs_path, extension) {
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            sources.push(CacheSourceFile::new(
+                path.clone(),
+                stubs::stub_file_uri(extension, &path),
+                format!("{}/{}", extension, file_name),
+            ));
+        }
+    }
+    sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    sources
+}
+
+fn load_cached_vendor_file(
+    index: &WorkspaceIndex,
+    root: &Path,
+    file_path: &Path,
+    config: &IndexCacheConfig,
+) -> bool {
+    let source = CacheSourceFile::workspace(root, file_path);
+    let cache_path = cache::cache_file_path_for_namespace(root, CacheNamespace::Vendor);
+    let report = cache::load_valid_cached_sources(
+        index,
+        &cache_path,
+        root,
+        std::slice::from_ref(&source),
+        config,
+    );
+
+    if report.loaded_files > 0 {
+        return true;
+    }
+    if let Some(reason) = report.miss_reason.as_deref() {
+        tracing::debug!(
+            "Vendor index cache miss for {}: {}",
+            file_path.display(),
+            reason
+        );
+    }
+    false
+}
+
+fn save_vendor_index_cache(index: &WorkspaceIndex, root: &Path, config: &IndexCacheConfig) {
+    let sources = indexed_vendor_cache_sources(index, root);
+    if sources.is_empty() {
+        return;
+    }
+
+    let cache_path = cache::cache_file_path_for_namespace(root, CacheNamespace::Vendor);
+    let cache_to_save = cache::build_cache_from_sources(index, root, &sources, config);
+    if let Err(e) = cache::save_cache_atomic(&cache_path, &cache_to_save) {
+        tracing::warn!(
+            "Failed to save vendor index cache at {}: {}",
+            cache_path.display(),
+            e
+        );
+    }
+}
+
+fn indexed_vendor_cache_sources(index: &WorkspaceIndex, root: &Path) -> Vec<CacheSourceFile> {
+    let vendor_dir = root.join("vendor");
+    let mut sources: Vec<CacheSourceFile> = index
+        .file_symbols
+        .iter()
+        .filter_map(|entry| {
+            let path = uri_to_path(entry.key())?;
+            (path.starts_with(&vendor_dir) && path.is_file())
+                .then(|| CacheSourceFile::workspace(root, &path))
+        })
+        .collect();
+    sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    sources.dedup_by(|left, right| left.relative_path == right.relative_path);
+    sources
 }
 
 /// Background workspace indexing.
@@ -7480,6 +7678,7 @@ impl LanguageServer for PhpLspBackend {
         let stubs_root_label = stubs_root.display().to_string();
         let client_stubs_path = self.stubs_path.lock().await.clone();
         let stub_extensions = self.stub_extensions.lock().await.clone();
+        let php_version = *self.php_version.lock().await;
 
         send_indexing_status(
             &self.client,
@@ -7499,6 +7698,7 @@ impl LanguageServer for PhpLspBackend {
                 &stubs_root,
                 load_client_stubs_path,
                 load_stub_extensions,
+                php_version,
                 false,
             )
         })
@@ -7522,7 +7722,6 @@ impl LanguageServer for PhpLspBackend {
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
-        let php_version = *self.php_version.lock().await;
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let include_paths = self.include_paths.lock().await.clone();
         let exclude_paths = self.exclude_paths.lock().await.clone();
@@ -10708,6 +10907,79 @@ mod tests {
         // Search for "xyz" should find nothing
         let results = index.search("xyz");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_reindex_keeps_vendor_and_stub_symbols() {
+        let index = WorkspaceIndex::new();
+        index.update_file(
+            "file:///tmp/project/src/Foo.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![make_symbol(
+                    "Foo",
+                    "App\\Foo",
+                    PhpSymbolKind::Class,
+                    (0, 0, 1, 0),
+                    None,
+                )],
+            },
+        );
+        index.update_file(
+            "file:///tmp/project/vendor/acme/pkg/Bar.php",
+            FileSymbols {
+                namespace: Some("Vendor\\Pkg".to_string()),
+                use_statements: vec![],
+                symbols: vec![make_symbol(
+                    "Bar",
+                    "Vendor\\Pkg\\Bar",
+                    PhpSymbolKind::Class,
+                    (0, 0, 1, 0),
+                    None,
+                )],
+            },
+        );
+        index.update_file(
+            "phpstub://Core/Core.php",
+            FileSymbols {
+                namespace: None,
+                use_statements: vec![],
+                symbols: vec![make_symbol(
+                    "stdClass",
+                    "stdClass",
+                    PhpSymbolKind::Class,
+                    (0, 0, 1, 0),
+                    None,
+                )],
+            },
+        );
+
+        let removed = remove_indexed_file_symbols(&index, &[PathBuf::from("/tmp/project")]);
+
+        assert_eq!(removed, 1);
+        assert!(index.resolve_fqn("App\\Foo").is_none());
+        assert!(index.resolve_fqn("Vendor\\Pkg\\Bar").is_some());
+        assert!(index.resolve_fqn("stdClass").is_some());
+    }
+
+    #[test]
+    fn test_cache_configs_use_separate_namespaces() {
+        let root = Path::new("/tmp/project");
+        let workspace_config =
+            workspace_index_cache_config(Some(root), PhpVersion::DEFAULT, &[], &[], &[], None);
+        let stubs_config = stubs_index_cache_config(
+            Path::new("/tmp/project/stubs"),
+            PhpVersion::DEFAULT,
+            &["Core".to_string()],
+        );
+        let vendor_config = vendor_index_cache_config(root, PhpVersion::DEFAULT, &[]);
+
+        assert_eq!(workspace_config.namespace, CacheNamespace::Workspace);
+        assert_eq!(stubs_config.namespace, CacheNamespace::Stubs);
+        assert_eq!(vendor_config.namespace, CacheNamespace::Vendor);
+        assert_ne!(workspace_config.config_hash(), stubs_config.config_hash());
+        assert_ne!(workspace_config.config_hash(), vendor_config.config_hash());
     }
 
     #[test]

@@ -86,8 +86,8 @@ phpstorm-stubs support.
 - Production hardening is still in progress. The current risk register and
   baseline measurements live in `docs/production-risk-register.md` and
   `docs/production-baseline.md`.
-- Workspace symbols are cached on disk between server starts. Stub/vendor cache
-  separation and large-project acceptance thresholds are still production
+- Workspace, stub, and lazy vendor file symbols are cached in separate disk
+  namespaces. Large-project acceptance thresholds are still production
   hardening work.
 - `references`, `rename`, and reference-count code lenses can still scan and
   reparse indexed workspace files. They are functional, but not yet optimized

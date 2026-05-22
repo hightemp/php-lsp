@@ -9,11 +9,29 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 pub const CACHE_FILE_NAME: &str = "index.bin";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheNamespace {
+    Workspace,
+    Stubs,
+    Vendor,
+}
+
+impl CacheNamespace {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheNamespace::Workspace => "workspace",
+            CacheNamespace::Stubs => "stubs",
+            CacheNamespace::Vendor => "vendor",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCacheConfig {
+    pub namespace: CacheNamespace,
     pub php_lsp_version: String,
     pub php_version: String,
     pub include_paths: Vec<String>,
@@ -25,6 +43,7 @@ pub struct IndexCacheConfig {
 impl IndexCacheConfig {
     pub fn config_hash(&self) -> u64 {
         let mut parts = vec![
+            format!("namespace={}", self.namespace.as_str()),
             format!("php-lsp-version={}", self.php_lsp_version),
             format!("php-version={}", self.php_version),
             format!("stubs-hash={:016x}", self.stubs_hash),
@@ -39,6 +58,7 @@ impl IndexCacheConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexCache {
     pub schema_version: u32,
+    pub namespace: String,
     pub php_lsp_version: String,
     pub workspace_root: String,
     pub config_hash: u64,
@@ -54,6 +74,31 @@ pub struct CachedFile {
     pub relative_path: String,
     pub metadata: CachedFileMetadata,
     pub file_symbols: FileSymbols,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheSourceFile {
+    pub path: PathBuf,
+    pub uri: String,
+    pub relative_path: String,
+}
+
+impl CacheSourceFile {
+    pub fn new(path: PathBuf, uri: String, relative_path: String) -> Self {
+        Self {
+            path,
+            uri,
+            relative_path,
+        }
+    }
+
+    pub fn workspace(root: &Path, path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            uri: path_to_uri(path),
+            relative_path: relative_cache_path(root, path),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +124,7 @@ pub struct CacheLoadReport {
     pub extra_files: usize,
     pub indexed_symbols: usize,
     pub parse_files: Vec<PathBuf>,
+    pub parse_sources: Vec<CacheSourceFile>,
     pub miss_reason: Option<String>,
 }
 
@@ -112,13 +158,26 @@ impl std::fmt::Display for CacheError {
 impl std::error::Error for CacheError {}
 
 pub fn cache_file_path(workspace_root: &Path) -> PathBuf {
-    cache_file_path_with_base(default_cache_base_dir(), workspace_root)
+    cache_file_path_for_namespace(workspace_root, CacheNamespace::Workspace)
 }
 
 pub fn cache_file_path_with_base(base_dir: PathBuf, workspace_root: &Path) -> PathBuf {
+    cache_file_path_with_base_for_namespace(base_dir, workspace_root, CacheNamespace::Workspace)
+}
+
+pub fn cache_file_path_for_namespace(workspace_root: &Path, namespace: CacheNamespace) -> PathBuf {
+    cache_file_path_with_base_for_namespace(default_cache_base_dir(), workspace_root, namespace)
+}
+
+pub fn cache_file_path_with_base_for_namespace(
+    base_dir: PathBuf,
+    workspace_root: &Path,
+    namespace: CacheNamespace,
+) -> PathBuf {
     base_dir
         .join("php-lsp")
         .join(workspace_hash(workspace_root))
+        .join(namespace.as_str())
         .join(CACHE_FILE_NAME)
 }
 
@@ -146,6 +205,20 @@ pub fn load_valid_cached_files(
     current_files: &[PathBuf],
     config: &IndexCacheConfig,
 ) -> CacheLoadReport {
+    let sources: Vec<CacheSourceFile> = current_files
+        .iter()
+        .map(|path| CacheSourceFile::workspace(workspace_root, path))
+        .collect();
+    load_valid_cached_sources(index, cache_path, workspace_root, &sources, config)
+}
+
+pub fn load_valid_cached_sources(
+    index: &WorkspaceIndex,
+    cache_path: &Path,
+    workspace_root: &Path,
+    current_sources: &[CacheSourceFile],
+    config: &IndexCacheConfig,
+) -> CacheLoadReport {
     let mut report = CacheLoadReport {
         cache_path: cache_path.to_path_buf(),
         loaded_files: 0,
@@ -154,6 +227,7 @@ pub fn load_valid_cached_files(
         extra_files: 0,
         indexed_symbols: 0,
         parse_files: Vec::new(),
+        parse_sources: Vec::new(),
         miss_reason: None,
     };
 
@@ -161,13 +235,23 @@ pub fn load_valid_cached_files(
         Ok(cache) => cache,
         Err(CacheError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
             report.miss_reason = Some("cache file not found".to_string());
-            report.parse_files = current_files.to_vec();
+            report.parse_sources = current_sources.to_vec();
+            report.parse_files = report
+                .parse_sources
+                .iter()
+                .map(|source| source.path.clone())
+                .collect();
             report.missing_files = report.parse_files.len();
             return report;
         }
         Err(err) => {
             report.miss_reason = Some(format!("failed to load cache: {}", err));
-            report.parse_files = current_files.to_vec();
+            report.parse_sources = current_sources.to_vec();
+            report.parse_files = report
+                .parse_sources
+                .iter()
+                .map(|source| source.path.clone())
+                .collect();
             report.missing_files = report.parse_files.len();
             return report;
         }
@@ -175,25 +259,32 @@ pub fn load_valid_cached_files(
 
     if let Some(reason) = cache_miss_reason(&cache, workspace_root, config) {
         report.miss_reason = Some(reason);
-        report.parse_files = current_files.to_vec();
+        report.parse_sources = current_sources.to_vec();
+        report.parse_files = report
+            .parse_sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect();
         report.missing_files = report.parse_files.len();
         return report;
     }
 
     let mut current_by_relative = HashMap::new();
-    for path in current_files {
-        current_by_relative.insert(relative_cache_path(workspace_root, path), path.clone());
+    for source in current_sources {
+        current_by_relative.insert(source.relative_path.clone(), source.clone());
     }
 
     let mut loaded_relatives = HashSet::new();
     for cached_file in cache.files {
-        let Some(current_path) = current_by_relative.get(&cached_file.relative_path) else {
+        let Some(current_source) = current_by_relative.get(&cached_file.relative_path) else {
             report.extra_files += 1;
             continue;
         };
 
-        match file_metadata(current_path) {
-            Ok(metadata) if metadata == cached_file.metadata => {
+        match file_metadata(&current_source.path) {
+            Ok(metadata)
+                if metadata == cached_file.metadata && cached_file.uri == current_source.uri =>
+            {
                 report.indexed_symbols += cached_file.file_symbols.symbols.len();
                 index.update_file(&cached_file.uri, cached_file.file_symbols);
                 loaded_relatives.insert(cached_file.relative_path);
@@ -205,12 +296,20 @@ pub fn load_valid_cached_files(
         }
     }
 
-    for (relative, path) in current_by_relative {
+    for (relative, source) in current_by_relative {
         if !loaded_relatives.contains(&relative) {
-            report.parse_files.push(path);
+            report.parse_sources.push(source);
         }
     }
+    report.parse_files = report
+        .parse_sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect();
     report.parse_files.sort();
+    report
+        .parse_sources
+        .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     report.missing_files = report.parse_files.len().saturating_sub(report.stale_files);
     report
 }
@@ -221,24 +320,36 @@ pub fn build_cache_from_index(
     current_files: &[PathBuf],
     config: &IndexCacheConfig,
 ) -> IndexCache {
+    let sources: Vec<CacheSourceFile> = current_files
+        .iter()
+        .map(|path| CacheSourceFile::workspace(workspace_root, path))
+        .collect();
+    build_cache_from_sources(index, workspace_root, &sources, config)
+}
+
+pub fn build_cache_from_sources(
+    index: &WorkspaceIndex,
+    workspace_root: &Path,
+    current_sources: &[CacheSourceFile],
+    config: &IndexCacheConfig,
+) -> IndexCache {
     let mut files = Vec::new();
 
-    for path in current_files {
-        let uri = path_to_uri(path);
+    for source in current_sources {
         let Some(file_symbols) = index
             .file_symbols
-            .get(&uri)
+            .get(&source.uri)
             .map(|entry| entry.value().clone())
         else {
             continue;
         };
-        let Ok(metadata) = file_metadata(path) else {
+        let Ok(metadata) = file_metadata(&source.path) else {
             continue;
         };
 
         files.push(CachedFile {
-            uri,
-            relative_path: relative_cache_path(workspace_root, path),
+            uri: source.uri.clone(),
+            relative_path: source.relative_path.clone(),
             metadata,
             file_symbols,
         });
@@ -249,6 +360,7 @@ pub fn build_cache_from_index(
 
     IndexCache {
         schema_version: CACHE_SCHEMA_VERSION,
+        namespace: config.namespace.as_str().to_string(),
         php_lsp_version: config.php_lsp_version.clone(),
         workspace_root: normalized_path_string(workspace_root),
         config_hash: config.config_hash(),
@@ -292,6 +404,13 @@ fn cache_miss_reason(
         return Some(format!(
             "schema version mismatch: cache={}, expected={}",
             cache.schema_version, CACHE_SCHEMA_VERSION
+        ));
+    }
+    if cache.namespace != config.namespace.as_str() {
+        return Some(format!(
+            "namespace mismatch: cache={}, expected={}",
+            cache.namespace,
+            config.namespace.as_str()
         ));
     }
     if cache.php_lsp_version != config.php_lsp_version {
@@ -417,6 +536,7 @@ mod tests {
 
     fn test_config() -> IndexCacheConfig {
         IndexCacheConfig {
+            namespace: CacheNamespace::Workspace,
             php_lsp_version: "0.4.1".to_string(),
             php_version: "8.2".to_string(),
             include_paths: vec!["src".to_string()],
@@ -518,5 +638,24 @@ mod tests {
             Some(CACHE_FILE_NAME)
         );
         assert!(path.starts_with(base.join("php-lsp")));
+        assert!(path.ends_with(Path::new("workspace").join(CACHE_FILE_NAME)));
+    }
+
+    #[test]
+    fn cache_path_uses_separate_namespace_directories() {
+        let base = PathBuf::from("/tmp/php-lsp-cache-base");
+        let root = Path::new("/tmp/project");
+        let workspace =
+            cache_file_path_with_base_for_namespace(base.clone(), root, CacheNamespace::Workspace);
+        let stubs =
+            cache_file_path_with_base_for_namespace(base.clone(), root, CacheNamespace::Stubs);
+        let vendor = cache_file_path_with_base_for_namespace(base, root, CacheNamespace::Vendor);
+
+        assert_ne!(workspace, stubs);
+        assert_ne!(workspace, vendor);
+        assert_ne!(stubs, vendor);
+        assert!(workspace.ends_with(Path::new("workspace").join(CACHE_FILE_NAME)));
+        assert!(stubs.ends_with(Path::new("stubs").join(CACHE_FILE_NAME)));
+        assert!(vendor.ends_with(Path::new("vendor").join(CACHE_FILE_NAME)));
     }
 }
