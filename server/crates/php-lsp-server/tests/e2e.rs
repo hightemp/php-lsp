@@ -551,6 +551,26 @@ fn semantic_tokens_full_delta_request(id: i64, uri: &str, previous_result_id: &s
         .finish()
 }
 
+fn semantic_tokens_range_request(
+    id: i64,
+    uri: &str,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+) -> Request {
+    Request::build("textDocument/semanticTokens/range")
+        .params(json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character }
+            }
+        }))
+        .id(id)
+        .finish()
+}
+
 fn rename_request(id: i64, uri: &str, line: u32, character: u32, new_name: &str) -> Request {
     Request::build("textDocument/rename")
         .params(json!({
@@ -888,9 +908,13 @@ async fn test_initialize_and_shutdown() {
             && file_operations.get("didRename").is_some()
             && file_operations.get("didDelete").is_some()
             && file_operations.get("willCreate").is_some()
-            && file_operations.get("willRename").is_some()
             && file_operations.get("willDelete").is_some(),
-        "expected will/did file operation capabilities, got: {}",
+        "expected implemented will/did file operation capabilities, got: {}",
+        file_operations
+    );
+    assert!(
+        file_operations.get("willRename").is_none(),
+        "willRename should not be advertised until it returns meaningful edits, got: {}",
         file_operations
     );
     assert!(
@@ -954,6 +978,12 @@ async fn test_initialize_and_shutdown() {
         semantic_full.get("delta").and_then(|v| v.as_bool()),
         Some(true),
         "expected full/delta semantic tokens support, got: {}",
+        result
+    );
+    assert_eq!(
+        semantic_provider.get("range").and_then(|v| v.as_bool()),
+        Some(true),
+        "expected semanticTokens/range support, got: {}",
         result
     );
     let semantic_token_types = semantic_provider
@@ -4628,6 +4658,86 @@ async fn test_semantic_tokens_full_returns_php_token_types() {
                 && *length == 8
                 && *token_type == TOKEN_VARIABLE),
         "expected local variable token for $message, got: {:?}",
+        tokens
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_semantic_tokens_range_returns_only_requested_lines() {
+    const TOKEN_METHOD: u64 = 10;
+    const TOKEN_VARIABLE: u64 = 6;
+
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let uri = "file:///test/SemanticTokensRange.php";
+    let code = "<?php\nclass Demo {\n    public function skip(): void {}\n    public function run(): void {\n        $value = \"one\";\n    }\n}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(semantic_tokens_range_request(2, uri, 3, 0, 5, 0))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let tokens = decode_semantic_tokens(&result);
+    assert!(
+        !tokens.is_empty(),
+        "expected range semantic tokens, got: {}",
+        result
+    );
+    assert!(
+        tokens
+            .iter()
+            .all(|(line, _, _, _, _)| *line >= 3 && *line < 5),
+        "range response should only include requested lines, got: {:?}",
+        tokens
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(line, _, _, token_type, _)| *line == 3 && *token_type == TOKEN_METHOD),
+        "expected method token inside range, got: {:?}",
+        tokens
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(line, _, _, token_type, _)| *line == 4 && *token_type == TOKEN_VARIABLE),
+        "expected variable token inside range, got: {:?}",
         tokens
     );
 

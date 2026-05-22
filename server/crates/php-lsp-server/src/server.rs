@@ -3363,6 +3363,92 @@ fn semantic_tokens_for_parser(parser: &FileParser) -> Option<Vec<SemanticToken>>
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AbsoluteSemanticToken {
+    line: u32,
+    start: u32,
+    length: u32,
+    token_type: u32,
+    token_modifiers_bitset: u32,
+}
+
+fn semantic_tokens_for_parser_range(
+    parser: &FileParser,
+    range: Range,
+) -> Option<Vec<SemanticToken>> {
+    let tokens = semantic_tokens_for_parser(parser)?;
+    let absolute_tokens = decode_semantic_tokens(&tokens);
+    let range_tokens: Vec<_> = absolute_tokens
+        .into_iter()
+        .filter(|token| semantic_token_overlaps_range(*token, range))
+        .collect();
+    Some(encode_semantic_tokens(&range_tokens))
+}
+
+fn decode_semantic_tokens(tokens: &[SemanticToken]) -> Vec<AbsoluteSemanticToken> {
+    let mut line = 0u32;
+    let mut start = 0u32;
+    tokens
+        .iter()
+        .map(|token| {
+            line = line.saturating_add(token.delta_line);
+            if token.delta_line == 0 {
+                start = start.saturating_add(token.delta_start);
+            } else {
+                start = token.delta_start;
+            }
+            AbsoluteSemanticToken {
+                line,
+                start,
+                length: token.length,
+                token_type: token.token_type,
+                token_modifiers_bitset: token.token_modifiers_bitset,
+            }
+        })
+        .collect()
+}
+
+fn encode_semantic_tokens(tokens: &[AbsoluteSemanticToken]) -> Vec<SemanticToken> {
+    let mut previous_line = 0u32;
+    let mut previous_start = 0u32;
+
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(index, token)| {
+            let delta_line = if index == 0 {
+                token.line
+            } else {
+                token.line.saturating_sub(previous_line)
+            };
+            let delta_start = if delta_line == 0 {
+                token.start.saturating_sub(previous_start)
+            } else {
+                token.start
+            };
+            previous_line = token.line;
+            previous_start = token.start;
+            SemanticToken {
+                delta_line,
+                delta_start,
+                length: token.length,
+                token_type: token.token_type,
+                token_modifiers_bitset: token.token_modifiers_bitset,
+            }
+        })
+        .collect()
+}
+
+fn semantic_token_overlaps_range(token: AbsoluteSemanticToken, range: Range) -> bool {
+    let token_start = Position::new(token.line, token.start);
+    let token_end = Position::new(token.line, token.start.saturating_add(token.length));
+    position_before(token_start, range.end) && position_before(range.start, token_end)
+}
+
+fn position_before(left: Position, right: Position) -> bool {
+    left.line < right.line || (left.line == right.line && left.character < right.character)
+}
+
 fn semantic_tokens_flat_len(token_count: usize) -> u32 {
     u32::try_from(token_count.saturating_mul(5)).unwrap_or(u32::MAX)
 }
@@ -3419,6 +3505,298 @@ fn full_document_range(source: &str) -> Range {
     Range {
         start: Position::new(0, 0),
         end: Position::new(line, character),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceSymbolCandidate {
+    score: i64,
+    symbol: php_lsp_types::SymbolInfo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceSymbolKindFilter {
+    Type,
+    Class,
+    Interface,
+    Trait,
+    Enum,
+    Function,
+    Method,
+    Property,
+    Constant,
+}
+
+fn workspace_symbol_candidates(
+    index: &WorkspaceIndex,
+    raw_query: &str,
+) -> Vec<WorkspaceSymbolCandidate> {
+    let (kind_filter, query) = parse_workspace_symbol_query(raw_query);
+    if query.is_empty() && kind_filter.is_none() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for file_symbols in index.file_symbols.iter() {
+        for symbol in &file_symbols.symbols {
+            if symbol.modifiers.is_builtin {
+                continue;
+            }
+            if !kind_filter.is_none_or(|filter| workspace_symbol_kind_matches(symbol.kind, filter))
+            {
+                continue;
+            }
+            let Some(score) = workspace_symbol_score(symbol, &query) else {
+                continue;
+            };
+            candidates.push(WorkspaceSymbolCandidate {
+                score,
+                symbol: symbol.clone(),
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                workspace_symbol_kind_rank(left.symbol.kind)
+                    .cmp(&workspace_symbol_kind_rank(right.symbol.kind))
+            })
+            .then_with(|| left.symbol.fqn.cmp(&right.symbol.fqn))
+    });
+    candidates
+}
+
+fn parse_workspace_symbol_query(raw_query: &str) -> (Option<WorkspaceSymbolKindFilter>, String) {
+    let query = raw_query.trim();
+    if let Some((prefix, rest)) = query.split_once(':') {
+        if let Some(filter) = parse_workspace_symbol_kind_filter(prefix) {
+            return (Some(filter), rest.trim().to_string());
+        }
+    }
+
+    if let Some((prefix, rest)) = query.split_once(char::is_whitespace) {
+        if let Some(filter) = parse_workspace_symbol_kind_filter(prefix) {
+            return (Some(filter), rest.trim().to_string());
+        }
+    }
+
+    (None, query.to_string())
+}
+
+fn parse_workspace_symbol_kind_filter(raw: &str) -> Option<WorkspaceSymbolKindFilter> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "type" | "types" => Some(WorkspaceSymbolKindFilter::Type),
+        "class" | "classes" => Some(WorkspaceSymbolKindFilter::Class),
+        "interface" | "interfaces" => Some(WorkspaceSymbolKindFilter::Interface),
+        "trait" | "traits" => Some(WorkspaceSymbolKindFilter::Trait),
+        "enum" | "enums" => Some(WorkspaceSymbolKindFilter::Enum),
+        "function" | "functions" | "fn" => Some(WorkspaceSymbolKindFilter::Function),
+        "method" | "methods" => Some(WorkspaceSymbolKindFilter::Method),
+        "property" | "properties" | "prop" | "props" => Some(WorkspaceSymbolKindFilter::Property),
+        "const" | "constant" | "constants" => Some(WorkspaceSymbolKindFilter::Constant),
+        _ => None,
+    }
+}
+
+fn workspace_symbol_kind_matches(
+    kind: php_lsp_types::PhpSymbolKind,
+    filter: WorkspaceSymbolKindFilter,
+) -> bool {
+    match filter {
+        WorkspaceSymbolKindFilter::Type => matches!(
+            kind,
+            php_lsp_types::PhpSymbolKind::Class
+                | php_lsp_types::PhpSymbolKind::Interface
+                | php_lsp_types::PhpSymbolKind::Trait
+                | php_lsp_types::PhpSymbolKind::Enum
+        ),
+        WorkspaceSymbolKindFilter::Class => kind == php_lsp_types::PhpSymbolKind::Class,
+        WorkspaceSymbolKindFilter::Interface => kind == php_lsp_types::PhpSymbolKind::Interface,
+        WorkspaceSymbolKindFilter::Trait => kind == php_lsp_types::PhpSymbolKind::Trait,
+        WorkspaceSymbolKindFilter::Enum => kind == php_lsp_types::PhpSymbolKind::Enum,
+        WorkspaceSymbolKindFilter::Function => kind == php_lsp_types::PhpSymbolKind::Function,
+        WorkspaceSymbolKindFilter::Method => kind == php_lsp_types::PhpSymbolKind::Method,
+        WorkspaceSymbolKindFilter::Property => kind == php_lsp_types::PhpSymbolKind::Property,
+        WorkspaceSymbolKindFilter::Constant => matches!(
+            kind,
+            php_lsp_types::PhpSymbolKind::ClassConstant
+                | php_lsp_types::PhpSymbolKind::GlobalConstant
+                | php_lsp_types::PhpSymbolKind::EnumCase
+        ),
+    }
+}
+
+fn workspace_symbol_score(symbol: &php_lsp_types::SymbolInfo, query: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(1_000 + workspace_symbol_kind_bonus(symbol.kind));
+    }
+
+    let mut best_score = fuzzy_text_score(&symbol.name, query);
+    if let Some(fqn_score) = fuzzy_text_score(&symbol.fqn, query) {
+        let qualified_bonus = if query.contains('\\') { 700 } else { 100 };
+        best_score = Some(
+            best_score
+                .unwrap_or(i64::MIN)
+                .max(fqn_score + qualified_bonus),
+        );
+    }
+    if let Some(container) = workspace_symbol_container_name(symbol) {
+        if container
+            .to_ascii_lowercase()
+            .contains(&query.to_ascii_lowercase())
+        {
+            best_score = Some(best_score.unwrap_or(i64::MIN).max(5_500));
+        }
+    }
+
+    Some(best_score? + workspace_symbol_kind_bonus(symbol.kind))
+}
+
+fn fuzzy_text_score(text: &str, query: &str) -> Option<i64> {
+    let text_lower = text.to_ascii_lowercase();
+    let query_lower = query.to_ascii_lowercase();
+    if query_lower.is_empty() {
+        return Some(1_000);
+    }
+    if text_lower == query_lower {
+        return Some(10_000);
+    }
+    if text_lower.starts_with(&query_lower) {
+        return Some(9_000 - text_lower.len().saturating_sub(query_lower.len()) as i64);
+    }
+    if let Some(index) = text_lower.find(&query_lower) {
+        return Some(7_000 - (index as i64 * 10));
+    }
+
+    fuzzy_abbreviation_score(&text_lower, &query_lower)
+}
+
+fn fuzzy_abbreviation_score(text: &str, query: &str) -> Option<i64> {
+    let mut score = 4_000i64;
+    let mut last_match_index: Option<usize> = None;
+    let mut search_from = 0usize;
+
+    for query_char in query.chars() {
+        let relative_index = text[search_from..].find(query_char)?;
+        let absolute_index = search_from + relative_index;
+        if let Some(last_match_index) = last_match_index {
+            let gap = absolute_index.saturating_sub(last_match_index + 1);
+            score -= gap as i64 * 8;
+        } else {
+            score -= absolute_index as i64 * 4;
+        }
+        if absolute_index == 0
+            || text[..absolute_index]
+                .chars()
+                .last()
+                .is_some_and(|ch| ch == '\\' || ch == '_' || ch == '-' || ch.is_whitespace())
+        {
+            score += 80;
+        }
+        last_match_index = Some(absolute_index);
+        search_from = absolute_index + query_char.len_utf8();
+    }
+
+    Some(score - text.len() as i64)
+}
+
+fn workspace_symbol_kind_bonus(kind: php_lsp_types::PhpSymbolKind) -> i64 {
+    match kind {
+        php_lsp_types::PhpSymbolKind::Class => 90,
+        php_lsp_types::PhpSymbolKind::Enum => 85,
+        php_lsp_types::PhpSymbolKind::Interface => 80,
+        php_lsp_types::PhpSymbolKind::Trait => 70,
+        php_lsp_types::PhpSymbolKind::Function => 60,
+        php_lsp_types::PhpSymbolKind::Method => 40,
+        php_lsp_types::PhpSymbolKind::Property => 30,
+        php_lsp_types::PhpSymbolKind::ClassConstant
+        | php_lsp_types::PhpSymbolKind::GlobalConstant
+        | php_lsp_types::PhpSymbolKind::EnumCase => 20,
+        php_lsp_types::PhpSymbolKind::Namespace => 10,
+    }
+}
+
+fn workspace_symbol_kind_rank(kind: php_lsp_types::PhpSymbolKind) -> u8 {
+    match kind {
+        php_lsp_types::PhpSymbolKind::Class => 0,
+        php_lsp_types::PhpSymbolKind::Enum => 1,
+        php_lsp_types::PhpSymbolKind::Interface => 2,
+        php_lsp_types::PhpSymbolKind::Trait => 3,
+        php_lsp_types::PhpSymbolKind::Function => 4,
+        php_lsp_types::PhpSymbolKind::Method => 5,
+        php_lsp_types::PhpSymbolKind::Property => 6,
+        php_lsp_types::PhpSymbolKind::ClassConstant
+        | php_lsp_types::PhpSymbolKind::GlobalConstant
+        | php_lsp_types::PhpSymbolKind::EnumCase => 7,
+        php_lsp_types::PhpSymbolKind::Namespace => 8,
+    }
+}
+
+fn workspace_symbol_container_name(symbol: &php_lsp_types::SymbolInfo) -> Option<String> {
+    symbol.parent_fqn.clone().or_else(|| {
+        let fqn = &symbol.fqn;
+        fqn.rfind('\\').map(|index| fqn[..index].to_string())
+    })
+}
+
+async fn workspace_symbol_source_for_uri(
+    uri_str: &str,
+    open_files: &DashMap<String, FileParser>,
+    source_cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(cached) = source_cache.get(uri_str) {
+        return cached.clone();
+    }
+
+    let source = { open_files.get(uri_str).map(|parser| parser.source()) };
+    let source = if source.is_some() {
+        source
+    } else if let Some(path) = uri_to_path(uri_str) {
+        read_file_to_string_blocking(path, "workspace/symbol source read")
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    source_cache.insert(uri_str.to_string(), source.clone());
+    source
+}
+
+async fn workspace_symbol_information(
+    symbol: &php_lsp_types::SymbolInfo,
+    open_files: &DashMap<String, FileParser>,
+    source_cache: &mut HashMap<String, Option<String>>,
+) -> Option<SymbolInformation> {
+    let uri: Uri = symbol.uri.parse().ok()?;
+    let source = workspace_symbol_source_for_uri(&symbol.uri, open_files, source_cache).await;
+    let range = workspace_symbol_lsp_range(source.as_deref(), symbol.range);
+
+    #[allow(deprecated)]
+    Some(SymbolInformation {
+        name: symbol.name.clone(),
+        kind: php_kind_to_lsp(symbol.kind),
+        tags: if symbol.modifiers.is_deprecated {
+            Some(vec![SymbolTag::DEPRECATED])
+        } else {
+            None
+        },
+        deprecated: None,
+        location: Location { uri, range },
+        container_name: workspace_symbol_container_name(symbol),
+    })
+}
+
+fn workspace_symbol_lsp_range(source: Option<&str>, range: (u32, u32, u32, u32)) -> Range {
+    let range = source
+        .map(|source| range_byte_to_utf16(source, range))
+        .unwrap_or(range);
+    Range {
+        start: Position::new(range.0, range.1),
+        end: Position::new(range.2, range.3),
     }
 }
 
@@ -9326,7 +9704,7 @@ impl LanguageServer for PhpLspBackend {
                             did_create: Some(php_files.clone()),
                             will_create: Some(php_files.clone()),
                             did_rename: Some(php_files.clone()),
-                            will_rename: Some(php_files.clone()),
+                            will_rename: None,
                             did_delete: Some(php_files),
                             will_delete: Some(php_file_operation_registration_options()),
                         }
@@ -9373,7 +9751,7 @@ impl LanguageServer for PhpLspBackend {
                         SemanticTokensOptions {
                             work_done_progress_options: WorkDoneProgressOptions::default(),
                             legend: semantic_tokens_legend(),
-                            range: None,
+                            range: Some(true),
                             full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                         },
                     ),
@@ -12038,6 +12416,30 @@ impl LanguageServer for PhpLspBackend {
         )))
     }
 
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        let uri_str = params.text_document.uri.as_str().to_string();
+        tracing::debug!("semanticTokens/range: {}", uri_str);
+
+        let data = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(parser) => parser,
+                None => return Ok(None),
+            };
+            match semantic_tokens_for_parser_range(&parser, params.range) {
+                Some(data) => data,
+                None => return Ok(None),
+            }
+        };
+
+        Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
+    }
+
     async fn symbol(
         &self,
         params: WorkspaceSymbolParams,
@@ -12049,40 +12451,19 @@ impl LanguageServer for PhpLspBackend {
             return Ok(Some(WorkspaceSymbolResponse::Flat(vec![])));
         }
 
-        let results = self.index.search(query);
+        let candidates = workspace_symbol_candidates(&self.index, query);
 
-        // Limit results to avoid overwhelming the client
-        let symbols: Vec<SymbolInformation> = results
-            .into_iter()
-            .filter(|sym| !sym.modifiers.is_builtin) // Exclude built-in symbols from stubs
-            .take(200)
-            .filter_map(|sym| {
-                let uri: Uri = sym.uri.parse().ok()?;
-                #[allow(deprecated)]
-                Some(SymbolInformation {
-                    name: sym.name.clone(),
-                    kind: php_kind_to_lsp(sym.kind),
-                    tags: if sym.modifiers.is_deprecated {
-                        Some(vec![SymbolTag::DEPRECATED])
-                    } else {
-                        None
-                    },
-                    deprecated: None,
-                    location: Location {
-                        uri,
-                        range: Range {
-                            start: Position::new(sym.range.0, sym.range.1),
-                            end: Position::new(sym.range.2, sym.range.3),
-                        },
-                    },
-                    container_name: sym.parent_fqn.clone().or_else(|| {
-                        // For top-level symbols, use namespace as container
-                        let fqn = &sym.fqn;
-                        fqn.rfind('\\').map(|i| fqn[..i].to_string())
-                    }),
-                })
-            })
-            .collect();
+        // Limit results to avoid overwhelming the client.
+        let mut source_cache = HashMap::new();
+        let mut symbols = Vec::new();
+        for candidate in candidates.into_iter().take(200) {
+            if let Some(symbol) =
+                workspace_symbol_information(&candidate.symbol, &self.open_files, &mut source_cache)
+                    .await
+            {
+                symbols.push(symbol);
+            }
+        }
 
         Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
     }
@@ -12839,6 +13220,70 @@ mod tests {
         // Search for "xyz" should find nothing
         let results = index.search("xyz");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_symbol_candidates_rank_filters_and_members() {
+        let index = WorkspaceIndex::new();
+        let file_symbols = FileSymbols {
+            namespace: Some("App\\Service".to_string()),
+            use_statements: vec![],
+            symbols: vec![
+                make_symbol(
+                    "UserService",
+                    "App\\Service\\UserService",
+                    PhpSymbolKind::Class,
+                    (0, 0, 10, 0),
+                    None,
+                ),
+                make_symbol(
+                    "buildUser",
+                    "App\\Service\\UserService::buildUser",
+                    PhpSymbolKind::Method,
+                    (2, 4, 4, 5),
+                    Some("App\\Service\\UserService"),
+                ),
+                make_symbol(
+                    "UserServiceFactory",
+                    "App\\Factory\\UserServiceFactory",
+                    PhpSymbolKind::Class,
+                    (20, 0, 25, 0),
+                    None,
+                ),
+            ],
+        };
+        index.update_file("file:///app.php", file_symbols);
+
+        let candidates = workspace_symbol_candidates(&index, "usrsvc");
+        let names: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.symbol.name.as_str())
+            .collect();
+        assert!(
+            names.starts_with(&["UserService"]),
+            "fuzzy query should rank the closest type first, got: {:?}",
+            names
+        );
+
+        let method_candidates = workspace_symbol_candidates(&index, "method:build");
+        assert_eq!(method_candidates.len(), 1);
+        assert_eq!(method_candidates[0].symbol.name, "buildUser");
+        assert_eq!(method_candidates[0].symbol.kind, PhpSymbolKind::Method);
+
+        let class_candidates = workspace_symbol_candidates(&index, "class:build");
+        assert!(
+            class_candidates.is_empty(),
+            "kind filter should exclude method-only matches"
+        );
+    }
+
+    #[test]
+    fn test_workspace_symbol_lsp_range_converts_byte_columns_to_utf16() {
+        let source = "<?php\n$привет = 1; class Demo {}\n";
+        let range = workspace_symbol_lsp_range(Some(source), (1, 19, 1, 24));
+
+        assert_eq!(range.start, Position::new(1, 13));
+        assert_eq!(range.end, Position::new(1, 18));
     }
 
     #[test]

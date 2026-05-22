@@ -836,11 +836,17 @@
   - Regression: добавлен fixture `test-fixtures/lsp-cases/src/Diagnostics/FrameworkNoFalsePositive.php` и server tests для Symfony/Laravel patterns плюс severity controls.
   - Validation: `cargo fmt --all --check`, targeted `cargo test -p php-lsp-server compute_diagnostics_`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `npm run lint`, `npm run build`, `git diff --check`.
 
-- [ ] **PR-043** Закрыть LSP polish gaps
+- [x] **PR-043** Закрыть LSP polish gaps *(completed 2026-05-22)*
   - Добавить `textDocument/semanticTokens/range` или явно документировать отсутствие.
   - Улучшить `workspace/symbol`: fuzzy scoring, container ranking, kind filters where possible.
   - Реализовать meaningful `willRenameFiles` для namespace/class path refactors или убрать завышенное ожидание из capabilities.
   - Проверить корректность UTF-16 ranges во всех новых edits.
+  - Implemented: `textDocument/semanticTokens/range` capability и handler поверх существующего extractor; range response фильтрует absolute tokens и заново кодирует LSP relative token stream.
+  - Implemented: `workspace/symbol` ищет по всем indexed file symbols, включая members, использует fuzzy scoring, container/FQN ranking и query kind filters (`class:`, `method:`, `function:`, `property:`, `const:` и т.п.).
+  - Implemented: `workspace/symbol` конвертирует indexed byte ranges в UTF-16 ranges по open buffer или blocking file read fallback.
+  - Implemented: `willRenameFiles` больше не advertised, пока сервер не возвращает meaningful namespace/class path refactor edits; `didRenameFiles` остается активным для index URI updates.
+  - Regression: e2e для `semanticTokens/range`, initialize capabilities; unit tests для workspace symbol ranking/filtering и UTF-16 range conversion.
+  - Validation: `cargo fmt --all --check`, targeted `workspace_symbol`/`semantic_tokens_range`/`test_initialize_and_shutdown`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
 ### Неделя 6: Release hardening, docs, acceptance (2026-06-25 → 2026-07-01)
 
