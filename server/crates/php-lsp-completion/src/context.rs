@@ -274,7 +274,12 @@ fn extract_object_expr(text: &str) -> String {
     // `$this->client->` needs the property type, not just the bare `client`.
     while i > 0 {
         let c = chars[i - 1];
-        if c.is_alphanumeric() || matches!(c, '_' | '$' | '\\' | '-' | '>' | '?') {
+        if c.is_alphanumeric()
+            || matches!(
+                c,
+                '_' | '$' | '\\' | '-' | '>' | '?' | '[' | ']' | '\'' | '"' | '(' | ')'
+            )
+        {
             i -= 1;
         } else {
             break;
@@ -381,6 +386,40 @@ mod tests {
             } => {
                 assert_eq!(object_expr, "$this->client");
                 assert_eq!(member_prefix, "reques");
+            }
+            other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_context_keeps_array_access_object() {
+        let code = "<?php\n$users[0]->";
+        let ctx = detect(code, 1, 11);
+        match ctx {
+            CompletionContext::MemberAccess {
+                object_expr,
+                member_prefix,
+                ..
+            } => {
+                assert_eq!(object_expr, "$users[0]");
+                assert_eq!(member_prefix, "");
+            }
+            other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_context_keeps_method_array_access_object() {
+        let code = "<?php\n$repo->findAll()[0]->";
+        let ctx = detect(code, 1, 21);
+        match ctx {
+            CompletionContext::MemberAccess {
+                object_expr,
+                member_prefix,
+                ..
+            } => {
+                assert_eq!(object_expr, "$repo->findAll()[0]");
+                assert_eq!(member_prefix, "");
             }
             other => panic!("Expected MemberAccess, got {:?}", other),
         }

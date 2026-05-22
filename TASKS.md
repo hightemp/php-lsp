@@ -813,10 +813,18 @@
   - Regression: parser tests for generic/class-string/callable/array-shape/literals and `TypeInfo` display tests.
   - Validation: `cargo fmt --all --check`, targeted PHPDoc/type display tests, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **PR-041** Улучшить inference для переменных и expressions
+- [x] **PR-041** Улучшить inference для переменных и expressions *(completed 2026-05-22)*
   - Возврат методов через PHPDoc generics, iterable foreach value type, array access best-effort.
   - `instanceof` narrowing для positive/negative branches.
   - Типы свойств из constructor promotion, assignments и `@var` объединять с приоритетами.
+  - Implemented: `VariableInference` сохраняет structured `TypeInfo`, чтобы использовать PHPDoc generics/array-shapes не только как display string.
+  - Implemented: `foreach ($items as $item)` выводит тип `$item` из `array<TKey, TValue>`, `list<T>`, `iterable<TKey, TValue>`, collection-like generics.
+  - Implemented: `$users[0]->...` и `$row['user']->...` резолвятся через generic element type / array-shape key; completion context сохраняет `$users[0]` и `$repo->findAll()[0]` как object expression.
+  - Implemented: method return `@return array<int, User>` участвует в array-access inference без ложного класса `array<int, User>`.
+  - Implemented: positive `if ($x instanceof Foo) { ... }` narrowing; negative guard narrowing с early exit сохранен regression-тестом.
+  - Implemented: property `@var` становится property type source, если native/promoted type отсутствует; native/promoted type имеет приоритет, assignment fallback остается запасным путем.
+  - Regression: parser tests для foreach generic value, generic method return array access, array shape access, completion-style `$users[0]`, positive/negative `instanceof`, property `@var`; completion context tests для array access object expr.
+  - Validation: `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
 - [ ] **PR-042** Снизить false positives diagnostics на framework-heavy коде
   - Добавить regression corpus для Symfony/Laravel/PHPUnit patterns без project-specific hardcode.

@@ -621,7 +621,7 @@ fn extract_properties(
     let doc_comment = find_doc_comment(node, source);
 
     // Extract type annotation if present
-    let type_info = node
+    let native_type_info = node
         .child_by_field_name("type")
         .map(|t| parse_type_node(t, source));
 
@@ -633,6 +633,11 @@ fn extract_properties(
                 // Remove leading $ from property name
                 let name = raw_name.strip_prefix('$').unwrap_or(raw_name).to_string();
                 let fqn = format!("{}::${}", parent_fqn, name);
+                let type_info = native_type_info.clone().or_else(|| {
+                    doc_comment
+                        .as_deref()
+                        .and_then(|doc| phpdoc_var_type_for_property(doc, raw_name))
+                });
 
                 result.symbols.push(SymbolInfo {
                     name,
@@ -826,6 +831,60 @@ fn apply_phpdoc_to_signature(signature: &mut Signature, doc_comment: &str) {
                 }
             }
         }
+    }
+}
+
+fn phpdoc_var_type_for_property(doc_comment: &str, raw_property_name: &str) -> Option<TypeInfo> {
+    let phpdoc = crate::phpdoc::parse_phpdoc(doc_comment);
+    let var_type = phpdoc.var_type?;
+    let tagged_var = phpdoc_tagged_var_name(doc_comment);
+
+    if let Some(tagged_var) = tagged_var {
+        if tagged_var != raw_property_name {
+            return None;
+        }
+    }
+
+    Some(var_type)
+}
+
+fn phpdoc_tagged_var_name(doc_comment: &str) -> Option<String> {
+    for raw_line in doc_comment.lines() {
+        let mut line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("/**") {
+            line = rest.trim_start();
+        }
+        if let Some(rest) = line.strip_prefix('*') {
+            line = rest.trim_start();
+        }
+        if line.starts_with("*/") || line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@var") {
+            for token in rest.split_whitespace() {
+                if let Some(name) = phpdoc_var_token(token) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn phpdoc_var_token(token: &str) -> Option<String> {
+    let trimmed = token.trim_matches(|c: char| c == ',' || c == ';' || c == ')' || c == '(');
+    if !trimmed.starts_with('$') {
+        return None;
+    }
+
+    let ident: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    if ident.len() > 1 {
+        Some(ident)
+    } else {
+        None
     }
 }
 
@@ -1756,5 +1815,46 @@ class MyService {
             not_promoted.is_none(),
             "Regular param $notPromoted should NOT become a Property symbol"
         );
+    }
+
+    #[test]
+    fn test_property_phpdoc_var_sets_property_type_when_native_type_is_missing() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App;
+
+use App\Entity\User;
+
+class Holder {
+    /** @var User $user */
+    private $user;
+
+    /** @var User $native */
+    private Account $native;
+}
+"#,
+        );
+
+        let user_prop = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\Holder::$user")
+            .expect("property should be extracted");
+        let user_type = user_prop
+            .signature
+            .as_ref()
+            .and_then(|sig| sig.return_type.as_ref());
+        assert!(matches!(user_type, Some(TypeInfo::Simple(name)) if name == "User"));
+
+        let native_prop = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\Holder::$native")
+            .expect("native property should be extracted");
+        let native_type = native_prop
+            .signature
+            .as_ref()
+            .and_then(|sig| sig.return_type.as_ref());
+        assert!(matches!(native_type, Some(TypeInfo::Simple(name)) if name == "Account"));
     }
 }

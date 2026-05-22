@@ -50,6 +50,7 @@ struct VariableInference {
     type_display: Option<String>,
     resolved_type_fqn: Option<String>,
     phpdoc_comment: Option<String>,
+    type_info: Option<TypeInfo>,
 }
 
 impl VariableInference {
@@ -166,6 +167,11 @@ pub fn infer_variable_type_at_position(
     let usage_start = position_to_byte(source, line, character);
     let normalized = normalize_var_name(var_name);
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
+    if let Some(resolved) =
+        infer_textual_array_access_type(scope, &normalized, usage_start, source, file_symbols, None)
+    {
+        return Some(resolved);
+    }
     infer_variable_type_in_scope(scope, &normalized, usage_start, source, file_symbols, None)
 }
 
@@ -885,19 +891,14 @@ fn try_resolve_object_type<'a>(
                 if sym.fqn == property_fqn_dollar {
                     if let Some(ref sig) = sym.signature {
                         if let Some(ref ret) = sig.return_type {
-                            let type_str = ret.to_string();
-                            // Resolve the type name to FQN
-                            if !type_str.is_empty() && type_str != "mixed" {
-                                // Strip nullable prefix for resolution
-                                let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
-                                // self/static/$this → return owning class
-                                if base_type == "self"
-                                    || base_type == "static"
-                                    || base_type == "$this"
-                                {
-                                    return Some(class_fqn.clone());
-                                }
-                                return Some(resolve_class_name(base_type, file_symbols));
+                            if let Some(resolved) = resolve_symbol_type_info_to_object_fqn(
+                                ret,
+                                &class_fqn,
+                                object_node,
+                                source,
+                                file_symbols,
+                            ) {
+                                return Some(resolved);
                             }
                         }
                     }
@@ -928,17 +929,14 @@ fn try_resolve_object_type<'a>(
                 if sym.fqn == method_fqn {
                     if let Some(ref sig) = sym.signature {
                         if let Some(ref ret) = sig.return_type {
-                            let type_str = ret.to_string();
-                            if !type_str.is_empty() && type_str != "mixed" {
-                                let base_type = type_str.strip_prefix('?').unwrap_or(&type_str);
-                                // self/static/$this → return owning class
-                                if base_type == "self"
-                                    || base_type == "static"
-                                    || base_type == "$this"
-                                {
-                                    return Some(class_fqn.clone());
-                                }
-                                return Some(resolve_class_name(base_type, file_symbols));
+                            if let Some(resolved) = resolve_symbol_type_info_to_object_fqn(
+                                ret,
+                                &class_fqn,
+                                object_node,
+                                source,
+                                file_symbols,
+                            ) {
+                                return Some(resolved);
                             }
                         }
                     }
@@ -987,6 +985,17 @@ fn try_resolve_object_type<'a>(
             }
 
             None
+        }
+        // Array access: $items[0] or $row['user'] can be object-like when
+        // the base expression is typed with PHPDoc generics or an array shape.
+        "subscript_expression" => {
+            let base = object_node.named_child(0)?;
+            let key_text = object_node
+                .named_child(1)
+                .map(|node| source[node.byte_range()].trim().to_string());
+            let base_type = infer_expression_type_info(base, source, file_symbols, resolver)?;
+            let value_type = iterable_value_type_info(&base_type, key_text.as_deref())?;
+            resolve_phpdoc_var_type(&value_type, object_node, source, file_symbols)
         }
         // Static call: Foo::create() — can't resolve return type without full type info
         _ => None,
@@ -1153,15 +1162,24 @@ fn find_variable_inference_before_usage(
             continue;
         }
 
+        if let Some(foreach_info) =
+            foreach_value_inference(stmt, var_name, usage_start, source, file_symbols, resolver)
+        {
+            inferred = Some((stmt.start_byte(), foreach_info));
+            continue;
+        }
+
         // Assignment inference: $var = <expr>;
         if let Some(right) = assignment_rhs {
             if let Some(resolved) = try_resolve_object_type(right, source, file_symbols, resolver) {
+                let type_info = Some(TypeInfo::Simple(resolved.clone()));
                 inferred = Some((
                     stmt.start_byte(),
                     VariableInference {
                         type_display: Some(resolved.clone()),
                         resolved_type_fqn: Some(resolved),
                         phpdoc_comment: None,
+                        type_info,
                     },
                 ));
             }
@@ -1179,7 +1197,13 @@ fn instanceof_guard_inference(
     file_symbols: &FileSymbols,
 ) -> Option<VariableInference> {
     if stmt.kind() != "if_statement" || stmt.end_byte() > usage_start {
-        return None;
+        return positive_instanceof_branch_inference(
+            stmt,
+            var_name,
+            usage_start,
+            source,
+            file_symbols,
+        );
     }
 
     let condition = if_condition_text(stmt, source)?;
@@ -1193,8 +1217,40 @@ fn instanceof_guard_inference(
     let resolved = resolve_class_name(&class_name, file_symbols);
     Some(VariableInference {
         type_display: Some(class_name),
-        resolved_type_fqn: Some(resolved),
+        resolved_type_fqn: Some(resolved.clone()),
         phpdoc_comment: None,
+        type_info: Some(TypeInfo::Simple(resolved)),
+    })
+}
+
+fn positive_instanceof_branch_inference(
+    stmt: Node,
+    var_name: &str,
+    usage_start: usize,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<VariableInference> {
+    if stmt.kind() != "if_statement" {
+        return None;
+    }
+
+    let body = stmt.child_by_field_name("body")?;
+    if usage_start < body.start_byte() || usage_start > body.end_byte() {
+        return None;
+    }
+
+    let condition = if_condition_text(stmt, source)?;
+    if !positive_instanceof_guard_for_var(condition, var_name) {
+        return None;
+    }
+
+    let class_name = class_name_after_instanceof(condition)?;
+    let resolved = resolve_class_name(&class_name, file_symbols);
+    Some(VariableInference {
+        type_display: Some(class_name),
+        resolved_type_fqn: Some(resolved.clone()),
+        phpdoc_comment: None,
+        type_info: Some(TypeInfo::Simple(resolved)),
     })
 }
 
@@ -1221,6 +1277,12 @@ fn negative_instanceof_guard_for_var(condition: &str, var_name: &str) -> bool {
     let compact: String = condition.chars().filter(|ch| !ch.is_whitespace()).collect();
     compact.starts_with(&format!("!{}instanceof", var_name))
         || compact.starts_with(&format!("!({}instanceof", var_name))
+}
+
+fn positive_instanceof_guard_for_var(condition: &str, var_name: &str) -> bool {
+    let compact: String = condition.chars().filter(|ch| !ch.is_whitespace()).collect();
+    compact.starts_with(&format!("{}instanceof", var_name))
+        || compact.starts_with(&format!("({}instanceof", var_name))
 }
 
 fn if_then_branch_exits(stmt: Node, source: &str) -> bool {
@@ -1288,6 +1350,7 @@ fn extract_preceding_phpdoc_var_inference(
         type_display,
         resolved_type_fqn,
         phpdoc_comment: Some(comment.to_string()),
+        type_info: Some(type_info),
     })
 }
 
@@ -1315,8 +1378,9 @@ fn infer_variable_in_scope(
                                 inferred.type_display =
                                     Some(source[type_node.byte_range()].trim().to_string());
                                 if let Some(class_name) = extract_type_name(type_node, source) {
-                                    inferred.resolved_type_fqn =
-                                        Some(resolve_class_name(&class_name, file_symbols));
+                                    let resolved = resolve_class_name(&class_name, file_symbols);
+                                    inferred.resolved_type_fqn = Some(resolved.clone());
+                                    inferred.type_info = Some(TypeInfo::Simple(resolved));
                                 }
                             }
                             break;
@@ -1478,6 +1542,280 @@ fn is_builtin_non_object_type(name: &str) -> bool {
             | "static"
             | "parent"
     )
+}
+
+fn resolve_symbol_type_info_to_object_fqn(
+    type_info: &TypeInfo,
+    owner_fqn: &str,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    match type_info {
+        TypeInfo::Self_ | TypeInfo::Static_ => Some(owner_fqn.to_string()),
+        TypeInfo::Simple(name) if matches!(name.as_str(), "$this" | "self" | "static") => {
+            Some(owner_fqn.to_string())
+        }
+        TypeInfo::Parent_ => None,
+        TypeInfo::Nullable(inner) => resolve_symbol_type_info_to_object_fqn(
+            inner,
+            owner_fqn,
+            context_node,
+            source,
+            file_symbols,
+        ),
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types.iter().find_map(|ty| {
+            resolve_symbol_type_info_to_object_fqn(
+                ty,
+                owner_fqn,
+                context_node,
+                source,
+                file_symbols,
+            )
+        }),
+        _ => resolve_phpdoc_var_type(type_info, context_node, source, file_symbols),
+    }
+}
+
+fn infer_expression_type_info(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    match node.kind() {
+        "parenthesized_expression" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if let Some(type_info) =
+                        infer_expression_type_info(child, source, file_symbols, resolver)
+                    {
+                        return Some(type_info);
+                    }
+                }
+            }
+            None
+        }
+        "variable_name" => {
+            let var_name = normalize_var_name(&source[node.byte_range()]);
+            let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
+            infer_variable_in_scope(
+                scope,
+                &var_name,
+                node.start_byte(),
+                source,
+                file_symbols,
+                resolver,
+            )
+            .type_info
+        }
+        "object_creation_expression" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if matches!(child.kind(), "name" | "qualified_name") {
+                        return Some(TypeInfo::Simple(resolve_class_name(
+                            &source[child.byte_range()],
+                            file_symbols,
+                        )));
+                    }
+                }
+            }
+            None
+        }
+        "member_access_expression" => {
+            let object = node.child_by_field_name("object")?;
+            let name = node.child_by_field_name("name")?;
+            let class_fqn = try_resolve_object_type(object, source, file_symbols, resolver)?;
+            let prop_fqn = format!("{}::${}", class_fqn, &source[name.byte_range()]);
+            file_symbols.symbols.iter().find_map(|sym| {
+                (sym.fqn == prop_fqn)
+                    .then(|| sym.signature.as_ref()?.return_type.clone())
+                    .flatten()
+            })
+        }
+        "member_call_expression" => {
+            let object = node.child_by_field_name("object")?;
+            let name = node.child_by_field_name("name")?;
+            let class_fqn = try_resolve_object_type(object, source, file_symbols, resolver)?;
+            let method_fqn = format!("{}::{}", class_fqn, &source[name.byte_range()]);
+            file_symbols.symbols.iter().find_map(|sym| {
+                (sym.fqn == method_fqn)
+                    .then(|| sym.signature.as_ref()?.return_type.clone())
+                    .flatten()
+            })
+        }
+        "subscript_expression" => {
+            let base = node.named_child(0)?;
+            let key_text = node
+                .named_child(1)
+                .map(|node| source[node.byte_range()].trim().to_string());
+            let base_type = infer_expression_type_info(base, source, file_symbols, resolver)?;
+            iterable_value_type_info(&base_type, key_text.as_deref())
+        }
+        _ => None,
+    }
+}
+
+fn foreach_value_inference(
+    stmt: Node,
+    var_name: &str,
+    usage_start: usize,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<VariableInference> {
+    if stmt.kind() != "foreach_statement"
+        || usage_start < stmt.start_byte()
+        || usage_start > stmt.end_byte()
+    {
+        return None;
+    }
+
+    let value_node = foreach_value_variable_node(stmt, source)?;
+    if normalize_var_name(&source[value_node.byte_range()]) != var_name {
+        return None;
+    }
+
+    let iterable_node = foreach_iterable_node(stmt)?;
+    let iterable_type = infer_expression_type_info(iterable_node, source, file_symbols, resolver)?;
+    let value_type = iterable_value_type_info(&iterable_type, None)?;
+    let resolved_type_fqn = resolve_phpdoc_var_type(&value_type, stmt, source, file_symbols);
+    Some(VariableInference {
+        type_display: Some(value_type.to_string()),
+        resolved_type_fqn,
+        phpdoc_comment: None,
+        type_info: Some(value_type),
+    })
+}
+
+fn foreach_iterable_node(stmt: Node) -> Option<Node> {
+    stmt.named_child(0)
+}
+
+fn foreach_value_variable_node<'a>(stmt: Node<'a>, source: &str) -> Option<Node<'a>> {
+    let value_expr = match stmt.named_child(1)? {
+        pair if pair.kind() == "pair" => {
+            let count = pair.named_child_count();
+            pair.named_child(count.saturating_sub(1))?
+        }
+        value => value,
+    };
+    variable_node_in_foreach_part(value_expr, source)
+}
+
+fn variable_node_in_foreach_part<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
+    if node.kind() == "variable_name" && source[node.byte_range()].starts_with('$') {
+        return Some(node);
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if let Some(found) = variable_node_in_foreach_part(child, source) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn infer_textual_array_access_type(
+    scope_node: Node,
+    expr_text: &str,
+    usage_start: usize,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<String> {
+    let (base_var, key_text) = parse_textual_array_access(expr_text)?;
+    let base = infer_variable_in_scope(
+        scope_node,
+        &base_var,
+        usage_start,
+        source,
+        file_symbols,
+        resolver,
+    );
+    let base_type = base.type_info.as_ref()?;
+    let value_type = iterable_value_type_info(base_type, key_text.as_deref())?;
+    resolve_phpdoc_var_type(&value_type, scope_node, source, file_symbols)
+}
+
+fn parse_textual_array_access(expr_text: &str) -> Option<(String, Option<String>)> {
+    let bracket = expr_text.find('[')?;
+    let base = expr_text[..bracket].trim();
+    if !base.starts_with('$') || base.len() <= 1 {
+        return None;
+    }
+    let key = expr_text[bracket + 1..]
+        .split(']')
+        .next()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string);
+    Some((normalize_var_name(base), key))
+}
+
+fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) -> Option<TypeInfo> {
+    match type_info {
+        TypeInfo::Nullable(inner) => iterable_value_type_info(inner, key_text),
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
+            .iter()
+            .find_map(|ty| iterable_value_type_info(ty, key_text)),
+        TypeInfo::Generic { base, args } => generic_value_type_arg(base, args).cloned(),
+        TypeInfo::ArrayShape(items) => array_shape_value_type(items, key_text).cloned(),
+        _ => None,
+    }
+}
+
+fn generic_value_type_arg<'a>(base: &str, args: &'a [TypeInfo]) -> Option<&'a TypeInfo> {
+    if args.is_empty() {
+        return None;
+    }
+
+    let base = base.trim_start_matches('\\').to_ascii_lowercase();
+    let value_arg_index = match base.as_str() {
+        "array" | "iterable" | "traversable" | "iterator" | "iteratoraggregate" | "generator" => {
+            usize::from(args.len() > 1)
+        }
+        "list" | "non-empty-list" | "arrayobject" => 0,
+        _ if base.ends_with("\\collection")
+            || base.ends_with("collection")
+            || base.ends_with("\\arrayobject") =>
+        {
+            usize::from(args.len() > 1)
+        }
+        _ => return None,
+    };
+
+    args.get(value_arg_index)
+}
+
+fn array_shape_value_type<'a>(
+    items: &'a [php_lsp_types::ArrayShapeItem],
+    key_text: Option<&str>,
+) -> Option<&'a TypeInfo> {
+    let key = key_text.and_then(normalize_array_access_key);
+    if let Some(key) = key {
+        if let Some(item) = items.iter().find(|item| {
+            item.key
+                .as_deref()
+                .and_then(normalize_array_access_key)
+                .as_deref()
+                == Some(key.as_str())
+        }) {
+            return Some(&item.value);
+        }
+    }
+
+    items
+        .iter()
+        .find(|item| item.key.is_none())
+        .or_else(|| items.first())
+        .map(|item| &item.value)
+}
+
+fn normalize_array_access_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches(|ch| ch == '\'' || ch == '"');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn position_to_byte(source: &str, line: u32, character: u32) -> usize {
@@ -2113,6 +2451,152 @@ class UserRepository {
             .as_deref()
             .unwrap_or("")
             .contains("@var Baz $baz2"));
+    }
+
+    #[test]
+    fn test_resolve_foreach_value_from_phpdoc_generic_array() {
+        let code = r#"<?php
+namespace App;
+
+use App\Entity\User;
+
+function run(): void {
+    /** @var array<int, User> $users */
+    $users = loadUsers();
+    foreach ($users as $user) {
+        $user->getName();
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "getName");
+        let result = parse_and_resolve(code, line, col).expect("foreach value should resolve");
+        assert_eq!(result.fqn, "App\\Entity\\User::getName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_array_access_from_phpdoc_generic_array() {
+        let code = r#"<?php
+namespace App;
+
+use App\Entity\User;
+
+function run(): void {
+    /** @var array<int, User> $users */
+    $users = loadUsers();
+    $users[0]->getName();
+}
+"#;
+        let (line, col) = find_line_col(code, "getName");
+        let result = parse_and_resolve(code, line, col).expect("array element should resolve");
+        assert_eq!(result.fqn, "App\\Entity\\User::getName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_array_shape_access_from_phpdoc_var() {
+        let code = r#"<?php
+namespace App;
+
+use App\Entity\User;
+
+function run(): void {
+    /** @var array{user: User} $row */
+    $row = [];
+    $row['user']->getName();
+}
+"#;
+        let (line, col) = find_line_col(code, "getName");
+        let result =
+            parse_and_resolve(code, line, col).expect("array-shape element should resolve");
+        assert_eq!(result.fqn, "App\\Entity\\User::getName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_array_access_from_phpdoc_generic_method_return() {
+        let code = r#"<?php
+namespace App;
+
+use App\Entity\User;
+
+class UserRepository {
+    /** @return array<int, User> */
+    public function findAll() {
+        return [];
+    }
+}
+
+function run(UserRepository $repo): void {
+    $repo->findAll()[0]->getName();
+}
+"#;
+        let (line, col) = find_line_col(code, "getName");
+        let result =
+            parse_and_resolve(code, line, col).expect("generic method return item should resolve");
+        assert_eq!(result.fqn, "App\\Entity\\User::getName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_infer_variable_type_at_position_from_phpdoc_array_access_text() {
+        let code = r#"<?php
+namespace App;
+
+use App\Entity\User;
+
+function run(): void {
+    /** @var list<User> $users */
+    $users = loadUsers();
+    $users[0]->
+}
+"#;
+        let inferred = parse_and_infer_var_type_at(code, 8, 16, "$users[0]")
+            .expect("array access object type should be inferred for completion");
+        assert_eq!(inferred, "App\\Entity\\User");
+    }
+
+    #[test]
+    fn test_infer_variable_type_inside_positive_instanceof_branch() {
+        let code = r#"<?php
+namespace App\Repository;
+
+use App\Entity\User;
+use Symfony\Component\Security\Core\User\PasswordAuthenticatedUserInterface;
+
+class UserRepository {
+    public function upgradePassword(PasswordAuthenticatedUserInterface $user): void {
+        if ($user instanceof User) {
+            $user->setPassword('secret');
+        }
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "setPassword");
+        let result = parse_and_infer_var_type_at(code, line, col, "$user");
+        assert_eq!(result.as_deref(), Some("App\\Entity\\User"));
+    }
+
+    #[test]
+    fn test_resolve_property_access_type_from_property_phpdoc_var() {
+        let code = r#"<?php
+namespace App;
+
+use App\Entity\User;
+
+class Holder {
+    /** @var User */
+    private $user;
+
+    public function run(): void {
+        $this->user->getName();
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "getName");
+        let result = parse_and_resolve(code, line, col).expect("property @var type should resolve");
+        assert_eq!(result.fqn, "App\\Entity\\User::getName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
     }
 
     #[test]
