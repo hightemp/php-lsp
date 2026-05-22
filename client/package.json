@@ -1,9 +1,13 @@
 {
   "name": "php-lsp",
   "displayName": "PHP Language Server",
-  "description": "PHP language support powered by php-lsp (Rust)",
+  "description": "PHP language support powered by hightemp (Rust)",
   "version": "0.5.0",
-  "publisher": "php-lsp",
+  "publisher": "hightemp",
+  "author": {
+    "email": "hightemp.unknown@gmail.com",
+    "name": "Anton"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/hightemp/php-lsp"
