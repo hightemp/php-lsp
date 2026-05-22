@@ -7747,6 +7747,10 @@ fn load_configured_stubs(
             let cache_sources = collect_stub_cache_sources(&stubs_path, &extensions);
             let cache_path = cache::cache_file_path_for_namespace(root, CacheNamespace::Stubs);
             let cache_config = stubs_index_cache_config(&stubs_path, php_version, &stub_extensions);
+            let stub_php_version = stubs::StubPhpVersion {
+                major: php_version.major,
+                minor: php_version.minor,
+            };
             let cache_report = cache::load_valid_cached_sources(
                 index,
                 &cache_path,
@@ -7763,7 +7767,14 @@ fn load_configured_stubs(
                 let Some(ext_name) = source.relative_path.split('/').next() else {
                     continue;
                 };
-                if stubs::load_stub_file(index, ext_name, &source.path).is_some() {
+                if stubs::load_stub_file_for_php_version(
+                    index,
+                    ext_name,
+                    &source.path,
+                    Some(stub_php_version),
+                )
+                .is_some()
+                {
                     parsed += 1;
                 }
             }

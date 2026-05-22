@@ -749,11 +749,16 @@
 
 ### Неделя 4: PHP version, stubs, PHPDoc (2026-06-11 → 2026-06-17)
 
-- [ ] **PR-030 / H-006** Version-aware stubs
+- [x] **PR-030 / H-006** Version-aware stubs *(completed 2026-05-22)*
   - Парсить/учитывать `PhpStormStubsElementAvailable` и другие version-gated атрибуты из phpstorm-stubs.
   - Фильтровать built-in symbols/signatures под `phpLsp.phpVersion`.
   - При смене версии через `didChangeConfiguration` обновлять stubs cache и diagnostics без restart.
   - E2E: API доступен в PHP 8.2 и недоступен в PHP 8.1.
+  - Добавлен version-aware symbol extraction для declaration-level и parameter-level `PhpStormStubsElementAvailable`.
+  - Stubs loader передает текущий `phpLsp.phpVersion` в parser и сохраняет уже отфильтрованные symbols/signatures в stubs cache.
+  - Cache schema поднята до v4, чтобы не переиспользовать старые unfiltered stubs snapshots.
+  - Regression: parser unit tests для symbol/parameter filtering и e2e `test_php_version_filters_version_gated_stubs` на 8.2-only sodium API.
+  - Validation: `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`.
 
 - [ ] **PR-031 / H-008** Переписать PHPDoc type parser
   - Поддержать `array<int, User>`, `list<User>`, `class-string<T>`, `(A&B)|null`, `callable(A): B`.

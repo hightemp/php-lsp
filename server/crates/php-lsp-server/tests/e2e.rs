@@ -4996,6 +4996,140 @@ strlen("x");
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_php_version_filters_version_gated_stubs() {
+    let stubs_path_raw = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
+    if !stubs_path_raw.join("PhpStormStubsMap.php").exists() {
+        eprintln!("Skipping test: server/data/stubs not found");
+        return;
+    }
+    let stubs_path = stubs_path_raw.canonicalize().unwrap();
+
+    let code = r#"<?php
+sodium_crypto_stream_xchacha20_xor_ic('a', 'b', 0, 'c');
+"#;
+    let uri = "file:///test/PhpVersionStubs.php";
+
+    let (mut service81, socket81) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket81.collect::<Vec<_>>().await;
+    });
+    let tmp_root81 =
+        std::env::temp_dir().join(format!("php-lsp-version-stubs-81-{}", std::process::id()));
+    fs::create_dir_all(&tmp_root81).unwrap();
+    let root_uri81 = format!("file://{}", tmp_root81.to_string_lossy());
+    service81
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            Some(&root_uri81),
+            Some(json!({
+                "stubsPath": stubs_path.to_string_lossy().to_string(),
+                "phpVersion": "8.1",
+                "stubExtensions": ["sodium"]
+            })),
+        ))
+        .await
+        .unwrap();
+    service81
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    service81
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+    let php81_definition = service81
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(2, uri, 1, 5))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(php81_definition).is_null(),
+        "PHP 8.1 should not resolve an 8.2-only sodium function"
+    );
+    service81
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_root81);
+
+    let (mut service82, socket82) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket82.collect::<Vec<_>>().await;
+    });
+    let tmp_root82 =
+        std::env::temp_dir().join(format!("php-lsp-version-stubs-82-{}", std::process::id()));
+    fs::create_dir_all(&tmp_root82).unwrap();
+    let root_uri82 = format!("file://{}", tmp_root82.to_string_lossy());
+    service82
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            3,
+            Some(&root_uri82),
+            Some(json!({
+                "stubsPath": stubs_path.to_string_lossy().to_string(),
+                "phpVersion": "8.2",
+                "stubExtensions": ["sodium"]
+            })),
+        ))
+        .await
+        .unwrap();
+    service82
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    service82
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+    let php82_definition = service82
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(4, uri, 1, 5))
+        .await
+        .unwrap();
+    let php82_result = extract_result(php82_definition);
+    assert!(
+        php82_result
+            .get("uri")
+            .and_then(|value| value.as_str())
+            .is_some_and(|uri| uri.starts_with("phpstub://sodium/")),
+        "PHP 8.2 should resolve the sodium function from stubs, got: {}",
+        php82_result
+    );
+    service82
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(100))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_root82);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_goto_definition_variables_and_constants() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

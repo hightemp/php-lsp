@@ -5,9 +5,13 @@
 
 use crate::workspace::WorkspaceIndex;
 use php_lsp_parser::parser::FileParser;
-use php_lsp_parser::symbols::extract_file_symbols;
+use php_lsp_parser::symbols::{
+    extract_file_symbols, extract_file_symbols_for_php_version, PhpSymbolExtractionVersion,
+};
 use php_lsp_types::SymbolModifiers;
 use std::path::{Path, PathBuf};
+
+pub use php_lsp_parser::symbols::PhpSymbolExtractionVersion as StubPhpVersion;
 
 /// Default extensions that are always loaded (common PHP extensions).
 pub const DEFAULT_EXTENSIONS: &[&str] = &[
@@ -49,6 +53,15 @@ pub const DEFAULT_EXTENSIONS: &[&str] = &[
 ///
 /// Returns the number of files loaded.
 pub fn load_stubs(index: &WorkspaceIndex, stubs_path: &Path, extensions: &[&str]) -> usize {
+    load_stubs_for_php_version(index, stubs_path, extensions, None)
+}
+
+pub fn load_stubs_for_php_version(
+    index: &WorkspaceIndex,
+    stubs_path: &Path,
+    extensions: &[&str],
+    php_version: Option<PhpSymbolExtractionVersion>,
+) -> usize {
     let mut loaded_files = 0;
 
     for ext_name in extensions {
@@ -62,7 +75,7 @@ pub fn load_stubs(index: &WorkspaceIndex, stubs_path: &Path, extensions: &[&str]
         }
 
         for file_path in &php_files {
-            if load_stub_file(index, ext_name, file_path).is_some() {
+            if load_stub_file_for_php_version(index, ext_name, file_path, php_version).is_some() {
                 loaded_files += 1;
             }
         }
@@ -90,6 +103,15 @@ pub fn collect_extension_stub_files(stubs_path: &Path, ext_name: &str) -> Vec<Pa
 /// Returns the number of symbols in the parsed file, or `None` if the file could
 /// not be read or parsed.
 pub fn load_stub_file(index: &WorkspaceIndex, ext_name: &str, file_path: &Path) -> Option<usize> {
+    load_stub_file_for_php_version(index, ext_name, file_path, None)
+}
+
+pub fn load_stub_file_for_php_version(
+    index: &WorkspaceIndex,
+    ext_name: &str,
+    file_path: &Path,
+    php_version: Option<PhpSymbolExtractionVersion>,
+) -> Option<usize> {
     match std::fs::read_to_string(file_path) {
         Ok(source) => {
             let mut parser = FileParser::new();
@@ -97,7 +119,11 @@ pub fn load_stub_file(index: &WorkspaceIndex, ext_name: &str, file_path: &Path) 
 
             let tree = parser.tree()?;
             let uri = stub_file_uri(ext_name, file_path);
-            let mut file_symbols = extract_file_symbols(tree, &source, &uri);
+            let mut file_symbols = if let Some(php_version) = php_version {
+                extract_file_symbols_for_php_version(tree, &source, &uri, php_version)
+            } else {
+                extract_file_symbols(tree, &source, &uri)
+            };
 
             for sym in &mut file_symbols.symbols {
                 sym.modifiers = SymbolModifiers {

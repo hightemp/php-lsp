@@ -6,8 +6,33 @@
 use php_lsp_types::*;
 use tree_sitter::{Node, Tree};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PhpSymbolExtractionVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+
 /// Extract all symbols from a parsed PHP file.
 pub fn extract_file_symbols(tree: &Tree, source: &str, uri: &str) -> FileSymbols {
+    extract_file_symbols_with_php_version(tree, source, uri, None)
+}
+
+/// Extract symbols while filtering phpstorm-stubs availability attributes.
+pub fn extract_file_symbols_for_php_version(
+    tree: &Tree,
+    source: &str,
+    uri: &str,
+    php_version: PhpSymbolExtractionVersion,
+) -> FileSymbols {
+    extract_file_symbols_with_php_version(tree, source, uri, Some(php_version))
+}
+
+fn extract_file_symbols_with_php_version(
+    tree: &Tree,
+    source: &str,
+    uri: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
+) -> FileSymbols {
     let mut result = FileSymbols::default();
     let root = tree.root_node();
 
@@ -27,12 +52,12 @@ pub fn extract_file_symbols(tree: &Tree, source: &str, uri: &str) -> FileSymbols
 
                 // If namespace has braces, recurse into body
                 if let Some(body) = child.child_by_field_name("body") {
-                    extract_children(body, source, uri, &mut result, &ns_name);
+                    extract_children(body, source, uri, &mut result, &ns_name, php_version);
                 }
                 // If no body — namespace applies to rest of file (current_ns is set)
             }
             _ => {
-                extract_from_node(child, source, uri, &mut result, &current_ns);
+                extract_from_node(child, source, uri, &mut result, &current_ns, php_version);
             }
         }
     }
@@ -58,13 +83,22 @@ fn extract_from_node(
     uri: &str,
     result: &mut FileSymbols,
     current_ns: &Option<String>,
+    php_version: Option<PhpSymbolExtractionVersion>,
 ) {
     match node.kind() {
         "namespace_use_declaration" => {
             extract_use_statements(node, source, result);
         }
         "class_declaration" => {
-            extract_class_like(node, source, uri, result, current_ns, PhpSymbolKind::Class);
+            extract_class_like(
+                node,
+                source,
+                uri,
+                result,
+                current_ns,
+                PhpSymbolKind::Class,
+                php_version,
+            );
         }
         "interface_declaration" => {
             extract_class_like(
@@ -74,23 +108,40 @@ fn extract_from_node(
                 result,
                 current_ns,
                 PhpSymbolKind::Interface,
+                php_version,
             );
         }
         "trait_declaration" => {
-            extract_class_like(node, source, uri, result, current_ns, PhpSymbolKind::Trait);
+            extract_class_like(
+                node,
+                source,
+                uri,
+                result,
+                current_ns,
+                PhpSymbolKind::Trait,
+                php_version,
+            );
         }
         "enum_declaration" => {
-            extract_class_like(node, source, uri, result, current_ns, PhpSymbolKind::Enum);
+            extract_class_like(
+                node,
+                source,
+                uri,
+                result,
+                current_ns,
+                PhpSymbolKind::Enum,
+                php_version,
+            );
         }
         "function_definition" => {
-            extract_function(node, source, uri, result, current_ns);
+            extract_function(node, source, uri, result, current_ns, php_version);
         }
         "const_declaration" => {
-            extract_global_constants(node, source, uri, result, current_ns);
+            extract_global_constants(node, source, uri, result, current_ns, php_version);
         }
         _ => {
             // Recurse into children
-            extract_children(node, source, uri, result, current_ns);
+            extract_children(node, source, uri, result, current_ns, php_version);
         }
     }
 }
@@ -101,10 +152,11 @@ fn extract_children(
     uri: &str,
     result: &mut FileSymbols,
     current_ns: &Option<String>,
+    php_version: Option<PhpSymbolExtractionVersion>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        extract_from_node(child, source, uri, result, current_ns);
+        extract_from_node(child, source, uri, result, current_ns, php_version);
     }
 }
 
@@ -336,7 +388,12 @@ fn extract_class_like(
     result: &mut FileSymbols,
     current_ns: &Option<String>,
     kind: PhpSymbolKind,
+    php_version: Option<PhpSymbolExtractionVersion>,
 ) {
+    if !node_is_available_for_php_version(node, source, php_version) {
+        return;
+    }
+
     let name_node = match node.child_by_field_name("name") {
         Some(n) => n,
         None => return,
@@ -375,7 +432,7 @@ fn extract_class_like(
 
     // Extract members from body (declaration_list)
     if let Some(body) = body_node {
-        extract_class_body(body, source, uri, result, &fqn);
+        extract_class_body(body, source, uri, result, &fqn, php_version);
     }
 }
 
@@ -386,21 +443,22 @@ fn extract_class_body(
     uri: &str,
     result: &mut FileSymbols,
     parent_fqn: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
 ) {
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         match child.kind() {
             "method_declaration" => {
-                extract_method(child, source, uri, result, parent_fqn);
+                extract_method(child, source, uri, result, parent_fqn, php_version);
             }
             "property_declaration" => {
-                extract_properties(child, source, uri, result, parent_fqn);
+                extract_properties(child, source, uri, result, parent_fqn, php_version);
             }
             "class_const_declaration" | "const_declaration" => {
-                extract_class_constants(child, source, uri, result, parent_fqn);
+                extract_class_constants(child, source, uri, result, parent_fqn, php_version);
             }
             "enum_case" => {
-                extract_enum_case(child, source, uri, result, parent_fqn);
+                extract_enum_case(child, source, uri, result, parent_fqn, php_version);
             }
             "use_declaration" => {
                 // Trait use — ignore for now (could track trait usage)
@@ -410,7 +468,18 @@ fn extract_class_body(
     }
 }
 
-fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols, parent_fqn: &str) {
+fn extract_method(
+    node: Node,
+    source: &str,
+    uri: &str,
+    result: &mut FileSymbols,
+    parent_fqn: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
+) {
+    if !node_is_available_for_php_version(node, source, php_version) {
+        return;
+    }
+
     let name_node = match node.child_by_field_name("name") {
         Some(n) => n,
         None => return,
@@ -421,7 +490,7 @@ fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols,
     let visibility = extract_visibility(node, source);
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
-    let mut signature = extract_signature(node, source);
+    let mut signature = extract_signature(node, source, php_version);
 
     // Apply PHPDoc fallbacks: @return type and [optional] params
     if let Some(ref doc) = doc_comment {
@@ -453,6 +522,9 @@ fn extract_method(node: Node, source: &str, uri: &str, result: &mut FileSymbols,
         let mut cursor = param_list.walk();
         for child in param_list.children(&mut cursor) {
             if child.kind() == "property_promotion_parameter" {
+                if !node_is_available_for_php_version(child, source, php_version) {
+                    continue;
+                }
                 let prop_vis = extract_visibility(child, source);
                 let prop_mods = extract_modifiers(child, source);
                 let prop_type = child
@@ -494,7 +566,12 @@ fn extract_function(
     uri: &str,
     result: &mut FileSymbols,
     current_ns: &Option<String>,
+    php_version: Option<PhpSymbolExtractionVersion>,
 ) {
+    if !node_is_available_for_php_version(node, source, php_version) {
+        return;
+    }
+
     let name_node = match node.child_by_field_name("name") {
         Some(n) => n,
         None => return,
@@ -502,7 +579,7 @@ fn extract_function(
     let name = node_text(name_node, source).to_string();
     let fqn = make_fqn(current_ns, &name);
     let doc_comment = find_doc_comment(node, source);
-    let mut signature = extract_signature(node, source);
+    let mut signature = extract_signature(node, source, php_version);
 
     // Apply PHPDoc fallbacks: @return type and [optional] params
     if let Some(ref doc) = doc_comment {
@@ -533,7 +610,12 @@ fn extract_properties(
     uri: &str,
     result: &mut FileSymbols,
     parent_fqn: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
 ) {
+    if !node_is_available_for_php_version(node, source, php_version) {
+        return;
+    }
+
     let visibility = extract_visibility(node, source);
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
@@ -582,7 +664,12 @@ fn extract_class_constants(
     uri: &str,
     result: &mut FileSymbols,
     parent_fqn: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
 ) {
+    if !node_is_available_for_php_version(node, source, php_version) {
+        return;
+    }
+
     let visibility = extract_visibility(node, source);
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
@@ -628,7 +715,12 @@ fn extract_global_constants(
     uri: &str,
     result: &mut FileSymbols,
     current_ns: &Option<String>,
+    php_version: Option<PhpSymbolExtractionVersion>,
 ) {
+    if !node_is_available_for_php_version(node, source, php_version) {
+        return;
+    }
+
     let doc_comment = find_doc_comment(node, source);
 
     let mut cursor = node.walk();
@@ -670,7 +762,12 @@ fn extract_enum_case(
     uri: &str,
     result: &mut FileSymbols,
     parent_fqn: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
 ) {
+    if !node_is_available_for_php_version(node, source, php_version) {
+        return;
+    }
+
     let name_node = match node.child_by_field_name("name") {
         Some(n) => n,
         None => return,
@@ -733,7 +830,11 @@ fn apply_phpdoc_to_signature(signature: &mut Signature, doc_comment: &str) {
 }
 
 /// Extract function/method signature (parameters + return type).
-fn extract_signature(node: Node, source: &str) -> Signature {
+fn extract_signature(
+    node: Node,
+    source: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
+) -> Signature {
     let mut params = Vec::new();
 
     if let Some(param_list) = node.child_by_field_name("parameters") {
@@ -743,6 +844,9 @@ fn extract_signature(node: Node, source: &str) -> Signature {
                 || child.kind() == "variadic_parameter"
                 || child.kind() == "property_promotion_parameter"
             {
+                if !node_is_available_for_php_version(child, source, php_version) {
+                    continue;
+                }
                 let param = extract_param(child, source);
                 params.push(param);
             }
@@ -888,6 +992,176 @@ fn node_range(node: Node) -> (u32, u32, u32, u32) {
     )
 }
 
+fn node_is_available_for_php_version(
+    node: Node,
+    source: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
+) -> bool {
+    let Some(php_version) = php_version else {
+        return true;
+    };
+
+    let node_text = leading_attribute_prefix_from_text(node_text(node, source));
+    if let Some(constraint) = availability_constraint_from_text(&node_text) {
+        return constraint.matches(php_version);
+    }
+
+    let prefix = immediate_attribute_prefix(source, node.start_byte());
+    availability_constraint_from_text(&prefix)
+        .map(|constraint| constraint.matches(php_version))
+        .unwrap_or(true)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AvailabilityConstraint {
+    from: Option<PhpSymbolExtractionVersion>,
+    to: Option<PhpSymbolExtractionVersion>,
+}
+
+impl AvailabilityConstraint {
+    fn matches(self, php_version: PhpSymbolExtractionVersion) -> bool {
+        self.from.is_none_or(|from| php_version >= from)
+            && self.to.is_none_or(|to| php_version <= to)
+    }
+}
+
+fn availability_constraint_from_text(text: &str) -> Option<AvailabilityConstraint> {
+    let marker = "PhpStormStubsElementAvailable";
+    let marker_start = text.find(marker)?;
+    let attr = text.get(marker_start..attribute_text_end(text, marker_start))?;
+
+    let from = named_version_argument(attr, "from");
+    let to = named_version_argument(attr, "to");
+    let from = from.or_else(|| {
+        if attr.contains("from:") || attr.contains("to:") {
+            None
+        } else {
+            first_quoted_version(attr)
+        }
+    });
+
+    Some(AvailabilityConstraint { from, to })
+}
+
+fn attribute_text_end(text: &str, marker_start: usize) -> usize {
+    text[marker_start..]
+        .find(']')
+        .map(|offset| marker_start + offset + 1)
+        .unwrap_or(text.len())
+}
+
+fn named_version_argument(attr: &str, name: &str) -> Option<PhpSymbolExtractionVersion> {
+    let needle = format!("{}:", name);
+    let start = attr.find(&needle)?;
+    first_quoted_version(attr.get(start + needle.len()..)?)
+}
+
+fn first_quoted_version(text: &str) -> Option<PhpSymbolExtractionVersion> {
+    for quote in ['\'', '"'] {
+        let Some(start) = text.find(quote) else {
+            continue;
+        };
+        let rest = text.get(start + quote.len_utf8()..)?;
+        let Some(end) = rest.find(quote) else {
+            continue;
+        };
+        if let Some(version) = parse_php_version_literal(&rest[..end]) {
+            return Some(version);
+        }
+    }
+    None
+}
+
+fn parse_php_version_literal(raw: &str) -> Option<PhpSymbolExtractionVersion> {
+    let version = raw.trim();
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    Some(PhpSymbolExtractionVersion { major, minor })
+}
+
+fn immediate_attribute_prefix(source: &str, start_byte: usize) -> String {
+    let mut end = start_byte.min(source.len());
+    let mut result = String::new();
+
+    loop {
+        end = trim_end_ascii_whitespace(source, end);
+        if end == 0 || !source[..end].ends_with(']') {
+            break;
+        }
+
+        let Some(start) = find_attribute_group_start(source, end) else {
+            break;
+        };
+        if !result.is_empty() {
+            result.insert(0, ' ');
+        }
+        result.insert_str(0, &source[start..end]);
+        end = start;
+    }
+
+    result
+}
+
+fn leading_attribute_prefix_from_text(text: &str) -> String {
+    let mut remaining = text.trim_start();
+    let mut result = String::new();
+
+    while remaining.starts_with("#[") {
+        let Some(end) = matching_attribute_group_end(remaining) else {
+            break;
+        };
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        result.push_str(&remaining[..end]);
+        remaining = remaining[end..].trim_start();
+    }
+
+    result
+}
+
+fn matching_attribute_group_end(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '[' => depth = depth.saturating_add(1),
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn trim_end_ascii_whitespace(source: &str, mut end: usize) -> usize {
+    while end > 0 && source.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    end
+}
+
+fn find_attribute_group_start(source: &str, end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in source[..end].char_indices().rev() {
+        match ch {
+            ']' => depth = depth.saturating_add(1),
+            '[' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && idx > 0 && source.as_bytes().get(idx - 1) == Some(&b'#') {
+                    return Some(idx - 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn make_fqn(namespace: &Option<String>, name: &str) -> String {
     match namespace {
         Some(ns) if !ns.is_empty() => format!("{}\\{}", ns, name),
@@ -960,6 +1234,18 @@ mod tests {
         parser.parse_full(code);
         let tree = parser.tree().unwrap();
         extract_file_symbols(tree, code, "file:///test.php")
+    }
+
+    fn parse_and_extract_for_version(code: &str, major: u16, minor: u16) -> FileSymbols {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        extract_file_symbols_for_php_version(
+            tree,
+            code,
+            "phpstub://Core/test.php",
+            PhpSymbolExtractionVersion { major, minor },
+        )
     }
 
     #[test]
@@ -1203,6 +1489,59 @@ mod tests {
         assert_eq!(sig.params.len(), 3);
         assert_eq!(sig.params[2].name, "arrays");
         assert!(sig.params[2].is_variadic);
+    }
+
+    #[test]
+    fn test_phpstorm_stubs_element_available_filters_symbols_by_version() {
+        let code = r#"<?php
+#[PhpStormStubsElementAvailable('8.1')]
+function only_81(): void {}
+
+#[PhpStormStubsElementAvailable(to: '7.4')]
+function old_only(): void {}
+
+#[PhpStormStubsElementAvailable(from: '8.0')]
+function since_80(): void {}
+"#;
+
+        let php80 = parse_and_extract_for_version(code, 8, 0);
+        assert!(php80.symbols.iter().any(|symbol| symbol.name == "since_80"));
+        assert!(!php80.symbols.iter().any(|symbol| symbol.name == "only_81"));
+        assert!(!php80.symbols.iter().any(|symbol| symbol.name == "old_only"));
+
+        let php81 = parse_and_extract_for_version(code, 8, 1);
+        assert!(php81.symbols.iter().any(|symbol| symbol.name == "only_81"));
+        assert!(php81.symbols.iter().any(|symbol| symbol.name == "since_80"));
+        assert!(!php81.symbols.iter().any(|symbol| symbol.name == "old_only"));
+    }
+
+    #[test]
+    fn test_phpstorm_stubs_element_available_filters_params_by_version() {
+        let code = r#"<?php
+function demo(
+    #[PhpStormStubsElementAvailable(from: '5.3', to: '7.4')] $value = null,
+    #[PhpStormStubsElementAvailable(from: '8.0')] string $value,
+    #[PhpStormStubsElementAvailable('8.1')] int $mode = 0
+): void {}
+"#;
+
+        let php74 = parse_and_extract_for_version(code, 7, 4);
+        let php74_sig = php74.symbols[0].signature.as_ref().unwrap();
+        assert_eq!(php74_sig.params.len(), 1);
+        assert_eq!(php74_sig.params[0].name, "value");
+        assert!(php74_sig.params[0].default_value.is_some());
+
+        let php80 = parse_and_extract_for_version(code, 8, 0);
+        let php80_sig = php80.symbols[0].signature.as_ref().unwrap();
+        assert_eq!(php80_sig.params.len(), 1);
+        assert_eq!(php80_sig.params[0].name, "value");
+        assert!(php80_sig.params[0].type_info.is_some());
+        assert!(php80_sig.params[0].default_value.is_none());
+
+        let php81 = parse_and_extract_for_version(code, 8, 1);
+        let php81_sig = php81.symbols[0].signature.as_ref().unwrap();
+        assert_eq!(php81_sig.params.len(), 2);
+        assert_eq!(php81_sig.params[1].name, "mode");
     }
 
     #[test]
