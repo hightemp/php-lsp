@@ -1608,6 +1608,35 @@ impl PhpLspBackend {
         Some(extract_file_symbols(tree, &source, uri_str))
     }
 
+    async fn source_for_uri(&self, uri_str: &str, label: &'static str) -> Option<String> {
+        if let Some(parser) = self.open_files.get(uri_str) {
+            return Some(parser.source());
+        }
+
+        let path = uri_to_path(uri_str)?;
+        read_file_to_string_blocking(path, label).await.ok()
+    }
+
+    async fn phpdoc_virtual_member_location(
+        &self,
+        member: &PhpDocVirtualMember,
+    ) -> Option<Location> {
+        let source = self
+            .source_for_uri(&member.owner.uri, "phpdoc virtual member source read")
+            .await?;
+        let doc_comment = member.owner.doc_comment.as_ref()?;
+        let doc_start = source.find(doc_comment)?;
+        let range = phpdoc_virtual_member_range(&source, doc_comment, doc_start, member)?;
+        let utf16_range = range_byte_to_utf16(&source, range);
+        Some(Location {
+            uri: member.owner.uri.parse::<Uri>().ok()?,
+            range: Range {
+                start: Position::new(utf16_range.0, utf16_range.1),
+                end: Position::new(utf16_range.2, utf16_range.3),
+            },
+        })
+    }
+
     fn type_definition_fqn_for_symbol(
         &self,
         symbol: &php_lsp_types::SymbolInfo,
@@ -6815,6 +6844,285 @@ fn current_class_fqn(file_symbols: &php_lsp_types::FileSymbols) -> Option<String
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhpDocVirtualMemberKind {
+    Property,
+    Method,
+}
+
+#[derive(Debug, Clone)]
+struct PhpDocVirtualMember {
+    owner: Arc<php_lsp_types::SymbolInfo>,
+    name: String,
+    kind: PhpDocVirtualMemberKind,
+    type_info: Option<php_lsp_types::TypeInfo>,
+    access: Option<php_lsp_types::PhpDocPropertyAccess>,
+    return_type: Option<php_lsp_types::TypeInfo>,
+    description: Option<String>,
+    is_static: bool,
+}
+
+fn phpdoc_virtual_member_for_symbol(
+    index: &WorkspaceIndex,
+    sym: &SymbolAtPosition,
+) -> Option<PhpDocVirtualMember> {
+    let kind = match sym.ref_kind {
+        RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {
+            PhpDocVirtualMemberKind::Property
+        }
+        RefKind::MethodCall => PhpDocVirtualMemberKind::Method,
+        _ => return None,
+    };
+    let (class_fqn, member_name) = sym.fqn.rsplit_once("::")?;
+    let member_name = member_name.trim_start_matches('$');
+    phpdoc_virtual_member(index, class_fqn, member_name, kind)
+}
+
+fn phpdoc_virtual_member(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+    kind: PhpDocVirtualMemberKind,
+) -> Option<PhpDocVirtualMember> {
+    for owner in index.get_type_hierarchy_symbols(class_fqn) {
+        let Some(ref doc_comment) = owner.doc_comment else {
+            continue;
+        };
+        let phpdoc = parse_phpdoc(doc_comment);
+        match kind {
+            PhpDocVirtualMemberKind::Property => {
+                if let Some(property) = phpdoc
+                    .properties
+                    .into_iter()
+                    .find(|property| property.name == member_name)
+                {
+                    return Some(PhpDocVirtualMember {
+                        owner,
+                        name: property.name,
+                        kind,
+                        type_info: property.type_info,
+                        access: Some(property.access),
+                        return_type: None,
+                        description: property.description,
+                        is_static: false,
+                    });
+                }
+            }
+            PhpDocVirtualMemberKind::Method => {
+                if let Some(method) = phpdoc
+                    .methods
+                    .into_iter()
+                    .find(|method| method.name == member_name)
+                {
+                    return Some(PhpDocVirtualMember {
+                        owner,
+                        name: method.name,
+                        kind,
+                        type_info: None,
+                        access: None,
+                        return_type: method.return_type,
+                        description: method.description,
+                        is_static: method.is_static,
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn phpdoc_property_tag(access: php_lsp_types::PhpDocPropertyAccess) -> &'static str {
+    match access {
+        php_lsp_types::PhpDocPropertyAccess::ReadWrite => "@property",
+        php_lsp_types::PhpDocPropertyAccess::ReadOnly => "@property-read",
+        php_lsp_types::PhpDocPropertyAccess::WriteOnly => "@property-write",
+    }
+}
+
+fn phpdoc_virtual_completion_data(item: &CompletionItem) -> Option<(&str, &str, &str)> {
+    let data = item.data.as_ref()?;
+    if data.get("kind")?.as_str()? != "phpdoc-virtual-member" {
+        return None;
+    }
+    Some((
+        data.get("ownerFqn")?.as_str()?,
+        data.get("memberKind")?.as_str()?,
+        data.get("memberName")?.as_str()?,
+    ))
+}
+
+fn phpdoc_virtual_member_markdown(member: &PhpDocVirtualMember) -> String {
+    let mut content = String::new();
+    content.push_str("```php\n");
+    match member.kind {
+        PhpDocVirtualMemberKind::Property => {
+            let access = member
+                .access
+                .map(phpdoc_property_tag)
+                .unwrap_or("@property");
+            content.push_str(access);
+            if let Some(ref type_info) = member.type_info {
+                content.push(' ');
+                content.push_str(&type_info.to_string());
+            }
+            content.push_str(" $");
+            content.push_str(&member.name);
+        }
+        PhpDocVirtualMemberKind::Method => {
+            content.push_str("@method ");
+            if member.is_static {
+                content.push_str("static ");
+            }
+            if let Some(ref return_type) = member.return_type {
+                content.push_str(&return_type.to_string());
+                content.push(' ');
+            }
+            content.push_str(&member.name);
+            content.push_str("()");
+        }
+    }
+    content.push_str("\n```\n");
+    if let Some(ref description) = member.description {
+        content.push_str("\n---\n\n");
+        content.push_str(description);
+        content.push('\n');
+    }
+    content
+}
+
+fn phpdoc_extra_markdown_sections(phpdoc: &php_lsp_types::PhpDoc) -> Vec<String> {
+    let mut sections = Vec::new();
+
+    if let Some(ref var_type) = phpdoc.var_type {
+        sections.push(format!("**@var** `{}`", var_type));
+    }
+
+    if !phpdoc.throws.is_empty() {
+        let throws = phpdoc
+            .throws
+            .iter()
+            .map(|throw_type| format!("- `{}`", throw_type))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("**Throws:**\n\n{}", throws));
+    }
+
+    if !phpdoc.properties.is_empty() {
+        let properties = phpdoc
+            .properties
+            .iter()
+            .map(|property| {
+                let access = phpdoc_property_tag(property.access);
+                let type_info = property
+                    .type_info
+                    .as_ref()
+                    .map(|type_info| format!(" {}", type_info))
+                    .unwrap_or_default();
+                let description = property
+                    .description
+                    .as_ref()
+                    .map(|description| format!(" - {}", description))
+                    .unwrap_or_default();
+                format!("- `{access}{type_info} ${}`{description}", property.name)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("**PHPDoc properties:**\n\n{}", properties));
+    }
+
+    if !phpdoc.methods.is_empty() {
+        let methods = phpdoc
+            .methods
+            .iter()
+            .map(|method| {
+                let static_part = if method.is_static { "static " } else { "" };
+                let return_type = method
+                    .return_type
+                    .as_ref()
+                    .map(|return_type| format!("{} ", return_type))
+                    .unwrap_or_default();
+                let description = method
+                    .description
+                    .as_ref()
+                    .map(|description| format!(" - {}", description))
+                    .unwrap_or_default();
+                format!(
+                    "- `@method {static_part}{return_type}{}()`{description}",
+                    method.name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("**PHPDoc methods:**\n\n{}", methods));
+    }
+
+    sections
+}
+
+fn phpdoc_virtual_member_range(
+    source: &str,
+    doc_comment: &str,
+    doc_start: usize,
+    member: &PhpDocVirtualMember,
+) -> Option<(u32, u32, u32, u32)> {
+    let needle = match member.kind {
+        PhpDocVirtualMemberKind::Property => format!("${}", member.name),
+        PhpDocVirtualMemberKind::Method => format!("{}(", member.name),
+    };
+    let tag = match member.kind {
+        PhpDocVirtualMemberKind::Property => "@property",
+        PhpDocVirtualMemberKind::Method => "@method",
+    };
+
+    let mut line_offset = 0usize;
+    for line in doc_comment.split_inclusive('\n') {
+        if line.contains(tag) {
+            if let Some(local_start) = line.find(&needle) {
+                let name_start = if member.kind == PhpDocVirtualMemberKind::Method {
+                    local_start
+                } else {
+                    local_start + 1
+                };
+                let name_end = name_start + member.name.len();
+                let absolute_start = doc_start + line_offset + name_start;
+                let absolute_end = doc_start + line_offset + name_end;
+                return Some(byte_offsets_to_range(source, absolute_start, absolute_end));
+            }
+        }
+        line_offset += line.len();
+    }
+
+    Some(byte_offsets_to_range(
+        source,
+        doc_start,
+        doc_start + doc_comment.len().min(3),
+    ))
+}
+
+fn byte_offsets_to_range(source: &str, start: usize, end: usize) -> (u32, u32, u32, u32) {
+    let (start_line, start_col) = byte_offset_to_line_col(source, start);
+    let (end_line, end_col) = byte_offset_to_line_col(source, end);
+    (start_line, start_col, end_line, end_col)
+}
+
+fn byte_offset_to_line_col(source: &str, byte_offset: usize) -> (u32, u32) {
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+
+    for (idx, ch) in source.char_indices() {
+        if idx >= byte_offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = idx + ch.len_utf8();
+        }
+    }
+
+    (line, byte_offset.saturating_sub(line_start) as u32)
+}
+
 fn resolve_member_type_from_index(
     index: &WorkspaceIndex,
     class_fqn: &str,
@@ -9334,6 +9642,12 @@ impl LanguageServer for PhpLspBackend {
             }
         };
 
+        let virtual_member = if symbol_info.is_none() {
+            phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)
+        } else {
+            None
+        };
+
         let result = if let Some(sym) = symbol_info {
             // Build hover content
             let mut content = String::new();
@@ -9430,6 +9744,12 @@ impl LanguageServer for PhpLspBackend {
                     content.push_str("`\n");
                 }
 
+                for section in phpdoc_extra_markdown_sections(&phpdoc) {
+                    content.push('\n');
+                    content.push_str(&section);
+                    content.push('\n');
+                }
+
                 // @deprecated
                 if let Some(ref dep) = phpdoc.deprecated {
                     content.push_str("\n⚠️ **Deprecated**");
@@ -9450,6 +9770,18 @@ impl LanguageServer for PhpLspBackend {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: content,
+                }),
+                range: Some(range),
+            })
+        } else if let Some(virtual_member) = virtual_member {
+            let range = Range {
+                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
+                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
+            };
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: phpdoc_virtual_member_markdown(&virtual_member),
                 }),
                 range: Some(range),
             })
@@ -9865,6 +10197,12 @@ impl LanguageServer for PhpLspBackend {
             } else {
                 None
             }
+        } else if let Some(virtual_member) =
+            phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)
+        {
+            self.phpdoc_virtual_member_location(&virtual_member)
+                .await
+                .map(GotoDefinitionResponse::Scalar)
         } else {
             None
         };
@@ -10743,6 +11081,15 @@ impl LanguageServer for PhpLspBackend {
             return Ok(None);
         }
 
+        let resolved_for_rename = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
+        if resolved_for_rename.is_none()
+            && phpdoc_virtual_member_for_symbol(&self.index, &sym).is_some()
+        {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "Cannot rename PHPDoc virtual members",
+            ));
+        }
+
         // Resolve symbol under cursor
         let (target_fqn, target_kind, _old_name) = {
             let kind = match sym.ref_kind {
@@ -10757,8 +11104,7 @@ impl LanguageServer for PhpLspBackend {
                 _ => return Ok(None),
             };
 
-            let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
-            if let Some(resolved) = resolved {
+            if let Some(resolved) = resolved_for_rename {
                 (resolved.fqn.clone(), resolved.kind, sym.name.clone())
             } else {
                 (sym.fqn.clone(), kind, sym.name.clone())
@@ -10872,8 +11218,14 @@ impl LanguageServer for PhpLspBackend {
                     return Ok(None);
                 }
 
-                // Don't rename built-in symbols
-                if let Some(resolved) = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind) {
+                // Don't rename built-in or PHPDoc virtual symbols
+                let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
+                if resolved.is_none()
+                    && phpdoc_virtual_member_for_symbol(&self.index, &sym).is_some()
+                {
+                    return Ok(None);
+                }
+                if let Some(resolved) = resolved {
                     if resolved.modifiers.is_builtin {
                         return Ok(None);
                     }
@@ -11568,6 +11920,50 @@ impl LanguageServer for PhpLspBackend {
     }
 
     async fn completion_resolve(&self, mut item: CompletionItem) -> Result<CompletionItem> {
+        let virtual_data =
+            phpdoc_virtual_completion_data(&item).map(|(owner_fqn, member_kind, member_name)| {
+                (
+                    owner_fqn.to_string(),
+                    member_kind.to_string(),
+                    member_name.to_string(),
+                )
+            });
+        if let Some((owner_fqn, member_kind, member_name)) = virtual_data {
+            let kind = match member_kind.as_str() {
+                "property" => PhpDocVirtualMemberKind::Property,
+                "method" => PhpDocVirtualMemberKind::Method,
+                _ => return Ok(item),
+            };
+            if let Some(member) = phpdoc_virtual_member(&self.index, &owner_fqn, &member_name, kind)
+            {
+                item.detail = Some(match member.kind {
+                    PhpDocVirtualMemberKind::Property => {
+                        let access = member
+                            .access
+                            .map(phpdoc_property_tag)
+                            .unwrap_or("@property");
+                        match &member.type_info {
+                            Some(type_info) => format!("{} {}", access, type_info),
+                            None => access.to_string(),
+                        }
+                    }
+                    PhpDocVirtualMemberKind::Method => {
+                        let mut detail = String::from("()");
+                        if let Some(ref return_type) = member.return_type {
+                            detail.push_str(": ");
+                            detail.push_str(&return_type.to_string());
+                        }
+                        detail
+                    }
+                });
+                item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: phpdoc_virtual_member_markdown(&member),
+                }));
+            }
+            return Ok(item);
+        }
+
         // Try to resolve more details for the completion item
         // The FQN is stored in item.data
         if let Some(ref data) = item.data {
@@ -11652,6 +12048,12 @@ impl LanguageServer for PhpLspBackend {
                         if let Some(ref ret) = phpdoc.return_type {
                             doc_parts.push(format!("\n@return `{}`", ret));
                         }
+
+                        let extra_sections = phpdoc_extra_markdown_sections(&phpdoc);
+                        if !extra_sections.is_empty() {
+                            doc_parts.push(String::new());
+                            doc_parts.extend(extra_sections);
+                        }
                     }
 
                     if !doc_parts.is_empty() {
@@ -11696,6 +12098,68 @@ mod tests {
             implements: vec![],
             traits: vec![],
         }
+    }
+
+    fn offset_at(source: &str, line: u32, col: u32) -> usize {
+        let mut current_line = 0u32;
+        let mut line_start = 0usize;
+        for (idx, ch) in source.char_indices() {
+            if current_line == line {
+                return line_start + col as usize;
+            }
+            if ch == '\n' {
+                current_line += 1;
+                line_start = idx + 1;
+            }
+        }
+        line_start + col as usize
+    }
+
+    #[test]
+    fn test_phpdoc_extra_markdown_sections_include_virtual_members() {
+        let phpdoc = parse_phpdoc(
+            "/**\n * @property-read string $slug Service slug\n * @method User owner()\n * @throws \\RuntimeException\n */",
+        );
+        let sections = phpdoc_extra_markdown_sections(&phpdoc).join("\n");
+
+        assert!(sections.contains("**Throws:**"));
+        assert!(sections.contains("`\\RuntimeException`"));
+        assert!(sections.contains("`@property-read string $slug` - Service slug"));
+        assert!(sections.contains("`@method User owner()`"));
+    }
+
+    #[test]
+    fn test_phpdoc_virtual_member_range_points_to_tag_name() {
+        let source =
+            "<?php\n/**\n * @property-read string $slug Service slug\n */\nclass Service {}\n";
+        let doc_start = source.find("/**").expect("doc comment start");
+        let doc_end = source.find("*/").expect("doc comment end") + 2;
+        let doc_comment = &source[doc_start..doc_end];
+        let mut owner = make_symbol(
+            "Service",
+            "App\\Service",
+            PhpSymbolKind::Class,
+            (4, 6, 4, 13),
+            None,
+        );
+        owner.doc_comment = Some(doc_comment.to_string());
+        let member = PhpDocVirtualMember {
+            owner: Arc::new(owner),
+            name: "slug".to_string(),
+            kind: PhpDocVirtualMemberKind::Property,
+            type_info: Some(TypeInfo::Simple("string".to_string())),
+            access: Some(PhpDocPropertyAccess::ReadOnly),
+            return_type: None,
+            description: Some("Service slug".to_string()),
+            is_static: false,
+        };
+
+        let range = phpdoc_virtual_member_range(source, doc_comment, doc_start, &member)
+            .expect("virtual member range");
+        let start = offset_at(source, range.0, range.1);
+        let end = offset_at(source, range.2, range.3);
+
+        assert_eq!(&source[start..end], "slug");
     }
 
     #[test]

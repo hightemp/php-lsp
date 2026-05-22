@@ -142,7 +142,32 @@ pub struct PhpDocParam {
 pub struct PhpDocProperty {
     pub name: String,
     pub type_info: Option<TypeInfo>,
+    pub access: PhpDocPropertyAccess,
     pub description: Option<String>,
+}
+
+/// Access mode declared by @property, @property-read or @property-write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PhpDocPropertyAccess {
+    ReadWrite,
+    ReadOnly,
+    WriteOnly,
+}
+
+impl PhpDocPropertyAccess {
+    pub fn is_readable(self) -> bool {
+        matches!(
+            self,
+            PhpDocPropertyAccess::ReadWrite | PhpDocPropertyAccess::ReadOnly
+        )
+    }
+
+    pub fn is_writable(self) -> bool {
+        matches!(
+            self,
+            PhpDocPropertyAccess::ReadWrite | PhpDocPropertyAccess::WriteOnly
+        )
+    }
 }
 
 /// A @method tag from PHPDoc.

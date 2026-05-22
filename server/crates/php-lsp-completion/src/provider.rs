@@ -6,7 +6,13 @@
 use crate::context::CompletionContext;
 use lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat};
 use php_lsp_index::workspace::WorkspaceIndex;
-use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo, Visibility};
+use php_lsp_parser::phpdoc::parse_phpdoc;
+use php_lsp_types::{
+    FileSymbols, PhpDocMethod, PhpDocProperty, PhpDocPropertyAccess, PhpSymbolKind, SymbolInfo,
+    Visibility,
+};
+use serde_json::json;
+use std::collections::HashSet;
 
 /// PHP keywords for free context.
 const PHP_KEYWORDS: &[&str] = &[
@@ -187,10 +193,153 @@ fn provide_member_completions(
                 Some(member_prefix),
             ));
         }
+        let mut seen_labels: HashSet<String> =
+            items.iter().map(|item| item.label.clone()).collect();
+        add_phpdoc_virtual_member_completions(
+            &fqn,
+            member_prefix,
+            index,
+            &mut items,
+            &mut seen_labels,
+        );
     }
 
     sort_completion_items(&mut items);
     items
+}
+
+fn add_phpdoc_virtual_member_completions(
+    class_fqn: &str,
+    member_prefix: &str,
+    index: &WorkspaceIndex,
+    items: &mut Vec<CompletionItem>,
+    seen_labels: &mut HashSet<String>,
+) {
+    for owner in index.get_type_hierarchy_symbols(class_fqn) {
+        let Some(ref doc_comment) = owner.doc_comment else {
+            continue;
+        };
+        let phpdoc = parse_phpdoc(doc_comment);
+
+        for method in &phpdoc.methods {
+            if method.is_static || !seen_labels.insert(method.name.clone()) {
+                continue;
+            }
+            items.push(phpdoc_method_completion_item(
+                &owner.fqn,
+                method,
+                member_prefix,
+            ));
+        }
+
+        for property in &phpdoc.properties {
+            if !seen_labels.insert(property.name.clone()) {
+                continue;
+            }
+            items.push(phpdoc_property_completion_item(
+                &owner.fqn,
+                property,
+                member_prefix,
+            ));
+        }
+    }
+}
+
+fn phpdoc_property_completion_item(
+    owner_fqn: &str,
+    property: &PhpDocProperty,
+    member_prefix: &str,
+) -> CompletionItem {
+    let label = property.name.clone();
+    let access = phpdoc_property_tag(property.access);
+    CompletionItem {
+        label: label.clone(),
+        kind: Some(CompletionItemKind::PROPERTY),
+        detail: Some(match &property.type_info {
+            Some(type_info) => format!("{} {}", access, type_info),
+            None => access.to_string(),
+        }),
+        sort_text: Some(format!(
+            "{}_{}_{}",
+            symbol_sort_rank(PhpSymbolKind::Property),
+            completion_prefix_rank(&label, Some(member_prefix)),
+            label.to_ascii_lowercase()
+        )),
+        filter_text: Some(format!("{} {}::${}", label, owner_fqn, property.name)),
+        data: Some(json!({
+            "kind": "phpdoc-virtual-member",
+            "ownerFqn": owner_fqn,
+            "memberKind": "property",
+            "memberName": property.name,
+        })),
+        commit_characters: Some(vec![";".to_string(), ",".to_string()]),
+        ..Default::default()
+    }
+}
+
+fn phpdoc_method_completion_item(
+    owner_fqn: &str,
+    method: &PhpDocMethod,
+    member_prefix: &str,
+) -> CompletionItem {
+    let label = method.name.clone();
+    CompletionItem {
+        label: label.clone(),
+        kind: Some(CompletionItemKind::METHOD),
+        detail: Some(phpdoc_method_detail(method)),
+        sort_text: Some(format!(
+            "{}_{}_{}",
+            symbol_sort_rank(PhpSymbolKind::Method),
+            completion_prefix_rank(&label, Some(member_prefix)),
+            label.to_ascii_lowercase()
+        )),
+        filter_text: Some(format!("{} {}::{}", label, owner_fqn, method.name)),
+        data: Some(json!({
+            "kind": "phpdoc-virtual-member",
+            "ownerFqn": owner_fqn,
+            "memberKind": "method",
+            "memberName": method.name,
+        })),
+        commit_characters: Some(vec!["(".to_string()]),
+        ..Default::default()
+    }
+}
+
+fn phpdoc_property_tag(access: PhpDocPropertyAccess) -> &'static str {
+    match access {
+        PhpDocPropertyAccess::ReadWrite => "@property",
+        PhpDocPropertyAccess::ReadOnly => "@property-read",
+        PhpDocPropertyAccess::WriteOnly => "@property-write",
+    }
+}
+
+fn phpdoc_method_detail(method: &PhpDocMethod) -> String {
+    let params: Vec<String> = method
+        .params
+        .iter()
+        .map(|param| {
+            let mut value = String::new();
+            if let Some(ref type_info) = param.type_info {
+                value.push_str(&type_info.to_string());
+                value.push(' ');
+            }
+            if param.is_variadic {
+                value.push_str("...");
+            }
+            if param.is_by_ref {
+                value.push('&');
+            }
+            value.push('$');
+            value.push_str(&param.name);
+            value
+        })
+        .collect();
+    let mut detail = format!("({})", params.join(", "));
+    if let Some(ref return_type) = method.return_type {
+        detail.push_str(": ");
+        detail.push_str(&return_type.to_string());
+    }
+    detail
 }
 
 /// Provide static access completions (`::`).
@@ -896,6 +1045,95 @@ mod tests {
                     .unwrap(),
             "members starting with typed prefix should sort before substring matches"
         );
+    }
+
+    #[test]
+    fn test_member_completion_includes_phpdoc_virtual_members() {
+        let mut service = make_symbol(
+            "Service",
+            "App\\Service",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        );
+        service.doc_comment = Some(
+            "/**\n * @property-read string $slug Service slug\n * @method User owner()\n */"
+                .to_string(),
+        );
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![service],
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::MemberAccess {
+            object_expr: "$service".to_string(),
+            member_prefix: String::new(),
+            class_fqn: Some("App\\Service".to_string()),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+
+        let slug = items
+            .iter()
+            .find(|item| item.label == "slug")
+            .expect("virtual property completion");
+        assert_eq!(slug.kind, Some(CompletionItemKind::PROPERTY));
+        assert_eq!(slug.detail.as_deref(), Some("@property-read string"));
+        assert!(
+            slug.data
+                .as_ref()
+                .and_then(|data| data.get("kind"))
+                .and_then(|kind| kind.as_str())
+                == Some("phpdoc-virtual-member")
+        );
+
+        let owner = items
+            .iter()
+            .find(|item| item.label == "owner")
+            .expect("virtual method completion");
+        assert_eq!(owner.kind, Some(CompletionItemKind::METHOD));
+        assert_eq!(owner.detail.as_deref(), Some("(): User"));
+    }
+
+    #[test]
+    fn test_member_completion_inherits_phpdoc_virtual_members() {
+        let mut base = make_symbol(
+            "BaseService",
+            "App\\BaseService",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        );
+        base.doc_comment = Some("/**\n * @property int $id\n */".to_string());
+        let mut service = make_symbol(
+            "Service",
+            "App\\Service",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        );
+        service.extends = vec!["App\\BaseService".to_string()];
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![base, service],
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::MemberAccess {
+            object_expr: "$service".to_string(),
+            member_prefix: String::new(),
+            class_fqn: Some("App\\Service".to_string()),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+
+        assert!(items.iter().any(|item| item.label == "id"));
     }
 
     #[test]

@@ -760,22 +760,36 @@
   - Regression: parser unit tests для symbol/parameter filtering и e2e `test_php_version_filters_version_gated_stubs` на 8.2-only sodium API.
   - Validation: `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`.
 
-- [ ] **PR-031 / H-008** Переписать PHPDoc type parser
+- [x] **PR-031 / H-008** Переписать PHPDoc type parser *(completed 2026-05-22)*
   - Поддержать `array<int, User>`, `list<User>`, `class-string<T>`, `(A&B)|null`, `callable(A): B`.
   - Не обрезать type expression через `first_word`.
   - Безопасно игнорировать malformed tags.
   - Добавить unit tests для пробелов внутри generics и nested скобок.
+  - Implemented: top-level scanner для PHPDoc type expressions, variable token lookup и method return/name split.
+  - Regression: unit tests для generics с пробелами, nested generics, callable return type, callable param variable lookup и malformed tags.
+  - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-parser phpdoc`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **PR-032 / H-009** Разделить модель `@property`, `@property-read`, `@property-write`
+- [x] **PR-032 / H-009** Разделить модель `@property`, `@property-read`, `@property-write` *(completed 2026-05-22)*
   - Добавить access mode в `PhpDocProperty`.
   - Учесть read/write режим в completion, diagnostics и future rename guards.
   - Сохранить обратную совместимость сериализации cache schema через schema version.
+  - Implemented: `PhpDocPropertyAccess::{ReadWrite, ReadOnly, WriteOnly}` с readable/writable helpers.
+  - Parser: `@property`, `@property-read`, `@property-write` теперь дают разные access modes; virtual member UI usage оставлен для PR-033.
+  - Cache: `CACHE_SCHEMA_VERSION` поднят до 5.
+  - Regression: `test_parse_property_access_modes`.
+  - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-parser phpdoc`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **PR-033 / H-010 / H-012** PHPDoc virtual members в LSP UI
+- [x] **PR-033 / H-010 / H-012** PHPDoc virtual members в LSP UI *(completed 2026-05-22)*
   - Показывать `@throws`, `@var`, `@property*`, `@method` в hover и completion resolve.
   - Добавить virtual properties/methods в `$obj->` completion.
   - Definition по virtual member возвращает range в doc-comment.
   - Rename для virtual members: явно запретить или реализовать локальный doc-comment edit.
+  - Implemented: class/member hover и completion resolve показывают `@throws`, `@var`, `@property*`, `@method`.
+  - Completion: `$obj->` включает inherited PHPDoc virtual properties/methods с metadata для resolve.
+  - Definition: unresolved PHPDoc virtual member ведет на имя в doc-comment tag.
+  - Rename: PHPDoc virtual members явно запрещены в `rename`/`prepareRename`.
+  - Regression: completion unit tests для direct/inherited virtual members; server unit tests для markdown sections и doc-comment range.
+  - Validation: `cargo fmt --all --check`, targeted `phpdoc_virtual`/`phpdoc_extra` tests, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
 - [ ] **PR-034 / H-013** E2E покрытие PHPDoc behavior
   - Fixture-driven tests по `test-fixtures/lsp-cases/src/PhpDoc/*`.

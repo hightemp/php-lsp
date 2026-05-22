@@ -225,6 +225,13 @@ impl WorkspaceIndex {
         members
     }
 
+    /// Get a type symbol and all type symbols in its trait/parent/interface hierarchy.
+    pub fn get_type_hierarchy_symbols(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
+        let mut types = Vec::new();
+        self.collect_type_hierarchy_symbols(type_fqn, &mut types, &mut Vec::new());
+        types
+    }
+
     /// Get only the direct members of a type (no inheritance traversal).
     fn get_direct_members(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
         let mut members = Vec::new();
@@ -265,6 +272,33 @@ impl WorkspaceIndex {
             for iface_fqn in &class_sym.implements {
                 self.collect_members_recursive(iface_fqn, members, visited);
             }
+        }
+    }
+
+    fn collect_type_hierarchy_symbols(
+        &self,
+        type_fqn: &str,
+        types: &mut Vec<Arc<SymbolInfo>>,
+        visited: &mut Vec<String>,
+    ) {
+        if visited.contains(&type_fqn.to_string()) {
+            return;
+        }
+        visited.push(type_fqn.to_string());
+
+        let Some(class_sym) = self.types.get(type_fqn).map(|r| r.value().clone()) else {
+            return;
+        };
+        types.push(class_sym.clone());
+
+        for trait_fqn in &class_sym.traits {
+            self.collect_type_hierarchy_symbols(trait_fqn, types, visited);
+        }
+        for parent_fqn in &class_sym.extends {
+            self.collect_type_hierarchy_symbols(parent_fqn, types, visited);
+        }
+        for iface_fqn in &class_sym.implements {
+            self.collect_type_hierarchy_symbols(iface_fqn, types, visited);
         }
     }
 }
