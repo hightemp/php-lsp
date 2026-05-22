@@ -83,6 +83,21 @@ phpstorm-stubs support.
 
 ## Known Limitations
 
+- Production hardening is still in progress. The current risk register and
+  baseline measurements live in `docs/production-risk-register.md` and
+  `docs/production-baseline.md`.
+- There is no persisted disk cache for the symbol index yet, so every server
+  start rebuilds workspace/stub state before the index is fully ready.
+- `references`, `rename`, and reference-count code lenses can still scan and
+  reparse indexed workspace files. They are functional, but not yet optimized
+  for very large repositories.
+- Workspace indexing uses bounded progress reporting, but file parsing is not
+  yet a fully parallel task queue.
+- Heavy operations do not yet have general LSP request cancellation support.
+- Rapid `didChange` bursts are handled synchronously without a debounce/version
+  queue for diagnostics.
+- Built-in stubs are configurable, but version-gated symbols from phpstorm-stubs
+  are not yet filtered for every `phpLsp.phpVersion` case.
 - Cross-file local variable analysis is intentionally limited; variable
   references and rename are local-scope oriented.
 - Type inference is useful but still shallow compared with mature PHP static

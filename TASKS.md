@@ -643,12 +643,12 @@
   - Метрики: files/sec, symbols/sec, peak RSS, stubs load time, first diagnostics time.
   - Результаты складывать в `target/php-lsp-profile/*.json`.
 
-- [ ] **PR-003** Добавить latency benchmarks для LSP requests
+- [x] **PR-003** Добавить latency benchmarks для LSP requests *(done 2026-05-22)*
   - Скрипт LSP-клиента для batch-запросов: hover, completion, definition, references, rename dry-run.
   - Измерять p50/p95/p99 на прогретом и холодном индексе.
   - Отдельно измерять открытый файл и неоткрытый файл.
 
-- [ ] **PR-004** Составить risk register production gaps
+- [x] **PR-004** Составить risk register production gaps *(done 2026-05-22)*
   - Документировать known bottlenecks: full workspace scan в references/rename/codeLens, sync file reads, stubs load, vendor resolve.
   - Для каждого риска указать mitigation и owner task.
   - Обновить `README.md` known limitations без завышения текущих возможностей.

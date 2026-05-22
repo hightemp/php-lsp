@@ -82,3 +82,30 @@ The harness supports additional real-project runs via:
 ```bash
 scripts/profile-workspace.sh --scenario laravel=/path/to/laravel --scenario symfony=/path/to/symfony
 ```
+
+## LSP Latency Benchmark Smoke Run
+
+Command:
+
+```bash
+scripts/benchmark-lsp-latency.sh --iterations 3 --timeout 60
+```
+
+The benchmark starts separate LSP sessions for `unopened` and `open` document states. Each session measures the same request batch before explicit index readiness (`cold`) and after `phpLsp/indexingStatus` reports `ready` (`warm`). Full per-request measurements are written to `target/php-lsp-profile/*-latency.json`.
+
+Warm-index p95 summary:
+
+| Scenario | State | Hover | Completion | Definition | References | Rename dry-run |
+|----------|-------|-------|------------|------------|------------|----------------|
+| `lsp-cases` | open | 0.341 ms | 0.335 ms | 0.222 ms | 4.957 ms | 4.259 ms |
+| `lsp-cases` | unopened | 0.207 ms | 0.190 ms | 0.262 ms | 0.243 ms | 0.191 ms |
+| `vendor-heavy` | open | 0.314 ms | 0.624 ms | 0.442 ms | 0.566 ms | 0.260 ms |
+| `vendor-heavy` | unopened | 0.100 ms | 0.172 ms | 0.156 ms | 0.074 ms | 0.053 ms |
+| `small-fixture` | open | 0.688 ms | 0.655 ms | 0.373 ms | 4.312 ms | 3.667 ms |
+| `small-fixture` | unopened | 0.338 ms | 0.269 ms | 0.245 ms | 0.238 ms | 0.251 ms |
+
+For real-project latency runs:
+
+```bash
+scripts/benchmark-lsp-latency.sh --iterations 10 --scenario laravel=/path/to/laravel --scenario symfony=/path/to/symfony
+```
