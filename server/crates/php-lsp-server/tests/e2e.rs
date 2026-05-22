@@ -6,6 +6,8 @@
 use futures::StreamExt;
 use serde_json::json;
 use std::fs;
+use std::time::Duration;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tower::{Service, ServiceExt};
 use tower_lsp::jsonrpc::Request;
 use tower_lsp::LspService;
@@ -64,6 +66,62 @@ fn initialize_request_with_workspace_folders(id: i64, folders: Vec<(&str, &str)>
 
 fn initialized_notification() -> Request {
     Request::build("initialized").params(json!({})).finish()
+}
+
+async fn next_publish_diagnostics(
+    notifications: &mut UnboundedReceiver<Request>,
+    uri: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    loop {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .expect("timed out waiting for publishDiagnostics");
+        let notification = tokio::time::timeout(remaining, notifications.recv())
+            .await
+            .expect("timed out waiting for publishDiagnostics")
+            .expect("notification channel closed");
+        if notification.method() != "textDocument/publishDiagnostics" {
+            continue;
+        }
+
+        let params = notification
+            .params()
+            .cloned()
+            .expect("publishDiagnostics params");
+        if params.get("uri").and_then(|value| value.as_str()) == Some(uri) {
+            return params;
+        }
+    }
+}
+
+async fn expect_no_publish_diagnostics(
+    notifications: &mut UnboundedReceiver<Request>,
+    uri: &str,
+    timeout: Duration,
+) {
+    let started = std::time::Instant::now();
+    while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
+        match tokio::time::timeout(remaining, notifications.recv()).await {
+            Ok(Some(notification))
+                if notification.method() == "textDocument/publishDiagnostics"
+                    && notification
+                        .params()
+                        .and_then(|params| params.get("uri"))
+                        .and_then(|value| value.as_str())
+                        == Some(uri) =>
+            {
+                panic!(
+                    "unexpected publishDiagnostics for {}: {:?}",
+                    uri,
+                    notification.params()
+                );
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 fn shutdown_request(id: i64) -> Request {
@@ -4526,6 +4584,97 @@ async fn test_semantic_tokens_full_delta_updates_previous_result() {
         semantic_token_data(&fresh_full_result),
         "delta edits should transform old token data into fresh full token data"
     );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_did_change_debounces_diagnostics_and_ignores_stale_versions() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let uri = "file:///test/DidChangeDebounce.php";
+    let original_code = "<?php\nfunction ready(): void {}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, original_code))
+        .await
+        .unwrap();
+
+    let opened = next_publish_diagnostics(&mut notifications, uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        opened.get("version").and_then(|value| value.as_i64()),
+        Some(1)
+    );
+
+    let broken_code = "<?php\nfunction broken( {\n";
+    let fixed_code = "<?php\nfunction fixed(): void {}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(uri, 2, broken_code))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(uri, 3, fixed_code))
+        .await
+        .unwrap();
+
+    let latest = next_publish_diagnostics(&mut notifications, uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        latest.get("version").and_then(|value| value.as_i64()),
+        Some(3)
+    );
+    assert_eq!(
+        latest
+            .get("diagnostics")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0),
+        "latest diagnostics should be computed from fixed version 3, got: {}",
+        latest
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(uri, 2, broken_code))
+        .await
+        .unwrap();
+    expect_no_publish_diagnostics(&mut notifications, uri, Duration::from_millis(300)).await;
 
     service
         .ready()

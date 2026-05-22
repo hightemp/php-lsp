@@ -32,13 +32,19 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp::ls_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 struct PhpLspIndexingStatusNotification;
+
+const DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS: u64 = 180;
+
+fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {
+    current.is_none_or(|current| incoming > current)
+}
 
 impl tower_lsp::ls_types::notification::Notification for PhpLspIndexingStatusNotification {
     type Params = serde_json::Value;
@@ -433,6 +439,10 @@ pub struct PhpLspBackend {
     client: Client,
     /// Open document parsers (URI string → FileParser).
     open_files: Arc<DashMap<String, FileParser>>,
+    /// Latest LSP document version observed for each open document.
+    document_versions: Arc<DashMap<String, i32>>,
+    /// Per-document debounce tasks for fast diagnostics after didChange.
+    diagnostic_debounce_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     /// Global workspace symbol index.
     index: Arc<WorkspaceIndex>,
     /// Workspace root path (set during initialize).
@@ -484,6 +494,8 @@ impl PhpLspBackend {
         PhpLspBackend {
             client,
             open_files: Arc::new(DashMap::new()),
+            document_versions: Arc::new(DashMap::new()),
+            diagnostic_debounce_tasks: Arc::new(Mutex::new(HashMap::new())),
             index: Arc::new(WorkspaceIndex::new()),
             workspace_root: Mutex::new(None),
             workspace_roots: Mutex::new(Vec::new()),
@@ -515,6 +527,75 @@ impl PhpLspBackend {
         if level == TraceValue::Verbose {
             tracing::trace!("{}", message);
             self.client.log_message(MessageType::LOG, message).await;
+        }
+    }
+
+    fn current_document_version(&self, uri_str: &str) -> Option<i32> {
+        self.document_versions.get(uri_str).map(|version| *version)
+    }
+
+    fn accept_document_version(&self, uri_str: &str, incoming: i32) -> bool {
+        let current = self.current_document_version(uri_str);
+        if !document_version_is_newer(current, incoming) {
+            tracing::debug!(
+                "Ignoring stale didChange for {}: incoming version {}, current version {:?}",
+                uri_str,
+                incoming,
+                current
+            );
+            return false;
+        }
+
+        self.document_versions.insert(uri_str.to_string(), incoming);
+        true
+    }
+
+    async fn cancel_debounced_diagnostics(&self, uri_str: &str) {
+        if let Some(handle) = self.diagnostic_debounce_tasks.lock().await.remove(uri_str) {
+            handle.abort();
+        }
+    }
+
+    async fn schedule_fast_diagnostics(&self, uri: Uri, version: i32) {
+        let uri_str = uri.as_str().to_string();
+        let client = self.client.clone();
+        let open_files = self.open_files.clone();
+        let document_versions = self.document_versions.clone();
+        let index = self.index.clone();
+        let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let php_version = *self.php_version.lock().await;
+        let debounce = Duration::from_millis(DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS);
+        let task_uri_str = uri_str.clone();
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(debounce).await;
+
+            if document_versions.get(&task_uri_str).map(|current| *current) != Some(version) {
+                return;
+            }
+
+            let diagnostics = compute_open_file_diagnostics(
+                &task_uri_str,
+                &open_files,
+                &index,
+                diagnostics_mode,
+                php_version,
+            );
+
+            if document_versions.get(&task_uri_str).map(|current| *current) == Some(version) {
+                client
+                    .publish_diagnostics(uri, diagnostics, Some(version))
+                    .await;
+            }
+        });
+
+        if let Some(previous) = self
+            .diagnostic_debounce_tasks
+            .lock()
+            .await
+            .insert(uri_str, handle)
+        {
+            previous.abort();
         }
     }
 
@@ -802,6 +883,7 @@ impl PhpLspBackend {
         let client = self.client.clone();
         let index = self.index.clone();
         let open_files = self.open_files.clone();
+        let reindex_document_versions = self.document_versions.clone();
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
@@ -874,6 +956,9 @@ impl PhpLspBackend {
             for entry in open_files.iter() {
                 let uri_str = entry.key().clone();
                 if let Ok(uri) = uri_str.parse::<Uri>() {
+                    let version = reindex_document_versions
+                        .get(&uri_str)
+                        .map(|current| *current);
                     let diags = compute_diagnostics(
                         &uri_str,
                         &entry,
@@ -881,7 +966,15 @@ impl PhpLspBackend {
                         diagnostics_mode,
                         php_version,
                     );
-                    reindex_client.publish_diagnostics(uri, diags, None).await;
+                    if reindex_document_versions
+                        .get(&uri_str)
+                        .map(|current| *current)
+                        == version
+                    {
+                        reindex_client
+                            .publish_diagnostics(uri, diags, version)
+                            .await;
+                    }
                 }
             }
         });
@@ -1556,6 +1649,7 @@ impl PhpLspBackend {
     /// Publish diagnostics for a file.
     async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
+        let version = self.current_document_version(&uri_str);
 
         // Pre-resolve use statements via lazy indexing so that vendor classes
         // are available for the synchronous `compute_diagnostics` resolver.
@@ -1591,19 +1685,13 @@ impl PhpLspBackend {
 
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let php_version = *self.php_version.lock().await;
-        let mut diagnostics = {
-            if let Some(parser) = self.open_files.get(&uri_str) {
-                compute_diagnostics(
-                    &uri_str,
-                    &parser,
-                    &self.index,
-                    diagnostics_mode,
-                    php_version,
-                )
-            } else {
-                vec![]
-            }
-        };
+        let mut diagnostics = compute_open_file_diagnostics(
+            &uri_str,
+            &self.open_files,
+            &self.index,
+            diagnostics_mode,
+            php_version,
+        );
 
         let has_syntax_errors = diagnostics.iter().any(|diagnostic| {
             diagnostic.source.as_deref() == Some("php-lsp")
@@ -1614,35 +1702,18 @@ impl PhpLspBackend {
             diagnostics.extend(self.psalm_diagnostics_for_uri(uri).await);
         }
 
-        self.client
-            .publish_diagnostics(uri.clone(), diagnostics, None)
-            .await;
-    }
-
-    /// Publish only in-process diagnostics from the current open buffer.
-    ///
-    /// This path is used for `didChange` so editor feedback is not blocked by
-    /// lazy vendor indexing or external analyzers such as PHPStan/Psalm.
-    async fn publish_fast_diagnostics(&self, uri: &Uri) {
-        let uri_str = uri.as_str().to_string();
-        let diagnostics_mode = *self.diagnostics_mode.lock().await;
-        let php_version = *self.php_version.lock().await;
-        let diagnostics = {
-            if let Some(parser) = self.open_files.get(&uri_str) {
-                compute_diagnostics(
-                    &uri_str,
-                    &parser,
-                    &self.index,
-                    diagnostics_mode,
-                    php_version,
-                )
-            } else {
-                vec![]
-            }
-        };
+        if self.current_document_version(&uri_str) != version {
+            tracing::debug!(
+                "Skipping stale diagnostics for {}: computed for version {:?}, current {:?}",
+                uri_str,
+                version,
+                self.current_document_version(&uri_str)
+            );
+            return;
+        }
 
         self.client
-            .publish_diagnostics(uri.clone(), diagnostics, None)
+            .publish_diagnostics(uri.clone(), diagnostics, version)
             .await;
     }
 
@@ -1740,6 +1811,8 @@ impl PhpLspBackend {
         self.index.remove_file(&uri_str);
         self.vendor_file_lru.lock().await.remove(&uri_str);
         self.open_files.remove(&uri_str);
+        self.document_versions.remove(&uri_str);
+        self.cancel_debounced_diagnostics(&uri_str).await;
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
         self.client
             .publish_diagnostics(uri.clone(), vec![], None)
@@ -1759,6 +1832,11 @@ impl PhpLspBackend {
             .open_files
             .remove(&old_uri_str)
             .map(|(_, parser)| parser);
+        let moved_version = self
+            .document_versions
+            .remove(&old_uri_str)
+            .map(|(_, version)| version);
+        self.cancel_debounced_diagnostics(&old_uri_str).await;
         if old_is_php {
             self.index.remove_file(&old_uri_str);
             self.vendor_file_lru.lock().await.remove(&old_uri_str);
@@ -1779,7 +1857,11 @@ impl PhpLspBackend {
         };
         if new_excluded {
             if let Some(parser) = moved_parser {
-                self.open_files.insert(new_uri.as_str().to_string(), parser);
+                let new_uri_str = new_uri.as_str().to_string();
+                self.open_files.insert(new_uri_str.clone(), parser);
+                if let Some(version) = moved_version {
+                    self.document_versions.insert(new_uri_str, version);
+                }
             }
             self.index.remove_file(new_uri.as_str());
             self.semantic_tokens_cache
@@ -1797,6 +1879,9 @@ impl PhpLspBackend {
                 self.index.update_file(&new_uri_str, file_symbols);
             }
             self.open_files.insert(new_uri_str.clone(), parser);
+            if let Some(version) = moved_version {
+                self.document_versions.insert(new_uri_str.clone(), version);
+            }
             self.semantic_tokens_cache.lock().await.remove(&new_uri_str);
             self.publish_diagnostics(new_uri).await;
         } else {
@@ -4389,6 +4474,20 @@ fn collect_outgoing_call_hierarchy(
 ///
 /// Extracted as a free function so it can be called both from
 /// `publish_diagnostics` and from the post-indexing re-check in `initialized`.
+fn compute_open_file_diagnostics(
+    uri_str: &str,
+    open_files: &DashMap<String, FileParser>,
+    index: &WorkspaceIndex,
+    diagnostics_mode: DiagnosticsMode,
+    php_version: PhpVersion,
+) -> Vec<Diagnostic> {
+    if let Some(parser) = open_files.get(uri_str) {
+        compute_diagnostics(uri_str, &parser, index, diagnostics_mode, php_version)
+    } else {
+        vec![]
+    }
+}
+
 fn compute_diagnostics(
     uri_str: &str,
     parser: &FileParser,
@@ -8086,6 +8185,7 @@ impl LanguageServer for PhpLspBackend {
         let client = self.client.clone();
         let index = self.index.clone();
         let open_files = self.open_files.clone();
+        let reindex_document_versions = self.document_versions.clone();
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
@@ -8153,6 +8253,9 @@ impl LanguageServer for PhpLspBackend {
             for entry in open_files.iter() {
                 let uri_str = entry.key().clone();
                 if let Ok(uri) = uri_str.parse::<Uri>() {
+                    let version = reindex_document_versions
+                        .get(&uri_str)
+                        .map(|current| *current);
                     let diags = compute_diagnostics(
                         &uri_str,
                         &entry,
@@ -8160,7 +8263,15 @@ impl LanguageServer for PhpLspBackend {
                         diagnostics_mode,
                         php_version,
                     );
-                    reindex_client.publish_diagnostics(uri, diags, None).await;
+                    if reindex_document_versions
+                        .get(&uri_str)
+                        .map(|current| *current)
+                        == version
+                    {
+                        reindex_client
+                            .publish_diagnostics(uri, diags, version)
+                            .await;
+                    }
                 }
             }
         });
@@ -8336,9 +8447,12 @@ impl LanguageServer for PhpLspBackend {
         let uri = params.text_document.uri.clone();
         let uri_str = uri.as_str().to_string();
         let text = &params.text_document.text;
+        let version = params.text_document.version;
 
         tracing::debug!("didOpen: {}", uri_str);
         self.log_trace(&format!("didOpen: {}", uri_str)).await;
+        self.document_versions.insert(uri_str.clone(), version);
+        self.cancel_debounced_diagnostics(&uri_str).await;
 
         let mut parser = FileParser::new();
         parser.parse_full(text);
@@ -8369,8 +8483,12 @@ impl LanguageServer for PhpLspBackend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let uri_str = uri.as_str().to_string();
+        let version = params.text_document.version;
 
-        tracing::debug!("didChange: {}", uri_str);
+        tracing::debug!("didChange: {} version {}", uri_str, version);
+        if !self.accept_document_version(&uri_str, version) {
+            return;
+        }
 
         let excluded = if let Some(path) = uri_to_path(&uri_str) {
             self.path_is_excluded_by_config(&path).await
@@ -8404,7 +8522,7 @@ impl LanguageServer for PhpLspBackend {
             }
         }
 
-        self.publish_fast_diagnostics(&uri).await;
+        self.schedule_fast_diagnostics(uri, version).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -8412,6 +8530,8 @@ impl LanguageServer for PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         tracing::debug!("didClose: {}", uri_str);
         self.open_files.remove(&uri_str);
+        self.document_versions.remove(&uri_str);
+        self.cancel_debounced_diagnostics(&uri_str).await;
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
         // Clear diagnostics for closed file
         self.client.publish_diagnostics(uri, vec![], None).await;
@@ -8419,6 +8539,8 @@ impl LanguageServer for PhpLspBackend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         tracing::debug!("didSave: {}", params.text_document.uri.as_str());
+        self.cancel_debounced_diagnostics(params.text_document.uri.as_str())
+            .await;
         self.publish_diagnostics(&params.text_document.uri).await;
     }
 
@@ -11395,6 +11517,14 @@ mod tests {
         for i in 0..32 {
             assert!(index.resolve_fqn(&format!("App\\Foo{}", i)).is_some());
         }
+    }
+
+    #[test]
+    fn test_document_version_ordering_accepts_only_newer_versions() {
+        assert!(document_version_is_newer(None, 1));
+        assert!(document_version_is_newer(Some(1), 2));
+        assert!(!document_version_is_newer(Some(2), 2));
+        assert!(!document_version_is_newer(Some(3), 2));
     }
 
     #[test]

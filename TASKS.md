@@ -703,11 +703,17 @@
 
 ### Неделя 3: Responsiveness, debounce, cancellation (2026-06-04 → 2026-06-10)
 
-- [ ] **PR-020** Очередь `didChange` с debounce и version ordering
+- [x] **PR-020** Очередь `didChange` с debounce и version ordering *(completed 2026-05-22)*
   - Хранить document version из LSP events.
   - Debounce diagnostics 150-250 мс.
   - Отменять устаревшие diagnostic tasks при новом изменении файла.
   - Гарантировать, что старый результат diagnostics не перетрет новый.
+  - Добавлен `document_versions` для open documents и per-URI debounce task registry.
+  - `didChange` игнорирует stale/duplicate versions, diagnostics публикуются после 180 мс debounce.
+  - `publishDiagnostics` теперь отправляет document version и пропускает результат, если версия изменилась во время вычисления.
+  - `didSave`/`didClose`/file delete/rename отменяют pending debounce tasks.
+  - Regression: e2e проверяет, что broken version 2 не публикуется после fixed version 3.
+  - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`.
 
 - [ ] **PR-021** Поддержать cancellation для тяжелых операций
   - Ввести `CancellationToken`/task registry для indexing, references, rename, external analyzer runs.
