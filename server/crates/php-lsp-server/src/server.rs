@@ -27,7 +27,7 @@ use php_lsp_parser::semantic_tokens::{
 use php_lsp_parser::signature_help::signature_help_context_at_position;
 use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -205,6 +205,110 @@ struct WorkspaceRootConfig {
     namespace_map: Option<NamespaceMap>,
 }
 
+const VENDOR_FILE_LRU_CAPACITY: usize = 512;
+const VENDOR_PRELOAD_ENTRYPOINT_LIMIT: usize = 16;
+
+#[derive(Debug, Clone)]
+struct VendorPsr4Mapping {
+    prefix: String,
+    directories: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VendorAutoloadMap {
+    psr4: Vec<VendorPsr4Mapping>,
+    files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct VendorAutoloadCacheEntry {
+    fingerprint: u64,
+    map: VendorAutoloadMap,
+}
+
+#[derive(Debug, Default)]
+struct VendorAutoloadCache {
+    by_vendor_dir: HashMap<PathBuf, VendorAutoloadCacheEntry>,
+}
+
+impl VendorAutoloadCache {
+    fn load(&mut self, vendor_dir: &Path) -> Option<VendorAutoloadMap> {
+        let fingerprint = vendor_autoload_metadata_hash(vendor_dir);
+        if let Some(entry) = self.by_vendor_dir.get(vendor_dir) {
+            if entry.fingerprint == fingerprint {
+                return Some(entry.map.clone());
+            }
+        }
+
+        let Some(map) = parse_vendor_autoload_map(vendor_dir) else {
+            self.by_vendor_dir.remove(vendor_dir);
+            return None;
+        };
+        self.by_vendor_dir.insert(
+            vendor_dir.to_path_buf(),
+            VendorAutoloadCacheEntry {
+                fingerprint,
+                map: map.clone(),
+            },
+        );
+        Some(map)
+    }
+
+    fn clear(&mut self) {
+        self.by_vendor_dir.clear();
+    }
+}
+
+#[derive(Debug)]
+struct VendorFileLru {
+    capacity: usize,
+    uris: VecDeque<String>,
+}
+
+impl Default for VendorFileLru {
+    fn default() -> Self {
+        Self {
+            capacity: VENDOR_FILE_LRU_CAPACITY,
+            uris: VecDeque::new(),
+        }
+    }
+}
+
+impl VendorFileLru {
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            uris: VecDeque::new(),
+        }
+    }
+
+    fn touch(&mut self, uri: String) -> Vec<String> {
+        if let Some(position) = self.uris.iter().position(|existing| existing == &uri) {
+            self.uris.remove(position);
+        }
+        self.uris.push_back(uri);
+
+        let mut evicted = Vec::new();
+        while self.uris.len() > self.capacity {
+            if let Some(uri) = self.uris.pop_front() {
+                evicted.push(uri);
+            }
+        }
+        evicted
+    }
+
+    fn remove(&mut self, uri: &str) {
+        if let Some(position) = self.uris.iter().position(|existing| existing == uri) {
+            self.uris.remove(position);
+        }
+    }
+
+    fn clear(&mut self) -> Vec<String> {
+        self.uris.drain(..).collect()
+    }
+}
+
 impl SemanticTokensCache {
     fn store(&mut self, uri: &str, data: Vec<SemanticToken>) -> SemanticTokensSnapshot {
         self.next_result_id += 1;
@@ -351,6 +455,10 @@ pub struct PhpLspBackend {
     formatting_config: Mutex<FormattingConfig>,
     /// Last semantic token snapshots used for full/delta requests.
     semantic_tokens_cache: Mutex<SemanticTokensCache>,
+    /// Parsed Composer vendor metadata keyed by vendor directory.
+    vendor_autoload_cache: Arc<Mutex<VendorAutoloadCache>>,
+    /// Bounded set of lazy-indexed vendor files currently kept in the symbol index.
+    vendor_file_lru: Arc<Mutex<VendorFileLru>>,
 }
 
 impl PhpLspBackend {
@@ -378,6 +486,8 @@ impl PhpLspBackend {
             work_done_progress_supported: Mutex::new(false),
             formatting_config: Mutex::new(FormattingConfig::default()),
             semantic_tokens_cache: Mutex::new(SemanticTokensCache::default()),
+            vendor_autoload_cache: Arc::new(Mutex::new(VendorAutoloadCache::default())),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
         }
     }
 
@@ -434,10 +544,26 @@ impl PhpLspBackend {
         }
 
         if let Some(enabled) = settings_bool(settings, "indexVendor", &["indexVendor"]) {
-            let mut index_vendor = self.index_vendor.lock().await;
-            if *index_vendor != enabled {
-                *index_vendor = enabled;
+            let changed = {
+                let mut index_vendor = self.index_vendor.lock().await;
+                if *index_vendor != enabled {
+                    *index_vendor = enabled;
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
                 applied.indexing_changed = true;
+                if !enabled {
+                    self.vendor_autoload_cache.lock().await.clear();
+                    let evicted = self.vendor_file_lru.lock().await.clear();
+                    for uri in evicted {
+                        self.index.remove_file(&uri);
+                    }
+                    let roots = self.workspace_roots.lock().await.clone();
+                    remove_indexed_vendor_symbols(&self.index, &roots);
+                }
             }
         }
 
@@ -662,6 +788,9 @@ impl PhpLspBackend {
         let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let php_version = *self.php_version.lock().await;
+        let index_vendor = *self.index_vendor.lock().await;
+        let vendor_autoload_cache = self.vendor_autoload_cache.clone();
+        let vendor_file_lru = self.vendor_file_lru.clone();
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let include_paths = self.include_paths.lock().await.clone();
         let exclude_paths = self.exclude_paths.lock().await.clone();
@@ -710,6 +839,18 @@ impl PhpLspBackend {
                         .await;
                     return;
                 }
+
+                if index_vendor {
+                    preload_vendor_entrypoints(
+                        &index,
+                        &config.root,
+                        &indexing_options.exclude_paths,
+                        php_version,
+                        &vendor_autoload_cache,
+                        &vendor_file_lru,
+                    )
+                    .await;
+                }
             }
 
             for entry in open_files.iter() {
@@ -757,6 +898,10 @@ impl PhpLspBackend {
         }
 
         self.workspace_root.lock().await.clone()
+    }
+
+    async fn touch_vendor_file_lru(&self, file_path: &Path) {
+        touch_vendor_file_lru(&self.index, &self.vendor_file_lru, file_path).await;
     }
 
     /// Resolve a member's type from the workspace index (for cross-file type resolution).
@@ -935,7 +1080,16 @@ impl PhpLspBackend {
             if index_vendor && vendor_dir.is_dir() {
                 let vendor_autoload = config.root.join("vendor/composer/autoload_psr4.php");
                 if vendor_autoload.exists() && all_paths.is_empty() {
-                    if let Some(vendor_paths) = resolve_vendor_paths(class_fqn, &vendor_dir) {
+                    if let Some(vendor_map) =
+                        cached_vendor_autoload_map(&self.vendor_autoload_cache, &vendor_dir).await
+                    {
+                        if let Some(vendor_paths) =
+                            resolve_vendor_paths_from_map(class_fqn, &vendor_map)
+                        {
+                            all_paths.extend(vendor_paths);
+                        }
+                    } else if let Some(vendor_paths) = resolve_vendor_paths(class_fqn, &vendor_dir)
+                    {
                         all_paths.extend(vendor_paths);
                     }
                 }
@@ -957,26 +1111,21 @@ impl PhpLspBackend {
                     .then(|| vendor_index_cache_config(&config.root, php_version, &exclude_paths));
                 if let Some(cache_config) = vendor_cache_config.as_ref() {
                     if load_cached_vendor_file(&self.index, &config.root, &abs, cache_config) {
+                        self.touch_vendor_file_lru(&abs).await;
                         tracing::debug!("Lazy-indexed vendor file from cache: {}", abs.display());
                         return true;
                     }
                 }
 
-                if abs.exists() {
-                    if let Ok(source) = std::fs::read_to_string(&abs) {
-                        let mut parser = FileParser::new();
-                        parser.parse_full(&source);
-                        if let Some(tree) = parser.tree() {
-                            let uri = path_to_uri(&abs);
-                            let file_symbols = extract_file_symbols(tree, &source, &uri);
-                            self.index.update_file(&uri, file_symbols);
-                            if let Some(cache_config) = vendor_cache_config.as_ref() {
-                                save_vendor_index_cache(&self.index, &config.root, cache_config);
-                            }
-                            tracing::debug!("Lazy-indexed file: {}", abs.display());
-                            return true;
-                        }
+                if abs.exists() && parse_and_index_php_file(&self.index, &abs) {
+                    if is_vendor_file {
+                        self.touch_vendor_file_lru(&abs).await;
                     }
+                    if let Some(cache_config) = vendor_cache_config.as_ref() {
+                        save_vendor_index_cache(&self.index, &config.root, cache_config);
+                    }
+                    tracing::debug!("Lazy-indexed file: {}", abs.display());
+                    return true;
                 }
             }
         }
@@ -1571,6 +1720,7 @@ impl PhpLspBackend {
 
         let uri_str = uri.as_str().to_string();
         self.index.remove_file(&uri_str);
+        self.vendor_file_lru.lock().await.remove(&uri_str);
         self.open_files.remove(&uri_str);
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
         self.client
@@ -1593,6 +1743,7 @@ impl PhpLspBackend {
             .map(|(_, parser)| parser);
         if old_is_php {
             self.index.remove_file(&old_uri_str);
+            self.vendor_file_lru.lock().await.remove(&old_uri_str);
             self.semantic_tokens_cache.lock().await.remove(&old_uri_str);
             self.client
                 .publish_diagnostics(old_uri.clone(), vec![], None)
@@ -6598,6 +6749,23 @@ fn remove_indexed_file_symbols(index: &WorkspaceIndex, roots: &[PathBuf]) -> usi
     removed
 }
 
+fn remove_indexed_vendor_symbols(index: &WorkspaceIndex, roots: &[PathBuf]) -> usize {
+    let uris: Vec<String> = index
+        .file_symbols
+        .iter()
+        .filter_map(|entry| {
+            let path = uri_to_path(entry.key())?;
+            path_is_under_vendor_roots(&path, roots).then(|| entry.key().clone())
+        })
+        .collect();
+
+    let removed = uris.len();
+    for uri in uris {
+        index.remove_file(&uri);
+    }
+    removed
+}
+
 fn path_is_under_vendor_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots
         .iter()
@@ -6668,9 +6836,18 @@ fn find_composer_json(root: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Try to resolve a FQN to file paths by scanning vendor/composer installed packages.
-fn resolve_vendor_paths(fqn: &str, vendor_dir: &Path) -> Option<Vec<PathBuf>> {
-    // Try to parse vendor/composer/installed.json for PSR-4 mappings
+fn vendor_autoload_metadata_hash(vendor_dir: &Path) -> u64 {
+    let mut parts = vec![
+        "vendor-autoload-metadata-v1".to_string(),
+        format!("vendor-dir={}", cache_path_label(vendor_dir)),
+    ];
+    for relative in ["composer/installed.json", "composer/autoload_psr4.php"] {
+        push_metadata_hash_part(&mut parts, "file", relative, &vendor_dir.join(relative));
+    }
+    cache::stable_hash_strings(parts.iter().map(String::as_str))
+}
+
+fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutoloadMap> {
     let installed_json = vendor_dir.join("composer/installed.json");
     if !installed_json.exists() {
         return None;
@@ -6685,44 +6862,81 @@ fn resolve_vendor_paths(fqn: &str, vendor_dir: &Path) -> Option<Vec<PathBuf>> {
         .and_then(|p| p.as_array())
         .or_else(|| data.as_array())?;
 
-    let mut paths = Vec::new();
+    let mut map = VendorAutoloadMap::default();
 
     for pkg in packages {
-        // Each package has "autoload" -> "psr-4" -> { "Prefix\\": "src/" }
+        let install_path = pkg
+            .get("install-path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let pkg_dir = vendor_package_dir(vendor_dir, install_path);
+
         if let Some(autoload) = pkg.get("autoload") {
-            if let Some(psr4) = autoload.get("psr-4").and_then(|v| v.as_object()) {
-                for (prefix, dirs) in psr4 {
-                    if let Some(relative) = fqn.strip_prefix(prefix.as_str()) {
-                        let relative_path = relative.replace('\\', "/") + ".php";
+            append_vendor_autoload(&mut map, &pkg_dir, autoload);
+        }
+    }
 
-                        // Get install path (package directory)
-                        let install_path = pkg
-                            .get("install-path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+    Some(map)
+}
 
-                        let pkg_dir = if install_path.starts_with("../") {
-                            vendor_dir.join("composer").join(install_path)
-                        } else {
-                            vendor_dir.join(install_path)
-                        };
-
-                        match dirs {
-                            serde_json::Value::String(dir) => {
-                                paths.push(pkg_dir.join(dir).join(&relative_path));
-                            }
-                            serde_json::Value::Array(dir_list) => {
-                                for dir in dir_list {
-                                    if let Some(dir_str) = dir.as_str() {
-                                        paths.push(pkg_dir.join(dir_str).join(&relative_path));
-                                    }
-                                }
-                            }
-                            _ => {}
+fn append_vendor_autoload(
+    map: &mut VendorAutoloadMap,
+    pkg_dir: &Path,
+    autoload: &serde_json::Value,
+) {
+    if let Some(psr4) = autoload.get("psr-4").and_then(|v| v.as_object()) {
+        for (prefix, dirs) in psr4 {
+            let mut directories = Vec::new();
+            match dirs {
+                serde_json::Value::String(dir) => {
+                    directories.push(pkg_dir.join(dir));
+                }
+                serde_json::Value::Array(dir_list) => {
+                    for dir in dir_list {
+                        if let Some(dir_str) = dir.as_str() {
+                            directories.push(pkg_dir.join(dir_str));
                         }
                     }
                 }
+                _ => {}
             }
+            if !directories.is_empty() {
+                map.psr4.push(VendorPsr4Mapping {
+                    prefix: prefix.clone(),
+                    directories,
+                });
+            }
+        }
+    }
+
+    if let Some(files) = autoload.get("files").and_then(|value| value.as_array()) {
+        for file in files {
+            if let Some(file_path) = file.as_str() {
+                map.files.push(pkg_dir.join(file_path));
+            }
+        }
+    }
+}
+
+fn vendor_package_dir(vendor_dir: &Path, install_path: &str) -> PathBuf {
+    if install_path.is_empty() {
+        vendor_dir.to_path_buf()
+    } else if install_path.starts_with("../") {
+        vendor_dir.join("composer").join(install_path)
+    } else {
+        vendor_dir.join(install_path)
+    }
+}
+
+fn resolve_vendor_paths_from_map(fqn: &str, map: &VendorAutoloadMap) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for mapping in &map.psr4 {
+        let Some(relative) = fqn.strip_prefix(mapping.prefix.as_str()) else {
+            continue;
+        };
+        let relative_path = relative.replace('\\', "/") + ".php";
+        for directory in &mapping.directories {
+            push_unique_path(&mut paths, directory.join(&relative_path));
         }
     }
 
@@ -6731,6 +6945,19 @@ fn resolve_vendor_paths(fqn: &str, vendor_dir: &Path) -> Option<Vec<PathBuf>> {
     } else {
         Some(paths)
     }
+}
+
+async fn cached_vendor_autoload_map(
+    cache: &Arc<Mutex<VendorAutoloadCache>>,
+    vendor_dir: &Path,
+) -> Option<VendorAutoloadMap> {
+    cache.lock().await.load(vendor_dir)
+}
+
+/// Try to resolve a FQN to file paths by scanning vendor/composer installed packages.
+fn resolve_vendor_paths(fqn: &str, vendor_dir: &Path) -> Option<Vec<PathBuf>> {
+    let map = parse_vendor_autoload_map(vendor_dir)?;
+    resolve_vendor_paths_from_map(fqn, &map)
 }
 
 /// Convert PhpSymbolKind to the ls_types SymbolKind used by tower-lsp.
@@ -7147,6 +7374,22 @@ fn collect_stub_cache_sources(stubs_path: &Path, extensions: &[String]) -> Vec<C
     sources
 }
 
+fn parse_and_index_php_file(index: &WorkspaceIndex, file_path: &Path) -> bool {
+    let Ok(source) = std::fs::read_to_string(file_path) else {
+        return false;
+    };
+    let mut parser = FileParser::new();
+    parser.parse_full(&source);
+    let Some(tree) = parser.tree() else {
+        return false;
+    };
+
+    let uri = path_to_uri(file_path);
+    let file_symbols = extract_file_symbols(tree, &source, &uri);
+    index.update_file(&uri, file_symbols);
+    true
+}
+
 fn load_cached_vendor_file(
     index: &WorkspaceIndex,
     root: &Path,
@@ -7174,6 +7417,18 @@ fn load_cached_vendor_file(
         );
     }
     false
+}
+
+async fn touch_vendor_file_lru(
+    index: &WorkspaceIndex,
+    vendor_file_lru: &Arc<Mutex<VendorFileLru>>,
+    file_path: &Path,
+) {
+    let uri = path_to_uri(file_path);
+    let evicted = vendor_file_lru.lock().await.touch(uri);
+    for uri in evicted {
+        index.remove_file(&uri);
+    }
 }
 
 fn save_vendor_index_cache(index: &WorkspaceIndex, root: &Path, config: &IndexCacheConfig) {
@@ -7207,6 +7462,52 @@ fn indexed_vendor_cache_sources(index: &WorkspaceIndex, root: &Path) -> Vec<Cach
     sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     sources.dedup_by(|left, right| left.relative_path == right.relative_path);
     sources
+}
+
+async fn preload_vendor_entrypoints(
+    index: &WorkspaceIndex,
+    root: &Path,
+    exclude_paths: &[PathBuf],
+    php_version: PhpVersion,
+    vendor_autoload_cache: &Arc<Mutex<VendorAutoloadCache>>,
+    vendor_file_lru: &Arc<Mutex<VendorFileLru>>,
+) -> usize {
+    let vendor_dir = root.join("vendor");
+    if !vendor_dir.is_dir() {
+        return 0;
+    }
+
+    let Some(autoload) = cached_vendor_autoload_map(vendor_autoload_cache, &vendor_dir).await
+    else {
+        return 0;
+    };
+    if autoload.files.is_empty() {
+        return 0;
+    }
+
+    let cache_config = vendor_index_cache_config(root, php_version, exclude_paths);
+    let mut loaded = 0;
+    for file_path in autoload.files.iter().take(VENDOR_PRELOAD_ENTRYPOINT_LIMIT) {
+        if !file_path.is_file() || path_is_excluded(file_path, root, exclude_paths) {
+            continue;
+        }
+
+        let from_cache = load_cached_vendor_file(index, root, file_path, &cache_config);
+        if from_cache || parse_and_index_php_file(index, file_path) {
+            touch_vendor_file_lru(index, vendor_file_lru, file_path).await;
+            loaded += 1;
+        }
+    }
+
+    if loaded > 0 {
+        save_vendor_index_cache(index, root, &cache_config);
+        tracing::debug!(
+            "Preloaded {} vendor autoload entrypoint file(s) for {}",
+            loaded,
+            root.display()
+        );
+    }
+    loaded
 }
 
 /// Background workspace indexing.
@@ -7722,6 +8023,9 @@ impl LanguageServer for PhpLspBackend {
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let index_vendor = *self.index_vendor.lock().await;
+        let vendor_autoload_cache = self.vendor_autoload_cache.clone();
+        let vendor_file_lru = self.vendor_file_lru.clone();
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let include_paths = self.include_paths.lock().await.clone();
         let exclude_paths = self.exclude_paths.lock().await.clone();
@@ -7764,6 +8068,18 @@ impl LanguageServer for PhpLspBackend {
                         .log_message(MessageType::ERROR, format!("Indexing failed: {}", e))
                         .await;
                     return;
+                }
+
+                if index_vendor {
+                    preload_vendor_entrypoints(
+                        &index,
+                        &config.root,
+                        &indexing_options.exclude_paths,
+                        php_version,
+                        &vendor_autoload_cache,
+                        &vendor_file_lru,
+                    )
+                    .await;
                 }
             }
 
@@ -7879,6 +8195,9 @@ impl LanguageServer for PhpLspBackend {
         let include_paths = self.include_paths.lock().await.clone();
         let exclude_paths = self.exclude_paths.lock().await.clone();
         let php_version = *self.php_version.lock().await;
+        let index_vendor = *self.index_vendor.lock().await;
+        let vendor_autoload_cache = self.vendor_autoload_cache.clone();
+        let vendor_file_lru = self.vendor_file_lru.clone();
         let stub_extensions = self.stub_extensions.lock().await.clone();
         let client_stubs_path = self.stubs_path.lock().await.clone();
         let cache_config = workspace_index_cache_config(
@@ -7922,6 +8241,19 @@ impl LanguageServer for PhpLspBackend {
                             format!("Workspace folder indexing failed: {}", e),
                         )
                         .await;
+                    continue;
+                }
+
+                if index_vendor {
+                    preload_vendor_entrypoints(
+                        &index,
+                        &config.root,
+                        &indexing_options.exclude_paths,
+                        php_version,
+                        &vendor_autoload_cache,
+                        &vendor_file_lru,
+                    )
+                    .await;
                 }
             }
         });
@@ -10980,6 +11312,106 @@ mod tests {
         assert_eq!(vendor_config.namespace, CacheNamespace::Vendor);
         assert_ne!(workspace_config.config_hash(), stubs_config.config_hash());
         assert_ne!(workspace_config.config_hash(), vendor_config.config_hash());
+    }
+
+    #[test]
+    fn test_vendor_file_lru_evicts_old_index_entries() {
+        let index = WorkspaceIndex::new();
+        let uri1 = "file:///tmp/project/vendor/acme/pkg/One.php";
+        let uri2 = "file:///tmp/project/vendor/acme/pkg/Two.php";
+        index.update_file(
+            uri1,
+            FileSymbols {
+                namespace: Some("Vendor\\Pkg".to_string()),
+                use_statements: vec![],
+                symbols: vec![make_symbol(
+                    "One",
+                    "Vendor\\Pkg\\One",
+                    PhpSymbolKind::Class,
+                    (0, 0, 1, 0),
+                    None,
+                )],
+            },
+        );
+        index.update_file(
+            uri2,
+            FileSymbols {
+                namespace: Some("Vendor\\Pkg".to_string()),
+                use_statements: vec![],
+                symbols: vec![make_symbol(
+                    "Two",
+                    "Vendor\\Pkg\\Two",
+                    PhpSymbolKind::Class,
+                    (0, 0, 1, 0),
+                    None,
+                )],
+            },
+        );
+
+        let mut lru = VendorFileLru::with_capacity(1);
+        assert!(lru.touch(uri1.to_string()).is_empty());
+        let evicted = lru.touch(uri2.to_string());
+        for uri in evicted {
+            index.remove_file(&uri);
+        }
+
+        assert!(index.resolve_fqn("Vendor\\Pkg\\One").is_none());
+        assert!(index.resolve_fqn("Vendor\\Pkg\\Two").is_some());
+    }
+
+    #[test]
+    fn test_vendor_autoload_map_parses_psr4_and_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "php-lsp-vendor-autoload-map-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vendor_dir = tmp.join("vendor");
+        let composer_dir = vendor_dir.join("composer");
+        std::fs::create_dir_all(&composer_dir).unwrap();
+
+        let installed_json = serde_json::json!({
+            "packages": [
+                {
+                    "name": "acme/library",
+                    "install-path": "../acme/library",
+                    "autoload": {
+                        "psr-4": {
+                            "Acme\\Library\\": ["src/", "generated/"]
+                        },
+                        "files": ["bootstrap.php"]
+                    }
+                }
+            ]
+        });
+        std::fs::write(
+            composer_dir.join("installed.json"),
+            serde_json::to_string(&installed_json).unwrap(),
+        )
+        .unwrap();
+
+        let map = parse_vendor_autoload_map(&vendor_dir).unwrap();
+        let paths = resolve_vendor_paths_from_map("Acme\\Library\\Http\\Client", &map).unwrap();
+
+        assert_eq!(paths.len(), 2);
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.to_string_lossy().ends_with("src/Http/Client.php")),
+            "Expected src PSR-4 path, got: {:?}",
+            paths
+        );
+        assert!(
+            map.files
+                .iter()
+                .any(|path| path.to_string_lossy().ends_with("bootstrap.php")),
+            "Expected autoload file path, got: {:?}",
+            map.files
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

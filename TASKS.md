@@ -565,9 +565,11 @@
   - Замер: время индексации, память, latency hover/completion
   - Оптимизация bottleneck'ов
 
-- [ ] **V1-011** Lazy vendor indexing — оптимизация
+- [x] **V1-011** Lazy vendor indexing — оптимизация *(done 2026-05-22)*
   - Предзагрузка popular packages
   - LRU-кэш для vendor-файлов
+  - Parsed Composer `vendor/composer/installed.json` metadata cache
+  - Dedicated vendor disk cache namespace for lazy-indexed file symbols
 
 ### Documentation
 
@@ -670,10 +672,13 @@
   - `stubs`: cache keyed by php-lsp version, PHP version, extension list and stubs hash; повторный smoke load: 85 stub files за 23.23 ms.
   - `vendor`: lazy-indexed vendor file symbols сохраняются в `vendor/index.bin` после первого парсинга vendor файла.
 
-- [ ] **PR-012 / V1-011** Оптимизировать lazy vendor indexing
+- [x] **PR-012 / V1-011** Оптимизировать lazy vendor indexing *(done 2026-05-22)*
   - Кэшировать parsed composer installed/autoload metadata.
   - Добавить LRU для vendor file symbols.
   - Предзагружать часто используемые vendor entrypoints после ready, без блокировки быстрых запросов.
+  - `vendor/composer/installed.json` парсится в `VendorAutoloadMap` и переиспользуется до изменения metadata fingerprint.
+  - LRU удерживает до 512 lazy-indexed vendor files в symbol index; вытесненные файлы могут быть восстановлены из `vendor/index.bin`.
+  - После workspace ready фоново предзагружаются до 16 `autoload.files` entrypoints.
 
 - [ ] **PR-013** Сделать indexing реально параллельным
   - Заменить последовательный loop с semaphore на task queue / `JoinSet`.

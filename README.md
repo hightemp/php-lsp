@@ -87,7 +87,8 @@ phpstorm-stubs support.
   baseline measurements live in `docs/production-risk-register.md` and
   `docs/production-baseline.md`.
 - Workspace, stub, and lazy vendor file symbols are cached in separate disk
-  namespaces. Large-project acceptance thresholds are still production
+  namespaces; Composer vendor metadata is cached in memory with an LRU for
+  lazy vendor symbols. Large-project acceptance thresholds are still production
   hardening work.
 - `references`, `rename`, and reference-count code lenses can still scan and
   reparse indexed workspace files. They are functional, but not yet optimized

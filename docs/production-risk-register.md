@@ -16,7 +16,7 @@ Scope: production-readiness milestone, weeks 1-6.
 | R-005 | Нет request cancellation для тяжелых операций | High | `PR-021`, `PR-050` | Open |
 | R-006 | `didChange` без debounce/version ordering | High | `PR-020`, `PR-050` | Open |
 | R-007 | Stubs грузятся на старте без PHP-version filtering | Medium | `PR-030`, `PR-011` | Partially mitigated |
-| R-008 | Lazy vendor indexing без metadata/LRU cache | Medium | `PR-012`, `PR-011` | Partially mitigated |
+| R-008 | Lazy vendor indexing scale validation | Medium | `PR-012`, `PR-011` | Partially mitigated |
 | R-009 | PHPDoc/type model shallow для production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041` | Open |
 | R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052` | Open |
 
@@ -181,23 +181,25 @@ Exit signal:
 - Changing PHP version updates built-in completion/definition/diagnostics without restart.
 - Stub load time is near-zero from cache after first run.
 
-### R-008: Lazy vendor indexing без metadata/LRU cache
+### R-008: Lazy vendor indexing scale validation
 
 Current evidence:
 
 - Lazy class resolution checks composer namespace maps and can parse `vendor/composer/installed.json`.
 - `PR-011` caches lazy-indexed vendor file symbols in a dedicated `vendor` cache namespace.
-- Vendor composer metadata resolution and an LRU policy are not cached yet.
+- `PR-012` caches parsed Composer installed/autoload metadata in memory until the Composer metadata fingerprint changes.
+- `PR-012` bounds lazy vendor symbols with a 512-file LRU and restores evicted file symbols from the `vendor` disk cache when needed.
+- `PR-012` preloads up to 16 Composer `autoload.files` entrypoints after workspace ready.
 
 Impact:
 
-- Repeated vendor lookups can re-read metadata/files.
-- Large vendor directories may cause unpredictable first-hit latency.
+- Large vendor directories may still have unpredictable first-hit latency until acceptance is measured on real projects.
+- The LRU cap is conservative and may need tuning after Laravel/Symfony-size profiling.
 
 Mitigation:
 
-- `PR-012`: cache composer installed/autoload metadata and add LRU for vendor file symbols.
-- Defer popular package preloading until after workspace ready.
+- `PR-012`: implemented Composer installed/autoload metadata cache, vendor file symbol LRU and nonblocking `autoload.files` preload.
+- `PR-012`: keep vendor file symbols in the dedicated `vendor` disk cache so LRU evictions do not force reparsing unchanged files.
 
 Exit signal:
 
