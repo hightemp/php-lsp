@@ -234,6 +234,11 @@
         "category": "PHP"
       },
       {
+        "command": "phpLsp.clearCacheAndRestart",
+        "title": "Clear PHP LSP Cache and Restart",
+        "category": "PHP"
+      },
+      {
         "command": "phpLsp.showStatus",
         "title": "Show Language Server Status",
         "category": "PHP"
@@ -244,6 +249,7 @@
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.mjs --production",
     "watch": "node esbuild.mjs --watch",
+    "check:cache-path": "node scripts/check-cache-path.mjs",
     "lint": "tsc --noEmit",
     "package": "vsce package"
   },

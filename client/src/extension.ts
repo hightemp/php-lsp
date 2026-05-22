@@ -1,5 +1,7 @@
 import * as path from "path";
 import * as os from "os";
+import * as fs from "fs";
+import { phpLspCacheDirForRoot } from "./cachePath";
 import {
   workspace,
   commands,
@@ -63,7 +65,7 @@ interface ExtensionSnapshot {
 }
 
 interface StatusQuickPickItem extends QuickPickItem {
-  action?: "restart" | "output" | "settings";
+  action?: "restart" | "clearCache" | "output" | "settings";
 }
 
 class PhpLspStatusController implements Disposable {
@@ -159,6 +161,11 @@ class PhpLspStatusController implements Disposable {
         action: "restart",
       },
       {
+        label: "$(trash) Clear cache and restart",
+        detail: "Deletes PHP LSP disk cache for the current workspace roots",
+        action: "clearCache",
+      },
+      {
         label: "$(output) Open LSP output",
         action: "output",
       },
@@ -177,6 +184,8 @@ class PhpLspStatusController implements Disposable {
 
     if (selected?.action === "restart") {
       await commands.executeCommand("phpLsp.restartServer");
+    } else if (selected?.action === "clearCache") {
+      await commands.executeCommand("phpLsp.clearCacheAndRestart");
     } else if (selected?.action === "output") {
       client?.outputChannel.show(true);
     } else if (selected?.action === "settings") {
@@ -346,6 +355,67 @@ function getServerEnvironment(logLevel: string): NodeJS.ProcessEnv {
   };
 }
 
+function discoverComposerRoot(root: string): string | undefined {
+  if (fs.existsSync(path.join(root, "composer.json"))) {
+    return root;
+  }
+
+  const skipDirs = new Set([
+    "node_modules",
+    "vendor",
+    ".git",
+    ".github",
+    "docker",
+    "cache",
+    "logs",
+    "tmp",
+  ]);
+
+  let candidates: string[] = [];
+  try {
+    candidates = fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .filter((entry) => !entry.name.startsWith(".") && !skipDirs.has(entry.name))
+      .map((entry) => path.join(root, entry.name))
+      .filter((candidate) => fs.existsSync(path.join(candidate, "composer.json")));
+  } catch {
+    return undefined;
+  }
+
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  return candidates.find((candidate) => {
+    try {
+      const content = fs.readFileSync(path.join(candidate, "composer.json"), "utf8");
+      return content.includes("\"autoload\"") || content.includes("\"psr-4\"");
+    } catch {
+      return false;
+    }
+  }) ?? candidates[0];
+}
+
+function currentWorkspaceCacheDirs(): string[] {
+  const roots = new Set<string>();
+  for (const folder of workspace.workspaceFolders ?? []) {
+    roots.add(folder.uri.fsPath);
+    const composerRoot = discoverComposerRoot(folder.uri.fsPath);
+    if (composerRoot) {
+      roots.add(composerRoot);
+    }
+  }
+
+  return Array.from(new Set(Array.from(roots, phpLspCacheDirForRoot)));
+}
+
+function cacheDirectoryCountLabel(count: number): string {
+  return `${count} director${count === 1 ? "y" : "ies"}`;
+}
+
 /**
  * Map Node.js os.platform()+os.arch() to the binary subdirectory name.
  */
@@ -390,7 +460,6 @@ function getServerPath(context: ExtensionContext): string {
  */
 function getStubsPath(context: ExtensionContext): string | undefined {
   const stubsPath = context.asAbsolutePath("stubs");
-  const fs = require("fs");
   if (fs.existsSync(stubsPath)) {
     return stubsPath;
   }
@@ -520,6 +589,71 @@ async function restartLanguageClient(context: ExtensionContext): Promise<void> {
   }
 }
 
+async function clearCacheAndRestartLanguageClient(context: ExtensionContext): Promise<void> {
+  const cacheDirs = currentWorkspaceCacheDirs();
+  if (cacheDirs.length === 0) {
+    window.showInformationMessage("PHP LSP cache was not cleared: no workspace folder is open");
+    return;
+  }
+
+  const confirmed = await window.showWarningMessage(
+    `Clear PHP LSP disk cache for ${cacheDirs.length} workspace root(s) and restart the language server?`,
+    { modal: true },
+    "Clear Cache and Restart",
+  );
+  if (confirmed !== "Clear Cache and Restart") {
+    return;
+  }
+
+  statusController?.update({
+    phase: "starting",
+    message: "Clearing disk cache and restarting language server",
+  });
+
+  await stopLanguageClient();
+
+  const failed: string[] = [];
+  let removed = 0;
+  for (const cacheDir of cacheDirs) {
+    try {
+      if (fs.existsSync(cacheDir)) {
+        await fs.promises.rm(cacheDir, { recursive: true, force: true });
+        removed += 1;
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      failed.push(`${cacheDir}: ${message}`);
+    }
+  }
+
+  if (failed.length > 0) {
+    const message = `Failed to clear PHP LSP cache: ${failed.join("; ")}`;
+    statusController?.update({
+      phase: "error",
+      message,
+    });
+    window.showErrorMessage(message);
+    return;
+  }
+
+  if (!workspace.getConfiguration("phpLsp").get<boolean>("enable", true)) {
+    statusController?.update({
+      phase: "ready",
+      message: "Language server is disabled",
+    });
+    window.showInformationMessage(
+      `PHP LSP cache cleared (${cacheDirectoryCountLabel(removed)} removed). Language server is disabled.`,
+    );
+    return;
+  }
+
+  if (await startLanguageClient(context)) {
+    window.showInformationMessage(
+      `PHP LSP cache cleared (${cacheDirectoryCountLabel(removed)} removed) and language server restarted`,
+    );
+  }
+}
+
 export function activate(context: ExtensionContext): void {
   const config = workspace.getConfiguration("phpLsp");
   if (!config.get<boolean>("enable", true)) {
@@ -533,6 +667,11 @@ export function activate(context: ExtensionContext): void {
   const restartCommand = commands.registerCommand(
     "phpLsp.restartServer",
     async () => restartLanguageClient(context),
+  );
+
+  const clearCacheCommand = commands.registerCommand(
+    "phpLsp.clearCacheAndRestart",
+    async () => clearCacheAndRestartLanguageClient(context),
   );
 
   const showStatusCommand = commands.registerCommand(
@@ -561,7 +700,13 @@ export function activate(context: ExtensionContext): void {
     }
   });
 
-  context.subscriptions.push(controller, restartCommand, showStatusCommand, enableConfigSubscription);
+  context.subscriptions.push(
+    controller,
+    restartCommand,
+    clearCacheCommand,
+    showStatusCommand,
+    enableConfigSubscription,
+  );
 
   // Start the client (also launches the server)
   void startLanguageClient(context);

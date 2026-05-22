@@ -691,6 +691,16 @@
   - Добавлен regression test на concurrent `WorkspaceIndex::update_file()`.
   - Smoke `parallel-pr013=test-fixtures/basic`: первый run indexed 4 files за 304.47 ms до ready; второй run из cache — 28.09 ms.
 
+- [x] **PR-014** Добавить команду `Clear PHP LSP Cache and Restart` *(completed 2026-05-22)*
+  - VS Code command: `phpLsp.clearCacheAndRestart`.
+  - Удалять cache только для текущих workspace roots: `~/.cache/php-lsp/{workspace-hash}/`.
+  - Чистить все namespaces: `workspace`, `stubs`, `vendor`.
+  - После очистки перезапускать language server и показывать user-facing confirmation/error.
+  - Не смешивать с обычным `Restart Language Server`, который должен продолжать использовать disk cache.
+  - Реализовано в command palette и status quick pick: подтверждение, stop server, удаление cache dir, restart.
+  - Добавлен client helper `cachePath.ts` с FNV-compatible hash/path logic и `npm run check:cache-path`.
+  - Validation: `npm run check:cache-path`, `npm run lint`, `npm run build`, `git diff --check`.
+
 ### Неделя 3: Responsiveness, debounce, cancellation (2026-06-04 → 2026-06-10)
 
 - [ ] **PR-020** Очередь `didChange` с debounce и version ordering
