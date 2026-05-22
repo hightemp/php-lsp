@@ -46,6 +46,8 @@ struct PhpLspIndexingStatusNotification;
 
 const DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS: u64 = 180;
 const HEAVY_REQUEST_YIELD_INTERVAL: usize = 32;
+const FILE_IO_SLOW_WARNING_MS: u64 = 100;
+const FILE_IO_TIMEOUT_MS: u64 = 15_000;
 
 fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {
     current.is_none_or(|current| incoming > current)
@@ -54,6 +56,66 @@ fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {
 async fn cooperative_heavy_request_yield(index: usize) {
     if index % HEAVY_REQUEST_YIELD_INTERVAL == 0 {
         tokio::task::yield_now().await;
+    }
+}
+
+async fn run_file_io_blocking<T, F>(
+    label: &'static str,
+    path_label: String,
+    op: F,
+) -> std::result::Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let started = Instant::now();
+    let task = tokio::task::spawn_blocking(op);
+    let result = match tokio::time::timeout(Duration::from_millis(FILE_IO_TIMEOUT_MS), task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => {
+            let message = format!("{} task failed for {}: {}", label, path_label, err);
+            tracing::warn!("{}", message);
+            return Err(message);
+        }
+        Err(_) => {
+            let message = format!(
+                "{} timed out after {} ms for {}",
+                label, FILE_IO_TIMEOUT_MS, path_label
+            );
+            tracing::warn!("{}", message);
+            return Err(message);
+        }
+    };
+
+    let elapsed = started.elapsed();
+    if elapsed >= Duration::from_millis(FILE_IO_SLOW_WARNING_MS) {
+        tracing::warn!(
+            "{} took {} ms for {}",
+            label,
+            elapsed.as_millis(),
+            path_label
+        );
+    }
+
+    Ok(result)
+}
+
+async fn read_file_to_string_blocking(
+    path: PathBuf,
+    label: &'static str,
+) -> std::io::Result<String> {
+    let path_label = path.display().to_string();
+    match run_file_io_blocking(label, path_label.clone(), move || {
+        std::fs::read_to_string(&path)
+    })
+    .await
+    {
+        Ok(Ok(source)) => Ok(source),
+        Ok(Err(err)) => {
+            tracing::debug!("{} failed for {}: {}", label, path_label, err);
+            Err(err)
+        }
+        Err(message) => Err(std::io::Error::other(message)),
     }
 }
 
@@ -302,28 +364,6 @@ struct VendorAutoloadCache {
 }
 
 impl VendorAutoloadCache {
-    fn load(&mut self, vendor_dir: &Path) -> Option<VendorAutoloadMap> {
-        let fingerprint = vendor_autoload_metadata_hash(vendor_dir);
-        if let Some(entry) = self.by_vendor_dir.get(vendor_dir) {
-            if entry.fingerprint == fingerprint {
-                return Some(entry.map.clone());
-            }
-        }
-
-        let Some(map) = parse_vendor_autoload_map(vendor_dir) else {
-            self.by_vendor_dir.remove(vendor_dir);
-            return None;
-        };
-        self.by_vendor_dir.insert(
-            vendor_dir.to_path_buf(),
-            VendorAutoloadCacheEntry {
-                fingerprint,
-                map: map.clone(),
-            },
-        );
-        Some(map)
-    }
-
     fn clear(&mut self) {
         self.by_vendor_dir.clear();
     }
@@ -1039,7 +1079,7 @@ impl PhpLspBackend {
 
                 if index_vendor {
                     preload_vendor_entrypoints(
-                        &index,
+                        index.clone(),
                         &config.root,
                         &indexing_options.exclude_paths,
                         php_version,
@@ -1288,18 +1328,12 @@ impl PhpLspBackend {
                 .unwrap_or_default();
 
             let vendor_dir = config.root.join("vendor");
-            if index_vendor && vendor_dir.is_dir() {
-                let vendor_autoload = config.root.join("vendor/composer/autoload_psr4.php");
-                if vendor_autoload.exists() && all_paths.is_empty() {
-                    if let Some(vendor_map) =
-                        cached_vendor_autoload_map(&self.vendor_autoload_cache, &vendor_dir).await
-                    {
-                        if let Some(vendor_paths) =
-                            resolve_vendor_paths_from_map(class_fqn, &vendor_map)
-                        {
-                            all_paths.extend(vendor_paths);
-                        }
-                    } else if let Some(vendor_paths) = resolve_vendor_paths(class_fqn, &vendor_dir)
+            if index_vendor && vendor_dir.is_dir() && all_paths.is_empty() {
+                if let Some(vendor_map) =
+                    cached_vendor_autoload_map(&self.vendor_autoload_cache, &vendor_dir).await
+                {
+                    if let Some(vendor_paths) =
+                        resolve_vendor_paths_from_map(class_fqn, &vendor_map)
                     {
                         all_paths.extend(vendor_paths);
                     }
@@ -1321,19 +1355,37 @@ impl PhpLspBackend {
                 let vendor_cache_config = is_vendor_file
                     .then(|| vendor_index_cache_config(&config.root, php_version, &exclude_paths));
                 if let Some(cache_config) = vendor_cache_config.as_ref() {
-                    if load_cached_vendor_file(&self.index, &config.root, &abs, cache_config) {
+                    if load_cached_vendor_file_blocking(
+                        self.index.clone(),
+                        config.root.clone(),
+                        abs.clone(),
+                        cache_config.clone(),
+                    )
+                    .await
+                    {
                         self.touch_vendor_file_lru(&abs).await;
                         tracing::debug!("Lazy-indexed vendor file from cache: {}", abs.display());
                         return true;
                     }
                 }
 
-                if abs.exists() && parse_and_index_php_file(&self.index, &abs) {
+                if parse_and_index_php_file_blocking(
+                    self.index.clone(),
+                    abs.clone(),
+                    "lazy PHP file index",
+                )
+                .await
+                {
                     if is_vendor_file {
                         self.touch_vendor_file_lru(&abs).await;
                     }
                     if let Some(cache_config) = vendor_cache_config.as_ref() {
-                        save_vendor_index_cache(&self.index, &config.root, cache_config);
+                        save_vendor_index_cache_blocking(
+                            self.index.clone(),
+                            config.root.clone(),
+                            cache_config.clone(),
+                        )
+                        .await;
                     }
                     tracing::debug!("Lazy-indexed file: {}", abs.display());
                     return true;
@@ -1900,25 +1952,32 @@ impl PhpLspBackend {
             return;
         };
 
-        match std::fs::read_to_string(&path) {
-            Ok(source) => {
-                let mut parser = FileParser::new();
-                parser.parse_full(&source);
-                if let Some(tree) = parser.tree() {
-                    let file_symbols = extract_file_symbols(tree, &source, &uri_str);
-                    let references =
-                        collect_symbol_references_in_file(tree, &source, &file_symbols);
-                    self.index
-                        .update_file_with_references(&uri_str, file_symbols, references);
+        match parse_workspace_file_for_index_blocking(path.clone(), "watched PHP file reindex")
+            .await
+        {
+            Ok(parsed) => {
+                if let Some(file_symbols) = parsed.file_symbols {
+                    self.index.update_file_with_references(
+                        &parsed.uri,
+                        file_symbols,
+                        parsed.references,
+                    );
                 } else {
+                    if let Some(error) = parsed.error {
+                        tracing::debug!(
+                            "Failed to reindex watched PHP file {}, removing from index: {}",
+                            path.display(),
+                            error
+                        );
+                    }
                     self.index.remove_file(&uri_str);
                 }
             }
-            Err(err) => {
-                tracing::debug!(
-                    "Failed to read watched PHP file {}, removing from index: {}",
+            Err(message) => {
+                tracing::warn!(
+                    "Failed to schedule watched PHP file reindex for {}, removing from index: {}",
                     path.display(),
-                    err
+                    message
                 );
                 self.index.remove_file(&uri_str);
             }
@@ -7216,6 +7275,25 @@ fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutoloadMap> {
     Some(map)
 }
 
+async fn vendor_autoload_metadata_hash_blocking(vendor_dir: PathBuf) -> Option<u64> {
+    let path_label = vendor_dir.display().to_string();
+    run_file_io_blocking("vendor autoload metadata hash", path_label, move || {
+        vendor_autoload_metadata_hash(&vendor_dir)
+    })
+    .await
+    .ok()
+}
+
+async fn parse_vendor_autoload_map_blocking(vendor_dir: PathBuf) -> Option<VendorAutoloadMap> {
+    let path_label = vendor_dir.display().to_string();
+    run_file_io_blocking("vendor autoload parse", path_label, move || {
+        parse_vendor_autoload_map(&vendor_dir)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 fn append_vendor_autoload(
     map: &mut VendorAutoloadMap,
     pkg_dir: &Path,
@@ -7288,10 +7366,33 @@ async fn cached_vendor_autoload_map(
     cache: &Arc<Mutex<VendorAutoloadCache>>,
     vendor_dir: &Path,
 ) -> Option<VendorAutoloadMap> {
-    cache.lock().await.load(vendor_dir)
+    let fingerprint = vendor_autoload_metadata_hash_blocking(vendor_dir.to_path_buf()).await?;
+    {
+        let cache = cache.lock().await;
+        if let Some(entry) = cache.by_vendor_dir.get(vendor_dir) {
+            if entry.fingerprint == fingerprint {
+                return Some(entry.map.clone());
+            }
+        }
+    }
+
+    let Some(map) = parse_vendor_autoload_map_blocking(vendor_dir.to_path_buf()).await else {
+        cache.lock().await.by_vendor_dir.remove(vendor_dir);
+        return None;
+    };
+
+    cache.lock().await.by_vendor_dir.insert(
+        vendor_dir.to_path_buf(),
+        VendorAutoloadCacheEntry {
+            fingerprint,
+            map: map.clone(),
+        },
+    );
+    Some(map)
 }
 
 /// Try to resolve a FQN to file paths by scanning vendor/composer installed packages.
+#[cfg(test)]
 fn resolve_vendor_paths(fqn: &str, vendor_dir: &Path) -> Option<Vec<PathBuf>> {
     let map = parse_vendor_autoload_map(vendor_dir)?;
     resolve_vendor_paths_from_map(fqn, &map)
@@ -7770,6 +7871,36 @@ fn parse_workspace_file_for_index(file_path: PathBuf) -> WorkspaceParseResult {
     }
 }
 
+async fn parse_workspace_file_for_index_blocking(
+    file_path: PathBuf,
+    label: &'static str,
+) -> std::result::Result<WorkspaceParseResult, String> {
+    let path_label = file_path.display().to_string();
+    run_file_io_blocking(label, path_label, move || {
+        parse_workspace_file_for_index(file_path)
+    })
+    .await
+}
+
+async fn parse_and_index_php_file_blocking(
+    index: Arc<WorkspaceIndex>,
+    file_path: PathBuf,
+    label: &'static str,
+) -> bool {
+    let path_label = file_path.display().to_string();
+    match run_file_io_blocking(label, path_label.clone(), move || {
+        parse_and_index_php_file(&index, &file_path)
+    })
+    .await
+    {
+        Ok(indexed) => indexed,
+        Err(message) => {
+            tracing::warn!("{} failed for {}: {}", label, path_label, message);
+            false
+        }
+    }
+}
+
 fn load_cached_vendor_file(
     index: &WorkspaceIndex,
     root: &Path,
@@ -7797,6 +7928,26 @@ fn load_cached_vendor_file(
         );
     }
     false
+}
+
+async fn load_cached_vendor_file_blocking(
+    index: Arc<WorkspaceIndex>,
+    root: PathBuf,
+    file_path: PathBuf,
+    config: IndexCacheConfig,
+) -> bool {
+    let path_label = file_path.display().to_string();
+    match run_file_io_blocking("vendor cache load", path_label.clone(), move || {
+        load_cached_vendor_file(&index, &root, &file_path, &config)
+    })
+    .await
+    {
+        Ok(loaded) => loaded,
+        Err(message) => {
+            tracing::warn!("Vendor cache load failed for {}: {}", path_label, message);
+            false
+        }
+    }
 }
 
 async fn touch_vendor_file_lru(
@@ -7828,6 +7979,21 @@ fn save_vendor_index_cache(index: &WorkspaceIndex, root: &Path, config: &IndexCa
     }
 }
 
+async fn save_vendor_index_cache_blocking(
+    index: Arc<WorkspaceIndex>,
+    root: PathBuf,
+    config: IndexCacheConfig,
+) {
+    let path_label = root.display().to_string();
+    if let Err(message) = run_file_io_blocking("vendor cache save", path_label.clone(), move || {
+        save_vendor_index_cache(&index, &root, &config)
+    })
+    .await
+    {
+        tracing::warn!("Vendor cache save failed for {}: {}", path_label, message);
+    }
+}
+
 fn indexed_vendor_cache_sources(index: &WorkspaceIndex, root: &Path) -> Vec<CacheSourceFile> {
     let vendor_dir = root.join("vendor");
     let mut sources: Vec<CacheSourceFile> = index
@@ -7845,7 +8011,7 @@ fn indexed_vendor_cache_sources(index: &WorkspaceIndex, root: &Path) -> Vec<Cach
 }
 
 async fn preload_vendor_entrypoints(
-    index: &WorkspaceIndex,
+    index: Arc<WorkspaceIndex>,
     root: &Path,
     exclude_paths: &[PathBuf],
     php_version: PhpVersion,
@@ -7872,15 +8038,28 @@ async fn preload_vendor_entrypoints(
             continue;
         }
 
-        let from_cache = load_cached_vendor_file(index, root, file_path, &cache_config);
-        if from_cache || parse_and_index_php_file(index, file_path) {
-            touch_vendor_file_lru(index, vendor_file_lru, file_path).await;
+        let from_cache = load_cached_vendor_file_blocking(
+            index.clone(),
+            root.to_path_buf(),
+            file_path.clone(),
+            cache_config.clone(),
+        )
+        .await;
+        if from_cache
+            || parse_and_index_php_file_blocking(
+                index.clone(),
+                file_path.clone(),
+                "vendor preload PHP file index",
+            )
+            .await
+        {
+            touch_vendor_file_lru(&index, vendor_file_lru, file_path).await;
             loaded += 1;
         }
     }
 
     if loaded > 0 {
-        save_vendor_index_cache(index, root, &cache_config);
+        save_vendor_index_cache_blocking(index, root.to_path_buf(), cache_config).await;
         tracing::debug!(
             "Preloaded {} vendor autoload entrypoint file(s) for {}",
             loaded,
@@ -8509,7 +8688,7 @@ impl LanguageServer for PhpLspBackend {
 
                 if index_vendor {
                     preload_vendor_entrypoints(
-                        &index,
+                        index.clone(),
                         &config.root,
                         &indexing_options.exclude_paths,
                         php_version,
@@ -8705,7 +8884,7 @@ impl LanguageServer for PhpLspBackend {
 
                 if index_vendor {
                     preload_vendor_entrypoints(
-                        &index,
+                        index.clone(),
                         &config.root,
                         &indexing_options.exclude_paths,
                         php_version,
@@ -10030,7 +10209,9 @@ impl LanguageServer for PhpLspBackend {
             let Some(path) = uri_to_path(&file_uri) else {
                 continue;
             };
-            let Ok(source) = std::fs::read_to_string(path) else {
+            let Ok(source) =
+                read_file_to_string_blocking(path, "callHierarchy/incoming read").await
+            else {
                 continue;
             };
             let mut parser = FileParser::new();
@@ -10094,7 +10275,9 @@ impl LanguageServer for PhpLspBackend {
             let Some(path) = uri_to_path(&file_uri) else {
                 return Ok(None);
             };
-            let Ok(source) = std::fs::read_to_string(path) else {
+            let Ok(source) =
+                read_file_to_string_blocking(path, "callHierarchy/outgoing read").await
+            else {
                 return Ok(None);
             };
             let mut parser = FileParser::new();
@@ -10380,13 +10563,15 @@ impl LanguageServer for PhpLspBackend {
             let source = parser.source();
             (extract_file_symbols(tree, &source, &uri_str), source)
         } else if let Some(file_symbols) = self.index.file_symbols.get(&uri_str) {
+            let file_symbols = file_symbols.value().clone();
             let Some(path) = uri_to_path(&uri_str) else {
                 return Ok(None);
             };
-            let Ok(source) = std::fs::read_to_string(path) else {
+            let Ok(source) = read_file_to_string_blocking(path, "codeLens source read").await
+            else {
                 return Ok(None);
             };
-            (file_symbols.value().clone(), source)
+            (file_symbols, source)
         } else {
             return Ok(None);
         };
@@ -10449,7 +10634,8 @@ impl LanguageServer for PhpLspBackend {
             let Some(path) = uri_to_path(&uri_str) else {
                 return Ok(None);
             };
-            let Ok(source) = std::fs::read_to_string(path) else {
+            let Ok(source) = read_file_to_string_blocking(path, "foldingRange source read").await
+            else {
                 return Ok(None);
             };
             let mut parser = FileParser::new();

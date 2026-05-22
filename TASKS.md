@@ -738,10 +738,14 @@
   - Regression: parser unit на occurrence collection, cache roundtrip для references, e2e на references из закрытого indexed file.
   - Validation: `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`.
 
-- [ ] **PR-023** Перевести sync file IO в тяжелых paths на blocking/background
+- [x] **PR-023** Перевести sync file IO в тяжелых paths на blocking/background *(completed 2026-05-22)*
   - Не делать `std::fs::read_to_string` в async handler hot path.
   - Использовать `spawn_blocking` или отдельный file IO worker для bulk reads.
   - Добавить timeout/error telemetry для медленных файловых операций.
+  - Добавлен общий `run_file_io_blocking()` с `spawn_blocking`, timeout 15s и warning telemetry для операций дольше 100ms.
+  - На blocking pool переведены watched-file reindex, lazy PHP/vendor indexing, vendor cache load/save, vendor autoload metadata parse, call hierarchy disk reads, `codeLens` source read и `foldingRange` source read.
+  - Прямые `read_to_string` в server hot paths заменены на blocking wrappers; оставшиеся sync reads находятся в sync helper'ах, которые вызываются через blocking pool, formatter helper'е уже внутри `spawn_blocking`, и startup composer discovery.
+  - Validation: `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
 ### Неделя 4: PHP version, stubs, PHPDoc (2026-06-11 → 2026-06-17)
 
