@@ -9,7 +9,7 @@ use std::fs;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tower::{Service, ServiceExt};
-use tower_lsp::jsonrpc::Request;
+use tower_lsp::jsonrpc::{ErrorCode, Request};
 use tower_lsp::LspService;
 
 use php_lsp_server::PhpLspBackend;
@@ -66,6 +66,12 @@ fn initialize_request_with_workspace_folders(id: i64, folders: Vec<(&str, &str)>
 
 fn initialized_notification() -> Request {
     Request::build("initialized").params(json!({})).finish()
+}
+
+fn cancel_request(id: i64) -> Request {
+    Request::build("$/cancelRequest")
+        .params(json!({ "id": id }))
+        .finish()
 }
 
 async fn next_publish_diagnostics(
@@ -594,6 +600,10 @@ fn extract_error_message(response: Option<tower_lsp::jsonrpc::Response>) -> Opti
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .map(|s| s.to_string())
+}
+
+fn extract_error_code(response: Option<tower_lsp::jsonrpc::Response>) -> Option<i64> {
+    response?.error().map(|error| error.code.code())
 }
 
 fn selection_range_chain(value: &serde_json::Value) -> Vec<(u64, u64, u64, u64)> {
@@ -5199,6 +5209,80 @@ function run(string $name): void {
             .iter()
             .all(|e| e.get("newText").and_then(|t| t.as_str()) == Some("$title")),
         "variable rename should preserve '$' prefix"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_cancel_request_cancels_references_request() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let target_uri = "file:///test/CancelReferencesTarget.php";
+    let target_code =
+        "<?php\nnamespace App;\nclass Target {}\nfunction run(): void { new Target(); }\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(target_uri, target_code))
+        .await
+        .unwrap();
+
+    for i in 0..96 {
+        let uri = format!("file:///test/CancelReferencesUse{}.php", i);
+        let code = format!(
+            "<?php\nnamespace App;\nclass Use{} {{ public function run(): void {{ new Target(); }} }}\n",
+            i
+        );
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(&uri, &code))
+            .await
+            .unwrap();
+    }
+
+    let references = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(2, target_uri, 3, 29, true));
+    let cancel = service.ready().await.unwrap().call(cancel_request(2));
+    let (references_response, cancel_response) = futures::join!(references, cancel);
+
+    assert!(
+        cancel_response.unwrap().is_none(),
+        "$/cancelRequest should not return a response"
+    );
+    assert_eq!(
+        extract_error_code(references_response.unwrap()),
+        Some(ErrorCode::RequestCancelled.code())
     );
 
     service

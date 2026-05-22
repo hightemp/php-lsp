@@ -29,9 +29,10 @@ use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
@@ -41,9 +42,50 @@ use tower_lsp::{Client, LanguageServer};
 struct PhpLspIndexingStatusNotification;
 
 const DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS: u64 = 180;
+const HEAVY_REQUEST_YIELD_INTERVAL: usize = 32;
 
 fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {
     current.is_none_or(|current| incoming > current)
+}
+
+async fn cooperative_heavy_request_yield(index: usize) {
+    if index % HEAVY_REQUEST_YIELD_INTERVAL == 0 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OperationCancellationToken {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl OperationCancellationToken {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+
+    async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            self.notify.notified().await;
+        }
+    }
 }
 
 impl tower_lsp::ls_types::notification::Notification for PhpLspIndexingStatusNotification {
@@ -443,6 +485,10 @@ pub struct PhpLspBackend {
     document_versions: Arc<DashMap<String, i32>>,
     /// Per-document debounce tasks for fast diagnostics after didChange.
     diagnostic_debounce_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    /// Per-document external analyzer runs that can be cancelled by newer document events.
+    analyzer_runs: Arc<Mutex<HashMap<String, OperationCancellationToken>>>,
+    /// Current background workspace indexing run.
+    indexing_run: Arc<Mutex<Option<OperationCancellationToken>>>,
     /// Global workspace symbol index.
     index: Arc<WorkspaceIndex>,
     /// Workspace root path (set during initialize).
@@ -496,6 +542,8 @@ impl PhpLspBackend {
             open_files: Arc::new(DashMap::new()),
             document_versions: Arc::new(DashMap::new()),
             diagnostic_debounce_tasks: Arc::new(Mutex::new(HashMap::new())),
+            analyzer_runs: Arc::new(Mutex::new(HashMap::new())),
+            indexing_run: Arc::new(Mutex::new(None)),
             index: Arc::new(WorkspaceIndex::new()),
             workspace_root: Mutex::new(None),
             workspace_roots: Mutex::new(Vec::new()),
@@ -554,6 +602,43 @@ impl PhpLspBackend {
         if let Some(handle) = self.diagnostic_debounce_tasks.lock().await.remove(uri_str) {
             handle.abort();
         }
+    }
+
+    async fn start_analyzer_run(&self, uri_str: &str) -> OperationCancellationToken {
+        let token = OperationCancellationToken::new();
+        if let Some(previous) = self
+            .analyzer_runs
+            .lock()
+            .await
+            .insert(uri_str.to_string(), token.clone())
+        {
+            previous.cancel();
+        }
+        token
+    }
+
+    async fn finish_analyzer_run(&self, uri_str: &str, token: &OperationCancellationToken) {
+        let mut runs = self.analyzer_runs.lock().await;
+        if runs
+            .get(uri_str)
+            .is_some_and(|current| current.is_same(token))
+        {
+            runs.remove(uri_str);
+        }
+    }
+
+    async fn cancel_analyzer_run(&self, uri_str: &str) {
+        if let Some(token) = self.analyzer_runs.lock().await.remove(uri_str) {
+            token.cancel();
+        }
+    }
+
+    async fn start_indexing_run(&self) -> OperationCancellationToken {
+        let token = OperationCancellationToken::new();
+        if let Some(previous) = self.indexing_run.lock().await.replace(token.clone()) {
+            previous.cancel();
+        }
+        token
     }
 
     async fn schedule_fast_diagnostics(&self, uri: Uri, version: i32) {
@@ -910,14 +995,19 @@ impl PhpLspBackend {
             cache_config,
             work_done_progress_supported,
         };
+        let indexing_token = self.start_indexing_run().await;
         tokio::spawn(async move {
             for config in &configs {
+                if indexing_token.is_cancelled() {
+                    return;
+                }
                 if let Err(e) = index_workspace(
                     &client,
                     &index,
                     &config.root,
                     config.namespace_map.as_ref(),
                     &indexing_options,
+                    &indexing_token,
                 )
                 .await
                 {
@@ -939,6 +1029,9 @@ impl PhpLspBackend {
                         .await;
                     return;
                 }
+                if indexing_token.is_cancelled() {
+                    return;
+                }
 
                 if index_vendor {
                     preload_vendor_entrypoints(
@@ -953,6 +1046,9 @@ impl PhpLspBackend {
                 }
             }
 
+            if indexing_token.is_cancelled() {
+                return;
+            }
             for entry in open_files.iter() {
                 let uri_str = entry.key().clone();
                 if let Ok(uri) = uri_str.parse::<Uri>() {
@@ -1576,7 +1672,11 @@ impl PhpLspBackend {
         locations
     }
 
-    async fn phpstan_diagnostics_for_uri(&self, uri: &Uri) -> Vec<Diagnostic> {
+    async fn phpstan_diagnostics_for_uri(
+        &self,
+        uri: &Uri,
+        cancellation: OperationCancellationToken,
+    ) -> Vec<Diagnostic> {
         let config = self.phpstan_config.lock().await.clone();
         if !config.enabled {
             return vec![];
@@ -1594,9 +1694,17 @@ impl PhpLspBackend {
         }
 
         let workspace_root = self.workspace_root_for_uri(uri.as_str()).await;
-        match run_phpstan_for_file(config, file_path, workspace_root).await {
+        match run_phpstan_for_file(config, file_path, workspace_root, Some(cancellation)).await {
             Ok(diagnostics) => diagnostics,
             Err(message) => {
+                if message.contains("command cancelled") {
+                    tracing::debug!(
+                        "PHPStan diagnostics cancelled for {}: {}",
+                        uri.as_str(),
+                        message
+                    );
+                    return vec![];
+                }
                 tracing::warn!(
                     "PHPStan diagnostics failed for {}: {}",
                     uri.as_str(),
@@ -1613,7 +1721,11 @@ impl PhpLspBackend {
         }
     }
 
-    async fn psalm_diagnostics_for_uri(&self, uri: &Uri) -> Vec<Diagnostic> {
+    async fn psalm_diagnostics_for_uri(
+        &self,
+        uri: &Uri,
+        cancellation: OperationCancellationToken,
+    ) -> Vec<Diagnostic> {
         let config = self.psalm_config.lock().await.clone();
         if !config.enabled {
             return vec![];
@@ -1631,9 +1743,17 @@ impl PhpLspBackend {
         }
 
         let workspace_root = self.workspace_root_for_uri(uri.as_str()).await;
-        match run_psalm_for_file(config, file_path, workspace_root).await {
+        match run_psalm_for_file(config, file_path, workspace_root, Some(cancellation)).await {
             Ok(diagnostics) => diagnostics,
             Err(message) => {
+                if message.contains("command cancelled") {
+                    tracing::debug!(
+                        "Psalm diagnostics cancelled for {}: {}",
+                        uri.as_str(),
+                        message
+                    );
+                    return vec![];
+                }
                 tracing::warn!("Psalm diagnostics failed for {}: {}", uri.as_str(), message);
                 self.client
                     .log_message(
@@ -1698,8 +1818,24 @@ impl PhpLspBackend {
                 && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
         });
         if diagnostics_mode == DiagnosticsMode::BasicSemantic && !has_syntax_errors {
-            diagnostics.extend(self.phpstan_diagnostics_for_uri(uri).await);
-            diagnostics.extend(self.psalm_diagnostics_for_uri(uri).await);
+            let analyzer_token = self.start_analyzer_run(&uri_str).await;
+            diagnostics.extend(
+                self.phpstan_diagnostics_for_uri(uri, analyzer_token.clone())
+                    .await,
+            );
+            if analyzer_token.is_cancelled() {
+                self.finish_analyzer_run(&uri_str, &analyzer_token).await;
+                return;
+            }
+            diagnostics.extend(
+                self.psalm_diagnostics_for_uri(uri, analyzer_token.clone())
+                    .await,
+            );
+            if analyzer_token.is_cancelled() {
+                self.finish_analyzer_run(&uri_str, &analyzer_token).await;
+                return;
+            }
+            self.finish_analyzer_run(&uri_str, &analyzer_token).await;
         }
 
         if self.current_document_version(&uri_str) != version {
@@ -1813,6 +1949,7 @@ impl PhpLspBackend {
         self.open_files.remove(&uri_str);
         self.document_versions.remove(&uri_str);
         self.cancel_debounced_diagnostics(&uri_str).await;
+        self.cancel_analyzer_run(&uri_str).await;
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
         self.client
             .publish_diagnostics(uri.clone(), vec![], None)
@@ -1837,6 +1974,8 @@ impl PhpLspBackend {
             .remove(&old_uri_str)
             .map(|(_, version)| version);
         self.cancel_debounced_diagnostics(&old_uri_str).await;
+        self.cancel_analyzer_run(&old_uri_str).await;
+        self.cancel_analyzer_run(new_uri.as_str()).await;
         if old_is_php {
             self.index.remove_file(&old_uri_str);
             self.vendor_file_lru.lock().await.remove(&old_uri_str);
@@ -3041,9 +3180,11 @@ fn build_analyzer_shell_command(template: &str, file_path: &Path) -> String {
 }
 
 async fn run_shell_command_with_timeout(
+    label: &str,
     command: &str,
     current_dir: Option<&Path>,
     timeout_ms: u64,
+    cancellation: Option<OperationCancellationToken>,
 ) -> std::result::Result<std::process::Output, String> {
     let mut process = if cfg!(windows) {
         let mut command_process = tokio::process::Command::new("cmd");
@@ -3065,12 +3206,33 @@ async fn run_shell_command_with_timeout(
     process.kill_on_drop(true);
     let child = process
         .spawn()
-        .map_err(|err| format!("failed to start PHPStan command: {}", err))?;
+        .map_err(|err| format!("failed to start {} command: {}", label, err))?;
 
-    tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
-        .await
-        .map_err(|_| format!("PHPStan command timed out after {}ms", timeout_ms))?
-        .map_err(|err| format!("failed to wait for PHPStan command: {}", err))
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
+    let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
+    tokio::pin!(timeout);
+
+    let output = if let Some(cancellation) = cancellation {
+        tokio::select! {
+            result = &mut wait => result,
+            _ = &mut timeout => {
+                return Err(format!("{} command timed out after {}ms", label, timeout_ms));
+            }
+            _ = cancellation.cancelled() => {
+                return Err(format!("{} command cancelled", label));
+            }
+        }
+    } else {
+        tokio::select! {
+            result = &mut wait => result,
+            _ = &mut timeout => {
+                return Err(format!("{} command timed out after {}ms", label, timeout_ms));
+            }
+        }
+    };
+
+    output.map_err(|err| format!("failed to wait for {} command: {}", label, err))
 }
 
 fn phpstan_json_message_line(message: &serde_json::Value) -> Option<u32> {
@@ -3177,11 +3339,17 @@ async fn run_phpstan_for_file(
     config: PhpStanConfig,
     file_path: PathBuf,
     workspace_root: Option<PathBuf>,
+    cancellation: Option<OperationCancellationToken>,
 ) -> std::result::Result<Vec<Diagnostic>, String> {
     let command = build_analyzer_shell_command(&config.command, &file_path);
-    let output =
-        run_shell_command_with_timeout(&command, workspace_root.as_deref(), config.timeout_ms)
-            .await?;
+    let output = run_shell_command_with_timeout(
+        "PHPStan",
+        &command,
+        workspace_root.as_deref(),
+        config.timeout_ms,
+        cancellation,
+    )
+    .await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     if stdout.trim().is_empty() {
@@ -3302,11 +3470,17 @@ async fn run_psalm_for_file(
     config: PsalmConfig,
     file_path: PathBuf,
     workspace_root: Option<PathBuf>,
+    cancellation: Option<OperationCancellationToken>,
 ) -> std::result::Result<Vec<Diagnostic>, String> {
     let command = build_analyzer_shell_command(&config.command, &file_path);
-    let output =
-        run_shell_command_with_timeout(&command, workspace_root.as_deref(), config.timeout_ms)
-            .await?;
+    let output = run_shell_command_with_timeout(
+        "Psalm",
+        &command,
+        workspace_root.as_deref(),
+        config.timeout_ms,
+        cancellation,
+    )
+    .await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     if stdout.trim().is_empty() {
@@ -7674,9 +7848,14 @@ async fn index_workspace(
     root: &Path,
     namespace_map: Option<&NamespaceMap>,
     options: &WorkspaceIndexingOptions,
+    cancellation: &OperationCancellationToken,
 ) -> std::result::Result<(), String> {
     let root_label = root.display().to_string();
     let started_at = Instant::now();
+    if cancellation.is_cancelled() {
+        tracing::debug!("Workspace indexing cancelled before start: {}", root_label);
+        return Ok(());
+    }
 
     send_indexing_status(
         client,
@@ -7721,6 +7900,13 @@ async fn index_workspace(
     // Collect PHP files
     let source_dirs = workspace_index_directories(root, namespace_map, &options.include_paths);
     let php_files = collect_php_files(&source_dirs, root, &options.exclude_paths);
+    if cancellation.is_cancelled() {
+        tracing::debug!(
+            "Workspace indexing cancelled after discovery: {}",
+            root_label
+        );
+        return Ok(());
+    }
 
     // Also add explicit files from composer.json
     let mut all_files = php_files;
@@ -7747,6 +7933,13 @@ async fn index_workspace(
     let cache_path = cache::cache_file_path(root);
     let cache_report =
         cache::load_valid_cached_files(index, &cache_path, root, &all_files, &options.cache_config);
+    if cancellation.is_cancelled() {
+        tracing::debug!(
+            "Workspace indexing cancelled after cache load: {}",
+            root_label
+        );
+        return Ok(());
+    }
     if let Some(reason) = cache_report.miss_reason.as_deref() {
         tracing::debug!(
             "Workspace index cache miss for {}: {}",
@@ -7813,6 +8006,17 @@ async fn index_workspace(
     let mut done = loaded_from_cache;
     let mut parse_errors = 0usize;
     while let Some(result) = parse_tasks.join_next().await {
+        if cancellation.is_cancelled() {
+            parse_tasks.abort_all();
+            tracing::debug!(
+                "Workspace indexing cancelled after {}/{} files: {}",
+                done,
+                total,
+                root_label
+            );
+            return Ok(());
+        }
+
         let parsed = match result {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -7853,6 +8057,14 @@ async fn index_workspace(
         done += 1;
 
         while parse_tasks.len() < parse_concurrency {
+            if cancellation.is_cancelled() {
+                parse_tasks.abort_all();
+                tracing::debug!(
+                    "Workspace indexing cancelled before scheduling more parse tasks: {}",
+                    root_label
+                );
+                return Ok(());
+            }
             let Some(file_path) = pending_files.next() else {
                 break;
             };
@@ -8209,14 +8421,19 @@ impl LanguageServer for PhpLspBackend {
             cache_config,
             work_done_progress_supported,
         };
+        let indexing_token = self.start_indexing_run().await;
         tokio::spawn(async move {
             for config in &configs {
+                if indexing_token.is_cancelled() {
+                    return;
+                }
                 if let Err(e) = index_workspace(
                     &client,
                     &index,
                     &config.root,
                     config.namespace_map.as_ref(),
                     &indexing_options,
+                    &indexing_token,
                 )
                 .await
                 {
@@ -8235,6 +8452,9 @@ impl LanguageServer for PhpLspBackend {
                         .await;
                     return;
                 }
+                if indexing_token.is_cancelled() {
+                    return;
+                }
 
                 if index_vendor {
                     preload_vendor_entrypoints(
@@ -8250,6 +8470,9 @@ impl LanguageServer for PhpLspBackend {
             }
 
             // Re-publish diagnostics for all open files now that the index is populated.
+            if indexing_token.is_cancelled() {
+                return;
+            }
             for entry in open_files.iter() {
                 let uri_str = entry.key().clone();
                 if let Ok(uri) = uri_str.parse::<Uri>() {
@@ -8391,14 +8614,19 @@ impl LanguageServer for PhpLspBackend {
             cache_config,
             work_done_progress_supported,
         };
+        let indexing_token = self.start_indexing_run().await;
         tokio::spawn(async move {
             for config in &added_configs {
+                if indexing_token.is_cancelled() {
+                    return;
+                }
                 if let Err(e) = index_workspace(
                     &client,
                     &index,
                     &config.root,
                     config.namespace_map.as_ref(),
                     &indexing_options,
+                    &indexing_token,
                 )
                 .await
                 {
@@ -8419,6 +8647,9 @@ impl LanguageServer for PhpLspBackend {
                         )
                         .await;
                     continue;
+                }
+                if indexing_token.is_cancelled() {
+                    return;
                 }
 
                 if index_vendor {
@@ -8453,6 +8684,7 @@ impl LanguageServer for PhpLspBackend {
         self.log_trace(&format!("didOpen: {}", uri_str)).await;
         self.document_versions.insert(uri_str.clone(), version);
         self.cancel_debounced_diagnostics(&uri_str).await;
+        self.cancel_analyzer_run(&uri_str).await;
 
         let mut parser = FileParser::new();
         parser.parse_full(text);
@@ -8489,6 +8721,7 @@ impl LanguageServer for PhpLspBackend {
         if !self.accept_document_version(&uri_str, version) {
             return;
         }
+        self.cancel_analyzer_run(&uri_str).await;
 
         let excluded = if let Some(path) = uri_to_path(&uri_str) {
             self.path_is_excluded_by_config(&path).await
@@ -8532,6 +8765,7 @@ impl LanguageServer for PhpLspBackend {
         self.open_files.remove(&uri_str);
         self.document_versions.remove(&uri_str);
         self.cancel_debounced_diagnostics(&uri_str).await;
+        self.cancel_analyzer_run(&uri_str).await;
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
         // Clear diagnostics for closed file
         self.client.publish_diagnostics(uri, vec![], None).await;
@@ -10045,10 +10279,15 @@ impl LanguageServer for PhpLspBackend {
 
         // Search all indexed files for references
         let mut locations = Vec::new();
+        let indexed_files: Vec<_> = self
+            .index
+            .file_symbols
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
 
-        for entry in self.index.file_symbols.iter() {
-            let file_uri = entry.key().clone();
-            let file_syms = entry.value().clone();
+        for (scanned_files, (file_uri, file_syms)) in indexed_files.into_iter().enumerate() {
+            cooperative_heavy_request_yield(scanned_files).await;
 
             // We need to parse the file to walk the CST
             // First check if it's an open file
@@ -10346,10 +10585,15 @@ impl LanguageServer for PhpLspBackend {
         // Find all references (including declaration)
         let mut changes: std::collections::HashMap<Uri, Vec<TextEdit>> =
             std::collections::HashMap::new();
+        let indexed_files: Vec<_> = self
+            .index
+            .file_symbols
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
 
-        for entry in self.index.file_symbols.iter() {
-            let file_uri = entry.key().clone();
-            let file_syms = entry.value().clone();
+        for (scanned_files, (file_uri, file_syms)) in indexed_files.into_iter().enumerate() {
+            cooperative_heavy_request_yield(scanned_files).await;
 
             let (refs, source_text) = if let Some(parser) = self.open_files.get(&file_uri) {
                 if let Some(tree) = parser.tree() {
@@ -12661,7 +12905,7 @@ class UserVoter extends Voter {
             ),
             timeout_ms: 5_000,
         };
-        let diagnostics = run_phpstan_for_file(config, file_path, Some(tmp.clone()))
+        let diagnostics = run_phpstan_for_file(config, file_path, Some(tmp.clone()), None)
             .await
             .unwrap();
 
@@ -12670,6 +12914,24 @@ class UserVoter extends Voter {
         assert_eq!(diagnostics[0].message, "PHPStan reported a test error.");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_run_shell_command_with_timeout_respects_cancellation() {
+        if cfg!(windows) {
+            return;
+        }
+
+        let token = OperationCancellationToken::new();
+        let cancel_token = token.clone();
+        let run = tokio::spawn(async move {
+            run_shell_command_with_timeout("Test", "sleep 5", None, 10_000, Some(token)).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_token.cancel();
+
+        let error = run.await.unwrap().unwrap_err();
+        assert_eq!(error, "Test command cancelled");
     }
 
     #[test]
@@ -12753,7 +13015,7 @@ class UserVoter extends Voter {
             ),
             timeout_ms: 5_000,
         };
-        let diagnostics = run_psalm_for_file(config, file_path, Some(tmp.clone()))
+        let diagnostics = run_psalm_for_file(config, file_path, Some(tmp.clone()), None)
             .await
             .unwrap();
 

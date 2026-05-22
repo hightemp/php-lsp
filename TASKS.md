@@ -715,10 +715,16 @@
   - Regression: e2e проверяет, что broken version 2 не публикуется после fixed version 3.
   - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`.
 
-- [ ] **PR-021** Поддержать cancellation для тяжелых операций
+- [x] **PR-021** Поддержать cancellation для тяжелых операций *(completed 2026-05-22)*
   - Ввести `CancellationToken`/task registry для indexing, references, rename, external analyzer runs.
   - Проверить `$/cancelRequest` для `references` на большой фикстуре.
   - Возвращать LSP `RequestCancelled` там, где клиент явно отменил запрос.
+  - Добавлен общий `OperationCancellationToken` на базе `AtomicBool + Notify`.
+  - Background indexing runs теперь отменяют предыдущий indexing/reindex batch; `index_workspace()` проверяет token на discovery/cache/parse этапах и abort'ит pending parse tasks.
+  - External analyzer runs (`PHPStan`/`Psalm`) получают per-URI token; `didChange`/`didClose`/delete/rename отменяют активный subprocess, `kill_on_drop` завершает процесс.
+  - `references` и `rename` получили cooperative yield points каждые 32 indexed files, чтобы `tower-lsp` успевал обработать `$/cancelRequest`.
+  - Regression: e2e `test_cancel_request_cancels_references_request` проверяет `RequestCancelled` (`-32800`) для большого `references` запроса.
+  - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`.
 
 - [ ] **PR-022** Убрать full reparse workspace из references/rename/codeLens
   - Построить reference index или per-file lightweight occurrence index при индексации.
