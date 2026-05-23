@@ -1898,6 +1898,20 @@ pub fn resolve_class_name_pub(name: &str, file_symbols: &FileSymbols) -> String 
     resolve_class_name(name, file_symbols)
 }
 
+/// Resolve a static access scope name using the current CST context.
+///
+/// This handles `self`, `static`, and `parent` by walking to the enclosing
+/// class-like declaration, while preserving normal namespace/use resolution for
+/// explicit class names.
+pub fn resolve_scope_class_name_pub(
+    scope_name: &str,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> String {
+    resolve_scope_class_name(scope_name, context_node, source, file_symbols)
+}
+
 /// Resolve a class name using use statements and current namespace.
 pub fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
     // Already fully qualified

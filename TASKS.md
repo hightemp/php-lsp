@@ -1048,3 +1048,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-23** Прогнать LSP-сервер по `/home/hightemp/ForTesting/symfony` и отловить ошибки работы.
 - [x] **T-2026-05-23** Убрать Symfony-specific hardcode `is_symfony_configurator_file` из diagnostics.
 - [x] **T-2026-05-23** Разобраться, почему completion не показывает методы `ReflectionMethod` для `$reflMethod->` в Symfony `CallbackValidator.php`.
+- [x] **T-2026-05-23** Протестировать autocomplete по `/home/hightemp/ForTesting/symfony` на падения и некорректные ответы.

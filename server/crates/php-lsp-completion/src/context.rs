@@ -162,8 +162,8 @@ fn check_member_access(text_before: &str, node: &Node, source: &str) -> Option<C
 /// Check for `::` static access pattern.
 fn check_static_access(
     text_before: &str,
-    _node: &Node,
-    _source: &str,
+    node: &Node,
+    source: &str,
     file_symbols: &FileSymbols,
 ) -> Option<CompletionContext> {
     let trimmed = text_before.trim_end();
@@ -176,7 +176,8 @@ fn check_static_access(
         {
             let before_colons = trimmed[..colon_pos].trim_end();
             let class_expr = extract_object_expr(before_colons);
-            let class_fqn = resolve_class_for_completion(&class_expr, file_symbols);
+            let class_fqn =
+                resolve_scope_class_for_completion(&class_expr, *node, source, file_symbols);
 
             return Some(CompletionContext::StaticAccess {
                 class_expr,
@@ -265,56 +266,52 @@ fn check_use_context(node: &Node, _text_before: &str, source: &str) -> Option<Co
 fn extract_object_expr(text: &str) -> String {
     // Walk backwards to find the start of the expression
     let trimmed = text.trim_end();
-    let end = trimmed.len();
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut i = chars.len();
+    let mut start = trimmed.len();
     let mut paren_depth = 0usize;
     let mut bracket_depth = 0usize;
 
     // Take the last object expression segment. This must keep simple member
     // chains such as `$this->client`, because completion after
     // `$this->client->` needs the property type, not just the bare `client`.
-    while i > 0 {
-        let c = chars[i - 1];
-
+    for (idx, c) in trimmed.char_indices().rev() {
         match c {
             ')' => {
                 paren_depth += 1;
-                i -= 1;
+                start = idx;
                 continue;
             }
             '(' if paren_depth > 0 => {
                 paren_depth -= 1;
-                i -= 1;
+                start = idx;
                 continue;
             }
             '(' => break,
             ']' => {
                 bracket_depth += 1;
-                i -= 1;
+                start = idx;
                 continue;
             }
             '[' if bracket_depth > 0 => {
                 bracket_depth -= 1;
-                i -= 1;
+                start = idx;
                 continue;
             }
             '[' => break,
             _ if paren_depth > 0 || bracket_depth > 0 => {
-                i -= 1;
+                start = idx;
                 continue;
             }
             _ => {}
         }
 
         if c.is_alphanumeric() || matches!(c, '_' | '$' | '\\' | '-' | '>' | '?') {
-            i -= 1;
+            start = idx;
         } else {
             break;
         }
     }
 
-    trimmed[i..end].to_string()
+    trimmed[start..].to_string()
 }
 
 /// Try to find the object expression from CST node context.
@@ -331,26 +328,29 @@ fn find_object_in_cst(node: &Node, source: &str) -> Option<String> {
     None
 }
 
-/// Resolve a class name for completion context.
-fn resolve_class_for_completion(name: &str, file_symbols: &FileSymbols) -> String {
-    php_lsp_parser::resolve::resolve_class_name_pub(name, file_symbols)
+/// Resolve a static access scope for completion context.
+fn resolve_scope_class_for_completion(
+    name: &str,
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> String {
+    php_lsp_parser::resolve::resolve_scope_class_name_pub(name, node, source, file_symbols)
 }
 
 /// Extract the word (identifier) before cursor.
 fn extract_word_before_cursor(text_before: &str) -> String {
-    let chars: Vec<char> = text_before.chars().collect();
-    let mut i = chars.len();
+    let mut start = text_before.len();
 
-    while i > 0 {
-        let c = chars[i - 1];
+    for (idx, c) in text_before.char_indices().rev() {
         if c.is_alphanumeric() || c == '_' {
-            i -= 1;
+            start = idx;
         } else {
             break;
         }
     }
 
-    text_before[i..].to_string()
+    text_before[start..].to_string()
 }
 
 /// Check if the position is a type hint context.
@@ -383,6 +383,18 @@ mod tests {
         let tree = parser.tree().unwrap();
         let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
         detect_context(tree, code, line, col, &file_symbols)
+    }
+
+    fn detect_at_marker(code: &str) -> CompletionContext {
+        let marker = "/*caret*/";
+        let offset = code.find(marker).expect("test code should contain marker");
+        let code = code.replace(marker, "");
+        let prefix = &code[..offset];
+        let line = prefix.bytes().filter(|b| *b == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let col = prefix[line_start..].len() as u32;
+
+        detect(&code, line, col)
     }
 
     #[test]
@@ -488,6 +500,53 @@ mod tests {
     }
 
     #[test]
+    fn test_static_access_context_after_non_ascii_text_on_same_line() {
+        let code = "<?php\n$this->assertSame('ཇི་ཨེམ་ཏི་-03:00', Timezones::/*caret*/get";
+        let ctx = detect_at_marker(code);
+        match ctx {
+            CompletionContext::StaticAccess {
+                class_expr,
+                member_prefix,
+                ..
+            } => {
+                assert_eq!(class_expr, "Timezones");
+                assert_eq!(member_prefix, "");
+            }
+            other => panic!("Expected StaticAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_static_access_context_resolves_self_static_and_parent() {
+        let code = "<?php\nnamespace App;\nclass Base {}\nclass Child extends Base { public function run() { self::/*caret*/foo(); static::bar(); parent::baz(); } }";
+        let ctx = detect_at_marker(code);
+        match ctx {
+            CompletionContext::StaticAccess { class_fqn, .. } => {
+                assert_eq!(class_fqn, "App\\Child");
+            }
+            other => panic!("Expected StaticAccess, got {:?}", other),
+        }
+
+        let code = "<?php\nnamespace App;\nclass Base {}\nclass Child extends Base { public function run() { self::foo(); static::/*caret*/bar(); parent::baz(); } }";
+        let ctx = detect_at_marker(code);
+        match ctx {
+            CompletionContext::StaticAccess { class_fqn, .. } => {
+                assert_eq!(class_fqn, "App\\Child");
+            }
+            other => panic!("Expected StaticAccess, got {:?}", other),
+        }
+
+        let code = "<?php\nnamespace App;\nclass Base {}\nclass Child extends Base { public function run() { self::foo(); static::bar(); parent::/*caret*/baz(); } }";
+        let ctx = detect_at_marker(code);
+        match ctx {
+            CompletionContext::StaticAccess { class_fqn, .. } => {
+                assert_eq!(class_fqn, "App\\Base");
+            }
+            other => panic!("Expected StaticAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_variable_context() {
         let code = "<?php\n$use";
         let ctx = detect(code, 1, 4);
@@ -506,6 +565,18 @@ mod tests {
         match ctx {
             CompletionContext::Free { prefix } => {
                 assert_eq!(prefix, "array_m");
+            }
+            other => panic!("Expected Free, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_free_context_after_non_ascii_text_on_same_line() {
+        let code = "<?php\nfoo('ཇི་ཨེམ་ཏི', Timez/*caret*/);";
+        let ctx = detect_at_marker(code);
+        match ctx {
+            CompletionContext::Free { prefix } => {
+                assert_eq!(prefix, "Timez");
             }
             other => panic!("Expected Free, got {:?}", other),
         }

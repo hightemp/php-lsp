@@ -352,18 +352,14 @@ fn provide_static_completions(
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
-    // Resolve the FQN
-    let fqn = if class_expr == "self" || class_expr == "static" || class_expr == "parent" {
-        // For self/static/parent, we'd need the current class context
-        // For now, use the fqn as-is
-        class_fqn.to_string()
-    } else {
-        class_fqn.to_string()
-    };
+    let fqn = class_fqn.to_string();
 
     let members = index.get_members(&fqn);
     for member in members {
+        let is_parent_instance_method =
+            class_expr == "parent" && member.kind == PhpSymbolKind::Method;
         if !member.modifiers.is_static
+            && !is_parent_instance_method
             && !matches!(
                 member.kind,
                 PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase
@@ -1193,5 +1189,55 @@ mod tests {
             !labels.contains(&"run"),
             "instance method should be hidden on `::`"
         );
+    }
+
+    #[test]
+    fn test_parent_static_completion_includes_instance_methods() {
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![
+                make_symbol(
+                    "Base",
+                    "App\\Base",
+                    PhpSymbolKind::Class,
+                    None,
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "setUp",
+                    "App\\Base::setUp",
+                    PhpSymbolKind::Method,
+                    Some("App\\Base"),
+                    Visibility::Protected,
+                    false,
+                ),
+                make_symbol(
+                    "create",
+                    "App\\Base::create",
+                    PhpSymbolKind::Method,
+                    Some("App\\Base"),
+                    Visibility::Public,
+                    true,
+                ),
+            ],
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::StaticAccess {
+            class_expr: "parent".to_string(),
+            member_prefix: String::new(),
+            class_fqn: "App\\Base".to_string(),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert!(
+            labels.contains(&"setUp"),
+            "`parent::` should complete inherited instance methods"
+        );
+        assert!(labels.contains(&"create"));
     }
 }
