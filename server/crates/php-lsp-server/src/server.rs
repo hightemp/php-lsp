@@ -50,6 +50,9 @@ const DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS: u64 = 180;
 const HEAVY_REQUEST_YIELD_INTERVAL: usize = 32;
 const FILE_IO_SLOW_WARNING_MS: u64 = 100;
 const FILE_IO_TIMEOUT_MS: u64 = 15_000;
+const DIAGNOSTIC_PHASE_SLOW_WARNING_MS: u64 = 500;
+const MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT: usize = 64;
+const DIAGNOSTIC_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {
     current.is_none_or(|current| incoming > current)
@@ -1999,40 +2002,46 @@ impl PhpLspBackend {
     async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
         let version = self.current_document_version(&uri_str);
+        let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let should_preresolve_dependencies =
+            diagnostics_mode == DiagnosticsMode::BasicSemantic && *self.index_vendor.lock().await;
 
         // Pre-resolve use statements via lazy indexing so that vendor classes
         // are available for the synchronous `compute_diagnostics` resolver.
-        if let Some(fs) = self.index.file_symbols.get(&uri_str) {
-            let fqns_to_resolve: Vec<String> = fs
-                .use_statements
-                .iter()
-                .filter(|u| u.kind == php_lsp_types::UseKind::Class)
-                .filter(|u| u.fqn.contains('\\'))
-                .map(|u| u.fqn.clone())
-                .collect();
-            drop(fs); // release DashMap ref before async calls
-            for fqn in fqns_to_resolve {
-                self.lazy_index_class_dependencies(&fqn).await;
+        if should_preresolve_dependencies {
+            if let Some(fs) = self.index.file_symbols.get(&uri_str) {
+                let fqns_to_resolve: Vec<String> = fs
+                    .use_statements
+                    .iter()
+                    .filter(|u| u.kind == php_lsp_types::UseKind::Class)
+                    .filter(|u| u.fqn.contains('\\'))
+                    .map(|u| u.fqn.clone())
+                    .collect();
+                drop(fs); // release DashMap ref before async calls
+                for fqn in fqns_to_resolve {
+                    self.lazy_index_class_dependencies(&fqn).await;
+                }
             }
         }
 
         // Also pre-resolve: class FQNs from aliased qualified names used in code.
         // e.g. `use Symfony\...\Constraints as Assert;` → `new Assert\NotBlank`
         // → need to lazily index `Symfony\...\Constraints\NotBlank`.
-        if let Some(parser) = self.open_files.get(&uri_str) {
-            if let Some(tree) = parser.tree() {
-                let source = parser.source();
-                if let Some(fs) = self.index.file_symbols.get(&uri_str) {
-                    let alias_fqns = collect_aliased_class_fqns(tree, &source, &fs);
-                    drop(fs);
-                    for fqn in alias_fqns {
-                        self.lazy_index_class_dependencies(&fqn).await;
+        if should_preresolve_dependencies {
+            if let Some(parser) = self.open_files.get(&uri_str) {
+                if let Some(tree) = parser.tree() {
+                    let source = parser.source();
+                    if let Some(fs) = self.index.file_symbols.get(&uri_str) {
+                        let alias_fqns = collect_aliased_class_fqns(tree, &source, &fs);
+                        drop(fs);
+                        for fqn in alias_fqns {
+                            self.lazy_index_class_dependencies(&fqn).await;
+                        }
                     }
                 }
             }
         }
 
-        let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let php_version = *self.php_version.lock().await;
         let mut diagnostics = compute_open_file_diagnostics(
@@ -5310,22 +5319,62 @@ fn collect_outgoing_call_hierarchy(
 fn compute_open_file_diagnostics(
     uri_str: &str,
     open_files: &DashMap<String, FileParser>,
-    index: &WorkspaceIndex,
+    index: &Arc<WorkspaceIndex>,
     diagnostics_mode: DiagnosticsMode,
     diagnostic_severity: DiagnosticSeverityConfig,
     php_version: PhpVersion,
 ) -> Vec<Diagnostic> {
     if let Some(parser) = open_files.get(uri_str) {
-        compute_diagnostics_with_config(
-            uri_str,
-            &parser,
-            index,
+        compute_source_diagnostics_on_dedicated_stack(
+            uri_str.to_string(),
+            parser.source(),
+            index.clone(),
             diagnostics_mode,
             diagnostic_severity,
             php_version,
         )
     } else {
         vec![]
+    }
+}
+
+fn compute_source_diagnostics_on_dedicated_stack(
+    uri_str: String,
+    source: String,
+    index: Arc<WorkspaceIndex>,
+    diagnostics_mode: DiagnosticsMode,
+    diagnostic_severity: DiagnosticSeverityConfig,
+    php_version: PhpVersion,
+) -> Vec<Diagnostic> {
+    let thread_name = format!("php-lsp-diagnostics:{uri_str}");
+    let handle = match std::thread::Builder::new()
+        .name(thread_name)
+        .stack_size(DIAGNOSTIC_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let mut parser = FileParser::new();
+            parser.parse_full(&source);
+            compute_diagnostics_with_config(
+                &uri_str,
+                &parser,
+                &index,
+                diagnostics_mode,
+                diagnostic_severity,
+                php_version,
+            )
+        }) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!("Failed to spawn diagnostics worker: {}", err);
+            return vec![];
+        }
+    };
+
+    match handle.join() {
+        Ok(diagnostics) => diagnostics,
+        Err(_) => {
+            tracing::warn!("Diagnostics worker panicked");
+            vec![]
+        }
     }
 }
 
@@ -5420,6 +5469,7 @@ fn compute_diagnostics_with_config(
     diagnostic_severity: DiagnosticSeverityConfig,
     php_version: PhpVersion,
 ) -> Vec<Diagnostic> {
+    let diagnostics_started = Instant::now();
     if diagnostics_mode == DiagnosticsMode::Off {
         return vec![];
     }
@@ -5469,8 +5519,10 @@ fn compute_diagnostics_with_config(
         .map(|entry| entry.value().clone())
         .unwrap_or_default();
 
+    let semantic_started = Instant::now();
     let sem_diags =
         extract_semantic_diagnostics(tree, &source, &file_symbols, |fqn| index.resolve_fqn(fqn));
+    warn_if_slow_diagnostic_phase(uri_str, "semantic", semantic_started);
 
     for sd in sem_diags {
         if let Some(diagnostic) = semantic_diagnostic_to_lsp(sd, &utf16_index, diagnostic_severity)
@@ -5478,6 +5530,9 @@ fn compute_diagnostics_with_config(
             diagnostics.push(diagnostic);
         }
     }
+
+    let skip_member_and_type_diagnostics =
+        count_member_type_diagnostic_nodes(tree.root_node()) > MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT;
 
     diagnostics.extend(apply_diagnostic_category(
         workspace_duplicate_symbol_diagnostics(uri_str, &file_symbols, index, &utf16_index),
@@ -5487,22 +5542,28 @@ fn compute_diagnostics_with_config(
     if diagnostic_severity
         .severity(DiagnosticCategory::Members)
         .is_some()
+        && !skip_member_and_type_diagnostics
     {
+        let members_started = Instant::now();
         diagnostics.extend(apply_diagnostic_category(
             member_access_diagnostics(tree, &source, &file_symbols, index, &utf16_index),
             DiagnosticCategory::Members,
             diagnostic_severity,
         ));
+        warn_if_slow_diagnostic_phase(uri_str, "members", members_started);
     }
     if diagnostic_severity
         .severity(DiagnosticCategory::TypeCompatibility)
         .is_some()
+        && !skip_member_and_type_diagnostics
     {
+        let types_started = Instant::now();
         diagnostics.extend(apply_diagnostic_category(
             type_compatibility_diagnostics(tree, &source, &file_symbols, index, &utf16_index),
             DiagnosticCategory::TypeCompatibility,
             diagnostic_severity,
         ));
+        warn_if_slow_diagnostic_phase(uri_str, "type compatibility", types_started);
     }
     diagnostics.extend(apply_diagnostic_category(
         override_signature_diagnostics(&file_symbols, index, &utf16_index),
@@ -5515,7 +5576,44 @@ fn compute_diagnostics_with_config(
         diagnostic_severity,
     ));
 
+    warn_if_slow_diagnostic_phase(uri_str, "total", diagnostics_started);
     diagnostics
+}
+
+fn count_member_type_diagnostic_nodes(node: tree_sitter::Node) -> usize {
+    let mut count = usize::from(matches!(
+        node.kind(),
+        "member_access_expression"
+            | "member_call_expression"
+            | "scoped_call_expression"
+            | "scoped_property_access_expression"
+            | "class_constant_access_expression"
+            | "function_call_expression"
+            | "object_creation_expression"
+            | "assignment_expression"
+            | "return_statement"
+    ));
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        count += count_member_type_diagnostic_nodes(child);
+        if count > MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT {
+            break;
+        }
+    }
+    count
+}
+
+fn warn_if_slow_diagnostic_phase(uri_str: &str, phase: &str, started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed >= Duration::from_millis(DIAGNOSTIC_PHASE_SLOW_WARNING_MS) {
+        tracing::warn!(
+            "diagnostics {} phase took {} ms for {}",
+            phase,
+            elapsed.as_millis(),
+            uri_str
+        );
+    }
 }
 
 fn semantic_diagnostic_to_lsp(
@@ -14068,6 +14166,52 @@ final class Factory
                 messages
             );
         }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_skips_member_type_checks_above_node_budget() {
+        let uri = "file:///large-member-heavy.php";
+        let mut code = String::from(
+            r#"<?php
+namespace App;
+
+class Service {}
+
+function configure(Service $service): void
+{
+"#,
+        );
+        for index in 0..=MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT {
+            code.push_str(&format!("    $service->missing{}();\n", index));
+        }
+        code.push_str("}\n");
+
+        let mut parser = FileParser::new();
+        parser.parse_full(&code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), &code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("Unknown method: App\\Service::missing")),
+            "Member diagnostics should be skipped above budget, got: {:?}",
+            messages
+        );
     }
 
     #[test]

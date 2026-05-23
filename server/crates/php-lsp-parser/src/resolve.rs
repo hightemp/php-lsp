@@ -6,7 +6,14 @@
 
 use crate::phpdoc::parse_phpdoc;
 use php_lsp_types::{FileSymbols, TypeInfo, UseKind};
+use std::cell::Cell;
 use tree_sitter::{Node, Point, Tree};
+
+const MAX_OBJECT_TYPE_RESOLVE_DEPTH: usize = 64;
+
+thread_local! {
+    static OBJECT_TYPE_RESOLVE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 
 /// Callback for resolving a member's type from an external source (e.g., workspace index).
 ///
@@ -798,6 +805,25 @@ fn resolve_node(
 /// - `Foo::create()` (static call returning self/static) → `Foo`
 /// - `ClassName` (as scope in scoped expressions) → `ClassName`
 fn try_resolve_object_type<'a>(
+    object_node: Node<'a>,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<String> {
+    OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| {
+        let current = depth.get();
+        if current >= MAX_OBJECT_TYPE_RESOLVE_DEPTH {
+            return None;
+        }
+
+        depth.set(current + 1);
+        let result = try_resolve_object_type_inner(object_node, source, file_symbols, resolver);
+        depth.set(current);
+        result
+    })
+}
+
+fn try_resolve_object_type_inner<'a>(
     object_node: Node<'a>,
     source: &str,
     file_symbols: &FileSymbols,

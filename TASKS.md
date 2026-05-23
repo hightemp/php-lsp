@@ -1045,4 +1045,5 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-21** Добавить milestone production-readiness с подробным расписанием задач.
 - [x] **T-2026-05-22** Обновить submodule `server/data/stubs` из upstream.
 - [x] **T-2026-05-23** Разобраться, почему `go to definition` не работает на `parent` в `AbstractObjectNormalizer.php`.
-- [ ] **T-2026-05-23** Прогнать LSP-сервер по `/home/hightemp/ForTesting/symfony` и отловить ошибки работы.
+- [x] **T-2026-05-23** Прогнать LSP-сервер по `/home/hightemp/ForTesting/symfony` и отловить ошибки работы.
+- [x] **T-2026-05-23** Убрать Symfony-specific hardcode `is_symfony_configurator_file` из diagnostics.
