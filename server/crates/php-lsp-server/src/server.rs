@@ -15,8 +15,9 @@ use php_lsp_parser::references::{
     find_variable_references_at_position,
 };
 use php_lsp_parser::resolve::{
-    infer_property_type_from_assignments, infer_variable_type_at_position, resolve_class_name_pub,
-    symbol_at_position, symbol_at_position_with_resolver, variable_definition_at_position,
+    infer_property_type_from_assignments, infer_variable_type_at_position,
+    infer_variable_type_at_position_with_resolver, resolve_class_name_pub, symbol_at_position,
+    symbol_at_position_with_resolver, variable_definition_at_position,
     variable_hover_info_at_position, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
@@ -1373,6 +1374,10 @@ impl PhpLspBackend {
         byte_col: u32,
     ) -> Option<String> {
         let object_expr = object_expr.trim();
+        if let Some(class_fqn) = infer_new_expression_type(object_expr, file_symbols) {
+            return Some(class_fqn);
+        }
+
         if object_expr.contains("->") || object_expr.contains("?->") {
             return self.infer_completion_member_chain_type(
                 object_expr,
@@ -1388,10 +1393,40 @@ impl PhpLspBackend {
             current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
                 .or_else(|| current_class_fqn(file_symbols))
         } else if object_expr.starts_with('$') {
-            infer_variable_type_at_position(tree, source, file_symbols, line, byte_col, object_expr)
+            self.infer_completion_variable_type(
+                tree,
+                source,
+                file_symbols,
+                line,
+                byte_col,
+                object_expr,
+            )
         } else {
             None
         }
+    }
+
+    fn infer_completion_variable_type(
+        &self,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        line: u32,
+        byte_col: u32,
+        var_name: &str,
+    ) -> Option<String> {
+        let resolve_member_type = |class_fqn: &str, member_name: &str| {
+            self.resolve_completion_member_type(class_fqn, member_name, file_symbols)
+        };
+        infer_variable_type_at_position_with_resolver(
+            tree,
+            source,
+            file_symbols,
+            line,
+            byte_col,
+            var_name,
+            &resolve_member_type,
+        )
     }
 
     fn infer_completion_member_chain_type(
@@ -1410,7 +1445,14 @@ impl PhpLspBackend {
             current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
                 .or_else(|| current_class_fqn(file_symbols))?
         } else if base_expr.starts_with('$') {
-            infer_variable_type_at_position(tree, source, file_symbols, line, byte_col, base_expr)?
+            self.infer_completion_variable_type(
+                tree,
+                source,
+                file_symbols,
+                line,
+                byte_col,
+                base_expr,
+            )?
         } else if let Some(class_fqn) = infer_new_expression_type(base_expr, file_symbols) {
             class_fqn
         } else {

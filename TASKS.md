@@ -1054,3 +1054,8 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-23** Разобрать остаточные Symfony autocomplete label misses: external PHPUnit symbols, `parent::` в anonymous class/trait, nullable/member chains.
 - [x] **T-2026-05-23** Исправить autocomplete для member-chain, начинающейся с `(new ClassName())`.
 - [x] **T-2026-05-23** Исправить resolution/completion `parent::` внутри anonymous class.
+- [x] **T-2026-05-23** Довести Symfony autocomplete/go-to-definition audit-fix-verify цикл до стабильного состояния.
+  - [x] Свежий аудит `/home/hightemp/ForTesting/symfony` по completion и definition.
+  - [x] Исправить воспроизводимые баги без Symfony-specific hardcode.
+  - [x] Добавить regression tests на исправленные случаи.
+  - [x] Прогнать `fmt`, `test`, `clippy`, `release build`, `git diff --check`.

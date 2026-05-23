@@ -182,6 +182,46 @@ pub fn infer_variable_type_at_position(
     infer_variable_type_in_scope(scope, &normalized, usage_start, source, file_symbols, None)
 }
 
+/// Infer variable type by name before a given position, using an external member resolver.
+///
+/// This lets completion resolve assignments such as
+/// `$session = $request->getSession()` when the return type for `getSession`
+/// lives in another file or an indexed dependency.
+pub fn infer_variable_type_at_position_with_resolver(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    line: u32,
+    character: u32,
+    var_name: &str,
+    resolver: MemberTypeResolver<'_>,
+) -> Option<String> {
+    let root = tree.root_node();
+    let point = Point::new(line as usize, character as usize);
+    let node = find_node_at_point(root, point).unwrap_or(root);
+    let usage_start = position_to_byte(source, line, character);
+    let normalized = normalize_var_name(var_name);
+    let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
+    if let Some(resolved) = infer_textual_array_access_type(
+        scope,
+        &normalized,
+        usage_start,
+        source,
+        file_symbols,
+        Some(resolver),
+    ) {
+        return Some(resolved);
+    }
+    infer_variable_type_in_scope(
+        scope,
+        &normalized,
+        usage_start,
+        source,
+        file_symbols,
+        Some(resolver),
+    )
+}
+
 /// Infer hover info for a variable under cursor at a given position.
 pub fn variable_hover_info_at_position(
     tree: &Tree,
@@ -420,7 +460,7 @@ fn resolve_node(
 
     match parent_kind {
         // Member access: $obj->method() or $obj->property
-        "member_access_expression" => {
+        "member_access_expression" | "nullsafe_member_access_expression" => {
             let name_field = parent.child_by_field_name("name");
             let object_field = parent.child_by_field_name("object");
 
@@ -457,7 +497,7 @@ fn resolve_node(
         }
 
         // Member call expression: $obj->method()
-        "member_call_expression" => {
+        "member_call_expression" | "nullsafe_member_call_expression" => {
             let name_field = parent.child_by_field_name("name");
             let object_field = parent.child_by_field_name("object");
 
@@ -563,6 +603,30 @@ fn resolve_node(
         // Function call
         "function_call_expression" => {
             let func_field = parent.child_by_field_name("function");
+            if let Some(func) = func_field {
+                if func.kind() == "member_access_expression" {
+                    let name_field = func.child_by_field_name("name");
+                    let object_field = func.child_by_field_name("object");
+                    if name_field.map(|n| n.id()) == Some(node.id()) {
+                        let object_text = object_field.map(|o| source[o.byte_range()].to_string());
+                        let class_fqn = object_field.and_then(|o| {
+                            try_resolve_object_type(o, source, file_symbols, resolver)
+                        });
+                        let fqn = if let Some(ref cls) = class_fqn {
+                            format!("{}::{}", cls, node_text)
+                        } else {
+                            node_text.to_string()
+                        };
+                        return Some(SymbolAtPosition {
+                            fqn,
+                            name: node_text.to_string(),
+                            ref_kind: RefKind::MethodCall,
+                            object_expr: object_text,
+                            range: node_range(node),
+                        });
+                    }
+                }
+            }
             if func_field.map(|n| n.id()) == Some(node.id())
                 || (node.kind() == "name"
                     || node.kind() == "qualified_name"
@@ -879,7 +943,7 @@ fn try_resolve_object_type_inner<'a>(
             Some(resolve_class_name(text, file_symbols))
         }
         // Member access: $obj->prop → try to resolve object type, then look up property type
-        "member_access_expression" => {
+        "member_access_expression" | "nullsafe_member_access_expression" => {
             let obj_field = object_node.child_by_field_name("object")?;
             let name_field = object_node.child_by_field_name("name")?;
             let prop_name = &source[name_field.byte_range()];
@@ -917,7 +981,7 @@ fn try_resolve_object_type_inner<'a>(
             None
         }
         // Member call: $obj->foo() → resolve object type, then look up method return type
-        "member_call_expression" => {
+        "member_call_expression" | "nullsafe_member_call_expression" => {
             let obj_field = object_node.child_by_field_name("object")?;
             let name_field = object_node.child_by_field_name("name")?;
             let method_name = &source[name_field.byte_range()];
@@ -956,7 +1020,10 @@ fn try_resolve_object_type_inner<'a>(
             // Secondary fallback: if the object is `$this->prop` and the method
             // wasn't found on the declared type, try the assignment-inferred type.
             // This handles PHPUnit patterns: `$this->em = $this->createStub(...)` → Stub
-            if obj_field.kind() == "member_access_expression" {
+            if matches!(
+                obj_field.kind(),
+                "member_access_expression" | "nullsafe_member_access_expression"
+            ) {
                 if let Some(this_obj) = obj_field.child_by_field_name("object") {
                     let this_text = &source[this_obj.byte_range()];
                     if this_text == "$this" {
@@ -1188,6 +1255,25 @@ fn find_variable_inference_before_usage(
             }
         }
 
+        // Best-effort flow inference for assignments inside a completed branch:
+        // `$session = null; if (...) { $session = $request->getSession(); } $session?->...`
+        //
+        // The variable is still nullable at runtime, but for member completion
+        // and definition the assigned object type is useful.
+        if stmt.end_byte() <= usage_start {
+            if let Some(stmt_info) = find_nested_variable_inference_before_usage(
+                stmt,
+                var_name,
+                usage_start,
+                source,
+                file_symbols,
+                resolver,
+            ) {
+                inferred = Some((stmt.start_byte(), stmt_info));
+                continue;
+            }
+        }
+
         // If the usage sits inside this statement, continue only down that
         // containing branch/block. This finds assignments in the active nested
         // scope without borrowing types from sibling branches.
@@ -1207,6 +1293,85 @@ fn find_variable_inference_before_usage(
     }
 
     inferred.map(|(_, info)| info)
+}
+
+fn find_nested_variable_inference_before_usage(
+    node: Node,
+    var_name: &str,
+    usage_start: usize,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<VariableInference> {
+    let mut inferred: Option<(usize, VariableInference)> = None;
+
+    for i in 0..node.named_child_count() {
+        let child = match node.named_child(i) {
+            Some(child) => child,
+            None => continue,
+        };
+        if child.start_byte() >= usage_start {
+            break;
+        }
+        if is_variable_inference_scope_boundary(child) {
+            continue;
+        }
+
+        let assignment_rhs = assignment_rhs_for_var(child, var_name, source)
+            .filter(|right| right.end_byte() <= usage_start);
+
+        if let Some(doc_info) = extract_preceding_phpdoc_var_inference(
+            child,
+            var_name,
+            assignment_rhs.is_some(),
+            source,
+            file_symbols,
+        ) {
+            inferred = Some((child.start_byte(), doc_info));
+        } else if let Some(right) = assignment_rhs {
+            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols, resolver) {
+                inferred = Some((
+                    child.start_byte(),
+                    VariableInference {
+                        type_display: Some(resolved.clone()),
+                        resolved_type_fqn: Some(resolved.clone()),
+                        phpdoc_comment: None,
+                        type_info: Some(TypeInfo::Simple(resolved)),
+                    },
+                ));
+            }
+        }
+
+        if child.end_byte() <= usage_start {
+            if let Some(child_info) = find_nested_variable_inference_before_usage(
+                child,
+                var_name,
+                usage_start,
+                source,
+                file_symbols,
+                resolver,
+            ) {
+                inferred = Some((child.start_byte(), child_info));
+            }
+        }
+    }
+
+    inferred.map(|(_, info)| info)
+}
+
+fn is_variable_inference_scope_boundary(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function"
+            | "anonymous_function_creation_expression"
+            | "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+    )
 }
 
 fn instanceof_guard_inference(
@@ -1642,7 +1807,7 @@ fn infer_expression_type_info(
             }
             None
         }
-        "member_access_expression" => {
+        "member_access_expression" | "nullsafe_member_access_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
             let class_fqn = try_resolve_object_type(object, source, file_symbols, resolver)?;
@@ -1653,7 +1818,7 @@ fn infer_expression_type_info(
                     .flatten()
             })
         }
-        "member_call_expression" => {
+        "member_call_expression" | "nullsafe_member_call_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
             let class_fqn = try_resolve_object_type(object, source, file_symbols, resolver)?;
@@ -2053,6 +2218,7 @@ fn is_constant_reference_context(parent_kind: &str) -> bool {
             | "function_call_expression"
             | "scoped_call_expression"
             | "member_call_expression"
+            | "nullsafe_member_call_expression"
             | "namespace_use_clause"
             | "namespace_definition"
     )
@@ -2604,6 +2770,103 @@ function run(object $object, mixed $method): void
         );
 
         assert_eq!(result.as_deref(), Some("ReflectionMethod"));
+    }
+
+    #[test]
+    fn test_infer_variable_type_from_completed_if_assignment() {
+        let code = r#"<?php
+namespace App;
+
+class Session {
+    public function get(): string { return ''; }
+}
+
+function run(bool $enabled): void
+{
+    $session = null;
+    if ($enabled) {
+        $session = new Session();
+    }
+
+    $session?->get();
+}
+"#;
+        let (line, col) = find_line_col(code, "$session?->");
+        let result =
+            parse_and_infer_var_type_at(code, line, col + "$session?->".len() as u32, "$session");
+
+        assert_eq!(result.as_deref(), Some("App\\Session"));
+    }
+
+    #[test]
+    fn test_infer_variable_type_from_completed_if_method_return_with_resolver() {
+        let code = r#"<?php
+namespace App;
+
+use Symfony\Component\HttpFoundation\Request;
+
+function run(Request $request, bool $enabled): void
+{
+    $session = null;
+    if ($enabled) {
+        $session = $request->getSession();
+    }
+
+    $session?->get();
+}
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let (line, col) = find_line_col(code, "$session?->");
+        let resolver = |class_fqn: &str, member_name: &str| {
+            (class_fqn == "Symfony\\Component\\HttpFoundation\\Request"
+                && member_name == "getSession")
+                .then(|| {
+                    "Symfony\\Component\\HttpFoundation\\Session\\SessionInterface".to_string()
+                })
+        };
+        let result = infer_variable_type_at_position_with_resolver(
+            tree,
+            code,
+            &file_symbols,
+            line,
+            col + "$session?->".len() as u32,
+            "$session",
+            &resolver,
+        );
+
+        assert_eq!(
+            result.as_deref(),
+            Some("Symfony\\Component\\HttpFoundation\\Session\\SessionInterface")
+        );
+    }
+
+    #[test]
+    fn test_resolve_nullable_method_call_from_completed_if_assignment() {
+        let code = r#"<?php
+namespace App;
+
+class Session {
+    public function get(string $key): string { return ''; }
+}
+
+function run(bool $enabled): void
+{
+    $session = null;
+    if ($enabled) {
+        $session = new Session();
+    }
+
+    $session?->get('token');
+}
+"#;
+        let (line, col) = find_line_col(code, "get('token')");
+        let result = parse_and_resolve(code, line, col)
+            .expect("nullable method call should resolve from completed if assignment");
+
+        assert_eq!(result.fqn, "App\\Session::get");
     }
 
     #[test]

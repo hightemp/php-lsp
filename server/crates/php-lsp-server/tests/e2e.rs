@@ -2052,6 +2052,116 @@ class Controller {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_and_definition_nullable_variable_from_method_return_assignment() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Request {
+    public function hasSession(): bool { return true; }
+    public function getSession(): Session { return new Session(); }
+}
+
+class Session {
+    public function get(string $key): string { return ''; }
+    public function all(): array { return []; }
+}
+
+class Controller {
+    public function search(Request $request): void {
+        $session = null;
+        if ($request->hasSession()) {
+            $session = $request->getSession();
+        }
+
+        $session?->get('token');
+    }
+}
+"#;
+    let uri = "file:///test/nullable-method-return-completion.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, uri, 20, 22))
+        .await
+        .unwrap();
+    let completion_result = extract_result(completion);
+    let labels: Vec<String> = completion_items_from_result(&completion_result)
+        .iter()
+        .filter_map(|item| {
+            item.get("label")
+                .and_then(|label| label.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "get"),
+        "expected nullable variable completion to include get, got: {:?}",
+        labels
+    );
+
+    let definition = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(3, uri, 20, 19))
+        .await
+        .unwrap();
+    let definition_result = extract_result(definition);
+    assert_eq!(
+        definition_result
+            .get("uri")
+            .and_then(|value| value.as_str()),
+        Some(uri),
+        "definition should point to same test file, got: {}",
+        definition_result
+    );
+    assert_eq!(
+        definition_result["range"]["start"]["line"].as_u64(),
+        Some(9),
+        "definition should point to Session::get, got: {}",
+        definition_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_member_access_from_nested_fully_qualified_new_stub_type() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
@@ -2179,6 +2289,101 @@ function validate(object $object, mixed $method): void
             .iter()
             .any(|label| label == "getNumberOfRequiredParameters"),
         "expected nullable new-expression chain completion to include getNumberOfRequiredParameters, got: {:?}",
+        labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_completion_member_access_from_parenthesized_new_expression() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_marker = r#"<?php
+namespace App;
+
+class Uri
+{
+    public function __construct(private mixed $client) {}
+    public function setHost(string $host): self { return $this; }
+    public function setPort(int $port): self { return $this; }
+}
+
+class UriFactory
+{
+    public function __construct(private mixed $client) {}
+
+    public function create(): void
+    {
+        (new Uri($this->client))->set/*caret*/;
+    }
+}
+"#;
+    let marker = "/*caret*/";
+    let marker_offset = code_with_marker
+        .find(marker)
+        .expect("test code should contain caret marker");
+    let code = code_with_marker.replace(marker, "");
+    let marker_prefix = &code[..marker_offset];
+    let marker_line = marker_prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let marker_line_start = marker_prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let marker_character = (marker_prefix.len() - marker_line_start) as u32;
+    let uri = "file:///test/NewExpressionCompletion.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, uri, marker_line, marker_character))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let labels: Vec<String> = completion_items_from_result(&result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+
+    assert!(
+        labels.iter().any(|label| label == "setHost"),
+        "expected new-expression completion to include setHost, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == "setPort"),
+        "expected new-expression completion to include setPort, got: {:?}",
         labels
     );
 

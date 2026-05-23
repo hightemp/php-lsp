@@ -311,7 +311,20 @@ fn extract_object_expr(text: &str) -> String {
         }
     }
 
-    trimmed[start..].to_string()
+    let mut expr_start = start;
+    let before_expr = &trimmed[..start];
+    let before_expr = before_expr.trim_end();
+    if let Some(new_start) = before_expr.rfind("new") {
+        let has_keyword_boundary = before_expr[..new_start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_' && ch != '\\');
+        if has_keyword_boundary && before_expr[new_start + 3..].trim().is_empty() {
+            expr_start = new_start;
+        }
+    }
+
+    trimmed[expr_start..].to_string()
 }
 
 /// Try to find the object expression from CST node context.
@@ -477,6 +490,40 @@ mod tests {
             } => {
                 assert_eq!(object_expr, "$repo->findAll()[0]");
                 assert_eq!(member_prefix, "");
+            }
+            other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_context_keeps_parenthesized_new_expression() {
+        let code = "<?php\n(new Uri('https://example.com'))->set";
+        let ctx = detect(code, 1, 38);
+        match ctx {
+            CompletionContext::MemberAccess {
+                object_expr,
+                member_prefix,
+                ..
+            } => {
+                assert_eq!(object_expr, "(new Uri('https://example.com'))");
+                assert_eq!(member_prefix, "set");
+            }
+            other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_context_keeps_bare_new_expression() {
+        let code = "<?php\nnew \\ReflectionClass($service)->is";
+        let ctx = detect(code, 1, 35);
+        match ctx {
+            CompletionContext::MemberAccess {
+                object_expr,
+                member_prefix,
+                ..
+            } => {
+                assert_eq!(object_expr, "new \\ReflectionClass($service)");
+                assert_eq!(member_prefix, "is");
             }
             other => panic!("Expected MemberAccess, got {:?}", other),
         }
