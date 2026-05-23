@@ -130,6 +130,34 @@ async fn expect_no_publish_diagnostics(
     }
 }
 
+async fn wait_for_indexing_phase(
+    notifications: &mut UnboundedReceiver<Request>,
+    phase: &str,
+    timeout: Duration,
+) {
+    let started = std::time::Instant::now();
+    loop {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .unwrap_or_else(|| panic!("timed out waiting for indexing phase `{phase}`"));
+        let notification = tokio::time::timeout(remaining, notifications.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for indexing phase `{phase}`"))
+            .expect("notification channel closed");
+        if notification.method() != "phpLsp/indexingStatus" {
+            continue;
+        }
+
+        let params = notification
+            .params()
+            .cloned()
+            .expect("indexingStatus params");
+        if params.get("phase").and_then(|value| value.as_str()) == Some(phase) {
+            return;
+        }
+    }
+}
+
 fn shutdown_request(id: i64) -> Request {
     Request::build("shutdown").id(id).finish()
 }
@@ -1875,6 +1903,113 @@ class Controller {
     assert!(
         labels.contains(&"requestHeaders"),
         "expected property completion from chained type, got: {:?}",
+        labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_completion_member_access_from_nested_fully_qualified_new_stub_type() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-reflection-completion-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&tmp_root).unwrap();
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let stubs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../data/stubs")
+        .canonicalize()
+        .unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            Some(&root_uri),
+            Some(json!({
+                "stubsPath": stubs_path.to_string_lossy().to_string()
+            })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "stubsLoaded", Duration::from_secs(5)).await;
+
+    let code = r#"<?php
+namespace App;
+
+function validate(object $object, mixed $method): void
+{
+    if ($method instanceof \Closure) {
+        $method($object);
+    } elseif (\is_array($method)) {
+        $method($object);
+    } elseif (null !== $object) {
+        if (!method_exists($object, $method)) {
+            throw new \RuntimeException();
+        }
+
+        $reflMethod = new \ReflectionMethod($object, $method);
+
+        if ($reflMethod->isStatic()) {
+        }
+    }
+}
+"#;
+    let uri = "file:///test/ReflectionCompletion.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, uri, 16, 29))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let labels: Vec<String> = completion_items_from_result(&result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+
+    assert!(
+        labels.iter().any(|label| label == "isStatic"),
+        "expected ReflectionMethod completion to include isStatic, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == "invoke"),
+        "expected ReflectionMethod completion to include invoke, got: {:?}",
         labels
     );
 

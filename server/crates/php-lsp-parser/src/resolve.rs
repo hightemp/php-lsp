@@ -1136,7 +1136,7 @@ fn find_variable_inference_before_usage(
             None => continue,
         };
 
-        // Only look at statements before the usage point
+        // Only look at statements before the usage point.
         if stmt.start_byte() >= usage_start {
             break;
         }
@@ -1186,6 +1186,23 @@ fn find_variable_inference_before_usage(
                     },
                 ));
             }
+        }
+
+        // If the usage sits inside this statement, continue only down that
+        // containing branch/block. This finds assignments in the active nested
+        // scope without borrowing types from sibling branches.
+        if stmt.end_byte() > usage_start {
+            if let Some(stmt_info) = find_variable_inference_before_usage(
+                stmt,
+                var_name,
+                usage_start,
+                source,
+                file_symbols,
+                resolver,
+            ) {
+                inferred = Some((stmt.start_byte(), stmt_info));
+            }
+            break;
         }
     }
 
@@ -2425,6 +2442,73 @@ class Child extends Base {
         assert_eq!(sym.name, "test");
         assert_eq!(sym.ref_kind, RefKind::MethodCall);
         assert_eq!(sym.fqn, "App\\Test\\Baz::test");
+    }
+
+    #[test]
+    fn test_infer_variable_type_from_fully_qualified_new_expression() {
+        let code = r#"<?php
+namespace App;
+
+function run(object $object, string $method): void
+{
+    $reflMethod = new \ReflectionMethod($object, $method);
+    $reflMethod->
+}
+"#;
+        let (line, col) = find_line_col(code, "$reflMethod->");
+        let result = parse_and_infer_var_type_at(
+            code,
+            line,
+            col + "$reflMethod->".len() as u32,
+            "$reflMethod",
+        );
+
+        assert_eq!(result.as_deref(), Some("ReflectionMethod"));
+
+        let result_inside_member_name = parse_and_infer_var_type_at(
+            code,
+            line,
+            col + "$reflMethod->isSt".len() as u32,
+            "$reflMethod",
+        );
+        assert_eq!(
+            result_inside_member_name.as_deref(),
+            Some("ReflectionMethod")
+        );
+    }
+
+    #[test]
+    fn test_infer_variable_type_from_assignment_inside_elseif_branch() {
+        let code = r#"<?php
+namespace App;
+
+function run(object $object, mixed $method): void
+{
+    if ($method instanceof \Closure) {
+        $method($object);
+    } elseif (\is_array($method)) {
+        $method($object);
+    } elseif (null !== $object) {
+        if (!method_exists($object, $method)) {
+            throw new \RuntimeException();
+        }
+
+        $reflMethod = new \ReflectionMethod($object, $method);
+
+        if ($reflMethod->isStatic()) {
+        }
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "$reflMethod->");
+        let result = parse_and_infer_var_type_at(
+            code,
+            line,
+            col + "$reflMethod->".len() as u32,
+            "$reflMethod",
+        );
+
+        assert_eq!(result.as_deref(), Some("ReflectionMethod"));
     }
 
     #[test]

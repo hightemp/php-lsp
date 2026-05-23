@@ -268,18 +268,46 @@ fn extract_object_expr(text: &str) -> String {
     let end = trimmed.len();
     let chars: Vec<char> = trimmed.chars().collect();
     let mut i = chars.len();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
 
     // Take the last object expression segment. This must keep simple member
     // chains such as `$this->client`, because completion after
     // `$this->client->` needs the property type, not just the bare `client`.
     while i > 0 {
         let c = chars[i - 1];
-        if c.is_alphanumeric()
-            || matches!(
-                c,
-                '_' | '$' | '\\' | '-' | '>' | '?' | '[' | ']' | '\'' | '"' | '(' | ')'
-            )
-        {
+
+        match c {
+            ')' => {
+                paren_depth += 1;
+                i -= 1;
+                continue;
+            }
+            '(' if paren_depth > 0 => {
+                paren_depth -= 1;
+                i -= 1;
+                continue;
+            }
+            '(' => break,
+            ']' => {
+                bracket_depth += 1;
+                i -= 1;
+                continue;
+            }
+            '[' if bracket_depth > 0 => {
+                bracket_depth -= 1;
+                i -= 1;
+                continue;
+            }
+            '[' => break,
+            _ if paren_depth > 0 || bracket_depth > 0 => {
+                i -= 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if c.is_alphanumeric() || matches!(c, '_' | '$' | '\\' | '-' | '>' | '?') {
             i -= 1;
         } else {
             break;
@@ -369,6 +397,23 @@ mod tests {
             } => {
                 assert_eq!(object_expr, "$obj");
                 assert_eq!(member_prefix, "meth");
+            }
+            other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_context_inside_parenthesized_condition() {
+        let code = "<?php\nif ($reflMethod->isSt) {}";
+        let ctx = detect(code, 1, 17);
+        match ctx {
+            CompletionContext::MemberAccess {
+                object_expr,
+                member_prefix,
+                ..
+            } => {
+                assert_eq!(object_expr, "$reflMethod");
+                assert_eq!(member_prefix, "");
             }
             other => panic!("Expected MemberAccess, got {:?}", other),
         }
