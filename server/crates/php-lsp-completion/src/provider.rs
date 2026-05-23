@@ -352,6 +352,11 @@ fn provide_static_completions(
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
+    items.push(class_pseudo_constant_completion_item(
+        class_fqn,
+        member_prefix,
+    ));
+
     let fqn = class_fqn.to_string();
 
     let members = index.get_members(&fqn);
@@ -384,6 +389,28 @@ fn provide_static_completions(
     // Also add class constants and enum cases
     sort_completion_items(&mut items);
     items
+}
+
+fn class_pseudo_constant_completion_item(class_fqn: &str, member_prefix: &str) -> CompletionItem {
+    let detail = if class_fqn.is_empty() {
+        "class-string".to_string()
+    } else {
+        format!("class-string<{}>", class_fqn)
+    };
+    let mut item = CompletionItem {
+        label: "class".to_string(),
+        kind: Some(CompletionItemKind::CONSTANT),
+        detail: Some(detail),
+        insert_text: Some("class".to_string()),
+        filter_text: Some(format!("class {}::class", class_fqn)),
+        ..Default::default()
+    };
+    item.sort_text = Some(format!(
+        "{}_{}_class",
+        symbol_sort_rank(PhpSymbolKind::ClassConstant),
+        completion_prefix_rank(&item.label, Some(member_prefix))
+    ));
+    item
 }
 
 /// Provide variable completions.
@@ -477,12 +504,16 @@ fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Complet
 
     // Add matching types
     let results = index.search(prefix);
-    for sym in results.iter().take(50) {
+    for sym in results {
         items.push(CompletionItem {
             label: sym.name.clone(),
             kind: Some(symbol_kind_to_completion_kind(sym.kind)),
             detail: Some(sym.fqn.clone()),
-            sort_text: Some(format!("0300_{}", sym.name.to_ascii_lowercase())),
+            sort_text: Some(format!(
+                "0300_{}_{}",
+                completion_prefix_rank(&sym.name, Some(prefix)),
+                sym.name.to_ascii_lowercase()
+            )),
             filter_text: Some(format!("{} {}", sym.name, sym.fqn)),
             data: Some(serde_json::Value::String(sym.fqn.clone())),
             ..Default::default()
@@ -800,6 +831,50 @@ mod tests {
         assert!(
             items.iter().any(|i| i.label == "UserService"),
             "Should find UserService"
+        );
+    }
+
+    #[test]
+    fn test_free_completion_ranks_prefix_matches_before_contains_matches() {
+        let mut symbols = Vec::new();
+        for idx in 0..120 {
+            symbols.push(make_symbol(
+                &format!("OtherTyNoise{idx:03}"),
+                &format!("App\\OtherTyNoise{idx:03}"),
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ));
+        }
+        symbols.push(make_symbol(
+            "TypeGuess",
+            "App\\TypeGuess",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        ));
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols,
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::Free {
+            prefix: "Ty".to_string(),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+
+        assert_eq!(
+            items.first().map(|item| item.label.as_str()),
+            Some("TypeGuess")
+        );
+        assert!(
+            items.iter().any(|item| item.label == "TypeGuess"),
+            "prefix match should survive truncation"
         );
     }
 
@@ -1189,6 +1264,37 @@ mod tests {
             !labels.contains(&"run"),
             "instance method should be hidden on `::`"
         );
+    }
+
+    #[test]
+    fn test_static_completion_includes_class_pseudo_constant() {
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![make_symbol(
+                "Service",
+                "App\\Service",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            )],
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::StaticAccess {
+            class_expr: "Service".to_string(),
+            member_prefix: String::new(),
+            class_fqn: "App\\Service".to_string(),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+        let class_item = items
+            .iter()
+            .find(|item| item.label == "class")
+            .expect("static completion should include ::class");
+
+        assert_eq!(class_item.kind, Some(CompletionItemKind::CONSTANT));
     }
 
     #[test]

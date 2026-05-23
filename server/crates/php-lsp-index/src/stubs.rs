@@ -32,7 +32,7 @@ pub const DEFAULT_EXTENSIONS: &[&str] = &[
     "tokenizer",
     "ctype",
     "fileinfo",
-    "pdo",
+    "PDO",
     "Reflection",
     "random",
     "intl",
@@ -177,6 +177,7 @@ mod tests {
         assert!(DEFAULT_EXTENSIONS.len() > 0);
         assert!(DEFAULT_EXTENSIONS.contains(&"Core"));
         assert!(DEFAULT_EXTENSIONS.contains(&"standard"));
+        assert!(DEFAULT_EXTENSIONS.contains(&"PDO"));
     }
 
     fn stubs_are_available(stubs_path: &Path) -> bool {

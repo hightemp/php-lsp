@@ -1049,3 +1049,6 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-23** Убрать Symfony-specific hardcode `is_symfony_configurator_file` из diagnostics.
 - [x] **T-2026-05-23** Разобраться, почему completion не показывает методы `ReflectionMethod` для `$reflMethod->` в Symfony `CallbackValidator.php`.
 - [x] **T-2026-05-23** Протестировать autocomplete по `/home/hightemp/ForTesting/symfony` на падения и некорректные ответы.
+- [x] **T-2026-05-23** Исправить completion `Blank::` внутри chained call в Symfony `BlankValidator.php`.
+- [x] **T-2026-05-23** Расширить Symfony autocomplete-аудит проверкой полноты ожидаемых labels по разным контекстам.
+- [ ] **T-2026-05-23** Разобрать остаточные Symfony autocomplete label misses: external PHPUnit symbols, `parent::` в anonymous class/trait, nullable/member chains.

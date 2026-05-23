@@ -1737,6 +1737,142 @@ echo $
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_static_class_labels_inside_chained_call() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_marker = r#"<?php
+namespace Symfony\Component\Validator\Constraints;
+
+abstract class Constraint
+{
+    public const DEFAULT_GROUP = 'Default';
+    public const CLASS_CONSTRAINT = 'class';
+    public const PROPERTY_CONSTRAINT = 'property';
+
+    public static function getErrorName(string $errorCode): string
+    {
+        return $errorCode;
+    }
+
+    public function validatedBy(): string
+    {
+        return static::class.'Validator';
+    }
+}
+
+class Blank extends Constraint
+{
+    public const NOT_BLANK_ERROR = '183ad2de-533d-4796-a439-6d3c3852b549';
+    public string $message = 'This value should be blank.';
+}
+
+class ViolationBuilder
+{
+    public function setCode(string $code): self
+    {
+        return $this;
+    }
+}
+
+class Context
+{
+    public function buildViolation(string $message): ViolationBuilder
+    {
+        return new ViolationBuilder();
+    }
+}
+
+class BlankValidator
+{
+    private Context $context;
+
+    public function validate(Constraint $constraint): void
+    {
+        $this->context
+            ->buildViolation($constraint->message)
+            ->setCode(Blank::/*caret*/);
+    }
+}
+"#;
+    let marker = "/*caret*/";
+    let offset = code_with_marker
+        .find(marker)
+        .expect("test code should contain caret marker");
+    let code = code_with_marker.replace(marker, "");
+    let prefix = &code[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let character = (prefix.len() - line_start) as u32;
+    let uri = "file:///test/blank-validator-completion.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, uri, line, character))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let items = completion_items_from_result(&result);
+    let labels: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .collect();
+
+    for expected in [
+        "class",
+        "NOT_BLANK_ERROR",
+        "DEFAULT_GROUP",
+        "CLASS_CONSTRAINT",
+        "PROPERTY_CONSTRAINT",
+        "getErrorName",
+    ] {
+        assert!(
+            labels.contains(&expected),
+            "expected static completion to include `{expected}`, got: {labels:?}"
+        );
+    }
+    assert!(
+        !labels.contains(&"validatedBy"),
+        "instance method should stay hidden for ClassName:: completion"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_member_access_from_inline_phpdoc_var() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
