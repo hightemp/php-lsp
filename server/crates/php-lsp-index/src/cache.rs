@@ -7,10 +7,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CACHE_SCHEMA_VERSION: u32 = 6;
 pub const CACHE_FILE_NAME: &str = "index.bin";
+static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheNamespace {
@@ -192,7 +194,15 @@ pub fn save_cache_atomic(path: &Path, cache: &IndexCache) -> Result<(), CacheErr
         fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = path.with_extension("bin.tmp");
+    let counter = CACHE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(CACHE_FILE_NAME),
+        std::process::id(),
+        counter
+    ));
     let bytes = bincode::serialize(cache)?;
     fs::write(&tmp_path, bytes)?;
     fs::rename(tmp_path, path)?;
@@ -702,6 +712,48 @@ mod tests {
         );
         assert!(path.starts_with(base.join("php-lsp")));
         assert!(path.ends_with(Path::new("workspace").join(CACHE_FILE_NAME)));
+    }
+
+    #[test]
+    fn concurrent_saves_to_same_cache_path_do_not_share_temp_file() {
+        let root = unique_temp_dir("concurrent-save");
+        let file = root.join("src").join("Foo.php");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "<?php class Foo {}").unwrap();
+        let uri = path_to_uri(&file);
+        let cache_path = root.join("cache").join(CACHE_FILE_NAME);
+        let config = test_config();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let root = root.clone();
+            let file = file.clone();
+            let uri = uri.clone();
+            let cache_path = cache_path.clone();
+            let config = config.clone();
+            handles.push(std::thread::spawn(move || {
+                let index = WorkspaceIndex::new();
+                index.update_file(
+                    &uri,
+                    FileSymbols {
+                        namespace: Some("App".to_string()),
+                        use_statements: vec![],
+                        symbols: vec![make_symbol(&uri)],
+                    },
+                );
+                let cache = build_cache_from_index(&index, &root, &[file], &config);
+                save_cache_atomic(&cache_path, &cache)
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let loaded = load_cache(&cache_path).unwrap();
+        assert_eq!(loaded.files.len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1115,7 +1115,8 @@ fn find_variable_inference_before_usage(
             break;
         }
 
-        let assignment_rhs = assignment_rhs_for_var(stmt, var_name, source);
+        let assignment_rhs = assignment_rhs_for_var(stmt, var_name, source)
+            .filter(|right| right.end_byte() <= usage_start);
 
         // Inline PHPDoc immediately before statement:
         //  - apply named @var always when variable matches
@@ -2398,6 +2399,35 @@ class Child extends Base {
         assert_eq!(sym.name, "test");
         assert_eq!(sym.ref_kind, RefKind::MethodCall);
         assert_eq!(sym.fqn, "App\\Test\\Baz::test");
+    }
+
+    #[test]
+    fn test_resolve_self_reassignment_rhs_does_not_recurse() {
+        let code = r#"<?php
+namespace App;
+
+class Generator {
+    public function randomBased(): self { return $this; }
+    public function generateId(): void {}
+}
+
+class Demo {
+    public function run(): void {
+        $generator = new Generator();
+        $generator = $generator->randomBased();
+        $generator->generateId();
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "randomBased");
+        let reassignment_call =
+            parse_and_resolve(code, line, col).expect("self-reassignment RHS should resolve");
+        assert_eq!(reassignment_call.fqn, "App\\Generator::randomBased");
+
+        let (line, col) = find_line_col(code, "generateId");
+        let later_call =
+            parse_and_resolve(code, line, col).expect("later method call should resolve");
+        assert_eq!(later_call.fqn, "App\\Generator::generateId");
     }
 
     #[test]

@@ -504,7 +504,6 @@ struct WorkspaceParseResult {
 
 #[derive(Debug, Clone)]
 struct VendorAutoloadCacheEntry {
-    fingerprint: u64,
     map: VendorAutoloadMap,
 }
 
@@ -1551,14 +1550,6 @@ impl PhpLspBackend {
                 {
                     if is_vendor_file {
                         self.touch_vendor_file_lru(&abs).await;
-                    }
-                    if let Some(cache_config) = vendor_cache_config.as_ref() {
-                        save_vendor_index_cache_blocking(
-                            self.index.clone(),
-                            config.root.clone(),
-                            cache_config.clone(),
-                        )
-                        .await;
                     }
                     tracing::debug!("Lazy-indexed file: {}", abs.display());
                     return true;
@@ -8461,17 +8452,6 @@ fn find_composer_json(root: &Path) -> Option<PathBuf> {
     }
 }
 
-fn vendor_autoload_metadata_hash(vendor_dir: &Path) -> u64 {
-    let mut parts = vec![
-        "vendor-autoload-metadata-v1".to_string(),
-        format!("vendor-dir={}", cache_path_label(vendor_dir)),
-    ];
-    for relative in ["composer/installed.json", "composer/autoload_psr4.php"] {
-        push_metadata_hash_part(&mut parts, "file", relative, &vendor_dir.join(relative));
-    }
-    cache::stable_hash_strings(parts.iter().map(String::as_str))
-}
-
 fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutoloadMap> {
     let installed_json = vendor_dir.join("composer/installed.json");
     if !installed_json.exists() {
@@ -8502,15 +8482,6 @@ fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutoloadMap> {
     }
 
     Some(map)
-}
-
-async fn vendor_autoload_metadata_hash_blocking(vendor_dir: PathBuf) -> Option<u64> {
-    let path_label = vendor_dir.display().to_string();
-    run_file_io_blocking("vendor autoload metadata hash", path_label, move || {
-        vendor_autoload_metadata_hash(&vendor_dir)
-    })
-    .await
-    .ok()
 }
 
 async fn parse_vendor_autoload_map_blocking(vendor_dir: PathBuf) -> Option<VendorAutoloadMap> {
@@ -8595,13 +8566,10 @@ async fn cached_vendor_autoload_map(
     cache: &Arc<Mutex<VendorAutoloadCache>>,
     vendor_dir: &Path,
 ) -> Option<VendorAutoloadMap> {
-    let fingerprint = vendor_autoload_metadata_hash_blocking(vendor_dir.to_path_buf()).await?;
     {
         let cache = cache.lock().await;
         if let Some(entry) = cache.by_vendor_dir.get(vendor_dir) {
-            if entry.fingerprint == fingerprint {
-                return Some(entry.map.clone());
-            }
+            return Some(entry.map.clone());
         }
     }
 
@@ -8612,10 +8580,7 @@ async fn cached_vendor_autoload_map(
 
     cache.lock().await.by_vendor_dir.insert(
         vendor_dir.to_path_buf(),
-        VendorAutoloadCacheEntry {
-            fingerprint,
-            map: map.clone(),
-        },
+        VendorAutoloadCacheEntry { map: map.clone() },
     );
     Some(map)
 }
@@ -9052,8 +9017,13 @@ fn collect_stub_cache_sources(stubs_path: &Path, extensions: &[String]) -> Vec<C
     sources
 }
 
+fn read_php_source_lossy(file_path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(file_path)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn parse_and_index_php_file(index: &WorkspaceIndex, file_path: &Path) -> bool {
-    let Ok(source) = std::fs::read_to_string(file_path) else {
+    let Ok(source) = read_php_source_lossy(file_path) else {
         return false;
     };
     let mut parser = FileParser::new();
@@ -9071,7 +9041,7 @@ fn parse_and_index_php_file(index: &WorkspaceIndex, file_path: &Path) -> bool {
 
 fn parse_workspace_file_for_index(file_path: PathBuf) -> WorkspaceParseResult {
     let uri = path_to_uri(&file_path);
-    let source = match std::fs::read_to_string(&file_path) {
+    let source = match read_php_source_lossy(&file_path) {
         Ok(source) => source,
         Err(err) => {
             return WorkspaceParseResult {
@@ -13338,6 +13308,34 @@ mod tests {
         assert!(index.resolve_fqn("App\\Foo").is_none());
         assert!(index.resolve_fqn("Vendor\\Pkg\\Bar").is_some());
         assert!(index.resolve_fqn("stdClass").is_some());
+    }
+
+    #[test]
+    fn test_workspace_index_reads_non_utf8_php_lossily() {
+        let tmp =
+            std::env::temp_dir().join(format!("php-lsp-non-utf8-index-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("Legacy.php");
+        std::fs::write(
+            &file,
+            b"<?php\nclass Legacy {\n    public const VALUE = \"\xff\";\n}\n",
+        )
+        .unwrap();
+
+        let parsed = parse_workspace_file_for_index(file);
+
+        assert!(
+            parsed.error.is_none(),
+            "got parse error: {:?}",
+            parsed.error
+        );
+        assert!(parsed
+            .file_symbols
+            .as_ref()
+            .is_some_and(|symbols| symbols.symbols.iter().any(|sym| sym.fqn == "Legacy")));
+
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
