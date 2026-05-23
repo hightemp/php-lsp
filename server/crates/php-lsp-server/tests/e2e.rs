@@ -1297,6 +1297,127 @@ $f->bar();
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_goto_definition_parent_scope_and_method() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let base_code = r#"<?php
+namespace App;
+
+class Base {
+    public function run(): void {}
+}
+"#;
+    let child_code = r#"<?php
+namespace App;
+
+class Child extends Base {
+    public function test(): void {
+        parent::run();
+    }
+}
+"#;
+    let base_uri = "file:///test/Base.php";
+    let child_uri = "file:///test/ParentDefinition.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(base_uri, base_code))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(child_uri, child_code))
+        .await
+        .unwrap();
+
+    let parent_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(2, child_uri, 5, 8))
+        .await
+        .unwrap();
+    let parent_result = extract_result(parent_resp);
+
+    assert_eq!(
+        parent_result.get("uri").and_then(|u| u.as_str()),
+        Some(base_uri),
+        "definition on parent scope should point to Base class, got: {}",
+        parent_result
+    );
+    assert_eq!(
+        parent_result["range"]["start"]["line"].as_u64(),
+        Some(3),
+        "definition on parent scope should point to Base class line, got: {}",
+        parent_result
+    );
+    assert_eq!(
+        parent_result["range"]["start"]["character"].as_u64(),
+        Some(6),
+        "definition on parent scope should point to Base class name, got: {}",
+        parent_result
+    );
+
+    let method_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(3, child_uri, 5, 16))
+        .await
+        .unwrap();
+    let method_result = extract_result(method_resp);
+
+    assert_eq!(
+        method_result.get("uri").and_then(|u| u.as_str()),
+        Some(base_uri),
+        "definition on parent method should point to Base::run, got: {}",
+        method_result
+    );
+    assert_eq!(
+        method_result["range"]["start"]["line"].as_u64(),
+        Some(4),
+        "definition on parent method should point to run() line, got: {}",
+        method_result
+    );
+    assert_eq!(
+        method_result["range"]["start"]["character"].as_u64(),
+        Some(20),
+        "definition on parent method should point to run() name, got: {}",
+        method_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_goto_declaration_points_to_import_or_definition_fallback() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

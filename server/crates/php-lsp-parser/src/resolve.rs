@@ -485,11 +485,7 @@ fn resolve_node(
                 let scope_text = scope_field.map(|s| source[s.byte_range()].to_string());
                 let scope_fqn = scope_text
                     .as_ref()
-                    .map(|s| match s.as_str() {
-                        "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
-                            .unwrap_or_else(|| s.to_string()),
-                        _ => resolve_class_name(s, file_symbols),
-                    })
+                    .map(|s| resolve_scope_class_name(s, parent, source, file_symbols))
                     .unwrap_or_default();
 
                 return Some(SymbolAtPosition {
@@ -506,11 +502,7 @@ fn resolve_node(
             }
 
             // Cursor on scope (class name)
-            let resolved = match node_text {
-                "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
-                    .unwrap_or_else(|| resolve_class_name(node_text, file_symbols)),
-                _ => resolve_class_name(node_text, file_symbols),
-            };
+            let resolved = resolve_scope_class_name(node_text, parent, source, file_symbols);
             Some(SymbolAtPosition {
                 fqn: resolved,
                 name: node_text.to_string(),
@@ -529,11 +521,7 @@ fn resolve_node(
                 let scope_text = scope_field.map(|s| source[s.byte_range()].to_string());
                 let scope_fqn = scope_text
                     .as_ref()
-                    .map(|s| match s.as_str() {
-                        "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
-                            .unwrap_or_else(|| s.to_string()),
-                        _ => resolve_class_name(s, file_symbols),
-                    })
+                    .map(|s| resolve_scope_class_name(s, parent, source, file_symbols))
                     .unwrap_or_default();
 
                 let (ref_kind, member_name) = if node_text.starts_with('$') {
@@ -555,11 +543,7 @@ fn resolve_node(
                 });
             }
 
-            let resolved = match node_text {
-                "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
-                    .unwrap_or_else(|| resolve_class_name(node_text, file_symbols)),
-                _ => resolve_class_name(node_text, file_symbols),
-            };
+            let resolved = resolve_scope_class_name(node_text, parent, source, file_symbols);
             Some(SymbolAtPosition {
                 fqn: resolved,
                 name: node_text.to_string(),
@@ -645,11 +629,7 @@ fn resolve_node(
                 let scope_text = scope_node.map(|s| source[s.byte_range()].to_string());
                 let scope_fqn = scope_text
                     .as_ref()
-                    .map(|s| match s.as_str() {
-                        "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
-                            .unwrap_or_else(|| s.to_string()),
-                        _ => resolve_class_name(s, file_symbols),
-                    })
+                    .map(|s| resolve_scope_class_name(s, parent, source, file_symbols))
                     .unwrap_or_default();
                 return Some(SymbolAtPosition {
                     fqn: if scope_fqn.is_empty() {
@@ -665,11 +645,7 @@ fn resolve_node(
             }
 
             if scope_node.map(|n| n.id()) == Some(node.id()) {
-                let resolved = match node_text {
-                    "self" | "static" => find_parent_class_fqn(parent, source, file_symbols)
-                        .unwrap_or_else(|| resolve_class_name(node_text, file_symbols)),
-                    _ => resolve_class_name(node_text, file_symbols),
-                };
+                let resolved = resolve_scope_class_name(node_text, parent, source, file_symbols);
                 return Some(SymbolAtPosition {
                     fqn: resolved,
                     name: node_text.to_string(),
@@ -2176,6 +2152,34 @@ fn find_parent_class_fqn(
     None
 }
 
+fn find_extended_parent_class_fqn(
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    let current_class_fqn = find_parent_class_fqn(context_node, source, file_symbols)?;
+    file_symbols
+        .symbols
+        .iter()
+        .find(|sym| sym.fqn == current_class_fqn)
+        .and_then(|sym| sym.extends.first().cloned())
+}
+
+fn resolve_scope_class_name(
+    scope_name: &str,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> String {
+    match scope_name {
+        "self" | "static" => find_parent_class_fqn(context_node, source, file_symbols)
+            .unwrap_or_else(|| scope_name.to_string()),
+        "parent" => find_extended_parent_class_fqn(context_node, source, file_symbols)
+            .unwrap_or_else(|| scope_name.to_string()),
+        _ => resolve_class_name(scope_name, file_symbols),
+    }
+}
+
 fn node_range(node: Node) -> (u32, u32, u32, u32) {
     let start = node.start_position();
     let end = node.end_position();
@@ -2329,6 +2333,36 @@ class UserRepository {
         assert_eq!(sym.name, "baz");
         assert_eq!(sym.ref_kind, RefKind::MethodCall);
         assert_eq!(sym.fqn, "App\\Foo::baz");
+    }
+
+    #[test]
+    fn test_resolve_parent_scope_to_extended_class() {
+        let code = r#"<?php
+namespace App;
+
+class Base {
+    public function run(): void {}
+}
+
+class Child extends Base {
+    public function test(): void {
+        parent::run();
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "parent::run");
+
+        let scope = parse_and_resolve(code, line, col).expect("parent scope should resolve");
+        assert_eq!(scope.name, "parent");
+        assert_eq!(scope.ref_kind, RefKind::ClassName);
+        assert_eq!(scope.fqn, "App\\Base");
+
+        let method_col = col + "parent::".len() as u32;
+        let method =
+            parse_and_resolve(code, line, method_col).expect("parent method should resolve");
+        assert_eq!(method.name, "run");
+        assert_eq!(method.ref_kind, RefKind::MethodCall);
+        assert_eq!(method.fqn, "App\\Base::run");
     }
 
     #[test]

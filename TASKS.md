@@ -1044,3 +1044,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-21** Изучить код проекта и составить список недостающих работ для production LSP сервера.
 - [x] **T-2026-05-21** Добавить milestone production-readiness с подробным расписанием задач.
 - [x] **T-2026-05-22** Обновить submodule `server/data/stubs` из upstream.
+- [x] **T-2026-05-23** Разобраться, почему `go to definition` не работает на `parent` в `AbstractObjectNormalizer.php`.
