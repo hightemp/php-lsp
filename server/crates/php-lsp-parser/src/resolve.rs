@@ -2210,11 +2210,58 @@ fn find_parent_class_fqn(
     None
 }
 
+fn find_anonymous_class_parent_fqn(
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    let mut current = Some(context_node);
+    while let Some(node) = current {
+        if node.kind() == "object_creation_expression"
+            && source[node.byte_range()]
+                .trim_start()
+                .starts_with("new class")
+        {
+            return first_base_clause_fqn(node, source, file_symbols);
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn first_base_clause_fqn(node: Node, source: &str, file_symbols: &FileSymbols) -> Option<String> {
+    if node.kind() == "declaration_list" {
+        return None;
+    }
+    if node.kind() == "base_clause" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if matches!(child.kind(), "name" | "qualified_name") {
+                let name = &source[child.byte_range()];
+                return Some(resolve_class_name(name, file_symbols));
+            }
+        }
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(fqn) = first_base_clause_fqn(child, source, file_symbols) {
+            return Some(fqn);
+        }
+    }
+    None
+}
+
 fn find_extended_parent_class_fqn(
     context_node: Node,
     source: &str,
     file_symbols: &FileSymbols,
 ) -> Option<String> {
+    if let Some(parent_fqn) = find_anonymous_class_parent_fqn(context_node, source, file_symbols) {
+        return Some(parent_fqn);
+    }
+
     let current_class_fqn = find_parent_class_fqn(context_node, source, file_symbols)?;
     file_symbols
         .symbols
@@ -2421,6 +2468,40 @@ class Child extends Base {
         assert_eq!(method.name, "run");
         assert_eq!(method.ref_kind, RefKind::MethodCall);
         assert_eq!(method.fqn, "App\\Base::run");
+    }
+
+    #[test]
+    fn test_resolve_parent_scope_inside_anonymous_class() {
+        let code = r#"<?php
+namespace App;
+
+class ControllerHelper {
+    public function __construct() {}
+}
+
+class Outer {
+    public function create(): object {
+        return new class extends ControllerHelper {
+            public function setContainer(): void {
+                parent::__construct();
+            }
+        };
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "parent::__construct");
+
+        let scope = parse_and_resolve(code, line, col)
+            .expect("anonymous class parent scope should resolve");
+        assert_eq!(scope.name, "parent");
+        assert_eq!(scope.ref_kind, RefKind::ClassName);
+        assert_eq!(scope.fqn, "App\\ControllerHelper");
+
+        let method_col = col + "parent::".len() as u32;
+        let method = parse_and_resolve(code, line, method_col)
+            .expect("anonymous class parent method should resolve");
+        assert_eq!(method.name, "__construct");
+        assert_eq!(method.fqn, "App\\ControllerHelper::__construct");
     }
 
     #[test]

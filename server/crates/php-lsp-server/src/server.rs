@@ -1411,6 +1411,8 @@ impl PhpLspBackend {
                 .or_else(|| current_class_fqn(file_symbols))?
         } else if base_expr.starts_with('$') {
             infer_variable_type_at_position(tree, source, file_symbols, line, byte_col, base_expr)?
+        } else if let Some(class_fqn) = infer_new_expression_type(base_expr, file_symbols) {
+            class_fqn
         } else {
             return None;
         };
@@ -8105,6 +8107,63 @@ fn byte_offset_to_line_col(source: &str, byte_offset: usize) -> (u32, u32) {
     (line, byte_offset.saturating_sub(line_start) as u32)
 }
 
+fn infer_new_expression_type(
+    expr: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<String> {
+    let expr = trim_balanced_outer_parens(expr.trim());
+    let rest = expr.strip_prefix("new")?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+
+    let rest = rest.trim_start();
+    let end = rest
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_alphanumeric() && ch != '_' && ch != '\\').then_some(idx))
+        .unwrap_or(rest.len());
+    let class_name = rest[..end].trim();
+    if class_name.is_empty() || class_name == "class" {
+        return None;
+    }
+
+    Some(
+        resolve_class_name_pub(class_name, file_symbols)
+            .trim_start_matches('\\')
+            .to_string(),
+    )
+}
+
+fn trim_balanced_outer_parens(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim();
+        if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+            return trimmed;
+        }
+
+        let mut depth = 0usize;
+        let mut encloses_whole_expr = false;
+        for (idx, ch) in trimmed.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        encloses_whole_expr = idx + ch.len_utf8() == trimmed.len();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !encloses_whole_expr {
+            return trimmed;
+        }
+        text = &trimmed[1..trimmed.len() - 1];
+    }
+}
+
 fn resolve_member_type_from_index(
     index: &WorkspaceIndex,
     class_fqn: &str,
@@ -13109,6 +13168,29 @@ mod tests {
             }
         }
         line_start + col as usize
+    }
+
+    #[test]
+    fn test_infer_new_expression_type_from_parenthesized_expression() {
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![UseStatement {
+                fqn: "Symfony\\Component\\Form\\Guess\\TypeGuess".to_string(),
+                alias: None,
+                kind: UseKind::Class,
+                range: (0, 0, 0, 0),
+            }],
+            symbols: vec![],
+        };
+
+        assert_eq!(
+            infer_new_expression_type("(new \\ReflectionClass($v))", &file_symbols).as_deref(),
+            Some("ReflectionClass")
+        );
+        assert_eq!(
+            infer_new_expression_type("((new TypeGuess(Foo::class)))", &file_symbols).as_deref(),
+            Some("Symfony\\Component\\Form\\Guess\\TypeGuess")
+        );
     }
 
     #[test]

@@ -2094,7 +2094,7 @@ async fn test_completion_member_access_from_nested_fully_qualified_new_stub_type
         .unwrap();
     wait_for_indexing_phase(&mut notifications, "stubsLoaded", Duration::from_secs(5)).await;
 
-    let code = r#"<?php
+    let code_with_marker = r#"<?php
 namespace App;
 
 function validate(object $object, mixed $method): void
@@ -2112,15 +2112,26 @@ function validate(object $object, mixed $method): void
 
         if ($reflMethod->isStatic()) {
         }
+
+        $required = (new \ReflectionClass($object))->getConstructor()?->getNumber/*caret*/;
     }
 }
 "#;
+    let marker = "/*caret*/";
+    let marker_offset = code_with_marker
+        .find(marker)
+        .expect("test code should contain caret marker");
+    let code = code_with_marker.replace(marker, "");
+    let marker_prefix = &code[..marker_offset];
+    let marker_line = marker_prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let marker_line_start = marker_prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let marker_character = (marker_prefix.len() - marker_line_start) as u32;
     let uri = "file:///test/ReflectionCompletion.php";
     service
         .ready()
         .await
         .unwrap()
-        .call(did_open_notification(uri, code))
+        .call(did_open_notification(uri, &code))
         .await
         .unwrap();
 
@@ -2146,6 +2157,28 @@ function validate(object $object, mixed $method): void
     assert!(
         labels.iter().any(|label| label == "invoke"),
         "expected ReflectionMethod completion to include invoke, got: {:?}",
+        labels
+    );
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(3, uri, marker_line, marker_character))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let labels: Vec<String> = completion_items_from_result(&result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "getNumberOfRequiredParameters"),
+        "expected nullable new-expression chain completion to include getNumberOfRequiredParameters, got: {:?}",
         labels
     );
 
