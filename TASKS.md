@@ -1059,3 +1059,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
   - [x] Исправить воспроизводимые баги без Symfony-specific hardcode.
   - [x] Добавить regression tests на исправленные случаи.
   - [x] Прогнать `fmt`, `test`, `clippy`, `release build`, `git diff --check`.
+- [x] **T-2026-05-24** Разобраться, почему member autocomplete в `CallbackValidator.php` показывает переменные после `$reflMethod->setAccessible`.
+- [x] **T-2026-05-24** Разобраться, почему go-to-definition не работает для `$this`.
+- [x] **T-2026-05-24** Исправить VS Marketplace badge в README под текущий `publisher`/`name` из `client/package.json`.
+- [x] **T-2026-05-24** Добавить публикацию VS Code extension в Marketplace в release workflow.

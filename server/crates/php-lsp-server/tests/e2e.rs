@@ -5951,7 +5951,62 @@ function demo(): void {
         "variable usage should go to assignment line"
     );
 
-    // 2) Global const usage -> const declaration
+    // 2) $this usage -> containing class declaration
+    let this_code = r#"<?php
+namespace App;
+
+class Demo {
+    public function run(): void {
+        $this;
+        $this->run();
+    }
+}
+"#;
+    let this_uri = "file:///test/GotoThis.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(this_uri, this_code))
+        .await
+        .unwrap();
+
+    for (id, line, character, label) in [
+        (3, 5, 10, "standalone $this"),
+        (4, 6, 10, "$this in member access"),
+    ] {
+        let this_resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(id, this_uri, line, character))
+            .await
+            .unwrap();
+        let this_result = extract_result(this_resp);
+        assert_eq!(
+            this_result.get("uri").and_then(|value| value.as_str()),
+            Some(this_uri),
+            "definition for {} should point to the current class, got: {}",
+            label,
+            this_result
+        );
+        assert_eq!(
+            this_result["range"]["start"]["line"].as_u64(),
+            Some(3),
+            "definition for {} should point to class name line, got: {}",
+            label,
+            this_result
+        );
+        assert_eq!(
+            this_result["range"]["start"]["character"].as_u64(),
+            Some(6),
+            "definition for {} should point to class name character, got: {}",
+            label,
+            this_result
+        );
+    }
+
+    // 3) Global const usage -> const declaration
     let const_code = r#"<?php
 namespace App;
 
@@ -5972,7 +6027,7 @@ echo BUILD;
         .ready()
         .await
         .unwrap()
-        .call(definition_request(3, const_uri, 5, 5))
+        .call(definition_request(5, const_uri, 5, 5))
         .await
         .unwrap();
     let build_result = extract_result(build_resp);
@@ -5987,7 +6042,7 @@ echo BUILD;
         "constant usage should go to const declaration line"
     );
 
-    // 3) self::CLASS_CONST usage -> class const declaration
+    // 4) self::CLASS_CONST usage -> class const declaration
     let class_const_code = r#"<?php
 namespace App;
 
@@ -6011,7 +6066,7 @@ class Foo {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(4, class_const_uri, 6, 21))
+        .call(definition_request(6, class_const_uri, 6, 21))
         .await
         .unwrap();
     let cc_result = extract_result(cc_resp);
@@ -6026,7 +6081,7 @@ class Foo {
         "class constant usage should go to class const declaration line"
     );
 
-    // 4) Static property usages: self::$created, static::$var, User::$var
+    // 5) Static property usages: self::$created, static::$var, User::$var
     let static_prop_code = r#"<?php
 namespace App;
 
@@ -6058,7 +6113,7 @@ class Demo {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(5, static_prop_uri, 12, 21))
+        .call(definition_request(7, static_prop_uri, 12, 21))
         .await
         .unwrap();
     let self_prop_result = extract_result(self_prop_resp);
@@ -6077,7 +6132,7 @@ class Demo {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(6, static_prop_uri, 13, 23))
+        .call(definition_request(8, static_prop_uri, 13, 23))
         .await
         .unwrap();
     let static_prop_result = extract_result(static_prop_resp);
@@ -6096,7 +6151,7 @@ class Demo {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(7, static_prop_uri, 14, 20))
+        .call(definition_request(9, static_prop_uri, 14, 20))
         .await
         .unwrap();
     let user_prop_result = extract_result(user_prop_resp);

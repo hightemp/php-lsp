@@ -192,22 +192,34 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Uncomment when you have a VS Code Marketplace publisher token
-  # publish:
-  #   name: Publish to Marketplace
-  #   needs: package-vsix
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Download VSIX
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: vsix-universal
-  #         path: vsix/
-  #
-  #     - name: Install vsce
-  #       run: npm install -g @vscode/vsce
-  #
-  #     - name: Publish
-  #       run: vsce publish --packagePath vsix/php-lsp.vsix
-  #       env:
-  #         VSCE_PAT: ${{ secrets.VSCE_PAT }}
+  publish-marketplace:
+    name: Publish to VS Marketplace
+    needs: package-vsix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download VSIX
+        uses: actions/download-artifact@v4
+        with:
+          name: vsix-universal
+          path: vsix/
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check Marketplace token
+        run: |
+          if [ -z "$VSCE_PAT" ]; then
+            echo "::error::Missing VSCE_PAT secret for VS Marketplace publishing"
+            exit 1
+          fi
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      - name: Install vsce
+        run: npm install -g @vscode/vsce
+
+      - name: Publish VSIX to Marketplace
+        run: vsce publish --packagePath vsix/php-lsp.vsix
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}

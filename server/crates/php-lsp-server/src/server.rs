@@ -6494,19 +6494,22 @@ fn current_class_fqn_at_range(
     file_symbols: &php_lsp_types::FileSymbols,
     range: (u32, u32, u32, u32),
 ) -> Option<String> {
-    file_symbols
-        .symbols
-        .iter()
-        .find(|sym| {
-            matches!(
-                sym.kind,
-                php_lsp_types::PhpSymbolKind::Class
-                    | php_lsp_types::PhpSymbolKind::Interface
-                    | php_lsp_types::PhpSymbolKind::Trait
-                    | php_lsp_types::PhpSymbolKind::Enum
-            ) && byte_range_contains(sym.range, range)
-        })
-        .map(|sym| sym.fqn.clone())
+    current_class_symbol_at_range(file_symbols, range).map(|sym| sym.fqn.clone())
+}
+
+fn current_class_symbol_at_range(
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&php_lsp_types::SymbolInfo> {
+    file_symbols.symbols.iter().find(|sym| {
+        matches!(
+            sym.kind,
+            php_lsp_types::PhpSymbolKind::Class
+                | php_lsp_types::PhpSymbolKind::Interface
+                | php_lsp_types::PhpSymbolKind::Trait
+                | php_lsp_types::PhpSymbolKind::Enum
+        ) && byte_range_contains(sym.range, range)
+    })
 }
 
 fn class_can_access_protected_member(
@@ -11190,7 +11193,7 @@ impl LanguageServer for PhpLspBackend {
         tracing::debug!("gotoDefinition: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position inside a block so DashMap guard is dropped
-        let (sym_at_pos, local_var_def) = {
+        let (sym_at_pos, local_var_def, this_class_def) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -11226,8 +11229,30 @@ impl LanguageServer for PhpLspBackend {
                 &file_symbols,
                 Some(&resolver),
             );
-            (sym, local_var_def)
+            let this_class_def = sym.as_ref().and_then(|sym| {
+                if sym.ref_kind == RefKind::Variable && sym.name == "$this" {
+                    current_class_symbol_at_range(
+                        &file_symbols,
+                        (pos.line, byte_col, pos.line, byte_col),
+                    )
+                    .map(|class_sym| (class_sym.uri.clone(), class_sym.selection_range))
+                } else {
+                    None
+                }
+            });
+            (sym, local_var_def, this_class_def)
         };
+
+        if let Some((target_uri, def)) = this_class_def {
+            let range = Range {
+                start: Position::new(def.0, def.1),
+                end: Position::new(def.2, def.3),
+            };
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                uri: target_uri.parse::<Uri>().unwrap_or_else(|_| uri.clone()),
+                range,
+            })));
+        }
 
         // Local variable definition (same file/scope).
         if let Some(def) = local_var_def {
