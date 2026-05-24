@@ -161,7 +161,9 @@ jobs:
         run: vsce package -o ../ht-php-lsp.vsix
 
       - name: Show VSIX contents
-        run: unzip -l ht-php-lsp.vsix | head -30
+        run: |
+          unzip -l ht-php-lsp.vsix | head -30
+          unzip -l ht-php-lsp.vsix extension/readme.md
 
       - name: Upload VSIX
         uses: actions/upload-artifact@v4

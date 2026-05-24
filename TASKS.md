@@ -1067,3 +1067,6 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-24** Переименовать VS Code extension package `name` в `ht-php-lsp` для Marketplace publish.
 - [x] **T-2026-05-24** Бампнуть release version до `0.5.4` для публикации обновленного Marketplace package.
 - [x] **T-2026-05-24** Исправить completion и go-to-definition для переменных, объявленных output-аргументом `preg_match` (`$matches` в Symfony `DateValidator.php`).
+- [x] **T-2026-05-24** Разобраться и исправить отсутствие `README.md` в опубликованном VS Code extension package.
+- [x] **T-2026-05-24** Добавить в `README.md` badge с поддерживаемыми версиями PHP.
+- [x] **T-2026-05-24** Бампнуть версию до `0.5.5` и подготовить релиз с README в VSIX.

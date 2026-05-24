@@ -9,6 +9,7 @@ client/node_modules/
 client/out/
 client/bin/
 client/stubs/
+client/README.md
 client/*.vsix
 client/.vscode-test/
 *.vsix
