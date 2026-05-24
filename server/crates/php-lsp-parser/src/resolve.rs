@@ -7,6 +7,7 @@
 use crate::phpdoc::parse_phpdoc;
 use php_lsp_types::{FileSymbols, TypeInfo, UseKind};
 use std::cell::Cell;
+use std::collections::HashSet;
 use tree_sitter::{Node, Point, Tree};
 
 const MAX_OBJECT_TYPE_RESOLVE_DEPTH: usize = 64;
@@ -155,6 +156,31 @@ pub fn variable_definition_at_position(
     find_variable_definition_before(scope, &var_name, usage_start, source, &mut best);
 
     best.map(|(_, range)| range)
+}
+
+/// Collect local variables declared before a position in the current scope.
+///
+/// This supports the same declaration forms as local goto-definition, including
+/// by-reference output arguments such as `preg_match(..., $matches)`.
+pub fn local_variable_names_at_position(
+    tree: &Tree,
+    source: &str,
+    line: u32,
+    character: u32,
+) -> Vec<String> {
+    let root = tree.root_node();
+    let point = Point::new(line as usize, character as usize);
+    let node = find_node_at_point(root, point).unwrap_or(root);
+    let usage_start = position_to_byte(source, line, character);
+    let scope = find_enclosing_function(node).unwrap_or(root);
+
+    let mut vars = Vec::new();
+    collect_variable_declarations_before(scope, usage_start, source, &mut vars);
+
+    let mut seen = HashSet::new();
+    vars.into_iter()
+        .filter_map(|(_, name)| seen.insert(name.clone()).then_some(name))
+        .collect()
 }
 
 /// Infer variable type by name before a given position.
@@ -2290,6 +2316,14 @@ fn find_variable_definition_before(
     }
 
     match node.kind() {
+        "variable_name" if is_by_ref_output_argument_variable(node, source) => {
+            if normalize_var_name(&source[node.byte_range()]) == var_name {
+                let start = node.start_byte();
+                if start < usage_start {
+                    *best = Some((start, node_range(node)));
+                }
+            }
+        }
         "simple_parameter" | "property_promotion_parameter" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 if normalize_var_name(&source[name_node.byte_range()]) == var_name {
@@ -2341,6 +2375,165 @@ fn find_variable_definition_before(
     for child in node.named_children(cursor) {
         find_variable_definition_before(child, var_name, usage_start, source, best);
     }
+}
+
+fn collect_variable_declarations_before(
+    node: Node,
+    usage_start: usize,
+    source: &str,
+    vars: &mut Vec<(usize, String)>,
+) {
+    if node.start_byte() >= usage_start {
+        return;
+    }
+
+    match node.kind() {
+        "variable_name" if is_by_ref_output_argument_variable(node, source) => {
+            collect_variable_node(node, usage_start, source, vars);
+        }
+        "simple_parameter" | "property_promotion_parameter" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                collect_variable_node(name_node, usage_start, source, vars);
+            }
+        }
+        "assignment_expression" | "by_ref_assignment_expression" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_variable_node(left, usage_start, source, vars);
+            }
+        }
+        "foreach_statement" => {
+            for field in ["key", "value"] {
+                if let Some(var_node) = node.child_by_field_name(field) {
+                    collect_variable_node(var_node, usage_start, source, vars);
+                }
+            }
+        }
+        "catch_clause" => {
+            for field in ["name", "variable"] {
+                if let Some(var_node) = node.child_by_field_name(field) {
+                    collect_variable_node(var_node, usage_start, source, vars);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.named_children(cursor) {
+        collect_variable_declarations_before(child, usage_start, source, vars);
+    }
+}
+
+fn collect_variable_node(
+    node: Node,
+    usage_start: usize,
+    source: &str,
+    vars: &mut Vec<(usize, String)>,
+) {
+    if node.start_byte() >= usage_start {
+        return;
+    }
+    let text = &source[node.byte_range()];
+    if !text.trim_start().starts_with('$') {
+        return;
+    }
+    vars.push((node.start_byte(), normalize_var_name(text)));
+}
+
+fn is_by_ref_output_argument_variable(node: Node, source: &str) -> bool {
+    let Some(argument) = ancestor_before_scope(node, "argument") else {
+        return false;
+    };
+    let Some(arguments) = argument
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")
+    else {
+        return false;
+    };
+    let Some(call) = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "function_call_expression")
+    else {
+        return false;
+    };
+    let Some(function_node) = call
+        .child_by_field_name("function")
+        .or_else(|| call.named_child(0))
+    else {
+        return false;
+    };
+
+    let function_name = source[function_node.byte_range()]
+        .trim()
+        .trim_start_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if !matches!(function_name.as_str(), "preg_match" | "preg_match_all") {
+        return false;
+    }
+
+    argument_name(argument, source).is_some_and(|name| name == "matches")
+        || argument_index(arguments, argument).is_some_and(|index| index == 2)
+}
+
+fn ancestor_before_scope<'tree>(node: Node<'tree>, ancestor_kind: &str) -> Option<Node<'tree>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == ancestor_kind {
+            return Some(parent);
+        }
+        if matches!(
+            parent.kind(),
+            "method_declaration"
+                | "function_definition"
+                | "anonymous_function"
+                | "anonymous_function_creation_expression"
+                | "program"
+        ) {
+            return None;
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn argument_index(arguments: Node, argument: Node) -> Option<usize> {
+    let mut cursor = arguments.walk();
+    let index = arguments
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+        .position(|child| child.id() == argument.id());
+    index
+}
+
+fn argument_name(argument: Node, source: &str) -> Option<String> {
+    if let Some(name_node) = argument.child_by_field_name("name") {
+        return Some(normalize_argument_name(&source[name_node.byte_range()]));
+    }
+
+    let text = &source[argument.byte_range()];
+    let colon_index = text.find(':')?;
+    let value_start = argument
+        .child_by_field_name("value")
+        .or_else(|| {
+            let mut cursor = argument.walk();
+            argument.named_children(&mut cursor).last()
+        })
+        .map(|value| value.start_byte().saturating_sub(argument.start_byte()))
+        .unwrap_or(text.len());
+
+    (colon_index < value_start).then(|| normalize_argument_name(&text[..colon_index]))
+}
+
+fn normalize_argument_name(name: &str) -> String {
+    name.trim()
+        .trim_start_matches('$')
+        .trim_end_matches(':')
+        .trim()
+        .to_string()
 }
 
 fn normalize_var_name(text: &str) -> String {
@@ -2481,6 +2674,13 @@ mod tests {
         parser.parse_full(code);
         let tree = parser.tree().unwrap();
         variable_definition_at_position(tree, code, line, col)
+    }
+
+    fn parse_and_local_variable_names(code: &str, line: u32, col: u32) -> Vec<String> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        local_variable_names_at_position(tree, code, line, col)
     }
 
     fn parse_and_infer_var_type_at(
@@ -3184,6 +3384,43 @@ class Holder {
             parse_and_find_var_def(code, 2, 10).expect("parameter definition should be found");
         // points to parameter line
         assert_eq!(def.0, 1);
+    }
+
+    #[test]
+    fn test_find_variable_definition_preg_match_output_argument() {
+        let code = r#"<?php
+function demo(string $value): void {
+    if (!preg_match('/(?P<year>\d+)/', $value, $matches)) {
+        return;
+    }
+    echo $matches['year'];
+}
+"#;
+        let (line, col) = find_line_col(code, "$matches['year']");
+        let def = parse_and_find_var_def(code, line, col + 2)
+            .expect("preg_match output variable definition should be found");
+        let (def_line, def_col) = find_line_col(code, "$matches))");
+        assert_eq!(def.0, def_line);
+        assert_eq!(def.1, def_col);
+    }
+
+    #[test]
+    fn test_local_variable_names_include_preg_match_output_argument() {
+        let code = r#"<?php
+function demo(string $value): void {
+    if (!preg_match('/(?P<year>\d+)/', $value, $matches)) {
+        return;
+    }
+    $mat
+}
+"#;
+        let (line, col) = find_line_col(code, "$mat");
+        let names = parse_and_local_variable_names(code, line, col + "$mat".len() as u32);
+        assert!(
+            names.iter().any(|name| name == "$matches"),
+            "expected $matches in local variable names, got: {:?}",
+            names
+        );
     }
 
     #[test]

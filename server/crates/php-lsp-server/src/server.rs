@@ -16,9 +16,9 @@ use php_lsp_parser::references::{
 };
 use php_lsp_parser::resolve::{
     infer_property_type_from_assignments, infer_variable_type_at_position,
-    infer_variable_type_at_position_with_resolver, resolve_class_name_pub, symbol_at_position,
-    symbol_at_position_with_resolver, variable_definition_at_position,
-    variable_hover_info_at_position, RefKind, SymbolAtPosition,
+    infer_variable_type_at_position_with_resolver, local_variable_names_at_position,
+    resolve_class_name_pub, symbol_at_position, symbol_at_position_with_resolver,
+    variable_definition_at_position, variable_hover_info_at_position, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
     find_missing_return_type_candidates, MissingReturnTypeCandidate,
@@ -8150,6 +8150,39 @@ fn byte_offset_to_line_col(source: &str, byte_offset: usize) -> (u32, u32) {
     (line, byte_offset.saturating_sub(line_start) as u32)
 }
 
+fn add_local_variable_completion_items(
+    items: &mut Vec<lsp_types::CompletionItem>,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    line: u32,
+    byte_col: u32,
+    prefix: &str,
+) {
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut seen: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
+
+    for var_name in local_variable_names_at_position(tree, source, line, byte_col) {
+        let name_without_dollar = var_name.trim_start_matches('$');
+        if !name_without_dollar
+            .to_ascii_lowercase()
+            .starts_with(&prefix_lower)
+        {
+            continue;
+        }
+        if !seen.insert(var_name.clone()) {
+            continue;
+        }
+
+        items.push(lsp_types::CompletionItem {
+            label: var_name.clone(),
+            kind: Some(lsp_types::CompletionItemKind::VARIABLE),
+            sort_text: Some(format!("0102_{}", name_without_dollar.to_ascii_lowercase())),
+            filter_text: Some(format!("{} {}", var_name, name_without_dollar)),
+            ..Default::default()
+        });
+    }
+}
+
 fn infer_new_expression_type(
     expr: &str,
     file_symbols: &php_lsp_types::FileSymbols,
@@ -12964,7 +12997,17 @@ impl LanguageServer for PhpLspBackend {
         }
 
         // Get completion items from the provider
-        let lsp_items = provide_completions(&context, &self.index, &file_symbols);
+        let mut lsp_items = provide_completions(&context, &self.index, &file_symbols);
+        if let php_lsp_completion::context::CompletionContext::Variable { prefix } = &context {
+            add_local_variable_completion_items(
+                &mut lsp_items,
+                &tree,
+                &source,
+                pos.line,
+                byte_col,
+                prefix,
+            );
+        }
 
         let enable_auto_imports = matches!(
             context,

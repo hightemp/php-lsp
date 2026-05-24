@@ -5951,7 +5951,96 @@ function demo(): void {
         "variable usage should go to assignment line"
     );
 
-    // 2) $this usage -> containing class declaration
+    // 2) preg_match output variable -> completion and definition at output argument
+    let preg_code_with_marker = r#"<?php
+function demo(string $value): void {
+    if (!preg_match('/(?P<year>\d+)/', $value, $matches)) {
+        return;
+    }
+    $mat/*caret*/;
+    echo $matches['year'];
+}
+"#;
+    let marker = "/*caret*/";
+    let marker_offset = preg_code_with_marker
+        .find(marker)
+        .expect("test code should contain caret marker");
+    let preg_code = preg_code_with_marker.replace(marker, "");
+    let marker_prefix = &preg_code[..marker_offset];
+    let completion_line = marker_prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let completion_line_start = marker_prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let completion_character = (marker_prefix.len() - completion_line_start) as u32;
+    let preg_uri = "file:///test/GotoPregMatchOutput.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(preg_uri, &preg_code))
+        .await
+        .unwrap();
+
+    let completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            3,
+            preg_uri,
+            completion_line,
+            completion_character,
+        ))
+        .await
+        .unwrap();
+    let completion_result = extract_result(completion_resp);
+    let completion_labels: Vec<String> = completion_items_from_result(&completion_result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        completion_labels.iter().any(|label| label == "$matches"),
+        "variable completion should include preg_match output variable, got: {:?}",
+        completion_labels
+    );
+
+    let output_offset = preg_code
+        .find("$matches))")
+        .expect("test code should contain preg_match output variable");
+    let usage_offset = preg_code
+        .find("$matches['year']")
+        .expect("test code should contain preg_match output variable usage")
+        + 2;
+    let usage_prefix = &preg_code[..usage_offset];
+    let usage_line = usage_prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let usage_line_start = usage_prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let usage_character = (usage_prefix.len() - usage_line_start) as u32;
+    let output_prefix = &preg_code[..output_offset];
+    let output_line = output_prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let output_line_start = output_prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let output_character = (output_prefix.len() - output_line_start) as u64;
+
+    let preg_def_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(4, preg_uri, usage_line, usage_character))
+        .await
+        .unwrap();
+    let preg_def_result = extract_result(preg_def_resp);
+    assert_eq!(
+        preg_def_result["range"]["start"]["line"].as_u64(),
+        Some(output_line as u64),
+        "preg_match output variable usage should go to output argument, got: {}",
+        preg_def_result
+    );
+    assert_eq!(
+        preg_def_result["range"]["start"]["character"].as_u64(),
+        Some(output_character),
+        "preg_match output variable usage should point at output argument variable, got: {}",
+        preg_def_result
+    );
+
+    // 3) $this usage -> containing class declaration
     let this_code = r#"<?php
 namespace App;
 
@@ -5972,8 +6061,8 @@ class Demo {
         .unwrap();
 
     for (id, line, character, label) in [
-        (3, 5, 10, "standalone $this"),
-        (4, 6, 10, "$this in member access"),
+        (5, 5, 10, "standalone $this"),
+        (6, 6, 10, "$this in member access"),
     ] {
         let this_resp = service
             .ready()
@@ -6006,7 +6095,7 @@ class Demo {
         );
     }
 
-    // 3) Global const usage -> const declaration
+    // 4) Global const usage -> const declaration
     let const_code = r#"<?php
 namespace App;
 
@@ -6027,7 +6116,7 @@ echo BUILD;
         .ready()
         .await
         .unwrap()
-        .call(definition_request(5, const_uri, 5, 5))
+        .call(definition_request(7, const_uri, 5, 5))
         .await
         .unwrap();
     let build_result = extract_result(build_resp);
@@ -6042,7 +6131,7 @@ echo BUILD;
         "constant usage should go to const declaration line"
     );
 
-    // 4) self::CLASS_CONST usage -> class const declaration
+    // 5) self::CLASS_CONST usage -> class const declaration
     let class_const_code = r#"<?php
 namespace App;
 
@@ -6066,7 +6155,7 @@ class Foo {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(6, class_const_uri, 6, 21))
+        .call(definition_request(8, class_const_uri, 6, 21))
         .await
         .unwrap();
     let cc_result = extract_result(cc_resp);
@@ -6081,7 +6170,7 @@ class Foo {
         "class constant usage should go to class const declaration line"
     );
 
-    // 5) Static property usages: self::$created, static::$var, User::$var
+    // 6) Static property usages: self::$created, static::$var, User::$var
     let static_prop_code = r#"<?php
 namespace App;
 
@@ -6113,7 +6202,7 @@ class Demo {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(7, static_prop_uri, 12, 21))
+        .call(definition_request(9, static_prop_uri, 12, 21))
         .await
         .unwrap();
     let self_prop_result = extract_result(self_prop_resp);
@@ -6132,7 +6221,7 @@ class Demo {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(8, static_prop_uri, 13, 23))
+        .call(definition_request(10, static_prop_uri, 13, 23))
         .await
         .unwrap();
     let static_prop_result = extract_result(static_prop_resp);
@@ -6151,7 +6240,7 @@ class Demo {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(9, static_prop_uri, 14, 20))
+        .call(definition_request(11, static_prop_uri, 14, 20))
         .await
         .unwrap();
     let user_prop_result = extract_result(user_prop_resp);
