@@ -1063,3 +1063,6 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-24** Разобраться, почему go-to-definition не работает для `$this`.
 - [x] **T-2026-05-24** Исправить VS Marketplace badge в README под текущий `publisher`/`name` из `client/package.json`.
 - [x] **T-2026-05-24** Добавить публикацию VS Code extension в Marketplace в release workflow.
+- [x] **T-2026-05-24** Исправить CI clippy failure `clippy::question_mark` в completion member-chain inference.
+- [x] **T-2026-05-24** Переименовать VS Code extension package `name` в `ht-php-lsp` для Marketplace publish.
+- [x] **T-2026-05-24** Бампнуть release version до `0.5.4` для публикации обновленного Marketplace package.

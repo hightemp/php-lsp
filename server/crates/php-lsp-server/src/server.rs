@@ -1453,10 +1453,8 @@ impl PhpLspBackend {
                 byte_col,
                 base_expr,
             )?
-        } else if let Some(class_fqn) = infer_new_expression_type(base_expr, file_symbols) {
-            class_fqn
         } else {
-            return None;
+            infer_new_expression_type(base_expr, file_symbols)?
         };
 
         for raw_member in parts {
