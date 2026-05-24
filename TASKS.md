@@ -1070,3 +1070,4 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-24** Разобраться и исправить отсутствие `README.md` в опубликованном VS Code extension package.
 - [x] **T-2026-05-24** Добавить в `README.md` badge с поддерживаемыми версиями PHP.
 - [x] **T-2026-05-24** Бампнуть версию до `0.5.5` и подготовить релиз с README в VSIX.
+- [x] **T-2026-05-24** Исправить Marketplace badges в `README.md`, которые показывают `retired badge`.
