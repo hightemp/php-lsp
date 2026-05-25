@@ -1589,7 +1589,12 @@ fn infer_variable_in_scope(
                                 inferred.type_display =
                                     Some(source[type_node.byte_range()].trim().to_string());
                                 if let Some(class_name) = extract_type_name(type_node, source) {
-                                    let resolved = resolve_class_name(&class_name, file_symbols);
+                                    let resolved = resolve_type_name_in_context(
+                                        &class_name,
+                                        param,
+                                        source,
+                                        file_symbols,
+                                    );
                                     inferred.resolved_type_fqn = Some(resolved.clone());
                                     inferred.type_info = Some(TypeInfo::Simple(resolved));
                                 }
@@ -2644,6 +2649,21 @@ fn resolve_scope_class_name(
     }
 }
 
+fn resolve_type_name_in_context(
+    type_name: &str,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> String {
+    match type_name.trim_start_matches('\\') {
+        "self" | "static" => find_parent_class_fqn(context_node, source, file_symbols)
+            .unwrap_or_else(|| type_name.to_string()),
+        "parent" => find_extended_parent_class_fqn(context_node, source, file_symbols)
+            .unwrap_or_else(|| type_name.to_string()),
+        _ => resolve_class_name(type_name, file_symbols),
+    }
+}
+
 fn node_range(node: Node) -> (u32, u32, u32, u32) {
     let start = node.start_position();
     let end = node.end_position();
@@ -3123,6 +3143,35 @@ class Demo {
         assert_eq!(sym.name, "name");
         assert_eq!(sym.fqn, "App\\Test\\Baz::$name");
         assert_eq!(sym.ref_kind, RefKind::PropertyAccess);
+    }
+
+    #[test]
+    fn test_resolve_property_access_on_self_typed_parameter() {
+        let code = r#"<?php
+namespace App;
+
+final class PromotedSelfDefaults {
+    public function __construct(
+        public ?string $objectManager = null,
+        public ?array $mapping = null,
+    ) {}
+
+    public function withDefaults(self $defaults): static {
+        $clone = clone $this;
+        $clone->objectManager ??= $defaults->objectManager;
+        $clone->mapping ??= $defaults->mapping ?? [];
+        return $clone;
+    }
+}
+"#;
+
+        let (line, col) = find_line_col(code, "$defaults->objectManager");
+        let result = parse_and_resolve(code, line, col + "$defaults->".len() as u32)
+            .expect("self typed parameter property access should resolve");
+
+        assert_eq!(result.name, "objectManager");
+        assert_eq!(result.fqn, "App\\PromotedSelfDefaults::$objectManager");
+        assert_eq!(result.ref_kind, RefKind::PropertyAccess);
     }
 
     #[test]

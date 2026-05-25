@@ -14017,6 +14017,65 @@ final class DashboardController extends AbstractController
     }
 
     #[test]
+    fn test_compute_diagnostics_allows_promoted_properties_on_self_typed_parameter() {
+        let uri = "file:///promoted-self-defaults.php";
+        let code = r#"<?php
+namespace App\Diagnostics;
+
+final class PromotedSelfDefaults
+{
+    public function __construct(
+        public ?string $objectManager = null,
+        public ?array $mapping = null,
+    ) {
+    }
+
+    public function withDefaults(self $defaults): static
+    {
+        $clone = clone $this;
+        $clone->objectManager ??= $defaults->objectManager;
+        $clone->mapping ??= $defaults->mapping ?? [];
+
+        return $clone;
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Unknown property: App\\Diagnostics\\PromotedSelfDefaults::$objectManager",
+            "Unknown property: App\\Diagnostics\\PromotedSelfDefaults::$mapping",
+            "Unknown property: self::$objectManager",
+            "Unknown property: self::$mapping",
+        ] {
+            assert!(
+                !messages.contains(&unexpected),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
+                messages
+            );
+        }
+    }
+
+    #[test]
     fn test_compute_diagnostics_applies_category_severity_controls() {
         let uri = "file:///severity-controls.php";
         let code = r#"<?php
