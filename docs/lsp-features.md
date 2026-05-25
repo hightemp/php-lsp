@@ -44,6 +44,7 @@ tools.
 | `textDocument/documentHighlight` | Supported | Local variables and non-local symbols in the current document. |
 | `textDocument/selectionRange` | Supported | AST-based selection expansion. |
 | `textDocument/linkedEditingRange` | Partial | Namespace/use alias ranges only. |
+| `textDocument/documentLink` | Supported | Static `include`, `include_once`, `require`, and `require_once` paths resolve to existing local files. |
 
 ## Symbols And Hierarchies
 

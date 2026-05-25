@@ -1197,6 +1197,355 @@ PR-052 ─→ PR-053
 
 ---
 
+## Milestone: IDE Intelligence & Tooling Expansion (5 недель)
+
+**Срок:** после закрытия `PV-014`, ориентир 2026-06-08 → 2026-07-12
+
+**Цель:** после GA-стабилизации расширить сервер от "production-ready PHP LSP" к более сильному IDE-инструменту: больше практичных code actions, CLI/tooling режимы, проектная конфигурация, более глубокая типизация PHPDoc/PHPStan/Psalm и framework-aware интеллект без ухудшения latency/false-positive baseline.
+
+### Scope rules
+
+- Не начинать этот milestone до финального acceptance `PV-014`, если задача не является маленькой независимой UX-фичей.
+- Не добавлять project-specific hardcode. Любая framework-aware логика должна быть оформлена как общий provider/adapter слой с тестовыми фикстурами.
+- Все новые дорогие операции должны иметь cancellation/debounce или lazy resolve.
+- Все новые публичные claims должны попадать в docs на английском: `README.md`, `docs/lsp-features.md`, `docs/architecture.md`, `docs/performance.md`.
+- Для каждой фичи: unit/e2e tests, regression fixture, `cargo fmt --all --check`, targeted tests, затем `cargo test --all` и `cargo clippy --all-targets -- -D warnings`.
+- После изменений клиента: `npm run lint`, `npm run build`, VSIX smoke если затронута упаковка/activation/lifecycle.
+
+### Exit criteria
+
+- `textDocument/documentLink` поддержан для `include`, `include_once`, `require`, `require_once`.
+- `codeAction/resolve` внедрен для тяжелых code actions; обычный `textDocument/codeAction` остается быстрым на больших файлах.
+- Есть минимум 8 новых production-useful code actions с тестами и documented behavior.
+- Есть проектная конфигурация `.php-lsp.toml` с JSON schema и командой инициализации.
+- Есть CLI `analyze` для batch diagnostics с table/json/github output и корректными exit codes.
+- Type engine умеет template params, template bindings, type aliases, conditional return types и shape-aware completion минимум в best-effort режиме.
+- Framework-aware слой реализован без bootstrapping приложения и без чтения базы данных.
+- Laravel/Eloquent-like patterns покрыты фикстурами: relations, scopes, casts, accessors, builders, magic properties/methods.
+- Blade-like templates либо поддержаны через virtual PHP + source map, либо явно оставлены как отдельный follow-up с documented limitation.
+- На large workspaces из `PV-*` warm p95 `hover/completion/definition` остается `< 50ms`, а heavy/codeAction latency не блокирует быстрые запросы.
+
+### Неделя 1: low-risk UX, protocol polish, конфигурация (2026-06-08 → 2026-06-14)
+
+- [x] **IE-001** Добавить `textDocument/documentLink` для PHP include/require paths *(completed 2026-05-25)*
+  - Реализовать capability `document_link_provider`.
+  - AST-based найти `include`, `include_once`, `require`, `require_once`.
+  - Поддержать только безопасные статические пути: string literal, `__DIR__ . '/file.php'`, `dirname(__FILE__) . '/file.php'` best-effort.
+  - Резолвить относительно текущего файла и workspace root; не выполнять PHP-код.
+  - Возвращать `DocumentLink` только если target exists.
+  - Добавить e2e: valid include, missing include ignored, nested include inside function/class method.
+  - Обновить `docs/lsp-features.md` на английском.
+  - Implemented: server advertises `documentLinkProvider` without resolve; handler works for open and unopened PHP files.
+  - Implemented: static path resolver supports string literals, concatenation, `__DIR__`, `__FILE__`, and `dirname(__FILE__)`.
+  - Regression: e2e covers existing `require`, `include_once`, nested `require_once`, and ignored missing include path.
+  - Docs: README feature list and `docs/lsp-features.md` updated in English.
+  - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-server`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, docs Cyrillic check for `docs/ README.md`, `git diff --check`.
+
+- [ ] **IE-002** Добавить команды версии и server diagnostics в VS Code client
+  - Команда `PHP: Show Language Server Version`.
+  - Показывать `server_info.version`, resolved binary path, platform target, stubs path, cache root.
+  - Добавить пункт в status quick pick.
+  - Если сервер не стартовал, команда должна показывать last known binary resolution error.
+  - Client tests или lightweight script validation для command registration.
+  - Обновить README commands table на английском.
+
+- [ ] **IE-003** Укрепить VS Code lifecycle и binary resolution
+  - При restart/clear-cache использовать serialized lifecycle queue, чтобы две команды не стартовали два сервера параллельно.
+  - `stopLanguageClient()` должен иметь timeout и fallback kill для зависшего процесса, где доступен process handle.
+  - Добавить PATH fallback: если bundled binary отсутствует и `phpLsp.serverPath` пустой, попробовать `php-lsp` из `PATH`, но явно логировать источник binary.
+  - Не включать network auto-download в этот task.
+  - Добавить output logs: start source, stop reason, restart reason, binary path.
+  - Validation: `npm run lint`, `npm run build`, manual activation smoke.
+
+- [ ] **IE-004** Добавить проектную конфигурацию `.php-lsp.toml`
+  - Новый server config loader: project config рядом с `composer.json`, затем global config, затем VS Code/init options.
+  - Определить precedence: VS Code settings override project config для editor-only настроек; project config задает shared tooling defaults.
+  - Минимальные секции:
+    - `[php] version`
+    - `[diagnostics]` category toggles/severity
+    - `[indexing] include/exclude/vendor/stubs`
+    - `[formatting] provider/command/timeout`
+    - `[phpstan] command/timeout/memory_limit`
+    - `[psalm] command/timeout`
+  - Добавить `config-schema.json` для TOML/JSON-schema compatible tooling.
+  - Добавить server command/CLI `init-config`, который создает дефолтный `.php-lsp.toml` без перезаписи существующего.
+  - Runtime reload: watched changes `.php-lsp.toml` должны применять config как `didChangeConfiguration`.
+  - Обновить architecture/config docs на английском.
+
+- [ ] **IE-005** Внедрить `codeAction/resolve` infrastructure
+  - Advertise `code_action_provider.resolve_provider = true`.
+  - Создать typed `CodeActionData` с `action_kind`, `uri`, `range`, `document_version`, `extra`.
+  - Existing cheap actions могут оставаться eagerly computed.
+  - Heavy actions должны возвращать lightweight action без `edit`; edit вычисляется в `codeAction/resolve`.
+  - Добавить stale guard: если document version изменилась, resolve возвращает no-op или пересчитывает action на актуальном тексте.
+  - Добавить e2e: unresolved class quickfix still works, heavy mock action resolves edit lazily, stale version guarded.
+
+### Неделя 2: production-useful code actions (2026-06-15 → 2026-06-21)
+
+- [ ] **IE-010** Code action: implement missing interface/abstract methods
+  - Определить cursor context: concrete class body или class declaration.
+  - Найти все abstract/interface methods из parents/interfaces/traits, которых нет в классе.
+  - Сгенерировать method stubs с visibility, static, return type, params, by-ref/variadic/defaults.
+  - Для unknown parameter default expression использовать safe placeholder или omit только если PHP позволяет.
+  - Не генерировать duplicate methods.
+  - Покрыть interface, abstract class, multiple interfaces, inherited already implemented method.
+
+- [ ] **IE-011** Code actions: generate constructor, getters, setters
+  - Generate constructor для non-static properties без existing `__construct`.
+  - Учитывать readonly/promoted properties и nullable/default values.
+  - Generate getter/setter для property under cursor.
+  - Bool property getter должен предлагать `isX()` и/или `getX()` по naming heuristic.
+  - Static property генерирует static accessor methods.
+  - Readonly property не получает setter.
+  - Tests: class indentation, existing methods, private/protected/public, typed/untyped property.
+
+- [ ] **IE-012** Code actions: change visibility и promote constructor parameter
+  - Change visibility для method/property/class constant/promoted property.
+  - Предлагать только альтернативные visibility и сохранять modifiers order.
+  - Promote constructor parameter:
+    - найти property declaration
+    - найти assignment `$this->prop = $param`
+    - заменить constructor parameter на promoted property
+    - удалить property declaration и assignment безопасно
+  - Guard: не предлагать при complex assignment, multiple assignments, attributes/comments that cannot be moved safely.
+  - Tests на простые и отказные сценарии.
+
+- [ ] **IE-013** Code action: update PHPDoc from signature
+  - Синхронизировать `@param` с actual params: add missing, remove stale, reorder.
+  - Синхронизировать `@return`: add/update/remove redundant `void`.
+  - Сохранять summary и unrelated tags.
+  - Не удалять `@template`, `@throws`, `@deprecated`, `@property`, `@method`.
+  - Учитывать promoted params, variadic, by-ref, nullable/union/intersection/generic display.
+  - Tests на create new docblock и patch existing docblock.
+
+- [ ] **IE-014** Refactor actions: extract variable, extract constant, inline variable
+  - Использовать `codeAction/resolve`, потому что selection analysis может быть дорогим.
+  - Extract variable:
+    - selection expression only
+    - insert assignment before statement
+    - replace selected expression with `$extracted`
+  - Extract constant:
+    - class scope only
+    - literals only на первом этапе
+    - insert `private const EXTRACTED = ...;`
+  - Inline variable:
+    - local variable with single assignment and safe usage count
+    - не инлайнить across branches/closures.
+  - Добавить prepare/refusal reasons в action title/detail где LSP позволяет.
+
+- [ ] **IE-015** Code actions для diagnostics и external analyzer findings
+  - Remove unused import как explicit quickfix рядом с diagnostic.
+  - Bulk "Remove all unused imports" через existing organize imports engine.
+  - Replace deprecated call, если diagnostic содержит replacement metadata из attribute/PHPDoc/stub metadata.
+  - Для PHPStan/Psalm diagnostics добавить extensible mapping:
+    - ignore diagnostic locally
+    - add missing `@throws`
+    - add iterable value type in PHPDoc
+    - fix obvious prefixed class name.
+  - Любой analyzer quickfix должен быть opt-in и покрыт фикстурой с synthetic diagnostic.
+
+### Неделя 3: CLI/tooling режимы и formatter strategy (2026-06-22 → 2026-06-28)
+
+- [ ] **IE-020** Добавить CLI `analyze`
+  - Running binary without subcommand сохраняет LSP stdio behavior.
+  - `php-lsp analyze [PATH] --project-root <DIR> --severity <all|hint|info|warning|error> --format <table|json|github>`.
+  - Использовать тот же parser/index/diagnostics pipeline, что и LSP.
+  - Exit codes:
+    - `0` no diagnostics at requested severity
+    - `1` execution/config error
+    - `2` diagnostics found
+  - Output:
+    - table для локального запуска
+    - JSON stable schema для scripts
+    - GitHub workflow annotations для CI.
+  - Tests: command parsing, JSON output shape, exit code behavior на fixture.
+
+- [ ] **IE-021** Добавить CLI `fix --dry-run` для safe fixers
+  - Первый набор rules: unused imports, organize imports, add return type from PHPDoc where safe.
+  - `--dry-run` показывает changes без записи.
+  - `--rule <RULE>` можно указывать несколько раз.
+  - Без `--rule` запускать только preferred safe native fixers.
+  - Не запускать formatter проекта внутри fix command без отдельного explicit flag.
+  - Tests: idempotency, dry-run no write, JSON output.
+
+- [ ] **IE-022** Улучшить formatting strategy
+  - Добавить auto-detect project tools из Composer metadata:
+    - Laravel Pint
+    - php-cs-fixer
+    - phpcbf
+  - Precedence:
+    - explicit `phpLsp.formatting.*` / `.php-lsp.toml`
+    - project tool detected in `require-dev`
+    - current external provider fallback
+    - optional built-in formatter task отдельно, если выбран parser/formatter dependency.
+  - External tools должны иметь timeout и cancellation.
+  - Range formatting должен оставаться conservative: не форматировать весь файл неожиданно.
+  - Docs на английском: formatter resolution order и troubleshooting.
+
+- [ ] **IE-023** Оценить и при необходимости добавить built-in formatter fallback
+  - Research-only first step: выбрать реалистичный formatter backend или отказаться.
+  - Если добавляем dependency:
+    - измерить binary size impact
+    - проверить PHP 7.4-8.4 syntax coverage
+    - добавить `phpLsp.formatting.provider = "built-in"`
+  - Если не добавляем:
+    - закрыть task documented decision в `DECISIONS.md`
+    - README должен честно говорить, что native formatter не поставляется.
+  - Не смешивать с IE-022 auto-detect.
+
+- [ ] **IE-024** CI интеграция для CLI
+  - Добавить docs на английском: пример GitHub Actions `php-lsp analyze`.
+  - Добавить package smoke, что binary subcommands работают в release build.
+  - Не включать CLI analyze в текущий project CI как required gate до стабилизации false positives.
+  - Добавить scripts/examples для локального запуска на fixture и anonymized large workspace.
+
+### Неделя 4: deep type intelligence (2026-06-29 → 2026-07-05)
+
+- [ ] **IE-030** Template model для classes/functions/methods
+  - Расширить symbol model:
+    - class-level template params with bounds
+    - method/function-level template params
+    - template variance metadata best-effort
+    - template bindings from `@extends`, `@implements`, `@use`, `@mixin`
+  - Type parser должен распознавать `@template`, `@template-covariant`, `@template-contravariant`.
+  - Inheritance resolver должен подставлять generic args при lookup members.
+  - Tests: generic repository, collection item type, inherited generic method return.
+
+- [ ] **IE-031** Type aliases и imported aliases
+  - Поддержать `@phpstan-type`, `@psalm-type`, `@phpstan-import-type`, `@psalm-import-type`.
+  - Alias scope: class docblock, file-level docblock если поддерживается parserом.
+  - Aliases должны участвовать в hover/completion/typeDefinition best-effort.
+  - Guard cycles: detect recursive aliases и fallback to raw type without panic.
+  - Tests: alias to array shape, imported alias, recursive alias ignored.
+
+- [ ] **IE-032** Conditional return types и class-string templates
+  - Parse PHPStan/Psalm conditional return syntax: `($arg is Foo ? A : B)`.
+  - Resolve branch when call-site argument is:
+    - literal string/int/bool/null
+    - `ClassName::class`
+    - variable with known literal/class-string type.
+  - `class-string<T>` argument should bind `T` for return type.
+  - Fallback: unresolved condition returns union of branches.
+  - Tests: service locator `make(Foo::class): Foo`, conditional factory, fallback union.
+
+- [ ] **IE-033** Shape-aware completion and definition
+  - Array shape keys from PHPDoc/literal arrays should appear in `$arr['...']` completion.
+  - Object shape properties should appear in `$obj->...` where modeled.
+  - Go-to-definition for shape key should jump to PHPDoc/literal declaration where practical.
+  - Preserve nested shapes and optional keys best-effort.
+  - Tests: `array{foo: User, bar?: int}`, nested shape, list shape ignored for key completion.
+
+- [ ] **IE-034** Closure, foreach, and collection callback inference
+  - Infer closure/arrow-function params from callable parameter types.
+  - Infer foreach key/value from `iterable<TKey,TValue>`, `array<TKey,TValue>`, `Generator<TKey,TValue,...>`.
+  - Recognize common map/filter/reduce callback patterns through generic method signatures, not hardcoded project classes.
+  - Ensure closure scopes do not leak variables into outer scope.
+  - Tests: collection-like generic class fixture, array_map, foreach generator.
+
+- [ ] **IE-035** Per-request expression type cache
+  - Add request-local cache for expression/member type resolution.
+  - Key by URI, document version, byte range, expected context.
+  - Use only within one request or one diagnostics pass; do not persist until invalidation story is proven.
+  - Benchmark before/after on completion, diagnostics, references-heavy fixture.
+  - Must not change visible behavior except latency.
+
+### Неделя 5: framework-aware providers and template files (2026-07-06 → 2026-07-12)
+
+- [ ] **IE-040** Ввести `VirtualMemberProvider` / framework adapter архитектуру
+  - Общий trait/provider слой для synthetic methods/properties/string keys.
+  - Providers получают readonly context: workspace root, composer metadata, indexed symbols, file content when already open/available.
+  - Providers не должны bootstrapping приложение, подключать database или выполнять user code.
+  - Results должны иметь source ranges или synthetic metadata for hover/completion/definition.
+  - Cache/invalidation: per workspace config/composer fingerprint + watched relevant files.
+  - Tests: provider ordering, duplicate merge, cache invalidation.
+
+- [ ] **IE-041** Laravel/Eloquent-like model virtual properties
+  - Detect model classes structurally: inheritance/interface/known framework symbols from Composer, not hardcoded project paths.
+  - Sources:
+    - `@property*` PHPDoc
+    - `$casts` property and `casts()` method
+    - legacy accessors `getXAttribute()`
+    - modern accessors returning `Attribute<TGet,TSet>`
+    - `$fillable`, `$guarded`, `$hidden`, `$visible` as weak mixed fallback.
+  - Respect `__get`/`__set` and `reportMagicProperties`-like setting.
+  - Tests: casts, accessors, property docs, magic property diagnostics.
+
+- [ ] **IE-042** Laravel/Eloquent-like relations, scopes, builders
+  - Infer relationship methods returning relation generics and expose related model properties where safe.
+  - Add `*_count` virtual properties for known relationships.
+  - Local scopes: `scopeActive($query)` exposes `active()` on builder-like chains.
+  - Custom builder detection through return types/attributes/static factory methods where available.
+  - Support fluent `query()->where()->first()` style chains via generics, not one-off method names.
+  - Tests: belongs-to/has-many-like fixtures, local scope, custom builder, relation count.
+
+- [ ] **IE-043** Framework string-key intelligence
+  - Completion + definition for string keys where files are static and discoverable:
+    - config keys
+    - route names
+    - translation keys
+    - view/template names
+  - Do not execute project code.
+  - Use file parsers or conservative static scanners.
+  - Add providers only in recognized project layout; otherwise no suggestions.
+  - Tests: config tree, route declarations, nested translations, view file lookup.
+
+- [ ] **IE-044** Blade-like template support via virtual PHP + source map
+  - Add document selector for template language only if client packaging contributes/activates it safely.
+  - Preprocess template into virtual PHP while preserving source map.
+  - Map diagnostics, hover, completion, semantic tokens back to original template ranges.
+  - Support first:
+    - escaped/raw echo blocks
+    - `@if`, `@foreach`, `@isset`, `@empty`
+    - comments/directives as semantic tokens
+  - Do not advertise full template support until diagnostics/source-map edge cases are stable.
+  - Tests: source map range conversion, hover/completion in echo, diagnostics no false whole-file range.
+
+- [ ] **IE-045** Final acceptance for intelligence milestone
+  - Run full validation:
+    - `cd server && cargo fmt --all --check`
+    - `cd server && cargo test --all`
+    - `cd server && cargo clippy --all-targets -- -D warnings`
+    - `cd client && npm run lint`
+    - `cd client && npm run build`
+    - `git diff --check`
+  - Re-run large workspace profile and latency baseline from `PV-*`.
+  - Add new fixture audits for type/framework features.
+  - Update English docs:
+    - `README.md`
+    - `docs/lsp-features.md`
+    - `docs/architecture.md`
+    - `docs/performance.md`
+    - `docs/production-baseline.md` if metrics changed.
+  - Update risk register with any remaining partial/accepted limitations.
+
+### IDE Intelligence Dependencies
+
+```
+PV-014 ─→ IE-001
+PV-014 ─→ IE-002
+PV-014 ─→ IE-003
+PV-014 ─→ IE-004
+IE-005 ─→ IE-014
+IE-005 ─→ IE-015
+IE-004 ─→ IE-020
+IE-004 ─→ IE-022
+IE-020 ─→ IE-021 ─→ IE-024
+IE-030 ─→ IE-031 ─→ IE-032
+IE-030 ─→ IE-033
+IE-030 ─→ IE-034
+IE-035 ─→ IE-045
+IE-040 ─→ IE-041 ─→ IE-042
+IE-040 ─→ IE-043
+IE-040 ─→ IE-044
+IE-001 ─→ IE-045
+IE-010 ─→ IE-045
+IE-020 ─→ IE-045
+IE-030 ─→ IE-045
+IE-040 ─→ IE-045
+```
+
+---
+
 ## Зависимости между задачами
 
 ```
@@ -1288,6 +1637,7 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 
 ## Текущие задачи
 
+- [x] **T-2026-05-25** Добавить новый milestone IDE intelligence/tooling expansion без ссылок на внешние проекты.
 - [x] **T-2026-05-25** Добавить Monica в список локальных проектов для production validation.
 - [x] **T-2026-05-25** Добавить список локальных проектов для production validation.
 - [x] **T-2026-05-25** Разбить production-ready gaps на новый milestone задач для Codex.

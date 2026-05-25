@@ -49,6 +49,7 @@ phpstorm-stubs support.
 - Document highlight.
 - Selection ranges based on the parsed AST.
 - Linked editing for namespace/use alias edits.
+- Document links for statically resolvable `include`/`require` paths.
 - Call hierarchy and type hierarchy.
 
 ### Refactoring And Editing
