@@ -50,6 +50,8 @@ Disk cache: workspace / stubs / vendor
 2. The client resolves the server binary:
    - `phpLsp.serverPath` if configured.
    - Otherwise `client/bin/<platform>/php-lsp` or `php-lsp.exe`.
+   - If the bundled binary is missing and no custom path is configured,
+     `php-lsp` from `PATH`.
 3. The client sends `initialize` with `initializationOptions` derived from
    `phpLsp.*` settings, including PHP version, diagnostics mode/severity,
    include/exclude paths, stub extensions, formatter, analyzer commands, and
@@ -278,3 +280,10 @@ The VS Code command `PHP: Clear PHP LSP Cache and Restart` deletes the disk cach
 directories for current workspace roots and discovered Composer roots, then
 restarts the language server. The older restart/reindex path refreshes symbols
 but does not delete disk cache files by itself.
+
+Client lifecycle operations are serialized so restart, cache clearing, enable,
+disable, and activation paths cannot start overlapping server processes. Stop
+uses the language-client timeout path, which terminates the managed child
+process when the server does not exit cleanly. The LSP output channel records
+the lifecycle reason, selected binary source, binary path, platform target, stop
+reason, and cache directories removed by the cache-clearing command.

@@ -130,7 +130,7 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 |---|---:|---|
 | `phpLsp.enable` | `true` | Enable the language server. |
 | `phpLsp.phpVersion` | `8.2` | Target PHP version for diagnostics and version-aware refactors (`7.4`-`8.4`). |
-| `phpLsp.serverPath` | `""` | Custom server binary path. Empty uses the bundled binary. |
+| `phpLsp.serverPath` | `""` | Custom server binary path. Empty uses the bundled binary, then falls back to `php-lsp` from `PATH` if the bundled binary is missing. |
 | `phpLsp.includePaths` | `[]` | Additional relative or absolute directories/files to include in workspace indexing. |
 | `phpLsp.excludePaths` | `[]` | Relative or absolute directories/files to exclude from workspace indexing. |
 | `phpLsp.stubs.extensions` | Common extensions | PHP stub extension set to index from the bundled stubs. |
@@ -196,12 +196,17 @@ The extension contributes these VS Code commands:
 
 ### Server Does Not Start
 
-- Check `PHP: Show Language Server Status` for the resolved server binary path.
+- Check `PHP: Show Language Server Status` or
+  `PHP: Show Language Server Version` for the resolved server binary path,
+  source, platform target, and last startup error.
 - If `phpLsp.serverPath` is set, verify that it points to an executable
   `php-lsp` binary.
 - If using the bundled binary, verify that your platform is one of
   `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, `win32-x64`, or
   `win32-arm64`.
+- If the bundled binary is absent and `phpLsp.serverPath` is empty, the client
+  tries `php-lsp` from `PATH` and logs the selected source in the LSP output
+  channel.
 - Set `"phpLsp.logLevel": "debug"` and `"phpLsp.trace.server": "messages"` for
   more output.
 

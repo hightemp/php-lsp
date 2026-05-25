@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
+import type { ChildProcess } from "child_process";
 import { phpLspCacheDirForRoot } from "./cachePath";
 import {
   workspace,
@@ -13,6 +14,7 @@ import {
   QuickPickItem,
   Disposable,
   MarkdownString,
+  OutputChannel,
   ThemeColor,
 } from "vscode";
 import {
@@ -25,8 +27,12 @@ import {
 let client: LanguageClient | undefined;
 let statusController: PhpLspStatusController | undefined;
 let indexingStatusSubscription: Disposable | undefined;
+let outputChannel: OutputChannel | undefined;
 let lastBinaryResolutionError: string | undefined;
 let lastStartError: string | undefined;
+let lifecycleQueue: Promise<void> = Promise.resolve();
+
+const STOP_TIMEOUT_MS = 5000;
 
 type IndexingPhase =
   | "starting"
@@ -55,7 +61,7 @@ interface ExtensionSnapshot {
   serverName: string;
   serverVersion?: string;
   serverPath: string;
-  serverBinarySource: "custom" | "bundled" | "unsupported";
+  serverBinarySource: ServerBinarySource;
   serverBinaryExists: boolean;
   stubsPath?: string;
   platformDir?: string;
@@ -81,11 +87,13 @@ interface StatusQuickPickItem extends QuickPickItem {
 
 interface ServerBinaryResolution {
   serverPath: string;
-  source: "custom" | "bundled" | "unsupported";
+  source: ServerBinarySource;
   exists: boolean;
   platformDir?: string;
   error?: string;
 }
+
+type ServerBinarySource = "custom" | "bundled" | "path" | "unsupported";
 
 class PhpLspStatusController implements Disposable {
   private readonly statusBar: StatusBarItem;
@@ -214,7 +222,7 @@ class PhpLspStatusController implements Disposable {
     } else if (selected?.action === "clearCache") {
       await commands.executeCommand("phpLsp.clearCacheAndRestart");
     } else if (selected?.action === "output") {
-      client?.outputChannel.show(true);
+      getOutputChannel().show(true);
     } else if (selected?.action === "settings") {
       await commands.executeCommand("workbench.action.openSettings", "phpLsp");
     }
@@ -393,8 +401,21 @@ function binaryDescription(snapshot: ExtensionSnapshot): string {
   if (snapshot.serverBinarySource === "unsupported") {
     return "unsupported platform";
   }
-  const source = snapshot.serverBinarySource === "custom" ? "custom" : snapshot.platformDir ?? "bundled";
+  const source = binarySourceLabel(snapshot.serverBinarySource, snapshot.platformDir);
   return snapshot.serverBinaryExists ? source : `${source}; missing`;
+}
+
+function binarySourceLabel(source: ServerBinarySource, platformDir: string | undefined): string {
+  switch (source) {
+    case "custom":
+      return "custom";
+    case "bundled":
+      return platformDir ?? "bundled";
+    case "path":
+      return "PATH";
+    case "unsupported":
+      return "unsupported platform";
+  }
 }
 
 function serverVersionLabel(snapshot: ExtensionSnapshot): string {
@@ -434,8 +455,67 @@ async function showServerVersion(snapshot: ExtensionSnapshot): Promise<void> {
   if (selected === "Copy Details") {
     await env.clipboard.writeText(detail);
   } else if (selected === "Open Output") {
-    client?.outputChannel.show(true);
+    getOutputChannel().show(true);
   }
+}
+
+function getOutputChannel(): OutputChannel {
+  outputChannel ??= window.createOutputChannel("PHP Language Server");
+  return outputChannel;
+}
+
+function lifecycleLog(message: string): void {
+  getOutputChannel().appendLine(`[${new Date().toISOString()}] ${message}`);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function enqueueLifecycleOperation(reason: string, operation: () => Promise<void>): Promise<void> {
+  const run = lifecycleQueue
+    .catch(() => undefined)
+    .then(async () => {
+      lifecycleLog(`Lifecycle begin: ${reason}`);
+      try {
+        await operation();
+        lifecycleLog(`Lifecycle complete: ${reason}`);
+      } catch (error: unknown) {
+        lifecycleLog(`Lifecycle failed: ${reason}: ${errorMessage(error)}`);
+        throw error;
+      }
+    });
+
+  lifecycleQueue = run.catch(() => undefined);
+  return run;
+}
+
+// Best-effort fallback for a timed-out stop; vscode-languageclient owns this child process.
+function managedServerProcess(languageClient: LanguageClient): ChildProcess | undefined {
+  return (languageClient as unknown as { _serverProcess?: ChildProcess })._serverProcess;
+}
+
+async function terminateManagedServerProcess(processToTerminate: ChildProcess | undefined, reason: string): Promise<void> {
+  if (!processToTerminate || processToTerminate.pid === undefined || processToTerminate.killed) {
+    lifecycleLog(`Fallback process termination skipped: reason=${reason}; process handle unavailable`);
+    return;
+  }
+
+  lifecycleLog(`Fallback process termination requested: reason=${reason}; pid=${processToTerminate.pid}`);
+  try {
+    processToTerminate.kill();
+  } catch (error: unknown) {
+    lifecycleLog(`Fallback process termination failed: reason=${reason}; error=${errorMessage(error)}`);
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, 1000);
+    processToTerminate.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
 }
 
 function getServerEnvironment(logLevel: string): NodeJS.ProcessEnv {
@@ -522,54 +602,132 @@ function getPlatformDir(): string | undefined {
   return map[platform]?.[arch];
 }
 
+function isExecutableFile(candidate: string): boolean {
+  try {
+    const stat = fs.statSync(candidate);
+    if (!stat.isFile()) {
+      return false;
+    }
+    return os.platform() === "win32" || (stat.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function findExecutableOnPath(binaryName: string): string | undefined {
+  const pathEnv = process.env.PATH;
+  if (!pathEnv) {
+    return undefined;
+  }
+
+  const extensions = os.platform() === "win32" && path.extname(binaryName) === ""
+    ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM")
+      .split(";")
+      .filter((extension) => extension.length > 0)
+    : [""];
+
+  for (const directory of pathEnv.split(path.delimiter)) {
+    if (directory.length === 0) {
+      continue;
+    }
+    for (const extension of extensions) {
+      const candidate = path.join(directory, `${binaryName}${extension}`);
+      if (isExecutableFile(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return undefined;
+}
+
 function resolveServerBinary(context: ExtensionContext): ServerBinaryResolution {
   const config = workspace.getConfiguration("phpLsp");
   const customPath = config.get<string>("serverPath", "").trim();
   if (customPath.length > 0) {
     const exists = fs.existsSync(customPath);
+    const executable = exists && isExecutableFile(customPath);
     return {
       serverPath: customPath,
       source: "custom",
       exists,
-      error: exists ? undefined : `Configured phpLsp.serverPath does not exist: ${customPath}`,
+      error: !exists
+        ? `Configured phpLsp.serverPath does not exist: ${customPath}`
+        : executable ? undefined : `Configured phpLsp.serverPath is not executable: ${customPath}`,
     };
   }
 
   const platformDir = getPlatformDir();
+  const binaryName = os.platform() === "win32" ? "php-lsp.exe" : "php-lsp";
+
   if (!platformDir) {
+    const pathBinary = findExecutableOnPath("php-lsp");
+    if (pathBinary) {
+      return {
+        serverPath: pathBinary,
+        source: "path",
+        exists: true,
+        error: undefined,
+      };
+    }
+
     return {
       serverPath: "",
       source: "unsupported",
       exists: false,
-      error: `Unsupported platform: ${os.platform()}-${os.arch()}`,
+      error: `Unsupported platform: ${os.platform()}-${os.arch()}; php-lsp was not found in PATH`,
     };
   }
 
-  const binaryName = os.platform() === "win32" ? "php-lsp.exe" : "php-lsp";
   const serverPath = context.asAbsolutePath(path.join("bin", platformDir, binaryName));
   const exists = fs.existsSync(serverPath);
+  const executable = exists && isExecutableFile(serverPath);
+  if (executable) {
+    return {
+      serverPath,
+      source: "bundled",
+      exists: true,
+      platformDir,
+      error: undefined,
+    };
+  }
+
+  const pathBinary = findExecutableOnPath("php-lsp");
+  if (pathBinary) {
+    return {
+      serverPath: pathBinary,
+      source: "path",
+      exists: true,
+      platformDir,
+      error: undefined,
+    };
+  }
+
   return {
     serverPath,
     source: "bundled",
     exists,
     platformDir,
-    error: exists ? undefined : `Bundled php-lsp binary was not found for ${platformDir}: ${serverPath}`,
+    error: exists
+      ? `Bundled php-lsp binary is not executable for ${platformDir}: ${serverPath}; php-lsp was not found in PATH`
+      : `Bundled php-lsp binary was not found for ${platformDir}: ${serverPath}; php-lsp was not found in PATH`,
   };
 }
 
 /**
  * Determine the path to the php-lsp server binary.
  */
-function getServerPath(context: ExtensionContext): string {
+function getServerBinaryForStart(context: ExtensionContext): ServerBinaryResolution {
   const binary = resolveServerBinary(context);
   if (binary.error) {
     lastBinaryResolutionError = binary.error;
+    lifecycleLog(`Binary resolution failed: ${binary.error}`);
     window.showErrorMessage(`PHP Language Server: ${binary.error}`);
     throw new Error(binary.error);
   }
 
   lastBinaryResolutionError = undefined;
-  return binary.serverPath;
+  return binary;
 }
 
 /**
@@ -583,23 +741,22 @@ function getStubsPath(context: ExtensionContext): string | undefined {
   return undefined;
 }
 
-function createLanguageClient(context: ExtensionContext): LanguageClient {
+function createLanguageClient(context: ExtensionContext, binary: ServerBinaryResolution): LanguageClient {
   const config = workspace.getConfiguration("phpLsp");
-  const serverPath = getServerPath(context);
   const stubsPath = getStubsPath(context);
   const logLevel = config.get<string>("logLevel", "info");
   const serverEnvironment = getServerEnvironment(logLevel);
 
   const serverOptions: ServerOptions = {
     run: {
-      command: serverPath,
+      command: binary.serverPath,
       transport: TransportKind.stdio,
       options: {
         env: serverEnvironment,
       },
     },
     debug: {
-      command: serverPath,
+      command: binary.serverPath,
       transport: TransportKind.stdio,
       args: ["--debug"],
       options: {
@@ -609,6 +766,7 @@ function createLanguageClient(context: ExtensionContext): LanguageClient {
   };
 
   const clientOptions: LanguageClientOptions = {
+    outputChannel: getOutputChannel(),
     documentSelector: [
       { scheme: "file", language: "php" },
       { scheme: "untitled", language: "php" },
@@ -653,19 +811,39 @@ function createLanguageClient(context: ExtensionContext): LanguageClient {
   );
 }
 
-async function stopLanguageClient(): Promise<void> {
+async function stopLanguageClient(reason: string): Promise<void> {
   indexingStatusSubscription?.dispose();
   indexingStatusSubscription = undefined;
 
-  if (client) {
-    await client.stop();
-    client = undefined;
+  const currentClient = client;
+  client = undefined;
+
+  if (!currentClient) {
+    lifecycleLog(`Stop skipped: reason=${reason}; no active client`);
+    return;
+  }
+
+  const processToTerminate = managedServerProcess(currentClient);
+  lifecycleLog(`Stopping language server: reason=${reason}; timeoutMs=${STOP_TIMEOUT_MS}`);
+  try {
+    await currentClient.stop(STOP_TIMEOUT_MS);
+    lifecycleLog(`Stopped language server: reason=${reason}`);
+  } catch (error: unknown) {
+    lifecycleLog(
+      `Stop failed or timed out: reason=${reason}; error=${errorMessage(error)}; managed process termination requested when available`,
+    );
+    await terminateManagedServerProcess(processToTerminate, reason);
   }
 }
 
-async function startLanguageClient(context: ExtensionContext): Promise<boolean> {
+async function startLanguageClient(context: ExtensionContext, reason: string): Promise<boolean> {
   try {
-    const nextClient = createLanguageClient(context);
+    const binary = getServerBinaryForStart(context);
+    lifecycleLog(
+      `Starting language server: reason=${reason}; source=${binarySourceLabel(binary.source, binary.platformDir)}; path=${binary.serverPath}; platform=${binary.platformDir ?? `${os.platform()}-${os.arch()}`}`,
+    );
+
+    const nextClient = createLanguageClient(context, binary);
     client = nextClient;
     indexingStatusSubscription = nextClient.onNotification(
       "phpLsp/indexingStatus",
@@ -674,9 +852,10 @@ async function startLanguageClient(context: ExtensionContext): Promise<boolean> 
 
     await nextClient.start();
     lastStartError = undefined;
+    lifecycleLog(`Started language server: reason=${reason}; path=${binary.serverPath}`);
     return true;
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     lastStartError = message;
     client = undefined;
     indexingStatusSubscription?.dispose();
@@ -691,22 +870,24 @@ async function startLanguageClient(context: ExtensionContext): Promise<boolean> 
 }
 
 async function restartLanguageClient(context: ExtensionContext): Promise<void> {
-  statusController?.update({
-    phase: "starting",
-    message: "Restarting language server",
-  });
-  await stopLanguageClient();
-  if (!workspace.getConfiguration("phpLsp").get<boolean>("enable", true)) {
+  await enqueueLifecycleOperation("restart command", async () => {
     statusController?.update({
-      phase: "ready",
-      message: "Language server is disabled",
+      phase: "starting",
+      message: "Restarting language server",
     });
-    window.showInformationMessage("PHP Language Server is disabled");
-    return;
-  }
-  if (await startLanguageClient(context)) {
-    window.showInformationMessage("PHP Language Server restarted");
-  }
+    await stopLanguageClient("restart command");
+    if (!workspace.getConfiguration("phpLsp").get<boolean>("enable", true)) {
+      statusController?.update({
+        phase: "ready",
+        message: "Language server is disabled",
+      });
+      window.showInformationMessage("PHP Language Server is disabled");
+      return;
+    }
+    if (await startLanguageClient(context, "restart command")) {
+      window.showInformationMessage("PHP Language Server restarted");
+    }
+  });
 }
 
 async function clearCacheAndRestartLanguageClient(context: ExtensionContext): Promise<void> {
@@ -725,60 +906,59 @@ async function clearCacheAndRestartLanguageClient(context: ExtensionContext): Pr
     return;
   }
 
-  statusController?.update({
-    phase: "starting",
-    message: "Clearing disk cache and restarting language server",
-  });
+  await enqueueLifecycleOperation("clear cache and restart command", async () => {
+    statusController?.update({
+      phase: "starting",
+      message: "Clearing disk cache and restarting language server",
+    });
 
-  await stopLanguageClient();
+    await stopLanguageClient("clear cache and restart command");
 
-  const failed: string[] = [];
-  let removed = 0;
-  for (const cacheDir of cacheDirs) {
-    try {
-      if (fs.existsSync(cacheDir)) {
-        await fs.promises.rm(cacheDir, { recursive: true, force: true });
-        removed += 1;
+    const failed: string[] = [];
+    let removed = 0;
+    for (const cacheDir of cacheDirs) {
+      try {
+        if (fs.existsSync(cacheDir)) {
+          lifecycleLog(`Removing cache directory: ${cacheDir}`);
+          await fs.promises.rm(cacheDir, { recursive: true, force: true });
+          removed += 1;
+        }
+      } catch (error: unknown) {
+        failed.push(`${cacheDir}: ${errorMessage(error)}`);
       }
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      failed.push(`${cacheDir}: ${message}`);
     }
-  }
 
-  if (failed.length > 0) {
-    const message = `Failed to clear PHP LSP cache: ${failed.join("; ")}`;
-    statusController?.update({
-      phase: "error",
-      message,
-    });
-    window.showErrorMessage(message);
-    return;
-  }
+    if (failed.length > 0) {
+      const message = `Failed to clear PHP LSP cache: ${failed.join("; ")}`;
+      statusController?.update({
+        phase: "error",
+        message,
+      });
+      window.showErrorMessage(message);
+      return;
+    }
 
-  if (!workspace.getConfiguration("phpLsp").get<boolean>("enable", true)) {
-    statusController?.update({
-      phase: "ready",
-      message: "Language server is disabled",
-    });
-    window.showInformationMessage(
-      `PHP LSP cache cleared (${cacheDirectoryCountLabel(removed)} removed). Language server is disabled.`,
-    );
-    return;
-  }
+    if (!workspace.getConfiguration("phpLsp").get<boolean>("enable", true)) {
+      statusController?.update({
+        phase: "ready",
+        message: "Language server is disabled",
+      });
+      window.showInformationMessage(
+        `PHP LSP cache cleared (${cacheDirectoryCountLabel(removed)} removed). Language server is disabled.`,
+      );
+      return;
+    }
 
-  if (await startLanguageClient(context)) {
-    window.showInformationMessage(
-      `PHP LSP cache cleared (${cacheDirectoryCountLabel(removed)} removed) and language server restarted`,
-    );
-  }
+    if (await startLanguageClient(context, "clear cache and restart command")) {
+      window.showInformationMessage(
+        `PHP LSP cache cleared (${cacheDirectoryCountLabel(removed)} removed) and language server restarted`,
+      );
+    }
+  });
 }
 
 export function activate(context: ExtensionContext): void {
   const config = workspace.getConfiguration("phpLsp");
-  if (!config.get<boolean>("enable", true)) {
-    return;
-  }
 
   const controller = new PhpLspStatusController(() => getExtensionSnapshot(context));
   statusController = controller;
@@ -811,17 +991,25 @@ export function activate(context: ExtensionContext): void {
 
     const enabled = workspace.getConfiguration("phpLsp").get<boolean>("enable", true);
     if (!enabled) {
-      await stopLanguageClient();
-      statusController?.update({
-        phase: "ready",
-        message: "Language server is disabled",
+      await enqueueLifecycleOperation("disable setting changed", async () => {
+        await stopLanguageClient("disable setting changed");
+        statusController?.update({
+          phase: "ready",
+          message: "Language server is disabled",
+        });
       });
-    } else if (!client) {
-      statusController?.update({
-        phase: "starting",
-        message: "Starting language server",
+    } else {
+      await enqueueLifecycleOperation("enable setting changed", async () => {
+        if (client) {
+          lifecycleLog("Start skipped: reason=enable setting changed; client already active");
+          return;
+        }
+        statusController?.update({
+          phase: "starting",
+          message: "Starting language server",
+        });
+        await startLanguageClient(context, "enable setting changed");
       });
-      await startLanguageClient(context);
     }
   });
 
@@ -834,12 +1022,27 @@ export function activate(context: ExtensionContext): void {
     enableConfigSubscription,
   );
 
+  if (!config.get<boolean>("enable", true)) {
+    lifecycleLog("Extension activated with phpLsp.enable=false; server start skipped");
+    statusController?.update({
+      phase: "ready",
+      message: "Language server is disabled",
+    });
+    return;
+  }
+
   // Start the client (also launches the server)
-  void startLanguageClient(context);
+  void enqueueLifecycleOperation("extension activation", async () => {
+    await startLanguageClient(context, "extension activation");
+  });
 }
 
 export async function deactivate(): Promise<void> {
-  await stopLanguageClient();
+  await enqueueLifecycleOperation("extension deactivation", async () => {
+    await stopLanguageClient("extension deactivation");
+  });
   statusController?.dispose();
   statusController = undefined;
+  outputChannel?.dispose();
+  outputChannel = undefined;
 }

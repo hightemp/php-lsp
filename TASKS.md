@@ -1255,13 +1255,21 @@ PR-052 ─→ PR-053
   - Docs: root README commands table updated in English.
   - Validation: `npm run lint`, `npm run check:commands`, `npm run build`, docs Cyrillic check for `docs/ README.md client/README.md`, `git diff --check`.
 
-- [ ] **IE-003** Укрепить VS Code lifecycle и binary resolution
+- [x] **IE-003** Укрепить VS Code lifecycle и binary resolution *(completed 2026-05-25)*
   - При restart/clear-cache использовать serialized lifecycle queue, чтобы две команды не стартовали два сервера параллельно.
   - `stopLanguageClient()` должен иметь timeout и fallback kill для зависшего процесса, где доступен process handle.
   - Добавить PATH fallback: если bundled binary отсутствует и `phpLsp.serverPath` пустой, попробовать `php-lsp` из `PATH`, но явно логировать источник binary.
   - Не включать network auto-download в этот task.
   - Добавить output logs: start source, stop reason, restart reason, binary path.
   - Validation: `npm run lint`, `npm run build`, manual activation smoke.
+  - Implemented: lifecycle queue serializes extension activation, restart, clear-cache restart, enable/disable changes, and deactivation.
+  - Implemented: `stopLanguageClient()` now uses a 5s timeout and best-effort managed process termination when the language-client process handle is available.
+  - Implemented: binary resolution now checks executable custom/bundled binaries and falls back to `php-lsp` from `PATH` when no custom path is configured and the bundled binary is missing.
+  - Implemented: LSP output channel logs lifecycle reason, selected binary source/path, platform target, stop reason, start/restart reason, and removed cache directories.
+  - Implemented: commands/config listener remain registered when `phpLsp.enable=false` on activation; server start is skipped until the setting is enabled.
+  - Docs: README troubleshooting/config and `docs/architecture.md` updated in English.
+  - Validation: `npm run lint`, `npm run check:commands`, `npm run build`, docs Cyrillic check for `docs/ README.md client/README.md`, `git diff --check`.
+  - Manual VS Code activation smoke was not run from the shell session to avoid opening a user GUI window; run before release packaging.
 
 - [ ] **IE-004** Добавить проектную конфигурацию `.php-lsp.toml`
   - Новый server config loader: project config рядом с `composer.json`, затем global config, затем VS Code/init options.
