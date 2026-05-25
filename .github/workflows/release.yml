@@ -20,6 +20,7 @@ jobs:
   build-server:
     name: Build Server (${{ matrix.target }})
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -35,6 +36,10 @@ jobs:
             os: macos-14
             platform: darwin-arm64
 
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            platform: darwin-x64
+
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             platform: win32-x64
@@ -48,6 +53,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -97,6 +103,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -121,6 +128,12 @@ jobs:
           name: server-darwin-arm64
           path: client/bin/darwin-arm64/
 
+      - name: Download darwin-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: server-darwin-x64
+          path: client/bin/darwin-x64/
+
       - name: Download win32-x64 binary
         uses: actions/download-artifact@v4
         with:
@@ -138,6 +151,7 @@ jobs:
           chmod +x client/bin/linux-x64/php-lsp
           chmod +x client/bin/linux-arm64/php-lsp
           chmod +x client/bin/darwin-arm64/php-lsp
+          chmod +x client/bin/darwin-x64/php-lsp
 
       - name: List bundled binaries
         run: find client/bin -type f | xargs ls -lh
@@ -161,9 +175,10 @@ jobs:
         run: vsce package -o ../ht-php-lsp.vsix
 
       - name: Show VSIX contents
-        run: |
-          unzip -l ht-php-lsp.vsix | head -30
-          unzip -l ht-php-lsp.vsix extension/readme.md
+        run: unzip -l ht-php-lsp.vsix | head -50
+
+      - name: Smoke test packaged VSIX
+        run: bash scripts/smoke-vsix.sh ht-php-lsp.vsix
 
       - name: Upload VSIX
         uses: actions/upload-artifact@v4
@@ -188,6 +203,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: vsix/ht-php-lsp.vsix
           generate_release_notes: true
           draft: false
@@ -198,30 +214,29 @@ jobs:
     name: Publish to VS Marketplace
     needs: package-vsix
     runs-on: ubuntu-latest
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
     steps:
+      - name: Skip Marketplace publish when token is not configured
+        if: env.VSCE_PAT == ''
+        run: echo "::notice::VSCE_PAT is not configured; skipping VS Marketplace publish."
+
       - name: Download VSIX
+        if: env.VSCE_PAT != ''
         uses: actions/download-artifact@v4
         with:
           name: vsix-universal
           path: vsix/
 
       - uses: actions/setup-node@v4
+        if: env.VSCE_PAT != ''
         with:
           node-version: 20
 
-      - name: Check Marketplace token
-        run: |
-          if [ -z "$VSCE_PAT" ]; then
-            echo "::error::Missing VSCE_PAT secret for VS Marketplace publishing"
-            exit 1
-          fi
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
-
       - name: Install vsce
+        if: env.VSCE_PAT != ''
         run: npm install -g @vscode/vsce
 
       - name: Publish VSIX to Marketplace
+        if: env.VSCE_PAT != ''
         run: vsce publish --packagePath vsix/ht-php-lsp.vsix
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}

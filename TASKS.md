@@ -600,11 +600,11 @@
 - [x] **VN-010** Release pipeline — cross-platform VSIX сборка + публикация в Marketplace *(done 2026-02-15)*
   - `scripts/build-server.sh` — сборка Rust бинарника, копирование в `client/bin/`
   - `scripts/bundle-stubs.sh` — копирование phpstorm-stubs в `client/stubs/`
-  - `.github/workflows/release.yml` — matrix build (7 платформ) + `vsce package --target`
+  - `.github/workflows/release.yml` — matrix build (6 VS Code platform directories) + universal VSIX package
   - `client/.vscodeignore` — включает только `bin/`, `stubs/`, `out/`, `package.json`
   - `extension.ts` — передаёт `stubsPath` в initializationOptions
   - `server.rs` — принимает `stubsPath` из initializationOptions для поиска стабов
-  - Поддержанные платформы: linux-x64, linux-arm64, alpine-x64, darwin-x64, darwin-arm64, win32-x64, win32-arm64
+  - Поддержанные published platform directories: linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64, win32-arm64; Alpine/musl не заявляется как published VSIX target
   - Локальная сборка VSIX: 2.56 MB (бинарник + стабы + клиент)
 
 - [x] **VN-011** Make release target — сборка + тегирование + push в GitHub *(done 2026-03-05)*
@@ -850,17 +850,28 @@
 
 ### Неделя 6: Release hardening, docs, acceptance (2026-06-25 → 2026-07-01)
 
-- [ ] **PR-050** Stress и soak testing
+- [x] **PR-050** Stress и soak testing *(completed 2026-05-25)*
   - 100 didChange за 1 секунду на файле с non-ASCII.
   - Одновременные hover/completion во время full indexing.
   - Cancel references/rename на большом workspace.
   - External analyzer timeout и malformed JSON без зависаний.
+  - Implemented: e2e stress `test_stress_100_did_change_non_ascii_publishes_latest_version` — 100 full `didChange` events с кириллицей принимаются за 1 секунду, stale diagnostics не публикуются, финальная версия чистая.
+  - Implemented: e2e responsiveness `test_hover_and_completion_respond_while_workspace_indexing_runs` — hover/completion по open buffer отвечают во время фоновой workspace indexing.
+  - Implemented: e2e cancellation `test_cancel_request_cancels_rename_request`; существующий references cancellation покрывает вторую тяжелую операцию.
+  - Implemented: analyzer soak unit tests для PHPStan/Psalm timeout и malformed JSON, обернутые в `tokio::time::timeout`, чтобы фиксировать отсутствие зависаний.
+  - Validation: targeted stress/cancel/analyzer tests, `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **PR-051** Release workflow production-ready
+- [x] **PR-051** Release workflow production-ready *(completed 2026-05-25)*
   - Синхронизировать `.github/workflows/release.yml` со всеми заявленными платформами.
   - Добавить `darwin-x64`, проверить linux musl/alpine решение или убрать из обещаний.
   - Включить Marketplace publish job за `VSCE_PAT`.
   - Добавить smoke test packaged VSIX: binary exists, stubs exist, extension activates.
+  - Implemented: release matrix теперь включает `darwin-x64` на Intel `macos-15-intel`; `darwin-arm64` остается на arm64 `macos-14`.
+  - Implemented: workflow_dispatch checkout/release uses requested tag, чтобы ручной release не публиковал default branch вместо tag.
+  - Implemented: Marketplace publish gated by `VSCE_PAT`; без секрета job делает явный skip notice и не валит GitHub release.
+  - Implemented: `scripts/smoke-vsix.sh` проверяет packaged VSIX: package metadata, extension bundle load/activation entrypoint, all platform binaries, bundled stubs, README/LICENSE.
+  - Implemented: Alpine/musl убран из documented published target set; Linux release binaries documented как GNU/glibc (`*-unknown-linux-gnu`).
+  - Validation: `actionlint` через `go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/release.yml`, YAML syntax parse, `bash -n` для shell scripts, `npm run lint`, `npm run build`, local VSIX package через `npx @vscode/vsce package --no-dependencies -o /tmp/ht-php-lsp-local-smoke.vsix`, smoke test на реальном `linux-x64` VSIX, synthetic universal VSIX smoke, `git diff --check`.
 
 - [ ] **PR-052** Документация production-ready
   - `docs/architecture.md`: data flow, indexing/cache model, diagnostics pipeline.

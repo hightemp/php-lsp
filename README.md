@@ -214,6 +214,10 @@ for these VS Code platform directories:
 - `win32-x64`
 - `win32-arm64`
 
+Published Linux binaries are built from the GNU targets
+(`*-unknown-linux-gnu`). Alpine/musl is not part of the universal VSIX release
+target set.
+
 `make release` requires a clean working tree, reads the semver value from
 `VERSION`, updates `client/package.json`, `client/package-lock.json`,
 `server/Cargo.toml`, and `server/Cargo.lock`, commits those version changes
