@@ -91,16 +91,19 @@ phpstorm-stubs support.
   namespaces; Composer vendor metadata is cached in memory with an LRU for
   lazy vendor symbols. Large-project acceptance thresholds are still production
   hardening work.
-- `references`, `rename`, and reference-count code lenses can still scan and
-  reparse indexed workspace files. They are functional, but not yet optimized
-  for very large repositories.
+- `references`, `rename`, and reference-count code lenses use indexed
+  per-file references, but still iterate workspace reference sets and can be
+  expensive on very large repositories.
 - Workspace indexing parses files through a bounded CPU-aware task queue;
   large-project acceptance thresholds are still being measured.
-- Heavy operations do not yet have general LSP request cancellation support.
-- Rapid `didChange` bursts are handled synchronously without a debounce/version
-  queue for diagnostics.
-- Built-in stubs are configurable, but version-gated symbols from phpstorm-stubs
-  are not yet filtered for every `phpLsp.phpVersion` case.
+- Heavy references/rename requests, background indexing, and external analyzers
+  have cancellation coverage; some other heavy requests remain benchmark watch
+  items.
+- Rapid `didChange` bursts still refresh parser/index state on each accepted
+  edit, while diagnostics are debounced and version-checked.
+- Built-in stubs are configurable and version-filtered for supported
+  phpstorm-stubs version-gating metadata. New metadata forms may require parser
+  updates.
 - Cross-file local variable analysis is intentionally limited; variable
   references and rename are local-scope oriented.
 - Type inference is useful but still shallow compared with mature PHP static
@@ -158,7 +161,77 @@ Example external formatting setup:
 }
 ```
 
-## Architecture
+## Documentation
+
+- [Architecture](docs/architecture.md): server/client data flow, indexing,
+  cache model, diagnostics pipeline, and runtime configuration behavior.
+- [LSP feature matrix](docs/lsp-features.md): supported, partial, and
+  unsupported LSP behavior.
+- [Performance guide](docs/performance.md): baseline methodology, profiling
+  commands, cache interpretation, and production acceptance metrics.
+- [Production baseline](docs/production-baseline.md): current measured
+  validation and performance numbers.
+- [Production risk register](docs/production-risk-register.md): tracked
+  production gaps and exit signals.
+
+## Troubleshooting
+
+### Server Does Not Start
+
+- Check `PHP: Show Language Server Status` for the resolved server binary path.
+- If `phpLsp.serverPath` is set, verify that it points to an executable
+  `php-lsp` binary.
+- If using the bundled binary, verify that your platform is one of
+  `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, `win32-x64`, or
+  `win32-arm64`.
+- Set `"phpLsp.logLevel": "debug"` and `"phpLsp.trace.server": "messages"` for
+  more output.
+
+### Indexing Is Slow Or Stale
+
+- Use `PHP: Show Language Server Status` to inspect indexed file count, cache
+  path, stubs path, include/exclude paths, and analyzer settings.
+- Add generated directories to `phpLsp.excludePaths`.
+- Keep `phpLsp.indexVendor` enabled for lazy vendor lookup, but exclude very
+  large generated vendor subtrees if they are not useful.
+- Use `PHP: Clear PHP LSP Cache and Restart` when changing branches, Composer
+  metadata, stubs, or project layout and the disk cache looks stale.
+
+### Diagnostics Are Too Noisy
+
+- Set `"phpLsp.diagnostics.mode": "syntax-only"` to keep only parser syntax
+  diagnostics.
+- Set `"phpLsp.diagnostics.mode": "off"` to disable built-in diagnostics.
+- Prefer per-category severity controls when only one category is noisy:
+
+```json
+{
+  "phpLsp.diagnostics.severity": {
+    "members": "off",
+    "unused": "hint"
+  }
+}
+```
+
+### PHPStan Or Psalm Diagnostics Do Not Appear
+
+- Enable the analyzer explicitly with `phpLsp.phpstan.enabled` or
+  `phpLsp.psalm.enabled`.
+- Make sure the configured command works from the workspace root and prints JSON.
+- Keep `{file}` in the command template unless the tool should receive the file
+  path appended at the end.
+- Increase `phpLsp.phpstan.timeoutMs` or `phpLsp.psalm.timeoutMs` for slow
+  projects.
+
+### Formatting Does Nothing
+
+- Formatting is disabled by default. Set `phpLsp.formatting.provider` to
+  `php-cs-fixer`, `phpcbf`, or `custom`.
+- For `custom`, configure `phpLsp.formatting.command` and include `{file}` where
+  the temporary PHP file path should be inserted.
+- Ensure the formatter executable is available from the workspace root.
+
+## Architecture Summary
 
 - **Server**: Rust (tokio + tower-lsp-server + tree-sitter-php)
 - **Client**: VS Code extension (TypeScript + vscode-languageclient)

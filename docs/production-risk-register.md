@@ -1,6 +1,7 @@
 # Production Risk Register
 
-Дата: 2026-05-22  
+Дата: 2026-05-22
+Last updated: 2026-05-25
 Scope: production-readiness milestone, weeks 1-6.
 
 Этот документ фиксирует известные production gaps после baseline/profiling setup. Формат намеренно операционный: каждый риск привязан к owner task из `TASKS.md`, чтобы его можно было закрыть измеримым изменением.
@@ -10,15 +11,15 @@ Scope: production-readiness milestone, weeks 1-6.
 | ID | Area | Severity | Owner task | Status |
 |----|------|----------|------------|--------|
 | R-001 | Disk cache maturity | High | `PR-010`, `PR-011` | Partially mitigated |
-| R-002 | `references`/`rename`/`codeLens` делают workspace scan | High | `PR-022`, `PR-021` | Open |
+| R-002 | `references`/`rename`/`codeLens` scale | High | `PR-022`, `PR-021` | Partially mitigated |
 | R-003 | Parallel indexing acceptance | High | `PR-013`, `PR-023` | Partially mitigated |
-| R-004 | Sync file IO в async/hot paths | High | `PR-023` | Open |
-| R-005 | Нет request cancellation для тяжелых операций | High | `PR-021`, `PR-050` | Open |
-| R-006 | `didChange` без debounce/version ordering | High | `PR-020`, `PR-050` | Open |
-| R-007 | Stubs грузятся на старте без PHP-version filtering | Medium | `PR-030`, `PR-011` | Partially mitigated |
+| R-004 | Sync file IO в async/hot paths | High | `PR-023` | Partially mitigated |
+| R-005 | Request cancellation coverage for heavy operations | High | `PR-021`, `PR-050` | Partially mitigated |
+| R-006 | `didChange` debounce/version ordering | High | `PR-020`, `PR-050` | Mitigated |
+| R-007 | Version-aware stubs | Medium | `PR-030`, `PR-011` | Mitigated |
 | R-008 | Lazy vendor indexing scale validation | Medium | `PR-012`, `PR-011` | Partially mitigated |
-| R-009 | PHPDoc/type model shallow для production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041` | Open |
-| R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052` | Open |
+| R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041` | Partially mitigated |
+| R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052` | Mitigated |
 
 ## Risks
 
@@ -47,29 +48,30 @@ Exit signal:
 - `scripts/profile-workspace.sh --scenario large=/path/to/project` показывает cold start after first run `< 5s` до `phase=ready`.
 - Cache invalidates changed files without full rebuild.
 
-### R-002: `references`/`rename`/`codeLens` делают workspace scan
+### R-002: `references`/`rename`/`codeLens` scale
 
 Current evidence:
 
-- `references` и `rename` проходят по `self.index.file_symbols.iter()`.
-- Для неоткрытых файлов handlers делают `std::fs::read_to_string`, `FileParser::new()`, `parse_full()` и `find_references_in_file()`.
-- `codeLens` вызывает `reference_locations_for_symbol()` для каждого class/function/member symbol, что масштабируется плохо на больших файлах/workspace.
+- `PR-022` добавил `WorkspaceIndex::file_references` и `SymbolReference`.
+- Workspace indexing, lazy vendor/stub indexing, `didOpen`, `didChange`, and watched-file reindex now collect per-file references.
+- `references`, `rename`, and `codeLens` use indexed references; closed files are not reparsed for the common path.
+- These requests still iterate indexed file reference sets and can remain O(indexed files) on very large workspaces.
 
 Impact:
 
-- Latency растет O(indexed files * parse cost) для каждого запроса.
-- `rename` может подвисать на больших workspace, особенно при открытом файле с большим числом символов и включенном code lens.
+- Latency no longer includes full workspace reparse, but can still grow with indexed workspace size.
+- `codeLens` reference counts may still be expensive on very large files/workspaces.
 
 Mitigation:
 
-- `PR-022`: построить reference/occurrence index при indexing and incremental updates.
-- `PR-021`: добавить cancellation для long-running references/rename/codeLens.
+- `PR-022`: implemented reference/occurrence index and cache roundtrip for references.
+- `PR-021`: added cooperative yield points so `$/cancelRequest` can cancel long references/rename requests.
 - `PR-003`: держать latency benchmark как regression gate.
 
 Exit signal:
 
-- Warm p95 `references`/`renameDryRun` на large fixture перестает зависеть от полного reparse workspace.
-- `codeLens` не делает full references scan на каждый visible document refresh.
+- Warm p95 `references`/`renameDryRun` на large fixture stays within the production target without full reparse.
+- `codeLens` stays responsive on large visible documents.
 
 ### R-003: Parallel indexing acceptance
 
@@ -98,88 +100,95 @@ Exit signal:
 
 Current evidence:
 
-- `std::fs::read_to_string` используется в lazy vendor indexing, workspace indexing, references, rename, codeLens, folding range and formatter result readback.
-- Часть этих чтений происходит в LSP request handlers.
+- `PR-023` added `run_file_io_blocking()` with `spawn_blocking`, a 15s timeout, and warning telemetry for file reads slower than 100ms.
+- Watched-file reindex, lazy PHP/vendor indexing, vendor cache load/save, vendor autoload metadata parsing, call hierarchy disk reads, `codeLens` source reads, and `foldingRange` source reads use blocking/background paths.
+- Remaining synchronous reads are limited to synchronous helper code called from blocking contexts, formatter work already inside `spawn_blocking`, and startup Composer discovery.
 
 Impact:
 
-- Медленная FS, network mounts or huge files can block the async executor and delay unrelated hover/completion/diagnostics.
+- Slow filesystems can still affect background work and startup discovery.
+- Hot LSP request paths are materially less likely to block unrelated hover/completion/diagnostics.
 
 Mitigation:
 
-- `PR-023`: использовать `tokio::task::spawn_blocking` или dedicated file IO worker for bulk reads.
-- Добавить slow IO telemetry в profiling JSON/logs.
+- `PR-023`: implemented blocking/background wrappers and slow IO telemetry.
+- Keep profiling large workspaces on slow disks/network mounts.
 
 Exit signal:
 
 - Parallel hover/completion remain responsive while indexing/references are reading files.
 - Slow file reads are observable and timeout-safe.
 
-### R-005: Нет request cancellation для тяжелых операций
+### R-005: Request cancellation coverage for heavy operations
 
 Current evidence:
 
-- There is no task registry/cancellation token around indexing, references, rename, codeLens or external analyzer runs.
-- Existing external analyzers have timeouts, but LSP `$/cancelRequest` is not a general control path for heavy server work.
+- `PR-021` introduced `OperationCancellationToken` for background indexing and external analyzer runs.
+- New indexing/reindex work cancels the previous indexing run.
+- PHPStan/Psalm runs are per URI and cancelled by newer document events, close, delete, or rename.
+- `references` and `rename` have cooperative yield points and e2e coverage for `$/cancelRequest`.
 
 Impact:
 
-- Editor can keep waiting for obsolete references/rename/analyzer requests.
-- Rapid navigation/editing can leave expensive work running after the user no longer needs it.
+- Cancellation coverage exists for the riskiest paths, but not every implemented LSP request has a request-scoped cancellation token.
+- Heavy hierarchy/codeLens requests should continue to be watched in latency benchmarks.
 
 Mitigation:
 
-- `PR-021`: introduce request-scoped cancellation tokens and task registry.
-- `PR-050`: stress test cancel references/rename on large workspace.
+- `PR-021`: implemented cancellation for indexing, analyzers, references, and rename.
+- `PR-050`: added stress tests for cancel references/rename and analyzer timeout/malformed JSON.
 
 Exit signal:
 
-- Cancelled long-running requests return LSP cancellation errors where appropriate.
-- New requests are not delayed by obsolete cancelled work.
+- Cancelled long-running references/rename return LSP cancellation errors where appropriate.
+- New requests remain responsive while obsolete work is cancelled or yields.
 
-### R-006: `didChange` без debounce/version ordering
+### R-006: `didChange` debounce/version ordering
 
 Current evidence:
 
-- `did_change()` applies edits, updates index immediately, then calls `publish_fast_diagnostics()` directly.
-- It does not track LSP document version in a queue and does not cancel outdated diagnostic work.
+- `PR-020` added `document_versions` for open documents and a per-URI debounce task registry.
+- `didChange` ignores stale/duplicate document versions.
+- Fast diagnostics publish after a 180ms debounce and include the LSP document version.
+- Pending debounce tasks are cancelled on new edits, save, close, delete, and rename.
 
 Impact:
 
-- Rapid typing can produce unnecessary parser/index/diagnostic churn.
-- Older diagnostics could race with newer results once slower diagnostic paths are added.
+- The stale diagnostics overwrite risk is covered by version checks.
+- Parser/index refresh still happens on each accepted edit; monitor burst CPU cost on large files.
 
 Mitigation:
 
-- `PR-020`: debounce diagnostics 150-250 ms, store document versions, cancel stale tasks.
-- `PR-050`: 100 `didChange` events/sec stress case with non-ASCII text.
+- `PR-020`: implemented debounce and version ordering.
+- `PR-050`: added 100 `didChange` events/sec stress case with non-ASCII text.
 
 Exit signal:
 
-- Only latest document version publishes diagnostics after a burst.
+- Latest-version diagnostics only after a burst; covered by e2e tests.
 - No stale diagnostics overwrite newer diagnostics.
 
-### R-007: Stubs грузятся на старте без PHP-version filtering
+### R-007: Version-aware stubs
 
 Current evidence:
 
 - `load_configured_stubs()` reads bundled phpstorm-stubs and loads configured extensions into the main index.
 - `PR-011` stores stubs in a dedicated `stubs` cache namespace and reloads changed/missing stub files by mtime/size/config hash.
-- `phpLsp.phpVersion` affects diagnostics/refactors in server logic, but built-in symbol availability is not yet filtered from version-gated stub metadata.
+- `PR-030` parses phpstorm-stubs version-gating attributes and filters symbols/signatures by `phpLsp.phpVersion`.
+- Changing PHP version reloads stubs and republishes diagnostics without restart.
 
 Impact:
 
-- First startup still parses configured stubs; repeated startup/reload can load unchanged stub files from cache.
-- Completion/definition can expose built-ins that are not available for the configured PHP version.
+- First startup may still parse configured stubs; repeated startup/reload can load unchanged stub files from cache.
+- Remaining risk is incomplete coverage if phpstorm-stubs adds new version-gating metadata forms not yet parsed.
 
 Mitigation:
 
-- `PR-030`: parse version-gated stub attributes and filter symbols/signatures by `phpLsp.phpVersion`.
+- `PR-030`: implemented version-aware symbol and parameter filtering.
 - `PR-011`: implemented separate stubs cache keyed by php-lsp version, PHP version, extension list and stubs hash.
 
 Exit signal:
 
-- Changing PHP version updates built-in completion/definition/diagnostics without restart.
+- Changing PHP version updates built-in completion/definition/diagnostics without restart; covered by e2e.
 - Stub load time is near-zero from cache after first run.
 
 ### R-008: Lazy vendor indexing scale validation
@@ -207,45 +216,48 @@ Exit signal:
 - First vendor hit is measured; subsequent hits are stable and cheap.
 - Vendor cache invalidates on composer metadata changes.
 
-### R-009: PHPDoc/type model shallow для production PHP
+### R-009: PHPDoc/type model depth for production PHP
 
 Current evidence:
 
-- PHPDoc and type inference support many editor cases, but complex generics/callables/array shapes are still milestone work.
-- Current tasks `PR-031`-`PR-041` exist because framework-heavy code needs richer type propagation.
+- `PR-031` rewrote the PHPDoc type parser for nested generics, callables, array shapes, list/literal/intersection/union types, and common PHPDoc syntax.
+- `PR-032`/`PR-033` added `@property`, `@property-read`, `@property-write`, and `@method` virtual members in LSP UI.
+- `PR-040`/`PR-041` extended `TypeInfo` and inference for common production PHPDoc/PHP expression patterns.
+- `PR-042` reduced framework-heavy diagnostics false positives for common Symfony/Laravel/Doctrine/PHPUnit patterns.
 
 Impact:
 
-- Completion/definition/diagnostics can be incomplete or noisy for Laravel/Symfony/PHPUnit patterns that rely on PHPDoc generics, templates and fluent APIs.
+- Completion/definition/diagnostics are materially better for PHPDoc-heavy projects, but still not a full static analyzer type system.
+- Complex framework magic, templates, fluent generics, and project-specific dynamic behavior can still need PHPStan/Psalm.
 
 Mitigation:
 
-- `PR-031`: robust PHPDoc type parser.
-- `PR-032`/`PR-033`: virtual members and property access modes.
-- `PR-040`/`PR-041`: extend `TypeInfo` and inference.
+- `PR-031`-`PR-034`: PHPDoc parser, virtual members, and e2e coverage.
+- `PR-040`-`PR-042`: richer type model, inference, and framework false-positive reductions.
 
 Exit signal:
 
 - Fixture-driven PHPDoc e2e tests cover hover/completion/definition/diagnostics behavior.
 - Framework-heavy regression corpus shows reduced false positives without project-specific hardcode.
+- Future work should be driven by real-project misses rather than broad parser rewrites.
 
 ### R-010: LSP polish/capability mismatch risk
 
 Current evidence:
 
-- Capabilities advertise broad workspace and file operation support.
-- Some behavior is still intentionally limited, such as `semanticTokens/range` absence and file operation `will*` hooks that do not yet perform namespace/class refactors.
+- `PR-043` added `textDocument/semanticTokens/range`, improved `workspace/symbol`, and stopped advertising `willRenameFiles` until meaningful path-refactor edits exist.
+- `PR-051` aligned release packaging with documented platforms and added VSIX smoke checks.
+- `PR-052` added `docs/lsp-features.md` with supported/partial/unsupported behavior.
 
 Impact:
 
-- Users may expect IDE-level behavior for every advertised capability.
-- Release/Marketplace docs can overpromise if limitations are not explicit.
+- Users can still expect IDE-level behavior beyond the current implementation, but the public docs now call out partial behavior and non-goals.
 
 Mitigation:
 
-- `PR-043`: close or document LSP polish gaps.
+- `PR-043`: closed capability mismatches in semantic tokens, workspace symbols, and file rename advertising.
 - `PR-051`: smoke test packaged VSIX and release workflow.
-- `PR-052`: publish architecture, feature matrix and troubleshooting docs.
+- `PR-052`: published architecture, feature matrix and troubleshooting docs.
 
 Exit signal:
 

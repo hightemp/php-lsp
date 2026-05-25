@@ -210,7 +210,7 @@
   - Исправить резолв `A\\B\\fn()` (без потери префикса и без двойного namespace в сообщениях)
   - Синхронизировать поведение в `resolve`, `semantic`, `references`
 
-- [ ] **H-006** Реально применить `phpVersion` из VS Code в сервере
+- [x] **H-006** Реально применить `phpVersion` из VS Code в сервере *(done 2026-05-22 via PR-030)*
   - Проблема: клиент отправляет `phpVersion`, но сервер его не использует; stubs загружаются по `DEFAULT_EXTENSIONS` без учета версии PHP.
   - Что сделать:
     - Расширить `initializationOptions`/runtime config на стороне сервера: читать `phpVersion`, валидировать формат (например `8.1`, `8.2`, `8.3`).
@@ -231,7 +231,7 @@
     - Добавлены regression-тесты для `self`, `static`, `parent` в аргументах и return type (включая nullable/union при допустимом синтаксисе).
     - Не сломаны текущие проверки unknown-class/unknown-type.
 
-- [ ] **H-008** PHPDoc parser: корректный разбор сложных типов и тегов
+- [x] **H-008** PHPDoc parser: корректный разбор сложных типов и тегов *(done 2026-05-22 via PR-031)*
   - Проблема: текущий разбор `@param/@return/@var` обрезает тип до первого слова и неустойчив для `array<int, User>`, `(A&B)|null`, `callable(...)`, и похожих форм.
   - Что сделать:
     - Переписать извлечение type-expression из строки тега без `first_word` (учесть generic-скобки `<...>`, круглые скобки, `|`, `&`, `?`).
@@ -242,7 +242,7 @@
     - `@method` содержит распарсенные params (минимум имя + type если указан).
     - Все существующие тесты `phpdoc` проходят + новые regression-тесты.
 
-- [ ] **H-009** PHPDoc model: разделить `@property`, `@property-read`, `@property-write`
+- [x] **H-009** PHPDoc model: разделить `@property`, `@property-read`, `@property-write` *(done 2026-05-22 via PR-032)*
   - Проблема: в модели нет различия read/write семантики virtual property; сейчас все варианты обрабатываются одинаково.
   - Что сделать:
     - Расширить структуру `PhpDocProperty` флагами доступа (`readable`/`writable`) или enum-kind.
@@ -252,7 +252,7 @@
     - Для трех тегов (`@property`, `@property-read`, `@property-write`) в тестах получаются разные значения access-mode.
     - Обратная совместимость: старые кейсы не ломаются.
 
-- [ ] **H-010** UI для PHPDoc в LSP: показывать `@throws`, `@var`, `@property*`, `@method`
+- [x] **H-010** UI для PHPDoc в LSP: показывать `@throws`, `@var`, `@property*`, `@method` *(done 2026-05-22 via PR-033)*
   - Проблема: hover/completion сейчас показывают только summary + `@param` + `@return` + `@deprecated`; остальные полезные теги теряются.
   - Что сделать:
     - Расширить markdown-рендер в `textDocument/hover` и `completionItem/resolve`.
@@ -272,7 +272,7 @@
     - На фикстуре с inline `@var` (`lsp-cases/src/PhpDoc/EdgeCases.php`) улучшается member completion.
     - Нет cross-scope false positives в references/definition.
 
-- [ ] **H-012** PHPDoc virtual members в completion/definition
+- [x] **H-012** PHPDoc virtual members в completion/definition *(done 2026-05-22 via PR-033)*
   - Проблема: class-level `@property` и `@method` сейчас не участвуют в навигации/автодополнении как виртуальные члены.
   - Что сделать:
     - Подмешивать virtual members из PHPDoc класса в completion для `$obj->`.
@@ -283,7 +283,7 @@
     - `Ctrl+Click` по virtual member возвращает definition в doc-comment.
     - Есть e2e/интеграционные тесты на completion + definition для virtual members.
 
-- [ ] **H-013** E2E покрытие PHPDoc (fixture-driven)
+- [x] **H-013** E2E покрытие PHPDoc (fixture-driven) *(done 2026-05-22 via PR-034)*
   - Проблема: есть unit-тесты parser-а, но не хватает сквозных e2e-тестов LSP на PHPDoc-поведение.
   - Что сделать:
     - Добавить e2e сценарии на `hover`, `completionItem/resolve`, `definition` по кейсам из `test-fixtures/lsp-cases/src/PhpDoc/*`.
@@ -561,10 +561,6 @@
 
 ### Performance
 
-- [ ] **V1-010** Профилирование на Laravel проекте
-  - Замер: время индексации, память, latency hover/completion
-  - Оптимизация bottleneck'ов
-
 - [x] **V1-011** Lazy vendor indexing — оптимизация *(done 2026-05-22)*
   - Предзагрузка popular packages
   - LRU-кэш для vendor-файлов
@@ -573,9 +569,9 @@
 
 ### Documentation
 
-- [ ] **V1-012** docs/architecture.md — потоки данных, диаграммы
-- [ ] **V1-013** docs/lsp-features.md — таблица статусов LSP-фич
-- [ ] **V1-014** README.md — полный (установка, настройки, troubleshooting)
+- [x] **V1-012** docs/architecture.md — потоки данных, диаграммы *(done 2026-05-25 via PR-052)*
+- [x] **V1-013** docs/lsp-features.md — таблица статусов LSP-фич *(done 2026-05-25 via PR-052)*
+- [x] **V1-014** README.md — полный (установка, настройки, troubleshooting) *(done 2026-05-25 via PR-052)*
 
 ---
 
@@ -873,17 +869,33 @@
   - Implemented: Alpine/musl убран из documented published target set; Linux release binaries documented как GNU/glibc (`*-unknown-linux-gnu`).
   - Validation: `actionlint` через `go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/release.yml`, YAML syntax parse, `bash -n` для shell scripts, `npm run lint`, `npm run build`, local VSIX package через `npx @vscode/vsce package --no-dependencies -o /tmp/ht-php-lsp-local-smoke.vsix`, smoke test на реальном `linux-x64` VSIX, synthetic universal VSIX smoke, `git diff --check`.
 
-- [ ] **PR-052** Документация production-ready
+- [x] **PR-052** Документация production-ready *(completed 2026-05-25)*
   - `docs/architecture.md`: data flow, indexing/cache model, diagnostics pipeline.
   - `docs/lsp-features.md`: таблица supported/partial/unsupported.
   - `docs/performance.md`: baseline, методика измерений, known bottlenecks.
   - README: установка, настройки, troubleshooting, external analyzers, formatter setup.
+  - Implemented: `docs/architecture.md` описывает components, startup flow, workspace roots, open-file lifecycle, symbol index, cache namespaces, indexing, stubs/vendor, diagnostics, runtime config, cache clearing.
+  - Implemented: `docs/lsp-features.md` фиксирует supported/partial/unsupported LSP capabilities и ограничения для heavy requests, formatter, file operations, hierarchies, semantic tokens.
+  - Implemented: `docs/performance.md` описывает baseline sources, profiling/latency commands, cache interpretation, package smoke, acceptance targets and validation commands.
+  - Implemented: README получил documentation links и troubleshooting для server startup, stale/slow indexing, noisy diagnostics, PHPStan/Psalm, formatting.
+  - Validation: docs file existence checks, README/TASKS link references via `rg`, `git diff --check`.
 
-- [ ] **PR-053** Финальный acceptance прогон
+- [x] **PR-053** Финальный acceptance прогон *(completed 2026-05-25)*
   - Все unit/e2e tests проходят.
   - Perf numbers внесены в docs.
   - Known limitations актуальны.
   - `TASKS.md` обновлен: завершенные PR tasks отмечены, оставшиеся перенесены в следующий milestone.
+  - Implemented: acceptance refresh added to `docs/production-baseline.md` with current validation commands and Rust test breakdown (309 tests).
+  - Implemented: `docs/production-risk-register.md` updated after PR-020..PR-052 so known limitations match current debounce, cancellation, reference index, version-aware stubs, PHPDoc/type model, and LSP polish state.
+  - Implemented: old duplicate H/V documentation tasks marked done; remaining real Laravel profiling task moved to Next Milestone Backlog.
+  - Validation: `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `npm run lint`, `npm run build`, `actionlint` for CI/release workflows, `bash -n` for release/profile shell scripts, docs/link presence checks, stale-limitation search, `git diff --check`.
+
+### Next Milestone Backlog
+
+- [ ] **V1-010** Профилирование на Laravel проекте *(moved from vNext 2026-05-25)*
+  - Замер: время индексации, память, latency hover/completion.
+  - Оптимизация bottleneck'ов.
+  - Нужен реальный Laravel workspace path; текущий acceptance покрывает fixture/profile harness и общие LSP checks.
 
 ### Production Readiness Dependencies
 

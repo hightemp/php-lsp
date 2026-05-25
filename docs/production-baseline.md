@@ -37,6 +37,33 @@ Breakdown from `cargo test --all`:
 | `php-lsp-server` e2e tests | 43 |
 | `php-lsp-types` | 2 |
 
+## Acceptance Validation Refresh
+
+Date: 2026-05-25
+Scope: final production-readiness acceptance after PR-052 documentation updates.
+
+| Command | Result |
+|---------|--------|
+| `cargo fmt --all --check` | pass |
+| `cargo test --all` | pass, 309 tests |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `npm run lint` | pass |
+| `npm run build` | pass |
+| `go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/ci.yml .github/workflows/release.yml` | pass |
+| `bash -n scripts/build-server.sh scripts/bundle-stubs.sh scripts/profile-workspace.sh scripts/benchmark-lsp-latency.sh scripts/smoke-vsix.sh` | pass |
+| `git diff --check` | pass |
+
+Rust acceptance test breakdown:
+
+| Target | Tests |
+|--------|-------|
+| `php-lsp-completion` | 25 |
+| `php-lsp-index` | 28 |
+| `php-lsp-parser` | 153 |
+| `php-lsp-server` unit tests | 44 |
+| `php-lsp-server` e2e tests | 57 |
+| `php-lsp-types` | 2 |
+
 ## Build Artifacts
 
 | Artifact | Command | Size |
