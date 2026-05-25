@@ -1296,13 +1296,19 @@ PR-052 ─→ PR-053
   - Regression: unit tests cover TOML normalization/merge; e2e covers project diagnostics config and watched-file reload.
   - Validation: `cargo fmt --all --check`, targeted config/e2e tests, `cargo test -p php-lsp-server`, CLI `init-config` smoke, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `npm run lint`, `npm run check:commands`, `npm run build`, docs Cyrillic check, `git diff --check`.
 
-- [ ] **IE-005** Внедрить `codeAction/resolve` infrastructure
+- [x] **IE-005** Внедрить `codeAction/resolve` infrastructure *(done 2026-05-25)*
   - Advertise `code_action_provider.resolve_provider = true`.
   - Создать typed `CodeActionData` с `action_kind`, `uri`, `range`, `document_version`, `extra`.
   - Existing cheap actions могут оставаться eagerly computed.
   - Heavy actions должны возвращать lightweight action без `edit`; edit вычисляется в `codeAction/resolve`.
   - Добавить stale guard: если document version изменилась, resolve возвращает no-op или пересчитывает action на актуальном тексте.
-  - Добавить e2e: unresolved class quickfix still works, heavy mock action resolves edit lazily, stale version guarded.
+  - Добавить e2e: unresolved class quickfix still works, heavy action resolves edit lazily, stale version guarded.
+  - Implemented: `Add return type` action now returns lightweight `CodeAction` with typed resolve data and no eager `WorkspaceEdit`.
+  - Implemented: `codeAction/resolve` computes the return-type edit on the current open document version and returns an empty edit for stale actions.
+  - Implemented: quickfix import and organize-imports actions remain eagerly editable.
+  - Docs: `docs/lsp-features.md` documents `codeAction/resolve` and lazy add-return-type behavior.
+  - Regression: e2e covers advertised resolve capability, lazy return-type resolve, stale-version no-op resolve, PHP-version filtering, and existing import quickfix behavior.
+  - Validation: `cargo fmt --all --check`, targeted e2e filters, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
 ### Неделя 2: production-useful code actions (2026-06-15 → 2026-06-21)
 

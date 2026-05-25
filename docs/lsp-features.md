@@ -67,7 +67,8 @@ tools.
 | `textDocument/prepareRename` | Supported | Rejects unsupported or built-in targets before rename. |
 | `textDocument/codeAction` quick fix | Supported | Adds imports for unresolved classes/functions when candidates exist. |
 | `source.organizeImports` | Supported | Sorts/removes import statements based on parser/index data. |
-| `refactor.rewrite` add return type | Partial | Adds return types from PHPDoc where supported by the configured PHP version. |
+| `codeAction/resolve` | Supported | Used for heavier refactor actions so `textDocument/codeAction` can return lightweight actions first. |
+| `refactor.rewrite` add return type | Partial | Adds return types from PHPDoc where supported by the configured PHP version. Edits are resolved lazily and stale document versions resolve to a no-op edit. |
 | Native PHP formatter | Unsupported | Formatting is delegated to external commands. |
 | `textDocument/formatting` | Partial | Requires `phpLsp.formatting.provider` or `phpLsp.formatting.command`. |
 | `textDocument/rangeFormatting` | Partial | Requires external formatter; formats selected PHP fragments via temporary files. |

@@ -37,6 +37,7 @@ use php_lsp_parser::semantic_tokens::{
 use php_lsp_parser::signature_help::signature_help_context_at_position;
 use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3470,43 +3471,108 @@ fn return_type_hint(
 
 fn build_add_return_type_action(
     uri: Uri,
-    source: &str,
     candidate: &MissingReturnTypeCandidate,
     php_version: PhpVersion,
+    request_range: Range,
+    document_version: Option<i32>,
 ) -> Option<CodeActionOrCommand> {
     let hint = return_type_hint(&candidate.return_type, php_version)?;
-    let utf16_index = Utf16LineIndex::new(source);
-    let insert_position = Position::new(
-        candidate.insert_position.0,
-        utf16_index.byte_col_to_utf16(candidate.insert_position.0, candidate.insert_position.1),
-    );
-
-    let mut changes = std::collections::HashMap::new();
-    changes.insert(
-        uri,
-        vec![TextEdit {
-            range: Range {
-                start: insert_position,
-                end: insert_position,
+    let data = serde_json::to_value(CodeActionData {
+        action_kind: CodeActionDataKind::AddReturnType,
+        uri: uri.as_str().to_string(),
+        range: request_range,
+        document_version,
+        extra: CodeActionDataExtra::AddReturnType {
+            hint: hint.clone(),
+            insert_position: CodeActionInsertPosition {
+                line: candidate.insert_position.0,
+                byte_character: candidate.insert_position.1,
             },
-            new_text: format!(": {}", hint),
-        }],
-    );
+        },
+    })
+    .ok()?;
 
     Some(CodeActionOrCommand::CodeAction(CodeAction {
         title: format!("Add return type `{}`", hint),
         kind: Some(CodeActionKind::REFACTOR_REWRITE),
         diagnostics: None,
-        edit: Some(WorkspaceEdit {
-            changes: Some(changes),
-            document_changes: None,
-            change_annotations: None,
-        }),
+        edit: None,
         command: None,
         is_preferred: Some(false),
         disabled: None,
-        data: None,
+        data: Some(data),
     }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum CodeActionDataKind {
+    AddReturnType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeActionData {
+    action_kind: CodeActionDataKind,
+    uri: String,
+    range: Range,
+    document_version: Option<i32>,
+    extra: CodeActionDataExtra,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum CodeActionDataExtra {
+    AddReturnType {
+        hint: String,
+        insert_position: CodeActionInsertPosition,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeActionInsertPosition {
+    line: u32,
+    byte_character: u32,
+}
+
+fn empty_workspace_edit() -> WorkspaceEdit {
+    WorkspaceEdit {
+        changes: Some(HashMap::new()),
+        document_changes: None,
+        change_annotations: None,
+    }
+}
+
+fn add_return_type_edit(
+    uri: Uri,
+    source: &str,
+    hint: &str,
+    insert_position: CodeActionInsertPosition,
+) -> WorkspaceEdit {
+    let utf16_index = Utf16LineIndex::new(source);
+    let position = Position::new(
+        insert_position.line,
+        utf16_index.byte_col_to_utf16(insert_position.line, insert_position.byte_character),
+    );
+
+    let mut changes = HashMap::new();
+    changes.insert(
+        uri,
+        vec![TextEdit {
+            range: Range {
+                start: position,
+                end: position,
+            },
+            new_text: format!(": {}", hint),
+        }],
+    );
+
+    WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    }
 }
 
 fn semantic_tokens_legend() -> SemanticTokensLegend {
@@ -10480,7 +10546,7 @@ impl LanguageServer for PhpLspBackend {
                             CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
                             CodeActionKind::REFACTOR_REWRITE,
                         ]),
-                        resolve_provider: Some(false),
+                        resolve_provider: Some(true),
                         work_done_progress_options: WorkDoneProgressOptions::default(),
                     },
                 )),
@@ -13287,6 +13353,7 @@ impl LanguageServer for PhpLspBackend {
         let uri = params.text_document.uri;
         let uri_str = uri.as_str().to_string();
         let php_version = *self.php_version.lock().await;
+        let document_version = self.current_document_version(&uri_str);
 
         let (source, file_symbols, add_return_type_actions) = {
             let parser = match self.open_files.get(&uri_str) {
@@ -13309,7 +13376,13 @@ impl LanguageServer for PhpLspBackend {
                 find_missing_return_type_candidates(tree, &source, range)
                     .into_iter()
                     .filter_map(|candidate| {
-                        build_add_return_type_action(uri.clone(), &source, &candidate, php_version)
+                        build_add_return_type_action(
+                            uri.clone(),
+                            &candidate,
+                            php_version,
+                            params.range,
+                            document_version,
+                        )
                     })
                     .collect()
             } else {
@@ -13436,6 +13509,60 @@ impl LanguageServer for PhpLspBackend {
         }
 
         Ok(Some(actions))
+    }
+
+    async fn code_action_resolve(&self, mut params: CodeAction) -> Result<CodeAction> {
+        let Some(data_value) = params.data.clone() else {
+            return Ok(params);
+        };
+        let Ok(data) = serde_json::from_value::<CodeActionData>(data_value) else {
+            return Ok(params);
+        };
+
+        let CodeActionData {
+            action_kind,
+            uri,
+            range: _requested_range,
+            document_version,
+            extra,
+        } = data;
+
+        match (action_kind, extra) {
+            (
+                CodeActionDataKind::AddReturnType,
+                CodeActionDataExtra::AddReturnType {
+                    hint,
+                    insert_position,
+                },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let source = match self.open_files.get(&uri) {
+                    Some(parser) => parser.source(),
+                    None => {
+                        params.edit = Some(empty_workspace_edit());
+                        return Ok(params);
+                    }
+                };
+
+                params.edit = Some(add_return_type_edit(
+                    uri_value,
+                    &source,
+                    &hint,
+                    insert_position,
+                ));
+            }
+        }
+
+        Ok(params)
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {

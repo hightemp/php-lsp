@@ -341,6 +341,13 @@ fn completion_resolve_request(id: i64, item: serde_json::Value) -> Request {
         .finish()
 }
 
+fn code_action_resolve_request(id: i64, action: serde_json::Value) -> Request {
+    Request::build("codeAction/resolve")
+        .params(action)
+        .id(id)
+        .finish()
+}
+
 fn signature_help_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/signatureHelp")
         .params(json!({
@@ -970,6 +977,16 @@ async fn test_initialize_and_shutdown() {
             .and_then(|c| c.get("codeActionProvider"))
             .is_some(),
         "expected codeActionProvider capability"
+    );
+    assert_eq!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("codeActionProvider"))
+            .and_then(|provider| provider.get("resolveProvider"))
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "expected codeActionProvider with resolve support, got: {}",
+        result
     );
     assert!(
         result
@@ -4470,8 +4487,26 @@ class Demo {
         function_action.get("kind").and_then(|v| v.as_str()),
         Some("refactor.rewrite")
     );
+    assert!(
+        function_action.get("edit").is_none(),
+        "add return type action should be resolved lazily, got: {}",
+        function_action
+    );
+    assert!(
+        function_action.get("data").is_some(),
+        "add return type action should carry resolve data, got: {}",
+        function_action
+    );
+    let function_resolve_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(3, function_action.clone()))
+        .await
+        .unwrap();
+    let function_resolved = extract_result(function_resolve_resp);
     assert_eq!(
-        function_action["edit"]["changes"][uri][0]["newText"].as_str(),
+        function_resolved["edit"]["changes"][uri][0]["newText"].as_str(),
         Some(": string|null")
     );
 
@@ -4481,8 +4516,17 @@ class Demo {
             action.get("title").and_then(|v| v.as_str()) == Some("Add return type `static`")
         })
         .unwrap_or_else(|| panic!("expected static return type action, got: {}", result));
+    assert_eq!(method_action.get("edit").and_then(|v| v.as_object()), None);
+    let method_resolve_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(4, method_action.clone()))
+        .await
+        .unwrap();
+    let method_resolved = extract_result(method_resolve_resp);
     assert_eq!(
-        method_action["edit"]["changes"][uri][0]["newText"].as_str(),
+        method_resolved["edit"]["changes"][uri][0]["newText"].as_str(),
         Some(": static")
     );
     assert!(
@@ -4494,6 +4538,106 @@ class Demo {
         }),
         "should not offer action for declarations that already have native return type: {}",
         result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_resolve_add_return_type_returns_noop_for_stale_version() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "8.2" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+/**
+ * @return string|null
+ */
+function label($value) {
+    return $value;
+}
+"#;
+    let uri = "file:///test/StaleAddReturnType.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(add_return_type_request(2, uri, ((0, 0), (8, 0))))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let action = result
+        .as_array()
+        .expect("code actions array")
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("expected add return type action, got: {}", result));
+
+    let changed_code = r#"<?php
+/**
+ * @return string|null
+ */
+function label($value): string|null {
+    return $value;
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(uri, 2, changed_code))
+        .await
+        .unwrap();
+
+    let resolve_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(3, action))
+        .await
+        .unwrap();
+    let resolved = extract_result(resolve_resp);
+    let changes = resolved["edit"]["changes"]
+        .as_object()
+        .expect("empty changes object");
+    assert!(
+        changes.is_empty(),
+        "stale add return type action should resolve to a no-op edit, got: {}",
+        resolved
     );
 
     service
