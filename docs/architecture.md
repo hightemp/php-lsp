@@ -51,8 +51,9 @@ Disk cache: workspace / stubs / vendor
    - `phpLsp.serverPath` if configured.
    - Otherwise `client/bin/<platform>/php-lsp` or `php-lsp.exe`.
 3. The client sends `initialize` with `initializationOptions` derived from
-   `phpLsp.*` settings, including PHP version, diagnostics mode, include/exclude
-   paths, stub extensions, formatter, analyzer commands, and bundled stubs path.
+   `phpLsp.*` settings, including PHP version, diagnostics mode/severity,
+   include/exclude paths, stub extensions, formatter, analyzer commands, and
+   bundled stubs path.
 4. The server stores the settings and advertises capabilities.
 5. After `initialized`, the server:
    - Discovers effective workspace roots, including Composer roots.
@@ -126,8 +127,9 @@ On `textDocument/didClose`:
 
 Top-level symbols are stored in dedicated maps for direct lookup. Members are
 stored in `file_symbols` and resolved through parent type lookup. Reference
-queries and rename use `file_references` first, but can still scan many indexed
-files for workspace-wide operations.
+queries, rename, and reference-count code lenses use `file_references` for
+non-local symbols. They avoid reparsing closed files in the common path, but can
+still iterate many indexed reference sets for workspace-wide operations.
 
 ## Disk Cache Model
 
@@ -251,9 +253,10 @@ Heavier requests include:
 - Incoming call hierarchy.
 - Some file-operation refreshes.
 
-These paths can iterate indexed files and may read unopened files from disk. The
-current production target is to keep the common open-file requests responsive
-while heavier operations are being optimized and measured.
+These paths can iterate indexed files and some hierarchy/lens paths may read
+unopened files from disk through blocking/background IO. The current production
+target is to keep common open-file requests responsive while heavier operations
+are measured on large projects.
 
 ## Configuration Updates
 

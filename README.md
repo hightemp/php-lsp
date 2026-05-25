@@ -131,6 +131,7 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.composer.enabled` | `true` | Enable `composer.json` autoload indexing. |
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
 | `phpLsp.diagnostics.mode` | `basic-semantic` | `off`, `syntax-only`, or `basic-semantic`. |
+| `phpLsp.diagnostics.severity` | Category warnings | Per-category severity for `unknownSymbols`, `unused`, `duplicateSymbols`, `members`, `typeCompatibility`, `overrideSignatures`, and `phpVersion`; values are `off`, `error`, `warning`, `information`, or `hint`. |
 | `phpLsp.formatting.provider` | `none` | `none`, `php-cs-fixer`, `phpcbf`, or `custom`. |
 | `phpLsp.formatting.command` | `""` | Custom formatter command; use `{file}` for the temporary PHP file. |
 | `phpLsp.phpstan.enabled` | `false` | Enable PHPStan diagnostics. |
@@ -160,6 +161,16 @@ Example external formatting setup:
   "phpLsp.formatting.provider": "php-cs-fixer"
 }
 ```
+
+## Commands
+
+The extension contributes these VS Code commands:
+
+| Command palette title | Command ID | Behavior |
+|---|---|---|
+| `PHP: Show Language Server Status` | `phpLsp.showStatus` | Opens the status quick pick with indexing, cache, stubs, diagnostics, formatter, analyzer, and server-binary details. |
+| `PHP: Restart Language Server` | `phpLsp.restartServer` | Restarts the client/server process and reuses the existing disk cache. |
+| `PHP: Clear PHP LSP Cache and Restart` | `phpLsp.clearCacheAndRestart` | Deletes cache directories for current workspace roots and discovered Composer roots, then restarts the server. |
 
 ## Documentation
 

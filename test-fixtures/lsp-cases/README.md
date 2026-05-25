@@ -9,7 +9,9 @@ This fixture set is designed for manual and automated checks of `php-lsp`.
   - `Unknown class`
   - `Unknown function` (namespaced calls)
   - constructor argument count mismatch
-- LSP requests: hover, go-to-definition, references, rename, completion, document symbols.
+- LSP requests: hover, go-to-definition, references, rename, completion,
+  document/workspace symbols, semantic tokens, inlay hints, code actions, code
+  lens, folding, selection ranges, and hierarchy requests.
 
 ## Structure
 - `src/Model`, `src/Service`: valid project-like code for indexing and cross-file navigation.
@@ -22,7 +24,8 @@ This fixture set is designed for manual and automated checks of `php-lsp`.
 - `src/Diagnostics/SemanticUnknowns.php`:
   unresolved class `use`, unknown class in `new`, type hints, inheritance, and unknown namespaced function.
 - `src/Diagnostics/ArgumentCountMismatch.php`:
-  constructor arity errors (too few/too many) and variadic no-false-positive.
+  constructor/function arity errors and optional/variadic no-false-positive
+  cases.
 - `src/Diagnostics/BuiltinNoFalsePositive.php`:
   built-in classes/functions and special type names that should not be reported.
 - `src/Diagnostics/FrameworkNoFalsePositive.php`:
@@ -34,9 +37,10 @@ This fixture set is designed for manual and automated checks of `php-lsp`.
 - `src/Lsp/ReferencesRename.php`:
   references/rename for class, method, property, and class constant.
 - `src/Lsp/ReferencesUnsupported.php`:
-  current limitation check: variable references return no results.
+  legacy-named fixture for same-scope local variable references.
 - `src/Lsp/RenameDisallowed.php`:
-  expected rename failures (variables, built-ins, invalid names).
+  expected rename failures for built-ins and invalid names; local variable
+  rename is covered by e2e tests.
 - `src/Lsp/CompletionIncomplete.php`:
   completion contexts: variable, member, static, namespace, free keyword (with intentionally incomplete code).
 - `src/Lsp/DocumentSymbols.php`:
@@ -61,6 +65,6 @@ This fixture set is designed for manual and automated checks of `php-lsp`.
 ## Notes
 - Some files are intentionally invalid while typing (especially completion fixtures).
 - `RenameDisallowed.php` includes cases that should fail by design:
-  - variable rename is unsupported,
   - built-in symbol rename is blocked (when stubs are loaded).
+  - invalid names such as names with spaces/backslashes are rejected.
 - "All possible cases" here means all cases supported by the current implementation.

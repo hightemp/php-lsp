@@ -36,7 +36,8 @@ Current evidence:
 Impact:
 
 - Повторный запуск на 5k-10k PHP файлов still needs acceptance validation against the production target `< 5s до готового индекса из disk cache`.
-- Vendor composer metadata cache/LRU is still separate hardening work under `PR-012`.
+- Vendor composer metadata cache/LRU landed in `PR-012`; large real-project
+  validation is still needed.
 
 Mitigation:
 
@@ -89,7 +90,8 @@ Impact:
 Mitigation:
 
 - `PR-013`: implemented bounded parallel parse queue with stable progress/error aggregation.
-- `PR-023`: continue moving remaining blocking file IO/parse work out of hot async request paths.
+- `PR-023`: moved remaining known blocking file IO/parse work out of hot async
+  request paths or into explicit blocking contexts.
 
 Exit signal:
 

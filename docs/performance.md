@@ -97,7 +97,9 @@ Watch these requests closely:
 - Rename dry-run
 
 Hover, completion, and definition are the primary interactive latency budget.
-References and rename are heavier and remain active optimization targets.
+References and rename use indexed per-file references, but remain active
+measurement targets because workspace-wide result collection can still scale
+with indexed project size.
 
 ## Package And Release Size
 
@@ -189,8 +191,7 @@ npm run build
 For workflow/release changes:
 
 ```bash
-go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/release.yml
-bash -n scripts/*.sh
+go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/ci.yml .github/workflows/release.yml
+bash -n scripts/build-server.sh scripts/bundle-stubs.sh scripts/profile-workspace.sh scripts/benchmark-lsp-latency.sh scripts/smoke-vsix.sh
 git diff --check
 ```
-

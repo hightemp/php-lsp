@@ -40,7 +40,7 @@ tools.
 | `textDocument/declaration` | Supported | Goes to import declarations when applicable, otherwise falls back to definition. |
 | `textDocument/typeDefinition` | Supported | Resolves variable/member/function return types where inferred or indexed. |
 | `textDocument/implementation` | Supported | Interface/trait/base type to implementations, and method implementation lookup. |
-| `textDocument/references` | Partial | Functional for symbols and local variables. Workspace symbol references can still be expensive on large workspaces. |
+| `textDocument/references` | Partial | Uses indexed per-file references for symbols and same-scope references for local variables. Workspace-wide references can still be expensive on large workspaces. |
 | `textDocument/documentHighlight` | Supported | Local variables and non-local symbols in the current document. |
 | `textDocument/selectionRange` | Supported | AST-based selection expansion. |
 | `textDocument/linkedEditingRange` | Partial | Namespace/use alias ranges only. |
@@ -62,7 +62,7 @@ tools.
 
 | LSP feature | Status | Notes |
 |---|---|---|
-| `textDocument/rename` | Partial | Supports classes, functions, methods, properties, constants, and local variables. Local variables are same-scope only. Built-ins and PHPDoc virtual members are not renamed. Workspace rename can be expensive on large workspaces. |
+| `textDocument/rename` | Partial | Supports classes, functions, methods, properties, constants, and same-scope local variables. Built-ins and PHPDoc virtual members are not renamed. Workspace rename can still be expensive on large workspaces. |
 | `textDocument/prepareRename` | Supported | Rejects unsupported or built-in targets before rename. |
 | `textDocument/codeAction` quick fix | Supported | Adds imports for unresolved classes/functions when candidates exist. |
 | `source.organizeImports` | Supported | Sorts/removes import statements based on parser/index data. |
@@ -85,7 +85,7 @@ tools.
 | `completionItem/resolve` | Supported | Enriches PHPDoc virtual member completions. |
 | `textDocument/signatureHelp` | Supported | Functions, methods, constructors, and active parameter tracking. |
 | `textDocument/inlayHint` | Supported | Argument labels and inferred PHPDoc parameter/return hints. |
-| `textDocument/codeLens` | Partial | Reference-count lenses for symbols. Current implementation can be expensive because it counts references across indexed files. |
+| `textDocument/codeLens` | Partial | Reference-count lenses for symbols. Counts use indexed references but can still be expensive across very large workspaces. |
 | `textDocument/foldingRange` | Supported | PHP structures, comments, arrays, namespaces, and blocks. |
 | `textDocument/semanticTokens/full` | Supported | Full semantic token snapshots with result IDs. |
 | `textDocument/semanticTokens/full/delta` | Supported | Delta edits from previous full snapshots. |
@@ -98,5 +98,4 @@ tools.
 - Full PHP static analyzer replacement.
 - Complete generic/template/array-shape type system parity with PHPStan/Psalm.
 - Guaranteed sublinear references/rename/codeLens performance on very large
-  workspaces before the reference-index hardening tasks are complete.
-
+  workspaces without additional reference-index sharding or aggregation.

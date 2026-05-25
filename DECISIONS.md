@@ -2,6 +2,10 @@
 
 Зафиксированные решения, принятые перед началом разработки.
 
+Статус на 2026-05-25: этот файл остается ADR-журналом. Если решение было
+расширено последующими production-readiness задачами, ниже добавлен блок
+`Текущий статус`.
+
 ---
 
 ## ADR-001: Имя проекта
@@ -15,6 +19,11 @@
 
 **Обоснование:** короткое, универсальное, понятное, не занято на crates.io.
 
+**Текущий статус:** Marketplace package published as `hightemp.ht-php-lsp`
+(`client/package.json` name `ht-php-lsp`, publisher `hightemp`). Settings prefix
+remains `phpLsp.*`; command IDs remain `phpLsp.restartServer`,
+`phpLsp.clearCacheAndRestart`, and `phpLsp.showStatus`.
+
 ---
 
 ## ADR-002: Rust edition и MSRV
@@ -26,6 +35,9 @@
 - Широко доступна (вышла Dec 2023)
 - tower-lsp-server v0.23 требует MSRV 1.77 — фактически MSRV будет определяться зависимостями
 - Edition 2021 — стабильная, поддерживается всеми инструментами
+
+**Текущий статус:** workspace MSRV is `1.85` in `server/Cargo.toml`; README
+badges and prerequisites use Rust 1.85+.
 
 ---
 
@@ -46,6 +58,11 @@
 **Известное ограничение:** нотификации обрабатываются асинхронно (out-of-order).
 **Mitigation:** собственная очередь для didChange через mpsc channel с ordering по version.
 
+**Текущий статус:** didChange ordering is enforced by latest-version tracking,
+stale/duplicate version rejection, per-URI debounced diagnostics tasks, and
+version checks before publish. This supersedes the original mpsc-only mitigation
+shape while preserving the same ordering goal.
+
 ---
 
 ## ADR-004: PHP парсер — tree-sitter-php
@@ -64,6 +81,11 @@
 5. Grammar `php` поддерживает mixed PHP/HTML файлы
 
 **Trade-off:** CST (не AST) — нужен слой маппинга CST → SymbolInfo. Одноразовая работа.
+
+**Текущий статус:** current workspace dependencies are `tree-sitter` `0.24`
+and `tree-sitter-php` `0.23` as declared in `server/Cargo.toml`. The project
+still uses grammar `php` and keeps UTF-16/LSP position conversion in
+`php-lsp-parser::utf16`.
 
 ---
 
@@ -97,6 +119,10 @@
 - Submodule легко обновить: `git submodule update --remote`
 - Не увеличивает размер бинарника
 
+**Текущий статус:** VSIX bundles selected stubs under `client/stubs/`. Runtime
+stubs are version-filtered by `phpLsp.phpVersion` where phpstorm-stubs metadata
+is supported, and cached under the separate `stubs` disk-cache namespace.
+
 ---
 
 ## ADR-007: Vendor индексация — lazy (on-demand)
@@ -113,6 +139,11 @@
 - Полная индексация vendor (10K+ файлов) замедляет startup
 - Lazy подход: пользователь не замечает задержки (hover/definition при первом обращении ~10мс)
 - Конфигурируемо: `phpLsp.indexVendor`
+
+**Текущий статус:** lazy vendor symbols are cached under the `vendor` disk-cache
+namespace, Composer generated metadata is cached by fingerprint, the hot
+in-memory vendor symbol set is LRU-bounded, and selected `autoload.files`
+entrypoints are preloaded after workspace ready.
 
 ---
 
@@ -139,6 +170,12 @@
 - Библиотек для PHPDoc на Rust нет
 - Полный парсер PHPDoc (с generics) — значительный объём работы, отложен на v1/vNext
 
+**Текущий статус:** parser now handles nested generics, callable signatures,
+array shapes, class-string, literal scalar types, `@property-read`,
+`@property-write`, virtual `@method` members, hover/completion/definition UI
+for virtual members, and fixture-driven PHPDoc e2e coverage. Full PHPStan/Psalm
+template semantics remain out of scope.
+
 ---
 
 ## ADR-009: LSP integration тесты — in-process mock client
@@ -157,6 +194,10 @@
 
 **Дополнительно (v1):** smoke-тесты с реальным subprocess для проверки stdio.
 
+**Текущий статус:** in-process LSP e2e tests remain the main regression suite.
+Release/package smoke is covered by `scripts/smoke-vsix.sh`; profile and
+latency subprocess clients live under `scripts/`.
+
 ---
 
 ## ADR-010: Multi-root workspace — не в MVP
@@ -167,6 +208,11 @@
 - Один root = один composer.json = один индекс — значительно проще
 - Multi-root потребует: отдельный индекс на каждый root, сложный resolve cross-root, маппинг URI → root
 - Добавить в v1/vNext когда архитектура стабилизируется
+
+**Текущий статус:** superseded. Multi-root workspace support is implemented:
+the server consumes `workspaceFolders`, discovers effective Composer roots,
+updates roots on `workspace/didChangeWorkspaceFolders`, and reindexes added
+roots.
 
 ---
 
@@ -234,6 +280,11 @@
 - Дисциплинирует: код всегда компилируется, тесты проходят
 - Минимальный overhead: один yml файл
 
+**Текущий статус:** CI runs Rust fmt/clippy/tests and client typecheck/build.
+Release workflow builds six platform binaries, packages a universal VSIX, runs
+VSIX smoke checks, creates a GitHub release, and publishes to VS Marketplace
+when `VSCE_PAT` is configured.
+
 ---
 
 ## ADR-016: Mixed PHP/HTML — grammar `php`
@@ -258,6 +309,6 @@
 | 3 | CST ≠ AST (tree-sitter) | Средняя | Среднее | Явный модуль symbols.rs для маппинга. Одноразовая работа |
 | 4 | tower-lsp notification ordering | Средняя | Высокое | mpsc channel + ordering по document version |
 | 5 | Память на крупных проектах | Средняя | Среднее | Lazy vendor indexing. Compact symbol representation |
-| 6 | PHPDoc parsing сложность | Средняя | Среднее | MVP: базовые теги. Расширенные — vNext |
+| 6 | PHPDoc parsing сложность | Средняя | Среднее | Поддержаны сложные PHPDoc type forms и virtual members; full analyzer-level templates remain external-analyzer territory |
 | 7 | phpstorm-stubs размер (~50MB) | Низкая | Низкое | Парсить при первом запуске, кэшировать (~5-10MB compact) |
 | 8 | tree-sitter-php лаг новых фич PHP | Низкая | Низкое | Грамматика активно поддерживается. При необходимости — PR upstream |

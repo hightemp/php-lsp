@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace App\Lsp;
 
-// CASE: Variable rename is not supported by current server implementation.
-function cannotRenameVariable(): void
+// CASE: Same-scope variable rename is supported by current server implementation.
+function canRenameLocalVariable(): void
 {
     $counter = 1;
     $counter++;
@@ -21,4 +21,3 @@ function cannotRenameBuiltin(): int
 // CASE: Invalid new name samples for rename request validation:
 // - "new name" (contains space) -> invalid params
 // - "Bad\\Name" (contains backslash) -> invalid params
-

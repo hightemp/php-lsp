@@ -1,5 +1,11 @@
 # Production Baseline
 
+Latest acceptance refresh: 2026-05-25
+Current project version: `0.5.5`
+Latest checked revision: `96ce449`
+
+## Initial Baseline
+
 Дата замера: 2026-05-21 15:57 MSK  
 Git revision: `ca1d6d6`  
 Host: `Linux apanov-Legion-S7-16IAH7 6.8.0-110-generic x86_64`
