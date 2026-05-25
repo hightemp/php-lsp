@@ -160,3 +160,154 @@ Second run result:
 | `small-cache-smoke-pr011` | `target/php-lsp-profile/cache-smoke-pr011/php-lsp/0da0d009104fa203/workspace/index.bin` | 4 | 4 | 14 | 26.71 ms |
 
 This validates the `PR-010` workspace cache path and mtime/size-valid file-symbol loading on a small fixture. After `PR-011`, workspace/stubs/vendor snapshots live under separate namespace directories below the same workspace hash; this smoke run created `workspace/index.bin` and `stubs/index.bin`, with second-run stubs load at 23.23 ms. Large-project acceptance is still tracked by the milestone exit criteria and should be measured with the same command against 5k-10k PHP files.
+
+## Production Validation Large Workspace Run
+
+Date: 2026-05-25
+Milestone task: `PV-001` / `PV-002`
+Primary scenario: `large-symfony`
+
+Workspace inventory:
+
+| Scenario | PHP files | Indexed files | Symbols | Workspace size | Composer metadata | Notes |
+|----------|-----------|---------------|---------|----------------|-------------------|-------|
+| `large-laravel-crm` | 904 | 866 | 2401 | 99M | `composer.json`, `composer.lock` | Additional Laravel-like scenario; below the 5k-file target. |
+| `large-symfony` | 10631 | 10575 | 72683 | 482M | `composer.json` | Primary large acceptance scenario; no `composer.lock` or `vendor/composer/installed.json`. |
+| `large-monica` | 1656 | 1330 | 7163 | 169M | `composer.json`, `composer.lock` | Additional Laravel-like scenario; below the 5k-file target. |
+
+Profile smoke outputs:
+
+| Scenario | JSON | Ready time | Peak RSS |
+|----------|------|------------|----------|
+| `large-laravel-crm` | `target/php-lsp-profile/large-laravel-crm.json` | 467.61 ms | 76,668,928 bytes |
+| `large-symfony` | `target/php-lsp-profile/large-symfony.json` | 7460.54 ms | 728,272,896 bytes |
+| `large-monica` | `target/php-lsp-profile/large-monica.json` | 620.68 ms | 107,020,288 bytes |
+
+Isolated cache command:
+
+```bash
+rm -rf target/php-lsp-profile/large-cache
+XDG_CACHE_HOME="$PWD/target/php-lsp-profile/large-cache" \
+  scripts/profile-workspace.sh --scenario large-symfony-cold=<large-symfony-workspace> --timeout 300
+XDG_CACHE_HOME="$PWD/target/php-lsp-profile/large-cache" \
+  scripts/profile-workspace.sh --scenario large-symfony-warm=<large-symfony-workspace> --timeout 300
+```
+
+Cold/warm cache results:
+
+| Scenario | Cache loaded | Cache missing | Indexed files | Symbols | Stub files | Stubs load | Ready time | Peak RSS |
+|----------|--------------|---------------|---------------|---------|------------|------------|------------|----------|
+| `large-symfony-cold` | 0 | 10575 | 10575 | 72683 | 86 | 313.73 ms | 7349.48 ms | 730,419,200 bytes |
+| `large-symfony-warm` | 10575 | 0 | 10575 | 72683 | 86 | 33.79 ms | 3423.19 ms | 625,729,536 bytes |
+
+Cache artifacts:
+
+| Namespace | Path | Size |
+|-----------|------|------|
+| `workspace` | `target/php-lsp-profile/large-cache/php-lsp/b416e4a456d014e6/workspace/index.bin` | 141,725,060 bytes |
+| `stubs` | `target/php-lsp-profile/large-cache/php-lsp/b416e4a456d014e6/stubs/index.bin` | 4,351,427 bytes |
+
+Result: the primary large workspace meets the warm-start target `< 5s`
+(`3423.19 ms` to `phase=ready`) from disk cache. Latency and heavy-request
+acceptance are tracked separately by `PV-003` and `PV-004`.
+
+### Large Workspace Latency
+
+Command:
+
+```bash
+scripts/benchmark-lsp-latency.sh \
+  --iterations 20 \
+  --timeout 300 \
+  --scenario large-symfony=<large-symfony-workspace>
+```
+
+Output: `target/php-lsp-profile/large-symfony-latency.json`
+
+Warm-index p95/p99 summary:
+
+| State | Hover p95 / p99 | Completion p95 / p99 | Definition p95 / p99 | References p95 / p99 | Rename dry-run p95 / p99 |
+|-------|-----------------|----------------------|----------------------|----------------------|--------------------------|
+| `open` | 3.562 ms / 4.164 ms | 6.556 ms / 7.462 ms | 2.855 ms / 3.050 ms | 72.527 ms / 74.123 ms | 73.529 ms / 73.619 ms |
+| `unopened` | 0.206 ms / 0.449 ms | 0.248 ms / 0.289 ms | 0.338 ms / 0.398 ms | 0.218 ms / 0.285 ms | 0.144 ms / 0.230 ms |
+
+Result: warm p95 for common interactive requests (`hover`, `completion`,
+`definition`) is below the `<50ms` production target on the primary large
+workspace. Warm open-file `references` and rename dry-run are materially more
+expensive at roughly 73ms p95 and remain covered by `PV-004` heavy-request
+responsiveness checks.
+
+### Large Workspace Heavy-Request Responsiveness
+
+Command:
+
+```bash
+scripts/benchmark-lsp-latency.sh \
+  --heavy-responsiveness \
+  --iterations 20 \
+  --timeout 300 \
+  --scenario large-symfony=<large-symfony-workspace>
+```
+
+Output: `target/php-lsp-profile/large-symfony-heavy-responsiveness.json`
+
+Fast requests while a heavy request is outstanding:
+
+| Heavy request | Hover p95 / p99 | Completion p95 / p99 |
+|---------------|-----------------|----------------------|
+| `references` | 6.067 ms / 6.199 ms | 5.851 ms / 6.381 ms |
+| `renameDryRun` | 5.755 ms / 5.875 ms | 6.390 ms / 6.425 ms |
+
+Heavy request duration and cancellation:
+
+| Request | Normal p95 / p99 | Cancelled | Cancel p95 / p99 |
+|---------|------------------|-----------|------------------|
+| `references` | 76.329 ms / 77.006 ms | 20/20 | 2.101 ms / 2.827 ms |
+| `renameDryRun` | 82.806 ms / 85.172 ms | 20/20 | 2.216 ms / 2.524 ms |
+
+Result: `references` and rename dry-run do not block unrelated
+hover/completion on the primary large workspace. Large-workspace
+`$/cancelRequest` also cancels both heavy request types consistently in this
+benchmark.
+
+## Packaged VSIX Dogfood Smoke
+
+Date: 2026-05-25
+Milestone task: `PV-011`
+
+Commands:
+
+```bash
+./scripts/build-server.sh
+./scripts/bundle-stubs.sh
+cd client
+npm ci
+npm run build
+npx @vscode/vsce package --no-dependencies -o /tmp/ht-php-lsp-pv011.vsix
+cd ..
+PHP_LSP_VSIX_PLATFORMS=linux-x64 scripts/smoke-vsix.sh /tmp/ht-php-lsp-pv011.vsix
+code --install-extension /tmp/ht-php-lsp-pv011.vsix --force
+code --list-extensions | rg '^hightemp\.ht-php-lsp$'
+```
+
+Result:
+
+| Check | Result |
+|-------|--------|
+| Host server build | pass, `client/bin/linux-x64/php-lsp` size 7.6M |
+| Stubs bundle | pass, 31 extensions, 3.5M |
+| Client build | pass |
+| Host VSIX package | pass, `/tmp/ht-php-lsp-pv011.vsix`, 3.99M |
+| Host VSIX smoke | pass with `PHP_LSP_VSIX_PLATFORMS=linux-x64` |
+| VS Code CLI install | pass, extension ID `hightemp.ht-php-lsp` installed |
+
+Notes:
+
+- The default `scripts/smoke-vsix.sh` checks the universal six-platform release
+  package. The local PV-011 package is host-only, so the smoke test was run with
+  `PHP_LSP_VSIX_PLATFORMS=linux-x64`.
+- `npm ci` reported audit findings in dependencies: 2 moderate and 1 high. The
+  audit warning did not fail build/package, but should be reviewed before GA if
+  dependency policy requires a clean audit.
+- Interactive VS Code UI dogfood checks for status popup and command palette
+  behavior still require a GUI session.

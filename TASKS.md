@@ -892,10 +892,253 @@
 
 ### Next Milestone Backlog
 
-- [ ] **V1-010** Профилирование на Laravel проекте *(moved from vNext 2026-05-25)*
+- [ ] **V1-010** Профилирование на Laravel проекте *(moved from vNext 2026-05-25; split into `PV-001`/`PV-002`)*
   - Замер: время индексации, память, latency hover/completion.
   - Оптимизация bottleneck'ов.
   - Нужен реальный Laravel workspace path; текущий acceptance покрывает fixture/profile harness и общие LSP checks.
+
+## Milestone: Production Validation & GA Hardening (2 недели)
+
+**Срок:** 2026-05-25 → 2026-06-07
+**Цель:** перевести проект из "release candidate / beta" в честный production-ready LSP для крупных PHP/Composer workspace. Этот milestone не про добавление новых LSP фич, а про доказательство производительности, устойчивости и качества на реальных проектах, фиксацию обнаруженных bottleneck'ов и обновление публичных production claims.
+
+### Exit criteria
+
+- Есть минимум один реальный Laravel или Symfony workspace с 5k-10k PHP files, на котором прогнаны профилирование, latency benchmark, heavy request benchmark и dogfood сценарии.
+- Warm start из disk cache до `phpLsp/indexingStatus phase=ready`: `< 5s` на выбранном large workspace.
+- Warm p95 для `hover`, `completion`, `definition`: `< 50ms` на выбранном large workspace.
+- `references`, `rename`, `codeLens` не блокируют параллельные `hover`/`completion`; если они остаются дорогими, есть измеренный лимит, mitigation task и честная документация.
+- Peak RSS на large workspace измерен и не показывает неконтролируемый рост между cold/warm runs.
+- 100 `didChange` за 1 секунду, external analyzer timeout/malformed JSON и cancel references/rename остаются covered tests.
+- `docs/production-baseline.md`, `docs/production-risk-register.md`, `docs/performance.md`, `README.md`, `docs/lsp-features.md` обновлены по фактическим результатам.
+- Перед релизом проходят: `cargo fmt --all --check`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `npm run lint`, `npm run build`, `actionlint`, `bash -n scripts/...`, `git diff --check`.
+
+### Неделя 1: измерения на реальном проекте и фиксация bottleneck'ов (2026-05-25 → 2026-05-31)
+
+- [x] **PV-001 / V1-010** Подготовить large PHP workspace для acceptance *(completed 2026-05-25)*
+  - Найти локальный реальный проект Laravel или Symfony с 5k-10k PHP files. Если такого нет, выбрать ближайший большой Composer workspace и зафиксировать отклонение.
+  - Known local test workspaces:
+    - `large-laravel-crm`: `/home/apanov/ForTesting/laravel-crm/`
+    - `large-symfony`: `/home/apanov/ForTesting/symfony`
+    - `large-monica`: `/home/apanov/ForTesting/monica`
+  - Записать абсолютный путь workspace в локальные run notes, но не коммитить приватные пути/данные в документацию. В docs писать anonymized label: `large-laravel`, `large-symfony`, `large-composer`.
+  - Проверить, что workspace открывается без destructive действий: не запускать composer install/update, миграции, тесты проекта или форматтеры проекта без отдельного явного решения.
+  - Зафиксировать счетчики: количество PHP files в project source, vendor files, общий размер workspace, наличие `composer.json`, `composer.lock`, `vendor/composer/installed.json`.
+  - Если workspace содержит generated/cache dirs, настроить `phpLsp.excludePaths` для профиля и документировать список excludes.
+  - Validation:
+    - `find <workspace> -name '*.php' | wc -l` или эквивалентный script result.
+    - `scripts/profile-workspace.sh --scenario large=<workspace> --timeout 300` стартует и пишет JSON.
+  - Result 2026-05-25:
+    - `large-laravel-crm`: 904 PHP files, 866 indexed files, 2401 symbols, 99M workspace, `composer.json`/`composer.lock` yes, no `vendor/composer/installed.json`, profile pass, ready 467.61 ms, peak RSS 76,668,928 bytes.
+    - `large-symfony`: 10631 PHP files, 10575 indexed files, 72683 symbols, 482M workspace, `composer.json` yes, no `composer.lock`, no `vendor/composer/installed.json`, profile pass, ready 7460.54 ms, peak RSS 728,272,896 bytes. Primary large acceptance candidate.
+    - `large-monica`: 1656 PHP files, 1330 indexed files, 7163 symbols, 169M workspace, `composer.json`/`composer.lock` yes, no `vendor/composer/installed.json`, profile pass, ready 620.68 ms, peak RSS 107,020,288 bytes.
+    - Profile JSON outputs: `target/php-lsp-profile/large-laravel-crm.json`, `target/php-lsp-profile/large-symfony.json`, `target/php-lsp-profile/large-monica.json`.
+
+- [x] **PV-002** Снять cold/warm indexing и cache baseline на large workspace *(completed 2026-05-25)*
+  - Использовать isolated cache, чтобы измерения были воспроизводимыми:
+    - `rm -rf target/php-lsp-profile/large-cache`
+    - `XDG_CACHE_HOME="$PWD/target/php-lsp-profile/large-cache" scripts/profile-workspace.sh --scenario large=<workspace> --timeout 300`
+    - повторить ту же команду второй раз для warm cache.
+  - Снять и внести в `docs/production-baseline.md`:
+    - time to `phpLsp/indexingStatus phase=ready`
+    - indexed files, symbols, stubs files
+    - cache files loaded/stale/missing
+    - stubs load time
+    - files/sec, symbols/sec если есть в JSON
+    - peak RSS
+    - cache path namespace stats: `workspace`, `stubs`, `vendor`
+  - Сравнить warm start с exit criteria `< 5s`.
+  - Если warm start не проходит:
+    - найти top bottleneck по JSON/logs
+    - создать follow-up `PV-FIX-*` task в этом milestone
+    - не править вслепую без измерения до/после.
+  - Validation:
+    - JSON артефакты есть в `target/php-lsp-profile/`.
+    - `docs/production-baseline.md` содержит large workspace cold/warm таблицу.
+    - `docs/production-risk-register.md` обновлен по `R-001`, `R-003`, `R-008`.
+  - Result 2026-05-25:
+    - Isolated cache run on `large-symfony` completed.
+    - Cold: 10575 indexed files, 72683 symbols, ready 7349.48 ms, stubs load 313.73 ms, peak RSS 730,419,200 bytes.
+    - Warm: 10575 cache files loaded, 0 missing/stale, ready 3423.19 ms, stubs load 33.79 ms, peak RSS 625,729,536 bytes.
+    - Warm start meets `<5s` large-workspace target.
+    - Cache artifacts: `workspace/index.bin` 141,725,060 bytes; `stubs/index.bin` 4,351,427 bytes.
+    - Updated `docs/production-baseline.md` and `docs/production-risk-register.md`.
+
+- [x] **PV-003** Снять latency benchmark на real large workspace *(completed 2026-05-25)*
+  - Запустить:
+    - `scripts/benchmark-lsp-latency.sh --iterations 20 --timeout 300 --scenario large=<workspace>`
+  - Проверить оба состояния benchmark, если script их поддерживает: `open` и `unopened`.
+  - Внести в `docs/production-baseline.md` p50/p95/p99 для:
+    - `textDocument/hover`
+    - `textDocument/completion`
+    - `textDocument/definition`
+    - `textDocument/references`
+    - rename dry-run
+  - Сравнить warm p95 `hover/completion/definition` с `< 50ms`.
+  - Если common request p95 не проходит:
+    - локализовать path: parser/open buffer, index lookup, lazy vendor hit, disk read fallback, UTF-16 conversion, completion provider.
+    - создать конкретный `PV-FIX-*` task с файлом/модулем и measured before/after target.
+  - Validation:
+    - `target/php-lsp-profile/*-latency.json` обновлен.
+    - `docs/performance.md` и `docs/production-baseline.md` отражают real large numbers.
+    - `docs/production-risk-register.md` обновлен по `R-002`, `R-004`, `R-005`.
+  - Result 2026-05-25:
+    - `scripts/benchmark-lsp-latency.sh --iterations 20 --timeout 300 --scenario large-symfony=<workspace>` passed.
+    - Output: `target/php-lsp-profile/large-symfony-latency.json`.
+    - Warm open p95: hover 3.562 ms, completion 6.556 ms, definition 2.855 ms.
+    - Warm unopened p95: hover 0.206 ms, completion 0.248 ms, definition 0.338 ms.
+    - Warm open heavy requests: references p95 72.527 ms, rename dry-run p95 73.529 ms.
+    - Common interactive latency meets `<50ms` production target; heavy request concurrency remains for `PV-004`.
+    - Updated `docs/production-baseline.md`, `docs/performance.md`, and `docs/production-risk-register.md`.
+
+- [x] **PV-004** Проверить heavy requests под нагрузкой *(completed 2026-05-25)*
+  - Цель: доказать, что `references`, `rename`, `codeLens`, incoming call hierarchy и file-operation refresh не блокируют быстрые `hover/completion`.
+  - Добавить или расширить benchmark/script, если текущего `benchmark-lsp-latency.sh` недостаточно:
+    - открыть PHP file из large workspace
+    - запустить долгий `references` или rename dry-run
+    - параллельно посылать `hover`/`completion` каждые 100-250ms
+    - измерить p95/p99 быстрых ответов во время heavy request
+  - Проверить `$/cancelRequest` для large `references` и `rename`, а не только fixture.
+  - Если `codeLens` дорогой:
+    - измерить число symbols в документе и reference-count latency
+    - рассмотреть batch/count cache или lazy codelens resolve task.
+  - Validation:
+    - benchmark выводит отдельные цифры "while heavy request is running".
+    - `docs/production-baseline.md` содержит таблицу heavy request responsiveness.
+    - Если есть bottleneck, добавлен `PV-FIX-*` task с target p95/p99.
+  - Implemented:
+    - Added `--heavy-responsiveness` mode to `scripts/benchmark-lsp-latency.sh` / `.py`.
+    - Added response buffering in the benchmark LSP client so out-of-order heavy/fast responses are not lost.
+    - Heavy mode measures hover/completion while `references` or rename dry-run is outstanding and then checks `$/cancelRequest` for both heavy request types.
+  - Result 2026-05-25:
+    - `scripts/benchmark-lsp-latency.sh --heavy-responsiveness --iterations 20 --timeout 300 --scenario large-symfony=<workspace>` passed.
+    - Output: `target/php-lsp-profile/large-symfony-heavy-responsiveness.json`.
+    - While `references` outstanding: hover p95 6.067 ms, completion p95 5.851 ms.
+    - While rename dry-run outstanding: hover p95 5.755 ms, completion p95 6.390 ms.
+    - Normal heavy p95: references 76.329 ms, rename dry-run 82.806 ms.
+    - Cancellation: references 20/20 cancelled, rename dry-run 20/20 cancelled; cancel p95 around 2.1-2.2 ms.
+    - No `PV-FIX-*` task needed from this run; `codeLens` remains a dogfood watch item.
+
+### Неделя 2: исправления, dogfooding, релизная готовность (2026-06-01 → 2026-06-07)
+
+- [x] **PV-010** Закрыть measured bottlenecks из `PV-002`-`PV-004` *(completed 2026-05-25)*
+  - Брать только bottleneck, подтвержденный измерением на large workspace или stress benchmark.
+  - Для каждого исправления:
+    - добавить regression/perf test или benchmark scenario
+    - сохранить before/after числа в `docs/production-baseline.md`
+    - обновить соответствующий риск в `docs/production-risk-register.md`
+  - Возможные направления, если измерения подтвердят проблему:
+    - reference count aggregation для `codeLens`
+    - inverted reference index by FQN/member key для `references`/`rename`
+    - дополнительное sharding/batching для `file_references`
+    - устранение disk read fallback из hot request path
+    - tuning vendor LRU/cache preload
+  - Validation:
+    - targeted benchmark показывает улучшение или документированное acceptable tradeoff.
+    - `cargo test --all` и `cargo clippy --all-targets -- -D warnings` проходят после code changes.
+  - Result 2026-05-25:
+    - `PV-002`: warm cache ready 3423.19 ms on `large-symfony`, below `<5s` target.
+    - `PV-003`: common warm p95 on `large-symfony` below `<50ms` target.
+    - `PV-004`: hover/completion stay below ~6.4 ms p95 while references/rename are outstanding; cancellation succeeds 20/20.
+    - No measured bottleneck from `PV-002`-`PV-004` requires a `PV-FIX-*` code task. Heavy references/rename remain documented as more expensive but acceptable for this acceptance pass.
+    - Benchmark tooling was extended and validated with `python3 -m py_compile scripts/benchmark-lsp-latency.py`, `bash -n scripts/benchmark-lsp-latency.sh`, and large-workspace benchmark runs.
+
+- [ ] **PV-011** Провести dogfood через packaged VSIX *(partial 2026-05-25; GUI dogfood pending)*
+  - Собрать package:
+    - `./scripts/build-server.sh`
+    - `./scripts/bundle-stubs.sh`
+    - `cd client && npm ci && npm run build && npx @vscode/vsce package --no-dependencies`
+  - Проверить package:
+    - `scripts/smoke-vsix.sh <path-to-vsix>`
+    - установить VSIX в VS Code
+    - открыть large workspace
+    - проверить status popup, indexing status, clear cache command, restart command.
+  - Dogfood checklist:
+    - open/edit/save PHP file with non-ASCII text
+    - hover/completion/definition on project symbol
+    - references/rename on class/method/property
+    - codeAction add use / organize imports on safe fixture or disposable branch
+    - PHPStan/Psalm disabled and enabled modes, если tools есть в workspace
+    - `PHP: Clear PHP LSP Cache and Restart` реально очищает cache dirs для workspace roots.
+  - Validation:
+    - `scripts/smoke-vsix.sh` passed.
+    - В `docs/production-baseline.md` есть dogfood notes: VSIX name/version, workspace label, pass/fail summary, known issues.
+  - Partial result 2026-05-25:
+    - Host package built at `/tmp/ht-php-lsp-pv011.vsix` (3.99M).
+    - `PHP_LSP_VSIX_PLATFORMS=linux-x64 scripts/smoke-vsix.sh /tmp/ht-php-lsp-pv011.vsix` passed.
+    - `code --install-extension /tmp/ht-php-lsp-pv011.vsix --force` passed; `code --list-extensions` shows `hightemp.ht-php-lsp`.
+    - Default universal smoke was not applicable to this host-only local package; universal six-platform package smoke remains covered by release workflow.
+    - `npm ci` reported audit findings: 2 moderate, 1 high. Build/package passed; audit review remains a GA policy question.
+    - Interactive GUI dogfood checks for status popup, command palette behavior, and opening large workspace are still pending.
+
+- [ ] **PV-012** Стабилизировать diagnostics false positives на real large workspace
+  - Прогнать diagnostics audit script или LSP client по выборке файлов из large workspace:
+    - framework controllers/services/models/tests
+    - files with PHPDoc generics/array shapes/callables
+    - files with vendor-heavy types
+  - Классифицировать diagnostics:
+    - true positive
+    - acceptable limitation
+    - false positive
+    - uncertain because project metadata missing
+  - Для false positives:
+    - добавить minimal fixture under `test-fixtures/lsp-cases/src/Diagnostics/`
+    - исправить без project-specific hardcode
+    - добавить unit/e2e regression.
+  - Для acceptable limitations:
+    - обновить `README.md` Known Limitations или `docs/lsp-features.md`.
+  - Validation:
+    - diagnostics audit summary добавлен в `docs/production-baseline.md`.
+    - Regression tests added for fixed false positives.
+
+- [ ] **PV-013** Закрыть или честно переоценить risk register
+  - Для каждого риска `R-001`-`R-010` в `docs/production-risk-register.md`:
+    - обновить current evidence по результатам large workspace measurements
+    - поменять status на `Mitigated`, `Accepted limitation`, или оставить `Partially mitigated` с новым owner task
+    - для `High` risks нельзя оставлять `Partially mitigated` без конкретной следующей задачи и измеримого exit signal.
+  - Обновить `README.md` Known Limitations:
+    - если large validation прошла, убрать "Production hardening is still in progress" или заменить на точную формулировку.
+    - если не прошла, явно написать какие thresholds не выполнены.
+  - Обновить `docs/lsp-features.md`, если capability behavior изменился.
+  - Validation:
+    - `rg -n "Partially mitigated|Production hardening is still in progress|Large-project acceptance thresholds are still" README.md docs/production-risk-register.md docs/lsp-features.md` проверен и результат осознанно оставлен или устранен.
+
+- [ ] **PV-014** Финальный GA acceptance прогон
+  - Запустить:
+    - `cd server && cargo fmt --all --check`
+    - `cd server && cargo test --all`
+    - `cd server && cargo clippy --all-targets -- -D warnings`
+    - `cd client && npm run lint`
+    - `cd client && npm run build`
+    - `go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/ci.yml .github/workflows/release.yml`
+    - `bash -n scripts/build-server.sh scripts/bundle-stubs.sh scripts/profile-workspace.sh scripts/benchmark-lsp-latency.sh scripts/smoke-vsix.sh`
+    - `git diff --check`
+  - Проверить release package smoke на свежем VSIX.
+  - Обновить `docs/production-baseline.md` финальным "GA Acceptance" блоком:
+    - дата
+    - git revision
+    - version
+    - команды
+    - test breakdown
+    - large workspace acceptance summary
+  - Если все exit criteria выполнены:
+    - отметить milestone tasks done
+    - добавить релизную задачу на bump/publish.
+  - Если нет:
+    - не называть проект production ready; оставить `0.x beta/RC` и создать следующий measured milestone.
+
+### Production Validation Dependencies
+
+```
+PV-001 ─→ PV-002 ─→ PV-003 ─→ PV-004
+PV-002 ─→ PV-010
+PV-003 ─→ PV-010
+PV-004 ─→ PV-010
+PV-010 ─→ PV-011 ─→ PV-012 ─→ PV-013 ─→ PV-014
+PV-002 ─→ PV-013
+PV-003 ─→ PV-013
+PV-004 ─→ PV-013
+```
 
 ### Production Readiness Dependencies
 
@@ -1004,6 +1247,9 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 
 ## Текущие задачи
 
+- [x] **T-2026-05-25** Добавить Monica в список локальных проектов для production validation.
+- [x] **T-2026-05-25** Добавить список локальных проектов для production validation.
+- [x] **T-2026-05-25** Разбить production-ready gaps на новый milestone задач для Codex.
 - [x] **T-2026-05-19** Добавить `.semantic-search` в ignore и проверить статус `server/data/stubs`.
 - [x] **T-2026-05-19** Добавить release/downloads badge в README и перенести нижний счётчик наверх.
 - [x] **T-2026-05-19** Дополнить README полным набором badge для GitHub и VS Marketplace.

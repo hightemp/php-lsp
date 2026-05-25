@@ -53,6 +53,7 @@ class LspSession:
         self.next_id = 1
         self.ready_observed = False
         self.status_events: list[dict[str, Any]] = []
+        self.pending_responses: dict[int, dict[str, Any]] = {}
         self.proc: subprocess.Popen[bytes] | None = None
         self.stderr_handle = None
 
@@ -164,6 +165,10 @@ class LspSession:
             self.ready_observed = True
 
     def wait_for_response(self, request_id: int, timeout_s: float) -> dict[str, Any] | None:
+        pending = self.pending_responses.pop(request_id, None)
+        if pending is not None:
+            return pending
+
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             msg = self.read_message(deadline - time.monotonic())
@@ -180,6 +185,9 @@ class LspSession:
                 continue
             if msg.get("id") == request_id:
                 return msg
+            if "id" in msg:
+                self.pending_responses[int(msg["id"])] = msg
+                continue
             self.observe_notification(msg)
         return None
 
@@ -444,6 +452,13 @@ def result_shape(response: dict[str, Any] | None) -> str:
     return type(result).__name__
 
 
+def is_cancelled_response(response: dict[str, Any] | None) -> bool:
+    if response is None:
+        return False
+    error = response.get("error")
+    return isinstance(error, dict) and error.get("code") == -32800
+
+
 def run_group(
     session: LspSession,
     phase: str,
@@ -512,6 +527,214 @@ def summarize(measurements: list[dict[str, Any]]) -> dict[str, Any]:
             "maxMs": round(max(durations), 3) if durations else None,
         }
     return summary
+
+
+def summarize_heavy(measurements: list[dict[str, Any]]) -> dict[str, Any]:
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    heavy_groups: dict[str, list[dict[str, Any]]] = {}
+    for item in measurements:
+        if item["kind"] == "fast":
+            key = (item["heavyCase"], item["case"])
+            groups.setdefault(key, []).append(item)
+        elif item["kind"] == "heavy":
+            heavy_groups.setdefault(item["case"], []).append(item)
+
+    summary: dict[str, Any] = {}
+    for (heavy_case, fast_case), items in sorted(groups.items()):
+        durations = [float(item["durationMs"]) for item in items if item.get("ok")]
+        key = f"while.{heavy_case}.{fast_case}"
+        summary[key] = {
+            "count": len(items),
+            "ok": sum(1 for item in items if item.get("ok")),
+            "errors": sum(1 for item in items if not item.get("ok")),
+            "p50Ms": percentile(durations, 50),
+            "p95Ms": percentile(durations, 95),
+            "p99Ms": percentile(durations, 99),
+            "minMs": round(min(durations), 3) if durations else None,
+            "maxMs": round(max(durations), 3) if durations else None,
+        }
+
+    for heavy_case, items in sorted(heavy_groups.items()):
+        durations = [float(item["durationMs"]) for item in items if item.get("ok")]
+        key = f"heavy.{heavy_case}"
+        summary[key] = {
+            "count": len(items),
+            "ok": sum(1 for item in items if item.get("ok")),
+            "errors": sum(1 for item in items if not item.get("ok")),
+            "p50Ms": percentile(durations, 50),
+            "p95Ms": percentile(durations, 95),
+            "p99Ms": percentile(durations, 99),
+            "minMs": round(min(durations), 3) if durations else None,
+            "maxMs": round(max(durations), 3) if durations else None,
+        }
+
+    cancel_groups: dict[str, list[dict[str, Any]]] = {}
+    for item in measurements:
+        if item["kind"] == "cancel":
+            cancel_groups.setdefault(item["case"], []).append(item)
+
+    for heavy_case, items in sorted(cancel_groups.items()):
+        durations = [float(item["durationMs"]) for item in items if item.get("responded")]
+        key = f"cancel.{heavy_case}"
+        summary[key] = {
+            "count": len(items),
+            "responded": sum(1 for item in items if item.get("responded")),
+            "cancelled": sum(1 for item in items if item.get("cancelled")),
+            "completedBeforeCancel": sum(1 for item in items if item.get("completedBeforeCancel")),
+            "errors": sum(1 for item in items if item.get("error") and not item.get("cancelled")),
+            "p50Ms": percentile(durations, 50),
+            "p95Ms": percentile(durations, 95),
+            "p99Ms": percentile(durations, 99),
+            "minMs": round(min(durations), 3) if durations else None,
+            "maxMs": round(max(durations), 3) if durations else None,
+        }
+    return summary
+
+
+def run_heavy_responsiveness_group(
+    session: LspSession,
+    cases: list[RequestCase],
+    iterations: int,
+) -> list[dict[str, Any]]:
+    heavy_cases = [case for case in cases if case.name in {"references", "renameDryRun"}]
+    fast_cases = [case for case in cases if case.name in {"hover", "completion"}]
+    if not heavy_cases:
+        raise RuntimeError("no references/renameDryRun cases available for heavy benchmark")
+    if not fast_cases:
+        raise RuntimeError("no hover/completion cases available for heavy benchmark")
+
+    measurements: list[dict[str, Any]] = []
+    for iteration in range(iterations):
+        for heavy_case in heavy_cases:
+            heavy_started = now_ms()
+            heavy_id = session.send_request(heavy_case.method, heavy_case.params)
+            for fast_case in fast_cases:
+                fast_started = now_ms()
+                fast_id = session.send_request(fast_case.method, fast_case.params)
+                fast_response = session.wait_for_response(fast_id, REQUEST_TIMEOUT_S)
+                fast_duration = now_ms() - fast_started
+                measurements.append(
+                    {
+                        "kind": "fast",
+                        "iteration": iteration + 1,
+                        "heavyCase": heavy_case.name,
+                        "case": fast_case.name,
+                        "method": fast_case.method,
+                        "file": str(fast_case.file),
+                        "durationMs": round(fast_duration, 3),
+                        "resultShape": result_shape(fast_response),
+                        "ok": fast_response is not None and "error" not in fast_response,
+                        "error": fast_response.get("error")
+                        if fast_response and "error" in fast_response
+                        else None,
+                    }
+                )
+
+            heavy_response = session.wait_for_response(heavy_id, REQUEST_TIMEOUT_S)
+            heavy_duration = now_ms() - heavy_started
+            measurements.append(
+                {
+                    "kind": "heavy",
+                    "iteration": iteration + 1,
+                    "case": heavy_case.name,
+                    "method": heavy_case.method,
+                    "file": str(heavy_case.file),
+                    "durationMs": round(heavy_duration, 3),
+                    "resultShape": result_shape(heavy_response),
+                    "ok": heavy_response is not None and "error" not in heavy_response,
+                    "error": heavy_response.get("error")
+                    if heavy_response and "error" in heavy_response
+                    else None,
+                }
+            )
+
+    for iteration in range(iterations):
+        for heavy_case in heavy_cases:
+            started = now_ms()
+            request_id = session.send_request(heavy_case.method, heavy_case.params)
+            session.send_notification("$/cancelRequest", {"id": request_id})
+            response = session.wait_for_response(request_id, REQUEST_TIMEOUT_S)
+            duration = now_ms() - started
+            cancelled = is_cancelled_response(response)
+            completed = response is not None and "error" not in response
+            measurements.append(
+                {
+                    "kind": "cancel",
+                    "iteration": iteration + 1,
+                    "case": heavy_case.name,
+                    "method": heavy_case.method,
+                    "file": str(heavy_case.file),
+                    "durationMs": round(duration, 3),
+                    "responded": response is not None,
+                    "cancelled": cancelled,
+                    "completedBeforeCancel": completed,
+                    "resultShape": result_shape(response),
+                    "error": response.get("error")
+                    if response and "error" in response
+                    else None,
+                }
+            )
+    return measurements
+
+
+def benchmark_heavy_responsiveness(args: argparse.Namespace) -> dict[str, Any]:
+    workspace = Path(args.workspace).resolve()
+    server = Path(args.server).resolve()
+    stubs = Path(args.stubs).resolve() if args.stubs else None
+    out_dir = Path(args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not workspace.exists():
+        raise FileNotFoundError(f"workspace does not exist: {workspace}")
+    if not server.exists():
+        raise FileNotFoundError(f"server binary does not exist: {server}")
+    if stubs is not None and not stubs.exists():
+        raise FileNotFoundError(f"stubs path does not exist: {stubs}")
+
+    cases = build_cases(workspace)
+    started = now_ms()
+    stderr_path = out_dir / f"{sanitize_name(args.scenario)}-heavy-responsiveness.stderr.log"
+    with LspSession(server, stderr_path, workspace, stubs, args.timeout) as session:
+        session.open_case_files(cases)
+        session.wait_ready()
+        measurements = run_heavy_responsiveness_group(session, cases, args.iterations)
+        status_events = session.status_events
+
+    result = {
+        "schemaVersion": 1,
+        "timestamp": timestamp(),
+        "scenario": args.scenario,
+        "workspaceRoot": str(workspace),
+        "serverPath": str(server),
+        "stubsPath": str(stubs) if stubs else None,
+        "iterations": args.iterations,
+        "status": "pass",
+        "durationMs": round(now_ms() - started, 3),
+        "cases": [
+            {
+                "case": case.name,
+                "method": case.method,
+                "file": str(case.file),
+                "position": {
+                    "line": case.position.line,
+                    "character": case.position.character,
+                },
+            }
+            for case in cases
+            if case.name in {"hover", "completion", "references", "renameDryRun"}
+        ],
+        "summary": summarize_heavy(measurements),
+        "measurements": measurements,
+        "lastReadyStatus": next(
+            (event for event in reversed(status_events) if event.get("phase") == "ready"),
+            None,
+        ),
+    }
+
+    output_path = out_dir / f"{sanitize_name(args.scenario)}-heavy-responsiveness.json"
+    output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    result["outputPath"] = str(output_path)
+    return result
 
 
 def run_session(
@@ -614,10 +837,15 @@ def main() -> int:
     parser.add_argument("--out", required=True, help="Output directory")
     parser.add_argument("--timeout", type=int, default=120, help="Server ready timeout in seconds")
     parser.add_argument("--iterations", type=int, default=5, help="Iterations per case and phase")
+    parser.add_argument(
+        "--heavy-responsiveness",
+        action="store_true",
+        help="Measure hover/completion latency while references/rename requests are outstanding",
+    )
     args = parser.parse_args()
 
     try:
-        result = benchmark(args)
+        result = benchmark_heavy_responsiveness(args) if args.heavy_responsiveness else benchmark(args)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

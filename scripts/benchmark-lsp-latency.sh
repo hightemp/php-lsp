@@ -9,6 +9,7 @@ STUBS_PATH="${PHP_LSP_BENCH_STUBS:-$REPO_ROOT/client/stubs}"
 OUT_DIR="${PHP_LSP_BENCH_OUT:-$REPO_ROOT/target/php-lsp-profile}"
 TIMEOUT="${PHP_LSP_BENCH_TIMEOUT:-120}"
 ITERATIONS="${PHP_LSP_BENCH_ITERATIONS:-5}"
+HEAVY_RESPONSIVENESS=0
 
 SCENARIOS=()
 
@@ -25,6 +26,7 @@ Options:
   --out DIR              output directory (default: target/php-lsp-profile)
   --timeout SECONDS      server ready timeout per session (default: 120)
   --iterations N         iterations per request/phase/open-state (default: 5)
+  --heavy-responsiveness measure hover/completion while references/rename are outstanding
   --scenario NAME=PATH   add a named scenario; may be passed multiple times
   -h, --help             show this help
 
@@ -79,6 +81,10 @@ while [[ $# -gt 0 ]]; do
         --iterations)
             ITERATIONS="$2"
             shift 2
+            ;;
+        --heavy-responsiveness)
+            HEAVY_RESPONSIVENESS=1
+            shift
             ;;
         --scenario)
             add_scenario "$2"
@@ -147,6 +153,10 @@ for SCENARIO in "${SCENARIOS[@]}"; do
 
     echo
     echo "=== Scenario: $NAME ==="
+    EXTRA_ARGS=()
+    if [[ "$HEAVY_RESPONSIVENESS" == "1" ]]; then
+        EXTRA_ARGS+=(--heavy-responsiveness)
+    fi
     "$REPO_ROOT/scripts/benchmark-lsp-latency.py" \
         --scenario "$NAME" \
         --workspace "$WORKSPACE" \
@@ -154,5 +164,6 @@ for SCENARIO in "${SCENARIOS[@]}"; do
         --stubs "$STUBS_PATH" \
         --out "$OUT_DIR" \
         --timeout "$TIMEOUT" \
-        --iterations "$ITERATIONS"
+        --iterations "$ITERATIONS" \
+        "${EXTRA_ARGS[@]}"
 done

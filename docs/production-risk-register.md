@@ -32,10 +32,17 @@ Current evidence:
 - Cache path: `~/.cache/php-lsp/{workspace-hash}/{namespace}/index.bin`.
 - Cache invalidates by file mtime/size, php-lsp version, PHP version, include/exclude paths, stub extension set and stubs hash.
 - Fixture smoke run shows cached workspace file symbols loading on second start.
+- `PV-002` large workspace run on `large-symfony` loaded 10575 workspace files
+  from disk cache on warm start; ready time improved from 7349.48 ms cold to
+  3423.19 ms warm, meeting the `<5s` large-workspace warm-start target.
+- `PV-002` also showed stubs cache load dropping from 313.73 ms cold to 33.79
+  ms warm.
 
 Impact:
 
-- Повторный запуск на 5k-10k PHP файлов still needs acceptance validation against the production target `< 5s до готового индекса из disk cache`.
+- Повторный запуск на primary 5k-10k PHP-file workspace meets the production
+  target `< 5s до готового индекса из disk cache`; changed-file invalidation
+  and additional real workspaces still need continued watch.
 - Vendor composer metadata cache/LRU landed in `PR-012`; large real-project
   validation is still needed.
 
@@ -57,11 +64,23 @@ Current evidence:
 - Workspace indexing, lazy vendor/stub indexing, `didOpen`, `didChange`, and watched-file reindex now collect per-file references.
 - `references`, `rename`, and `codeLens` use indexed references; closed files are not reparsed for the common path.
 - These requests still iterate indexed file reference sets and can remain O(indexed files) on very large workspaces.
+- `PV-003` latency benchmark on `large-symfony` shows warm open-file
+  `references` p95/p99 at 72.527 ms / 74.123 ms and rename dry-run p95/p99 at
+  73.529 ms / 73.619 ms.
+- In the same run, common warm open-file requests stayed below target:
+  hover p95 3.562 ms, completion p95 6.556 ms, definition p95 2.855 ms.
+- `PV-004` heavy-responsiveness benchmark on `large-symfony` shows
+  hover/completion p95 staying under 6.4 ms while `references` or rename dry-run
+  is outstanding.
+- `PV-004` normal heavy request p95: `references` 76.329 ms, rename dry-run
+  82.806 ms.
 
 Impact:
 
 - Latency no longer includes full workspace reparse, but can still grow with indexed workspace size.
 - `codeLens` reference counts may still be expensive on very large files/workspaces.
+- `references` and rename dry-run no longer look like a responsiveness blocker
+  on the primary large workspace; `codeLens` still needs separate dogfood watch.
 
 Mitigation:
 
@@ -81,10 +100,17 @@ Current evidence:
 - `PR-013` replaced the sequential indexing loop with a bounded `JoinSet::spawn_blocking` task queue.
 - Parse concurrency uses a CPU-aware default capped at 8 workers.
 - `WorkspaceIndex::update_file()` is still centralized after each parse task completes, and a regression test covers concurrent index updates.
+- `PV-002` primary large workspace cold run indexed 10575 files / 72683 symbols
+  with `filesPerSec=1503.84`, `symbolsPerSec=10336.04`, and peak RSS
+  730,419,200 bytes.
+- `PV-002` warm cache run loaded the same workspace with peak RSS 625,729,536
+  bytes and ready time 3423.19 ms.
 
 Impact:
 
-- Large-project speedup and memory profile still need acceptance measurement on 5k-10k PHP files.
+- Large-project indexing and memory profile now have a first acceptance
+  measurement on `large-symfony`; more projects and latency/heavy-request
+  benchmarks are still required before GA.
 - Other sync file IO hot paths are still tracked by `R-004`/`PR-023`.
 
 Mitigation:
@@ -105,6 +131,9 @@ Current evidence:
 - `PR-023` added `run_file_io_blocking()` with `spawn_blocking`, a 15s timeout, and warning telemetry for file reads slower than 100ms.
 - Watched-file reindex, lazy PHP/vendor indexing, vendor cache load/save, vendor autoload metadata parsing, call hierarchy disk reads, `codeLens` source reads, and `foldingRange` source reads use blocking/background paths.
 - Remaining synchronous reads are limited to synchronous helper code called from blocking contexts, formatter work already inside `spawn_blocking`, and startup Composer discovery.
+- `PV-003` did not show common request latency symptoms from disk IO on the
+  primary large workspace: warm open-file hover/completion/definition p95 stayed
+  under 7 ms.
 
 Impact:
 
@@ -129,6 +158,8 @@ Current evidence:
 - New indexing/reindex work cancels the previous indexing run.
 - PHPStan/Psalm runs are per URI and cancelled by newer document events, close, delete, or rename.
 - `references` and `rename` have cooperative yield points and e2e coverage for `$/cancelRequest`.
+- `PV-004` large-workspace cancellation check cancelled `references` 20/20 and
+  rename dry-run 20/20; cancel p95 stayed near 2 ms for both request types.
 
 Impact:
 

@@ -20,6 +20,9 @@ Current tracked artifacts:
 The risk register in `docs/production-risk-register.md` explains which numbers
 are still production blockers.
 
+Latest large-workspace validation numbers are recorded in
+`docs/production-baseline.md` under "Production Validation Large Workspace Run".
+
 ## Key Metrics
 
 | Metric | Why it matters |
