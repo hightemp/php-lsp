@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/hightemp/php-lsp/main/config-schema.json",
+  "title": "PHP Language Server project configuration",
+  "description": "Schema for .php-lsp.toml. VS Code settings override these shared defaults when explicitly configured.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "php": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "enum": ["7.4", "8.0", "8.1", "8.2", "8.3", "8.4"]
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["off", "syntax-only", "basic-semantic"]
+        },
+        "severity": {
+          "$ref": "#/$defs/diagnosticSeverity"
+        },
+        "unknownSymbols": { "$ref": "#/$defs/diagnosticLevel" },
+        "unknown_symbols": { "$ref": "#/$defs/diagnosticLevel" },
+        "unused": { "$ref": "#/$defs/diagnosticLevel" },
+        "duplicateSymbols": { "$ref": "#/$defs/diagnosticLevel" },
+        "duplicate_symbols": { "$ref": "#/$defs/diagnosticLevel" },
+        "members": { "$ref": "#/$defs/diagnosticLevel" },
+        "typeCompatibility": { "$ref": "#/$defs/diagnosticLevel" },
+        "type_compatibility": { "$ref": "#/$defs/diagnosticLevel" },
+        "overrideSignatures": { "$ref": "#/$defs/diagnosticLevel" },
+        "override_signatures": { "$ref": "#/$defs/diagnosticLevel" },
+        "phpVersion": { "$ref": "#/$defs/diagnosticLevel" },
+        "php_version": { "$ref": "#/$defs/diagnosticLevel" }
+      }
+    },
+    "indexing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "composer": { "type": "boolean" },
+        "vendor": { "type": "boolean" },
+        "include": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "stubs": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "stubs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string" },
+        "extensions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "formatting": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["none", "custom", "php-cs-fixer", "phpcbf"]
+        },
+        "command": { "type": "string" },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1000
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1000
+        }
+      }
+    },
+    "phpstan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "command": { "type": "string" },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1000
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1000
+        },
+        "memory_limit": { "type": "string" },
+        "memoryLimit": { "type": "string" }
+      }
+    },
+    "psalm": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "command": { "type": "string" },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1000
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1000
+        }
+      }
+    }
+  },
+  "$defs": {
+    "diagnosticLevel": {
+      "type": "string",
+      "enum": ["off", "error", "warning", "information", "hint"]
+    },
+    "diagnosticSeverity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "unknownSymbols": { "$ref": "#/$defs/diagnosticLevel" },
+        "unknown_symbols": { "$ref": "#/$defs/diagnosticLevel" },
+        "unused": { "$ref": "#/$defs/diagnosticLevel" },
+        "duplicateSymbols": { "$ref": "#/$defs/diagnosticLevel" },
+        "duplicate_symbols": { "$ref": "#/$defs/diagnosticLevel" },
+        "members": { "$ref": "#/$defs/diagnosticLevel" },
+        "typeCompatibility": { "$ref": "#/$defs/diagnosticLevel" },
+        "type_compatibility": { "$ref": "#/$defs/diagnosticLevel" },
+        "overrideSignatures": { "$ref": "#/$defs/diagnosticLevel" },
+        "override_signatures": { "$ref": "#/$defs/diagnosticLevel" },
+        "phpVersion": { "$ref": "#/$defs/diagnosticLevel" },
+        "php_version": { "$ref": "#/$defs/diagnosticLevel" }
+      }
+    }
+  }
+}

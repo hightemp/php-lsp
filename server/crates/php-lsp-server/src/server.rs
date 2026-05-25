@@ -1,5 +1,9 @@
 //! LSP server implementation — LanguageServer trait.
 
+use crate::config::{
+    global_config_candidates, load_toml_settings, merge_json_objects, normalize_client_settings,
+    PROJECT_CONFIG_FILE_NAME,
+};
 use dashmap::DashMap;
 use php_lsp_completion::context::detect_context;
 use php_lsp_completion::provider::provide_completions;
@@ -207,6 +211,7 @@ impl PhpVersion {
 struct FormattingConfig {
     provider: String,
     command: Option<String>,
+    timeout_ms: u64,
 }
 
 impl Default for FormattingConfig {
@@ -214,18 +219,27 @@ impl Default for FormattingConfig {
         Self {
             provider: "none".to_string(),
             command: None,
+            timeout_ms: 30_000,
         }
     }
 }
 
 impl FormattingConfig {
-    fn from_options(provider: Option<&str>, command: Option<&str>) -> Self {
+    fn from_options(
+        provider: Option<&str>,
+        command: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Self {
         let provider = provider.unwrap_or("none").trim().to_ascii_lowercase();
         let command = command
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        Self { provider, command }
+        Self {
+            provider,
+            command,
+            timeout_ms: timeout_ms.unwrap_or(30_000).max(1_000),
+        }
     }
 
     fn command_template(&self) -> Option<String> {
@@ -250,6 +264,7 @@ struct PhpStanConfig {
     enabled: bool,
     command: String,
     timeout_ms: u64,
+    memory_limit: Option<String>,
 }
 
 impl Default for PhpStanConfig {
@@ -259,6 +274,7 @@ impl Default for PhpStanConfig {
             command: "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}"
                 .to_string(),
             timeout_ms: 30_000,
+            memory_limit: None,
         }
     }
 }
@@ -672,6 +688,64 @@ fn settings_u64(settings: &serde_json::Value, flat_key: &str, nested_path: &[&st
     settings_value(settings, flat_key, nested_path).and_then(|value| value.as_u64())
 }
 
+fn settings_string_aliases<'a>(
+    settings: &'a serde_json::Value,
+    flat_key: &str,
+    nested_paths: &[&[&str]],
+) -> Option<&'a str> {
+    if let Some(value) = settings.get(flat_key).and_then(|value| value.as_str()) {
+        return Some(value);
+    }
+    for path in nested_paths {
+        let mut current = settings;
+        let mut found = true;
+        for key in *path {
+            match current.get(*key) {
+                Some(value) => current = value,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found {
+            if let Some(value) = current.as_str() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn settings_u64_aliases(
+    settings: &serde_json::Value,
+    flat_key: &str,
+    nested_paths: &[&[&str]],
+) -> Option<u64> {
+    if let Some(value) = settings.get(flat_key).and_then(|value| value.as_u64()) {
+        return Some(value);
+    }
+    for path in nested_paths {
+        let mut current = settings;
+        let mut found = true;
+        for key in *path {
+            match current.get(*key) {
+                Some(value) => current = value,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found {
+            if let Some(value) = current.as_u64() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 /// Main LSP backend holding all state.
 pub struct PhpLspBackend {
     /// Client handle for sending notifications to VS Code.
@@ -698,6 +772,8 @@ pub struct PhpLspBackend {
     workspace_configs: Mutex<Vec<WorkspaceRootConfig>>,
     /// Trace level from InitializeParams (off/messages/verbose).
     trace_level: Mutex<TraceValue>,
+    /// Last explicit client initialization/configuration settings.
+    client_settings: Mutex<serde_json::Value>,
     /// Path to bundled phpstorm-stubs (from client initializationOptions).
     stubs_path: Mutex<Option<PathBuf>>,
     /// Target PHP version from client initializationOptions.
@@ -749,6 +825,7 @@ impl PhpLspBackend {
             namespace_map: Mutex::new(None),
             workspace_configs: Mutex::new(Vec::new()),
             trace_level: Mutex::new(TraceValue::Off),
+            client_settings: Mutex::new(serde_json::json!({})),
             stubs_path: Mutex::new(None),
             php_version: Mutex::new(PhpVersion::DEFAULT),
             diagnostics_mode: Mutex::new(DiagnosticsMode::default()),
@@ -1001,7 +1078,11 @@ impl PhpLspBackend {
             *self.log_level.lock().await = log_level.trim().to_ascii_lowercase();
         }
 
-        if let Some(stubs_path) = settings_string(settings, "stubsPath", &["stubsPath"]) {
+        if let Some(stubs_path) = settings_string_aliases(
+            settings,
+            "stubsPath",
+            &[&["stubs", "path"], &["bundledStubsPath"]],
+        ) {
             let next_path = if stubs_path.trim().is_empty() {
                 None
             } else {
@@ -1019,7 +1100,15 @@ impl PhpLspBackend {
         let formatting_command =
             settings_value(settings, "formattingCommand", &["formatting", "command"])
                 .and_then(|value| value.as_str());
-        if formatting_provider.is_some() || formatting_command.is_some() {
+        let formatting_timeout_ms = settings_u64_aliases(
+            settings,
+            "formattingTimeoutMs",
+            &[&["formatting", "timeoutMs"], &["formatting", "timeout"]],
+        );
+        if formatting_provider.is_some()
+            || formatting_command.is_some()
+            || formatting_timeout_ms.is_some()
+        {
             let current = self.formatting_config.lock().await.clone();
             let next_config = {
                 let provider = formatting_provider.unwrap_or(&current.provider);
@@ -1030,7 +1119,11 @@ impl PhpLspBackend {
                 } else {
                     current.command.as_deref()
                 };
-                FormattingConfig::from_options(Some(provider), command)
+                FormattingConfig::from_options(
+                    Some(provider),
+                    command,
+                    formatting_timeout_ms.or(Some(current.timeout_ms)),
+                )
             };
             *self.formatting_config.lock().await = next_config;
         }
@@ -1039,8 +1132,17 @@ impl PhpLspBackend {
         let phpstan_command = settings_string(settings, "phpstanCommand", &["phpstan", "command"]);
         let phpstan_timeout_ms =
             settings_u64(settings, "phpstanTimeoutMs", &["phpstan", "timeoutMs"]);
+        let phpstan_memory_limit = settings_string_aliases(
+            settings,
+            "phpstanMemoryLimit",
+            &[&["phpstan", "memoryLimit"], &["phpstan", "memory_limit"]],
+        );
 
-        if phpstan_enabled.is_some() || phpstan_command.is_some() || phpstan_timeout_ms.is_some() {
+        if phpstan_enabled.is_some()
+            || phpstan_command.is_some()
+            || phpstan_timeout_ms.is_some()
+            || phpstan_memory_limit.is_some()
+        {
             let current = self.phpstan_config.lock().await.clone();
             let mut next_config = current.clone();
             if let Some(enabled) = phpstan_enabled {
@@ -1056,6 +1158,11 @@ impl PhpLspBackend {
             }
             if let Some(timeout_ms) = phpstan_timeout_ms {
                 next_config.timeout_ms = timeout_ms.max(1_000);
+            }
+            if let Some(memory_limit) = phpstan_memory_limit {
+                let memory_limit = memory_limit.trim();
+                next_config.memory_limit =
+                    (!memory_limit.is_empty()).then(|| memory_limit.to_string());
             }
 
             if next_config != current {
@@ -1093,6 +1200,46 @@ impl PhpLspBackend {
         }
 
         applied
+    }
+
+    async fn apply_effective_configuration_settings(
+        &self,
+        client_settings: &serde_json::Value,
+        workspace_roots: &[PathBuf],
+    ) -> AppliedConfiguration {
+        let (settings, messages) =
+            load_effective_configuration_settings(workspace_roots, client_settings);
+        for message in messages {
+            if message.contains("failed") {
+                tracing::warn!("{}", message);
+                self.client.log_message(MessageType::WARNING, message).await;
+            } else {
+                tracing::info!("{}", message);
+                self.client.log_message(MessageType::INFO, message).await;
+            }
+        }
+        self.apply_configuration_settings(&settings).await
+    }
+
+    async fn apply_configuration_side_effects(&self, applied: AppliedConfiguration) {
+        if applied.stubs_changed {
+            self.reload_configured_stubs().await;
+        }
+        if applied.indexing_changed {
+            self.reindex_workspaces().await;
+        }
+        if applied.diagnostics_changed || applied.stubs_changed {
+            self.republish_open_diagnostics().await;
+        }
+    }
+
+    async fn reload_effective_configuration(&self) {
+        let client_settings = self.client_settings.lock().await.clone();
+        let workspace_roots = self.workspace_roots.lock().await.clone();
+        let applied = self
+            .apply_effective_configuration_settings(&client_settings, &workspace_roots)
+            .await;
+        self.apply_configuration_side_effects(applied).await;
     }
 
     async fn reload_configured_stubs(&self) {
@@ -3862,7 +4009,8 @@ fn build_formatter_shell_command(template: &str, file_path: &Path) -> String {
 fn run_formatter_shell_command(
     command: &str,
     current_dir: Option<&Path>,
-) -> std::io::Result<std::process::Output> {
+    timeout_ms: u64,
+) -> std::result::Result<std::process::Output, String> {
     let mut process = if cfg!(windows) {
         let mut command_process = std::process::Command::new("cmd");
         command_process.arg("/C").arg(command);
@@ -3877,7 +4025,65 @@ fn run_formatter_shell_command(
         process.current_dir(current_dir);
     }
 
-    process.output()
+    process
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = process
+        .spawn()
+        .map_err(|err| format!("failed to spawn formatter command: {}", err))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = stdout.map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut buffer);
+            buffer
+        })
+    });
+    let stderr_reader = stderr.map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stderr, &mut buffer);
+            buffer
+        })
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_reader
+                    .map(|reader| reader.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let stderr = stderr_reader
+                    .map(|reader| reader.join().unwrap_or_default())
+                    .unwrap_or_default();
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(reader) = stdout_reader {
+                        let _ = reader.join();
+                    }
+                    if let Some(reader) = stderr_reader {
+                        let _ = reader.join();
+                    }
+                    return Err(format!(
+                        "formatter command timed out after {}ms",
+                        timeout_ms
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(format!("failed to poll formatter command: {}", err)),
+        }
+    }
 }
 
 fn build_analyzer_shell_command(template: &str, file_path: &Path) -> String {
@@ -3887,6 +4093,22 @@ fn build_analyzer_shell_command(template: &str, file_path: &Path) -> String {
     } else {
         format!("{} {}", template, escaped_file)
     }
+}
+
+fn build_phpstan_shell_command(config: &PhpStanConfig, file_path: &Path) -> String {
+    let mut template = config.command.clone();
+    if let Some(memory_limit) = config.memory_limit.as_deref() {
+        if template.contains("{memory_limit}") {
+            template = template.replace("{memory_limit}", &shell_escape(memory_limit));
+        } else if !template.contains("--memory-limit") {
+            template.push_str(" --memory-limit=");
+            template.push_str(&shell_escape(memory_limit));
+        }
+    } else if template.contains("{memory_limit}") {
+        template = template.replace("{memory_limit}", "");
+    }
+
+    build_analyzer_shell_command(&template, file_path)
 }
 
 async fn run_shell_command_with_timeout(
@@ -4051,7 +4273,7 @@ async fn run_phpstan_for_file(
     workspace_root: Option<PathBuf>,
     cancellation: Option<OperationCancellationToken>,
 ) -> std::result::Result<Vec<Diagnostic>, String> {
-    let command = build_analyzer_shell_command(&config.command, &file_path);
+    let command = build_phpstan_shell_command(&config, &file_path);
     let output = run_shell_command_with_timeout(
         "PHPStan",
         &command,
@@ -4247,8 +4469,9 @@ fn run_external_formatter(
         .map_err(|err| format!("failed to write formatter temp file: {}", err))?;
 
     let command = build_formatter_shell_command(&template, &file_path);
-    let output = run_formatter_shell_command(&command, workspace_root.as_deref())
-        .map_err(|err| format!("failed to run formatter command: {}", err));
+    let output =
+        run_formatter_shell_command(&command, workspace_root.as_deref(), config.timeout_ms)
+            .map_err(|err| format!("failed to run formatter command: {}", err));
     let formatted = std::fs::read_to_string(&file_path)
         .map_err(|err| format!("failed to read formatter temp file: {}", err));
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -8740,6 +8963,74 @@ fn workspace_roots_from_initialize(params: &InitializeParams) -> Vec<PathBuf> {
     roots
 }
 
+fn project_config_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(composer_json) = find_composer_json(root) {
+        if let Some(composer_root) = composer_json.parent() {
+            push_unique_path(
+                &mut candidates,
+                composer_root.join(PROJECT_CONFIG_FILE_NAME),
+            );
+        }
+    }
+
+    push_unique_path(&mut candidates, root.join(PROJECT_CONFIG_FILE_NAME));
+    candidates
+}
+
+fn load_effective_configuration_settings(
+    workspace_roots: &[PathBuf],
+    client_settings: &serde_json::Value,
+) -> (serde_json::Value, Vec<String>) {
+    let mut effective = serde_json::json!({});
+    let mut messages = Vec::new();
+
+    if let Some(path) = global_config_candidates()
+        .into_iter()
+        .find(|path| path.exists())
+    {
+        match load_toml_settings(&path) {
+            Ok(settings) => {
+                merge_json_objects(&mut effective, &settings);
+                messages.push(format!("Loaded global config: {}", path.display()));
+            }
+            Err(message) => messages.push(message),
+        }
+    }
+
+    for root in workspace_roots {
+        for path in project_config_candidates(root) {
+            if !path.exists() {
+                continue;
+            }
+            match load_toml_settings(&path) {
+                Ok(settings) => {
+                    merge_json_objects(&mut effective, &settings);
+                    messages.push(format!("Loaded project config: {}", path.display()));
+                    break;
+                }
+                Err(message) => messages.push(message),
+            }
+        }
+    }
+
+    let client_settings = normalize_client_settings(client_settings);
+    merge_json_objects(&mut effective, &client_settings);
+
+    (effective, messages)
+}
+
+fn uri_is_project_config_file(uri: &Uri) -> bool {
+    uri_to_path(uri.as_str())
+        .and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|file_name| file_name == PROJECT_CONFIG_FILE_NAME)
+}
+
 fn discover_workspace_root_config(root: &Path, composer_enabled: bool) -> WorkspaceRootConfig {
     let composer_path = composer_enabled.then(|| find_composer_json(root)).flatten();
 
@@ -10096,18 +10387,20 @@ impl LanguageServer for PhpLspBackend {
 
         let workspace_roots = workspace_roots_from_initialize(&params);
 
-        // Extract runtime settings from client initializationOptions.
-        if let Some(ref opts) = params.initialization_options {
-            self.apply_configuration_settings(opts).await;
-        }
-
         if !workspace_roots.is_empty() {
             for root in &workspace_roots {
                 tracing::info!("Workspace root: {}", root.display());
             }
             *self.workspace_root.lock().await = workspace_roots.first().cloned();
-            *self.workspace_roots.lock().await = workspace_roots;
+            *self.workspace_roots.lock().await = workspace_roots.clone();
         }
+
+        let client_settings = params
+            .initialization_options
+            .unwrap_or_else(|| serde_json::json!({}));
+        *self.client_settings.lock().await = client_settings.clone();
+        self.apply_effective_configuration_settings(&client_settings, &workspace_roots)
+            .await;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -10708,7 +11001,13 @@ impl LanguageServer for PhpLspBackend {
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         tracing::debug!("didChangeWatchedFiles: {} change(s)", params.changes.len());
 
+        let mut config_changed = false;
         for event in params.changes {
+            if uri_is_project_config_file(&event.uri) {
+                config_changed = true;
+                continue;
+            }
+
             match event.typ {
                 FileChangeType::DELETED => self.remove_php_file(&event.uri).await,
                 FileChangeType::CREATED | FileChangeType::CHANGED => {
@@ -10717,21 +11016,17 @@ impl LanguageServer for PhpLspBackend {
                 _ => {}
             }
         }
+
+        if config_changed {
+            self.reload_effective_configuration().await;
+        }
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         tracing::debug!("didChangeConfiguration");
 
-        let applied = self.apply_configuration_settings(&params.settings).await;
-        if applied.stubs_changed {
-            self.reload_configured_stubs().await;
-        }
-        if applied.indexing_changed {
-            self.reindex_workspaces().await;
-        }
-        if applied.diagnostics_changed || applied.stubs_changed {
-            self.republish_open_diagnostics().await;
-        }
+        *self.client_settings.lock().await = params.settings.clone();
+        self.reload_effective_configuration().await;
     }
 
     async fn will_create_files(&self, _params: CreateFilesParams) -> Result<Option<WorkspaceEdit>> {
@@ -15226,10 +15521,12 @@ class UserVoter extends Voter {
 
     #[test]
     fn test_formatting_provider_none_disables_stale_command() {
-        let config = FormattingConfig::from_options(Some("none"), Some("vendor/bin/php-cs-fixer"));
+        let config =
+            FormattingConfig::from_options(Some("none"), Some("vendor/bin/php-cs-fixer"), None);
         assert!(config.command_template().is_none());
 
-        let custom = FormattingConfig::from_options(Some("custom"), Some("vendor/bin/fmt {file}"));
+        let custom =
+            FormattingConfig::from_options(Some("custom"), Some("vendor/bin/fmt {file}"), None);
         assert_eq!(
             custom.command_template().as_deref(),
             Some("vendor/bin/fmt {file}")
@@ -15331,6 +15628,7 @@ class UserVoter extends Voter {
                 shell_escape(&script_path.to_string_lossy())
             ),
             timeout_ms: 5_000,
+            memory_limit: None,
         };
         let diagnostics = run_phpstan_for_file(config, file_path, Some(tmp.clone()), None)
             .await
@@ -15393,6 +15691,7 @@ class UserVoter extends Voter {
                     enabled: true,
                     command: command.clone(),
                     timeout_ms: 50,
+                    memory_limit: None,
                 },
                 file_path.clone(),
                 Some(tmp.clone()),
@@ -15465,6 +15764,7 @@ class UserVoter extends Voter {
                     enabled: true,
                     command: command.clone(),
                     timeout_ms: 5_000,
+                    memory_limit: None,
                 },
                 file_path.clone(),
                 Some(tmp.clone()),

@@ -1271,7 +1271,7 @@ PR-052 ─→ PR-053
   - Validation: `npm run lint`, `npm run check:commands`, `npm run build`, docs Cyrillic check for `docs/ README.md client/README.md`, `git diff --check`.
   - Manual VS Code activation smoke was not run from the shell session to avoid opening a user GUI window; run before release packaging.
 
-- [ ] **IE-004** Добавить проектную конфигурацию `.php-lsp.toml`
+- [x] **IE-004** Добавить проектную конфигурацию `.php-lsp.toml` *(completed 2026-05-25)*
   - Новый server config loader: project config рядом с `composer.json`, затем global config, затем VS Code/init options.
   - Определить precedence: VS Code settings override project config для editor-only настроек; project config задает shared tooling defaults.
   - Минимальные секции:
@@ -1285,6 +1285,16 @@ PR-052 ─→ PR-053
   - Добавить server command/CLI `init-config`, который создает дефолтный `.php-lsp.toml` без перезаписи существующего.
   - Runtime reload: watched changes `.php-lsp.toml` должны применять config как `didChangeConfiguration`.
   - Обновить architecture/config docs на английском.
+  - Implemented: TOML config loader with precedence `built-in defaults -> global config -> project .php-lsp.toml -> explicit VS Code/init options`.
+  - Implemented: global config discovery via `PHP_LSP_CONFIG`, `$XDG_CONFIG_HOME/php-lsp/config.toml`, `$HOME/.config/php-lsp/config.toml`, and `$HOME/.php-lsp.toml`.
+  - Implemented: project config discovery next to discovered `composer.json`, falling back to workspace-root `.php-lsp.toml`.
+  - Implemented: sections `[php]`, `[diagnostics]`, `[diagnostics.severity]`, `[indexing]`, `[stubs]`, `[formatting]`, `[phpstan]`, `[psalm]`.
+  - Implemented: `php-lsp init-config [--path <path>]` creates the default config without overwriting existing files.
+  - Implemented: VS Code client watches `**/.php-lsp.toml` and sends explicit `didChangeConfiguration` payloads so default VS Code values do not mask project config.
+  - Implemented: formatter timeout config and PHPStan `memory_limit` support.
+  - Docs: added `docs/configuration.md`, root `config-schema.json`, README and architecture updates in English.
+  - Regression: unit tests cover TOML normalization/merge; e2e covers project diagnostics config and watched-file reload.
+  - Validation: `cargo fmt --all --check`, targeted config/e2e tests, `cargo test -p php-lsp-server`, CLI `init-config` smoke, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `npm run lint`, `npm run check:commands`, `npm run build`, docs Cyrillic check, `git diff --check`.
 
 - [ ] **IE-005** Внедрить `codeAction/resolve` infrastructure
   - Advertise `code_action_provider.resolve_provider = true`.

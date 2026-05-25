@@ -149,6 +149,11 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.trace.server` | `off` | LSP transport trace: `off`, `messages`, or `verbose`. |
 | `phpLsp.logLevel` | `info` | Server log level: `error`, `warn`, `info`, `debug`, or `trace`. |
 
+Shared project defaults can also be stored in `.php-lsp.toml`. Use
+`php-lsp init-config` to create a default file without overwriting an existing
+one. Config precedence is built-in defaults, global config, project config, then
+explicit VS Code settings. See [Configuration](docs/configuration.md).
+
 Example external diagnostics setup:
 
 ```json
@@ -183,6 +188,8 @@ The extension contributes these VS Code commands:
 
 - [Architecture](docs/architecture.md): server/client data flow, indexing,
   cache model, diagnostics pipeline, and runtime configuration behavior.
+- [Configuration](docs/configuration.md): `.php-lsp.toml` discovery,
+  precedence, schema, and examples.
 - [LSP feature matrix](docs/lsp-features.md): supported, partial, and
   unsupported LSP behavior.
 - [Performance guide](docs/performance.md): baseline methodology, profiling

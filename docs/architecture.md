@@ -52,12 +52,13 @@ Disk cache: workspace / stubs / vendor
    - Otherwise `client/bin/<platform>/php-lsp` or `php-lsp.exe`.
    - If the bundled binary is missing and no custom path is configured,
      `php-lsp` from `PATH`.
-3. The client sends `initialize` with `initializationOptions` derived from
-   `phpLsp.*` settings, including PHP version, diagnostics mode/severity,
-   include/exclude paths, stub extensions, formatter, analyzer commands, and
-   bundled stubs path.
-4. The server stores the settings and advertises capabilities.
-5. After `initialized`, the server:
+3. The client sends `initialize` with explicit `phpLsp.*` settings plus the
+   bundled stubs fallback path. VS Code default values are not sent as
+   overrides, so `.php-lsp.toml` can define shared project defaults.
+4. The server loads effective configuration in this order: built-in defaults,
+   global config, project `.php-lsp.toml`, then explicit client settings.
+5. The server stores the settings and advertises capabilities.
+6. After `initialized`, the server:
    - Discovers effective workspace roots, including Composer roots.
    - Loads configured phpstorm-stubs.
    - Starts background workspace indexing.
@@ -262,7 +263,8 @@ are measured on large projects.
 
 ## Configuration Updates
 
-`workspace/didChangeConfiguration` is applied at runtime:
+`workspace/didChangeConfiguration` and watched `.php-lsp.toml` changes are
+applied at runtime:
 
 | Changed setting group | Server action |
 |---|---|

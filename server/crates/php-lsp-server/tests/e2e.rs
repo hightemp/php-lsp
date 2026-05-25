@@ -2321,6 +2321,80 @@ function validate(object $object, mixed $method): void
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_project_config_controls_diagnostics_and_reloads_on_watch() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root =
+        std::env::temp_dir().join(format!("php-lsp-project-config-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(&tmp_root).unwrap();
+    let config_path = tmp_root.join(".php-lsp.toml");
+    fs::write(&config_path, "[diagnostics]\nmode = \"off\"\n").unwrap();
+
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let file_path = tmp_root.join("broken.php");
+    let file_uri = format!("file://{}", file_path.to_string_lossy());
+    let config_uri = format!("file://{}", config_path.to_string_lossy());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            &file_uri,
+            "<?php\nfunction broken( {\n",
+        ))
+        .await
+        .unwrap();
+
+    let disabled =
+        next_publish_diagnostics(&mut notifications, &file_uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        disabled["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "project config should disable diagnostics"
+    );
+
+    fs::write(&config_path, "[diagnostics]\nmode = \"syntax-only\"\n").unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &config_uri,
+            2,
+        )]))
+        .await
+        .unwrap();
+
+    let reloaded =
+        next_publish_diagnostics(&mut notifications, &file_uri, Duration::from_secs(1)).await;
+    assert!(
+        reloaded["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| !diagnostics.is_empty()),
+        "config reload should republish syntax diagnostics, got: {}",
+        reloaded
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_member_access_from_parenthesized_new_expression() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

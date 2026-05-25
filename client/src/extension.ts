@@ -741,6 +741,70 @@ function getStubsPath(context: ExtensionContext): string | undefined {
   return undefined;
 }
 
+function hasConfiguredValue(config: ReturnType<typeof workspace.getConfiguration>, key: string): boolean {
+  const inspected = config.inspect<unknown>(key);
+  return inspected !== undefined && (
+    inspected.globalValue !== undefined ||
+    inspected.workspaceValue !== undefined ||
+    inspected.workspaceFolderValue !== undefined ||
+    inspected.globalLanguageValue !== undefined ||
+    inspected.workspaceLanguageValue !== undefined ||
+    inspected.workspaceFolderLanguageValue !== undefined
+  );
+}
+
+function setIfConfigured<T>(
+  target: Record<string, unknown>,
+  config: ReturnType<typeof workspace.getConfiguration>,
+  key: string,
+  optionKey: string,
+  defaultValue: T,
+): void {
+  if (hasConfiguredValue(config, key)) {
+    target[optionKey] = config.get<T>(key, defaultValue);
+  }
+}
+
+function buildInitializationOptions(config: ReturnType<typeof workspace.getConfiguration>, stubsPath: string | undefined): Record<string, unknown> {
+  const options: Record<string, unknown> = {};
+
+  setIfConfigured(options, config, "phpVersion", "phpVersion", "8.2");
+  setIfConfigured(options, config, "diagnostics.mode", "diagnosticsMode", "basic-semantic");
+  setIfConfigured(options, config, "diagnostics.severity", "diagnosticsSeverity", {});
+  setIfConfigured(options, config, "composer.enabled", "composerEnabled", true);
+  setIfConfigured(options, config, "indexVendor", "indexVendor", true);
+  setIfConfigured(options, config, "includePaths", "includePaths", []);
+  setIfConfigured(options, config, "excludePaths", "excludePaths", []);
+  setIfConfigured(options, config, "stubs.extensions", "stubExtensions", []);
+  setIfConfigured(options, config, "logLevel", "logLevel", "info");
+  setIfConfigured(options, config, "formatting.provider", "formattingProvider", "none");
+  setIfConfigured(options, config, "formatting.command", "formattingCommand", "");
+  setIfConfigured(options, config, "phpstan.enabled", "phpstanEnabled", false);
+  setIfConfigured(
+    options,
+    config,
+    "phpstan.command",
+    "phpstanCommand",
+    "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}",
+  );
+  setIfConfigured(options, config, "phpstan.timeoutMs", "phpstanTimeoutMs", 30000);
+  setIfConfigured(options, config, "psalm.enabled", "psalmEnabled", false);
+  setIfConfigured(
+    options,
+    config,
+    "psalm.command",
+    "psalmCommand",
+    "vendor/bin/psalm --output-format=json --no-progress {file}",
+  );
+  setIfConfigured(options, config, "psalm.timeoutMs", "psalmTimeoutMs", 30000);
+
+  if (stubsPath) {
+    options.bundledStubsPath = stubsPath;
+  }
+
+  return options;
+}
+
 function createLanguageClient(context: ExtensionContext, binary: ServerBinaryResolution): LanguageClient {
   const config = workspace.getConfiguration("phpLsp");
   const stubsPath = getStubsPath(context);
@@ -772,35 +836,12 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
       { scheme: "untitled", language: "php" },
     ],
     synchronize: {
-      configurationSection: "phpLsp",
-      fileEvents: workspace.createFileSystemWatcher("**/*.php"),
+      fileEvents: [
+        workspace.createFileSystemWatcher("**/*.php"),
+        workspace.createFileSystemWatcher("**/.php-lsp.toml"),
+      ],
     },
-    initializationOptions: {
-      phpVersion: config.get<string>("phpVersion", "8.2"),
-      diagnosticsMode: config.get<string>("diagnostics.mode", "basic-semantic"),
-      diagnosticsSeverity: config.get<Record<string, string>>("diagnostics.severity", {}),
-      composerEnabled: config.get<boolean>("composer.enabled", true),
-      indexVendor: config.get<boolean>("indexVendor", true),
-      includePaths: config.get<string[]>("includePaths", []),
-      excludePaths: config.get<string[]>("excludePaths", []),
-      stubExtensions: config.get<string[]>("stubs.extensions", []),
-      logLevel,
-      formattingProvider: config.get<string>("formatting.provider", "none"),
-      formattingCommand: config.get<string>("formatting.command", ""),
-      phpstanEnabled: config.get<boolean>("phpstan.enabled", false),
-      phpstanCommand: config.get<string>(
-        "phpstan.command",
-        "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}",
-      ),
-      phpstanTimeoutMs: config.get<number>("phpstan.timeoutMs", 30000),
-      psalmEnabled: config.get<boolean>("psalm.enabled", false),
-      psalmCommand: config.get<string>(
-        "psalm.command",
-        "vendor/bin/psalm --output-format=json --no-progress {file}",
-      ),
-      psalmTimeoutMs: config.get<number>("psalm.timeoutMs", 30000),
-      stubsPath: stubsPath,
-    },
+    initializationOptions: buildInitializationOptions(config, stubsPath),
   };
 
   return new LanguageClient(
@@ -809,6 +850,17 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
     serverOptions,
     clientOptions,
   );
+}
+
+async function notifyServerConfigurationChanged(context: ExtensionContext): Promise<void> {
+  if (!client?.isRunning()) {
+    return;
+  }
+
+  const config = workspace.getConfiguration("phpLsp");
+  await client.sendNotification("workspace/didChangeConfiguration", {
+    settings: buildInitializationOptions(config, getStubsPath(context)),
+  });
 }
 
 async function stopLanguageClient(reason: string): Promise<void> {
@@ -985,7 +1037,7 @@ export function activate(context: ExtensionContext): void {
   );
 
   const enableConfigSubscription = workspace.onDidChangeConfiguration(async (event) => {
-    if (!event.affectsConfiguration("phpLsp.enable")) {
+    if (!event.affectsConfiguration("phpLsp")) {
       return;
     }
 
@@ -998,18 +1050,16 @@ export function activate(context: ExtensionContext): void {
           message: "Language server is disabled",
         });
       });
-    } else {
+    } else if (!client) {
       await enqueueLifecycleOperation("enable setting changed", async () => {
-        if (client) {
-          lifecycleLog("Start skipped: reason=enable setting changed; client already active");
-          return;
-        }
         statusController?.update({
           phase: "starting",
           message: "Starting language server",
         });
         await startLanguageClient(context, "enable setting changed");
       });
+    } else {
+      await notifyServerConfigurationChanged(context);
     }
   });
 
