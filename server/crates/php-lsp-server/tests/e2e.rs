@@ -4812,6 +4812,113 @@ async fn test_workspace_references_use_indexed_closed_files() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_and_completion_respond_while_workspace_indexing_runs() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-indexing-responsiveness-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let src_dir = tmp_root.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    for file_index in 0..240 {
+        let mut code = format!("<?php\nnamespace Stress\\Generated{};\n", file_index);
+        for class_index in 0..12 {
+            code.push_str(&format!(
+                "class Generated{}_{class_index} {{ public function method{class_index}(): void {{}} }}\n",
+                file_index
+            ));
+        }
+        fs::write(src_dir.join(format!("Generated{file_index}.php")), code).unwrap();
+    }
+
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "indexing", Duration::from_secs(2)).await;
+
+    let uri = "file:///test/IndexingResponsiveness.php";
+    let code = "<?php\nnamespace App\\Stress;\nclass RealtimeService { public function ping(): void {} }\nfunction run(RealtimeService $service): void {\n    $service->\n}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, 3, 18));
+    let completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(3, uri, 4, 14));
+    let (hover_response, completion_response) =
+        tokio::time::timeout(Duration::from_secs(2), async {
+            futures::join!(hover, completion)
+        })
+        .await
+        .expect("hover and completion should respond while indexing runs");
+
+    let hover_result = extract_result(hover_response.unwrap());
+    assert!(
+        hover_markdown_value(&hover_result).contains("RealtimeService"),
+        "hover should resolve open-file class during indexing, got: {}",
+        hover_result
+    );
+    let completion_result = extract_result(completion_response.unwrap());
+    let labels: Vec<_> = completion_items_from_result(&completion_result)
+        .into_iter()
+        .filter_map(|item| {
+            item.get("label")
+                .and_then(|label| label.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "ping"),
+        "completion should include open-file member during indexing, got: {:?}",
+        labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_watched_files_incrementally_reindex_created_changed_deleted_php_files() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -5569,6 +5676,101 @@ async fn test_did_change_debounces_diagnostics_and_ignores_stale_versions() {
         .call(did_change_full_notification(uri, 2, broken_code))
         .await
         .unwrap();
+    expect_no_publish_diagnostics(&mut notifications, uri, Duration::from_millis(300)).await;
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_stress_100_did_change_non_ascii_publishes_latest_version() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let uri = "file:///test/StressNonAscii.php";
+    let initial_code =
+        "<?php\nnamespace App;\nclass Stress { public function run(): void { echo \"привет\"; } }\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, initial_code))
+        .await
+        .unwrap();
+    let _ = next_publish_diagnostics(&mut notifications, uri, Duration::from_secs(1)).await;
+
+    let burst = async {
+        for i in 0..100 {
+            let version = i + 2;
+            let code = if i == 99 {
+                format!(
+                    "<?php\nnamespace App;\nclass Stress {{ public function run(): void {{ echo \"финал {}\"; }} }}\n",
+                    i
+                )
+            } else if i % 2 == 0 {
+                format!(
+                    "<?php\nnamespace App;\nclass Stress {{ public function run(): void {{ echo \"черновик {}\"; }}\n",
+                    i
+                )
+            } else {
+                format!(
+                    "<?php\nnamespace App;\nclass Stress {{ public function run(): void {{ echo \"правка {}\"; }} }}\n",
+                    i
+                )
+            };
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(did_change_full_notification(uri, version, &code))
+                .await
+                .unwrap();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(1), burst)
+        .await
+        .expect("100 didChange notifications should be accepted within one second");
+
+    let latest = next_publish_diagnostics(&mut notifications, uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        latest.get("version").and_then(|value| value.as_i64()),
+        Some(101),
+        "diagnostics should be published for the latest burst version, got: {}",
+        latest
+    );
+    assert!(
+        latest
+            .get("diagnostics")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.is_empty()),
+        "final valid version should have no diagnostics, got: {}",
+        latest
+    );
     expect_no_publish_diagnostics(&mut notifications, uri, Duration::from_millis(300)).await;
 
     service
@@ -6445,6 +6647,81 @@ async fn test_cancel_request_cancels_references_request() {
     );
     assert_eq!(
         extract_error_code(references_response.unwrap()),
+        Some(ErrorCode::RequestCancelled.code())
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_cancel_request_cancels_rename_request() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let target_uri = "file:///test/CancelRenameTarget.php";
+    let target_code =
+        "<?php\nnamespace App;\nclass Target {}\nfunction run(): void { new Target(); }\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(target_uri, target_code))
+        .await
+        .unwrap();
+
+    for i in 0..160 {
+        let uri = format!("file:///test/CancelRenameUse{}.php", i);
+        let code = format!(
+            "<?php\nnamespace App;\nclass RenameUse{} {{ public function run(): void {{ new Target(); }} }}\n",
+            i
+        );
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(&uri, &code))
+            .await
+            .unwrap();
+    }
+
+    let rename =
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(rename_request(2, target_uri, 2, 8, "RenamedTarget"));
+    let cancel = service.ready().await.unwrap().call(cancel_request(2));
+    let (rename_response, cancel_response) = futures::join!(rename, cancel);
+
+    assert!(
+        cancel_response.unwrap().is_none(),
+        "$/cancelRequest should not return a response"
+    );
+    assert_eq!(
+        extract_error_code(rename_response.unwrap()),
         Some(ErrorCode::RequestCancelled.code())
     );
 

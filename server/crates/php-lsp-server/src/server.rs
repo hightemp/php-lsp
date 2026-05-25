@@ -15022,6 +15022,150 @@ class UserVoter extends Voter {
         assert_eq!(error, "Test command cancelled");
     }
 
+    #[tokio::test]
+    async fn test_external_analyzers_timeout_without_hanging() {
+        if cfg!(windows) {
+            return;
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let tmp = std::env::temp_dir().join(format!(
+            "php-lsp-analyzer-timeout-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file_path = tmp.join("Subject.php");
+        std::fs::write(&file_path, "<?php\nclass Subject {}\n").unwrap();
+        let script_path = tmp.join("slow-analyzer.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nsleep 5\n").unwrap();
+        let command = format!(
+            "sh {} {{file}}",
+            shell_escape(&script_path.to_string_lossy())
+        );
+
+        let phpstan = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_phpstan_for_file(
+                PhpStanConfig {
+                    enabled: true,
+                    command: command.clone(),
+                    timeout_ms: 50,
+                },
+                file_path.clone(),
+                Some(tmp.clone()),
+                None,
+            ),
+        )
+        .await
+        .expect("PHPStan timeout path should not hang")
+        .unwrap_err();
+        assert!(
+            phpstan.contains("PHPStan command timed out after 50ms"),
+            "unexpected PHPStan timeout error: {}",
+            phpstan
+        );
+
+        let psalm = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_psalm_for_file(
+                PsalmConfig {
+                    enabled: true,
+                    command,
+                    timeout_ms: 50,
+                },
+                file_path,
+                Some(tmp.clone()),
+                None,
+            ),
+        )
+        .await
+        .expect("Psalm timeout path should not hang")
+        .unwrap_err();
+        assert!(
+            psalm.contains("Psalm command timed out after 50ms"),
+            "unexpected Psalm timeout error: {}",
+            psalm
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_external_analyzers_malformed_json_without_hanging() {
+        if cfg!(windows) {
+            return;
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let tmp = std::env::temp_dir().join(format!(
+            "php-lsp-analyzer-malformed-json-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file_path = tmp.join("Subject.php");
+        std::fs::write(&file_path, "<?php\nclass Subject {}\n").unwrap();
+        let script_path = tmp.join("malformed-analyzer.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf '{not-json'\nexit 0\n").unwrap();
+        let command = format!(
+            "sh {} {{file}}",
+            shell_escape(&script_path.to_string_lossy())
+        );
+
+        let phpstan = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_phpstan_for_file(
+                PhpStanConfig {
+                    enabled: true,
+                    command: command.clone(),
+                    timeout_ms: 5_000,
+                },
+                file_path.clone(),
+                Some(tmp.clone()),
+                None,
+            ),
+        )
+        .await
+        .expect("PHPStan malformed JSON path should not hang")
+        .unwrap_err();
+        assert!(
+            phpstan.contains("invalid PHPStan JSON"),
+            "unexpected PHPStan malformed JSON error: {}",
+            phpstan
+        );
+
+        let psalm = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_psalm_for_file(
+                PsalmConfig {
+                    enabled: true,
+                    command,
+                    timeout_ms: 5_000,
+                },
+                file_path,
+                Some(tmp.clone()),
+                None,
+            ),
+        )
+        .await
+        .expect("Psalm malformed JSON path should not hang")
+        .unwrap_err();
+        assert!(
+            psalm.contains("invalid Psalm JSON"),
+            "unexpected Psalm malformed JSON error: {}",
+            psalm
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_parse_psalm_json_diagnostics_maps_issues() {
         let file_path = PathBuf::from("/tmp/php-lsp-psalm/src/Foo.php");
