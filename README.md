@@ -84,18 +84,19 @@ phpstorm-stubs support.
 
 ## Known Limitations
 
-- Production hardening is still in progress. The current risk register and
-  baseline measurements live in `docs/production-risk-register.md` and
-  `docs/production-baseline.md`.
+- Production validation has measured a primary 10k-file Symfony workspace and
+  two additional Laravel-like workspaces. Remaining GA work is tracked in
+  `docs/production-risk-register.md` and `docs/production-baseline.md`.
 - Workspace, stub, and lazy vendor file symbols are cached in separate disk
   namespaces; Composer vendor metadata is cached in memory with an LRU for
-  lazy vendor symbols. Large-project acceptance thresholds are still production
-  hardening work.
+  lazy vendor symbols. The primary large-workspace warm cache target is met;
+  installed-vendor first-hit behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses use indexed
   per-file references, but still iterate workspace reference sets and can be
   expensive on very large repositories.
-- Workspace indexing parses files through a bounded CPU-aware task queue;
-  large-project acceptance thresholds are still being measured.
+- Workspace indexing parses files through a bounded CPU-aware task queue; the
+  primary large-workspace indexing baseline is measured in
+  `docs/production-baseline.md`.
 - Heavy references/rename requests, background indexing, and external analyzers
   have cancellation coverage; some other heavy requests remain benchmark watch
   items.
@@ -108,6 +109,10 @@ phpstorm-stubs support.
   references and rename are local-scope oriented.
 - Type inference is useful but still shallow compared with mature PHP static
   analyzers.
+- Built-in semantic diagnostics depend on indexed project and vendor symbols.
+  If Composer/vendor metadata is absent, external framework classes can be
+  reported as unknown; dynamic framework APIs such as some Eloquent relation
+  members are best-effort.
 - Diagnostics are optimized for editor feedback: file changes publish fast
   in-process diagnostics, while full diagnostics and optional external analyzer
   runs are used on open/save and reconfiguration.
@@ -210,6 +215,8 @@ The extension contributes these VS Code commands:
 
 ### Diagnostics Are Too Noisy
 
+- Ensure Composer metadata and `vendor/composer/installed.json` are available
+  when you want built-in diagnostics to resolve external framework symbols.
 - Set `"phpLsp.diagnostics.mode": "syntax-only"` to keep only parser syntax
   diagnostics.
 - Set `"phpLsp.diagnostics.mode": "off"` to disable built-in diagnostics.

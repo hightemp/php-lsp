@@ -2,11 +2,11 @@
 
 Latest acceptance refresh: 2026-05-25
 Current project version: `0.5.5`
-Latest checked revision: `96ce449`
+Latest checked revision: `a9692c0` + working tree validation updates
 
 ## Initial Baseline
 
-Дата замера: 2026-05-21 15:57 MSK  
+Measurement date: 2026-05-21 15:57 MSK
 Git revision: `ca1d6d6`  
 Host: `Linux apanov-Legion-S7-16IAH7 6.8.0-110-generic x86_64`
 
@@ -51,7 +51,7 @@ Scope: final production-readiness acceptance after PR-052 documentation updates.
 | Command | Result |
 |---------|--------|
 | `cargo fmt --all --check` | pass |
-| `cargo test --all` | pass, 309 tests |
+| `cargo test --all` | pass, 311 tests |
 | `cargo clippy --all-targets -- -D warnings` | pass |
 | `npm run lint` | pass |
 | `npm run build` | pass |
@@ -65,8 +65,8 @@ Rust acceptance test breakdown:
 |--------|-------|
 | `php-lsp-completion` | 25 |
 | `php-lsp-index` | 28 |
-| `php-lsp-parser` | 153 |
-| `php-lsp-server` unit tests | 44 |
+| `php-lsp-parser` | 154 |
+| `php-lsp-server` unit tests | 45 |
 | `php-lsp-server` e2e tests | 57 |
 | `php-lsp-types` | 2 |
 
@@ -269,6 +269,51 @@ Result: `references` and rename dry-run do not block unrelated
 hover/completion on the primary large workspace. Large-workspace
 `$/cancelRequest` also cancels both heavy request types consistently in this
 benchmark.
+
+### Large Workspace Diagnostics Audit
+
+Date: 2026-05-25
+Milestone task: `PV-012`
+
+Sample command shape:
+
+```bash
+python3 scripts/audit-lsp-workspace.py \
+  --scenario <scenario-name> \
+  --workspace <workspace-root> \
+  --server server/target/release/php-lsp \
+  --stubs client/stubs \
+  --out target/php-lsp-profile \
+  --max-files 500 \
+  --max-definition-probes 0 \
+  --no-document-symbol \
+  --no-include-vendor
+```
+
+Diagnostics sample results:
+
+| Scenario | Output | Files opened | Files with diagnostics | Diagnostics | Missing diagnostics | Request/stderr errors | Classification |
+|----------|--------|--------------|------------------------|-------------|---------------------|-----------------------|----------------|
+| `large-symfony-diagnostics-sample` | `target/php-lsp-profile/large-symfony-diagnostics-sample.json` | 500 | 366 | 2800 | 0 | 0 / 0 | Mostly unknown external PHPUnit/Twig/Doctrine/Monolog symbols because this checkout has no `composer.lock` or `vendor/composer/installed.json`. |
+| `large-laravel-crm-diagnostics-sample` | `target/php-lsp-profile/large-laravel-crm-diagnostics-sample.json` | 500 | 183 | 1006 | 0 | 0 / 0 | Mostly missing Laravel/Illuminate/Carbon/Konekt vendor metadata. |
+| `large-monica-diagnostics-sample` | `target/php-lsp-profile/large-monica-diagnostics-sample.json` | 500 | 453 | 2124 | 0 | 0 / 0 | Mostly missing Laravel/Sabre/Carbon/Inertia vendor metadata plus accepted dynamic Eloquent relation member limits. |
+
+Fixed false positive:
+
+| Scenario | Output | Result |
+|----------|--------|--------|
+| `fixture-promoted-self-diagnostics-release` | `target/php-lsp-profile/fixture-promoted-self-diagnostics-release.json` | 1 file, 0 diagnostics |
+| `large-symfony-mapentity-diagnostics-release` | `target/php-lsp-profile/large-symfony-mapentity-diagnostics-release.json` | Real Symfony `MapEntity.php`, 0 diagnostics |
+
+The fixed issue was a member diagnostic false positive for promoted constructor
+properties accessed through a `self`-typed parameter, as in
+`withDefaults(self $defaults)` followed by `$defaults->objectManager`. The
+resolver now maps `self`/`static` parameter types to the enclosing class before
+member lookup. Regression coverage exists in the parser resolver, server
+diagnostics, and `test-fixtures/lsp-cases/src/Diagnostics/PromotedSelfDefaults.php`.
+The copied host VS Code binary `client/bin/linux-x64/php-lsp` was also checked
+with the same fixture and real Symfony `MapEntity.php`; both runs published 0
+diagnostics.
 
 ## Packaged VSIX Dogfood Smoke
 

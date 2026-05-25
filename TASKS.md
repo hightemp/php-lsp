@@ -1071,7 +1071,7 @@
     - `npm ci` reported audit findings: 2 moderate, 1 high. Build/package passed; audit review remains a GA policy question.
     - Interactive GUI dogfood checks for status popup, command palette behavior, and opening large workspace are still pending.
 
-- [ ] **PV-012** Стабилизировать diagnostics false positives на real large workspace
+- [x] **PV-012** Стабилизировать diagnostics false positives на real large workspace *(completed 2026-05-25)*
   - Прогнать diagnostics audit script или LSP client по выборке файлов из large workspace:
     - framework controllers/services/models/tests
     - files with PHPDoc generics/array shapes/callables
@@ -1085,13 +1085,40 @@
     - добавить minimal fixture under `test-fixtures/lsp-cases/src/Diagnostics/`
     - исправить без project-specific hardcode
     - добавить unit/e2e regression.
+  - Current fix 2026-05-25:
+    - investigate Symfony `MapEntity::withDefaults(self $defaults, ...)` diagnostics.
+    - fix variable type inference so `self`/`static` typed parameters resolve to the enclosing class before member diagnostics.
+    - add regression coverage for promoted constructor properties accessed through a `self`-typed parameter.
   - Для acceptable limitations:
     - обновить `README.md` Known Limitations или `docs/lsp-features.md`.
   - Validation:
     - diagnostics audit summary добавлен в `docs/production-baseline.md`.
     - Regression tests added for fixed false positives.
+  - Result 2026-05-25:
+    - Release diagnostics samples:
+      - `large-symfony-diagnostics-sample`: 500 files, 2800 diagnostics, 0 missing diagnostics, 0 request/stderr errors.
+      - `large-laravel-crm-diagnostics-sample`: 500 files, 1006 diagnostics, 0 missing diagnostics, 0 request/stderr errors.
+      - `large-monica-diagnostics-sample`: 500 files, 2124 diagnostics, 0 missing diagnostics, 0 request/stderr errors.
+    - Top sample diagnostics are mostly classified as missing Composer/vendor metadata (`PHPUnit`, `Twig`, `Doctrine`, `Illuminate`, `Carbon`, `Sabre`, `Inertia`) or accepted dynamic framework limits (for example Eloquent relation members).
+    - Fixed one confirmed real-project false positive: `self`/`static` typed parameters now resolve to the enclosing class before member diagnostics, so promoted constructor properties accessed via `withDefaults(self $defaults)` no longer produce unknown-property diagnostics.
+    - Added regression coverage:
+      - `test-fixtures/lsp-cases/src/Diagnostics/PromotedSelfDefaults.php`
+      - `php-lsp-parser::resolve::tests::test_resolve_property_access_on_self_typed_parameter`
+      - `php-lsp-server::server::tests::test_compute_diagnostics_allows_promoted_properties_on_self_typed_parameter`
+    - Release targeted audit:
+      - `fixture-promoted-self-diagnostics-release`: 1 file, 0 diagnostics.
+      - `large-symfony-mapentity-diagnostics-release`: real Symfony `MapEntity.php`, 0 diagnostics.
+    - Validation commands passed:
+      - `cargo fmt --all --check`
+      - `cargo test --all`
+      - `cargo clippy --all-targets -- -D warnings`
+      - `cargo build --release -p php-lsp-server`
+      - `./scripts/build-server.sh`
+      - `git diff --check`
+    - Copied host VS Code binary was rechecked through `client/bin/linux-x64/php-lsp` on the new fixture and real Symfony `MapEntity.php`; both published 0 diagnostics.
+    - Documentation updated in `docs/production-baseline.md`, `docs/production-risk-register.md`, `docs/lsp-features.md`, and `README.md`.
 
-- [ ] **PV-013** Закрыть или честно переоценить risk register
+- [x] **PV-013** Закрыть или честно переоценить risk register *(completed 2026-05-25)*
   - Для каждого риска `R-001`-`R-010` в `docs/production-risk-register.md`:
     - обновить current evidence по результатам large workspace measurements
     - поменять status на `Mitigated`, `Accepted limitation`, или оставить `Partially mitigated` с новым owner task
@@ -1102,6 +1129,20 @@
   - Обновить `docs/lsp-features.md`, если capability behavior изменился.
   - Validation:
     - `rg -n "Partially mitigated|Production hardening is still in progress|Large-project acceptance thresholds are still" README.md docs/production-risk-register.md docs/lsp-features.md` проверен и результат осознанно оставлен или устранен.
+  - Result 2026-05-25:
+    - High risks no longer remain `Partially mitigated`:
+      - `R-001` disk cache maturity -> `Mitigated`
+      - `R-002` references/rename/codeLens scale -> `Accepted limitation`
+      - `R-003` parallel indexing acceptance -> `Mitigated`
+      - `R-004` sync file IO in async/hot paths -> `Mitigated`
+      - `R-005` heavy-request cancellation -> `Mitigated`
+    - `R-008` remains `Partially mitigated` intentionally because installed-vendor first-hit scale still needs `PV-014`/GA acceptance evidence.
+    - `R-009` is now `Accepted limitation` after the `PV-012` diagnostics audit and `self`/promoted-property false-positive fix.
+    - README Known Limitations no longer says production hardening is generally in progress or that large-project acceptance thresholds are still unmeasured.
+    - Validation query now only returns `R-008`, which is intentional and Medium severity.
+  - Docs language cleanup 2026-05-25 *(completed)*:
+    - keep `docs/` and `README.md` in English.
+    - `rg -n "[А-Яа-яЁё]" docs README.md` returns no matches.
 
 - [ ] **PV-014** Финальный GA acceptance прогон
   - Запустить:
