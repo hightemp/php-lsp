@@ -5,6 +5,7 @@ import { phpLspCacheDirForRoot } from "./cachePath";
 import {
   workspace,
   commands,
+  env,
   window,
   ExtensionContext,
   StatusBarAlignment,
@@ -24,6 +25,8 @@ import {
 let client: LanguageClient | undefined;
 let statusController: PhpLspStatusController | undefined;
 let indexingStatusSubscription: Disposable | undefined;
+let lastBinaryResolutionError: string | undefined;
+let lastStartError: string | undefined;
 
 type IndexingPhase =
   | "starting"
@@ -48,9 +51,17 @@ interface IndexingStatus {
 }
 
 interface ExtensionSnapshot {
+  extensionVersion: string;
+  serverName: string;
+  serverVersion?: string;
   serverPath: string;
+  serverBinarySource: "custom" | "bundled" | "unsupported";
+  serverBinaryExists: boolean;
   stubsPath?: string;
   platformDir?: string;
+  cacheDirs: string[];
+  lastBinaryResolutionError?: string;
+  lastStartError?: string;
   workspaceFolders: string[];
   phpVersion: string;
   diagnosticsMode: string;
@@ -65,7 +76,15 @@ interface ExtensionSnapshot {
 }
 
 interface StatusQuickPickItem extends QuickPickItem {
-  action?: "restart" | "clearCache" | "output" | "settings";
+  action?: "version" | "restart" | "clearCache" | "output" | "settings";
+}
+
+interface ServerBinaryResolution {
+  serverPath: string;
+  source: "custom" | "bundled" | "unsupported";
+  exists: boolean;
+  platformDir?: string;
+  error?: string;
 }
 
 class PhpLspStatusController implements Disposable {
@@ -153,8 +172,14 @@ class PhpLspStatusController implements Disposable {
       },
       {
         label: "$(server-process) Server binary",
-        description: snapshot.platformDir ?? "custom",
+        description: binaryDescription(snapshot),
         detail: snapshot.serverPath,
+      },
+      {
+        label: "$(versions) Server version",
+        description: snapshot.serverVersion ?? "not initialized",
+        detail: serverDiagnosticsDetail(snapshot),
+        action: "version",
       },
       {
         label: "$(debug-restart) Restart language server",
@@ -182,7 +207,9 @@ class PhpLspStatusController implements Disposable {
       matchOnDetail: true,
     });
 
-    if (selected?.action === "restart") {
+    if (selected?.action === "version") {
+      await showServerVersion(this.snapshotProvider());
+    } else if (selected?.action === "restart") {
       await commands.executeCommand("phpLsp.restartServer");
     } else if (selected?.action === "clearCache") {
       await commands.executeCommand("phpLsp.clearCacheAndRestart");
@@ -229,6 +256,7 @@ function statusTooltip(status: IndexingStatus, snapshot: ExtensionSnapshot): Mar
     tooltip.appendMarkdown(`: ${status.message}`);
   }
   tooltip.appendMarkdown("\n\n");
+  tooltip.appendMarkdown(`Server: ${serverVersionLabel(snapshot)}\n\n`);
   if (typeof status.indexedFiles === "number" || typeof status.totalFiles === "number") {
     tooltip.appendMarkdown(`Files: ${fileProgressLabel(status)}\n\n`);
   }
@@ -330,10 +358,23 @@ function analyzerSummary(snapshot: ExtensionSnapshot): string {
 
 function getExtensionSnapshot(context: ExtensionContext): ExtensionSnapshot {
   const config = workspace.getConfiguration("phpLsp");
+  const binary = resolveServerBinary(context);
+  if (binary.error) {
+    lastBinaryResolutionError = binary.error;
+  }
+  const serverInfo = client?.initializeResult?.serverInfo;
   return {
-    serverPath: getServerPath(context),
+    extensionVersion: String(context.extension.packageJSON.version ?? "unknown"),
+    serverName: serverInfo?.name ?? "php-lsp",
+    serverVersion: serverInfo?.version,
+    serverPath: binary.serverPath,
+    serverBinarySource: binary.source,
+    serverBinaryExists: binary.exists,
     stubsPath: getStubsPath(context),
-    platformDir: getPlatformDir(),
+    platformDir: binary.platformDir,
+    cacheDirs: currentWorkspaceCacheDirs(),
+    lastBinaryResolutionError,
+    lastStartError,
     workspaceFolders: workspace.workspaceFolders?.map((folder) => folder.uri.fsPath) ?? [],
     phpVersion: config.get<string>("phpVersion", "8.2"),
     diagnosticsMode: config.get<string>("diagnostics.mode", "basic-semantic"),
@@ -346,6 +387,55 @@ function getExtensionSnapshot(context: ExtensionContext): ExtensionSnapshot {
     includePaths: config.get<string[]>("includePaths", []),
     excludePaths: config.get<string[]>("excludePaths", []),
   };
+}
+
+function binaryDescription(snapshot: ExtensionSnapshot): string {
+  if (snapshot.serverBinarySource === "unsupported") {
+    return "unsupported platform";
+  }
+  const source = snapshot.serverBinarySource === "custom" ? "custom" : snapshot.platformDir ?? "bundled";
+  return snapshot.serverBinaryExists ? source : `${source}; missing`;
+}
+
+function serverVersionLabel(snapshot: ExtensionSnapshot): string {
+  return `${snapshot.serverName} ${snapshot.serverVersion ?? "not initialized"}`;
+}
+
+function formatPathList(paths: string[], empty: string): string {
+  if (paths.length === 0) {
+    return empty;
+  }
+  return paths.join("\n");
+}
+
+function serverDiagnosticsDetail(snapshot: ExtensionSnapshot): string {
+  return [
+    `Server: ${serverVersionLabel(snapshot)}`,
+    `Extension: ht-php-lsp ${snapshot.extensionVersion}`,
+    `Binary source: ${binaryDescription(snapshot)}`,
+    `Binary path: ${snapshot.serverPath || "unresolved"}`,
+    `Platform target: ${snapshot.platformDir ?? `${os.platform()}-${os.arch()}`}`,
+    `Stubs path: ${snapshot.stubsPath ?? "not found"}`,
+    `Cache roots:\n${formatPathList(snapshot.cacheDirs, "No workspace cache roots")}`,
+    `Last binary resolution error: ${snapshot.lastBinaryResolutionError ?? "none"}`,
+    `Last start error: ${snapshot.lastStartError ?? "none"}`,
+  ].join("\n");
+}
+
+async function showServerVersion(snapshot: ExtensionSnapshot): Promise<void> {
+  const detail = serverDiagnosticsDetail(snapshot);
+  const selected = await window.showInformationMessage(
+    `PHP Language Server: ${serverVersionLabel(snapshot)}`,
+    { modal: true, detail },
+    "Copy Details",
+    "Open Output",
+  );
+
+  if (selected === "Copy Details") {
+    await env.clipboard.writeText(detail);
+  } else if (selected === "Open Output") {
+    client?.outputChannel.show(true);
+  }
 }
 
 function getServerEnvironment(logLevel: string): NodeJS.ProcessEnv {
@@ -432,27 +522,54 @@ function getPlatformDir(): string | undefined {
   return map[platform]?.[arch];
 }
 
+function resolveServerBinary(context: ExtensionContext): ServerBinaryResolution {
+  const config = workspace.getConfiguration("phpLsp");
+  const customPath = config.get<string>("serverPath", "").trim();
+  if (customPath.length > 0) {
+    const exists = fs.existsSync(customPath);
+    return {
+      serverPath: customPath,
+      source: "custom",
+      exists,
+      error: exists ? undefined : `Configured phpLsp.serverPath does not exist: ${customPath}`,
+    };
+  }
+
+  const platformDir = getPlatformDir();
+  if (!platformDir) {
+    return {
+      serverPath: "",
+      source: "unsupported",
+      exists: false,
+      error: `Unsupported platform: ${os.platform()}-${os.arch()}`,
+    };
+  }
+
+  const binaryName = os.platform() === "win32" ? "php-lsp.exe" : "php-lsp";
+  const serverPath = context.asAbsolutePath(path.join("bin", platformDir, binaryName));
+  const exists = fs.existsSync(serverPath);
+  return {
+    serverPath,
+    source: "bundled",
+    exists,
+    platformDir,
+    error: exists ? undefined : `Bundled php-lsp binary was not found for ${platformDir}: ${serverPath}`,
+  };
+}
+
 /**
  * Determine the path to the php-lsp server binary.
  */
 function getServerPath(context: ExtensionContext): string {
-  // Check user-configured path first
-  const config = workspace.getConfiguration("phpLsp");
-  const customPath = config.get<string>("serverPath", "");
-  if (customPath) {
-    return customPath;
+  const binary = resolveServerBinary(context);
+  if (binary.error) {
+    lastBinaryResolutionError = binary.error;
+    window.showErrorMessage(`PHP Language Server: ${binary.error}`);
+    throw new Error(binary.error);
   }
 
-  // Use bundled binary from bin/<platform>/ subdirectory
-  const platformDir = getPlatformDir();
-  if (!platformDir) {
-    const msg = `Unsupported platform: ${os.platform()}-${os.arch()}`;
-    window.showErrorMessage(`PHP Language Server: ${msg}`);
-    throw new Error(msg);
-  }
-
-  const binaryName = os.platform() === "win32" ? "php-lsp.exe" : "php-lsp";
-  return context.asAbsolutePath(path.join("bin", platformDir, binaryName));
+  lastBinaryResolutionError = undefined;
+  return binary.serverPath;
 }
 
 /**
@@ -556,9 +673,11 @@ async function startLanguageClient(context: ExtensionContext): Promise<boolean> 
     );
 
     await nextClient.start();
+    lastStartError = undefined;
     return true;
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+    lastStartError = message;
     client = undefined;
     indexingStatusSubscription?.dispose();
     indexingStatusSubscription = undefined;
@@ -680,6 +799,11 @@ export function activate(context: ExtensionContext): void {
     async () => statusController?.showPopup(),
   );
 
+  const showServerVersionCommand = commands.registerCommand(
+    "phpLsp.showServerVersion",
+    async () => showServerVersion(getExtensionSnapshot(context)),
+  );
+
   const enableConfigSubscription = workspace.onDidChangeConfiguration(async (event) => {
     if (!event.affectsConfiguration("phpLsp.enable")) {
       return;
@@ -706,6 +830,7 @@ export function activate(context: ExtensionContext): void {
     restartCommand,
     clearCacheCommand,
     showStatusCommand,
+    showServerVersionCommand,
     enableConfigSubscription,
   );
 

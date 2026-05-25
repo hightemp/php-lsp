@@ -356,6 +356,11 @@
         "command": "phpLsp.showStatus",
         "title": "Show Language Server Status",
         "category": "PHP"
+      },
+      {
+        "command": "phpLsp.showServerVersion",
+        "title": "Show Language Server Version",
+        "category": "PHP"
       }
     ]
   },
@@ -364,6 +369,7 @@
     "build": "node esbuild.mjs --production",
     "watch": "node esbuild.mjs --watch",
     "check:cache-path": "node scripts/check-cache-path.mjs",
+    "check:commands": "node scripts/check-commands.mjs",
     "prepare:package": "node scripts/prepare-package-metadata.mjs",
     "lint": "tsc --noEmit",
     "package": "vsce package"

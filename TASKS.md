@@ -1241,13 +1241,19 @@ PR-052 ─→ PR-053
   - Docs: README feature list and `docs/lsp-features.md` updated in English.
   - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-server`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, docs Cyrillic check for `docs/ README.md`, `git diff --check`.
 
-- [ ] **IE-002** Добавить команды версии и server diagnostics в VS Code client
+- [x] **IE-002** Добавить команды версии и server diagnostics в VS Code client *(completed 2026-05-25)*
   - Команда `PHP: Show Language Server Version`.
   - Показывать `server_info.version`, resolved binary path, platform target, stubs path, cache root.
   - Добавить пункт в status quick pick.
   - Если сервер не стартовал, команда должна показывать last known binary resolution error.
   - Client tests или lightweight script validation для command registration.
   - Обновить README commands table на английском.
+  - Implemented: new `phpLsp.showServerVersion` VS Code command with initialized server name/version, extension version, binary source/path, platform target, stubs path, cache roots, and last binary/start errors.
+  - Implemented: status quick pick now includes a `Server version` action and the status tooltip shows the initialized server version when available.
+  - Implemented: binary resolution now records missing custom/bundled binary errors before server startup fails.
+  - Regression: added `npm run check:commands` lightweight validation for command contribution/registration drift.
+  - Docs: root README commands table updated in English.
+  - Validation: `npm run lint`, `npm run check:commands`, `npm run build`, docs Cyrillic check for `docs/ README.md client/README.md`, `git diff --check`.
 
 - [ ] **IE-003** Укрепить VS Code lifecycle и binary resolution
   - При restart/clear-cache использовать serialized lifecycle queue, чтобы две команды не стартовали два сервера параллельно.

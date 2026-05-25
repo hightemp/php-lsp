@@ -175,6 +175,7 @@ The extension contributes these VS Code commands:
 | Command palette title | Command ID | Behavior |
 |---|---|---|
 | `PHP: Show Language Server Status` | `phpLsp.showStatus` | Opens the status quick pick with indexing, cache, stubs, diagnostics, formatter, analyzer, and server-binary details. |
+| `PHP: Show Language Server Version` | `phpLsp.showServerVersion` | Shows the initialized server name/version plus resolved binary, platform, stubs, cache roots, and last startup errors. |
 | `PHP: Restart Language Server` | `phpLsp.restartServer` | Restarts the client/server process and reuses the existing disk cache. |
 | `PHP: Clear PHP LSP Cache and Restart` | `phpLsp.clearCacheAndRestart` | Deletes cache directories for current workspace roots and discovered Composer roots, then restarts the server. |
 
