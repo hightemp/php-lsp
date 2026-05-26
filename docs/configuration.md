@@ -140,8 +140,9 @@ resolved in this order:
    available.
 
 Supported provider values are `auto`, `none`, `pint`, `php-cs-fixer`, `phpcbf`,
-and `custom`. Use `none` to disable formatting. Use `custom` with `command` and
-the `{file}` placeholder when a project has a wrapper script.
+and `custom`. There is intentionally no `built-in` provider. Use `none` to
+disable formatting. Use `custom` with `command` and the `{file}` placeholder
+when a project has a wrapper script.
 
 External formatter commands are timeout-bound by `timeoutMs` and are cancelled
 when a document changes, closes, or a newer formatting request supersedes the

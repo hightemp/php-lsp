@@ -1565,7 +1565,7 @@ PR-052 ─→ PR-053
   - Docs: `README.md`, `client/README.md`, `docs/configuration.md`, `docs/lsp-features.md`, `docs/production-risk-register.md`, `config-schema.json`, and VS Code setting metadata document provider resolution, timeout, cancellation, and troubleshooting.
   - Validation: `cargo fmt --all --check`, targeted formatting tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, `npm run lint`, `npm run build`, docs Cyrillic check, `git diff --check`.
 
-- [ ] **IE-023** Оценить и при необходимости добавить built-in formatter fallback
+- [x] **IE-023** Оценить и при необходимости добавить built-in formatter fallback *(done 2026-05-26)*
   - Research-only first step: выбрать реалистичный formatter backend или отказаться.
   - Если добавляем dependency:
     - измерить binary size impact
@@ -1575,6 +1575,17 @@ PR-052 ─→ PR-053
     - закрыть task documented decision в `DECISIONS.md`
     - README должен честно говорить, что native formatter не поставляется.
   - Не смешивать с IE-022 auto-detect.
+  - Decision: do not add `built-in` provider in this milestone.
+  - Documented: ADR-017 in `DECISIONS.md` records the formatter-backend
+    evaluation and revisit criteria.
+  - Rationale: the current tree-sitter CST architecture is not a formatter AST;
+    the realistic Rust-native candidate, Mago formatter, brings a separate
+    parser/AST/tooling stack and currently requires Rust `1.95.0`, while
+    php-lsp keeps workspace MSRV `1.85`.
+  - Docs: `README.md`, `docs/configuration.md`, and `docs/lsp-features.md`
+    explicitly state that native formatting is not shipped and no `built-in`
+    formatter provider is advertised.
+  - Validation: docs Cyrillic check for public English docs, `git diff --check`.
 
 - [ ] **IE-024** CI интеграция для CLI
   - Добавить docs на английском: пример GitHub Actions `php-lsp analyze`.

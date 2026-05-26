@@ -182,7 +182,8 @@ phpstorm-stubs support.
 - External PHPStan/Psalm diagnostics require those tools to be installed and
   configured by the workspace.
 - Formatting is delegated to external tools; php-lsp auto-detects common
-  Composer dev tools but does not implement a native PHP formatter.
+  Composer dev tools but does not implement or advertise a native PHP
+  formatter provider.
 
 ## Configuration
 

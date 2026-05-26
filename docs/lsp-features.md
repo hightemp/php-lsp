@@ -74,7 +74,7 @@ tools.
 | `source.organizeImports` | Supported | Sorts/removes import statements based on parser/index data. |
 | `codeAction/resolve` | Supported | Used for heavier refactor actions so `textDocument/codeAction` can return lightweight actions first. |
 | `refactor.rewrite` add return type | Partial | Adds return types from PHPDoc where supported by the configured PHP version. Edits are resolved lazily and stale document versions resolve to a no-op edit. |
-| Native PHP formatter | Unsupported | Formatting is delegated to external commands. |
+| Native PHP formatter | Unsupported | Formatting is delegated to external commands. There is no `built-in` provider; see ADR-017 in `DECISIONS.md`. |
 | `textDocument/formatting` | Partial | Uses `phpLsp.formatting.provider`, `phpLsp.formatting.command`, or auto-detected Composer tools (`pint`, `php-cs-fixer`, `phpcbf`). External formatter processes are timeout-bound and cancellable. |
 | `textDocument/rangeFormatting` | Partial | Uses the same external formatter resolution, but formats only selected PHP fragments via temporary files and never formats the whole document for a range request. |
 | `textDocument/onTypeFormatting` | Supported | Local indentation edits for newline, semicolon, and closing brace. |

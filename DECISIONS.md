@@ -300,6 +300,49 @@ when `VSCE_PAT` is configured.
 
 ---
 
+## ADR-017: Built-in PHP Formatter Fallback
+
+**Status:** Accepted on 2026-05-26.
+
+**Decision:** Do not add a built-in PHP formatter provider for the current
+production-readiness milestone. The supported formatting strategy remains
+external formatter integration through `auto`, `pint`, `php-cs-fixer`,
+`phpcbf`, `custom`, or `none`.
+
+**Rationale:**
+- IE-022 already provides the production-facing formatter surface: Composer
+  tool auto-detection, explicit provider precedence, timeout-bound external
+  processes, request cancellation, and conservative range formatting.
+- The current parser architecture is tree-sitter CST based. A native formatter
+  needs a stable printable AST or a dedicated formatting IR; building that on
+  the existing CST would be a large, style-sensitive feature with high
+  regression risk.
+- Mago is the only realistic Rust-native PHP formatter candidate found during
+  evaluation. Its formatter is technically strong, but it is part of the Mago
+  parser/AST/tooling stack rather than a small drop-in formatter for this
+  tree-sitter based server.
+- The current Mago workspace declares Rust `1.95.0`, while php-lsp currently
+  declares Rust `1.85` as its workspace MSRV. Adding it now would force an MSRV
+  jump unrelated to the language-server core.
+- Existing project-standard formatters such as Pint, PHP CS Fixer, phpcbf, and
+  Prettier PHP are best integrated as external tools, which is already covered
+  by the formatter strategy.
+
+**Revisit When:**
+- A formatter-only Rust crate is available with PHP 7.4-8.4 syntax coverage,
+  stable APIs, and an MSRV compatible with php-lsp.
+- Binary size, startup time, and formatting latency are measured against the
+  release package.
+- Whole-document formatting is production-safe and range formatting has an
+  explicit conservative behavior that cannot unexpectedly rewrite entire files.
+
+**References:**
+- Mago formatter docs: https://mago.carthage.software/1.27.0/en/tools/formatter/overview/
+- Mago formatter crate docs: https://docs.rs/mago-formatter/latest/mago_formatter/
+- Mago workspace manifest: https://github.com/carthage-software/mago/blob/main/Cargo.toml
+
+---
+
 ## Риски и компромиссы
 
 | # | Риск | Вероятность | Влияние | Mitigation |
