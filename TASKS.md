@@ -1390,6 +1390,21 @@ PR-052 ─→ PR-053
   - Regression: e2e covers property/method/constant/promoted-property visibility changes, lazy promote resolve edits, and refusal for complex assignment.
   - Validation: `cargo fmt --all --check`, targeted IE-012 e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
+- [x] **IE-012S** Code actions: visibility and promotion Supported coverage *(done 2026-05-26)*
+  - Довести feature matrix для `textDocument/codeAction` visibility and promotion refactors до `Supported`.
+  - Change visibility должен учитывать interface/abstract/override contracts и не предлагать unsafe public/protected lowering.
+  - Change visibility должен подавляться для interface members и abstract contract declarations, где visibility задает API contract.
+  - Promote constructor parameter должен переносить safe property PHPDoc and attributes onto promoted constructor parameter instead of suppressing all documented properties.
+  - Promote constructor parameter должен сохранять type contract metadata when property has richer PHPDoc than native parameter type.
+  - Добавить regression tests на safe/unsafe visibility, interface/override refusal, promoted property metadata transfer, complex assignment refusal, and stale lazy resolve behavior.
+  - Implemented: visibility actions are contract-aware for interface, abstract, and override methods; unsafe lowering below inherited/interface visibility is suppressed.
+  - Implemented: standalone concrete methods, properties, constants, and promoted properties still support direct visibility edits with resolve-time revalidation.
+  - Implemented: constructor promotion moves safe property PHPDoc and attributes onto the promoted parameter and deletes the full property metadata block plus the exact assignment.
+  - Guard: promotion continues to refuse static properties, already promoted params, multi-property declarations, missing exact assignments, and complex/multiple assignments.
+  - Docs: `docs/lsp-features.md` marks visibility and promotion refactors as `Supported`.
+  - Regression: e2e covers standalone visibility changes, interface/override refusal, protected override widening, PHPDoc/attribute promotion transfer, simple promotion, promoted-property visibility, and complex assignment refusal.
+  - Validation: `cargo fmt --all --check`, targeted IE-012S e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
+
 - [x] **IE-013** Code action: update PHPDoc from signature *(done 2026-05-26)*
   - Синхронизировать `@param` с actual params: add missing, remove stale, reorder.
   - Синхронизировать `@return`: add/update/remove redundant `void`.

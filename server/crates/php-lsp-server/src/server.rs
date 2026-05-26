@@ -3808,8 +3808,148 @@ fn symbol_supports_visibility_change(symbol: &php_lsp_types::SymbolInfo) -> bool
     ) && !symbol.modifiers.is_builtin
 }
 
+fn visibility_rank(visibility: php_lsp_types::Visibility) -> u8 {
+    match visibility {
+        php_lsp_types::Visibility::Private => 0,
+        php_lsp_types::Visibility::Protected => 1,
+        php_lsp_types::Visibility::Public => 2,
+    }
+}
+
+fn parent_symbol_for_member<'a>(
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Option<&'a php_lsp_types::SymbolInfo> {
+    let parent_fqn = symbol.parent_fqn.as_deref()?;
+    file_symbols.symbols.iter().find(|candidate| {
+        candidate.fqn == parent_fqn
+            && matches!(
+                candidate.kind,
+                php_lsp_types::PhpSymbolKind::Class
+                    | php_lsp_types::PhpSymbolKind::Interface
+                    | php_lsp_types::PhpSymbolKind::Trait
+            )
+    })
+}
+
+fn collect_method_contract_visibilities(
+    index: &WorkspaceIndex,
+    type_fqn: &str,
+    method_name: &str,
+    out: &mut Vec<php_lsp_types::Visibility>,
+    visited: &mut HashSet<String>,
+) {
+    let normalized_type = type_fqn.trim_start_matches('\\').to_string();
+    if !visited.insert(normalized_type.clone()) {
+        return;
+    }
+
+    let Some(type_sym) = index
+        .types
+        .get(&normalized_type)
+        .map(|entry| entry.value().clone())
+    else {
+        return;
+    };
+
+    let wanted = normalized_method_name(method_name);
+    for member in direct_member_symbols_from_index(index, &normalized_type) {
+        if member.kind == php_lsp_types::PhpSymbolKind::Method
+            && normalized_method_name(&member.name) == wanted
+        {
+            out.push(member.visibility);
+        }
+    }
+
+    for trait_fqn in &type_sym.traits {
+        collect_method_contract_visibilities(index, trait_fqn, method_name, out, visited);
+    }
+    for parent_fqn in &type_sym.extends {
+        collect_method_contract_visibilities(index, parent_fqn, method_name, out, visited);
+    }
+    for iface_fqn in &type_sym.implements {
+        collect_method_contract_visibilities(index, iface_fqn, method_name, out, visited);
+    }
+}
+
+fn required_method_visibility(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    method: &php_lsp_types::SymbolInfo,
+) -> Option<php_lsp_types::Visibility> {
+    let parent = parent_symbol_for_member(file_symbols, method)?;
+    if parent.kind != php_lsp_types::PhpSymbolKind::Class {
+        return None;
+    }
+
+    let mut visibilities = Vec::new();
+    let mut visited = HashSet::new();
+    for trait_fqn in &parent.traits {
+        collect_method_contract_visibilities(
+            index,
+            trait_fqn,
+            &method.name,
+            &mut visibilities,
+            &mut visited,
+        );
+    }
+    for parent_fqn in &parent.extends {
+        collect_method_contract_visibilities(
+            index,
+            parent_fqn,
+            &method.name,
+            &mut visibilities,
+            &mut visited,
+        );
+    }
+    for iface_fqn in &parent.implements {
+        collect_method_contract_visibilities(
+            index,
+            iface_fqn,
+            &method.name,
+            &mut visibilities,
+            &mut visited,
+        );
+    }
+
+    visibilities
+        .into_iter()
+        .max_by_key(|visibility| visibility_rank(*visibility))
+}
+
+fn visibility_change_is_safe(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+    target_visibility: php_lsp_types::Visibility,
+) -> bool {
+    if !symbol_supports_visibility_change(symbol) || symbol.visibility == target_visibility {
+        return false;
+    }
+
+    if parent_symbol_for_member(file_symbols, symbol)
+        .is_some_and(|parent| parent.kind == php_lsp_types::PhpSymbolKind::Interface)
+    {
+        return false;
+    }
+
+    if symbol.kind == php_lsp_types::PhpSymbolKind::Method {
+        if symbol.modifiers.is_abstract {
+            return false;
+        }
+
+        if let Some(required_visibility) = required_method_visibility(index, file_symbols, symbol) {
+            return visibility_rank(target_visibility) >= visibility_rank(required_visibility);
+        }
+    }
+
+    true
+}
+
 fn build_change_visibility_actions(
     uri: Uri,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
     symbol: &php_lsp_types::SymbolInfo,
     request_range: Range,
     document_version: Option<i32>,
@@ -3824,7 +3964,9 @@ fn build_change_visibility_actions(
         php_lsp_types::Visibility::Private,
     ]
     .into_iter()
-    .filter(|visibility| *visibility != symbol.visibility)
+    .filter(|target_visibility| {
+        visibility_change_is_safe(index, file_symbols, symbol, *target_visibility)
+    })
     .filter_map(|target_visibility| {
         let data = serde_json::to_value(CodeActionData {
             action_kind: CodeActionDataKind::ChangeVisibility,
@@ -5210,11 +5352,13 @@ fn find_visibility_token(
 
 fn change_visibility_edit(
     uri: Uri,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
     source: &str,
     symbol: &php_lsp_types::SymbolInfo,
     target_visibility: php_lsp_types::Visibility,
 ) -> Option<WorkspaceEdit> {
-    if !symbol_supports_visibility_change(symbol) || symbol.visibility == target_visibility {
+    if !visibility_change_is_safe(index, file_symbols, symbol, target_visibility) {
         return Some(empty_workspace_edit());
     }
 
@@ -5434,21 +5578,19 @@ fn property_declaration_is_safe_to_remove(
     source: &str,
     property: &php_lsp_types::SymbolInfo,
 ) -> bool {
-    if property.doc_comment.is_some() {
-        return false;
-    }
-    let Some(start) = byte_offset_for_line_col(source, property.range.0, property.range.1) else {
+    let Some(range_start) = byte_offset_for_line_col(source, property.range.0, property.range.1)
+    else {
         return false;
     };
+    let start = find_visibility_token(source, property)
+        .map(|(token_start, _)| token_start)
+        .unwrap_or(range_start);
     let Some(end) = byte_offset_for_line_col(source, property.range.2, property.range.3) else {
         return false;
     };
     let Some(text) = source.get(start..end) else {
         return false;
     };
-    if text.contains("#[") {
-        return false;
-    }
     let before_semicolon = text
         .split_once(';')
         .map(|(before, _)| before)
@@ -5461,6 +5603,138 @@ fn property_promotion_prefix(property: &php_lsp_types::SymbolInfo) -> String {
     if property.modifiers.is_readonly {
         parts.push("readonly");
     }
+    parts.join(" ")
+}
+
+fn adjacent_attribute_start(source: &str, declaration_start: usize) -> Option<usize> {
+    let mut current = line_start_offset(source, declaration_start);
+    let mut first_attribute_start = None;
+
+    while current > 0 {
+        let previous_end = current.saturating_sub(1);
+        let previous_start = source[..previous_end]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let line = source.get(previous_start..previous_end).unwrap_or("");
+        let trimmed = line.trim();
+        if trimmed.starts_with("#[") {
+            first_attribute_start = Some(previous_start);
+            current = previous_start;
+            continue;
+        }
+        break;
+    }
+
+    first_attribute_start
+}
+
+struct PropertyPromotionMetadata {
+    delete_start: usize,
+    doc_comment: Option<String>,
+    attributes: Vec<String>,
+}
+
+fn property_promotion_metadata(
+    source: &str,
+    property: &php_lsp_types::SymbolInfo,
+) -> Option<PropertyPromotionMetadata> {
+    let range_start = byte_offset_for_line_col(source, property.range.0, property.range.1)?;
+    let declaration_start = find_visibility_token(source, property)
+        .map(|(token_start, _)| token_start)
+        .unwrap_or(range_start);
+    let doc_span = symbol_doc_comment_span(source, property);
+    let doc_comment = property.doc_comment.clone();
+    let attribute_start = if let Some((_, doc_end)) = doc_span {
+        doc_end
+    } else if declaration_start > range_start {
+        range_start
+    } else {
+        adjacent_attribute_start(source, declaration_start).unwrap_or(declaration_start)
+    };
+    let attributes = source
+        .get(attribute_start..declaration_start)
+        .map(collect_attribute_groups)
+        .unwrap_or_default();
+    let delete_start = doc_span
+        .map(|(doc_start, _)| line_start_offset(source, doc_start))
+        .or_else(|| {
+            if declaration_start > range_start {
+                Some(line_start_offset(source, range_start))
+            } else {
+                adjacent_attribute_start(source, declaration_start)
+            }
+        })
+        .unwrap_or(declaration_start);
+
+    Some(PropertyPromotionMetadata {
+        delete_start,
+        doc_comment,
+        attributes,
+    })
+}
+
+fn compact_phpdoc_comment(doc_comment: &str) -> Option<String> {
+    let content = phpdoc_content_lines(doc_comment)
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!content.is_empty()).then(|| format!("/** {} */", content))
+}
+
+fn compact_attribute(attribute: &str) -> String {
+    attribute.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn promoted_parameter_text_with_metadata(
+    source: &str,
+    property: &php_lsp_types::SymbolInfo,
+    param_start: usize,
+    promoted_param: &str,
+) -> String {
+    let Some(metadata) = property_promotion_metadata(source, property) else {
+        return promoted_param.to_string();
+    };
+    if metadata.doc_comment.is_none() && metadata.attributes.is_empty() {
+        return promoted_param.to_string();
+    }
+
+    let line_start = line_start_offset(source, param_start);
+    let before_param = source.get(line_start..param_start).unwrap_or("");
+    if before_param.trim().is_empty() {
+        let indent = before_param;
+        let mut text = String::new();
+        if let Some(doc_comment) = metadata.doc_comment.as_deref() {
+            let content_lines = phpdoc_content_lines(doc_comment);
+            if !content_lines.is_empty() {
+                text.push_str(&render_phpdoc_comment(indent, &content_lines));
+                text.push('\n');
+            }
+        }
+        for attribute in &metadata.attributes {
+            text.push_str(&render_reindented_block(attribute, indent));
+        }
+        text.push_str(indent);
+        text.push_str(promoted_param);
+        return text;
+    }
+
+    let mut parts = Vec::new();
+    if let Some(doc_comment) = metadata
+        .doc_comment
+        .as_deref()
+        .and_then(compact_phpdoc_comment)
+    {
+        parts.push(doc_comment);
+    }
+    parts.extend(
+        metadata
+            .attributes
+            .iter()
+            .map(|attr| compact_attribute(attr)),
+    );
+    parts.push(promoted_param.to_string());
     parts.join(" ")
 }
 
@@ -5526,11 +5800,13 @@ fn promote_constructor_parameter_plan(
         return None;
     }
 
-    let property_start = byte_offset_for_line_col(source, property.range.0, property.range.1)?;
     let property_end = byte_offset_for_line_col(source, property.range.2, property.range.3)?;
-    let property_delete = line_full_span(source, property_start, property_end);
+    let metadata = property_promotion_metadata(source, property)?;
+    let property_delete = line_full_span(source, metadata.delete_start, property_end);
     let assignment_delete = find_constructor_assignment_line(source, constructor, &property.name)?;
     let promoted_param = format!("{} {}", property_promotion_prefix(property), param.text);
+    let promoted_param =
+        promoted_parameter_text_with_metadata(source, property, param.start, &promoted_param);
 
     Some(PromoteConstructorParameterPlan {
         property_delete,
@@ -16362,6 +16638,8 @@ impl LanguageServer for PhpLspBackend {
                 if let Some(symbol) = visibility_symbol {
                     actions.extend(build_change_visibility_actions(
                         uri.clone(),
+                        &self.index,
+                        &file_symbols,
                         symbol,
                         params.range,
                         document_version,
@@ -16857,8 +17135,15 @@ impl LanguageServer for PhpLspBackend {
                     return Ok(params);
                 };
 
-                params.edit = change_visibility_edit(uri_value, &source, symbol, target_visibility)
-                    .or_else(|| Some(empty_workspace_edit()));
+                params.edit = change_visibility_edit(
+                    uri_value,
+                    &self.index,
+                    &file_symbols,
+                    &source,
+                    symbol,
+                    target_visibility,
+                )
+                .or_else(|| Some(empty_workspace_edit()));
             }
             (
                 CodeActionDataKind::PromoteConstructorParameter,

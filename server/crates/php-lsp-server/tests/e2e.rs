@@ -5111,6 +5111,27 @@ async fn test_code_action_change_visibility_and_promote_constructor_parameter() 
     let visibility_code = r#"<?php
 namespace App;
 
+interface VisibilityContract
+{
+    public function required(): void;
+}
+
+abstract class VisibilityBase
+{
+    abstract protected function inherited(): void;
+}
+
+class VisibilityChild extends VisibilityBase implements VisibilityContract
+{
+    public function required(): void
+    {
+    }
+
+    protected function inherited(): void
+    {
+    }
+}
+
 class VisibilityDemo
 {
     private string $name;
@@ -5141,7 +5162,7 @@ class VisibilityDemo
         .call(code_action_request_with_only(
             2,
             visibility_uri,
-            ((5, 20), (5, 24)),
+            ((26, 20), (26, 24)),
             json!([]),
             vec!["refactor.rewrite"],
         ))
@@ -5183,7 +5204,7 @@ class VisibilityDemo
         .call(code_action_request_with_only(
             4,
             visibility_uri,
-            ((6, 20), (6, 24)),
+            ((27, 20), (27, 24)),
             json!([]),
             vec!["refactor.rewrite"],
         ))
@@ -5210,7 +5231,7 @@ class VisibilityDemo
         .call(code_action_request_with_only(
             5,
             visibility_uri,
-            ((8, 20), (8, 23)),
+            ((29, 20), (29, 23)),
             json!([]),
             vec!["refactor.rewrite"],
         ))
@@ -5237,7 +5258,7 @@ class VisibilityDemo
         .call(code_action_request_with_only(
             6,
             visibility_uri,
-            ((12, 43), (12, 45)),
+            ((33, 43), (33, 45)),
             json!([]),
             vec!["refactor.rewrite"],
         ))
@@ -5272,6 +5293,91 @@ class VisibilityDemo
         Some("public")
     );
 
+    let interface_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            8,
+            visibility_uri,
+            ((5, 21), (5, 29)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let interface_result = extract_result(interface_resp);
+    assert!(
+        !interface_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(|action| action
+                .get("title")
+                .and_then(|value| value.as_str())
+                .is_some_and(|title| title.starts_with("Change visibility"))),
+        "interface contract method should not offer visibility changes, got: {}",
+        interface_result
+    );
+
+    let implemented_contract_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            9,
+            visibility_uri,
+            ((15, 20), (15, 28)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let implemented_contract_result = extract_result(implemented_contract_resp);
+    assert!(
+        !implemented_contract_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(|action| {
+                matches!(
+                    action.get("title").and_then(|value| value.as_str()),
+                    Some("Change visibility to protected") | Some("Change visibility to private")
+                )
+            }),
+        "implementation of public interface method should not offer lowering, got: {}",
+        implemented_contract_result
+    );
+
+    let protected_override_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            10,
+            visibility_uri,
+            ((19, 24), (19, 33)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let protected_override_result = extract_result(protected_override_resp);
+    let protected_override_actions = protected_override_result
+        .as_array()
+        .expect("code actions array");
+    assert!(
+        protected_override_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Change visibility to public")
+        }) && !protected_override_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Change visibility to private")
+        }),
+        "protected override should allow widening but not lowering below abstract contract, got: {}",
+        protected_override_result
+    );
+
     let promote_code = r#"<?php
 namespace App;
 
@@ -5301,7 +5407,7 @@ class PromoteDemo
         .await
         .unwrap()
         .call(code_action_request_with_only(
-            8,
+            11,
             promote_uri,
             ((8, 40), (8, 44)),
             json!([]),
@@ -5329,7 +5435,7 @@ class PromoteDemo
         .ready()
         .await
         .unwrap()
-        .call(code_action_resolve_request(9, promote_action))
+        .call(code_action_resolve_request(12, promote_action))
         .await
         .unwrap();
     let promote_resolved = extract_result(promote_resolve);
@@ -5351,6 +5457,104 @@ class PromoteDemo
             == 2,
         "expected property and assignment deletions, got: {}",
         promote_resolved
+    );
+
+    let metadata_promote_code = r#"<?php
+namespace App;
+
+class MetadataPromotion
+{
+    /**
+     * Display name.
+     *
+     * @var non-empty-string
+     */
+    #[Sensitive]
+    private string $label;
+
+    public function __construct(
+        string $label,
+    ) {
+        $this->label = $label;
+    }
+}
+"#;
+    let metadata_promote_uri = "file:///test/MetadataPromotion.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            metadata_promote_uri,
+            metadata_promote_code,
+        ))
+        .await
+        .unwrap();
+    let metadata_promote_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            13,
+            metadata_promote_uri,
+            ((14, 16), (14, 22)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let metadata_promote_result = extract_result(metadata_promote_resp);
+    let metadata_promote_action = metadata_promote_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Promote constructor parameter `$label`")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected metadata promote action, got: {}",
+                metadata_promote_result
+            )
+        });
+    let metadata_promote_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(14, metadata_promote_action))
+        .await
+        .unwrap();
+    let metadata_promote_resolved = extract_result(metadata_promote_resolve);
+    let metadata_promote_edits = metadata_promote_resolved["edit"]["changes"][metadata_promote_uri]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected metadata promote edits, got: {}",
+                metadata_promote_resolved
+            )
+        });
+    assert!(
+        metadata_promote_edits.iter().any(|edit| {
+            edit["newText"].as_str().is_some_and(|new_text| {
+                new_text.contains("Display name.")
+                    && new_text.contains("@var non-empty-string")
+                    && new_text.contains("#[Sensitive]")
+                    && new_text.contains("private string $label")
+            })
+        }),
+        "expected promoted parameter replacement to carry PHPDoc and attribute metadata, got: {}",
+        metadata_promote_resolved
+    );
+    assert!(
+        metadata_promote_edits
+            .iter()
+            .filter(|edit| edit["newText"].as_str() == Some(""))
+            .count()
+            == 2,
+        "expected metadata property block and assignment deletions, got: {}",
+        metadata_promote_resolved
     );
 
     let complex_code = r#"<?php
@@ -5379,7 +5583,7 @@ class ComplexPromotion
         .await
         .unwrap()
         .call(code_action_request_with_only(
-            10,
+            15,
             complex_uri,
             ((7, 40), (7, 45)),
             json!([]),
