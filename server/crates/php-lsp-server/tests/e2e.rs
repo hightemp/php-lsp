@@ -1330,6 +1330,132 @@ function run(): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_local_variable_method_return_types_and_links() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+namespace App;
+
+class PortingProcess {}
+
+class PortingRequest {
+    public function getPortingProcess(): ?PortingProcess { return new PortingProcess(); }
+}
+
+abstract class SoapHandler {
+    protected function ensureProcessCreated(): ?PortingProcess { return new PortingProcess(); }
+}
+
+abstract class BaseHandler extends SoapHandler {
+    protected function updatePortingProcess(): bool { return true; }
+}
+
+class CdbHandler extends BaseHandler {
+    public function handle(PortingRequest $portingRequest): void {
+        $recipient/*recipient*/Process = $this->ensureProcessCreated();
+        $recipientProcess/*updated*/Updated = $this->updatePortingProcess();
+    }
+}
+"#;
+    let markers = ["/*recipient*/", "/*updated*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (recipient_line, recipient_character) = marker_position("/*recipient*/");
+    let (updated_line, updated_character) = marker_position("/*updated*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/hover-local-method-return-types.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let recipient_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, recipient_line, recipient_character))
+        .await
+        .unwrap();
+    let recipient_result = extract_result(recipient_resp);
+    let recipient_hover = hover_markdown_value(&recipient_result);
+    assert!(
+        recipient_hover.contains("?PortingProcess $recipientProcess"),
+        "expected nullable PortingProcess variable hover, got: {}",
+        recipient_hover
+    );
+    assert!(
+        recipient_hover
+            .contains("?[`PortingProcess`](<file:///test/hover-local-method-return-types.php#L4>)"),
+        "expected clickable PortingProcess type link, got: {}",
+        recipient_hover
+    );
+
+    let updated_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, updated_line, updated_character))
+        .await
+        .unwrap();
+    let updated_result = extract_result(updated_resp);
+    let updated_hover = hover_markdown_value(&updated_result);
+    assert!(
+        updated_hover.contains("bool $recipientProcessUpdated"),
+        "expected bool variable hover from method return type, got: {}",
+        updated_hover
+    );
+    assert!(
+        updated_hover.contains("**Type:** `bool`"),
+        "expected bool type section, got: {}",
+        updated_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_goto_definition() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

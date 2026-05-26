@@ -1745,6 +1745,34 @@ PR-052 ─→ PR-053
     `cargo test --all`, `cargo fmt --all --check`,
     `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
+- [x] **IE-032C** Hover: inferred local variable return types and clickable type links *(done 2026-05-26)*
+  - Reproduce hover missing type information on variables such as
+    `$recipientProcess` and `$recipientProcessUpdated` after assignment from
+    indexed method calls.
+  - Reuse the same RHS method-return `TypeInfo` path that powers local variable
+    inlay hints, including inherited methods and nullable object returns.
+  - Render variable hover Markdown with concrete inferred type text for locals
+    inferred from `new`, method/function calls, inline PHPDoc, and foreach where
+    existing inference supports them.
+  - Add clickable Markdown links for resolvable class/interface/trait/enum names
+    in hover type text, while keeping scalar/generic text readable when a single
+    definition target is unavailable.
+  - Add e2e coverage for hovering `$recipientProcess`,
+    `$recipientProcessUpdated`, and linked `PortingProcess` type text.
+  - Implemented: local variable hover now uses the same indexed RHS
+    method/function return `TypeInfo` path as local variable inlay hints,
+    including current assignment hover on the left-hand variable.
+  - Implemented: hover keeps scalar method returns such as `bool` visible and
+    preserves PHPDoc hover context where available.
+  - Implemented: hover adds a Markdown `Type` section with a clickable file link
+    for resolvable class-like types, e.g. `?PortingProcess`.
+  - Regression: e2e covers hover on `$recipientProcess` and
+    `$recipientProcessUpdated`, including a linked `PortingProcess` type and
+    scalar `bool` type section.
+  - Validation: `cargo test -p php-lsp-server --test e2e hover`,
+    `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
+
 - [ ] **IE-033** Shape-aware completion and definition
   - Array shape keys from PHPDoc/literal arrays should appear in `$arr['...']` completion.
   - Object shape properties should appear in `$obj->...` where modeled.

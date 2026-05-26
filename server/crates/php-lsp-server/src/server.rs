@@ -9772,6 +9772,13 @@ struct LocalVariableInlayType {
     target_fqn: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct LocalVariableHoverData {
+    variable_name: String,
+    type_hint: Option<LocalVariableInlayType>,
+    phpdoc_comment: Option<String>,
+}
+
 fn add_local_variable_type_inlay_hint(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
@@ -9839,7 +9846,7 @@ fn local_variable_inlay_type(
         Some(&resolver),
     )?;
 
-    local_variable_inlay_type_from_hover_info(&info, ctx.file_symbols)
+    local_variable_type_from_hover_info(&info, ctx.file_symbols, false)
 }
 
 fn local_variable_inlay_type_from_expression(
@@ -9927,7 +9934,7 @@ fn local_variable_inlay_type_from_variable_expression(
         Some(&resolver),
     )?;
 
-    local_variable_inlay_type_from_hover_info(&info, ctx.file_symbols)
+    local_variable_type_from_hover_info(&info, ctx.file_symbols, false)
 }
 
 fn is_plain_assignment_expression(
@@ -9971,16 +9978,196 @@ fn variable_node_in_foreach_part_for_inlay<'tree>(
     None
 }
 
-fn local_variable_inlay_type_from_hover_info(
+fn local_variable_hover_data(
+    ctx: &InlayHintContext<'_>,
+    variable_node: tree_sitter::Node,
+) -> Option<LocalVariableHoverData> {
+    let variable_name = variable_text_for_node(ctx.source, variable_node)?;
+    let usage_start = variable_node.start_byte();
+    let rhs_node =
+        assignment_rhs_for_variable_hover(variable_node, &variable_name, usage_start, ctx.source);
+
+    let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
+    };
+    let parser_info = infer_variable_hover_info_at_node(
+        variable_node,
+        ctx.source,
+        ctx.file_symbols,
+        usage_start,
+        &variable_name,
+        Some(&resolver),
+    );
+    let type_hint = rhs_node
+        .and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
+        .or_else(|| {
+            parser_info
+                .as_ref()
+                .and_then(|info| local_variable_type_from_hover_info(info, ctx.file_symbols, true))
+        });
+    let phpdoc_comment = parser_info.and_then(|info| info.phpdoc_comment);
+
+    if type_hint.is_none() && phpdoc_comment.is_none() {
+        return None;
+    }
+
+    Some(LocalVariableHoverData {
+        variable_name,
+        type_hint,
+        phpdoc_comment,
+    })
+}
+
+fn assignment_rhs_for_variable_hover<'tree>(
+    variable_node: tree_sitter::Node<'tree>,
+    variable_name: &str,
+    usage_start: usize,
+    source: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    if let Some(current_rhs) = current_assignment_rhs_for_variable(variable_node, source) {
+        return Some(current_rhs);
+    }
+
+    let scope = local_variable_scope_node(variable_node);
+    latest_assignment_rhs_before_usage(scope, variable_name, usage_start, source)
+        .map(|(_, rhs)| rhs)
+}
+
+fn current_assignment_rhs_for_variable<'tree>(
+    variable_node: tree_sitter::Node<'tree>,
+    source: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    let assignment = variable_node.parent()?;
+    if assignment.kind() != "assignment_expression" {
+        return None;
+    }
+    let left = assignment.child_by_field_name("left")?;
+    let right = assignment.child_by_field_name("right")?;
+    (left.id() == variable_node.id() && is_plain_assignment_expression(left, right, source))
+        .then_some(right)
+}
+
+fn latest_assignment_rhs_before_usage<'tree>(
+    node: tree_sitter::Node<'tree>,
+    variable_name: &str,
+    usage_start: usize,
+    source: &str,
+) -> Option<(usize, tree_sitter::Node<'tree>)> {
+    let mut best = None;
+    collect_latest_assignment_rhs_before_usage(
+        node,
+        variable_name,
+        usage_start,
+        source,
+        &mut best,
+        true,
+    );
+    best
+}
+
+fn collect_latest_assignment_rhs_before_usage<'tree>(
+    node: tree_sitter::Node<'tree>,
+    variable_name: &str,
+    usage_start: usize,
+    source: &str,
+    best: &mut Option<(usize, tree_sitter::Node<'tree>)>,
+    is_scope_root: bool,
+) {
+    if node.start_byte() > usage_start {
+        return;
+    }
+    if !is_scope_root && is_variable_inference_scope_boundary_for_hover(node) {
+        return;
+    }
+
+    if let Some(rhs) = assignment_rhs_for_variable_node(node, variable_name, source)
+        .filter(|rhs| rhs.end_byte() <= usage_start)
+    {
+        let candidate = (node.start_byte(), rhs);
+        if best
+            .as_ref()
+            .is_none_or(|(best_start, _)| candidate.0 >= *best_start)
+        {
+            *best = Some(candidate);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() > usage_start {
+            break;
+        }
+        collect_latest_assignment_rhs_before_usage(
+            child,
+            variable_name,
+            usage_start,
+            source,
+            best,
+            false,
+        );
+    }
+}
+
+fn assignment_rhs_for_variable_node<'tree>(
+    node: tree_sitter::Node<'tree>,
+    variable_name: &str,
+    source: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    if node.kind() != "assignment_expression" {
+        return None;
+    }
+    let left = node.child_by_field_name("left")?;
+    let right = node.child_by_field_name("right")?;
+    if left.kind() != "variable_name"
+        || variable_text_for_node(source, left).as_deref() != Some(variable_name)
+        || !is_plain_assignment_expression(left, right, source)
+    {
+        return None;
+    }
+    Some(right)
+}
+
+fn local_variable_scope_node(mut node: tree_sitter::Node) -> tree_sitter::Node {
+    loop {
+        if matches!(
+            node.kind(),
+            "method_declaration" | "function_definition" | "anonymous_function"
+        ) {
+            return node;
+        }
+        let Some(parent) = node.parent() else {
+            return node;
+        };
+        node = parent;
+    }
+}
+
+fn is_variable_inference_scope_boundary_for_hover(node: tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function"
+            | "anonymous_function_creation_expression"
+            | "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+    )
+}
+
+fn local_variable_type_from_hover_info(
     info: &php_lsp_parser::resolve::VariableHoverInfo,
     file_symbols: &php_lsp_types::FileSymbols,
+    allow_scalar: bool,
 ) -> Option<LocalVariableInlayType> {
     let display = info
         .type_display
         .as_deref()
         .or(info.resolved_type_fqn.as_deref())?
         .trim();
-    if !is_useful_local_variable_type_hint(display) {
+    if display.is_empty() || (!allow_scalar && !is_useful_local_variable_type_hint(display)) {
         return None;
     }
 
@@ -10207,6 +10394,40 @@ fn local_variable_inlay_tooltip(type_hint: &LocalVariableInlayType) -> String {
         .as_deref()
         .unwrap_or(type_hint.display.as_str());
     format!("Inferred local variable type: {type_text}")
+}
+
+fn local_variable_type_markdown(
+    index: &WorkspaceIndex,
+    type_hint: &LocalVariableInlayType,
+) -> String {
+    let Some(target_fqn) = type_hint.target_fqn.as_deref() else {
+        return markdown_code_span(&type_hint.display);
+    };
+    let Some(symbol) = index.resolve_fqn(target_fqn.trim_start_matches('\\')) else {
+        return markdown_code_span(&type_hint.display);
+    };
+    let destination = markdown_file_location_destination(&symbol);
+    if let Some(rest) = type_hint.display.strip_prefix('?') {
+        return format!("?[{}](<{}>)", markdown_code_span(rest), destination);
+    }
+    format!(
+        "[{}](<{}>)",
+        markdown_code_span(&type_hint.display),
+        destination
+    )
+}
+
+fn markdown_file_location_destination(symbol: &php_lsp_types::SymbolInfo) -> String {
+    let line = symbol.selection_range.0.saturating_add(1);
+    format!("{}#L{}", symbol.uri, line)
+}
+
+fn markdown_code_span(text: &str) -> String {
+    if text.contains('`') {
+        format!("`` {} ``", text)
+    } else {
+        format!("`{}`", text)
+    }
 }
 
 fn location_for_inlay_type_fqn(index: &WorkspaceIndex, fqn: &str) -> Option<Location> {
@@ -16698,7 +16919,7 @@ impl LanguageServer for PhpLspBackend {
         tracing::debug!("hover: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position and local variable hover info inside a block so DashMap guard is dropped.
-        let (sym_at_pos, var_hover_info) = {
+        let (sym_at_pos, local_var_hover) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -16711,6 +16932,7 @@ impl LanguageServer for PhpLspBackend {
 
             let source = parser.source();
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let utf16_index = Utf16LineIndex::new(&source);
 
             // Get file symbols for name resolution
             let file_symbols = self
@@ -16737,13 +16959,22 @@ impl LanguageServer for PhpLspBackend {
                 Some(s) => s,
                 None => return Ok(None),
             };
-            let var_hover_info = if sym_at_pos.ref_kind == RefKind::Variable {
-                variable_hover_info_at_position(tree, &source, &file_symbols, pos.line, byte_col)
+            let local_var_hover = if sym_at_pos.ref_kind == RefKind::Variable {
+                let ctx = InlayHintContext {
+                    tree,
+                    source: &source,
+                    file_symbols: &file_symbols,
+                    index: &self.index,
+                    utf16_index: &utf16_index,
+                    requested_range: (0, 0, u32::MAX, u32::MAX),
+                };
+                variable_name_node_at_range(tree, &source, (pos.line, byte_col, pos.line, byte_col))
+                    .and_then(|variable_node| local_variable_hover_data(&ctx, variable_node))
             } else {
                 None
             };
 
-            (sym_at_pos, var_hover_info)
+            (sym_at_pos, local_var_hover)
         };
 
         // Look up symbol in index (with lazy vendor fallback)
@@ -16911,15 +17142,11 @@ impl LanguageServer for PhpLspBackend {
                 }),
                 range: Some(range),
             })
-        } else if let Some(var_info) = var_hover_info {
+        } else if let Some(var_info) = local_var_hover {
             let mut content = String::new();
             content.push_str("```php\n");
-            if let Some(ref t) = var_info.type_display {
-                content.push_str(t);
-                content.push(' ');
-                content.push_str(&var_info.variable_name);
-            } else if let Some(ref fqn) = var_info.resolved_type_fqn {
-                content.push_str(fqn);
+            if let Some(ref type_hint) = var_info.type_hint {
+                content.push_str(&type_hint.display);
                 content.push(' ');
                 content.push_str(&var_info.variable_name);
             } else {
@@ -16927,6 +17154,12 @@ impl LanguageServer for PhpLspBackend {
                 content.push_str(&var_info.variable_name);
             }
             content.push_str("\n```\n");
+
+            if let Some(ref type_hint) = var_info.type_hint {
+                content.push_str("\n**Type:** ");
+                content.push_str(&local_variable_type_markdown(&self.index, type_hint));
+                content.push('\n');
+            }
 
             if let Some(ref doc) = var_info.phpdoc_comment {
                 let phpdoc = parse_phpdoc(doc);
