@@ -6702,6 +6702,439 @@ class Demo {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_code_action_unused_import_quickfixes() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+use App\Unused;
+use App\AlsoUnused;
+use App\Used;
+
+class Demo {
+    public function run(Used $used): void {}
+}
+"#;
+    let uri = "file:///test/UnusedImportQuickfix.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(2, uri, 3, 0, 3, 15, json!([])))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let actions = result.as_array().expect("code actions array");
+    let remove_single = actions
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Remove unused import")
+        })
+        .unwrap_or_else(|| panic!("expected Remove unused import action, got: {}", result));
+    assert_eq!(
+        remove_single["edit"]["changes"][uri][0]["newText"].as_str(),
+        Some("")
+    );
+
+    let remove_all = actions
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Remove all unused imports")
+        })
+        .unwrap_or_else(|| panic!("expected Remove all unused imports action, got: {}", result));
+    let remove_all_text = remove_all["edit"]["changes"][uri][0]["newText"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        remove_all_text.contains("use App\\Used;")
+            && !remove_all_text.contains("App\\Unused")
+            && !remove_all_text.contains("App\\AlsoUnused"),
+        "expected organize-imports-backed bulk unused import removal, got: {}",
+        remove_all
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_deprecated_replacement_from_diagnostic_data() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = "<?php\noldCall();\n";
+    let uri = "file:///test/DeprecatedReplacement.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let deprecated_diag = json!([
+        {
+            "range": {
+                "start": { "line": 1, "character": 0 },
+                "end": { "line": 1, "character": 7 }
+            },
+            "severity": 2,
+            "source": "php-lsp",
+            "code": "php-lsp.deprecated",
+            "message": "Deprecated call: oldCall",
+            "data": {
+                "phpLsp": {
+                    "replacement": {
+                        "title": "Replace deprecated call with `newCall`",
+                        "newText": "newCall"
+                    }
+                }
+            }
+        }
+    ]);
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(2, uri, 1, 0, 1, 7, deprecated_diag))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let action = result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Replace deprecated call with `newCall`")
+        })
+        .unwrap_or_else(|| panic!("expected deprecated replacement action, got: {}", result));
+    assert_eq!(
+        action["edit"]["changes"][uri][0]["newText"].as_str(),
+        Some("newCall")
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_external_analyzer_fixes_are_opt_in() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Demo
+{
+    public function run(array $items): void
+    {
+        foreach ($items as $item) {}
+        Legacy\Foo::run();
+        risky();
+    }
+}
+"#;
+    let uri = "file:///test/AnalyzerQuickfixes.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let throws_diag = json!([
+        {
+            "range": {
+                "start": { "line": 9, "character": 8 },
+                "end": { "line": 9, "character": 13 }
+            },
+            "severity": 1,
+            "source": "phpstan",
+            "code": "missingType.checkedException",
+            "message": "Method App\\Demo::run() throws RuntimeException but is missing @throws.",
+            "data": {
+                "phpLsp": {
+                    "analyzerFixes": [
+                        { "kind": "addThrows", "exception": "\\RuntimeException" }
+                    ]
+                }
+            }
+        }
+    ]);
+
+    let disabled_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(
+            2,
+            uri,
+            9,
+            8,
+            9,
+            13,
+            throws_diag.clone(),
+        ))
+        .await
+        .unwrap();
+    let disabled_result = extract_result(disabled_resp);
+    assert!(
+        disabled_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .all(|action| action
+                .get("title")
+                .and_then(|value| value.as_str())
+                .is_none_or(
+                    |title| !title.contains("PHPStan") && !title.starts_with("Add @throws")
+                )),
+        "analyzer quick fixes must be disabled by default, got: {}",
+        disabled_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_configuration_notification(json!({
+            "phpLsp": {
+                "analyzerCodeActions": {
+                    "enabled": true
+                }
+            }
+        })))
+        .await
+        .unwrap();
+
+    let throws_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(3, uri, 9, 8, 9, 13, throws_diag))
+        .await
+        .unwrap();
+    let throws_result = extract_result(throws_resp);
+    let throws_actions = throws_result.as_array().expect("code actions array");
+    assert!(
+        throws_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Ignore PHPStan diagnostic locally")
+                && action["edit"]["changes"][uri][0]["newText"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("@phpstan-ignore-next-line"))
+        }),
+        "expected PHPStan ignore action, got: {}",
+        throws_result
+    );
+    assert!(
+        throws_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Add @throws \\RuntimeException")
+                && action["edit"]["changes"][uri][0]["newText"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("@throws \\RuntimeException"))
+        }),
+        "expected add @throws action, got: {}",
+        throws_result
+    );
+
+    let iterable_diag = json!([
+        {
+            "range": {
+                "start": { "line": 5, "character": 23 },
+                "end": { "line": 5, "character": 29 }
+            },
+            "severity": 1,
+            "source": "phpstan",
+            "code": "missingType.iterableValue",
+            "message": "Method App\\Demo::run() has parameter $items with no value type specified in iterable type array.",
+            "data": {
+                "phpLsp": {
+                    "analyzerFixes": [
+                        {
+                            "kind": "addIterableValueType",
+                            "variable": "items",
+                            "typeText": "array<int, Item>"
+                        }
+                    ]
+                }
+            }
+        }
+    ]);
+    let iterable_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(4, uri, 5, 23, 5, 29, iterable_diag))
+        .await
+        .unwrap();
+    let iterable_result = extract_result(iterable_resp);
+    assert!(
+        iterable_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(|action| {
+                action.get("title").and_then(|value| value.as_str())
+                    == Some("Add PHPDoc iterable value type for `$items`")
+                    && action["edit"]["changes"][uri][0]["newText"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("@param array<int, Item> $items"))
+            }),
+        "expected iterable value PHPDoc action, got: {}",
+        iterable_result
+    );
+
+    let prefixed_class_diag = json!([
+        {
+            "range": {
+                "start": { "line": 8, "character": 8 },
+                "end": { "line": 8, "character": 18 }
+            },
+            "severity": 1,
+            "source": "psalm",
+            "code": "UndefinedClass",
+            "message": "Class Legacy\\Foo was not found.",
+            "data": {
+                "phpLsp": {
+                    "analyzerFixes": [
+                        {
+                            "kind": "replacePrefixedClassName",
+                            "replacement": "\\App\\Legacy\\Foo"
+                        }
+                    ]
+                }
+            }
+        }
+    ]);
+    let prefixed_class_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(
+            5,
+            uri,
+            8,
+            8,
+            8,
+            18,
+            prefixed_class_diag,
+        ))
+        .await
+        .unwrap();
+    let prefixed_class_result = extract_result(prefixed_class_resp);
+    let prefixed_class_actions = prefixed_class_result
+        .as_array()
+        .expect("code actions array");
+    assert!(
+        prefixed_class_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Ignore Psalm diagnostic locally")
+                && action["edit"]["changes"][uri][0]["newText"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("@psalm-suppress UndefinedClass"))
+        }),
+        "expected Psalm ignore action, got: {}",
+        prefixed_class_result
+    );
+    assert!(
+        prefixed_class_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Replace class name with `\\App\\Legacy\\Foo`")
+                && action["edit"]["changes"][uri][0]["newText"].as_str()
+                    == Some("\\App\\Legacy\\Foo")
+        }),
+        "expected prefixed class replacement action, got: {}",
+        prefixed_class_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_action_add_return_type_from_phpdoc() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

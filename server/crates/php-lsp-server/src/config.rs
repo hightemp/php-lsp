@@ -46,6 +46,9 @@ memory_limit = ""
 enabled = false
 command = "vendor/bin/psalm --output-format=json --no-progress {file}"
 timeoutMs = 30000
+
+[analyzerCodeActions]
+enabled = false
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +244,7 @@ pub fn normalize_project_config_settings(raw: &Value) -> Value {
         "psalm",
         &["enabled", "command", "timeoutMs", "timeout"],
     );
+    copy_section(raw, &mut settings, "analyzerCodeActions", &["enabled"]);
 
     Value::Object(settings)
 }

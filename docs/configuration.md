@@ -77,6 +77,9 @@ memory_limit = "1G"
 enabled = false
 command = "vendor/bin/psalm --output-format=json --no-progress {file}"
 timeoutMs = 30000
+
+[analyzerCodeActions]
+enabled = false
 ```
 
 ## Sections
@@ -91,8 +94,14 @@ timeoutMs = 30000
 | `[formatting]` | `provider`, `command`, `timeoutMs` |
 | `[phpstan]` | `enabled`, `command`, `timeoutMs`, `memory_limit` |
 | `[psalm]` | `enabled`, `command`, `timeoutMs` |
+| `[analyzerCodeActions]` | `enabled` |
 
 Relative include/exclude paths are interpreted relative to the effective
 workspace root. `phpstan.memory_limit` is added to the PHPStan command unless
 the command already contains `--memory-limit`; `{memory_limit}` can be used in a
 custom command template for explicit placement.
+
+Analyzer code actions are disabled by default. When
+`analyzerCodeActions.enabled` is true, PHPStan/Psalm diagnostics can offer local
+ignore comments and metadata-driven fixes such as missing `@throws`, iterable
+PHPDoc value types, and obvious prefixed class-name replacements.

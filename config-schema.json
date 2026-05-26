@@ -124,6 +124,16 @@
           "minimum": 1000
         }
       }
+    },
+    "analyzerCodeActions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable opt-in quick fixes for PHPStan and Psalm diagnostics when diagnostic metadata is available."
+        }
+      }
     }
   },
   "$defs": {

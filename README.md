@@ -56,7 +56,9 @@ phpstorm-stubs support.
 
 - Rename for classes, functions, methods, properties, constants, and local
   variables.
-- Quick fixes to import unresolved classes and functions.
+- Quick fixes to import unresolved classes/functions, remove unused imports,
+  apply diagnostic replacement metadata, and optionally map PHPStan/Psalm
+  findings to local fixes.
 - Source action to organize imports.
 - Refactor action to add return types from PHPDoc when supported by the target
   PHP version.
@@ -149,6 +151,7 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.psalm.enabled` | `false` | Enable Psalm diagnostics. |
 | `phpLsp.psalm.command` | `vendor/bin/psalm ... {file}` | Psalm command that prints JSON output. |
 | `phpLsp.psalm.timeoutMs` | `30000` | Psalm timeout per file. |
+| `phpLsp.analyzerCodeActions.enabled` | `false` | Enable opt-in quick fixes for PHPStan and Psalm diagnostics when diagnostic metadata is available. |
 | `phpLsp.trace.server` | `off` | LSP transport trace: `off`, `messages`, or `verbose`. |
 | `phpLsp.logLevel` | `info` | Server log level: `error`, `warn`, `info`, `debug`, or `trace`. |
 
@@ -164,7 +167,8 @@ Example external diagnostics setup:
   "phpLsp.phpstan.enabled": true,
   "phpLsp.phpstan.command": "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}",
   "phpLsp.psalm.enabled": true,
-  "phpLsp.psalm.command": "vendor/bin/psalm --output-format=json --no-progress {file}"
+  "phpLsp.psalm.command": "vendor/bin/psalm --output-format=json --no-progress {file}",
+  "phpLsp.analyzerCodeActions.enabled": true
 }
 ```
 

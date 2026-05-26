@@ -298,6 +298,11 @@ impl Default for PsalmConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AnalyzerCodeActionConfig {
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DiagnosticsMode {
     Off,
     SyntaxOnly,
@@ -787,6 +792,8 @@ pub struct PhpLspBackend {
     phpstan_config: Mutex<PhpStanConfig>,
     /// Psalm subprocess diagnostics configuration.
     psalm_config: Mutex<PsalmConfig>,
+    /// Opt-in code actions for external analyzer diagnostics.
+    analyzer_code_actions: Mutex<AnalyzerCodeActionConfig>,
     /// Whether composer.json autoload discovery is enabled.
     composer_enabled: Mutex<bool>,
     /// Whether lazy vendor indexing is enabled.
@@ -833,6 +840,7 @@ impl PhpLspBackend {
             diagnostic_severity: Mutex::new(DiagnosticSeverityConfig::default()),
             phpstan_config: Mutex::new(PhpStanConfig::default()),
             psalm_config: Mutex::new(PsalmConfig::default()),
+            analyzer_code_actions: Mutex::new(AnalyzerCodeActionConfig::default()),
             composer_enabled: Mutex::new(true),
             index_vendor: Mutex::new(true),
             include_paths: Mutex::new(Vec::new()),
@@ -1197,6 +1205,18 @@ impl PhpLspBackend {
             if next_config != current {
                 *self.psalm_config.lock().await = next_config;
                 applied.diagnostics_changed = true;
+            }
+        }
+
+        if let Some(enabled) = settings_bool(
+            settings,
+            "analyzerCodeActionsEnabled",
+            &["analyzerCodeActions", "enabled"],
+        ) {
+            let mut analyzer_code_actions = self.analyzer_code_actions.lock().await;
+            let next_config = AnalyzerCodeActionConfig { enabled };
+            if *analyzer_code_actions != next_config {
+                *analyzer_code_actions = next_config;
             }
         }
 
@@ -8887,6 +8907,562 @@ fn build_add_import_edit(
         },
         alias,
     ))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticDataEnvelope {
+    #[serde(rename = "phpLsp")]
+    php_lsp: Option<PhpLspDiagnosticData>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PhpLspDiagnosticData {
+    replacement: Option<DiagnosticReplacement>,
+    #[serde(default)]
+    analyzer_fixes: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticReplacement {
+    new_text: String,
+    title: Option<String>,
+    range: Option<Range>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ExternalAnalyzerFix {
+    AddThrows {
+        exception: String,
+    },
+    AddIterableValueType {
+        variable: String,
+        #[serde(rename = "typeText")]
+        type_text: String,
+    },
+    ReplacePrefixedClassName {
+        replacement: String,
+        range: Option<Range>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalAnalyzer {
+    PhpStan,
+    Psalm,
+}
+
+impl ExternalAnalyzer {
+    fn display_name(self) -> &'static str {
+        match self {
+            ExternalAnalyzer::PhpStan => "PHPStan",
+            ExternalAnalyzer::Psalm => "Psalm",
+        }
+    }
+}
+
+fn diagnostic_code_str(diagnostic: &Diagnostic) -> Option<&str> {
+    match diagnostic.code.as_ref()? {
+        NumberOrString::String(value) => Some(value.as_str()),
+        NumberOrString::Number(_) => None,
+    }
+}
+
+fn diagnostic_data(diagnostic: &Diagnostic) -> Option<PhpLspDiagnosticData> {
+    let data = diagnostic.data.clone()?;
+    if let Ok(envelope) = serde_json::from_value::<DiagnosticDataEnvelope>(data.clone()) {
+        if let Some(php_lsp) = envelope.php_lsp {
+            return Some(php_lsp);
+        }
+    }
+    serde_json::from_value::<PhpLspDiagnosticData>(data).ok()
+}
+
+fn diagnostic_external_analyzer(diagnostic: &Diagnostic) -> Option<ExternalAnalyzer> {
+    match diagnostic
+        .source
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("phpstan") => Some(ExternalAnalyzer::PhpStan),
+        Some("psalm") => Some(ExternalAnalyzer::Psalm),
+        _ => None,
+    }
+}
+
+fn is_unused_import_diagnostic(diagnostic: &Diagnostic) -> bool {
+    diagnostic.source.as_deref() == Some("php-lsp")
+        && (diagnostic_code_str(diagnostic) == Some("php-lsp.unusedImport")
+            || diagnostic.message.starts_with("Unused import: "))
+}
+
+fn diagnostic_range_byte_offsets(source: &str, range: Range) -> Option<(usize, usize)> {
+    let start = lsp_position_to_byte(source, range.start)?;
+    let end = lsp_position_to_byte(source, range.end)?;
+    Some((start.min(source.len()), end.min(source.len())))
+}
+
+fn remove_unused_import_edit(uri: Uri, source: &str, range: Range) -> Option<WorkspaceEdit> {
+    let (start, end) = diagnostic_range_byte_offsets(source, range)?;
+    let (start, end) = line_full_span(source, start, end);
+    Some(workspace_edit_from_text_edits(
+        uri,
+        vec![TextEdit {
+            range: lsp_range_for_byte_offsets(source, start, end),
+            new_text: String::new(),
+        }],
+    ))
+}
+
+fn build_remove_unused_import_action(
+    uri: Uri,
+    source: &str,
+    diagnostic: &Diagnostic,
+    is_preferred: bool,
+) -> Option<CodeActionOrCommand> {
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: "Remove unused import".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic.clone()]),
+        edit: Some(remove_unused_import_edit(uri, source, diagnostic.range)?),
+        command: None,
+        is_preferred: Some(is_preferred),
+        disabled: None,
+        data: None,
+    }))
+}
+
+fn build_remove_all_unused_imports_action(
+    uri: Uri,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    diagnostics: &[Diagnostic],
+) -> Option<CodeActionOrCommand> {
+    let unused_diagnostics = diagnostics
+        .iter()
+        .filter(|diagnostic| is_unused_import_diagnostic(diagnostic))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unused_diagnostics.is_empty() {
+        return None;
+    }
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: "Remove all unused imports".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(unused_diagnostics),
+        edit: Some(build_organize_imports_edit(uri, source, file_symbols)?),
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: None,
+    }))
+}
+
+fn build_diagnostic_replacement_action(
+    uri: Uri,
+    source: &str,
+    diagnostic: &Diagnostic,
+    replacement: &DiagnosticReplacement,
+    is_preferred: bool,
+) -> Option<CodeActionOrCommand> {
+    if replacement.new_text.trim().is_empty() {
+        return None;
+    }
+
+    let range = replacement.range.unwrap_or(diagnostic.range);
+    let title = replacement.title.clone().unwrap_or_else(|| {
+        format!(
+            "Replace with `{}`",
+            replacement.new_text.trim().trim_end_matches("()")
+        )
+    });
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic.clone()]),
+        edit: Some(workspace_edit_from_text_edits(
+            uri,
+            vec![TextEdit {
+                range: lsp_range_for_byte_offsets(
+                    source,
+                    diagnostic_range_byte_offsets(source, range)?.0,
+                    diagnostic_range_byte_offsets(source, range)?.1,
+                ),
+                new_text: replacement.new_text.clone(),
+            }],
+        )),
+        command: None,
+        is_preferred: Some(is_preferred),
+        disabled: None,
+        data: None,
+    }))
+}
+
+fn line_insert_position(line: u32) -> Range {
+    Range {
+        start: Position::new(line, 0),
+        end: Position::new(line, 0),
+    }
+}
+
+fn analyzer_ignore_comment(
+    source: &str,
+    diagnostic: &Diagnostic,
+    analyzer: ExternalAnalyzer,
+) -> Option<String> {
+    let line = diagnostic.range.start.line;
+    let indent = leading_ascii_whitespace(line_text(source, line));
+    match analyzer {
+        ExternalAnalyzer::PhpStan => Some(format!("{indent}// @phpstan-ignore-next-line\n")),
+        ExternalAnalyzer::Psalm => {
+            let code = diagnostic_code_str(diagnostic)?.trim();
+            if code.is_empty() {
+                return None;
+            }
+            Some(format!("{indent}/** @psalm-suppress {code} */\n"))
+        }
+    }
+}
+
+fn build_ignore_external_analyzer_action(
+    uri: Uri,
+    source: &str,
+    diagnostic: &Diagnostic,
+    analyzer: ExternalAnalyzer,
+) -> Option<CodeActionOrCommand> {
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Ignore {} diagnostic locally", analyzer.display_name()),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic.clone()]),
+        edit: Some(workspace_edit_from_text_edits(
+            uri,
+            vec![TextEdit {
+                range: line_insert_position(diagnostic.range.start.line),
+                new_text: analyzer_ignore_comment(source, diagnostic, analyzer)?,
+            }],
+        )),
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: None,
+    }))
+}
+
+fn callable_symbol_containing_range(
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&php_lsp_types::SymbolInfo> {
+    let start_line = range.0;
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+            )
+        })
+        .find(|symbol| {
+            byte_range_contains(symbol.range, range)
+                || byte_ranges_overlap(symbol.range, range)
+                || byte_ranges_overlap(symbol.selection_range, range)
+                || (symbol.selection_range.0 <= start_line && start_line <= symbol.range.2)
+        })
+}
+
+fn render_existing_phpdoc_plan(
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    content_lines: Vec<String>,
+) -> Option<UpdatePhpDocPlan> {
+    let (doc_start, doc_end) = symbol_doc_comment_span(source, symbol)?;
+    let line_start = line_start_offset(source, doc_start);
+    let line_end = line_end_offset(source, doc_end);
+    let line_prefix = source.get(line_start..doc_start).unwrap_or("");
+    let line_suffix = source.get(doc_end..line_end).unwrap_or("");
+    let starts_standalone = line_prefix.trim().is_empty();
+    let ends_standalone = line_suffix.trim().is_empty();
+    let start = if starts_standalone {
+        line_start
+    } else {
+        doc_start
+    };
+    let indent = if starts_standalone { line_prefix } else { "" };
+    let mut new_text =
+        render_phpdoc_comment(indent, &normalize_phpdoc_content_lines(content_lines));
+    if starts_standalone && !ends_standalone {
+        new_text.push('\n');
+    }
+
+    Some(UpdatePhpDocPlan {
+        start,
+        end: doc_end,
+        new_text,
+    })
+}
+
+fn render_created_phpdoc_plan(
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    content_lines: Vec<String>,
+) -> Option<UpdatePhpDocPlan> {
+    let declaration_start = byte_offset_for_line_col(source, symbol.range.0, symbol.range.1)?;
+    let insert_at = line_start_offset(source, declaration_start);
+    let indent = line_indent_at_offset(source, declaration_start);
+    let mut new_text =
+        render_phpdoc_comment(&indent, &normalize_phpdoc_content_lines(content_lines));
+    new_text.push('\n');
+    Some(UpdatePhpDocPlan {
+        start: insert_at,
+        end: insert_at,
+        new_text,
+    })
+}
+
+fn add_throws_phpdoc_edit(
+    uri: Uri,
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    exception: &str,
+) -> Option<WorkspaceEdit> {
+    let exception = exception.trim();
+    if exception.is_empty() {
+        return None;
+    }
+    let throws_line = format!("@throws {exception}");
+    let plan = if let Some(doc_comment) = symbol.doc_comment.as_deref() {
+        let mut lines = phpdoc_content_lines(doc_comment);
+        if lines.iter().any(|line| line.trim() == throws_line) {
+            return None;
+        }
+        let insert_at = lines
+            .iter()
+            .rposition(|line| phpdoc_line_is_tag(line))
+            .map(|idx| idx + 1)
+            .unwrap_or_else(|| phpdoc_managed_insert_index(&lines));
+        lines.insert(insert_at, throws_line);
+        render_existing_phpdoc_plan(source, symbol, lines)?
+    } else {
+        render_created_phpdoc_plan(source, symbol, vec![throws_line])?
+    };
+
+    Some(workspace_edit_from_text_edits(
+        uri,
+        vec![TextEdit {
+            range: lsp_range_for_byte_offsets(source, plan.start, plan.end),
+            new_text: plan.new_text,
+        }],
+    ))
+}
+
+fn normalize_phpdoc_variable_name(variable: &str) -> Option<String> {
+    let name = variable.trim().trim_start_matches('$');
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn phpdoc_param_insert_index(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .position(|line| phpdoc_line_starts_with_tag(line, "@return"))
+        .or_else(|| {
+            lines
+                .iter()
+                .rposition(|line| phpdoc_line_starts_with_tag(line, "@param"))
+                .map(|idx| idx + 1)
+        })
+        .unwrap_or_else(|| phpdoc_managed_insert_index(lines))
+}
+
+fn update_param_phpdoc_lines(
+    mut lines: Vec<String>,
+    variable: &str,
+    type_text: &str,
+) -> Vec<String> {
+    let variable_token = format!("${variable}");
+    for line in &mut lines {
+        let Some(rest) = phpdoc_tag_rest(line, "@param") else {
+            continue;
+        };
+        let Some(type_end) = consume_phpdoc_type_expr(rest) else {
+            continue;
+        };
+        let after_type = rest[type_end..].trim_start();
+        let Some((variable_start, variable_end)) = find_phpdoc_variable_token_span(after_type)
+        else {
+            continue;
+        };
+        let existing_variable_text = after_type[variable_start..variable_end].trim();
+        if phpdoc_variable_name_from_token(existing_variable_text).as_deref() != Some(variable) {
+            continue;
+        }
+
+        let description = after_type[variable_end..].trim();
+        let mut updated = format!("@param {} {}", type_text.trim(), existing_variable_text);
+        if !description.is_empty() {
+            updated.push(' ');
+            updated.push_str(description);
+        }
+        *line = updated;
+        return lines;
+    }
+
+    let insert_at = phpdoc_param_insert_index(&lines);
+    lines.insert(
+        insert_at,
+        format!("@param {} {}", type_text.trim(), variable_token),
+    );
+    lines
+}
+
+fn add_iterable_value_type_phpdoc_edit(
+    uri: Uri,
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    variable: &str,
+    type_text: &str,
+) -> Option<WorkspaceEdit> {
+    let variable = normalize_phpdoc_variable_name(variable)?;
+    let type_text = type_text.trim();
+    if type_text.is_empty() {
+        return None;
+    }
+
+    let plan = if let Some(doc_comment) = symbol.doc_comment.as_deref() {
+        let lines =
+            update_param_phpdoc_lines(phpdoc_content_lines(doc_comment), &variable, type_text);
+        render_existing_phpdoc_plan(source, symbol, lines)?
+    } else {
+        render_created_phpdoc_plan(
+            source,
+            symbol,
+            vec![format!("@param {} ${}", type_text, variable)],
+        )?
+    };
+
+    Some(workspace_edit_from_text_edits(
+        uri,
+        vec![TextEdit {
+            range: lsp_range_for_byte_offsets(source, plan.start, plan.end),
+            new_text: plan.new_text,
+        }],
+    ))
+}
+
+fn build_external_analyzer_fix_actions(
+    uri: Uri,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    diagnostic: &Diagnostic,
+    analyzer: ExternalAnalyzer,
+    data: Option<&PhpLspDiagnosticData>,
+) -> Vec<CodeActionOrCommand> {
+    let mut actions = Vec::new();
+    if let Some(action) =
+        build_ignore_external_analyzer_action(uri.clone(), source, diagnostic, analyzer)
+    {
+        actions.push(action);
+    }
+
+    let range = lsp_range_to_byte_range(source, diagnostic.range);
+    let callable = callable_symbol_containing_range(file_symbols, range);
+    let fixes = data
+        .into_iter()
+        .flat_map(|data| data.analyzer_fixes.iter())
+        .filter_map(|value| serde_json::from_value::<ExternalAnalyzerFix>(value.clone()).ok());
+
+    for fix in fixes {
+        match fix {
+            ExternalAnalyzerFix::AddThrows { exception } => {
+                let Some(symbol) = callable else {
+                    continue;
+                };
+                if let Some(edit) =
+                    add_throws_phpdoc_edit(uri.clone(), source, symbol, exception.as_str())
+                {
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Add @throws {}", exception.trim()),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: Some(vec![diagnostic.clone()]),
+                        edit: Some(edit),
+                        command: None,
+                        is_preferred: Some(false),
+                        disabled: None,
+                        data: None,
+                    }));
+                }
+            }
+            ExternalAnalyzerFix::AddIterableValueType {
+                variable,
+                type_text,
+            } => {
+                let Some(symbol) = callable else {
+                    continue;
+                };
+                if let Some(edit) = add_iterable_value_type_phpdoc_edit(
+                    uri.clone(),
+                    source,
+                    symbol,
+                    variable.as_str(),
+                    type_text.as_str(),
+                ) {
+                    let variable = normalize_phpdoc_variable_name(&variable)
+                        .map(|name| format!("${name}"))
+                        .unwrap_or(variable);
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Add PHPDoc iterable value type for `{variable}`"),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: Some(vec![diagnostic.clone()]),
+                        edit: Some(edit),
+                        command: None,
+                        is_preferred: Some(false),
+                        disabled: None,
+                        data: None,
+                    }));
+                }
+            }
+            ExternalAnalyzerFix::ReplacePrefixedClassName { replacement, range } => {
+                if replacement.trim().is_empty() {
+                    continue;
+                }
+                let range = range.unwrap_or(diagnostic.range);
+                let Some((start, end)) = diagnostic_range_byte_offsets(source, range) else {
+                    continue;
+                };
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Replace class name with `{}`", replacement.trim()),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diagnostic.clone()]),
+                    edit: Some(workspace_edit_from_text_edits(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: lsp_range_for_byte_offsets(source, start, end),
+                            new_text: replacement,
+                        }],
+                    )),
+                    command: None,
+                    is_preferred: Some(false),
+                    disabled: None,
+                    data: None,
+                }));
+            }
+        }
+    }
+
+    actions
 }
 
 fn range_overlaps(a: Range, b: Range) -> bool {
@@ -17506,6 +18082,7 @@ impl LanguageServer for PhpLspBackend {
         let uri = params.text_document.uri;
         let uri_str = uri.as_str().to_string();
         let php_version = *self.php_version.lock().await;
+        let analyzer_code_actions = *self.analyzer_code_actions.lock().await;
         let document_version = self.current_document_version(&uri_str);
 
         let (
@@ -17741,9 +18318,56 @@ impl LanguageServer for PhpLspBackend {
             params.context.diagnostics
         };
 
+        let all_quickfix_diagnostics = diagnostics.clone();
         let mut quickfix_count = 0usize;
 
         for diagnostic in diagnostics {
+            let data = diagnostic_data(&diagnostic);
+            let analyzer = diagnostic_external_analyzer(&diagnostic);
+
+            if analyzer.is_none_or(|_| analyzer_code_actions.enabled) {
+                if let Some(replacement) = data.as_ref().and_then(|data| data.replacement.as_ref())
+                {
+                    if let Some(action) = build_diagnostic_replacement_action(
+                        uri.clone(),
+                        &source,
+                        &diagnostic,
+                        replacement,
+                        quickfix_count == 0,
+                    ) {
+                        actions.push(action);
+                        quickfix_count += 1;
+                    }
+                }
+            }
+
+            if is_unused_import_diagnostic(&diagnostic) {
+                if let Some(action) = build_remove_unused_import_action(
+                    uri.clone(),
+                    &source,
+                    &diagnostic,
+                    quickfix_count == 0,
+                ) {
+                    actions.push(action);
+                    quickfix_count += 1;
+                }
+            }
+
+            if analyzer_code_actions.enabled {
+                if let Some(analyzer) = analyzer {
+                    let analyzer_actions = build_external_analyzer_fix_actions(
+                        uri.clone(),
+                        &source,
+                        &file_symbols,
+                        &diagnostic,
+                        analyzer,
+                        data.as_ref(),
+                    );
+                    quickfix_count += analyzer_actions.len();
+                    actions.extend(analyzer_actions);
+                }
+            }
+
             let Some((import_kind, unresolved_fqn)) =
                 unknown_symbol_from_diagnostic(&diagnostic.message)
             else {
@@ -17812,6 +18436,15 @@ impl LanguageServer for PhpLspBackend {
                 }));
                 quickfix_count += 1;
             }
+        }
+
+        if let Some(action) = build_remove_all_unused_imports_action(
+            uri.clone(),
+            &source,
+            &file_symbols,
+            &all_quickfix_diagnostics,
+        ) {
+            actions.push(action);
         }
 
         Ok(Some(actions))

@@ -797,6 +797,13 @@ function buildInitializationOptions(config: ReturnType<typeof workspace.getConfi
     "vendor/bin/psalm --output-format=json --no-progress {file}",
   );
   setIfConfigured(options, config, "psalm.timeoutMs", "psalmTimeoutMs", 30000);
+  setIfConfigured(
+    options,
+    config,
+    "analyzerCodeActions.enabled",
+    "analyzerCodeActionsEnabled",
+    false,
+  );
 
   if (stubsPath) {
     options.bundledStubsPath = stubsPath;

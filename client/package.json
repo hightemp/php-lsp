@@ -315,6 +315,12 @@
           "scope": "resource",
           "description": "Maximum time in milliseconds to wait for Psalm diagnostics per file."
         },
+        "phpLsp.analyzerCodeActions.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Enable opt-in quick fixes for PHPStan and Psalm diagnostics when diagnostic metadata is available."
+        },
         "phpLsp.trace.server": {
           "type": "string",
           "enum": [

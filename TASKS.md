@@ -1477,7 +1477,7 @@ PR-052 ─→ PR-053
   - Docs: `README.md` and `docs/lsp-features.md` document the Supported extract/inline refactor behavior.
   - Validation: `cargo fmt --all --check`, targeted IE-014S e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
-- [ ] **IE-015** Code actions для diagnostics и external analyzer findings
+- [x] **IE-015** Code actions для diagnostics и external analyzer findings *(done 2026-05-26)*
   - Remove unused import как explicit quickfix рядом с diagnostic.
   - Bulk "Remove all unused imports" через existing organize imports engine.
   - Replace deprecated call, если diagnostic содержит replacement metadata из attribute/PHPDoc/stub metadata.
@@ -1487,6 +1487,14 @@ PR-052 ─→ PR-053
     - add iterable value type in PHPDoc
     - fix obvious prefixed class name.
   - Любой analyzer quickfix должен быть opt-in и покрыт фикстурой с synthetic diagnostic.
+  - Implemented: `php-lsp.unusedImport` diagnostics now offer a local `Remove unused import` quick fix.
+  - Implemented: `Remove all unused imports` quick fix reuses the existing organize-imports edit.
+  - Implemented: diagnostic `data.phpLsp.replacement` metadata produces a replacement quick fix for deprecated-call style diagnostics.
+  - Implemented: opt-in `analyzerCodeActions.enabled` setting for PHPStan/Psalm quick fixes in `.php-lsp.toml`, VS Code settings, and initialization options.
+  - Implemented: PHPStan/Psalm diagnostics can offer local ignore comments and metadata-driven `addThrows`, `addIterableValueType`, and `replacePrefixedClassName` fixes.
+  - Regression: e2e covers unused import single/bulk fixes, deprecated replacement metadata, analyzer fixes disabled by default, and synthetic analyzer fixtures for ignore, `@throws`, iterable PHPDoc type, and prefixed class replacement.
+  - Docs: `README.md`, `docs/configuration.md`, `docs/lsp-features.md`, `config-schema.json`, and VS Code setting contributions document the opt-in analyzer code actions.
+  - Validation: `cargo fmt --all --check`, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, `npm run lint`, `npm run build`, docs Cyrillic check, `git diff --check`.
 
 ### Неделя 3: CLI/tooling режимы и formatter strategy (2026-06-22 → 2026-06-28)
 
