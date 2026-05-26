@@ -1496,6 +1496,13 @@ PR-052 ─→ PR-053
   - Docs: `README.md`, `docs/configuration.md`, `docs/lsp-features.md`, `config-schema.json`, and VS Code setting contributions document the opt-in analyzer code actions.
   - Validation: `cargo fmt --all --check`, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, `npm run lint`, `npm run build`, docs Cyrillic check, `git diff --check`.
 
+- [x] **DOC-README-LSP-FEATURES** Sync README feature overview with current LSP feature matrix *(done 2026-05-26)*
+  - Обновить README на английском, чтобы он отражал недавно добавленные LSP features из `docs/lsp-features.md`.
+  - Не дублировать всю feature matrix, но явно перечислить основные Supported/Partial возможности по navigation, hierarchy, diagnostics, code actions, formatting, semantic tokens, workspace/file operations.
+  - Проверить, что README остается кратким entrypoint и ссылается на `docs/lsp-features.md` для детальной матрицы.
+  - Implemented: README feature overview now covers diagnostic severity controls, PHPDoc virtual-member hover/completion, inlay hints, semantic token modes, detailed navigation, symbols/hierarchies, code-action families, formatting, and workspace/file-operation behavior.
+  - Validation: docs Cyrillic check and `git diff --check`.
+
 ### Неделя 3: CLI/tooling режимы и formatter strategy (2026-06-22 → 2026-06-28)
 
 - [ ] **IE-020** Добавить CLI `analyze`

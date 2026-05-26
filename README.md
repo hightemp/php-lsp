@@ -33,38 +33,73 @@ phpstorm-stubs support.
   properties, and member calls.
 - Override signature and PHP-version compatibility diagnostics.
 - Optional PHPStan and Psalm diagnostics through configured external commands.
+- Per-category diagnostic severity controls for unknown symbols, unused code,
+  duplicate symbols, members, type compatibility, override signatures, and
+  PHP-version checks.
 - Test-friendly diagnostics for common PHPUnit patterns, including assertion
   helpers, test doubles, trait-based test helpers, anonymous classes, and
   closure/destructuring variable scopes.
-- Hover for symbols, signatures, types, and PHPDoc.
+- Hover for symbols, signatures, types, variables, PHPDoc, deprecation, and
+  PHPDoc virtual members.
 - Completion for classes, interfaces, traits, enums, functions, constants,
-  methods, properties, variables, namespaces, keywords, and snippets.
-- Signature help for functions, methods, and constructors.
-- Document symbols and workspace symbols.
+  methods, properties, variables, namespaces, keywords, snippets, PHPDoc virtual
+  members, and auto-import edits.
+- Completion resolve enriches PHPDoc virtual member completions.
+- Signature help for functions, methods, constructors, and active parameter
+  tracking.
+- Inlay hints for argument labels and inferred PHPDoc parameter/return types.
+- Semantic tokens with full, delta, and range requests.
 
 ### Navigation
 
-- Go to definition, declaration, type definition, and implementation.
-- Find all references.
-- Document highlight.
+- Go to definition for indexed symbols, local variables, `$this`, constructors,
+  PHPDoc virtual members, and lazy vendor fallback.
+- Go to declaration for imports, with definition fallback.
+- Go to type definition for inferred variables, members, function returns, and
+  indexed symbol types.
+- Go to implementation for interface/trait/base types and methods.
+- Find references through indexed per-file references and same-scope local
+  variable references.
+- Document highlight for local variables and non-local symbols.
 - Selection ranges based on the parsed AST.
 - Linked editing for namespace/use alias edits.
 - Document links for statically resolvable `include`/`require` paths.
-- Call hierarchy and type hierarchy.
+
+### Symbols And Hierarchies
+
+- Nested document symbols for namespaces, types, and members, including
+  signatures and deprecation tags.
+- Ranked workspace symbol search over the indexed workspace.
+- Call hierarchy for functions, methods, constructors, incoming calls, and
+  outgoing calls.
+- Type hierarchy for classes, interfaces, traits, enums, supertypes, and
+  subtypes.
 
 ### Refactoring And Editing
 
 - Rename for classes, functions, methods, properties, constants, and local
   variables.
+- Prepare rename rejects unsupported or built-in targets before editing.
 - Quick fixes to import unresolved classes/functions, remove unused imports,
   apply diagnostic replacement metadata, and optionally map PHPStan/Psalm
   findings to local fixes.
 - Source action to organize imports.
+- Quick fix to implement missing interface, abstract parent, and abstract trait
+  methods while preserving PHPDoc, analyzer tags, attributes, visibility,
+  static, params, defaults, and native-safe return types.
+- Refactor actions to generate constructors and property getters/setters from
+  indexed properties.
+- Refactor actions to change member visibility and promote simple constructor
+  assignments to constructor property promotion.
+- Refactor action to synchronize PHPDoc `@param` and `@return` tags from
+  function/method signatures while preserving richer analyzer-specific tags.
 - Refactor action to add return types from PHPDoc when supported by the target
   PHP version.
 - Refactor actions to extract selected expressions to local variables, extract
   class-scope literals to constants, and inline simple same-block local
   variables.
+- Heavy refactor edits use `codeAction/resolve` so initial code-action requests
+  stay lightweight.
 - Document formatting, range formatting, and on-type formatting through
   external formatters (`php-cs-fixer`, `phpcbf`, or a custom command).
 
@@ -73,20 +108,24 @@ phpstorm-stubs support.
 - Status bar popup with indexing status, file/percentage progress, symbol count,
   stubs information, active diagnostics/analyzers, formatter, include paths, and
   server binary details.
-- Semantic tokens with full and delta updates.
-- Inlay hints for call arguments and PHPDoc-inferred parameter/return types.
 - Code lenses with reference counts.
 - Folding ranges for PHP structures, comments, arrays, and blocks.
+- Document formatting and range formatting through configured external tools.
+- On-type indentation edits for newline, semicolon, and closing brace.
 
 ### Workspace Support
 
+- Initialization options and runtime configuration updates through
+  `workspace/didChangeConfiguration`.
 - Composer autoload support for PSR-4, PSR-0, classmap, and files entries.
 - Additional include and exclude paths from extension configuration.
 - Built-in phpstorm-stubs bundle with configurable extension stubs.
 - Lazy `vendor/` indexing.
 - Multi-root workspace support.
 - Watched PHP file changes and LSP file-operation notifications.
-- Runtime configuration updates through `workspace/didChangeConfiguration`.
+- Create/change/delete PHP file events reindex or remove symbols from the
+  workspace index.
+- Rename file notifications move indexed file state from old URI to new URI.
 
 ## Known Limitations
 
