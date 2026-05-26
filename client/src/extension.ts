@@ -161,7 +161,7 @@ class PhpLspStatusController implements Disposable {
       {
         label: "$(tools) Formatter",
         description: snapshot.formattingProvider,
-        detail: snapshot.formattingProvider === "none" ? "Document formatting is disabled" : "External formatter is configured",
+        detail: formatterDetail(snapshot.formattingProvider),
       },
       {
         label: "$(output) Log level",
@@ -364,6 +364,16 @@ function analyzerSummary(snapshot: ExtensionSnapshot): string {
   return enabled.length > 0 ? enabled.join(", ") : "off";
 }
 
+function formatterDetail(provider: string): string {
+  if (provider === "none") {
+    return "Document formatting is disabled";
+  }
+  if (provider === "auto") {
+    return "Auto-detects Laravel Pint, php-cs-fixer, or phpcbf from Composer metadata";
+  }
+  return "External formatter is configured";
+}
+
 function getExtensionSnapshot(context: ExtensionContext): ExtensionSnapshot {
   const config = workspace.getConfiguration("phpLsp");
   const binary = resolveServerBinary(context);
@@ -390,7 +400,7 @@ function getExtensionSnapshot(context: ExtensionContext): ExtensionSnapshot {
     indexVendor: config.get<boolean>("indexVendor", true),
     phpstanEnabled: config.get<boolean>("phpstan.enabled", false),
     psalmEnabled: config.get<boolean>("psalm.enabled", false),
-    formattingProvider: config.get<string>("formatting.provider", "none"),
+    formattingProvider: config.get<string>("formatting.provider", "auto"),
     logLevel: config.get<string>("logLevel", "info"),
     includePaths: config.get<string[]>("includePaths", []),
     excludePaths: config.get<string[]>("excludePaths", []),
@@ -777,8 +787,9 @@ function buildInitializationOptions(config: ReturnType<typeof workspace.getConfi
   setIfConfigured(options, config, "excludePaths", "excludePaths", []);
   setIfConfigured(options, config, "stubs.extensions", "stubExtensions", []);
   setIfConfigured(options, config, "logLevel", "logLevel", "info");
-  setIfConfigured(options, config, "formatting.provider", "formattingProvider", "none");
+  setIfConfigured(options, config, "formatting.provider", "formattingProvider", "auto");
   setIfConfigured(options, config, "formatting.command", "formattingCommand", "");
+  setIfConfigured(options, config, "formatting.timeoutMs", "formattingTimeoutMs", 30000);
   setIfConfigured(options, config, "phpstan.enabled", "phpstanEnabled", false);
   setIfConfigured(
     options,

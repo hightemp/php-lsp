@@ -255,27 +255,38 @@
         },
         "phpLsp.formatting.provider": {
           "type": "string",
-          "default": "none",
+          "default": "auto",
           "enum": [
+            "auto",
             "none",
+            "pint",
             "php-cs-fixer",
             "phpcbf",
             "custom"
           ],
           "enumDescriptions": [
+            "Auto-detect Laravel Pint, php-cs-fixer, or phpcbf from Composer metadata",
             "Disable document formatting",
+            "Run Laravel Pint on a temporary file",
             "Run php-cs-fixer on a temporary file",
             "Run phpcbf on a temporary file",
             "Run the custom formatting command"
           ],
           "scope": "resource",
-          "description": "External formatter provider for textDocument/formatting"
+          "description": "Formatter provider for textDocument/formatting"
         },
         "phpLsp.formatting.command": {
           "type": "string",
           "default": "",
           "scope": "resource",
           "description": "Custom formatter command. Use {file} as the temporary PHP file placeholder; if omitted, the file path is appended."
+        },
+        "phpLsp.formatting.timeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "scope": "resource",
+          "description": "External formatter timeout in milliseconds."
         },
         "phpLsp.phpstan.enabled": {
           "type": "boolean",

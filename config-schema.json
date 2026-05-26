@@ -78,7 +78,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["none", "custom", "php-cs-fixer", "phpcbf"]
+          "enum": ["auto", "none", "custom", "pint", "php-cs-fixer", "phpcbf"]
         },
         "command": { "type": "string" },
         "timeoutMs": {

@@ -137,7 +137,7 @@ Current evidence:
 
 - `PR-023` added `run_file_io_blocking()` with `spawn_blocking`, a 15s timeout, and warning telemetry for file reads slower than 100ms.
 - Watched-file reindex, lazy PHP/vendor indexing, vendor cache load/save, vendor autoload metadata parsing, call hierarchy disk reads, `codeLens` source reads, and `foldingRange` source reads use blocking/background paths.
-- Remaining synchronous reads are limited to synchronous helper code called from blocking contexts, formatter work already inside `spawn_blocking`, and startup Composer discovery.
+- Remaining synchronous reads are limited to synchronous helper code called from blocking contexts, formatter temporary-file IO around timeout/cancellable subprocesses, and startup Composer discovery.
 - `PV-003` did not show common request latency symptoms from disk IO on the
   primary large workspace: warm open-file hover/completion/definition p95 stayed
   under 7 ms.

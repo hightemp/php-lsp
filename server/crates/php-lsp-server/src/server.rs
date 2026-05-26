@@ -218,7 +218,7 @@ struct FormattingConfig {
 impl Default for FormattingConfig {
     fn default() -> Self {
         Self {
-            provider: "none".to_string(),
+            provider: "auto".to_string(),
             command: None,
             timeout_ms: 30_000,
         }
@@ -231,11 +231,18 @@ impl FormattingConfig {
         command: Option<&str>,
         timeout_ms: Option<u64>,
     ) -> Self {
-        let provider = provider.unwrap_or("none").trim().to_ascii_lowercase();
+        let mut provider = provider.unwrap_or("auto").trim().to_ascii_lowercase();
         let command = command
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        if provider.is_empty() {
+            provider = if command.is_some() {
+                "custom".to_string()
+            } else {
+                "auto".to_string()
+            };
+        }
         Self {
             provider,
             command,
@@ -243,10 +250,33 @@ impl FormattingConfig {
         }
     }
 
+    fn resolve_for_workspace(&self, workspace_root: Option<&Path>) -> Self {
+        if self.provider != "auto" {
+            return self.clone();
+        }
+
+        let Some(workspace_root) = workspace_root else {
+            return self.clone();
+        };
+        let Some(tool) = detect_project_formatter_tool(workspace_root) else {
+            return self.clone();
+        };
+
+        Self {
+            provider: tool.provider().to_string(),
+            command: Some(tool.command_template().to_string()),
+            timeout_ms: self.timeout_ms,
+        }
+    }
+
     fn command_template(&self) -> Option<String> {
         match self.provider.as_str() {
-            "none" => None,
+            "auto" | "none" => None,
             "custom" => self.command.clone(),
+            "pint" => self
+                .command
+                .clone()
+                .or_else(|| Some("vendor/bin/pint --quiet {file}".to_string())),
             "php-cs-fixer" => self
                 .command
                 .clone()
@@ -764,6 +794,8 @@ pub struct PhpLspBackend {
     diagnostic_debounce_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     /// Per-document external analyzer runs that can be cancelled by newer document events.
     analyzer_runs: Arc<Mutex<HashMap<String, OperationCancellationToken>>>,
+    /// Per-document external formatter runs that can be cancelled by newer document events.
+    formatter_runs: Arc<Mutex<HashMap<String, OperationCancellationToken>>>,
     /// Current background workspace indexing run.
     indexing_run: Arc<Mutex<Option<OperationCancellationToken>>>,
     /// Global workspace symbol index.
@@ -826,6 +858,7 @@ impl PhpLspBackend {
             document_versions: Arc::new(DashMap::new()),
             diagnostic_debounce_tasks: Arc::new(Mutex::new(HashMap::new())),
             analyzer_runs: Arc::new(Mutex::new(HashMap::new())),
+            formatter_runs: Arc::new(Mutex::new(HashMap::new())),
             indexing_run: Arc::new(Mutex::new(None)),
             index: Arc::new(WorkspaceIndex::new()),
             workspace_root: Mutex::new(None),
@@ -915,6 +948,35 @@ impl PhpLspBackend {
 
     async fn cancel_analyzer_run(&self, uri_str: &str) {
         if let Some(token) = self.analyzer_runs.lock().await.remove(uri_str) {
+            token.cancel();
+        }
+    }
+
+    async fn start_formatter_run(&self, uri_str: &str) -> OperationCancellationToken {
+        let token = OperationCancellationToken::new();
+        if let Some(previous) = self
+            .formatter_runs
+            .lock()
+            .await
+            .insert(uri_str.to_string(), token.clone())
+        {
+            previous.cancel();
+        }
+        token
+    }
+
+    async fn finish_formatter_run(&self, uri_str: &str, token: &OperationCancellationToken) {
+        let mut runs = self.formatter_runs.lock().await;
+        if runs
+            .get(uri_str)
+            .is_some_and(|current| current.is_same(token))
+        {
+            runs.remove(uri_str);
+        }
+    }
+
+    async fn cancel_formatter_run(&self, uri_str: &str) {
+        if let Some(token) = self.formatter_runs.lock().await.remove(uri_str) {
             token.cancel();
         }
     }
@@ -1120,7 +1182,13 @@ impl PhpLspBackend {
         {
             let current = self.formatting_config.lock().await.clone();
             let next_config = {
-                let provider = formatting_provider.unwrap_or(&current.provider);
+                let provider = formatting_provider.map(str::to_string).unwrap_or_else(|| {
+                    if formatting_command.is_some() {
+                        "custom".to_string()
+                    } else {
+                        current.provider.clone()
+                    }
+                });
                 let command = if formatting_command.is_some() {
                     formatting_command
                 } else if formatting_provider.is_some() && provider != current.provider {
@@ -1129,7 +1197,7 @@ impl PhpLspBackend {
                     current.command.as_deref()
                 };
                 FormattingConfig::from_options(
-                    Some(provider),
+                    Some(&provider),
                     command,
                     formatting_timeout_ms.or(Some(current.timeout_ms)),
                 )
@@ -2413,6 +2481,7 @@ impl PhpLspBackend {
         self.document_versions.remove(&uri_str);
         self.cancel_debounced_diagnostics(&uri_str).await;
         self.cancel_analyzer_run(&uri_str).await;
+        self.cancel_formatter_run(&uri_str).await;
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
         self.client
             .publish_diagnostics(uri.clone(), vec![], None)
@@ -2439,6 +2508,8 @@ impl PhpLspBackend {
         self.cancel_debounced_diagnostics(&old_uri_str).await;
         self.cancel_analyzer_run(&old_uri_str).await;
         self.cancel_analyzer_run(new_uri.as_str()).await;
+        self.cancel_formatter_run(&old_uri_str).await;
+        self.cancel_formatter_run(new_uri.as_str()).await;
         if old_is_php {
             self.index.remove_file(&old_uri_str);
             self.vendor_file_lru.lock().await.remove(&old_uri_str);
@@ -8222,84 +8293,56 @@ fn build_formatter_shell_command(template: &str, file_path: &Path) -> String {
     }
 }
 
-fn run_formatter_shell_command(
-    command: &str,
-    current_dir: Option<&Path>,
-    timeout_ms: u64,
-) -> std::result::Result<std::process::Output, String> {
-    let mut process = if cfg!(windows) {
-        let mut command_process = std::process::Command::new("cmd");
-        command_process.arg("/C").arg(command);
-        command_process
-    } else {
-        let mut command_process = std::process::Command::new("sh");
-        command_process.arg("-c").arg(command);
-        command_process
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedFormatterTool {
+    Pint,
+    PhpCsFixer,
+    PhpCbf,
+}
 
-    if let Some(current_dir) = current_dir {
-        process.current_dir(current_dir);
-    }
-
-    process
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = process
-        .spawn()
-        .map_err(|err| format!("failed to spawn formatter command: {}", err))?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_reader = stdout.map(|mut stdout| {
-        std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut stdout, &mut buffer);
-            buffer
-        })
-    });
-    let stderr_reader = stderr.map(|mut stderr| {
-        std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut stderr, &mut buffer);
-            buffer
-        })
-    });
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = stdout_reader
-                    .map(|reader| reader.join().unwrap_or_default())
-                    .unwrap_or_default();
-                let stderr = stderr_reader
-                    .map(|reader| reader.join().unwrap_or_default())
-                    .unwrap_or_default();
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => {
-                if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(reader) = stdout_reader {
-                        let _ = reader.join();
-                    }
-                    if let Some(reader) = stderr_reader {
-                        let _ = reader.join();
-                    }
-                    return Err(format!(
-                        "formatter command timed out after {}ms",
-                        timeout_ms
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(err) => return Err(format!("failed to poll formatter command: {}", err)),
+impl DetectedFormatterTool {
+    fn provider(self) -> &'static str {
+        match self {
+            Self::Pint => "pint",
+            Self::PhpCsFixer => "php-cs-fixer",
+            Self::PhpCbf => "phpcbf",
         }
     }
+
+    fn command_template(self) -> &'static str {
+        match self {
+            Self::Pint => "vendor/bin/pint --quiet {file}",
+            Self::PhpCsFixer => "vendor/bin/php-cs-fixer fix --using-cache=no --quiet {file}",
+            Self::PhpCbf => "vendor/bin/phpcbf {file}",
+        }
+    }
+}
+
+fn detect_project_formatter_tool(workspace_root: &Path) -> Option<DetectedFormatterTool> {
+    let composer_json = find_composer_json(workspace_root)?;
+    let content = std::fs::read_to_string(composer_json).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    if composer_declares_package(&value, "laravel/pint") {
+        return Some(DetectedFormatterTool::Pint);
+    }
+    if composer_declares_package(&value, "friendsofphp/php-cs-fixer") {
+        return Some(DetectedFormatterTool::PhpCsFixer);
+    }
+    if composer_declares_package(&value, "squizlabs/php_codesniffer") {
+        return Some(DetectedFormatterTool::PhpCbf);
+    }
+
+    None
+}
+
+fn composer_declares_package(value: &serde_json::Value, package: &str) -> bool {
+    ["require-dev", "require"].iter().any(|section| {
+        value
+            .get(section)
+            .and_then(|section| section.as_object())
+            .is_some_and(|packages| packages.contains_key(package))
+    })
 }
 
 fn build_analyzer_shell_command(template: &str, file_path: &Path) -> String {
@@ -8668,10 +8711,11 @@ fn temp_format_dir() -> PathBuf {
     std::env::temp_dir().join(format!("php-lsp-format-{}-{}", std::process::id(), nanos))
 }
 
-fn run_external_formatter(
+async fn run_external_formatter(
     source: String,
     config: FormattingConfig,
     workspace_root: Option<PathBuf>,
+    cancellation: Option<OperationCancellationToken>,
 ) -> std::result::Result<Option<String>, String> {
     let Some(template) = config.command_template() else {
         return Ok(None);
@@ -8685,9 +8729,15 @@ fn run_external_formatter(
         .map_err(|err| format!("failed to write formatter temp file: {}", err))?;
 
     let command = build_formatter_shell_command(&template, &file_path);
-    let output =
-        run_formatter_shell_command(&command, workspace_root.as_deref(), config.timeout_ms)
-            .map_err(|err| format!("failed to run formatter command: {}", err));
+    let output = run_shell_command_with_timeout(
+        "Formatter",
+        &command,
+        workspace_root.as_deref(),
+        config.timeout_ms,
+        cancellation,
+    )
+    .await
+    .map_err(|err| format!("failed to run formatter command: {}", err));
     let formatted = std::fs::read_to_string(&file_path)
         .map_err(|err| format!("failed to read formatter temp file: {}", err));
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -15678,6 +15728,7 @@ impl LanguageServer for PhpLspBackend {
         self.document_versions.insert(uri_str.clone(), version);
         self.cancel_debounced_diagnostics(&uri_str).await;
         self.cancel_analyzer_run(&uri_str).await;
+        self.cancel_formatter_run(&uri_str).await;
 
         let mut parser = FileParser::new();
         parser.parse_full(text);
@@ -15717,6 +15768,7 @@ impl LanguageServer for PhpLspBackend {
             return;
         }
         self.cancel_analyzer_run(&uri_str).await;
+        self.cancel_formatter_run(&uri_str).await;
 
         let excluded = if let Some(path) = uri_to_path(&uri_str) {
             self.path_is_excluded_by_config(&path).await
@@ -15763,6 +15815,7 @@ impl LanguageServer for PhpLspBackend {
         self.document_versions.remove(&uri_str);
         self.cancel_debounced_diagnostics(&uri_str).await;
         self.cancel_analyzer_run(&uri_str).await;
+        self.cancel_formatter_run(&uri_str).await;
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
         // Clear diagnostics for closed file
         self.client.publish_diagnostics(uri, vec![], None).await;
@@ -15864,26 +15917,31 @@ impl LanguageServer for PhpLspBackend {
             parser.source()
         };
 
-        let config = self.formatting_config.lock().await.clone();
+        let workspace_root = self.workspace_root_for_uri(&uri_str).await;
+        let config = self
+            .formatting_config
+            .lock()
+            .await
+            .clone()
+            .resolve_for_workspace(workspace_root.as_deref());
         if config.command_template().is_none() {
             return Ok(None);
         }
 
-        let workspace_root = self.workspace_root_for_uri(&uri_str).await;
-        let source_for_formatter = source.clone();
-        let formatted = tokio::task::spawn_blocking(move || {
-            run_external_formatter(source_for_formatter, config, workspace_root)
-        })
-        .await
-        .map_err(|err| {
-            tracing::error!("Formatter task failed: {}", err);
-            tower_lsp::jsonrpc::Error::internal_error()
-        })?;
+        let token = self.start_formatter_run(&uri_str).await;
+        let formatted =
+            run_external_formatter(source.clone(), config, workspace_root, Some(token.clone()))
+                .await;
+        self.finish_formatter_run(&uri_str, &token).await;
 
         let formatted = match formatted {
             Ok(Some(formatted)) => formatted,
             Ok(None) => return Ok(Some(vec![])),
             Err(message) => {
+                if message.contains("command cancelled") {
+                    tracing::debug!("Formatter cancelled for {}: {}", uri_str, message);
+                    return Ok(Some(vec![]));
+                }
                 self.client
                     .log_message(
                         MessageType::WARNING,
@@ -15922,26 +15980,32 @@ impl LanguageServer for PhpLspBackend {
             return Ok(Some(vec![]));
         }
 
-        let config = self.formatting_config.lock().await.clone();
+        let workspace_root = self.workspace_root_for_uri(&uri_str).await;
+        let config = self
+            .formatting_config
+            .lock()
+            .await
+            .clone()
+            .resolve_for_workspace(workspace_root.as_deref());
         if config.command_template().is_none() {
             return Ok(None);
         }
 
         let (formatter_input, was_wrapped) = range_formatter_input(fragment);
-        let workspace_root = self.workspace_root_for_uri(&uri_str).await;
-        let formatted = tokio::task::spawn_blocking(move || {
-            run_external_formatter(formatter_input, config, workspace_root)
-        })
-        .await
-        .map_err(|err| {
-            tracing::error!("Range formatter task failed: {}", err);
-            tower_lsp::jsonrpc::Error::internal_error()
-        })?;
+        let token = self.start_formatter_run(&uri_str).await;
+        let formatted =
+            run_external_formatter(formatter_input, config, workspace_root, Some(token.clone()))
+                .await;
+        self.finish_formatter_run(&uri_str, &token).await;
 
         let formatted = match formatted {
             Ok(Some(formatted)) => strip_range_formatter_wrapper(formatted, was_wrapped),
             Ok(None) => return Ok(Some(vec![])),
             Err(message) => {
+                if message.contains("command cancelled") {
+                    tracing::debug!("Range formatter cancelled for {}: {}", uri_str, message);
+                    return Ok(Some(vec![]));
+                }
                 self.client
                     .log_message(
                         MessageType::WARNING,
@@ -21038,6 +21102,60 @@ class UserVoter extends Voter {
             custom.command_template().as_deref(),
             Some("vendor/bin/fmt {file}")
         );
+    }
+
+    #[test]
+    fn test_formatting_auto_detects_project_tools_from_composer_metadata() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let tmp = std::env::temp_dir().join(format!(
+            "php-lsp-format-detect-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("composer.json"),
+            r#"{
+                "require-dev": {
+                    "friendsofphp/php-cs-fixer": "^3.0",
+                    "squizlabs/php_codesniffer": "^3.0"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = FormattingConfig::default().resolve_for_workspace(Some(&tmp));
+        assert_eq!(config.provider, "php-cs-fixer");
+        assert_eq!(
+            config.command_template().as_deref(),
+            Some("vendor/bin/php-cs-fixer fix --using-cache=no --quiet {file}")
+        );
+
+        std::fs::write(
+            tmp.join("composer.json"),
+            r#"{
+                "require-dev": {
+                    "laravel/pint": "^1.0",
+                    "friendsofphp/php-cs-fixer": "^3.0"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = FormattingConfig::default().resolve_for_workspace(Some(&tmp));
+        assert_eq!(config.provider, "pint");
+        assert_eq!(
+            config.command_template().as_deref(),
+            Some("vendor/bin/pint --quiet {file}")
+        );
+
+        let disabled = FormattingConfig::from_options(Some("none"), None, None)
+            .resolve_for_workspace(Some(&tmp));
+        assert!(disabled.command_template().is_none());
+
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

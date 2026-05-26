@@ -1543,7 +1543,7 @@ PR-052 ─→ PR-053
   - Docs: `README.md` and `docs/configuration.md` document CLI fix usage, rule selection, exit codes, and formatter behavior.
   - Validation: `cargo fmt --all --check`, targeted fix unit tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, real `php-lsp fix --help`, real fixture dry-run, docs Cyrillic check, `git diff --check`.
 
-- [ ] **IE-022** Улучшить formatting strategy
+- [x] **IE-022** Улучшить formatting strategy *(done 2026-05-26)*
   - Добавить auto-detect project tools из Composer metadata:
     - Laravel Pint
     - php-cs-fixer
@@ -1556,6 +1556,14 @@ PR-052 ─→ PR-053
   - External tools должны иметь timeout и cancellation.
   - Range formatting должен оставаться conservative: не форматировать весь файл неожиданно.
   - Docs на английском: formatter resolution order и troubleshooting.
+  - Implemented: `phpLsp.formatting.provider = "auto"` as the default provider and `.php-lsp.toml` starter default.
+  - Implemented: Composer `require-dev`/`require` detection for `laravel/pint`, `friendsofphp/php-cs-fixer`, and `squizlabs/php_codesniffer` with precedence Pint → php-cs-fixer → phpcbf.
+  - Implemented: explicit provider precedence for VS Code settings and `.php-lsp.toml`; `none` disables formatting, `custom` keeps command templates, and `pint` is now a supported explicit provider.
+  - Implemented: external formatter execution through the shared timeout/cancellable subprocess runner; formatting runs are cancelled on document change/close/rename and when superseded by a newer formatting request.
+  - Preserved: range formatting formats only the selected fragment through a temporary file and never silently formats the whole document.
+  - Regression: unit tests cover Composer detection precedence and explicit `none`; e2e covers php-cs-fixer auto-detection from Composer metadata.
+  - Docs: `README.md`, `client/README.md`, `docs/configuration.md`, `docs/lsp-features.md`, `docs/production-risk-register.md`, `config-schema.json`, and VS Code setting metadata document provider resolution, timeout, cancellation, and troubleshooting.
+  - Validation: `cargo fmt --all --check`, targeted formatting tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, `npm run lint`, `npm run build`, docs Cyrillic check, `git diff --check`.
 
 - [ ] **IE-023** Оценить и при необходимости добавить built-in formatter fallback
   - Research-only first step: выбрать реалистичный formatter backend или отказаться.

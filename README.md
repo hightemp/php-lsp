@@ -101,7 +101,8 @@ phpstorm-stubs support.
 - Heavy refactor edits use `codeAction/resolve` so initial code-action requests
   stay lightweight.
 - Document formatting, range formatting, and on-type formatting through
-  external formatters (`php-cs-fixer`, `phpcbf`, or a custom command).
+  auto-detected or configured external formatters (`pint`, `php-cs-fixer`,
+  `phpcbf`, or a custom command).
 
 ### Editor UI
 
@@ -110,7 +111,8 @@ phpstorm-stubs support.
   server binary details.
 - Code lenses with reference counts.
 - Folding ranges for PHP structures, comments, arrays, and blocks.
-- Document formatting and range formatting through configured external tools.
+- Document formatting and range formatting through auto-detected or configured
+  external tools.
 - On-type indentation edits for newline, semicolon, and closing brace.
 
 ### CLI And Tooling
@@ -179,8 +181,8 @@ phpstorm-stubs support.
   runs are used on open/save and reconfiguration.
 - External PHPStan/Psalm diagnostics require those tools to be installed and
   configured by the workspace.
-- Formatting is delegated to external tools; php-lsp does not implement a native
-  PHP formatter.
+- Formatting is delegated to external tools; php-lsp auto-detects common
+  Composer dev tools but does not implement a native PHP formatter.
 
 ## Configuration
 
@@ -198,8 +200,9 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
 | `phpLsp.diagnostics.mode` | `basic-semantic` | `off`, `syntax-only`, or `basic-semantic`. |
 | `phpLsp.diagnostics.severity` | Category warnings | Per-category severity for `unknownSymbols`, `unused`, `duplicateSymbols`, `members`, `typeCompatibility`, `overrideSignatures`, and `phpVersion`; values are `off`, `error`, `warning`, `information`, or `hint`. |
-| `phpLsp.formatting.provider` | `none` | `none`, `php-cs-fixer`, `phpcbf`, or `custom`. |
+| `phpLsp.formatting.provider` | `auto` | `auto`, `none`, `pint`, `php-cs-fixer`, `phpcbf`, or `custom`. |
 | `phpLsp.formatting.command` | `""` | Custom formatter command; use `{file}` for the temporary PHP file. |
+| `phpLsp.formatting.timeoutMs` | `30000` | External formatter timeout per request. |
 | `phpLsp.phpstan.enabled` | `false` | Enable PHPStan diagnostics. |
 | `phpLsp.phpstan.command` | `vendor/bin/phpstan ... {file}` | PHPStan command that prints JSON output. |
 | `phpLsp.phpstan.timeoutMs` | `30000` | PHPStan timeout per file. |
@@ -234,6 +237,20 @@ Example external formatting setup:
   "phpLsp.formatting.provider": "php-cs-fixer"
 }
 ```
+
+Formatter resolution order:
+
+1. Explicit `phpLsp.formatting.*` settings or `[formatting]` values in
+   `.php-lsp.toml`.
+2. Composer metadata auto-detection from `require-dev`/`require`: `laravel/pint`,
+   `friendsofphp/php-cs-fixer`, then `squizlabs/php_codesniffer`.
+3. No formatting provider when no explicit provider or supported Composer tool is
+   available.
+
+External formatter commands are timeout-bound and cancelled when the document
+changes, closes, or a newer formatting request supersedes the old one. Range
+formatting stays conservative: php-lsp formats only the selected fragment via a
+temporary file and never silently formats the whole document for a range request.
 
 ## CLI
 
@@ -359,11 +376,16 @@ The extension contributes these VS Code commands:
 
 ### Formatting Does Nothing
 
-- Formatting is disabled by default. Set `phpLsp.formatting.provider` to
-  `php-cs-fixer`, `phpcbf`, or `custom`.
+- With the default `auto` provider, make sure Composer `require-dev` includes
+  `laravel/pint`, `friendsofphp/php-cs-fixer`, or `squizlabs/php_codesniffer`.
+- Set `phpLsp.formatting.provider` explicitly to `pint`, `php-cs-fixer`,
+  `phpcbf`, or `custom` to bypass auto-detection; set it to `none` to disable
+  formatting.
 - For `custom`, configure `phpLsp.formatting.command` and include `{file}` where
   the temporary PHP file path should be inserted.
 - Ensure the formatter executable is available from the workspace root.
+- Increase `phpLsp.formatting.timeoutMs` if the external formatter times out on
+  large files.
 
 ## Architecture Summary
 

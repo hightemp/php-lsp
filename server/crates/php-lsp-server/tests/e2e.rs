@@ -3966,6 +3966,103 @@ async fn test_document_formatting_uses_custom_external_command() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_document_formatting_auto_detects_php_cs_fixer_from_composer_metadata() {
+    if cfg!(windows) {
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-format-auto-detect-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let vendor_bin = tmp.join("vendor/bin");
+    fs::create_dir_all(&vendor_bin).unwrap();
+    fs::write(
+        tmp.join("composer.json"),
+        r#"{"require-dev":{"friendsofphp/php-cs-fixer":"^3.0"}}"#,
+    )
+    .unwrap();
+
+    let formatted = "<?php\nfunction ok(): void\n{\n    echo \"auto\";\n}\n";
+    let tool_path = vendor_bin.join("php-cs-fixer");
+    fs::write(
+        &tool_path,
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do file=\"$arg\"; done\ncat > \"$file\" <<'PHP'\n{}PHP\n",
+            formatted
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&tool_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tool_path, permissions).unwrap();
+    }
+
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let root_uri = format!("file://{}", tmp.display());
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = "<?php\nfunction ok(): void { echo \"auto\"; }\n";
+    let uri = format!("file://{}", tmp.join("AutoFormat.php").display());
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(formatting_request(2, &uri))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let edits = result.as_array().expect("formatting edits array");
+    assert_eq!(edits.len(), 1, "expected one auto-detected edit");
+    assert_eq!(
+        edits[0]["newText"].as_str(),
+        Some(formatted),
+        "auto-detected formatter edit should contain formatted source, got: {}",
+        result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_document_range_formatting_uses_custom_external_command() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

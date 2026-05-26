@@ -32,7 +32,7 @@ extensions = []
 # path = "/absolute/path/to/phpstorm-stubs"
 
 [formatting]
-provider = "none"
+provider = "auto"
 command = ""
 timeoutMs = 30000
 

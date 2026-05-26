@@ -89,7 +89,7 @@ exclude = ["var/cache", "storage/framework/cache"]
 extensions = ["Core", "SPL", "standard", "PDO", "json", "mbstring"]
 
 [formatting]
-provider = "php-cs-fixer"
+provider = "auto"
 timeoutMs = 30000
 
 [phpstan]
@@ -125,6 +125,29 @@ Relative include/exclude paths are interpreted relative to the effective
 workspace root. `phpstan.memory_limit` is added to the PHPStan command unless
 the command already contains `--memory-limit`; `{memory_limit}` can be used in a
 custom command template for explicit placement.
+
+## Formatter Resolution
+
+`[formatting] provider = "auto"` is the default. The formatter provider is
+resolved in this order:
+
+1. Explicit VS Code `phpLsp.formatting.*` settings or `.php-lsp.toml`
+   `[formatting]` values.
+2. Composer `require-dev`/`require` auto-detection:
+   `laravel/pint`, `friendsofphp/php-cs-fixer`, then
+   `squizlabs/php_codesniffer`.
+3. No external formatter when no explicit provider or supported Composer tool is
+   available.
+
+Supported provider values are `auto`, `none`, `pint`, `php-cs-fixer`, `phpcbf`,
+and `custom`. Use `none` to disable formatting. Use `custom` with `command` and
+the `{file}` placeholder when a project has a wrapper script.
+
+External formatter commands are timeout-bound by `timeoutMs` and are cancelled
+when a document changes, closes, or a newer formatting request supersedes the
+old request. Range formatting remains conservative: php-lsp formats only the
+selected fragment via a temporary file and does not run whole-document
+formatting for range requests.
 
 Analyzer code actions are disabled by default. When
 `analyzerCodeActions.enabled` is true, PHPStan/Psalm diagnostics can offer local
