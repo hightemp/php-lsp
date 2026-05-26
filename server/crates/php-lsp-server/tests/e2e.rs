@@ -4318,6 +4318,147 @@ class ConflictDemo {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_code_action_implement_missing_interface_and_abstract_methods() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "8.2" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+interface Logger
+{
+    public function log(string $message): void;
+}
+
+interface Factory
+{
+    public static function make(?string &$name, int ...$ids): array;
+}
+
+interface CountableThing extends Logger
+{
+    public function count(): int;
+}
+
+abstract class Base
+{
+    public function log(string $message): void
+    {
+    }
+
+    abstract protected function base(int $value = 0): ?string;
+}
+
+class Demo extends Base implements CountableThing, Factory
+{
+}
+"#;
+    let uri = "file:///test/ImplementMissingMethods.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(2, uri, 28, 0, 28, 0, json!([])))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let actions = result.as_array().expect("code actions array");
+    let action = actions
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Implement 3 missing methods")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected implement missing methods action, got: {}", result));
+    assert!(
+        action.get("edit").is_none(),
+        "implement missing methods should resolve lazily, got: {}",
+        action
+    );
+    assert!(
+        action.get("data").is_some(),
+        "implement missing methods should carry resolve data, got: {}",
+        action
+    );
+
+    let resolve_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(3, action))
+        .await
+        .unwrap();
+    let resolved = extract_result(resolve_resp);
+    let new_text = resolved["edit"]["changes"][uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected generated method stubs, got: {}", resolved));
+
+    assert!(
+        new_text.contains("protected function base(int $value = 0): ?string"),
+        "expected abstract parent method stub, got: {}",
+        new_text
+    );
+    assert!(
+        new_text.contains("public function count(): int"),
+        "expected interface method stub, got: {}",
+        new_text
+    );
+    assert!(
+        new_text.contains("public static function make(?string &$name, int ...$ids): array"),
+        "expected static by-ref variadic interface method stub, got: {}",
+        new_text
+    );
+    assert!(
+        !new_text.contains("function log("),
+        "concrete inherited method should not be duplicated, got: {}",
+        new_text
+    );
+    assert!(
+        new_text.contains("throw new \\BadMethodCallException('Not implemented yet.');"),
+        "expected safe throwing body, got: {}",
+        new_text
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_action_organize_imports_sorts_groups_and_removes_unused() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

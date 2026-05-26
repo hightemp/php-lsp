@@ -1312,13 +1312,20 @@ PR-052 ─→ PR-053
 
 ### Неделя 2: production-useful code actions (2026-06-15 → 2026-06-21)
 
-- [ ] **IE-010** Code action: implement missing interface/abstract methods
+- [x] **IE-010** Code action: implement missing interface/abstract methods *(done 2026-05-25)*
   - Определить cursor context: concrete class body или class declaration.
   - Найти все abstract/interface methods из parents/interfaces/traits, которых нет в классе.
   - Сгенерировать method stubs с visibility, static, return type, params, by-ref/variadic/defaults.
   - Для unknown parameter default expression использовать safe placeholder или omit только если PHP позволяет.
   - Не генерировать duplicate methods.
   - Покрыть interface, abstract class, multiple interfaces, inherited already implemented method.
+  - Implemented: quickfix action appears for concrete classes under cursor and returns lazy `CodeActionData`.
+  - Implemented: resolve recomputes missing methods for the same document version and inserts stubs before the class closing brace.
+  - Implemented: required-method collection covers interfaces, parent interfaces, abstract parent classes, and abstract trait methods; inherited concrete parent/trait methods satisfy requirements.
+  - Implemented: stubs preserve visibility, `static`, params, by-ref, variadic, defaults, and native-safe parameter/return type hints.
+  - Docs: `docs/lsp-features.md` documents the implement-missing-methods code action.
+  - Regression: e2e covers interface methods, abstract parent methods, multiple interfaces, static/by-ref/variadic/default params, and inherited already implemented methods.
+  - Validation: `cargo fmt --all --check`, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
 - [ ] **IE-011** Code actions: generate constructor, getters, setters
   - Generate constructor для non-static properties без existing `__construct`.

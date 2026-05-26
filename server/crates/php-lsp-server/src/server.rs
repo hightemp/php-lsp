@@ -3508,6 +3508,7 @@ fn build_add_return_type_action(
 #[serde(rename_all = "camelCase")]
 enum CodeActionDataKind {
     AddReturnType,
+    ImplementMissingMethods,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3526,6 +3527,9 @@ enum CodeActionDataExtra {
     AddReturnType {
         hint: String,
         insert_position: CodeActionInsertPosition,
+    },
+    ImplementMissingMethods {
+        class_fqn: String,
     },
 }
 
@@ -3573,6 +3577,526 @@ fn add_return_type_edit(
         document_changes: None,
         change_annotations: None,
     }
+}
+
+fn build_implement_missing_methods_action(
+    uri: Uri,
+    class_sym: &php_lsp_types::SymbolInfo,
+    missing_methods: &[Arc<php_lsp_types::SymbolInfo>],
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Option<CodeActionOrCommand> {
+    if missing_methods.is_empty() {
+        return None;
+    }
+
+    let data = serde_json::to_value(CodeActionData {
+        action_kind: CodeActionDataKind::ImplementMissingMethods,
+        uri: uri.as_str().to_string(),
+        range: request_range,
+        document_version,
+        extra: CodeActionDataExtra::ImplementMissingMethods {
+            class_fqn: class_sym.fqn.clone(),
+        },
+    })
+    .ok()?;
+
+    let title = if missing_methods.len() == 1 {
+        format!("Implement missing method `{}`", missing_methods[0].name)
+    } else {
+        format!("Implement {} missing methods", missing_methods.len())
+    };
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: None,
+        edit: None,
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: Some(data),
+    }))
+}
+
+fn concrete_class_symbol_at_range(
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&php_lsp_types::SymbolInfo> {
+    file_symbols.symbols.iter().find(|sym| {
+        sym.kind == php_lsp_types::PhpSymbolKind::Class
+            && !sym.modifiers.is_abstract
+            && byte_range_contains(sym.range, range)
+    })
+}
+
+fn direct_method_symbols_from_file<'a>(
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    type_fqn: &str,
+) -> Vec<&'a php_lsp_types::SymbolInfo> {
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|sym| {
+            sym.kind == php_lsp_types::PhpSymbolKind::Method
+                && sym.parent_fqn.as_deref() == Some(type_fqn)
+        })
+        .collect()
+}
+
+fn direct_member_symbols_from_index(
+    index: &WorkspaceIndex,
+    type_fqn: &str,
+) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
+    let mut members = Vec::new();
+    for entry in index.file_symbols.iter() {
+        for sym in &entry.value().symbols {
+            if sym.parent_fqn.as_deref() == Some(type_fqn) {
+                members.push(Arc::new(sym.clone()));
+            }
+        }
+    }
+    members
+}
+
+fn normalized_method_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+fn collect_concrete_methods_from_type(
+    index: &WorkspaceIndex,
+    type_fqn: &str,
+    implemented: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+) {
+    let normalized_type = type_fqn.trim_start_matches('\\').to_string();
+    if !visited.insert(normalized_type.clone()) {
+        return;
+    }
+
+    let Some(type_sym) = index
+        .types
+        .get(&normalized_type)
+        .map(|entry| entry.value().clone())
+    else {
+        return;
+    };
+
+    for member in direct_member_symbols_from_index(index, &normalized_type) {
+        if member.kind == php_lsp_types::PhpSymbolKind::Method && !member.modifiers.is_abstract {
+            implemented.insert(normalized_method_name(&member.name));
+        }
+    }
+
+    for trait_fqn in &type_sym.traits {
+        collect_concrete_methods_from_type(index, trait_fqn, implemented, visited);
+    }
+    for parent_fqn in &type_sym.extends {
+        collect_concrete_methods_from_type(index, parent_fqn, implemented, visited);
+    }
+}
+
+fn collect_required_methods_from_type(
+    index: &WorkspaceIndex,
+    type_fqn: &str,
+    required: &mut Vec<Arc<php_lsp_types::SymbolInfo>>,
+    seen: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+) {
+    let normalized_type = type_fqn.trim_start_matches('\\').to_string();
+    if !visited.insert(normalized_type.clone()) {
+        return;
+    }
+
+    let Some(type_sym) = index
+        .types
+        .get(&normalized_type)
+        .map(|entry| entry.value().clone())
+    else {
+        return;
+    };
+
+    for member in direct_member_symbols_from_index(index, &normalized_type) {
+        let required_method = match type_sym.kind {
+            php_lsp_types::PhpSymbolKind::Interface => {
+                member.kind == php_lsp_types::PhpSymbolKind::Method
+            }
+            php_lsp_types::PhpSymbolKind::Class | php_lsp_types::PhpSymbolKind::Trait => {
+                member.kind == php_lsp_types::PhpSymbolKind::Method && member.modifiers.is_abstract
+            }
+            _ => false,
+        };
+
+        if required_method && seen.insert(normalized_method_name(&member.name)) {
+            required.push(member);
+        }
+    }
+
+    for trait_fqn in &type_sym.traits {
+        collect_required_methods_from_type(index, trait_fqn, required, seen, visited);
+    }
+    for parent_fqn in &type_sym.extends {
+        collect_required_methods_from_type(index, parent_fqn, required, seen, visited);
+    }
+    for iface_fqn in &type_sym.implements {
+        collect_required_methods_from_type(index, iface_fqn, required, seen, visited);
+    }
+}
+
+fn missing_implementation_methods(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    class_sym: &php_lsp_types::SymbolInfo,
+) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
+    if class_sym.kind != php_lsp_types::PhpSymbolKind::Class || class_sym.modifiers.is_abstract {
+        return Vec::new();
+    }
+
+    let mut implemented = HashSet::new();
+    for method in direct_method_symbols_from_file(file_symbols, &class_sym.fqn) {
+        implemented.insert(normalized_method_name(&method.name));
+    }
+
+    let mut concrete_visited = HashSet::new();
+    for trait_fqn in &class_sym.traits {
+        collect_concrete_methods_from_type(
+            index,
+            trait_fqn,
+            &mut implemented,
+            &mut concrete_visited,
+        );
+    }
+    for parent_fqn in &class_sym.extends {
+        collect_concrete_methods_from_type(
+            index,
+            parent_fqn,
+            &mut implemented,
+            &mut concrete_visited,
+        );
+    }
+
+    let mut required = Vec::new();
+    let mut seen_required = HashSet::new();
+    let mut required_visited = HashSet::new();
+    for trait_fqn in &class_sym.traits {
+        collect_required_methods_from_type(
+            index,
+            trait_fqn,
+            &mut required,
+            &mut seen_required,
+            &mut required_visited,
+        );
+    }
+    for parent_fqn in &class_sym.extends {
+        collect_required_methods_from_type(
+            index,
+            parent_fqn,
+            &mut required,
+            &mut seen_required,
+            &mut required_visited,
+        );
+    }
+    for iface_fqn in &class_sym.implements {
+        collect_required_methods_from_type(
+            index,
+            iface_fqn,
+            &mut required,
+            &mut seen_required,
+            &mut required_visited,
+        );
+    }
+
+    let mut missing = Vec::new();
+    for method in required {
+        let name = normalized_method_name(&method.name);
+        if implemented.insert(name) {
+            missing.push(method);
+        }
+    }
+
+    missing.sort_by(|left, right| {
+        normalized_method_name(&left.name)
+            .cmp(&normalized_method_name(&right.name))
+            .then_with(|| left.fqn.cmp(&right.fqn))
+    });
+    missing
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeHintPosition {
+    Parameter,
+    Return,
+}
+
+fn native_type_hint_text(
+    type_info: &php_lsp_types::TypeInfo,
+    php_version: PhpVersion,
+    position: TypeHintPosition,
+) -> Option<String> {
+    use php_lsp_types::TypeInfo;
+
+    match type_info {
+        TypeInfo::Simple(name) => Some(name.clone()),
+        TypeInfo::Self_ | TypeInfo::Parent_ => Some(type_info.to_string()),
+        TypeInfo::Static_ if position == TypeHintPosition::Return && php_version.at_least(8, 0) => {
+            Some("static".to_string())
+        }
+        TypeInfo::Mixed if php_version.at_least(8, 0) => Some("mixed".to_string()),
+        TypeInfo::Void if position == TypeHintPosition::Return => Some("void".to_string()),
+        TypeInfo::Never if position == TypeHintPosition::Return && php_version.at_least(8, 1) => {
+            Some("never".to_string())
+        }
+        TypeInfo::Nullable(inner) => match inner.as_ref() {
+            TypeInfo::Mixed | TypeInfo::Void | TypeInfo::Never | TypeInfo::Nullable(_) => None,
+            _ => native_type_hint_text(inner, php_version, position)
+                .map(|inner| format!("?{}", inner)),
+        },
+        TypeInfo::Union(types) if php_version.at_least(8, 0) => {
+            let parts = types
+                .iter()
+                .map(|ty| native_type_hint_text(ty, php_version, position))
+                .collect::<Option<Vec<_>>>()?;
+            if parts.iter().any(|part| part == "void") {
+                None
+            } else {
+                Some(parts.join("|"))
+            }
+        }
+        TypeInfo::Intersection(types) if php_version.at_least(8, 1) => {
+            let parts = types
+                .iter()
+                .map(|ty| match ty {
+                    TypeInfo::Simple(_) | TypeInfo::Self_ | TypeInfo::Parent_ => {
+                        native_type_hint_text(ty, php_version, position)
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(parts.join("&"))
+        }
+        TypeInfo::LiteralNull if php_version.at_least(8, 2) => Some("null".to_string()),
+        TypeInfo::LiteralBool(value)
+            if position == TypeHintPosition::Return && php_version.at_least(8, 2) =>
+        {
+            Some(if *value { "true" } else { "false" }.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn render_method_param(param: &php_lsp_types::ParamInfo, php_version: PhpVersion) -> String {
+    let mut text = String::new();
+    if let Some(type_info) = &param.type_info {
+        if let Some(type_text) =
+            native_type_hint_text(type_info, php_version, TypeHintPosition::Parameter)
+        {
+            text.push_str(&type_text);
+            text.push(' ');
+        }
+    }
+    if param.is_by_ref {
+        text.push('&');
+    }
+    if param.is_variadic {
+        text.push_str("...");
+    }
+    text.push('$');
+    text.push_str(&param.name);
+    if !param.is_variadic {
+        if let Some(default_value) = param.default_value.as_deref() {
+            text.push_str(" = ");
+            text.push_str(default_value);
+        }
+    }
+    text
+}
+
+fn render_missing_method_stub(
+    method: &php_lsp_types::SymbolInfo,
+    method_indent: &str,
+    body_indent: &str,
+    php_version: PhpVersion,
+) -> String {
+    let visibility = match method.visibility {
+        php_lsp_types::Visibility::Public => "public",
+        php_lsp_types::Visibility::Protected => "protected",
+        php_lsp_types::Visibility::Private => "private",
+    };
+
+    let signature = method
+        .signature
+        .clone()
+        .unwrap_or(php_lsp_types::Signature {
+            params: Vec::new(),
+            return_type: None,
+        });
+    let params = signature
+        .params
+        .iter()
+        .map(|param| render_method_param(param, php_version))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut text = String::new();
+    text.push_str(method_indent);
+    text.push_str(visibility);
+    text.push(' ');
+    if method.modifiers.is_static {
+        text.push_str("static ");
+    }
+    text.push_str("function ");
+    text.push_str(&method.name);
+    text.push('(');
+    text.push_str(&params);
+    text.push(')');
+    if let Some(return_type) = signature.return_type.as_ref().and_then(|return_type| {
+        native_type_hint_text(return_type, php_version, TypeHintPosition::Return)
+    }) {
+        text.push_str(": ");
+        text.push_str(&return_type);
+    }
+    text.push('\n');
+    text.push_str(method_indent);
+    text.push_str("{\n");
+    text.push_str(body_indent);
+    text.push_str("throw new \\BadMethodCallException('Not implemented yet.');\n");
+    text.push_str(method_indent);
+    text.push_str("}\n");
+    text
+}
+
+fn line_start_offsets(source: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    for (idx, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            offsets.push(idx + 1);
+        }
+    }
+    offsets
+}
+
+fn byte_offset_for_line_col(source: &str, line: u32, byte_col: u32) -> Option<usize> {
+    let offsets = line_start_offsets(source);
+    let start = *offsets.get(line as usize)?;
+    Some((start + byte_col as usize).min(source.len()))
+}
+
+fn line_col_for_byte_offset(source: &str, offset: usize) -> (u32, u32) {
+    let offsets = line_start_offsets(source);
+    let line_idx = offsets
+        .partition_point(|line_start| *line_start <= offset)
+        .saturating_sub(1);
+    let line_start = offsets.get(line_idx).copied().unwrap_or(0);
+    (line_idx as u32, offset.saturating_sub(line_start) as u32)
+}
+
+fn class_closing_brace_position(
+    source: &str,
+    class_sym: &php_lsp_types::SymbolInfo,
+) -> Option<(u32, u32)> {
+    let start = byte_offset_for_line_col(source, class_sym.range.0, class_sym.range.1)?;
+    let end = byte_offset_for_line_col(source, class_sym.range.2, class_sym.range.3)?;
+    let class_text = source.get(start..end)?;
+    let closing_relative = class_text.rfind('}')?;
+    Some(line_col_for_byte_offset(source, start + closing_relative))
+}
+
+fn line_text(source: &str, line: u32) -> &str {
+    source.lines().nth(line as usize).unwrap_or("")
+}
+
+fn line_prefix_by_byte_col(line_text: &str, byte_col: u32) -> &str {
+    let end = (byte_col as usize).min(line_text.len());
+    line_text.get(..end).unwrap_or("")
+}
+
+fn leading_ascii_whitespace(text: &str) -> String {
+    text.chars()
+        .take_while(|ch| *ch == ' ' || *ch == '\t')
+        .collect()
+}
+
+fn method_insertion_needs_leading_blank(source: &str, closing_line: u32, closing_col: u32) -> bool {
+    let close_line_text = line_text(source, closing_line);
+    if !line_prefix_by_byte_col(close_line_text, closing_col)
+        .trim()
+        .is_empty()
+    {
+        return true;
+    }
+
+    let lines = source.lines().collect::<Vec<_>>();
+    for line in lines
+        .get(..closing_line as usize)
+        .unwrap_or(&[])
+        .iter()
+        .rev()
+    {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return !trimmed.ends_with('{');
+    }
+
+    false
+}
+
+fn implement_missing_methods_edit(
+    uri: Uri,
+    source: &str,
+    class_sym: &php_lsp_types::SymbolInfo,
+    missing_methods: &[Arc<php_lsp_types::SymbolInfo>],
+    php_version: PhpVersion,
+) -> Option<WorkspaceEdit> {
+    if missing_methods.is_empty() {
+        return Some(empty_workspace_edit());
+    }
+
+    let (closing_line, closing_col) = class_closing_brace_position(source, class_sym)?;
+    let utf16_index = Utf16LineIndex::new(source);
+    let insert_position = Position::new(
+        closing_line,
+        utf16_index.byte_col_to_utf16(closing_line, closing_col),
+    );
+    let close_line = line_text(source, closing_line);
+    let close_indent = leading_ascii_whitespace(line_prefix_by_byte_col(close_line, closing_col));
+    let method_indent = format!("{}    ", close_indent);
+    let body_indent = format!("{}    ", method_indent);
+
+    let mut new_text = String::new();
+    if method_insertion_needs_leading_blank(source, closing_line, closing_col) {
+        new_text.push('\n');
+    }
+    for (idx, method) in missing_methods.iter().enumerate() {
+        if idx > 0 {
+            new_text.push('\n');
+        }
+        new_text.push_str(&render_missing_method_stub(
+            method,
+            &method_indent,
+            &body_indent,
+            php_version,
+        ));
+    }
+
+    let mut changes = HashMap::new();
+    changes.insert(
+        uri,
+        vec![TextEdit {
+            range: Range {
+                start: insert_position,
+                end: insert_position,
+            },
+            new_text,
+        }],
+    );
+
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    })
 }
 
 fn semantic_tokens_legend() -> SemanticTokensLegend {
@@ -13345,8 +13869,14 @@ impl LanguageServer for PhpLspBackend {
             params.context.only.as_ref(),
             &CodeActionKind::REFACTOR_REWRITE,
         );
+        let wants_implement_missing_methods =
+            code_action_kind_allowed(params.context.only.as_ref(), &CodeActionKind::QUICKFIX);
 
-        if !wants_quickfix && !wants_organize_imports && !wants_add_return_type {
+        if !wants_quickfix
+            && !wants_organize_imports
+            && !wants_add_return_type
+            && !wants_implement_missing_methods
+        {
             return Ok(Some(vec![]));
         }
 
@@ -13355,7 +13885,7 @@ impl LanguageServer for PhpLspBackend {
         let php_version = *self.php_version.lock().await;
         let document_version = self.current_document_version(&uri_str);
 
-        let (source, file_symbols, add_return_type_actions) = {
+        let (source, file_symbols, add_return_type_actions, implement_missing_methods_actions) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(Some(vec![])),
@@ -13388,11 +13918,36 @@ impl LanguageServer for PhpLspBackend {
             } else {
                 Vec::new()
             };
-            (source, file_symbols, add_return_type_actions)
+            let implement_missing_methods_actions = if wants_implement_missing_methods {
+                let range = lsp_range_to_byte_range(&source, params.range);
+                concrete_class_symbol_at_range(&file_symbols, range)
+                    .and_then(|class_sym| {
+                        let missing_methods =
+                            missing_implementation_methods(&self.index, &file_symbols, class_sym);
+                        build_implement_missing_methods_action(
+                            uri.clone(),
+                            class_sym,
+                            &missing_methods,
+                            params.range,
+                            document_version,
+                        )
+                    })
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (
+                source,
+                file_symbols,
+                add_return_type_actions,
+                implement_missing_methods_actions,
+            )
         };
 
         let mut actions = Vec::new();
         actions.extend(add_return_type_actions);
+        actions.extend(implement_missing_methods_actions);
 
         if wants_organize_imports {
             if let Some(edit) = build_organize_imports_edit(uri.clone(), &source, &file_symbols) {
@@ -13559,6 +14114,65 @@ impl LanguageServer for PhpLspBackend {
                     &hint,
                     insert_position,
                 ));
+            }
+            (
+                CodeActionDataKind::ImplementMissingMethods,
+                CodeActionDataExtra::ImplementMissingMethods { class_fqn },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let (source, file_symbols) = match self.open_files.get(&uri) {
+                    Some(parser) => {
+                        let source = parser.source();
+                        let file_symbols = match parser.tree() {
+                            Some(tree) => self
+                                .index
+                                .file_symbols
+                                .get(&uri)
+                                .map(|entry| entry.value().clone())
+                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
+                            None => {
+                                params.edit = Some(empty_workspace_edit());
+                                return Ok(params);
+                            }
+                        };
+                        (source, file_symbols)
+                    }
+                    None => {
+                        params.edit = Some(empty_workspace_edit());
+                        return Ok(params);
+                    }
+                };
+
+                let Some(class_sym) = file_symbols.symbols.iter().find(|sym| {
+                    sym.fqn == class_fqn && sym.kind == php_lsp_types::PhpSymbolKind::Class
+                }) else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let php_version = *self.php_version.lock().await;
+                let missing_methods =
+                    missing_implementation_methods(&self.index, &file_symbols, class_sym);
+                params.edit = implement_missing_methods_edit(
+                    uri_value,
+                    &source,
+                    class_sym,
+                    &missing_methods,
+                    php_version,
+                )
+                .or_else(|| Some(empty_workspace_edit()));
+            }
+            _ => {
+                params.edit = Some(empty_workspace_edit());
             }
         }
 

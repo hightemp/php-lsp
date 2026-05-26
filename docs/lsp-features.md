@@ -66,6 +66,7 @@ tools.
 | `textDocument/rename` | Partial | Supports classes, functions, methods, properties, constants, and same-scope local variables. Built-ins and PHPDoc virtual members are not renamed. Workspace rename can still be expensive on large workspaces. |
 | `textDocument/prepareRename` | Supported | Rejects unsupported or built-in targets before rename. |
 | `textDocument/codeAction` quick fix | Supported | Adds imports for unresolved classes/functions when candidates exist. |
+| `textDocument/codeAction` implement missing methods | Partial | Generates concrete stubs for missing interface, abstract parent, and abstract trait methods. Edits are resolved lazily and stale document versions resolve to a no-op edit. |
 | `source.organizeImports` | Supported | Sorts/removes import statements based on parser/index data. |
 | `codeAction/resolve` | Supported | Used for heavier refactor actions so `textDocument/codeAction` can return lightweight actions first. |
 | `refactor.rewrite` add return type | Partial | Adds return types from PHPDoc where supported by the configured PHP version. Edits are resolved lazily and stale document versions resolve to a no-op edit. |
