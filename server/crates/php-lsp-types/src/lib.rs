@@ -213,6 +213,25 @@ pub struct TemplateBinding {
     pub args: Vec<TypeInfo>,
 }
 
+/// A PHPStan/Psalm local type alias declared by `@phpstan-type` or `@psalm-type`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PhpDocTypeAlias {
+    pub name: String,
+    pub type_info: TypeInfo,
+}
+
+/// A PHPStan/Psalm imported type alias declared by `@phpstan-import-type` or
+/// `@psalm-import-type`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PhpDocTypeAliasImport {
+    /// Local alias name visible in this scope.
+    pub name: String,
+    /// Alias name declared on the source type.
+    pub source_alias: String,
+    /// Source class/interface/trait/enum name as written in PHPDoc.
+    pub source_type: String,
+}
+
 /// Parsed PHPDoc information.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhpDoc {
@@ -226,6 +245,8 @@ pub struct PhpDoc {
     pub methods: Vec<PhpDocMethod>,
     pub templates: Vec<TemplateParam>,
     pub template_bindings: Vec<TemplateBinding>,
+    pub type_aliases: Vec<PhpDocTypeAlias>,
+    pub type_alias_imports: Vec<PhpDocTypeAliasImport>,
 }
 
 /// A @param tag from PHPDoc.
@@ -345,6 +366,10 @@ pub struct FileSymbols {
     pub namespace: Option<String>,
     pub use_statements: Vec<UseStatement>,
     pub symbols: Vec<SymbolInfo>,
+    #[serde(default)]
+    pub type_aliases: Vec<PhpDocTypeAlias>,
+    #[serde(default)]
+    pub type_alias_imports: Vec<PhpDocTypeAliasImport>,
 }
 
 /// A precomputed symbol occurrence used by references/rename/code lens.

@@ -19437,6 +19437,7 @@ mod tests {
                 range: (0, 0, 0, 0),
             }],
             symbols: vec![],
+            ..Default::default()
         };
 
         assert_eq!(
@@ -19554,6 +19555,7 @@ mod tests {
                     Some("App\\Service\\UserService"),
                 ),
             ],
+            ..Default::default()
         };
 
         // Index file
@@ -19611,6 +19613,7 @@ mod tests {
                     None,
                 ),
             ],
+            ..Default::default()
         };
         index.update_file("file:///app.php", file_symbols);
 
@@ -19657,6 +19660,7 @@ mod tests {
                     None,
                 ),
             ],
+            ..Default::default()
         };
         index.update_file("file:///app.php", file_symbols);
 
@@ -19707,6 +19711,7 @@ mod tests {
                     (0, 0, 1, 0),
                     None,
                 )],
+                ..Default::default()
             },
         );
         index.update_file(
@@ -19721,6 +19726,7 @@ mod tests {
                     (0, 0, 1, 0),
                     None,
                 )],
+                ..Default::default()
             },
         );
         index.update_file(
@@ -19735,6 +19741,7 @@ mod tests {
                     (0, 0, 1, 0),
                     None,
                 )],
+                ..Default::default()
             },
         );
 
@@ -19796,6 +19803,7 @@ mod tests {
                             (0, 0, 1, 0),
                             None,
                         )],
+                        ..Default::default()
                     },
                 );
             }));
@@ -19854,6 +19862,7 @@ mod tests {
                     (0, 0, 1, 0),
                     None,
                 )],
+                ..Default::default()
             },
         );
         index.update_file(
@@ -19868,6 +19877,7 @@ mod tests {
                     (0, 0, 1, 0),
                     None,
                 )],
+                ..Default::default()
             },
         );
 

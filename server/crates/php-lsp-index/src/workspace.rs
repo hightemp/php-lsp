@@ -5,9 +5,25 @@ use php_lsp_types::{
     ArrayShapeItem, FileSymbols, PhpSymbolKind, Signature, SymbolInfo, SymbolReference,
     TemplateBindingKind, TypeInfo,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 type TemplateSubstitutions = HashMap<String, TypeInfo>;
+const MAX_TYPE_ALIAS_EXPANSION_DEPTH: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeAliasScope {
+    Class(String),
+    File(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypeAliasVisit {
+    scope: TypeAliasScope,
+    name: String,
+}
 
 /// Global index of all symbols in the workspace.
 pub struct WorkspaceIndex {
@@ -113,13 +129,13 @@ impl WorkspaceIndex {
     pub fn resolve_fqn(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
         // Try top-level lookup first
         if let Some(sym) = self.types.get(fqn).map(|r| r.value().clone()) {
-            return Some(sym);
+            return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
         if let Some(sym) = self.functions.get(fqn).map(|r| r.value().clone()) {
-            return Some(sym);
+            return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
         if let Some(sym) = self.constants.get(fqn).map(|r| r.value().clone()) {
-            return Some(sym);
+            return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
 
         // Try Class::member resolution
@@ -162,7 +178,7 @@ impl WorkspaceIndex {
         let members = self.get_direct_members(class_fqn);
         // Prefer exact FQN match first
         if let Some(sym) = members.iter().find(|m| m.fqn == original_fqn) {
-            return Some(substitute_symbol_arc(sym.clone(), substitutions));
+            return Some(self.materialize_symbol(sym.clone(), substitutions));
         }
         // Fallback: match by name (for cases where caller doesn't know exact FQN form)
         // Property names in SymbolInfo are stored without '$' prefix, so strip it for comparison
@@ -171,7 +187,7 @@ impl WorkspaceIndex {
             .iter()
             .find(|m| m.name == member_name || m.name == bare_name)
         {
-            return Some(substitute_symbol_arc(sym.clone(), substitutions));
+            return Some(self.materialize_symbol(sym.clone(), substitutions));
         }
 
         // Walk the class hierarchy: look up extends and implements
@@ -317,7 +333,7 @@ impl WorkspaceIndex {
         members.extend(
             direct
                 .into_iter()
-                .map(|sym| substitute_symbol_arc(sym, substitutions)),
+                .map(|sym| self.materialize_symbol(sym, substitutions)),
         );
 
         // Recurse into parent classes and interfaces
@@ -380,6 +396,304 @@ impl WorkspaceIndex {
             .collect()
     }
 
+    fn materialize_symbol(
+        &self,
+        symbol: Arc<SymbolInfo>,
+        substitutions: &TemplateSubstitutions,
+    ) -> Arc<SymbolInfo> {
+        if symbol.signature.is_none() && substitutions.is_empty() {
+            return symbol;
+        }
+
+        let mut materialized = (*symbol).clone();
+        let mut changed = false;
+
+        if let Some(signature) = materialized.signature.as_ref() {
+            let scope = alias_scope_for_symbol(&materialized);
+            let expanded = self.expand_signature_type_aliases(signature, &scope);
+            if expanded != *signature {
+                materialized.signature = Some(expanded);
+                changed = true;
+            }
+        }
+
+        let mut scoped_substitutions = substitutions.clone();
+        for template in &materialized.templates {
+            scoped_substitutions.remove(&template.name);
+        }
+        if !scoped_substitutions.is_empty() {
+            materialized.signature = materialized
+                .signature
+                .as_ref()
+                .map(|signature| substitute_signature(signature, &scoped_substitutions));
+            changed = true;
+        }
+
+        if changed {
+            Arc::new(materialized)
+        } else {
+            symbol
+        }
+    }
+
+    fn expand_signature_type_aliases(
+        &self,
+        signature: &Signature,
+        scope: &TypeAliasScope,
+    ) -> Signature {
+        Signature {
+            params: signature
+                .params
+                .iter()
+                .map(|param| {
+                    let mut param = param.clone();
+                    param.type_info = param.type_info.as_ref().map(|type_info| {
+                        self.expand_type_aliases(type_info, scope, &mut Vec::new())
+                    });
+                    param
+                })
+                .collect(),
+            return_type: signature
+                .return_type
+                .as_ref()
+                .map(|type_info| self.expand_type_aliases(type_info, scope, &mut Vec::new())),
+        }
+    }
+
+    fn expand_type_aliases(
+        &self,
+        type_info: &TypeInfo,
+        scope: &TypeAliasScope,
+        visited: &mut Vec<TypeAliasVisit>,
+    ) -> TypeInfo {
+        match type_info {
+            TypeInfo::Simple(name) => self
+                .type_alias_for_name(name, scope, visited)
+                .unwrap_or_else(|| TypeInfo::Simple(name.clone())),
+            TypeInfo::Generic { base, args } => {
+                let base = self
+                    .type_alias_for_name(base, scope, visited)
+                    .unwrap_or_else(|| TypeInfo::Simple(base.clone()));
+                let args = args
+                    .iter()
+                    .map(|arg| self.expand_type_aliases(arg, scope, visited))
+                    .collect();
+                match base {
+                    TypeInfo::Simple(base) => TypeInfo::Generic { base, args },
+                    TypeInfo::Generic {
+                        base,
+                        args: mut base_args,
+                    } => {
+                        base_args.extend(args);
+                        TypeInfo::Generic {
+                            base,
+                            args: base_args,
+                        }
+                    }
+                    other => other,
+                }
+            }
+            TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+                items
+                    .iter()
+                    .map(|item| ArrayShapeItem {
+                        key: item.key.clone(),
+                        optional: item.optional,
+                        value: self.expand_type_aliases(&item.value, scope, visited),
+                    })
+                    .collect(),
+            ),
+            TypeInfo::Callable {
+                params,
+                return_type,
+            } => TypeInfo::Callable {
+                params: params
+                    .iter()
+                    .map(|param| self.expand_type_aliases(param, scope, visited))
+                    .collect(),
+                return_type: return_type.as_ref().map(|return_type| {
+                    Box::new(self.expand_type_aliases(return_type, scope, visited))
+                }),
+            },
+            TypeInfo::ClassString(Some(inner)) => TypeInfo::ClassString(Some(Box::new(
+                self.expand_type_aliases(inner, scope, visited),
+            ))),
+            TypeInfo::ClassString(None) => TypeInfo::ClassString(None),
+            TypeInfo::Union(types) => TypeInfo::Union(
+                types
+                    .iter()
+                    .map(|type_info| self.expand_type_aliases(type_info, scope, visited))
+                    .collect(),
+            ),
+            TypeInfo::Intersection(types) => TypeInfo::Intersection(
+                types
+                    .iter()
+                    .map(|type_info| self.expand_type_aliases(type_info, scope, visited))
+                    .collect(),
+            ),
+            TypeInfo::Nullable(inner) => {
+                TypeInfo::Nullable(Box::new(self.expand_type_aliases(inner, scope, visited)))
+            }
+            TypeInfo::LiteralString(_)
+            | TypeInfo::LiteralInt(_)
+            | TypeInfo::LiteralFloat(_)
+            | TypeInfo::LiteralBool(_)
+            | TypeInfo::LiteralNull
+            | TypeInfo::Void
+            | TypeInfo::Never
+            | TypeInfo::Mixed
+            | TypeInfo::Self_
+            | TypeInfo::Static_
+            | TypeInfo::Parent_ => type_info.clone(),
+        }
+    }
+
+    fn type_alias_for_name(
+        &self,
+        name: &str,
+        scope: &TypeAliasScope,
+        visited: &mut Vec<TypeAliasVisit>,
+    ) -> Option<TypeInfo> {
+        let name = name.trim();
+        if name.is_empty()
+            || name.starts_with('$')
+            || name.contains('\\')
+            || is_phpdoc_builtin_type(name)
+            || visited.len() >= MAX_TYPE_ALIAS_EXPANSION_DEPTH
+        {
+            return None;
+        }
+
+        let visit = TypeAliasVisit {
+            scope: scope.clone(),
+            name: name.to_string(),
+        };
+        if visited.contains(&visit) {
+            return None;
+        }
+        visited.push(visit);
+
+        let resolved = match scope {
+            TypeAliasScope::Class(class_fqn) => {
+                self.class_type_alias_for_name(class_fqn, name, visited)
+            }
+            TypeAliasScope::File(uri) => self.file_type_alias_for_name(uri, name, visited),
+        };
+
+        visited.pop();
+        resolved
+    }
+
+    fn class_type_alias_for_name(
+        &self,
+        class_fqn: &str,
+        name: &str,
+        visited: &mut Vec<TypeAliasVisit>,
+    ) -> Option<TypeInfo> {
+        let class_symbol = self
+            .types
+            .get(class_fqn)
+            .map(|entry| entry.value().clone())?;
+        let file_symbols = self
+            .file_symbols
+            .get(&class_symbol.uri)
+            .map(|entry| entry.value().clone());
+        let phpdoc = class_symbol
+            .doc_comment
+            .as_deref()
+            .map(php_lsp_parser::phpdoc::parse_phpdoc)
+            .unwrap_or_default();
+
+        if let Some(alias) = phpdoc.type_aliases.iter().find(|alias| alias.name == name) {
+            let type_info = if let Some(file_symbols) = file_symbols.as_ref() {
+                let alias_names = visible_alias_names_for_class(&phpdoc, file_symbols);
+                let template_names = phpdoc
+                    .templates
+                    .iter()
+                    .map(|template| template.name.clone())
+                    .collect();
+                resolve_alias_type_names_in_file(
+                    &alias.type_info,
+                    file_symbols,
+                    &alias_names,
+                    &template_names,
+                )
+            } else {
+                alias.type_info.clone()
+            };
+            return Some(self.expand_type_aliases(
+                &type_info,
+                &TypeAliasScope::Class(class_fqn.to_string()),
+                visited,
+            ));
+        }
+
+        if let Some(import) = phpdoc
+            .type_alias_imports
+            .iter()
+            .find(|import| import.name == name)
+        {
+            let source_type = file_symbols
+                .as_ref()
+                .map(|file_symbols| resolve_alias_source_type(&import.source_type, file_symbols))
+                .unwrap_or_else(|| import.source_type.trim_start_matches('\\').to_string());
+            return self.type_alias_for_name(
+                &import.source_alias,
+                &TypeAliasScope::Class(source_type),
+                visited,
+            );
+        }
+
+        self.file_type_alias_for_name(&class_symbol.uri, name, visited)
+    }
+
+    fn file_type_alias_for_name(
+        &self,
+        uri: &str,
+        name: &str,
+        visited: &mut Vec<TypeAliasVisit>,
+    ) -> Option<TypeInfo> {
+        let file_symbols = self
+            .file_symbols
+            .get(uri)
+            .map(|entry| entry.value().clone())?;
+
+        if let Some(alias) = file_symbols
+            .type_aliases
+            .iter()
+            .find(|alias| alias.name == name)
+        {
+            let alias_names = visible_alias_names_for_file(&file_symbols);
+            let template_names = HashSet::new();
+            let type_info = resolve_alias_type_names_in_file(
+                &alias.type_info,
+                &file_symbols,
+                &alias_names,
+                &template_names,
+            );
+            return Some(self.expand_type_aliases(
+                &type_info,
+                &TypeAliasScope::File(uri.to_string()),
+                visited,
+            ));
+        }
+
+        if let Some(import) = file_symbols
+            .type_alias_imports
+            .iter()
+            .find(|import| import.name == name)
+        {
+            let source_type = resolve_alias_source_type(&import.source_type, &file_symbols);
+            return self.type_alias_for_name(
+                &import.source_alias,
+                &TypeAliasScope::Class(source_type),
+                visited,
+            );
+        }
+
+        None
+    }
+
     fn collect_type_hierarchy_symbols(
         &self,
         type_fqn: &str,
@@ -412,28 +726,218 @@ fn same_fqn(left: &str, right: &str) -> bool {
     left.trim_start_matches('\\') == right.trim_start_matches('\\')
 }
 
-fn substitute_symbol_arc(
-    symbol: Arc<SymbolInfo>,
-    substitutions: &TemplateSubstitutions,
-) -> Arc<SymbolInfo> {
-    if substitutions.is_empty() {
-        return symbol;
+fn alias_scope_for_symbol(symbol: &SymbolInfo) -> TypeAliasScope {
+    if let Some(parent_fqn) = symbol.parent_fqn.as_ref() {
+        TypeAliasScope::Class(parent_fqn.clone())
+    } else if matches!(
+        symbol.kind,
+        PhpSymbolKind::Class
+            | PhpSymbolKind::Interface
+            | PhpSymbolKind::Trait
+            | PhpSymbolKind::Enum
+    ) {
+        TypeAliasScope::Class(symbol.fqn.clone())
+    } else {
+        TypeAliasScope::File(symbol.uri.clone())
     }
+}
 
-    let mut scoped = substitutions.clone();
-    for template in &symbol.templates {
-        scoped.remove(&template.name);
-    }
-    if scoped.is_empty() {
-        return symbol;
-    }
+fn visible_alias_names_for_class(
+    phpdoc: &php_lsp_types::PhpDoc,
+    file_symbols: &FileSymbols,
+) -> HashSet<String> {
+    let mut names = visible_alias_names_for_file(file_symbols);
+    names.extend(phpdoc.type_aliases.iter().map(|alias| alias.name.clone()));
+    names.extend(
+        phpdoc
+            .type_alias_imports
+            .iter()
+            .map(|import| import.name.clone()),
+    );
+    names
+}
 
-    let mut substituted = (*symbol).clone();
-    substituted.signature = substituted
-        .signature
-        .as_ref()
-        .map(|signature| substitute_signature(signature, &scoped));
-    Arc::new(substituted)
+fn visible_alias_names_for_file(file_symbols: &FileSymbols) -> HashSet<String> {
+    let mut names = HashSet::new();
+    names.extend(
+        file_symbols
+            .type_aliases
+            .iter()
+            .map(|alias| alias.name.clone()),
+    );
+    names.extend(
+        file_symbols
+            .type_alias_imports
+            .iter()
+            .map(|import| import.name.clone()),
+    );
+    names
+}
+
+fn resolve_alias_source_type(source_type: &str, file_symbols: &FileSymbols) -> String {
+    php_lsp_parser::resolve::resolve_class_name_pub(source_type, file_symbols)
+}
+
+fn resolve_alias_type_names_in_file(
+    type_info: &TypeInfo,
+    file_symbols: &FileSymbols,
+    alias_names: &HashSet<String>,
+    template_names: &HashSet<String>,
+) -> TypeInfo {
+    match type_info {
+        TypeInfo::Simple(name) => {
+            if should_preserve_alias_type_name(name, alias_names, template_names) {
+                TypeInfo::Simple(name.clone())
+            } else {
+                TypeInfo::Simple(php_lsp_parser::resolve::resolve_class_name_pub(
+                    name,
+                    file_symbols,
+                ))
+            }
+        }
+        TypeInfo::Generic { base, args } => {
+            let base = if should_preserve_alias_type_name(base, alias_names, template_names) {
+                base.clone()
+            } else {
+                php_lsp_parser::resolve::resolve_class_name_pub(base, file_symbols)
+            };
+            TypeInfo::Generic {
+                base,
+                args: args
+                    .iter()
+                    .map(|arg| {
+                        resolve_alias_type_names_in_file(
+                            arg,
+                            file_symbols,
+                            alias_names,
+                            template_names,
+                        )
+                    })
+                    .collect(),
+            }
+        }
+        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+            items
+                .iter()
+                .map(|item| ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: resolve_alias_type_names_in_file(
+                        &item.value,
+                        file_symbols,
+                        alias_names,
+                        template_names,
+                    ),
+                })
+                .collect(),
+        ),
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => TypeInfo::Callable {
+            params: params
+                .iter()
+                .map(|param| {
+                    resolve_alias_type_names_in_file(
+                        param,
+                        file_symbols,
+                        alias_names,
+                        template_names,
+                    )
+                })
+                .collect(),
+            return_type: return_type.as_ref().map(|return_type| {
+                Box::new(resolve_alias_type_names_in_file(
+                    return_type,
+                    file_symbols,
+                    alias_names,
+                    template_names,
+                ))
+            }),
+        },
+        TypeInfo::ClassString(Some(inner)) => TypeInfo::ClassString(Some(Box::new(
+            resolve_alias_type_names_in_file(inner, file_symbols, alias_names, template_names),
+        ))),
+        TypeInfo::ClassString(None) => TypeInfo::ClassString(None),
+        TypeInfo::Union(types) => TypeInfo::Union(
+            types
+                .iter()
+                .map(|type_info| {
+                    resolve_alias_type_names_in_file(
+                        type_info,
+                        file_symbols,
+                        alias_names,
+                        template_names,
+                    )
+                })
+                .collect(),
+        ),
+        TypeInfo::Intersection(types) => TypeInfo::Intersection(
+            types
+                .iter()
+                .map(|type_info| {
+                    resolve_alias_type_names_in_file(
+                        type_info,
+                        file_symbols,
+                        alias_names,
+                        template_names,
+                    )
+                })
+                .collect(),
+        ),
+        TypeInfo::Nullable(inner) => TypeInfo::Nullable(Box::new(
+            resolve_alias_type_names_in_file(inner, file_symbols, alias_names, template_names),
+        )),
+        TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed
+        | TypeInfo::Self_
+        | TypeInfo::Static_
+        | TypeInfo::Parent_ => type_info.clone(),
+    }
+}
+
+fn should_preserve_alias_type_name(
+    name: &str,
+    alias_names: &HashSet<String>,
+    template_names: &HashSet<String>,
+) -> bool {
+    name.starts_with('$')
+        || alias_names.contains(name)
+        || template_names.contains(name)
+        || is_phpdoc_builtin_type(name)
+}
+
+fn is_phpdoc_builtin_type(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches('\\').to_ascii_lowercase().as_str(),
+        "array"
+            | "bool"
+            | "boolean"
+            | "callable"
+            | "false"
+            | "float"
+            | "int"
+            | "integer"
+            | "iterable"
+            | "list"
+            | "mixed"
+            | "never"
+            | "null"
+            | "object"
+            | "resource"
+            | "scalar"
+            | "self"
+            | "static"
+            | "string"
+            | "true"
+            | "void"
+    )
 }
 
 fn substitute_signature(signature: &Signature, substitutions: &TemplateSubstitutions) -> Signature {
@@ -586,6 +1090,7 @@ mod tests {
             namespace: Some("App".to_string()),
             use_statements: vec![],
             symbols: vec![sym],
+            ..Default::default()
         };
 
         index.update_file("file:///test.php", file_symbols);
@@ -603,6 +1108,7 @@ mod tests {
             namespace: Some("App".to_string()),
             use_statements: vec![],
             symbols: vec![sym],
+            ..Default::default()
         };
 
         index.update_file("file:///test.php", file_symbols);
@@ -623,6 +1129,7 @@ mod tests {
                 make_class("BarService", "App\\BarService", "file:///a.php"),
                 make_function("helper_foo", "App\\helper_foo", "file:///a.php"),
             ],
+            ..Default::default()
         };
 
         index.update_file("file:///a.php", file_symbols);
@@ -639,6 +1146,7 @@ mod tests {
             namespace: None,
             use_statements: vec![],
             symbols: vec![make_class("Foo", "Foo", "file:///test.php")],
+            ..Default::default()
         };
         index.update_file("file:///test.php", sym_v1);
         assert!(index.resolve_fqn("Foo").is_some());
@@ -647,6 +1155,7 @@ mod tests {
             namespace: None,
             use_statements: vec![],
             symbols: vec![make_class("Bar", "Bar", "file:///test.php")],
+            ..Default::default()
         };
         index.update_file("file:///test.php", sym_v2);
         assert!(index.resolve_fqn("Foo").is_none());
@@ -679,6 +1188,7 @@ mod tests {
             namespace: Some("App".to_string()),
             use_statements: vec![],
             symbols: vec![class_sym, method_sym],
+            ..Default::default()
         };
         index.update_file("file:///test.php", file_symbols);
 
@@ -743,6 +1253,7 @@ mod tests {
             namespace: Some("App".to_string()),
             use_statements: vec![],
             symbols: vec![parent_class, parent_method],
+            ..Default::default()
         };
         index.update_file("file:///parent.php", parent_file);
 
@@ -769,6 +1280,7 @@ mod tests {
             namespace: Some("App".to_string()),
             use_statements: vec![],
             symbols: vec![child_class],
+            ..Default::default()
         };
         index.update_file("file:///child.php", child_file);
 
@@ -833,6 +1345,7 @@ mod tests {
                 namespace: Some("App".to_string()),
                 use_statements: vec![],
                 symbols: vec![trait_sym, trait_method],
+                ..Default::default()
             },
         );
 
@@ -860,6 +1373,7 @@ mod tests {
                 namespace: Some("App".to_string()),
                 use_statements: vec![],
                 symbols: vec![class_sym],
+                ..Default::default()
             },
         );
 
@@ -913,11 +1427,13 @@ mod tests {
             namespace: None,
             use_statements: vec![],
             symbols: vec![class_a],
+            ..Default::default()
         };
         let file_b = FileSymbols {
             namespace: None,
             use_statements: vec![],
             symbols: vec![class_b],
+            ..Default::default()
         };
         index.update_file("file:///a.php", file_a);
         index.update_file("file:///b.php", file_b);
@@ -956,6 +1472,7 @@ mod tests {
             namespace: Some("App".to_string()),
             use_statements: vec![],
             symbols: vec![child_class],
+            ..Default::default()
         };
         index.update_file("file:///tests/MyTest.php", child_file);
 
@@ -1006,6 +1523,7 @@ mod tests {
             namespace: Some("Vendor".to_string()),
             use_statements: vec![],
             symbols: vec![parent_class, parent_method],
+            ..Default::default()
         };
         index.update_file("file:///vendor/TestCase.php", parent_file);
 
@@ -1058,6 +1576,7 @@ mod tests {
             namespace: Some("Vendor".to_string()),
             use_statements: vec![],
             symbols: vec![gp_class, gp_method],
+            ..Default::default()
         };
         index.update_file("file:///vendor/BaseAssert.php", gp_file);
 
@@ -1108,6 +1627,7 @@ mod tests {
                 namespace: Some("App".to_string()),
                 use_statements: vec![],
                 symbols: vec![repository, repository_method],
+                ..Default::default()
             },
         );
 
@@ -1128,6 +1648,7 @@ mod tests {
                 namespace: Some("App".to_string()),
                 use_statements: vec![],
                 symbols: vec![user_repository],
+                ..Default::default()
             },
         );
 
@@ -1180,6 +1701,7 @@ mod tests {
                 namespace: Some("App".to_string()),
                 use_statements: vec![],
                 symbols: vec![collection, first_method],
+                ..Default::default()
             },
         );
 
@@ -1197,6 +1719,7 @@ mod tests {
                 namespace: Some("App".to_string()),
                 use_statements: vec![],
                 symbols: vec![user_collection],
+                ..Default::default()
             },
         );
 
@@ -1211,6 +1734,229 @@ mod tests {
                 .as_ref()
                 .and_then(|signature| signature.return_type.clone()),
             Some(TypeInfo::Simple("App\\User".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_type_alias_expands_class_scoped_array_shape() {
+        let index = WorkspaceIndex::new();
+
+        let mut service = make_class("UserService", "App\\UserService", "file:///service.php");
+        service.doc_comment =
+            Some("/**\n * @phpstan-type UserShape array{id: int, name?: string}\n */".to_string());
+        let method = SymbolInfo {
+            name: "getShape".to_string(),
+            fqn: "App\\UserService::getShape".to_string(),
+            kind: PhpSymbolKind::Method,
+            uri: "file:///service.php".to_string(),
+            range: (5, 4, 7, 5),
+            selection_range: (5, 20, 5, 28),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: Some("/** @return UserShape */".to_string()),
+            signature: Some(Signature {
+                params: vec![],
+                return_type: Some(TypeInfo::Simple("UserShape".to_string())),
+            }),
+            parent_fqn: Some("App\\UserService".to_string()),
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
+        };
+        index.update_file(
+            "file:///service.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![service, method],
+                ..Default::default()
+            },
+        );
+
+        let found = index
+            .resolve_fqn("App\\UserService::getShape")
+            .expect("method with type alias should resolve");
+        let return_type = found
+            .signature
+            .as_ref()
+            .and_then(|signature| signature.return_type.as_ref())
+            .expect("return type should be available");
+        let TypeInfo::ArrayShape(items) = return_type else {
+            panic!("expected alias to expand to array shape, got {return_type:?}");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key.as_deref(), Some("id"));
+        assert_eq!(items[1].key.as_deref(), Some("name"));
+        assert!(items[1].optional);
+    }
+
+    #[test]
+    fn test_imported_type_alias_expands_from_source_class() {
+        let index = WorkspaceIndex::new();
+
+        let mut types = make_class("Types", "App\\Types", "file:///types.php");
+        types.doc_comment = Some("/**\n * @phpstan-type UserShape array{id: int}\n */".to_string());
+        index.update_file(
+            "file:///types.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![types],
+                ..Default::default()
+            },
+        );
+
+        let mut service = make_class("UserService", "App\\UserService", "file:///service.php");
+        service.doc_comment = Some(
+            "/**\n * @phpstan-import-type UserShape from Types as LocalShape\n */".to_string(),
+        );
+        let method = SymbolInfo {
+            name: "getShape".to_string(),
+            fqn: "App\\UserService::getShape".to_string(),
+            kind: PhpSymbolKind::Method,
+            uri: "file:///service.php".to_string(),
+            range: (5, 4, 7, 5),
+            selection_range: (5, 20, 5, 28),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: Some("/** @return LocalShape */".to_string()),
+            signature: Some(Signature {
+                params: vec![],
+                return_type: Some(TypeInfo::Simple("LocalShape".to_string())),
+            }),
+            parent_fqn: Some("App\\UserService".to_string()),
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
+        };
+        index.update_file(
+            "file:///service.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![service, method],
+                ..Default::default()
+            },
+        );
+
+        let found = index
+            .resolve_fqn("App\\UserService::getShape")
+            .expect("method with imported type alias should resolve");
+        assert!(matches!(
+            found
+                .signature
+                .as_ref()
+                .and_then(|signature| signature.return_type.as_ref()),
+            Some(TypeInfo::ArrayShape(_))
+        ));
+    }
+
+    #[test]
+    fn test_file_level_type_alias_expands_function_return() {
+        let index = WorkspaceIndex::new();
+
+        let function = SymbolInfo {
+            name: "getShape".to_string(),
+            fqn: "App\\getShape".to_string(),
+            kind: PhpSymbolKind::Function,
+            uri: "file:///functions.php".to_string(),
+            range: (6, 0, 8, 1),
+            selection_range: (6, 9, 6, 17),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: Some("/** @return UserShape */".to_string()),
+            signature: Some(Signature {
+                params: vec![],
+                return_type: Some(TypeInfo::Simple("UserShape".to_string())),
+            }),
+            parent_fqn: None,
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
+        };
+        index.update_file(
+            "file:///functions.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![function],
+                type_aliases: vec![PhpDocTypeAlias {
+                    name: "UserShape".to_string(),
+                    type_info: TypeInfo::ArrayShape(vec![ArrayShapeItem {
+                        key: Some("id".to_string()),
+                        optional: false,
+                        value: TypeInfo::Simple("int".to_string()),
+                    }]),
+                }],
+                ..Default::default()
+            },
+        );
+
+        let found = index
+            .resolve_fqn("App\\getShape")
+            .expect("function with file-level type alias should resolve");
+        assert!(matches!(
+            found
+                .signature
+                .as_ref()
+                .and_then(|signature| signature.return_type.as_ref()),
+            Some(TypeInfo::ArrayShape(_))
+        ));
+    }
+
+    #[test]
+    fn test_recursive_type_alias_falls_back_to_raw_alias() {
+        let index = WorkspaceIndex::new();
+
+        let mut service = make_class("LoopService", "App\\LoopService", "file:///loop.php");
+        service.doc_comment =
+            Some("/**\n * @phpstan-type A B\n * @phpstan-type B A\n */".to_string());
+        let method = SymbolInfo {
+            name: "loop".to_string(),
+            fqn: "App\\LoopService::loop".to_string(),
+            kind: PhpSymbolKind::Method,
+            uri: "file:///loop.php".to_string(),
+            range: (5, 4, 7, 5),
+            selection_range: (5, 20, 5, 24),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: Some("/** @return A */".to_string()),
+            signature: Some(Signature {
+                params: vec![],
+                return_type: Some(TypeInfo::Simple("A".to_string())),
+            }),
+            parent_fqn: Some("App\\LoopService".to_string()),
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
+        };
+        index.update_file(
+            "file:///loop.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![service, method],
+                ..Default::default()
+            },
+        );
+
+        let found = index
+            .resolve_fqn("App\\LoopService::loop")
+            .expect("recursive alias method should still resolve");
+        assert_eq!(
+            found
+                .signature
+                .as_ref()
+                .and_then(|signature| signature.return_type.clone()),
+            Some(TypeInfo::Simple("A".to_string()))
         );
     }
 }

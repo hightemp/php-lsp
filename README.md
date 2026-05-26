@@ -31,8 +31,9 @@ phpstorm-stubs support.
   missing properties, and missing class constants.
 - Basic type compatibility checks for assignments, returns, arguments,
   properties, and member calls.
-- Best-effort PHPDoc template metadata and inherited generic member type
-  substitution for common repository and collection patterns.
+- Best-effort PHPDoc template metadata, PHPStan/Psalm type aliases and imported
+  aliases, and inherited generic member type substitution for common repository
+  and collection patterns.
 - Override signature and PHP-version compatibility diagnostics.
 - Optional PHPStan and Psalm diagnostics through configured external commands.
 - Per-category diagnostic severity controls for unknown symbols, unused code,
@@ -172,8 +173,9 @@ phpstorm-stubs support.
   updates.
 - Cross-file local variable analysis is intentionally limited; variable
   references and rename are local-scope oriented.
-- Type inference includes common PHPDoc generic inheritance bindings, but it is
-  still shallow compared with mature PHP static analyzers.
+- Type inference includes common PHPDoc generic inheritance bindings and
+  class/file-scoped PHPStan/Psalm type aliases, but it is still shallow compared
+  with mature PHP static analyzers.
 - Built-in semantic diagnostics depend on indexed project and vendor symbols.
   If Composer/vendor metadata is absent, external framework classes can be
   reported as unknown; dynamic framework APIs such as some Eloquent relation

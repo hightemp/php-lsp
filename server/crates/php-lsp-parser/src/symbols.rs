@@ -35,6 +35,7 @@ fn extract_file_symbols_with_php_version(
 ) -> FileSymbols {
     let mut result = FileSymbols::default();
     let root = tree.root_node();
+    extract_file_level_phpdoc_aliases(root, source, &mut result);
 
     // Walk top-level children of program node.
     // Handle namespace-without-braces by tracking current namespace.
@@ -63,6 +64,57 @@ fn extract_file_symbols_with_php_version(
     }
 
     result
+}
+
+fn extract_file_level_phpdoc_aliases(root: Node, source: &str, result: &mut FileSymbols) {
+    collect_file_level_phpdoc_aliases(root, source, result);
+
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() == "namespace_definition" {
+            collect_file_level_phpdoc_aliases(child, source, result);
+        }
+    }
+}
+
+fn collect_file_level_phpdoc_aliases(node: Node, source: &str, result: &mut FileSymbols) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "comment" {
+            continue;
+        }
+
+        let text = node_text(child, source);
+        if !text.starts_with("/**") || phpdoc_comment_belongs_to_declaration(child) {
+            continue;
+        }
+
+        let phpdoc = crate::phpdoc::parse_phpdoc(text);
+        result.type_aliases.extend(phpdoc.type_aliases);
+        result.type_alias_imports.extend(phpdoc.type_alias_imports);
+    }
+}
+
+fn phpdoc_comment_belongs_to_declaration(comment: Node) -> bool {
+    let mut next = comment.next_sibling();
+    while let Some(node) = next {
+        match node.kind() {
+            "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+            | "function_definition"
+            | "const_declaration" => return true,
+            "namespace_definition" | "namespace_use_declaration" | "declare_statement" => {
+                return false;
+            }
+            "comment" => return false,
+            _ => {
+                next = node.next_sibling();
+            }
+        }
+    }
+    false
 }
 
 /// Find the namespace name from a namespace_definition node.
@@ -1675,6 +1727,43 @@ mod tests {
         assert_eq!(
             syms.symbols[0].doc_comment.as_deref(),
             Some("/** This is Foo. */")
+        );
+    }
+
+    #[test]
+    fn test_extract_file_level_type_alias_metadata() {
+        let code = r#"<?php
+/**
+ * @phpstan-type UserShape array{id: int}
+ * @phpstan-import-type ExternalShape from Types as LocalShape
+ */
+namespace App;
+
+function getShape() {}
+"#;
+        let syms = parse_and_extract(code);
+
+        assert_eq!(syms.type_aliases.len(), 1);
+        assert_eq!(syms.type_aliases[0].name, "UserShape");
+        assert!(matches!(
+            syms.type_aliases[0].type_info,
+            TypeInfo::ArrayShape(_)
+        ));
+        assert_eq!(syms.type_alias_imports.len(), 1);
+        assert_eq!(syms.type_alias_imports[0].name, "LocalShape");
+        assert_eq!(syms.type_alias_imports[0].source_alias, "ExternalShape");
+        assert_eq!(syms.type_alias_imports[0].source_type, "Types");
+    }
+
+    #[test]
+    fn test_class_type_alias_docblock_is_not_file_level_alias() {
+        let syms = parse_and_extract(
+            "<?php\n/**\n * @phpstan-type UserShape array{id: int}\n */\nclass Foo {}\n",
+        );
+        assert!(syms.type_aliases.is_empty());
+        assert_eq!(
+            syms.symbols[0].doc_comment.as_deref(),
+            Some("/**\n * @phpstan-type UserShape array{id: int}\n */")
         );
     }
 

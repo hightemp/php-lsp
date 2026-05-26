@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 7;
+pub const CACHE_SCHEMA_VERSION: u32 = 8;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -584,6 +584,7 @@ mod tests {
                 namespace: Some("App".to_string()),
                 use_statements: vec![],
                 symbols: vec![make_symbol(&uri)],
+                ..Default::default()
             },
         );
 
@@ -631,6 +632,7 @@ mod tests {
                 namespace: None,
                 use_statements: vec![],
                 symbols: vec![make_symbol(&uri)],
+                ..Default::default()
             },
             references.clone(),
         );
@@ -677,6 +679,7 @@ mod tests {
                 namespace: None,
                 use_statements: vec![],
                 symbols: vec![make_symbol(&uri)],
+                ..Default::default()
             },
         );
 
@@ -741,6 +744,7 @@ mod tests {
                         namespace: Some("App".to_string()),
                         use_statements: vec![],
                         symbols: vec![make_symbol(&uri)],
+                        ..Default::default()
                     },
                 );
                 let cache = build_cache_from_index(&index, &root, &[file], &config);

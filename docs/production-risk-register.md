@@ -20,7 +20,7 @@ The format is intentionally operational: every risk is tied to an owner task in
 | R-006 | `didChange` debounce/version ordering | High | `PR-020`, `PR-050` | Mitigated |
 | R-007 | Version-aware stubs | Medium | `PR-030`, `PR-011` | Mitigated |
 | R-008 | Lazy vendor indexing scale validation | Medium | `PR-012`, `PR-011`, `PV-014` | Partially mitigated |
-| R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041`, `IE-030`, `PV-012` | Accepted limitation |
+| R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041`, `IE-030`, `IE-031`, `PV-012` | Accepted limitation |
 | R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052` | Mitigated |
 
 ## Risks
@@ -274,6 +274,8 @@ Current evidence:
 - `PR-042` reduced framework-heavy diagnostics false positives for common Symfony/Laravel/Doctrine/PHPUnit patterns.
 - `IE-030` added PHPDoc template metadata and generic inheritance substitution
   for common repository and collection member types.
+- `IE-031` added PHPStan/Psalm `@phpstan-type`/`@psalm-type` and imported
+  type alias expansion for indexed signatures, with cycle guards.
 - `PV-012` fixed a real Symfony false positive for promoted constructor
   properties accessed through a `self`-typed parameter
   (`withDefaults(self $defaults)` then `$defaults->objectManager`).
@@ -290,8 +292,8 @@ Impact:
 Mitigation:
 
 - `PR-031`-`PR-034`: PHPDoc parser, virtual members, and e2e coverage.
-- `PR-040`-`PR-042`, `IE-030`: richer type model, inference, PHPDoc template
-  metadata, and framework false-positive reductions.
+- `PR-040`-`PR-042`, `IE-030`/`IE-031`: richer type model, inference, PHPDoc
+  template/type-alias metadata, and framework false-positive reductions.
 - `PV-012`: added regression coverage for `self`/`static` parameter type
   resolution before member diagnostics.
 

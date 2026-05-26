@@ -825,6 +825,7 @@ mod tests {
                 templates: vec![],
                 template_bindings: vec![],
             }],
+            ..Default::default()
         };
         index.update_file("file:///test.php", file_symbols.clone());
 
@@ -863,6 +864,7 @@ mod tests {
             namespace: Some("App".to_string()),
             use_statements: vec![],
             symbols,
+            ..Default::default()
         };
         let index = WorkspaceIndex::new();
         index.update_file("file:///test.php", file_symbols.clone());
@@ -915,6 +917,7 @@ mod tests {
                 templates: vec![],
                 template_bindings: vec![],
             }],
+            ..Default::default()
         };
         let index = WorkspaceIndex::new();
 
@@ -974,6 +977,7 @@ mod tests {
                     template_bindings: vec![],
                 },
             ],
+            ..Default::default()
         };
 
         let index = WorkspaceIndex::new();
@@ -1031,6 +1035,7 @@ mod tests {
                     true,
                 ),
             ],
+            ..Default::default()
         };
         let index = WorkspaceIndex::new();
         index.update_file("file:///test.php", file_symbols.clone());
@@ -1097,6 +1102,7 @@ mod tests {
                     false,
                 ),
             ],
+            ..Default::default()
         };
         let index = WorkspaceIndex::new();
         index.update_file("file:///test.php", file_symbols.clone());
@@ -1146,6 +1152,7 @@ mod tests {
             namespace: Some("App".to_string()),
             use_statements: vec![],
             symbols: vec![service],
+            ..Default::default()
         };
         let index = WorkspaceIndex::new();
         index.update_file("file:///test.php", file_symbols.clone());
@@ -1203,6 +1210,7 @@ mod tests {
             namespace: Some("App".to_string()),
             use_statements: vec![],
             symbols: vec![base, service],
+            ..Default::default()
         };
         let index = WorkspaceIndex::new();
         index.update_file("file:///test.php", file_symbols.clone());
@@ -1256,6 +1264,7 @@ mod tests {
                     true,
                 ),
             ],
+            ..Default::default()
         };
         let index = WorkspaceIndex::new();
         index.update_file("file:///test.php", file_symbols.clone());
@@ -1289,6 +1298,7 @@ mod tests {
                 Visibility::Public,
                 false,
             )],
+            ..Default::default()
         };
         let index = WorkspaceIndex::new();
         index.update_file("file:///test.php", file_symbols.clone());
@@ -1338,6 +1348,7 @@ mod tests {
                     true,
                 ),
             ],
+            ..Default::default()
         };
         let index = WorkspaceIndex::new();
         index.update_file("file:///test.php", file_symbols.clone());

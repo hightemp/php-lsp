@@ -38,7 +38,7 @@ tools.
 |---|---|---|
 | `textDocument/definition` | Supported | Handles indexed symbols, local variables, `$this`, constructors, PHPDoc virtual members, and lazy vendor fallback. |
 | `textDocument/declaration` | Supported | Goes to import declarations when applicable, otherwise falls back to definition. |
-| `textDocument/typeDefinition` | Supported | Resolves variable/member/function return types where inferred or indexed, including common PHPDoc generic inheritance substitutions. |
+| `textDocument/typeDefinition` | Supported | Resolves variable/member/function return types where inferred or indexed, including common PHPDoc generic inheritance substitutions and PHPStan/Psalm type alias expansion. |
 | `textDocument/implementation` | Supported | Interface/trait/base type to implementations, and method implementation lookup. |
 | `textDocument/references` | Partial | Uses indexed per-file references for symbols and same-scope references for local variables. Workspace-wide references can still be expensive on large workspaces. |
 | `textDocument/documentHighlight` | Supported | Local variables and non-local symbols in the current document. |
@@ -87,8 +87,8 @@ tools.
 | Diagnostics: built-in semantic | Supported | Unknown symbols, unused code, duplicate symbols, member access, type compatibility, override signatures, PHP-version checks. Without Composer/vendor metadata, external framework symbols can be reported as unknown; highly dynamic framework members such as some Eloquent relation APIs remain best-effort. |
 | Diagnostics: PHPStan | Partial | Optional external command, timeout-bound, JSON output required. |
 | Diagnostics: Psalm | Partial | Optional external command, timeout-bound, JSON output required. |
-| `textDocument/hover` | Supported | Symbols, signatures, types, PHPDoc, variables, deprecation, PHPDoc virtual members. |
-| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, and auto-import edits. |
+| `textDocument/hover` | Supported | Symbols, signatures, types, PHPDoc, variables, deprecation, PHPDoc virtual members, and expanded indexed PHPDoc type aliases in signatures. |
+| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, and expanded member signature aliases. |
 | `completionItem/resolve` | Supported | Enriches PHPDoc virtual member completions. |
 | `textDocument/signatureHelp` | Supported | Functions, methods, constructors, and active parameter tracking. |
 | `textDocument/inlayHint` | Supported | Argument labels and inferred PHPDoc parameter/return hints. |
@@ -103,6 +103,7 @@ tools.
 - Namespace/class rewrites during file rename.
 - Native formatter implementation.
 - Full PHP static analyzer replacement.
-- Complete generic/template/array-shape type system parity with PHPStan/Psalm.
+- Complete generic/template/type-alias/array-shape type system parity with
+  PHPStan/Psalm.
 - Guaranteed sublinear references/rename/codeLens performance on very large
   workspaces without additional reference-index sharding or aggregation.

@@ -1646,12 +1646,32 @@ PR-052 ─→ PR-053
     `cargo clippy --all-targets -- -D warnings`, docs Cyrillic check,
     `git diff --check`.
 
-- [ ] **IE-031** Type aliases и imported aliases
+- [x] **IE-031** Type aliases и imported aliases *(done 2026-05-26)*
   - Поддержать `@phpstan-type`, `@psalm-type`, `@phpstan-import-type`, `@psalm-import-type`.
   - Alias scope: class docblock, file-level docblock если поддерживается parserом.
   - Aliases должны участвовать в hover/completion/typeDefinition best-effort.
   - Guard cycles: detect recursive aliases и fallback to raw type without panic.
   - Tests: alias to array shape, imported alias, recursive alias ignored.
+  - Implemented: PHPDoc parser support for PHPStan/Psalm local and imported
+    type alias tags, including optional `=` syntax and `as` import aliases.
+  - Implemented: `FileSymbols` stores file-level alias metadata; class
+    docblock aliases remain class-scoped and are parsed from the indexed class
+    docblock when materializing signatures.
+  - Implemented: `WorkspaceIndex` expands aliases for indexed function/member
+    signatures before template substitution, resolves imported aliases through
+    the source class scope, and falls back to the raw alias on recursive cycles.
+  - Implemented: cache schema version bump to invalidate symbol snapshots
+    without file-level alias metadata.
+  - Regression: parser tests cover alias/import parsing and file-level alias
+    extraction; index tests cover class-scoped array-shape aliases, file-level
+    function aliases, imported aliases, and recursive alias fallback.
+  - Docs: `README.md`, `docs/lsp-features.md`, and
+    `docs/production-risk-register.md` mention the new best-effort PHPDoc type
+    alias support.
+  - Validation: `cargo test -p php-lsp-parser`, `cargo test -p php-lsp-index`,
+    `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, docs Cyrillic check,
+    `git diff --check`.
 
 - [ ] **IE-032** Conditional return types и class-string templates
   - Parse PHPStan/Psalm conditional return syntax: `($arg is Foo ? A : B)`.

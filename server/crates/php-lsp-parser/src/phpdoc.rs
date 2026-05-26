@@ -2,11 +2,13 @@
 //!
 //! Extracts type information and documentation from PHPDoc comments.
 //! Supports: @param, @return, @var, @throws, @deprecated, @property, @method,
-//! @template, @extends, @implements, @use, and @mixin.
+//! @template, @extends, @implements, @use, @mixin, @phpstan-type/@psalm-type,
+//! and @phpstan-import-type/@psalm-import-type.
 
 use php_lsp_types::{
     ArrayShapeItem, PhpDoc, PhpDocMethod, PhpDocParam, PhpDocProperty, PhpDocPropertyAccess,
-    TemplateBinding, TemplateBindingKind, TemplateParam, TemplateVariance, TypeInfo,
+    PhpDocTypeAlias, PhpDocTypeAliasImport, TemplateBinding, TemplateBindingKind, TemplateParam,
+    TemplateVariance, TypeInfo,
 };
 
 /// Parse a PHPDoc comment string into structured data.
@@ -76,6 +78,10 @@ fn parse_tag(line: &str, doc: &mut PhpDoc) {
         parse_template_tag(rest, variance, doc);
     } else if let Some((rest, kind)) = template_binding_tag(line) {
         parse_template_binding_tag(rest, kind, doc);
+    } else if let Some(rest) = type_alias_tag(line) {
+        parse_type_alias_tag(rest, doc);
+    } else if let Some(rest) = type_alias_import_tag(line) {
+        parse_type_alias_import_tag(rest, doc);
     } else if let Some(rest) = line.strip_prefix("@param") {
         parse_param_tag(rest.trim(), doc);
     } else if let Some(rest) = line.strip_prefix("@return") {
@@ -169,6 +175,26 @@ fn template_binding_tag(line: &str) -> Option<(&str, TemplateBindingKind)> {
     for tag in ["@mixin", "@phpstan-mixin", "@psalm-mixin"] {
         if let Some(rest) = strip_exact_tag(line, tag) {
             return Some((rest, TemplateBindingKind::Mixin));
+        }
+    }
+
+    None
+}
+
+fn type_alias_tag(line: &str) -> Option<&str> {
+    for tag in ["@phpstan-type", "@psalm-type"] {
+        if let Some(rest) = strip_exact_tag(line, tag) {
+            return Some(rest);
+        }
+    }
+
+    None
+}
+
+fn type_alias_import_tag(line: &str) -> Option<&str> {
+    for tag in ["@phpstan-import-type", "@psalm-import-type"] {
+        if let Some(rest) = strip_exact_tag(line, tag) {
+            return Some(rest);
         }
     }
 
@@ -272,6 +298,69 @@ fn template_binding_from_type(
         }),
         _ => None,
     }
+}
+
+fn parse_type_alias_tag(rest: &str, doc: &mut PhpDoc) {
+    let Some((name, remaining)) = split_first_word(rest) else {
+        return;
+    };
+    let name = name.trim();
+    if !is_valid_template_name(name) {
+        return;
+    }
+
+    let remaining = remaining.trim_start();
+    let remaining = remaining
+        .strip_prefix('=')
+        .unwrap_or(remaining)
+        .trim_start();
+    let Some((type_str, _)) = split_type_prefix(remaining) else {
+        return;
+    };
+
+    doc.type_aliases.push(PhpDocTypeAlias {
+        name: name.to_string(),
+        type_info: parse_type_string(type_str),
+    });
+}
+
+fn parse_type_alias_import_tag(rest: &str, doc: &mut PhpDoc) {
+    let Some((source_alias, remaining)) = split_first_word(rest) else {
+        return;
+    };
+    let source_alias = source_alias.trim();
+    if !is_valid_template_name(source_alias) {
+        return;
+    }
+
+    let Some(remaining) = remaining.trim_start().strip_prefix("from ") else {
+        return;
+    };
+    let Some((source_type, remaining)) = split_first_word(remaining) else {
+        return;
+    };
+    let source_type = source_type.trim();
+    if source_type.is_empty() {
+        return;
+    }
+
+    let local_name = if let Some(rest) = remaining.trim_start().strip_prefix("as ") {
+        let Some((alias, _)) = split_first_word(rest) else {
+            return;
+        };
+        alias.trim()
+    } else {
+        source_alias
+    };
+    if !is_valid_template_name(local_name) {
+        return;
+    }
+
+    doc.type_alias_imports.push(PhpDocTypeAliasImport {
+        name: local_name.to_string(),
+        source_alias: source_alias.to_string(),
+        source_type: source_type.to_string(),
+    });
 }
 
 fn parse_var_tag(rest: &str, doc: &mut PhpDoc) {
@@ -1346,6 +1435,44 @@ mod tests {
         );
         assert_eq!(doc.template_bindings[2].kind, TemplateBindingKind::Use);
         assert_eq!(doc.template_bindings[3].kind, TemplateBindingKind::Mixin);
+    }
+
+    #[test]
+    fn test_parse_type_alias_tags() {
+        let doc = parse_phpdoc(
+            "/**\n * @phpstan-type UserShape array{id: int, name?: string}\n * @psalm-type IdList = list<int>\n */",
+        );
+
+        assert_eq!(doc.type_aliases.len(), 2);
+        assert_eq!(doc.type_aliases[0].name, "UserShape");
+        let TypeInfo::ArrayShape(items) = &doc.type_aliases[0].type_info else {
+            panic!("expected array shape alias");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key.as_deref(), Some("id"));
+        assert_eq!(items[0].value, TypeInfo::Simple("int".to_string()));
+        assert_eq!(
+            doc.type_aliases[1].type_info,
+            TypeInfo::Generic {
+                base: "list".to_string(),
+                args: vec![TypeInfo::Simple("int".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_type_alias_import_tags() {
+        let doc = parse_phpdoc(
+            "/**\n * @phpstan-import-type UserShape from UserTypes\n * @psalm-import-type AddressShape from \\App\\Types as LocalAddress\n */",
+        );
+
+        assert_eq!(doc.type_alias_imports.len(), 2);
+        assert_eq!(doc.type_alias_imports[0].name, "UserShape");
+        assert_eq!(doc.type_alias_imports[0].source_alias, "UserShape");
+        assert_eq!(doc.type_alias_imports[0].source_type, "UserTypes");
+        assert_eq!(doc.type_alias_imports[1].name, "LocalAddress");
+        assert_eq!(doc.type_alias_imports[1].source_alias, "AddressShape");
+        assert_eq!(doc.type_alias_imports[1].source_type, "\\App\\Types");
     }
 
     #[test]
