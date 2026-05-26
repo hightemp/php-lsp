@@ -1800,6 +1800,25 @@ PR-052 ─→ PR-053
     `cargo fmt --all --check`,
     `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
+- [x] **REL-060** Bump project version to 0.6.0 *(done 2026-05-26)*
+  - Update all source-controlled package/version declarations for the Rust
+    server, VS Code extension, release metadata, and documentation references
+    from the current release version to `0.6.0`.
+  - Keep generated build/cache artifacts out of the version bump unless they are
+    intentionally source-controlled release metadata.
+  - Refresh lockfiles where package metadata requires it.
+  - Validate manifests/build metadata after the bump.
+  - Updated: `VERSION`, Rust workspace version and lockfile package entries,
+    VS Code extension `package.json`/`package-lock.json`, PRD status, and
+    production baseline current-version reference.
+  - Validation: no source-controlled project references to the previous release
+    version remain outside external stubs/ignored artifacts; cargo metadata
+    with `--locked` reports all `php-lsp-*` packages at `0.6.0`; npm package
+    metadata reports `0.6.0`;
+    `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `npm run lint`,
+    `npm run build`, `git diff --check`.
+
 - [ ] **IE-033** Shape-aware completion and definition
   - Array shape keys from PHPDoc/literal arrays should appear in `$arr['...']` completion.
   - Object shape properties should appear in `$obj->...` where modeled.
@@ -2101,6 +2120,6 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 - [x] **T-2026-05-24** Исправить completion и go-to-definition для переменных, объявленных output-аргументом `preg_match` (`$matches` в Symfony `DateValidator.php`).
 - [x] **T-2026-05-24** Разобраться и исправить отсутствие `README.md` в опубликованном VS Code extension package.
 - [x] **T-2026-05-24** Добавить в `README.md` badge с поддерживаемыми версиями PHP.
-- [x] **T-2026-05-24** Бампнуть версию до `0.5.5` и подготовить релиз с README в VSIX.
+- [x] **T-2026-05-24** Подготовить предыдущий релиз с README в VSIX.
 - [x] **T-2026-05-24** Исправить Marketplace badges в `README.md`, которые показывают `retired badge`.
 - [x] **T-2026-05-25** Актуализировать всю документацию после повторного прохода по проекту.

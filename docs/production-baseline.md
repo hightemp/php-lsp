@@ -1,7 +1,7 @@
 # Production Baseline
 
 Latest acceptance refresh: 2026-05-25
-Current project version: `0.5.5`
+Current project version: `0.6.0`
 Latest checked revision: `a9692c0` + working tree validation updates
 
 ## Initial Baseline
