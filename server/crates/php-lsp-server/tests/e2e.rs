@@ -1360,6 +1360,10 @@ class PortingRequest {
     public function getPortingProcess(): ?PortingProcess { return new PortingProcess(); }
 }
 
+class DonorProcess {
+    public function getCurrentPlace(): ?string { return 'si'; }
+}
+
 abstract class SoapHandler {
     protected function ensureProcessCreated(): ?PortingProcess { return new PortingProcess(); }
 }
@@ -3433,10 +3437,12 @@ function run(Repository $repo): void {
 }
 
 class CdbHandler extends BaseHandler {
-    public function handle(PortingRequest $portingRequest): void {
+    public function handle(PortingRequest $portingRequest, \stdClass $message, DonorProcess $donorProcess): void {
         $portingProcess = $portingRequest->getPortingProcess();
         $recipientProcess = $this->ensureProcessCreated();
         $recipientProcessUpdated = $this->updatePortingProcess();
+        $requestId = (string)($message->NPRequestId ?? '');
+        $currentPlace = (string)$donorProcess->getCurrentPlace();
     }
 }
 "#;
@@ -3483,6 +3489,15 @@ class CdbHandler extends BaseHandler {
     assert!(
         labels.iter().any(|label| label == ": bool"),
         "expected bool method-return hint, got: {:?}",
+        labels
+    );
+    assert!(
+        labels
+            .iter()
+            .filter(|label| label.as_str() == ": string")
+            .count()
+            >= 2,
+        "expected explicit string cast local variable hints, got: {:?}",
         labels
     );
     assert!(

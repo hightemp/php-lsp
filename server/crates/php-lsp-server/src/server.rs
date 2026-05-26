@@ -9864,6 +9864,7 @@ fn local_variable_inlay_type_from_expression(
         | "scoped_call_expression" => {
             local_variable_inlay_type_from_call_expression(ctx, expression)
         }
+        "cast_expression" => local_variable_inlay_type_from_cast_expression(ctx, expression),
         "variable_name" => local_variable_inlay_type_from_variable_expression(ctx, expression),
         _ => None,
     }
@@ -9915,6 +9916,35 @@ fn local_variable_inlay_type_from_call_expression(
         .or(symbol.parent_fqn.as_deref())
         .unwrap_or_default();
     local_variable_inlay_type_from_type_info(ctx, owner_fqn, &symbol.uri, return_type, true)
+}
+
+fn local_variable_inlay_type_from_cast_expression(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<LocalVariableInlayType> {
+    let cast_type = expression.child_by_field_name("type")?;
+    let display = local_variable_cast_type_display(node_text(ctx.source, cast_type))?;
+    Some(LocalVariableInlayType {
+        display,
+        target_fqn: None,
+    })
+}
+
+fn local_variable_cast_type_display(raw_type: &str) -> Option<String> {
+    let normalized = raw_type
+        .trim()
+        .trim_matches(|ch| ch == '(' || ch == ')')
+        .to_ascii_lowercase();
+    let display = match normalized.as_str() {
+        "array" => "array",
+        "binary" | "string" => "string",
+        "bool" | "boolean" => "bool",
+        "double" | "float" | "real" => "float",
+        "int" | "integer" => "int",
+        "object" => "object",
+        _ => return None,
+    };
+    Some(display.to_string())
 }
 
 fn local_variable_inlay_type_from_variable_expression(

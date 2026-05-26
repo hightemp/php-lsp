@@ -1773,6 +1773,33 @@ PR-052 ─→ PR-053
     `cargo test --all`, `cargo fmt --all --check`,
     `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
+- [x] **IE-032D** Inlay hints: explicit scalar casts and casted method returns *(done 2026-05-26)*
+  - Reproduce missing local variable type hints in
+    `/home/apanov/Projects/bdpn-ui/app/src/Soap/Inbound/Handler/CdbConfirmHandler.php`
+    for assignments such as `$requestId = (string)(...)`.
+  - Reproduce missing local variable type hints in
+    `/home/apanov/Projects/bdpn-ui/app/src/Soap/Inbound/Handler/CdbHandler.php`
+    for assignments such as `$currentPlace = (string)$donorProcess->getCurrentPlace();`.
+  - Infer useful local variable inlay hints from explicit PHP cast expressions
+    (`(string)`, `(int)`, `(float)`, `(bool)`, `(array)`, `(object)`) without
+    re-enabling noisy scalar literal hints like `$count = 1`.
+  - Keep hover behavior aligned with inlay hints because variable hover reuses
+    the same RHS expression inference path.
+  - Add e2e coverage for casted null-coalesce/stdClass property reads and
+    casted method calls.
+  - Implemented: local variable RHS inference recognizes `cast_expression` and
+    maps PHP cast aliases to stable hint labels (`string`, `int`, `float`,
+    `bool`, `array`, `object`).
+  - Implemented: explicit cast hints are allowed for scalar/object PHP casts
+    while scalar literal assignments remain suppressed.
+  - Regression: e2e covers `(string)($message->NPRequestId ?? '')` and
+    `(string)$donorProcess->getCurrentPlace()` producing local `: string`
+    inlay hints.
+  - Validation: `cargo test -p php-lsp-server --test e2e test_inlay_hints`,
+    `cargo test -p php-lsp-server --test e2e hover`, `cargo test --all`,
+    `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
+
 - [ ] **IE-033** Shape-aware completion and definition
   - Array shape keys from PHPDoc/literal arrays should appear in `$arr['...']` completion.
   - Object shape properties should appear in `$obj->...` where modeled.
