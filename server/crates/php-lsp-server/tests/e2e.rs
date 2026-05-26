@@ -1088,6 +1088,20 @@ async fn test_initialize_and_shutdown() {
         result
     );
     assert!(
+        code_action_kinds
+            .iter()
+            .any(|kind| kind.as_str() == Some("refactor.extract")),
+        "expected refactor.extract capability, got: {}",
+        result
+    );
+    assert!(
+        code_action_kinds
+            .iter()
+            .any(|kind| kind.as_str() == Some("refactor.inline")),
+        "expected refactor.inline capability, got: {}",
+        result
+    );
+    assert!(
         result
             .get("serverInfo")
             .and_then(|s| s.get("name"))
@@ -5603,6 +5617,297 @@ class ComplexPromotion
                 .is_some_and(|title| title.starts_with("Promote constructor parameter"))),
         "complex assignment should suppress promote action, got: {}",
         complex_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_extract_and_inline_refactors() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "8.2" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let refactor_code = r#"<?php
+namespace App;
+
+class RefactorDemo
+{
+    public function compute(int $a, int $b): int
+    {
+        return ($a + $b) * 2;
+    }
+
+    public function constants(): string
+    {
+        return 'active';
+    }
+
+    public function inline(int $a, int $b): int
+    {
+        $total = $a + $b;
+        return $total;
+    }
+
+    public function blocked(bool $flag): int
+    {
+        if ($flag) {
+            $value = 1;
+        }
+
+        return $value;
+    }
+}
+"#;
+    let uri = "file:///test/RefactorDemo.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, refactor_code))
+        .await
+        .unwrap();
+
+    let extract_variable_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            2,
+            uri,
+            ((7, 16), (7, 23)),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let extract_variable_result = extract_result(extract_variable_resp);
+    let extract_variable_action = extract_variable_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Extract variable `$extracted`")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected extract variable action, got: {}",
+                extract_variable_result
+            )
+        });
+    assert!(
+        extract_variable_action.get("edit").is_none(),
+        "extract variable should resolve lazily, got: {}",
+        extract_variable_action
+    );
+    let extract_variable_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(
+            3,
+            extract_variable_action.clone(),
+        ))
+        .await
+        .unwrap();
+    let extract_variable_resolved = extract_result(extract_variable_resolve);
+    let extract_variable_edits = extract_variable_resolved["edit"]["changes"][uri]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected extract variable edits, got: {}",
+                extract_variable_resolved
+            )
+        });
+    assert!(
+        extract_variable_edits
+            .iter()
+            .any(|edit| { edit["newText"].as_str() == Some("        $extracted = $a + $b;\n") })
+            && extract_variable_edits
+                .iter()
+                .any(|edit| edit["newText"].as_str() == Some("$extracted")),
+        "expected assignment insertion and expression replacement, got: {}",
+        extract_variable_resolved
+    );
+
+    let extract_constant_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            4,
+            uri,
+            ((12, 15), (12, 23)),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let extract_constant_result = extract_result(extract_constant_resp);
+    let extract_constant_action = extract_constant_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Extract constant `EXTRACTED`")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected extract constant action, got: {}",
+                extract_constant_result
+            )
+        });
+    let extract_constant_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(5, extract_constant_action))
+        .await
+        .unwrap();
+    let extract_constant_resolved = extract_result(extract_constant_resolve);
+    let extract_constant_edits = extract_constant_resolved["edit"]["changes"][uri]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected extract constant edits, got: {}",
+                extract_constant_resolved
+            )
+        });
+    assert!(
+        extract_constant_edits.iter().any(|edit| edit["newText"]
+            .as_str()
+            .is_some_and(|new_text| new_text.contains("private const EXTRACTED = 'active';")))
+            && extract_constant_edits
+                .iter()
+                .any(|edit| edit["newText"].as_str() == Some("self::EXTRACTED")),
+        "expected constant insertion and literal replacement, got: {}",
+        extract_constant_resolved
+    );
+
+    let inline_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            6,
+            uri,
+            ((18, 15), (18, 21)),
+            json!([]),
+            vec!["refactor.inline"],
+        ))
+        .await
+        .unwrap();
+    let inline_result = extract_result(inline_resp);
+    let inline_action = inline_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Inline variable `$total`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected inline variable action, got: {}", inline_result));
+    let inline_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(7, inline_action))
+        .await
+        .unwrap();
+    let inline_resolved = extract_result(inline_resolve);
+    let inline_edits = inline_resolved["edit"]["changes"][uri]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected inline edits, got: {}", inline_resolved));
+    assert!(
+        inline_edits
+            .iter()
+            .any(|edit| edit["newText"].as_str() == Some("($a + $b)"))
+            && inline_edits
+                .iter()
+                .any(|edit| edit["newText"].as_str() == Some("")),
+        "expected inline replacement and assignment deletion, got: {}",
+        inline_resolved
+    );
+
+    let blocked_inline_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            8,
+            uri,
+            ((27, 15), (27, 21)),
+            json!([]),
+            vec!["refactor.inline"],
+        ))
+        .await
+        .unwrap();
+    let blocked_inline_result = extract_result(blocked_inline_resp);
+    assert!(
+        !blocked_inline_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(
+                |action| action.get("title").and_then(|value| value.as_str())
+                    == Some("Inline variable `$value`")
+            ),
+        "branch-crossing inline should be suppressed, got: {}",
+        blocked_inline_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(uri, 2, refactor_code))
+        .await
+        .unwrap();
+    let stale_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(9, extract_variable_action))
+        .await
+        .unwrap();
+    let stale_resolved = extract_result(stale_resolve);
+    assert_eq!(
+        stale_resolved["edit"]["changes"]
+            .as_object()
+            .map(|map| map.len()),
+        Some(0),
+        "stale extract action should resolve to no-op edit, got: {}",
+        stale_resolved
     );
 
     service

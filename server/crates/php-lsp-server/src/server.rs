@@ -2853,8 +2853,17 @@ enum ImportKind {
 }
 
 fn code_action_kind_allowed(only: Option<&Vec<CodeActionKind>>, kind: &CodeActionKind) -> bool {
-    only.map(|kinds| kinds.is_empty() || kinds.iter().any(|k| k == kind))
-        .unwrap_or(true)
+    only.map(|kinds| {
+        kinds.is_empty()
+            || kinds.iter().any(|requested| {
+                requested == kind
+                    || kind
+                        .as_str()
+                        .strip_prefix(requested.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            })
+    })
+    .unwrap_or(true)
 }
 
 fn unknown_symbol_from_diagnostic(message: &str) -> Option<(ImportKind, String)> {
@@ -3514,6 +3523,9 @@ enum CodeActionDataKind {
     ChangeVisibility,
     PromoteConstructorParameter,
     UpdatePhpDoc,
+    ExtractVariable,
+    ExtractConstant,
+    InlineVariable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3553,6 +3565,15 @@ enum CodeActionDataExtra {
     },
     UpdatePhpDoc {
         symbol_fqn: String,
+    },
+    ExtractVariable {
+        variable_name: String,
+    },
+    ExtractConstant {
+        constant_name: String,
+    },
+    InlineVariable {
+        variable_name: String,
     },
 }
 
@@ -5919,6 +5940,839 @@ fn promote_constructor_parameter_edit(
         document_changes: None,
         change_annotations: None,
     })
+}
+
+fn byte_offsets_for_range(source: &str, range: (u32, u32, u32, u32)) -> Option<(usize, usize)> {
+    let start = byte_offset_for_line_col(source, range.0, range.1)?;
+    let end = byte_offset_for_line_col(source, range.2, range.3)?;
+    Some((start.min(end), end.max(start)))
+}
+
+fn trimmed_byte_offsets(source: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let text = source.get(start..end)?;
+    let leading = text.len().saturating_sub(text.trim_start().len());
+    let trailing = text.len().saturating_sub(text.trim_end().len());
+    let trimmed_start = start + leading;
+    let trimmed_end = end.saturating_sub(trailing);
+    (trimmed_start < trimmed_end).then_some((trimmed_start, trimmed_end))
+}
+
+fn selected_named_node_exact<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    source: &str,
+    range: (u32, u32, u32, u32),
+) -> Option<tree_sitter::Node<'tree>> {
+    let (start, end) = byte_offsets_for_range(source, range)?;
+    let (start, end) = trimmed_byte_offsets(source, start, end)?;
+    let root = tree.root_node();
+    let mut node = root.descendant_for_byte_range(start, end)?;
+
+    while !node.is_named() {
+        node = node.parent()?;
+    }
+
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.is_named() && candidate.start_byte() == start && candidate.end_byte() == end {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+
+    None
+}
+
+fn node_contains_node(outer: tree_sitter::Node, inner: tree_sitter::Node) -> bool {
+    outer.start_byte() <= inner.start_byte() && outer.end_byte() >= inner.end_byte()
+}
+
+fn is_refactor_scope_boundary(node: tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function"
+            | "anonymous_function_creation_expression"
+            | "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+    )
+}
+
+fn nearest_local_refactor_scope<'tree>(
+    mut node: tree_sitter::Node<'tree>,
+) -> Option<tree_sitter::Node<'tree>> {
+    loop {
+        if matches!(
+            node.kind(),
+            "method_declaration"
+                | "function_definition"
+                | "arrow_function"
+                | "anonymous_function"
+                | "anonymous_function_creation_expression"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn collect_variable_names_for_refactor(
+    node: tree_sitter::Node,
+    scope_id: usize,
+    source: &str,
+    names: &mut HashSet<String>,
+) {
+    if node.id() != scope_id && is_refactor_scope_boundary(node) {
+        return;
+    }
+
+    if node.kind() == "variable_name" {
+        let text = source.get(node.byte_range()).unwrap_or("").trim();
+        if let Some(name) = text.strip_prefix('$') {
+            names.insert(name.to_string());
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_variable_names_for_refactor(child, scope_id, source, names);
+    }
+}
+
+fn unique_local_variable_name(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    selected_node: tree_sitter::Node,
+) -> String {
+    let root = tree.root_node();
+    let scope = nearest_local_refactor_scope(selected_node).unwrap_or(root);
+    let mut names = HashSet::new();
+    collect_variable_names_for_refactor(scope, scope.id(), source, &mut names);
+
+    let base = "extracted";
+    if !names.contains(base) {
+        return base.to_string();
+    }
+
+    for suffix in 2.. {
+        let candidate = format!("{}{}", base, suffix);
+        if !names.contains(&candidate) {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded suffix search should always find a variable name")
+}
+
+fn requested_variable_name(raw: &str) -> Option<String> {
+    let normalized = normalize_variable_new_name(raw)?;
+    Some(normalized.trim_start_matches('$').to_string())
+}
+
+fn is_php_statement_node(node: tree_sitter::Node) -> bool {
+    node.kind().ends_with("_statement")
+}
+
+fn enclosing_statement_for_refactor<'tree>(
+    mut node: tree_sitter::Node<'tree>,
+) -> Option<tree_sitter::Node<'tree>> {
+    loop {
+        if is_php_statement_node(node) {
+            return Some(node);
+        }
+        if node.kind() == "program" {
+            return None;
+        }
+        node = node.parent()?;
+    }
+}
+
+fn statement_container_id(statement: tree_sitter::Node) -> Option<usize> {
+    let parent = statement.parent()?;
+    matches!(parent.kind(), "compound_statement" | "program").then_some(parent.id())
+}
+
+fn is_assignment_left_context(node: tree_sitter::Node) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        let Some(parent) = candidate.parent() else {
+            return false;
+        };
+        if matches!(
+            parent.kind(),
+            "assignment_expression" | "by_ref_assignment_expression"
+        ) {
+            return parent
+                .child_by_field_name("left")
+                .is_some_and(|left| node_contains_node(left, node));
+        }
+        if is_php_statement_node(parent) || is_refactor_scope_boundary(parent) {
+            return false;
+        }
+        current = Some(parent);
+    }
+    false
+}
+
+fn is_extractable_expression_node(node: tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "array_creation_expression"
+            | "binary_expression"
+            | "boolean"
+            | "cast_expression"
+            | "class_constant_access_expression"
+            | "conditional_expression"
+            | "encapsed_string"
+            | "false"
+            | "float"
+            | "function_call_expression"
+            | "integer"
+            | "member_access_expression"
+            | "member_call_expression"
+            | "name"
+            | "null"
+            | "object_creation_expression"
+            | "parenthesized_expression"
+            | "qualified_name"
+            | "scoped_call_expression"
+            | "scoped_property_access_expression"
+            | "string"
+            | "subscript_expression"
+            | "true"
+            | "unary_op_expression"
+            | "variable_name"
+    )
+}
+
+fn selected_extract_expression<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    source: &str,
+    range: (u32, u32, u32, u32),
+) -> Option<tree_sitter::Node<'tree>> {
+    let node = selected_named_node_exact(tree, source, range)?;
+    if is_extractable_expression_node(node) && !is_assignment_left_context(node) {
+        Some(node)
+    } else {
+        None
+    }
+}
+
+struct ExtractVariablePlan {
+    variable_name: String,
+    assignment_insert: usize,
+    assignment_text: String,
+    expression_start: usize,
+    expression_end: usize,
+}
+
+fn extract_variable_plan(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    range: (u32, u32, u32, u32),
+    variable_name: Option<&str>,
+) -> Option<ExtractVariablePlan> {
+    let expression = selected_extract_expression(tree, source, range)?;
+    let statement = enclosing_statement_for_refactor(expression)?;
+    statement_container_id(statement)?;
+
+    let expression_text = source
+        .get(expression.start_byte()..expression.end_byte())?
+        .trim();
+    if expression_text.is_empty() || expression_text.contains(['\n', '\r']) {
+        return None;
+    }
+
+    let variable_name = match variable_name {
+        Some(name) => requested_variable_name(name)?,
+        None => unique_local_variable_name(tree, source, expression),
+    };
+    let assignment_insert = line_start_offset(source, statement.start_byte());
+    let indent = line_indent_at_offset(source, statement.start_byte());
+    let assignment_text = format!("{}${} = {};\n", indent, variable_name, expression_text);
+
+    Some(ExtractVariablePlan {
+        variable_name,
+        assignment_insert,
+        assignment_text,
+        expression_start: expression.start_byte(),
+        expression_end: expression.end_byte(),
+    })
+}
+
+fn build_extract_variable_action(
+    uri: Uri,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Option<CodeActionOrCommand> {
+    let range = lsp_range_to_byte_range(source, request_range);
+    let plan = extract_variable_plan(tree, source, range, None)?;
+    let data = serde_json::to_value(CodeActionData {
+        action_kind: CodeActionDataKind::ExtractVariable,
+        uri: uri.as_str().to_string(),
+        range: request_range,
+        document_version,
+        extra: CodeActionDataExtra::ExtractVariable {
+            variable_name: plan.variable_name.clone(),
+        },
+    })
+    .ok()?;
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Extract variable `${}`", plan.variable_name),
+        kind: Some(CodeActionKind::REFACTOR_EXTRACT),
+        diagnostics: None,
+        edit: None,
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: Some(data),
+    }))
+}
+
+fn workspace_edit_from_text_edits(uri: Uri, mut edits: Vec<TextEdit>) -> WorkspaceEdit {
+    edits.sort_by(|left, right| {
+        (right.range.start.line, right.range.start.character)
+            .cmp(&(left.range.start.line, left.range.start.character))
+    });
+
+    let mut changes = HashMap::new();
+    changes.insert(uri, edits);
+    WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    }
+}
+
+fn extract_variable_edit(
+    uri: Uri,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    range: (u32, u32, u32, u32),
+    variable_name: &str,
+) -> Option<WorkspaceEdit> {
+    let plan = extract_variable_plan(tree, source, range, Some(variable_name))?;
+    Some(workspace_edit_from_text_edits(
+        uri,
+        vec![
+            TextEdit {
+                range: lsp_range_for_byte_offsets(
+                    source,
+                    plan.assignment_insert,
+                    plan.assignment_insert,
+                ),
+                new_text: plan.assignment_text,
+            },
+            TextEdit {
+                range: lsp_range_for_byte_offsets(
+                    source,
+                    plan.expression_start,
+                    plan.expression_end,
+                ),
+                new_text: format!("${}", plan.variable_name),
+            },
+        ],
+    ))
+}
+
+fn class_symbol_at_range(
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&php_lsp_types::SymbolInfo> {
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Class)
+        .filter(|sym| byte_range_contains(sym.range, range))
+        .min_by_key(|sym| {
+            (
+                sym.range.2.saturating_sub(sym.range.0),
+                sym.range.3.saturating_sub(sym.range.1),
+            )
+        })
+}
+
+fn direct_class_constant_name_exists(
+    file_symbols: &php_lsp_types::FileSymbols,
+    class_fqn: &str,
+    constant_name: &str,
+) -> bool {
+    file_symbols.symbols.iter().any(|sym| {
+        sym.kind == php_lsp_types::PhpSymbolKind::ClassConstant
+            && sym.parent_fqn.as_deref() == Some(class_fqn)
+            && sym.name.eq_ignore_ascii_case(constant_name)
+    })
+}
+
+fn unique_class_constant_name(
+    file_symbols: &php_lsp_types::FileSymbols,
+    class_fqn: &str,
+) -> String {
+    let base = "EXTRACTED";
+    if !direct_class_constant_name_exists(file_symbols, class_fqn, base) {
+        return base.to_string();
+    }
+
+    for suffix in 2.. {
+        let candidate = format!("{}{}", base, suffix);
+        if !direct_class_constant_name_exists(file_symbols, class_fqn, &candidate) {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded suffix search should always find a constant name")
+}
+
+fn is_numeric_literal_text(text: &str) -> bool {
+    let normalized = text.trim().trim_start_matches(['+', '-']).replace('_', "");
+    !normalized.is_empty()
+        && (normalized.parse::<i64>().is_ok() || normalized.parse::<f64>().is_ok())
+}
+
+fn is_extract_constant_literal_node(source: &str, node: tree_sitter::Node) -> bool {
+    let raw = source.get(node.byte_range()).unwrap_or("").trim();
+    let lower = raw.to_ascii_lowercase();
+    matches!(lower.as_str(), "true" | "false" | "null")
+        || is_numeric_literal_text(raw)
+        || is_static_string_literal_node(node)
+}
+
+struct ExtractConstantPlan {
+    constant_name: String,
+    insert_position: Position,
+    insert_text: String,
+    expression_start: usize,
+    expression_end: usize,
+}
+
+fn valid_constant_name(raw: &str) -> Option<String> {
+    let name = raw.trim().to_ascii_uppercase();
+    if name.is_empty() {
+        return None;
+    }
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(name)
+}
+
+fn extract_constant_plan(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+    constant_name: Option<&str>,
+) -> Option<ExtractConstantPlan> {
+    let literal = selected_named_node_exact(tree, source, range)?;
+    if !is_extract_constant_literal_node(source, literal) {
+        return None;
+    }
+    let class_sym = class_symbol_at_range(file_symbols, node_range_node(literal))?;
+    let constant_name = match constant_name {
+        Some(name) => valid_constant_name(name)?,
+        None => unique_class_constant_name(file_symbols, &class_sym.fqn),
+    };
+    if direct_class_constant_name_exists(file_symbols, &class_sym.fqn, &constant_name) {
+        return None;
+    }
+
+    let literal_text = source.get(literal.byte_range())?.trim();
+    if literal_text.contains(['\n', '\r']) {
+        return None;
+    }
+
+    let insertion = class_method_insertion(source, class_sym)?;
+    let mut insert_text = String::new();
+    if insertion.needs_leading_blank {
+        insert_text.push('\n');
+    }
+    insert_text.push_str(&insertion.method_indent);
+    insert_text.push_str("private const ");
+    insert_text.push_str(&constant_name);
+    insert_text.push_str(" = ");
+    insert_text.push_str(literal_text);
+    insert_text.push_str(";\n");
+
+    Some(ExtractConstantPlan {
+        constant_name,
+        insert_position: insertion.position,
+        insert_text,
+        expression_start: literal.start_byte(),
+        expression_end: literal.end_byte(),
+    })
+}
+
+fn build_extract_constant_action(
+    uri: Uri,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Option<CodeActionOrCommand> {
+    let range = lsp_range_to_byte_range(source, request_range);
+    let plan = extract_constant_plan(tree, source, file_symbols, range, None)?;
+    let data = serde_json::to_value(CodeActionData {
+        action_kind: CodeActionDataKind::ExtractConstant,
+        uri: uri.as_str().to_string(),
+        range: request_range,
+        document_version,
+        extra: CodeActionDataExtra::ExtractConstant {
+            constant_name: plan.constant_name.clone(),
+        },
+    })
+    .ok()?;
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Extract constant `{}`", plan.constant_name),
+        kind: Some(CodeActionKind::REFACTOR_EXTRACT),
+        diagnostics: None,
+        edit: None,
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: Some(data),
+    }))
+}
+
+fn extract_constant_edit(
+    uri: Uri,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+    constant_name: &str,
+) -> Option<WorkspaceEdit> {
+    let plan = extract_constant_plan(tree, source, file_symbols, range, Some(constant_name))?;
+    Some(workspace_edit_from_text_edits(
+        uri,
+        vec![
+            TextEdit {
+                range: Range {
+                    start: plan.insert_position,
+                    end: plan.insert_position,
+                },
+                new_text: plan.insert_text,
+            },
+            TextEdit {
+                range: lsp_range_for_byte_offsets(
+                    source,
+                    plan.expression_start,
+                    plan.expression_end,
+                ),
+                new_text: format!("self::{}", plan.constant_name),
+            },
+        ],
+    ))
+}
+
+fn variable_name_node_at_range<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    source: &str,
+    range: (u32, u32, u32, u32),
+) -> Option<tree_sitter::Node<'tree>> {
+    let (start, end) = byte_offsets_for_range(source, range)?;
+    let root = tree.root_node();
+    let mut node = if start == end {
+        let point = tree_sitter::Point::new(range.0 as usize, range.1 as usize);
+        root.descendant_for_point_range(point, point)?
+    } else {
+        root.descendant_for_byte_range(start, end)?
+    };
+
+    while !node.is_named() {
+        node = node.parent()?;
+    }
+
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "variable_name" {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn variable_text_for_node(source: &str, node: tree_sitter::Node) -> Option<String> {
+    let text = source.get(node.byte_range())?.trim();
+    text.starts_with('$').then(|| text.to_string())
+}
+
+struct InlineAssignment {
+    statement_start: usize,
+    statement_end: usize,
+    statement_container_id: usize,
+    rhs_start: usize,
+    rhs_end: usize,
+}
+
+struct InlineRead {
+    start: usize,
+    end: usize,
+    statement_start: usize,
+    statement_container_id: usize,
+}
+
+fn simple_inline_assignment_from_statement(
+    statement: tree_sitter::Node,
+    source: &str,
+    variable_name: &str,
+) -> Option<InlineAssignment> {
+    if statement.kind() != "expression_statement" {
+        return None;
+    }
+    let expression = statement.named_child(0)?;
+    if expression.kind() != "assignment_expression" {
+        return None;
+    }
+    let left = expression.child_by_field_name("left")?;
+    let right = expression.child_by_field_name("right")?;
+    if left.kind() != "variable_name" || variable_text_for_node(source, left)? != variable_name {
+        return None;
+    }
+    let operator_text = source.get(left.end_byte()..right.start_byte())?.trim();
+    if operator_text != "=" {
+        return None;
+    }
+
+    Some(InlineAssignment {
+        statement_start: statement.start_byte(),
+        statement_end: statement.end_byte(),
+        statement_container_id: statement_container_id(statement)?,
+        rhs_start: right.start_byte(),
+        rhs_end: right.end_byte(),
+    })
+}
+
+fn collect_inline_assignments(
+    node: tree_sitter::Node,
+    scope_id: usize,
+    source: &str,
+    variable_name: &str,
+    assignments: &mut Vec<InlineAssignment>,
+) {
+    if node.id() != scope_id && is_refactor_scope_boundary(node) {
+        return;
+    }
+    if let Some(assignment) = simple_inline_assignment_from_statement(node, source, variable_name) {
+        assignments.push(assignment);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_inline_assignments(child, scope_id, source, variable_name, assignments);
+    }
+}
+
+fn collect_inline_reads(
+    node: tree_sitter::Node,
+    scope_id: usize,
+    source: &str,
+    variable_name: &str,
+    reads: &mut Vec<InlineRead>,
+) {
+    if node.id() != scope_id && is_refactor_scope_boundary(node) {
+        return;
+    }
+
+    if node.kind() == "variable_name"
+        && variable_text_for_node(source, node).as_deref() == Some(variable_name)
+        && !is_assignment_left_context(node)
+    {
+        if let Some(statement) = enclosing_statement_for_refactor(node) {
+            if let Some(container_id) = statement_container_id(statement) {
+                reads.push(InlineRead {
+                    start: node.start_byte(),
+                    end: node.end_byte(),
+                    statement_start: statement.start_byte(),
+                    statement_container_id: container_id,
+                });
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_inline_reads(child, scope_id, source, variable_name, reads);
+    }
+}
+
+fn inline_replacement_is_atomic(node: tree_sitter::Node, source: &str) -> bool {
+    let raw = source.get(node.byte_range()).unwrap_or("").trim();
+    let lower = raw.to_ascii_lowercase();
+    matches!(lower.as_str(), "true" | "false" | "null")
+        || is_numeric_literal_text(raw)
+        || matches!(
+            node.kind(),
+            "array_creation_expression"
+                | "boolean"
+                | "class_constant_access_expression"
+                | "encapsed_string"
+                | "float"
+                | "integer"
+                | "member_access_expression"
+                | "name"
+                | "null"
+                | "parenthesized_expression"
+                | "qualified_name"
+                | "scoped_property_access_expression"
+                | "string"
+                | "subscript_expression"
+                | "variable_name"
+        )
+}
+
+fn inline_replacement_text_for_node(source: &str, rhs: tree_sitter::Node) -> Option<String> {
+    let raw = source.get(rhs.byte_range())?.trim();
+    if raw.is_empty() || raw.contains(['\n', '\r']) {
+        return None;
+    }
+    if inline_replacement_is_atomic(rhs, source) {
+        Some(raw.to_string())
+    } else {
+        Some(format!("({})", raw))
+    }
+}
+
+struct InlineVariablePlan {
+    variable_name: String,
+    assignment_delete: (usize, usize),
+    usage_replace: (usize, usize, String),
+}
+
+fn inline_variable_plan(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    range: (u32, u32, u32, u32),
+    variable_name: Option<&str>,
+) -> Option<InlineVariablePlan> {
+    let selected_variable = variable_name_node_at_range(tree, source, range)?;
+    let selected_name = variable_text_for_node(source, selected_variable)?;
+    if !is_renameable_variable(&selected_name) {
+        return None;
+    }
+    if let Some(requested) = variable_name {
+        let requested = normalize_variable_new_name(requested)?;
+        if requested != selected_name {
+            return None;
+        }
+    }
+
+    let root = tree.root_node();
+    let scope = nearest_local_refactor_scope(selected_variable).unwrap_or(root);
+    let mut assignments = Vec::new();
+    collect_inline_assignments(scope, scope.id(), source, &selected_name, &mut assignments);
+    if assignments.len() != 1 {
+        return None;
+    }
+
+    let mut reads = Vec::new();
+    collect_inline_reads(scope, scope.id(), source, &selected_name, &mut reads);
+    if reads.len() != 1 {
+        return None;
+    }
+
+    let assignment = assignments.into_iter().next()?;
+    let read = reads.into_iter().next()?;
+    if assignment.statement_container_id != read.statement_container_id
+        || assignment.statement_end > read.statement_start
+    {
+        return None;
+    }
+
+    let rhs_node = tree
+        .root_node()
+        .descendant_for_byte_range(assignment.rhs_start, assignment.rhs_end)?;
+    if source
+        .get(assignment.rhs_start..assignment.rhs_end)?
+        .contains(&selected_name)
+    {
+        return None;
+    }
+    let replacement = inline_replacement_text_for_node(source, rhs_node)?;
+    let assignment_delete =
+        line_full_span(source, assignment.statement_start, assignment.statement_end);
+
+    Some(InlineVariablePlan {
+        variable_name: selected_name,
+        assignment_delete,
+        usage_replace: (read.start, read.end, replacement),
+    })
+}
+
+fn build_inline_variable_action(
+    uri: Uri,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Option<CodeActionOrCommand> {
+    let range = lsp_range_to_byte_range(source, request_range);
+    let plan = inline_variable_plan(tree, source, range, None)?;
+    let data = serde_json::to_value(CodeActionData {
+        action_kind: CodeActionDataKind::InlineVariable,
+        uri: uri.as_str().to_string(),
+        range: request_range,
+        document_version,
+        extra: CodeActionDataExtra::InlineVariable {
+            variable_name: plan.variable_name.clone(),
+        },
+    })
+    .ok()?;
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Inline variable `{}`", plan.variable_name),
+        kind: Some(CodeActionKind::REFACTOR_INLINE),
+        diagnostics: None,
+        edit: None,
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: Some(data),
+    }))
+}
+
+fn inline_variable_edit(
+    uri: Uri,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    range: (u32, u32, u32, u32),
+    variable_name: &str,
+) -> Option<WorkspaceEdit> {
+    let plan = inline_variable_plan(tree, source, range, Some(variable_name))?;
+    Some(workspace_edit_from_text_edits(
+        uri,
+        vec![
+            TextEdit {
+                range: lsp_range_for_byte_offsets(
+                    source,
+                    plan.usage_replace.0,
+                    plan.usage_replace.1,
+                ),
+                new_text: plan.usage_replace.2,
+            },
+            TextEdit {
+                range: lsp_range_for_byte_offsets(
+                    source,
+                    plan.assignment_delete.0,
+                    plan.assignment_delete.1,
+                ),
+                new_text: String::new(),
+            },
+        ],
+    ))
 }
 
 fn callable_symbol_at_range(
@@ -13769,6 +14623,8 @@ impl LanguageServer for PhpLspBackend {
                         code_action_kinds: Some(vec![
                             CodeActionKind::QUICKFIX,
                             CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                            CodeActionKind::REFACTOR_EXTRACT,
+                            CodeActionKind::REFACTOR_INLINE,
                             CodeActionKind::REFACTOR_REWRITE,
                         ]),
                         resolve_provider: Some(true),
@@ -16574,6 +17430,14 @@ impl LanguageServer for PhpLspBackend {
             params.context.only.as_ref(),
             &CodeActionKind::REFACTOR_REWRITE,
         );
+        let wants_refactor_extract = code_action_kind_allowed(
+            params.context.only.as_ref(),
+            &CodeActionKind::REFACTOR_EXTRACT,
+        );
+        let wants_refactor_inline = code_action_kind_allowed(
+            params.context.only.as_ref(),
+            &CodeActionKind::REFACTOR_INLINE,
+        );
         let wants_implement_missing_methods =
             code_action_kind_allowed(params.context.only.as_ref(), &CodeActionKind::QUICKFIX);
 
@@ -16581,6 +17445,8 @@ impl LanguageServer for PhpLspBackend {
             && !wants_organize_imports
             && !wants_add_return_type
             && !wants_generate_members
+            && !wants_refactor_extract
+            && !wants_refactor_inline
             && !wants_implement_missing_methods
         {
             return Ok(Some(vec![]));
@@ -16596,6 +17462,8 @@ impl LanguageServer for PhpLspBackend {
             file_symbols,
             add_return_type_actions,
             generate_member_actions,
+            refactor_extract_actions,
+            refactor_inline_actions,
             implement_missing_methods_actions,
         ) = {
             let parser = match self.open_files.get(&uri_str) {
@@ -16706,6 +17574,44 @@ impl LanguageServer for PhpLspBackend {
             } else {
                 Vec::new()
             };
+            let refactor_extract_actions = if wants_refactor_extract {
+                let mut actions = Vec::new();
+                if let Some(action) = build_extract_variable_action(
+                    uri.clone(),
+                    tree,
+                    &source,
+                    params.range,
+                    document_version,
+                ) {
+                    actions.push(action);
+                }
+                if let Some(action) = build_extract_constant_action(
+                    uri.clone(),
+                    tree,
+                    &source,
+                    &file_symbols,
+                    params.range,
+                    document_version,
+                ) {
+                    actions.push(action);
+                }
+                actions
+            } else {
+                Vec::new()
+            };
+            let refactor_inline_actions = if wants_refactor_inline {
+                build_inline_variable_action(
+                    uri.clone(),
+                    tree,
+                    &source,
+                    params.range,
+                    document_version,
+                )
+                .into_iter()
+                .collect()
+            } else {
+                Vec::new()
+            };
             let implement_missing_methods_actions = if wants_implement_missing_methods {
                 let range = lsp_range_to_byte_range(&source, params.range);
                 concrete_class_symbol_at_range(&file_symbols, range)
@@ -16730,6 +17636,8 @@ impl LanguageServer for PhpLspBackend {
                 file_symbols,
                 add_return_type_actions,
                 generate_member_actions,
+                refactor_extract_actions,
+                refactor_inline_actions,
                 implement_missing_methods_actions,
             )
         };
@@ -16737,6 +17645,8 @@ impl LanguageServer for PhpLspBackend {
         let mut actions = Vec::new();
         actions.extend(add_return_type_actions);
         actions.extend(generate_member_actions);
+        actions.extend(refactor_extract_actions);
+        actions.extend(refactor_inline_actions);
         actions.extend(implement_missing_methods_actions);
 
         if wants_organize_imports {
@@ -16867,7 +17777,7 @@ impl LanguageServer for PhpLspBackend {
         let CodeActionData {
             action_kind,
             uri,
-            range: _requested_range,
+            range: requested_range,
             document_version,
             extra,
         } = data;
@@ -17243,6 +18153,101 @@ impl LanguageServer for PhpLspBackend {
                 };
 
                 params.edit = update_phpdoc_from_signature_edit(uri_value, &source, symbol)
+                    .or_else(|| Some(empty_workspace_edit()));
+            }
+            (
+                CodeActionDataKind::ExtractVariable,
+                CodeActionDataExtra::ExtractVariable { variable_name },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let Some(parser) = self.open_files.get(&uri) else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+                let source = parser.source();
+                let Some(tree) = parser.tree() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+                let range = lsp_range_to_byte_range(&source, requested_range);
+                params.edit =
+                    extract_variable_edit(uri_value, tree, &source, range, &variable_name)
+                        .or_else(|| Some(empty_workspace_edit()));
+            }
+            (
+                CodeActionDataKind::ExtractConstant,
+                CodeActionDataExtra::ExtractConstant { constant_name },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let Some(parser) = self.open_files.get(&uri) else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+                let source = parser.source();
+                let Some(tree) = parser.tree() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+                let file_symbols = self
+                    .index
+                    .file_symbols
+                    .get(&uri)
+                    .map(|entry| entry.value().clone())
+                    .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri));
+                let range = lsp_range_to_byte_range(&source, requested_range);
+                params.edit = extract_constant_edit(
+                    uri_value,
+                    tree,
+                    &source,
+                    &file_symbols,
+                    range,
+                    &constant_name,
+                )
+                .or_else(|| Some(empty_workspace_edit()));
+            }
+            (
+                CodeActionDataKind::InlineVariable,
+                CodeActionDataExtra::InlineVariable { variable_name },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let Some(parser) = self.open_files.get(&uri) else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+                let source = parser.source();
+                let Some(tree) = parser.tree() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+                let range = lsp_range_to_byte_range(&source, requested_range);
+                params.edit = inline_variable_edit(uri_value, tree, &source, range, &variable_name)
                     .or_else(|| Some(empty_workspace_edit()));
             }
             _ => {

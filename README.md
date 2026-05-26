@@ -60,6 +60,8 @@ phpstorm-stubs support.
 - Source action to organize imports.
 - Refactor action to add return types from PHPDoc when supported by the target
   PHP version.
+- Refactor actions to extract selected expressions to local variables, extract
+  class-scope literals to constants, and inline simple local variables.
 - Document formatting, range formatting, and on-type formatting through
   external formatters (`php-cs-fixer`, `phpcbf`, or a custom command).
 

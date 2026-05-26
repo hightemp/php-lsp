@@ -1437,7 +1437,7 @@ PR-052 ─→ PR-053
   - Regression: e2e covers return description preservation, generic precision preservation, analyzer-specific tag preservation, by-ref token correction, promoted constructor params, redundant docblock removal, and no action for already-current PHPDoc.
   - Validation: `cargo fmt --all --check`, targeted IE-013 e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
-- [ ] **IE-014** Refactor actions: extract variable, extract constant, inline variable
+- [x] **IE-014** Refactor actions: extract variable, extract constant, inline variable *(done 2026-05-26)*
   - Использовать `codeAction/resolve`, потому что selection analysis может быть дорогим.
   - Extract variable:
     - selection expression only
@@ -1451,6 +1451,14 @@ PR-052 ─→ PR-053
     - local variable with single assignment and safe usage count
     - не инлайнить across branches/closures.
   - Добавить prepare/refusal reasons в action title/detail где LSP позволяет.
+  - Implemented: `refactor.extract` advertises lazy Extract variable and Extract constant actions.
+  - Implemented: Extract variable accepts exact selected expressions, inserts `$extracted = ...;` before the enclosing statement, and replaces the selected expression.
+  - Implemented: Extract constant accepts class-scope scalar literals, inserts `private const EXTRACTED = ...;`, and replaces the literal with `self::EXTRACTED`.
+  - Implemented: `refactor.inline` advertises lazy Inline variable for local variables with one simple assignment and one same-block read.
+  - Guard: inline suppresses branch/closure-crossing cases, multiple assignments/reads, compound assignments, self-referential RHS, and stale document versions.
+  - Docs: `README.md` and `docs/lsp-features.md` document extract/inline refactors.
+  - Regression: e2e covers extract variable, extract constant, inline variable, branch-crossing refusal, stale resolve no-op, and advertised `refactor.extract`/`refactor.inline` capabilities.
+  - Validation: `cargo fmt --all --check`, targeted IE-014 e2e, targeted code-action e2e tests, initialize capability e2e, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
 - [ ] **IE-015** Code actions для diagnostics и external analyzer findings
   - Remove unused import как explicit quickfix рядом с diagnostic.
