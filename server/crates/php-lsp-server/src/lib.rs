@@ -4,6 +4,7 @@
 
 pub mod analyze;
 pub mod config;
+pub mod fix;
 mod server;
 
 pub use server::PhpLspBackend;

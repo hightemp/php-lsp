@@ -3290,7 +3290,7 @@ fn import_is_used(source_without_imports: &str, import: &OrganizableImport) -> b
     }
 }
 
-fn build_organize_imports_edit(
+pub(crate) fn build_organize_imports_edit(
     uri: Uri,
     source: &str,
     file_symbols: &php_lsp_types::FileSymbols,
@@ -3487,7 +3487,7 @@ fn return_type_hint_is_supported(
     }
 }
 
-fn return_type_hint(
+pub(crate) fn return_type_hint(
     type_info: &php_lsp_types::TypeInfo,
     php_version: PhpVersion,
 ) -> Option<String> {
@@ -8995,7 +8995,7 @@ fn diagnostic_external_analyzer(diagnostic: &Diagnostic) -> Option<ExternalAnaly
     }
 }
 
-fn is_unused_import_diagnostic(diagnostic: &Diagnostic) -> bool {
+pub(crate) fn is_unused_import_diagnostic(diagnostic: &Diagnostic) -> bool {
     diagnostic.source.as_deref() == Some("php-lsp")
         && (diagnostic_code_str(diagnostic) == Some("php-lsp.unusedImport")
             || diagnostic.message.starts_with("Unused import: "))

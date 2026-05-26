@@ -51,6 +51,20 @@ the language server. It uses PHP version, diagnostic mode/severity, Composer
 discovery, and include/exclude path settings when building its command-line
 diagnostic report.
 
+## Fix From CLI
+
+```bash
+php-lsp fix [PATH] --dry-run --project-root <DIR> --rule unused-imports --format json
+```
+
+The `fix` command uses the same configuration loading path as `analyze`. In
+dry-run mode it reports safe native edits without writing files. Without
+`--rule`, it previews unused-import cleanup and PHPDoc-derived native return
+types that are valid for the configured PHP version. `--rule` can be repeated
+with `unused-imports`, `organize-imports`, and `add-return-type`.
+
+`php-lsp fix` does not run configured project formatters.
+
 ## Example
 
 ```toml

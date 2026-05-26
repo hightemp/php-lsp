@@ -124,6 +124,10 @@ phpstorm-stubs support.
   `--format <table|json|github>`.
 - Analyze output is available as a local table, stable JSON for scripts, or
   GitHub workflow annotations.
+- `php-lsp fix [PATH] --dry-run` previews safe native fixes without writing
+  files.
+- `fix` supports repeated `--rule` values for `unused-imports`,
+  `organize-imports`, and `add-return-type`, plus `--format <table|json>`.
 
 ### Workspace Support
 
@@ -235,10 +239,11 @@ Example external formatting setup:
 
 ```bash
 php-lsp analyze [PATH] --project-root <DIR> --severity warning --format table
+php-lsp fix [PATH] --dry-run --project-root <DIR> --rule unused-imports --format json
 ```
 
 `PATH` can be a PHP file or directory. When it is omitted, php-lsp analyzes the
-effective project root. The command loads the same global/project
+effective project root. CLI commands load the same global/project
 `.php-lsp.toml` configuration used by the language server for PHP version,
 diagnostic mode/severity, Composer discovery, and include/exclude paths.
 
@@ -257,6 +262,18 @@ Output formats:
 | `table` | Human-readable local output. |
 | `json` | Stable machine-readable report with `schemaVersion`, `summary`, and `diagnostics`. |
 | `github` | GitHub Actions workflow annotations. |
+
+Fix dry-run mode:
+
+- `php-lsp fix` currently requires `--dry-run` and refuses to write files.
+- Without `--rule`, it runs the preferred safe native fixers: unused imports and
+  PHPDoc-derived return types that can be represented as native PHP return
+  types for the configured PHP version.
+- `--rule` can be repeated. Supported values are `unused-imports`,
+  `organize-imports`, and `add-return-type`.
+- Exit code `0` means no edits would be produced, `1` means execution or
+  configuration error, and `2` means edits would be produced.
+- The fix command does not run project formatters.
 
 ## Commands
 

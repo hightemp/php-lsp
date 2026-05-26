@@ -1527,13 +1527,21 @@ PR-052 ─→ PR-053
   - Docs: `README.md` and `docs/configuration.md` document CLI usage, config loading, formats, and exit codes.
   - Validation: `cargo fmt --all --check`, targeted analyze unit tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, real `php-lsp analyze --help`, docs Cyrillic check, `git diff --check`.
 
-- [ ] **IE-021** Добавить CLI `fix --dry-run` для safe fixers
+- [x] **IE-021** Добавить CLI `fix --dry-run` для safe fixers *(done 2026-05-26)*
   - Первый набор rules: unused imports, organize imports, add return type from PHPDoc where safe.
   - `--dry-run` показывает changes без записи.
   - `--rule <RULE>` можно указывать несколько раз.
   - Без `--rule` запускать только preferred safe native fixers.
   - Не запускать formatter проекта внутри fix command без отдельного explicit flag.
   - Tests: idempotency, dry-run no write, JSON output.
+  - Implemented: `php-lsp fix [PATH] --dry-run` subcommand while preserving stdio LSP behavior when no subcommand is provided.
+  - Implemented: `--project-root`, repeated `--rule`, and `--format <table|json>` parsing with validation and `--help`.
+  - Implemented: supported rules `unused-imports`, `organize-imports`, and `add-return-type`; default rules are preferred safe native fixers (`unused-imports`, `add-return-type`).
+  - Implemented: dry-run-only execution that refuses to write files without `--dry-run`; no project formatter is invoked.
+  - Implemented: table output and stable JSON (`schemaVersion`, `rules`, `summary`, `files`, `fixes`, `edits`).
+  - Regression: unit tests cover command parsing, JSON output shape, dry-run no-write behavior, missing `--dry-run`, and idempotency after applying generated edits.
+  - Docs: `README.md` and `docs/configuration.md` document CLI fix usage, rule selection, exit codes, and formatter behavior.
+  - Validation: `cargo fmt --all --check`, targeted fix unit tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, real `php-lsp fix --help`, real fixture dry-run, docs Cyrillic check, `git diff --check`.
 
 - [ ] **IE-022** Улучшить formatting strategy
   - Добавить auto-detect project tools из Composer metadata:

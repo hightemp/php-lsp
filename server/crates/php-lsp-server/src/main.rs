@@ -52,6 +52,16 @@ async fn handle_cli_command() -> bool {
             }
             std::process::exit(result.exit_code);
         }
+        "fix" => {
+            let result = php_lsp_server::fix::run_fix_cli(args.collect());
+            if !result.stdout.is_empty() {
+                print!("{}", result.stdout);
+            }
+            if !result.stderr.is_empty() {
+                eprint!("{}", result.stderr);
+            }
+            std::process::exit(result.exit_code);
+        }
         "init-config" => {
             let path = parse_init_config_path(args.collect());
             match write_default_project_config(&path) {
@@ -103,7 +113,7 @@ fn parse_init_config_path(args: Vec<String>) -> PathBuf {
 
 fn print_help() {
     println!(
-        "php-lsp {}\n\nUsage:\n  php-lsp                 Start the LSP server on stdio\n  php-lsp analyze [PATH]  Analyze PHP files and print diagnostics\n  php-lsp analyze [PATH] --project-root <DIR> --severity <all|hint|info|warning|error> --format <table|json|github>\n  php-lsp init-config     Create .php-lsp.toml in the current directory\n  php-lsp init-config --path <path>\n  php-lsp --version",
+        "php-lsp {}\n\nUsage:\n  php-lsp                 Start the LSP server on stdio\n  php-lsp analyze [PATH]  Analyze PHP files and print diagnostics\n  php-lsp analyze [PATH] --project-root <DIR> --severity <all|hint|info|warning|error> --format <table|json|github>\n  php-lsp fix [PATH] --dry-run\n  php-lsp fix [PATH] --dry-run --project-root <DIR> --rule <unused-imports|organize-imports|add-return-type> --format <table|json>\n  php-lsp init-config     Create .php-lsp.toml in the current directory\n  php-lsp init-config --path <path>\n  php-lsp --version",
         env!("CARGO_PKG_VERSION")
     );
 }
