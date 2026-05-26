@@ -5675,6 +5675,26 @@ class RefactorDemo
         return $total;
     }
 
+    public function collision(int $a, int $b): int
+    {
+        $extracted = 1;
+        return $a * $b;
+    }
+
+    public function inlineMany(int $a, int $b): int
+    {
+        $total = $a + $b;
+        $left = $total;
+        return $left + $total;
+    }
+
+    public function reassigned(int $a, int $b): int
+    {
+        $value = $a;
+        $value = $b;
+        return $value;
+    }
+
     public function blocked(bool $flag): int
     {
         if ($flag) {
@@ -5683,6 +5703,21 @@ class RefactorDemo
 
         return $value;
     }
+}
+
+class ConstantCollisionDemo
+{
+    private const EXTRACTED = 1;
+
+    public function value(): int
+    {
+        return 10;
+    }
+}
+
+function outside(): string
+{
+    return 'outside';
 }
 "#;
     let uri = "file:///test/RefactorDemo.php";
@@ -5859,14 +5894,264 @@ class RefactorDemo
         inline_resolved
     );
 
-    let blocked_inline_resp = service
+    let collision_extract_resp = service
         .ready()
         .await
         .unwrap()
         .call(code_action_request_with_only(
             8,
             uri,
-            ((27, 15), (27, 21)),
+            ((24, 15), (24, 22)),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let collision_extract_result = extract_result(collision_extract_resp);
+    let collision_extract_action = collision_extract_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Extract variable `$extracted2`")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected extract variable collision fallback, got: {}",
+                collision_extract_result
+            )
+        });
+    let collision_extract_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(9, collision_extract_action))
+        .await
+        .unwrap();
+    let collision_extract_resolved = extract_result(collision_extract_resolve);
+    let collision_extract_edits = collision_extract_resolved["edit"]["changes"][uri]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected collision extract edits, got: {}",
+                collision_extract_resolved
+            )
+        });
+    assert!(
+        collision_extract_edits
+            .iter()
+            .any(|edit| { edit["newText"].as_str() == Some("        $extracted2 = $a * $b;\n") })
+            && collision_extract_edits
+                .iter()
+                .any(|edit| edit["newText"].as_str() == Some("$extracted2")),
+        "expected collision-safe extracted variable edits, got: {}",
+        collision_extract_resolved
+    );
+
+    let inline_many_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            10,
+            uri,
+            ((31, 23), (31, 29)),
+            json!([]),
+            vec!["refactor.inline"],
+        ))
+        .await
+        .unwrap();
+    let inline_many_result = extract_result(inline_many_resp);
+    let inline_many_action = inline_many_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Inline variable `$total`")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected multi-read inline variable action, got: {}",
+                inline_many_result
+            )
+        });
+    let inline_many_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(11, inline_many_action))
+        .await
+        .unwrap();
+    let inline_many_resolved = extract_result(inline_many_resolve);
+    let inline_many_edits = inline_many_resolved["edit"]["changes"][uri]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected multi-read inline edits, got: {}",
+                inline_many_resolved
+            )
+        });
+    assert!(
+        inline_many_edits
+            .iter()
+            .filter(|edit| edit["newText"].as_str() == Some("($a + $b)"))
+            .count()
+            == 2
+            && inline_many_edits
+                .iter()
+                .any(|edit| edit["newText"].as_str() == Some("")),
+        "expected all same-block reads to be inlined and assignment deleted, got: {}",
+        inline_many_resolved
+    );
+
+    let reassigned_inline_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            12,
+            uri,
+            ((38, 15), (38, 21)),
+            json!([]),
+            vec!["refactor.inline"],
+        ))
+        .await
+        .unwrap();
+    let reassigned_inline_result = extract_result(reassigned_inline_resp);
+    assert!(
+        !reassigned_inline_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(|action| {
+                action.get("title").and_then(|value| value.as_str())
+                    == Some("Inline variable `$value`")
+            }),
+        "reassigned local variable should be suppressed, got: {}",
+        reassigned_inline_result
+    );
+
+    let constant_collision_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            13,
+            uri,
+            ((57, 15), (57, 17)),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let constant_collision_result = extract_result(constant_collision_resp);
+    let constant_collision_action = constant_collision_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Extract constant `EXTRACTED2`")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected extract constant collision fallback, got: {}",
+                constant_collision_result
+            )
+        });
+    let constant_collision_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(14, constant_collision_action))
+        .await
+        .unwrap();
+    let constant_collision_resolved = extract_result(constant_collision_resolve);
+    let constant_collision_edits = constant_collision_resolved["edit"]["changes"][uri]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected constant collision edits, got: {}",
+                constant_collision_resolved
+            )
+        });
+    assert!(
+        constant_collision_edits.iter().any(|edit| edit["newText"]
+            .as_str()
+            .is_some_and(|new_text| new_text.contains("private const EXTRACTED2 = 10;")))
+            && constant_collision_edits
+                .iter()
+                .any(|edit| edit["newText"].as_str() == Some("self::EXTRACTED2")),
+        "expected collision-safe extracted constant edits, got: {}",
+        constant_collision_resolved
+    );
+
+    let nonliteral_constant_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            15,
+            uri,
+            ((7, 16), (7, 23)),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let nonliteral_constant_result = extract_result(nonliteral_constant_resp);
+    assert!(
+        !nonliteral_constant_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(|action| action
+                .get("title")
+                .and_then(|value| value.as_str())
+                .is_some_and(|title| title.starts_with("Extract constant"))),
+        "non-literal selection should not offer extract constant, got: {}",
+        nonliteral_constant_result
+    );
+
+    let out_of_class_constant_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            16,
+            uri,
+            ((63, 11), (63, 20)),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let out_of_class_constant_result = extract_result(out_of_class_constant_resp);
+    assert!(
+        !out_of_class_constant_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(|action| action
+                .get("title")
+                .and_then(|value| value.as_str())
+                .is_some_and(|title| title.starts_with("Extract constant"))),
+        "out-of-class literal should not offer extract constant, got: {}",
+        out_of_class_constant_result
+    );
+
+    let blocked_inline_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            17,
+            uri,
+            ((47, 15), (47, 21)),
             json!([]),
             vec!["refactor.inline"],
         ))
@@ -5897,7 +6182,7 @@ class RefactorDemo
         .ready()
         .await
         .unwrap()
-        .call(code_action_resolve_request(9, extract_variable_action))
+        .call(code_action_resolve_request(18, extract_variable_action))
         .await
         .unwrap();
     let stale_resolved = extract_result(stale_resolve);

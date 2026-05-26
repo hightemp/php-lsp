@@ -6351,6 +6351,49 @@ struct ExtractConstantPlan {
     expression_end: usize,
 }
 
+struct ClassConstantInsertion {
+    position: Position,
+    member_indent: String,
+    needs_leading_newline: bool,
+    needs_trailing_blank: bool,
+}
+
+fn class_constant_insertion(
+    source: &str,
+    class_sym: &php_lsp_types::SymbolInfo,
+) -> Option<ClassConstantInsertion> {
+    let start = byte_offset_for_line_col(source, class_sym.range.0, class_sym.range.1)?;
+    let end = byte_offset_for_line_col(source, class_sym.range.2, class_sym.range.3)?;
+    let class_text = source.get(start..end)?;
+    let open_brace = start + class_text.find('{')?;
+    let open_line_end = line_end_offset(source, open_brace);
+    let has_open_line_break = source.as_bytes().get(open_line_end) == Some(&b'\n');
+    let insert_byte = if has_open_line_break {
+        open_line_end + 1
+    } else {
+        open_brace + 1
+    };
+    let (line, byte_col) = line_col_for_byte_offset(source, insert_byte);
+    let utf16_index = Utf16LineIndex::new(source);
+    let position = Position::new(line, utf16_index.byte_col_to_utf16(line, byte_col));
+
+    let open_line = line_text(source, line_col_for_byte_offset(source, open_brace).0);
+    let open_col = line_col_for_byte_offset(source, open_brace).1;
+    let class_indent = leading_ascii_whitespace(line_prefix_by_byte_col(open_line, open_col));
+    let member_indent = format!("{}    ", class_indent);
+    let needs_trailing_blank = source
+        .get(insert_byte..end)
+        .map(|after| !after.trim_start().starts_with('}'))
+        .unwrap_or(false);
+
+    Some(ClassConstantInsertion {
+        position,
+        member_indent,
+        needs_leading_newline: !has_open_line_break,
+        needs_trailing_blank,
+    })
+}
+
 fn valid_constant_name(raw: &str) -> Option<String> {
     let name = raw.trim().to_ascii_uppercase();
     if name.is_empty() {
@@ -6392,17 +6435,20 @@ fn extract_constant_plan(
         return None;
     }
 
-    let insertion = class_method_insertion(source, class_sym)?;
+    let insertion = class_constant_insertion(source, class_sym)?;
     let mut insert_text = String::new();
-    if insertion.needs_leading_blank {
+    if insertion.needs_leading_newline {
         insert_text.push('\n');
     }
-    insert_text.push_str(&insertion.method_indent);
+    insert_text.push_str(&insertion.member_indent);
     insert_text.push_str("private const ");
     insert_text.push_str(&constant_name);
     insert_text.push_str(" = ");
     insert_text.push_str(literal_text);
     insert_text.push_str(";\n");
+    if insertion.needs_trailing_blank {
+        insert_text.push('\n');
+    }
 
     Some(ExtractConstantPlan {
         constant_name,
@@ -6621,12 +6667,16 @@ fn inline_replacement_is_atomic(node: tree_sitter::Node, source: &str) -> bool {
                 | "class_constant_access_expression"
                 | "encapsed_string"
                 | "float"
+                | "function_call_expression"
                 | "integer"
                 | "member_access_expression"
+                | "member_call_expression"
                 | "name"
                 | "null"
+                | "object_creation_expression"
                 | "parenthesized_expression"
                 | "qualified_name"
+                | "scoped_call_expression"
                 | "scoped_property_access_expression"
                 | "string"
                 | "subscript_expression"
@@ -6649,7 +6699,7 @@ fn inline_replacement_text_for_node(source: &str, rhs: tree_sitter::Node) -> Opt
 struct InlineVariablePlan {
     variable_name: String,
     assignment_delete: (usize, usize),
-    usage_replace: (usize, usize, String),
+    usage_replacements: Vec<(usize, usize, String)>,
 }
 
 fn inline_variable_plan(
@@ -6680,15 +6730,15 @@ fn inline_variable_plan(
 
     let mut reads = Vec::new();
     collect_inline_reads(scope, scope.id(), source, &selected_name, &mut reads);
-    if reads.len() != 1 {
+    if reads.is_empty() {
         return None;
     }
 
     let assignment = assignments.into_iter().next()?;
-    let read = reads.into_iter().next()?;
-    if assignment.statement_container_id != read.statement_container_id
-        || assignment.statement_end > read.statement_start
-    {
+    if !reads.iter().all(|read| {
+        assignment.statement_container_id == read.statement_container_id
+            && assignment.statement_end <= read.statement_start
+    }) {
         return None;
     }
 
@@ -6704,11 +6754,15 @@ fn inline_variable_plan(
     let replacement = inline_replacement_text_for_node(source, rhs_node)?;
     let assignment_delete =
         line_full_span(source, assignment.statement_start, assignment.statement_end);
+    let usage_replacements = reads
+        .into_iter()
+        .map(|read| (read.start, read.end, replacement.clone()))
+        .collect();
 
     Some(InlineVariablePlan {
         variable_name: selected_name,
         assignment_delete,
-        usage_replace: (read.start, read.end, replacement),
+        usage_replacements,
     })
 }
 
@@ -6752,27 +6806,24 @@ fn inline_variable_edit(
     variable_name: &str,
 ) -> Option<WorkspaceEdit> {
     let plan = inline_variable_plan(tree, source, range, Some(variable_name))?;
-    Some(workspace_edit_from_text_edits(
-        uri,
-        vec![
-            TextEdit {
-                range: lsp_range_for_byte_offsets(
-                    source,
-                    plan.usage_replace.0,
-                    plan.usage_replace.1,
-                ),
-                new_text: plan.usage_replace.2,
-            },
-            TextEdit {
-                range: lsp_range_for_byte_offsets(
-                    source,
-                    plan.assignment_delete.0,
-                    plan.assignment_delete.1,
-                ),
-                new_text: String::new(),
-            },
-        ],
-    ))
+    let mut edits = plan
+        .usage_replacements
+        .into_iter()
+        .map(|(start, end, replacement)| TextEdit {
+            range: lsp_range_for_byte_offsets(source, start, end),
+            new_text: replacement,
+        })
+        .collect::<Vec<_>>();
+    edits.push(TextEdit {
+        range: lsp_range_for_byte_offsets(
+            source,
+            plan.assignment_delete.0,
+            plan.assignment_delete.1,
+        ),
+        new_text: String::new(),
+    });
+
+    Some(workspace_edit_from_text_edits(uri, edits))
 }
 
 fn callable_symbol_at_range(

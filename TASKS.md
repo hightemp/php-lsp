@@ -1460,6 +1460,23 @@ PR-052 ─→ PR-053
   - Regression: e2e covers extract variable, extract constant, inline variable, branch-crossing refusal, stale resolve no-op, and advertised `refactor.extract`/`refactor.inline` capabilities.
   - Validation: `cargo fmt --all --check`, targeted IE-014 e2e, targeted code-action e2e tests, initialize capability e2e, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
+- [x] **IE-014S** Code actions: extract and inline refactors Supported coverage *(done 2026-05-26)*
+  - Довести feature matrix для `textDocument/codeAction` extract and inline refactors до `Supported`.
+  - Extract variable должен поддерживать selected expression in return/assignment/call/condition contexts, generate collision-free local variable names, and keep lazy stale-version no-op behavior.
+  - Extract constant должен поддерживать scalar literal extraction inside classes, insert class constants in stable class-member position, avoid name collisions, and refuse non-literals/out-of-class selections.
+  - Inline variable должен поддерживать one simple local assignment with one or more safe reads in the same straight-line block before any reassignment.
+  - Inline variable должен parenthesize complex RHS where needed, delete the full assignment statement, and refuse branch/closure crossing, compound assignments, self-referential RHS, and unsafe usage counts.
+  - Добавить regression tests на multiple safe reads, reassignment refusal, name-collision fallback, non-literal constant refusal, out-of-class refusal, and stale lazy resolve.
+  - Implemented: feature matrix now marks `textDocument/codeAction` extract and inline refactors as `Supported`.
+  - Implemented: Extract variable keeps lazy stale-version no-op behavior and generates collision-free local variable names such as `$extracted2`.
+  - Implemented: Extract constant now inserts collision-free `private const` members in a stable class-member position with existing indentation.
+  - Implemented: Inline variable now replaces one or more safe same-block reads from one simple assignment and deletes the full assignment statement.
+  - Guard: inline still refuses branch/closure crossing, reassignment before/around reads, compound assignments, self-referential RHS, and unsafe usage counts.
+  - Guard: extract constant refuses non-literal and out-of-class selections.
+  - Regression: e2e covers multiple inline reads, reassignment refusal, extract variable/constant name-collision fallback, non-literal constant refusal, out-of-class refusal, and stale lazy resolve.
+  - Docs: `README.md` and `docs/lsp-features.md` document the Supported extract/inline refactor behavior.
+  - Validation: `cargo fmt --all --check`, targeted IE-014S e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
+
 - [ ] **IE-015** Code actions для diagnostics и external analyzer findings
   - Remove unused import как explicit quickfix рядом с diagnostic.
   - Bulk "Remove all unused imports" через existing organize imports engine.
