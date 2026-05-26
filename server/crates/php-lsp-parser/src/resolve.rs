@@ -248,6 +248,41 @@ pub fn infer_variable_type_at_position_with_resolver(
     )
 }
 
+/// Infer hover-style type information for a variable at an arbitrary usage byte.
+///
+/// `context_node` is used to find the local scope, while `usage_start` controls
+/// which preceding assignments/PHPDoc/foreach bindings are visible.
+pub fn infer_variable_hover_info_at_node(
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    usage_start: usize,
+    var_name: &str,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<VariableHoverInfo> {
+    let normalized = normalize_var_name(var_name);
+    let scope =
+        find_enclosing_function(context_node).unwrap_or_else(|| find_root_node(context_node));
+    let inference = infer_variable_in_scope(
+        scope,
+        &normalized,
+        usage_start,
+        source,
+        file_symbols,
+        resolver,
+    );
+    if !inference.has_data() {
+        return None;
+    }
+
+    Some(VariableHoverInfo {
+        variable_name: normalized,
+        type_display: inference.type_display,
+        resolved_type_fqn: inference.resolved_type_fqn,
+        phpdoc_comment: inference.phpdoc_comment,
+    })
+}
+
 /// Infer hover info for a variable under cursor at a given position.
 pub fn variable_hover_info_at_position(
     tree: &Tree,

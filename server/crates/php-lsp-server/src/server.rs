@@ -19,10 +19,11 @@ use php_lsp_parser::references::{
     find_variable_references_at_position,
 };
 use php_lsp_parser::resolve::{
-    infer_property_type_from_assignments, infer_variable_type_at_position,
-    infer_variable_type_at_position_with_resolver, local_variable_names_at_position,
-    resolve_class_name_pub, symbol_at_position, symbol_at_position_with_resolver,
-    variable_definition_at_position, variable_hover_info_at_position, RefKind, SymbolAtPosition,
+    infer_property_type_from_assignments, infer_variable_hover_info_at_node,
+    infer_variable_type_at_position, infer_variable_type_at_position_with_resolver,
+    local_variable_names_at_position, resolve_class_name_pub, symbol_at_position,
+    symbol_at_position_with_resolver, variable_definition_at_position,
+    variable_hover_info_at_position, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
     find_missing_return_type_candidates, MissingReturnTypeCandidate,
@@ -9544,6 +9545,7 @@ fn inlay_hints(
     };
 
     collect_call_argument_inlay_hints(&ctx, tree.root_node(), &mut hints);
+    collect_local_variable_type_inlay_hints(&ctx, tree.root_node(), &mut hints);
     collect_phpdoc_parameter_type_inlay_hints(
         tree.root_node(),
         source,
@@ -9684,6 +9686,266 @@ fn add_call_argument_inlay_hints(
             data: None,
         });
     }
+}
+
+fn collect_local_variable_type_inlay_hints(
+    ctx: &InlayHintContext<'_>,
+    node: tree_sitter::Node,
+    hints: &mut Vec<InlayHint>,
+) {
+    let mut seen = HashSet::new();
+    collect_local_variable_type_inlay_hints_inner(ctx, node, hints, &mut seen);
+}
+
+fn collect_local_variable_type_inlay_hints_inner(
+    ctx: &InlayHintContext<'_>,
+    node: tree_sitter::Node,
+    hints: &mut Vec<InlayHint>,
+    seen: &mut HashSet<(u32, u32, String)>,
+) {
+    match node.kind() {
+        "expression_statement" => {
+            add_assignment_variable_type_inlay_hint(ctx, node, hints, seen);
+        }
+        "foreach_statement" => {
+            add_foreach_variable_type_inlay_hint(ctx, node, hints, seen);
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_local_variable_type_inlay_hints_inner(ctx, child, hints, seen);
+    }
+}
+
+fn add_assignment_variable_type_inlay_hint(
+    ctx: &InlayHintContext<'_>,
+    statement: tree_sitter::Node,
+    hints: &mut Vec<InlayHint>,
+    seen: &mut HashSet<(u32, u32, String)>,
+) {
+    let Some(expr) = statement.named_child(0) else {
+        return;
+    };
+    if expr.kind() != "assignment_expression" {
+        return;
+    }
+    let Some(left) = expr.child_by_field_name("left") else {
+        return;
+    };
+    let Some(right) = expr.child_by_field_name("right") else {
+        return;
+    };
+    if left.kind() != "variable_name"
+        || !is_plain_assignment_expression(left, right, ctx.source)
+        || !byte_ranges_overlap(node_range_node(left), ctx.requested_range)
+    {
+        return;
+    }
+
+    add_local_variable_type_inlay_hint(ctx, left, right.end_byte(), hints, seen);
+}
+
+fn add_foreach_variable_type_inlay_hint(
+    ctx: &InlayHintContext<'_>,
+    statement: tree_sitter::Node,
+    hints: &mut Vec<InlayHint>,
+    seen: &mut HashSet<(u32, u32, String)>,
+) {
+    let Some(value_node) = foreach_value_variable_node_for_inlay(statement, ctx.source) else {
+        return;
+    };
+    if !byte_ranges_overlap(node_range_node(value_node), ctx.requested_range) {
+        return;
+    }
+
+    add_local_variable_type_inlay_hint(ctx, value_node, value_node.end_byte(), hints, seen);
+}
+
+fn add_local_variable_type_inlay_hint(
+    ctx: &InlayHintContext<'_>,
+    variable_node: tree_sitter::Node,
+    usage_start: usize,
+    hints: &mut Vec<InlayHint>,
+    seen: &mut HashSet<(u32, u32, String)>,
+) {
+    let Some(variable_name) = variable_text_for_node(ctx.source, variable_node) else {
+        return;
+    };
+    let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
+    };
+    let Some(info) = infer_variable_hover_info_at_node(
+        variable_node,
+        ctx.source,
+        ctx.file_symbols,
+        usage_start,
+        &variable_name,
+        Some(&resolver),
+    ) else {
+        return;
+    };
+    let Some(label_type) = local_variable_inlay_type_label(&info, ctx.file_symbols) else {
+        return;
+    };
+
+    let end = variable_node.end_position();
+    let position = Position::new(
+        end.row as u32,
+        ctx.utf16_index
+            .byte_col_to_utf16(end.row as u32, end.column as u32),
+    );
+    let label = format!(": {}", label_type);
+    if !seen.insert((position.line, position.character, label.clone())) {
+        return;
+    }
+
+    hints.push(InlayHint {
+        position,
+        label: InlayHintLabel::String(label),
+        kind: Some(InlayHintKind::TYPE),
+        text_edits: None,
+        tooltip: Some(InlayHintTooltip::String(
+            "Inferred local variable type".to_string(),
+        )),
+        padding_left: Some(false),
+        padding_right: Some(true),
+        data: None,
+    });
+}
+
+fn is_plain_assignment_expression(
+    left: tree_sitter::Node,
+    right: tree_sitter::Node,
+    source: &str,
+) -> bool {
+    left.end_byte() <= right.start_byte()
+        && source
+            .get(left.end_byte()..right.start_byte())
+            .is_some_and(|between| between.trim() == "=")
+}
+
+fn foreach_value_variable_node_for_inlay<'tree>(
+    statement: tree_sitter::Node<'tree>,
+    source: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    let value_expr = match statement.named_child(1)? {
+        pair if pair.kind() == "pair" => {
+            let count = pair.named_child_count();
+            pair.named_child(count.saturating_sub(1))?
+        }
+        value => value,
+    };
+    variable_node_in_foreach_part_for_inlay(value_expr, source)
+}
+
+fn variable_node_in_foreach_part_for_inlay<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    if node.kind() == "variable_name" && node_text(source, node).starts_with('$') {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = variable_node_in_foreach_part_for_inlay(child, source) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn local_variable_inlay_type_label(
+    info: &php_lsp_parser::resolve::VariableHoverInfo,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<String> {
+    let display = info
+        .type_display
+        .as_deref()
+        .or(info.resolved_type_fqn.as_deref())?
+        .trim();
+    if !is_useful_local_variable_type_hint(display) {
+        return None;
+    }
+
+    Some(shorten_inlay_type_display(display, file_symbols))
+}
+
+fn shorten_inlay_type_display(display: &str, file_symbols: &php_lsp_types::FileSymbols) -> String {
+    if !display.contains('\\')
+        || display.contains(['<', '>', '{', '}', '|', '&', '?', '(', ')', ',', ' '])
+    {
+        return display.to_string();
+    }
+
+    if let Some(use_stmt) = file_symbols
+        .use_statements
+        .iter()
+        .find(|use_stmt| use_stmt.kind == php_lsp_types::UseKind::Class && use_stmt.fqn == display)
+    {
+        return use_stmt
+            .alias
+            .clone()
+            .unwrap_or_else(|| display.rsplit('\\').next().unwrap_or(display).to_string());
+    }
+
+    if let Some(namespace) = file_symbols.namespace.as_deref() {
+        if let Some(rest) = display
+            .strip_prefix(namespace)
+            .and_then(|rest| rest.strip_prefix('\\'))
+        {
+            return rest.to_string();
+        }
+    }
+
+    display.rsplit('\\').next().unwrap_or(display).to_string()
+}
+
+fn is_useful_local_variable_type_hint(display: &str) -> bool {
+    let display = display.trim();
+    if display.is_empty() {
+        return false;
+    }
+
+    if display.contains('<') || display.contains('{') || display.contains('\\') {
+        return true;
+    }
+    if display.contains('|') {
+        return display.split('|').any(is_useful_local_variable_type_hint);
+    }
+    if display.contains('&') {
+        return display.split('&').any(is_useful_local_variable_type_hint);
+    }
+
+    !is_scalar_local_variable_type_hint(display.trim_start_matches('?'))
+}
+
+fn is_scalar_local_variable_type_hint(display: &str) -> bool {
+    matches!(
+        display
+            .trim_start_matches('\\')
+            .to_ascii_lowercase()
+            .as_str(),
+        "array"
+            | "bool"
+            | "boolean"
+            | "callable"
+            | "false"
+            | "float"
+            | "int"
+            | "integer"
+            | "iterable"
+            | "mixed"
+            | "never"
+            | "null"
+            | "object"
+            | "resource"
+            | "scalar"
+            | "string"
+            | "true"
+            | "void"
+    )
 }
 
 fn collect_phpdoc_parameter_type_inlay_hints(

@@ -50,7 +50,8 @@ phpstorm-stubs support.
 - Completion resolve enriches PHPDoc virtual member completions.
 - Signature help for functions, methods, constructors, and active parameter
   tracking.
-- Inlay hints for argument labels and inferred PHPDoc parameter/return types.
+- Inlay hints for argument labels, inferred PHPDoc parameter/return types, and
+  useful inferred local variable types.
 - Semantic tokens with full, delta, and range requests.
 
 ### Navigation

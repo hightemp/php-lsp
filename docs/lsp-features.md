@@ -91,7 +91,7 @@ tools.
 | `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, and expanded member signature aliases. |
 | `completionItem/resolve` | Supported | Enriches PHPDoc virtual member completions. |
 | `textDocument/signatureHelp` | Supported | Functions, methods, constructors, and active parameter tracking. |
-| `textDocument/inlayHint` | Supported | Argument labels and inferred PHPDoc parameter/return hints. |
+| `textDocument/inlayHint` | Supported | Argument labels, inferred PHPDoc parameter/return hints, and useful inferred local variable type hints for assignments and foreach values. |
 | `textDocument/codeLens` | Partial | Reference-count lenses for symbols. Counts use indexed references but can still be expensive across very large workspaces. |
 | `textDocument/foldingRange` | Supported | PHP structures, comments, arrays, namespaces, and blocks. |
 | `textDocument/semanticTokens/full` | Supported | Full semantic token snapshots with result IDs. |

@@ -1683,6 +1683,39 @@ PR-052 ─→ PR-053
   - Fallback: unresolved condition returns union of branches.
   - Tests: service locator `make(Foo::class): Foo`, conditional factory, fallback union.
 
+- [x] **IE-032A** Inlay hints: inferred local variable types *(done 2026-05-26)*
+  - Extend `textDocument/inlayHint` with Rust-style `: Type` hints after local
+    variable declarations/assignments where the server can infer a useful type.
+  - Cover at minimum:
+    - `$user = new User();`
+    - `$item = $repo->find();` via indexed member return type resolver
+    - inline/local PHPDoc `@var`
+    - `foreach ($items as $item)` value inference where existing inference
+      supports generic arrays/lists.
+  - Avoid noisy hints for unknown/mixed/scalar-only cases unless inference has
+    an explicit useful display type.
+  - Keep hints range-aware, sorted with existing inlay hints, and guarded from
+    duplicate hints on the same variable/range.
+  - Add e2e coverage for new-expression, method-return, PHPDoc, and foreach
+    variable type hints.
+  - Update `README.md` / `docs/lsp-features.md` after implementation.
+  - Implemented: `textDocument/inlayHint` now emits local variable `: Type`
+    hints for simple assignments and foreach value variables when existing
+    inference can produce a useful object/generic/shape-like type.
+  - Implemented: hints reuse indexed member return type resolution, inline
+    PHPDoc `@var`, generic/list foreach value inference, range filtering,
+    sorting, and duplicate guards.
+  - Implemented: scalar-only assignment hints such as `$count = 1` are
+    suppressed to avoid noisy editor output.
+  - Regression: e2e covers `new User()`, `$repo->find()`, inline PHPDoc
+    `array<int, User>`, foreach `$item`, and scalar suppression.
+  - Docs: `README.md` and `docs/lsp-features.md` mention inferred local
+    variable type inlay hints.
+  - Validation: `cargo test -p php-lsp-parser`,
+    `cargo test -p php-lsp-server --test e2e test_inlay_hints`,
+    `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`.
+
 - [ ] **IE-033** Shape-aware completion and definition
   - Array shape keys from PHPDoc/literal arrays should appear in `$arr['...']` completion.
   - Object shape properties should appear in `$obj->...` where modeled.

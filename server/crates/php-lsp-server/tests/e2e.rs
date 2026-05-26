@@ -3227,6 +3227,97 @@ function run(Formatter $formatter): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_inlay_hints_for_local_variable_types() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class User {}
+
+class Repository {
+    public function find(): User { return new User(); }
+}
+
+function run(Repository $repo): void {
+    $created = new User();
+    $found = $repo->find();
+    /** @var array<int, User> $users */
+    $users = [];
+    foreach ($users as $item) {
+        $copy = $item;
+    }
+    $count = 1;
+}
+"#;
+    let uri = "file:///test/local-variable-inlay-hints.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 22, 0))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let hints = result.as_array().expect("expected inlay hint array");
+    let labels: Vec<&str> = hints
+        .iter()
+        .filter_map(|hint| hint.get("label").and_then(|label| label.as_str()))
+        .collect();
+
+    assert!(
+        labels.iter().filter(|label| **label == ": User").count() >= 3,
+        "expected User local variable type hints, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&": array<int, User>"),
+        "expected PHPDoc generic local variable type hint, got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&": int"),
+        "scalar assignment should not produce a noisy local variable hint: {:?}",
+        labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_folding_ranges_for_php_structures() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
