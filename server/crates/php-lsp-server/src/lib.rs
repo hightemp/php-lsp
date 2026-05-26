@@ -2,6 +2,7 @@
 //!
 //! Re-exports the server module for integration testing.
 
+pub mod analyze;
 pub mod config;
 mod server;
 

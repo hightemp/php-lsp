@@ -1505,7 +1505,7 @@ PR-052 ─→ PR-053
 
 ### Неделя 3: CLI/tooling режимы и formatter strategy (2026-06-22 → 2026-06-28)
 
-- [ ] **IE-020** Добавить CLI `analyze`
+- [x] **IE-020** Добавить CLI `analyze` *(done 2026-05-26)*
   - Running binary without subcommand сохраняет LSP stdio behavior.
   - `php-lsp analyze [PATH] --project-root <DIR> --severity <all|hint|info|warning|error> --format <table|json|github>`.
   - Использовать тот же parser/index/diagnostics pipeline, что и LSP.
@@ -1518,6 +1518,14 @@ PR-052 ─→ PR-053
     - JSON stable schema для scripts
     - GitHub workflow annotations для CI.
   - Tests: command parsing, JSON output shape, exit code behavior на fixture.
+  - Implemented: `php-lsp analyze` subcommand while preserving stdio LSP behavior when no subcommand is provided.
+  - Implemented: `[PATH]`, `--project-root`, `--severity`, and `--format` parsing with validation and `--help`.
+  - Implemented: CLI analysis builds a workspace index from Composer/source/include paths and runs the existing parser/index/built-in diagnostics pipeline.
+  - Implemented: severity filtering as a threshold (`error`, `warning`, `info`, `hint`, `all`) and exit codes `0`, `1`, `2`.
+  - Implemented: table, stable JSON (`schemaVersion`, `summary`, `diagnostics`), and GitHub annotation output formats.
+  - Regression: unit tests cover command parsing, JSON output shape, clean/error/diagnostics exit codes, and fixture diagnostics.
+  - Docs: `README.md` and `docs/configuration.md` document CLI usage, config loading, formats, and exit codes.
+  - Validation: `cargo fmt --all --check`, targeted analyze unit tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, real `php-lsp analyze --help`, docs Cyrillic check, `git diff --check`.
 
 - [ ] **IE-021** Добавить CLI `fix --dry-run` для safe fixers
   - Первый набор rules: unused imports, organize imports, add return type from PHPDoc where safe.

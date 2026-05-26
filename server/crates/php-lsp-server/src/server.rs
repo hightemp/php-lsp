@@ -188,15 +188,15 @@ fn indexing_parse_concurrency() -> usize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct PhpVersion {
+pub(crate) struct PhpVersion {
     major: u16,
     minor: u16,
 }
 
 impl PhpVersion {
-    const DEFAULT: Self = Self { major: 8, minor: 2 };
+    pub(crate) const DEFAULT: Self = Self { major: 8, minor: 2 };
 
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         let mut parts = raw.split('.');
         let major = parts.next()?.parse().ok()?;
         let minor = parts.next().unwrap_or("0").parse().ok()?;
@@ -303,7 +303,7 @@ struct AnalyzerCodeActionConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum DiagnosticsMode {
+pub(crate) enum DiagnosticsMode {
     Off,
     SyntaxOnly,
     #[default]
@@ -311,7 +311,7 @@ enum DiagnosticsMode {
 }
 
 impl DiagnosticsMode {
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
             "syntax-only" | "syntax" => Some(Self::SyntaxOnly),
@@ -383,7 +383,7 @@ impl DiagnosticLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DiagnosticSeverityConfig {
+pub(crate) struct DiagnosticSeverityConfig {
     unknown_symbols: DiagnosticLevel,
     unused: DiagnosticLevel,
     duplicate_symbols: DiagnosticLevel,
@@ -409,7 +409,7 @@ impl Default for DiagnosticSeverityConfig {
 }
 
 impl DiagnosticSeverityConfig {
-    fn parse(value: &serde_json::Value) -> Option<Self> {
+    pub(crate) fn parse(value: &serde_json::Value) -> Option<Self> {
         if let Some(level) = DiagnosticLevel::parse(value) {
             return Some(Self::all(level));
         }
@@ -497,9 +497,9 @@ struct SemanticTokensCache {
 }
 
 #[derive(Debug, Clone)]
-struct WorkspaceRootConfig {
-    root: PathBuf,
-    namespace_map: Option<NamespaceMap>,
+pub(crate) struct WorkspaceRootConfig {
+    pub(crate) root: PathBuf,
+    pub(crate) namespace_map: Option<NamespaceMap>,
 }
 
 const VENDOR_FILE_LRU_CAPACITY: usize = 512;
@@ -680,7 +680,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn normalize_config_paths(paths: Vec<String>) -> Vec<PathBuf> {
+pub(crate) fn normalize_config_paths(paths: Vec<String>) -> Vec<PathBuf> {
     paths
         .into_iter()
         .filter_map(|path| {
@@ -10742,7 +10742,7 @@ fn compute_diagnostics(
     )
 }
 
-fn compute_diagnostics_with_config(
+pub(crate) fn compute_diagnostics_with_config(
     uri_str: &str,
     parser: &FileParser,
     index: &WorkspaceIndex,
@@ -13596,7 +13596,7 @@ fn path_is_excluded(path: &Path, root: &Path, exclude_paths: &[PathBuf]) -> bool
     })
 }
 
-fn workspace_index_directories(
+pub(crate) fn workspace_index_directories(
     root: &Path,
     namespace_map: Option<&NamespaceMap>,
     include_paths: &[PathBuf],
@@ -13623,7 +13623,7 @@ fn workspace_index_directories(
 }
 
 /// Collect all .php files from the given directories.
-fn collect_php_files(
+pub(crate) fn collect_php_files(
     directories: &[PathBuf],
     root: &Path,
     exclude_paths: &[PathBuf],
@@ -13698,7 +13698,7 @@ fn uri_is_php_file(uri: &Uri) -> bool {
 }
 
 /// Convert a file path to a file:// URI.
-fn path_to_uri(path: &Path) -> String {
+pub(crate) fn path_to_uri(path: &Path) -> String {
     format!("file://{}", path.display())
 }
 
@@ -13751,7 +13751,7 @@ fn project_config_candidates(root: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-fn load_effective_configuration_settings(
+pub(crate) fn load_effective_configuration_settings(
     workspace_roots: &[PathBuf],
     client_settings: &serde_json::Value,
 ) -> (serde_json::Value, Vec<String>) {
@@ -13803,7 +13803,10 @@ fn uri_is_project_config_file(uri: &Uri) -> bool {
         .is_some_and(|file_name| file_name == PROJECT_CONFIG_FILE_NAME)
 }
 
-fn discover_workspace_root_config(root: &Path, composer_enabled: bool) -> WorkspaceRootConfig {
+pub(crate) fn discover_workspace_root_config(
+    root: &Path,
+    composer_enabled: bool,
+) -> WorkspaceRootConfig {
     let composer_path = composer_enabled.then(|| find_composer_json(root)).flatten();
 
     if let Some(ref cp) = composer_path {

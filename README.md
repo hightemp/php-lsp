@@ -113,6 +113,18 @@ phpstorm-stubs support.
 - Document formatting and range formatting through configured external tools.
 - On-type indentation edits for newline, semicolon, and closing brace.
 
+### CLI And Tooling
+
+- Running `php-lsp` without a subcommand starts the LSP server on stdio.
+- `php-lsp init-config` creates a starter `.php-lsp.toml` file.
+- `php-lsp analyze [PATH]` runs the same parser, workspace index, and built-in
+  diagnostics pipeline from the command line.
+- `analyze` supports `--project-root <DIR>`,
+  `--severity <all|hint|info|warning|error>`, and
+  `--format <table|json|github>`.
+- Analyze output is available as a local table, stable JSON for scripts, or
+  GitHub workflow annotations.
+
 ### Workspace Support
 
 - Initialization options and runtime configuration updates through
@@ -218,6 +230,33 @@ Example external formatting setup:
   "phpLsp.formatting.provider": "php-cs-fixer"
 }
 ```
+
+## CLI
+
+```bash
+php-lsp analyze [PATH] --project-root <DIR> --severity warning --format table
+```
+
+`PATH` can be a PHP file or directory. When it is omitted, php-lsp analyzes the
+effective project root. The command loads the same global/project
+`.php-lsp.toml` configuration used by the language server for PHP version,
+diagnostic mode/severity, Composer discovery, and include/exclude paths.
+
+Analyze exit codes:
+
+| Code | Meaning |
+|---:|---|
+| `0` | No diagnostics at the requested severity. |
+| `1` | Execution or configuration error. |
+| `2` | Diagnostics were found. |
+
+Output formats:
+
+| Format | Use |
+|---|---|
+| `table` | Human-readable local output. |
+| `json` | Stable machine-readable report with `schemaVersion`, `summary`, and `diagnostics`. |
+| `github` | GitHub Actions workflow annotations. |
 
 ## Commands
 

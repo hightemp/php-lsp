@@ -40,6 +40,17 @@ php-lsp init-config --path path/to/.php-lsp.toml
 
 The JSON schema is available at [`config-schema.json`](../config-schema.json).
 
+## Analyze From CLI
+
+```bash
+php-lsp analyze [PATH] --project-root <DIR> --severity warning --format json
+```
+
+The `analyze` command loads the same global and project configuration files as
+the language server. It uses PHP version, diagnostic mode/severity, Composer
+discovery, and include/exclude path settings when building its command-line
+diagnostic report.
+
 ## Example
 
 ```toml
