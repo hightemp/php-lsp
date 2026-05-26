@@ -67,6 +67,7 @@ tools.
 | `textDocument/prepareRename` | Supported | Rejects unsupported or built-in targets before rename. |
 | `textDocument/codeAction` quick fix | Supported | Adds imports for unresolved classes/functions when candidates exist. |
 | `textDocument/codeAction` implement missing methods | Partial | Generates concrete stubs for missing interface, abstract parent, and abstract trait methods. Edits are resolved lazily and stale document versions resolve to a no-op edit. |
+| `textDocument/codeAction` generate members | Partial | Generates constructors and property getters/setters from indexed property symbols. Handles readonly/static properties and bool getter naming. |
 | `source.organizeImports` | Supported | Sorts/removes import statements based on parser/index data. |
 | `codeAction/resolve` | Supported | Used for heavier refactor actions so `textDocument/codeAction` can return lightweight actions first. |
 | `refactor.rewrite` add return type | Partial | Adds return types from PHPDoc where supported by the configured PHP version. Edits are resolved lazily and stale document versions resolve to a no-op edit. |

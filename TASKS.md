@@ -1327,7 +1327,7 @@ PR-052 ─→ PR-053
   - Regression: e2e covers interface methods, abstract parent methods, multiple interfaces, static/by-ref/variadic/default params, and inherited already implemented methods.
   - Validation: `cargo fmt --all --check`, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
-- [ ] **IE-011** Code actions: generate constructor, getters, setters
+- [x] **IE-011** Code actions: generate constructor, getters, setters *(done 2026-05-26)*
   - Generate constructor для non-static properties без existing `__construct`.
   - Учитывать readonly/promoted properties и nullable/default values.
   - Generate getter/setter для property under cursor.
@@ -1335,6 +1335,12 @@ PR-052 ─→ PR-053
   - Static property генерирует static accessor methods.
   - Readonly property не получает setter.
   - Tests: class indentation, existing methods, private/protected/public, typed/untyped property.
+  - Implemented: lazy `Generate constructor` refactor for concrete classes without direct `__construct`; static properties are excluded.
+  - Implemented: constructor params preserve native-safe type hints and safe trailing property defaults; body assigns instance/readonly properties.
+  - Implemented: lazy property getter/setter refactors under cursor, including bool `isX` naming, static accessors, readonly setter suppression, and existing accessor suppression.
+  - Docs: `docs/lsp-features.md` documents generated constructor/getter/setter member actions.
+  - Regression: e2e covers constructor generation, nullable default params, readonly/static properties, bool getter naming, setter generation, existing constructor suppression, and existing accessor suppression.
+  - Validation: `cargo fmt --all --check`, targeted generate-members e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
 - [ ] **IE-012** Code actions: change visibility и promote constructor parameter
   - Change visibility для method/property/class constant/promoted property.

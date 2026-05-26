@@ -4459,6 +4459,351 @@ class Demo extends Base implements CountableThing, Factory
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_code_action_generate_constructor_getters_and_setters() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "8.2" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class GenerateMembers
+{
+    private string $name;
+    private readonly int $id;
+    private ?bool $active = null;
+    private static int $count = 0;
+}
+"#;
+    let uri = "file:///test/GenerateMembers.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let constructor_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            2,
+            uri,
+            ((3, 6), (3, 21)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let constructor_result = extract_result(constructor_resp);
+    let constructor_action = constructor_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Generate constructor")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected constructor action, got: {}", constructor_result));
+    assert!(
+        constructor_action.get("edit").is_none(),
+        "constructor action should resolve lazily, got: {}",
+        constructor_action
+    );
+    let constructor_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(3, constructor_action))
+        .await
+        .unwrap();
+    let constructor_resolved = extract_result(constructor_resolve);
+    let constructor_text = constructor_resolved["edit"]["changes"][uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected constructor edit, got: {}", constructor_resolved));
+    assert!(
+        constructor_text
+            .contains("public function __construct(string $name, int $id, ?bool $active = null)"),
+        "expected constructor params with nullable default, got: {}",
+        constructor_text
+    );
+    assert!(
+        constructor_text.contains("$this->name = $name;")
+            && constructor_text.contains("$this->id = $id;")
+            && constructor_text.contains("$this->active = $active;"),
+        "expected instance assignments, got: {}",
+        constructor_text
+    );
+    assert!(
+        !constructor_text.contains("count"),
+        "static property should not be included in constructor, got: {}",
+        constructor_text
+    );
+
+    let active_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            4,
+            uri,
+            ((7, 18), (7, 25)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let active_result = extract_result(active_resp);
+    let active_actions = active_result.as_array().expect("code actions array");
+    let getter_action = active_actions
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Generate getter `isActive`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected bool getter action, got: {}", active_result));
+    let setter_action = active_actions
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Generate setter `setActive`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected setter action, got: {}", active_result));
+
+    let getter_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(5, getter_action))
+        .await
+        .unwrap();
+    let getter_resolved = extract_result(getter_resolve);
+    let getter_text = getter_resolved["edit"]["changes"][uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected getter edit, got: {}", getter_resolved));
+    assert!(
+        getter_text.contains("public function isActive(): ?bool")
+            && getter_text.contains("return $this->active;"),
+        "expected bool getter, got: {}",
+        getter_text
+    );
+
+    let setter_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(6, setter_action))
+        .await
+        .unwrap();
+    let setter_resolved = extract_result(setter_resolve);
+    let setter_text = setter_resolved["edit"]["changes"][uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected setter edit, got: {}", setter_resolved));
+    assert!(
+        setter_text.contains("public function setActive(?bool $active): void")
+            && setter_text.contains("$this->active = $active;"),
+        "expected setter, got: {}",
+        setter_text
+    );
+
+    let readonly_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            7,
+            uri,
+            ((6, 25), (6, 28)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let readonly_result = extract_result(readonly_resp);
+    let readonly_actions = readonly_result.as_array().expect("code actions array");
+    assert!(
+        readonly_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Generate getter `getId`")
+        }),
+        "expected readonly getter, got: {}",
+        readonly_result
+    );
+    assert!(
+        !readonly_actions.iter().any(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Generate setter `setId`")
+        }),
+        "readonly property should not offer setter, got: {}",
+        readonly_result
+    );
+
+    let static_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            8,
+            uri,
+            ((8, 23), (8, 29)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let static_result = extract_result(static_resp);
+    let static_getter_action = static_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Generate getter `getCount`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected static getter action, got: {}", static_result));
+    let static_getter_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(9, static_getter_action))
+        .await
+        .unwrap();
+    let static_getter_resolved = extract_result(static_getter_resolve);
+    let static_getter_text = static_getter_resolved["edit"]["changes"][uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected static getter edit, got: {}",
+                static_getter_resolved
+            )
+        });
+    assert!(
+        static_getter_text.contains("public static function getCount(): int")
+            && static_getter_text.contains("return self::$count;"),
+        "expected static getter, got: {}",
+        static_getter_text
+    );
+
+    let existing_code = r#"<?php
+namespace App;
+
+class ExistingMembers
+{
+    private string $title;
+
+    public function __construct()
+    {
+    }
+
+    public function getTitle(): string
+    {
+        return $this->title;
+    }
+
+    public function setTitle(string $title): void
+    {
+        $this->title = $title;
+    }
+}
+"#;
+    let existing_uri = "file:///test/ExistingMembers.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(existing_uri, existing_code))
+        .await
+        .unwrap();
+
+    let existing_class_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            10,
+            existing_uri,
+            ((3, 6), (3, 21)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let existing_class_result = extract_result(existing_class_resp);
+    assert!(
+        !existing_class_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(
+                |action| action.get("title").and_then(|value| value.as_str())
+                    == Some("Generate constructor")
+            ),
+        "existing constructor should suppress constructor action, got: {}",
+        existing_class_result
+    );
+
+    let existing_property_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            11,
+            existing_uri,
+            ((5, 19), (5, 25)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let existing_property_result = extract_result(existing_property_resp);
+    assert!(
+        !existing_property_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(|action| {
+                matches!(
+                    action.get("title").and_then(|value| value.as_str()),
+                    Some("Generate getter `getTitle`") | Some("Generate setter `setTitle`")
+                )
+            }),
+        "existing accessors should suppress accessor actions, got: {}",
+        existing_property_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_action_organize_imports_sorts_groups_and_removes_unused() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

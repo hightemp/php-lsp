@@ -3509,6 +3509,8 @@ fn build_add_return_type_action(
 enum CodeActionDataKind {
     AddReturnType,
     ImplementMissingMethods,
+    GenerateConstructor,
+    GenerateAccessor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3531,6 +3533,21 @@ enum CodeActionDataExtra {
     ImplementMissingMethods {
         class_fqn: String,
     },
+    GenerateConstructor {
+        class_fqn: String,
+    },
+    GenerateAccessor {
+        property_fqn: String,
+        accessor_kind: AccessorKind,
+        method_name: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum AccessorKind {
+    Getter,
+    Setter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3617,6 +3634,128 @@ fn build_implement_missing_methods_action(
         disabled: None,
         data: Some(data),
     }))
+}
+
+fn build_generate_constructor_action(
+    uri: Uri,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    class_sym: &php_lsp_types::SymbolInfo,
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Option<CodeActionOrCommand> {
+    if direct_method_name_exists(file_symbols, &class_sym.fqn, "__construct")
+        || constructor_generation_properties(source, file_symbols, &class_sym.fqn).is_empty()
+    {
+        return None;
+    }
+
+    let data = serde_json::to_value(CodeActionData {
+        action_kind: CodeActionDataKind::GenerateConstructor,
+        uri: uri.as_str().to_string(),
+        range: request_range,
+        document_version,
+        extra: CodeActionDataExtra::GenerateConstructor {
+            class_fqn: class_sym.fqn.clone(),
+        },
+    })
+    .ok()?;
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: "Generate constructor".to_string(),
+        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+        diagnostics: None,
+        edit: None,
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: Some(data),
+    }))
+}
+
+fn build_generate_accessor_action(
+    uri: Uri,
+    property: &php_lsp_types::SymbolInfo,
+    accessor_kind: AccessorKind,
+    method_name: String,
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Option<CodeActionOrCommand> {
+    if accessor_kind == AccessorKind::Setter && property.modifiers.is_readonly {
+        return None;
+    }
+
+    let data = serde_json::to_value(CodeActionData {
+        action_kind: CodeActionDataKind::GenerateAccessor,
+        uri: uri.as_str().to_string(),
+        range: request_range,
+        document_version,
+        extra: CodeActionDataExtra::GenerateAccessor {
+            property_fqn: property.fqn.clone(),
+            accessor_kind,
+            method_name: method_name.clone(),
+        },
+    })
+    .ok()?;
+
+    let accessor_label = match accessor_kind {
+        AccessorKind::Getter => "getter",
+        AccessorKind::Setter => "setter",
+    };
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Generate {} `{}`", accessor_label, method_name),
+        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+        diagnostics: None,
+        edit: None,
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: Some(data),
+    }))
+}
+
+fn build_generate_accessor_actions(
+    uri: Uri,
+    index: &WorkspaceIndex,
+    property: &php_lsp_types::SymbolInfo,
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Vec<CodeActionOrCommand> {
+    let Some(class_fqn) = property.parent_fqn.as_deref() else {
+        return Vec::new();
+    };
+
+    let mut actions = Vec::new();
+    let getter = getter_name(property);
+    if !member_method_name_exists(index, class_fqn, &getter) {
+        if let Some(action) = build_generate_accessor_action(
+            uri.clone(),
+            property,
+            AccessorKind::Getter,
+            getter,
+            request_range,
+            document_version,
+        ) {
+            actions.push(action);
+        }
+    }
+
+    let setter = setter_name(property);
+    if !property.modifiers.is_readonly && !member_method_name_exists(index, class_fqn, &setter) {
+        if let Some(action) = build_generate_accessor_action(
+            uri,
+            property,
+            AccessorKind::Setter,
+            setter,
+            request_range,
+            document_version,
+        ) {
+            actions.push(action);
+        }
+    }
+
+    actions
 }
 
 fn concrete_class_symbol_at_range(
@@ -4042,6 +4181,75 @@ fn method_insertion_needs_leading_blank(source: &str, closing_line: u32, closing
     false
 }
 
+struct ClassMethodInsertion {
+    position: Position,
+    method_indent: String,
+    body_indent: String,
+    needs_leading_blank: bool,
+}
+
+fn class_method_insertion(
+    source: &str,
+    class_sym: &php_lsp_types::SymbolInfo,
+) -> Option<ClassMethodInsertion> {
+    let (closing_line, closing_col) = class_closing_brace_position(source, class_sym)?;
+    let utf16_index = Utf16LineIndex::new(source);
+    let position = Position::new(
+        closing_line,
+        utf16_index.byte_col_to_utf16(closing_line, closing_col),
+    );
+    let close_line = line_text(source, closing_line);
+    let close_indent = leading_ascii_whitespace(line_prefix_by_byte_col(close_line, closing_col));
+    let method_indent = format!("{}    ", close_indent);
+    let body_indent = format!("{}    ", method_indent);
+
+    Some(ClassMethodInsertion {
+        position,
+        method_indent,
+        body_indent,
+        needs_leading_blank: method_insertion_needs_leading_blank(
+            source,
+            closing_line,
+            closing_col,
+        ),
+    })
+}
+
+fn generated_methods_workspace_edit(
+    uri: Uri,
+    insertion: ClassMethodInsertion,
+    rendered_methods: Vec<String>,
+) -> WorkspaceEdit {
+    let mut new_text = String::new();
+    if insertion.needs_leading_blank {
+        new_text.push('\n');
+    }
+    for (idx, method) in rendered_methods.into_iter().enumerate() {
+        if idx > 0 {
+            new_text.push('\n');
+        }
+        new_text.push_str(&method);
+    }
+
+    let mut changes = HashMap::new();
+    changes.insert(
+        uri,
+        vec![TextEdit {
+            range: Range {
+                start: insertion.position,
+                end: insertion.position,
+            },
+            new_text,
+        }],
+    );
+
+    WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    }
+}
+
 fn implement_missing_methods_edit(
     uri: Uri,
     source: &str,
@@ -4053,50 +4261,439 @@ fn implement_missing_methods_edit(
         return Some(empty_workspace_edit());
     }
 
-    let (closing_line, closing_col) = class_closing_brace_position(source, class_sym)?;
-    let utf16_index = Utf16LineIndex::new(source);
-    let insert_position = Position::new(
-        closing_line,
-        utf16_index.byte_col_to_utf16(closing_line, closing_col),
-    );
-    let close_line = line_text(source, closing_line);
-    let close_indent = leading_ascii_whitespace(line_prefix_by_byte_col(close_line, closing_col));
-    let method_indent = format!("{}    ", close_indent);
-    let body_indent = format!("{}    ", method_indent);
+    let insertion = class_method_insertion(source, class_sym)?;
+    let rendered_methods = missing_methods
+        .iter()
+        .map(|method| {
+            render_missing_method_stub(
+                method,
+                &insertion.method_indent,
+                &insertion.body_indent,
+                php_version,
+            )
+        })
+        .collect();
 
-    let mut new_text = String::new();
-    if method_insertion_needs_leading_blank(source, closing_line, closing_col) {
-        new_text.push('\n');
-    }
-    for (idx, method) in missing_methods.iter().enumerate() {
-        if idx > 0 {
-            new_text.push('\n');
-        }
-        new_text.push_str(&render_missing_method_stub(
-            method,
-            &method_indent,
-            &body_indent,
-            php_version,
-        ));
-    }
-
-    let mut changes = HashMap::new();
-    changes.insert(
+    Some(generated_methods_workspace_edit(
         uri,
-        vec![TextEdit {
-            range: Range {
-                start: insert_position,
-                end: insert_position,
-            },
-            new_text,
-        }],
+        insertion,
+        rendered_methods,
+    ))
+}
+
+fn direct_property_symbols_from_file<'a>(
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    type_fqn: &str,
+) -> Vec<&'a php_lsp_types::SymbolInfo> {
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|sym| {
+            sym.kind == php_lsp_types::PhpSymbolKind::Property
+                && sym.parent_fqn.as_deref() == Some(type_fqn)
+        })
+        .collect()
+}
+
+fn property_symbol_at_range(
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&php_lsp_types::SymbolInfo> {
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Property)
+        .find(|sym| {
+            byte_range_contains(sym.range, range) || byte_ranges_overlap(sym.selection_range, range)
+        })
+}
+
+fn direct_method_name_exists(
+    file_symbols: &php_lsp_types::FileSymbols,
+    class_fqn: &str,
+    method_name: &str,
+) -> bool {
+    let wanted = normalized_method_name(method_name);
+    direct_method_symbols_from_file(file_symbols, class_fqn)
+        .iter()
+        .any(|method| normalized_method_name(&method.name) == wanted)
+}
+
+fn member_method_name_exists(index: &WorkspaceIndex, class_fqn: &str, method_name: &str) -> bool {
+    index
+        .resolve_member(&format!("{}::{}", class_fqn, method_name))
+        .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Method)
+}
+
+fn property_type_info(property: &php_lsp_types::SymbolInfo) -> Option<&php_lsp_types::TypeInfo> {
+    property
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.return_type.as_ref())
+}
+
+fn type_info_contains_bool(type_info: &php_lsp_types::TypeInfo) -> bool {
+    use php_lsp_types::TypeInfo;
+
+    match type_info {
+        TypeInfo::Simple(name) => matches!(name.to_ascii_lowercase().as_str(), "bool" | "boolean"),
+        TypeInfo::Nullable(inner) => type_info_contains_bool(inner),
+        TypeInfo::Union(types) => types.iter().any(type_info_contains_bool),
+        _ => false,
+    }
+}
+
+fn property_is_bool(property: &php_lsp_types::SymbolInfo) -> bool {
+    property_type_info(property).is_some_and(type_info_contains_bool)
+}
+
+fn studly_identifier(raw: &str) -> String {
+    let mut result = String::new();
+    for part in raw
+        .trim_start_matches('$')
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+    {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            result.extend(first.to_uppercase());
+            result.push_str(chars.as_str());
+        }
+    }
+
+    if result.is_empty() {
+        "Value".to_string()
+    } else {
+        result
+    }
+}
+
+fn bool_getter_name(property_name: &str) -> String {
+    let mut chars = property_name.chars();
+    let starts_with_is = chars.next() == Some('i')
+        && chars.next() == Some('s')
+        && chars.next().is_some_and(|ch| ch.is_ascii_uppercase());
+    if starts_with_is {
+        property_name.to_string()
+    } else {
+        format!("is{}", studly_identifier(property_name))
+    }
+}
+
+fn getter_name(property: &php_lsp_types::SymbolInfo) -> String {
+    if property_is_bool(property) {
+        bool_getter_name(&property.name)
+    } else {
+        format!("get{}", studly_identifier(&property.name))
+    }
+}
+
+fn setter_name(property: &php_lsp_types::SymbolInfo) -> String {
+    format!("set{}", studly_identifier(&property.name))
+}
+
+fn property_default_value(source: &str, property: &php_lsp_types::SymbolInfo) -> Option<String> {
+    let start = byte_offset_for_line_col(source, property.range.0, property.range.1)?;
+    let end = byte_offset_for_line_col(source, property.range.2, property.range.3)?;
+    let declaration = source.get(start..end)?;
+    let needle = format!("${}", property.name);
+    let name_start = declaration.find(&needle)?;
+    let after_name = declaration.get(name_start + needle.len()..)?;
+    let equals_offset = after_name.find('=')?;
+    let before_equals = after_name.get(..equals_offset)?;
+    if before_equals.contains(',') || before_equals.contains(';') {
+        return None;
+    }
+
+    let mut value = String::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in after_name[equals_offset + 1..].chars() {
+        if let Some(active_quote) = quote {
+            value.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                value.push(ch);
+            }
+            '(' => {
+                paren_depth += 1;
+                value.push(ch);
+            }
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                value.push(ch);
+            }
+            '[' => {
+                bracket_depth += 1;
+                value.push(ch);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                value.push(ch);
+            }
+            '{' => {
+                brace_depth += 1;
+                value.push(ch);
+            }
+            '}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                value.push(ch);
+            }
+            ',' | ';' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
+            _ => value.push(ch),
+        }
+    }
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+struct ConstructorProperty<'a> {
+    symbol: &'a php_lsp_types::SymbolInfo,
+    default_value: Option<String>,
+    param_default: Option<String>,
+}
+
+fn constructor_generation_properties<'a>(
+    source: &str,
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    class_fqn: &str,
+) -> Vec<ConstructorProperty<'a>> {
+    let mut properties: Vec<_> = direct_property_symbols_from_file(file_symbols, class_fqn)
+        .into_iter()
+        .filter(|property| !property.modifiers.is_static)
+        .map(|property| ConstructorProperty {
+            symbol: property,
+            default_value: property_default_value(source, property),
+            param_default: None,
+        })
+        .collect();
+
+    properties.sort_by_key(|property| property.symbol.selection_range);
+
+    let mut has_later_required = false;
+    for property in properties.iter_mut().rev() {
+        if let Some(default_value) = property.default_value.clone() {
+            if !has_later_required {
+                property.param_default = Some(default_value);
+            }
+        } else {
+            has_later_required = true;
+        }
+    }
+
+    properties
+}
+
+fn render_constructor_param(property: &ConstructorProperty<'_>, php_version: PhpVersion) -> String {
+    let mut text = String::new();
+    if let Some(type_info) = property_type_info(property.symbol) {
+        if let Some(type_text) =
+            native_type_hint_text(type_info, php_version, TypeHintPosition::Parameter)
+        {
+            text.push_str(&type_text);
+            text.push(' ');
+        }
+    }
+    text.push('$');
+    text.push_str(&property.symbol.name);
+    if let Some(default_value) = property.param_default.as_deref() {
+        text.push_str(" = ");
+        text.push_str(default_value);
+    }
+    text
+}
+
+fn render_constructor_method(
+    properties: &[ConstructorProperty<'_>],
+    method_indent: &str,
+    body_indent: &str,
+    php_version: PhpVersion,
+) -> String {
+    let params = properties
+        .iter()
+        .map(|property| render_constructor_param(property, php_version))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut text = String::new();
+    text.push_str(method_indent);
+    text.push_str("public function __construct(");
+    text.push_str(&params);
+    text.push_str(")\n");
+    text.push_str(method_indent);
+    text.push_str("{\n");
+    for property in properties {
+        text.push_str(body_indent);
+        text.push_str("$this->");
+        text.push_str(&property.symbol.name);
+        text.push_str(" = $");
+        text.push_str(&property.symbol.name);
+        text.push_str(";\n");
+    }
+    text.push_str(method_indent);
+    text.push_str("}\n");
+    text
+}
+
+fn render_accessor_method(
+    property: &php_lsp_types::SymbolInfo,
+    accessor_kind: AccessorKind,
+    method_name: &str,
+    method_indent: &str,
+    body_indent: &str,
+    php_version: PhpVersion,
+) -> String {
+    let is_static = property.modifiers.is_static;
+    let type_hint = property_type_info(property);
+    let mut text = String::new();
+    text.push_str(method_indent);
+    text.push_str("public ");
+    if is_static {
+        text.push_str("static ");
+    }
+    text.push_str("function ");
+    text.push_str(method_name);
+
+    match accessor_kind {
+        AccessorKind::Getter => {
+            text.push_str("()");
+            if let Some(return_type) = type_hint.and_then(|type_info| {
+                native_type_hint_text(type_info, php_version, TypeHintPosition::Return)
+            }) {
+                text.push_str(": ");
+                text.push_str(&return_type);
+            }
+            text.push('\n');
+            text.push_str(method_indent);
+            text.push_str("{\n");
+            text.push_str(body_indent);
+            text.push_str("return ");
+            if is_static {
+                text.push_str("self::$");
+            } else {
+                text.push_str("$this->");
+            }
+            text.push_str(&property.name);
+            text.push_str(";\n");
+            text.push_str(method_indent);
+            text.push_str("}\n");
+        }
+        AccessorKind::Setter => {
+            text.push('(');
+            if let Some(param_type) = type_hint.and_then(|type_info| {
+                native_type_hint_text(type_info, php_version, TypeHintPosition::Parameter)
+            }) {
+                text.push_str(&param_type);
+                text.push(' ');
+            }
+            text.push('$');
+            text.push_str(&property.name);
+            text.push_str("): void\n");
+            text.push_str(method_indent);
+            text.push_str("{\n");
+            text.push_str(body_indent);
+            if is_static {
+                text.push_str("self::$");
+            } else {
+                text.push_str("$this->");
+            }
+            text.push_str(&property.name);
+            text.push_str(" = $");
+            text.push_str(&property.name);
+            text.push_str(";\n");
+            text.push_str(method_indent);
+            text.push_str("}\n");
+        }
+    }
+
+    text
+}
+
+fn generate_constructor_edit(
+    uri: Uri,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    class_sym: &php_lsp_types::SymbolInfo,
+    php_version: PhpVersion,
+) -> Option<WorkspaceEdit> {
+    if direct_method_name_exists(file_symbols, &class_sym.fqn, "__construct") {
+        return Some(empty_workspace_edit());
+    }
+    let properties = constructor_generation_properties(source, file_symbols, &class_sym.fqn);
+    if properties.is_empty() {
+        return Some(empty_workspace_edit());
+    }
+
+    let insertion = class_method_insertion(source, class_sym)?;
+    let constructor = render_constructor_method(
+        &properties,
+        &insertion.method_indent,
+        &insertion.body_indent,
+        php_version,
+    );
+    Some(generated_methods_workspace_edit(
+        uri,
+        insertion,
+        vec![constructor],
+    ))
+}
+
+fn generate_accessor_edit(
+    uri: Uri,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    property: &php_lsp_types::SymbolInfo,
+    accessor_kind: AccessorKind,
+    method_name: &str,
+    php_version: PhpVersion,
+) -> Option<WorkspaceEdit> {
+    if accessor_kind == AccessorKind::Setter && property.modifiers.is_readonly {
+        return Some(empty_workspace_edit());
+    }
+
+    let class_fqn = property.parent_fqn.as_deref()?;
+    if direct_method_name_exists(file_symbols, class_fqn, method_name) {
+        return Some(empty_workspace_edit());
+    }
+
+    let class_sym = file_symbols
+        .symbols
+        .iter()
+        .find(|sym| sym.fqn == class_fqn && sym.kind == php_lsp_types::PhpSymbolKind::Class)?;
+    let insertion = class_method_insertion(source, class_sym)?;
+    let accessor = render_accessor_method(
+        property,
+        accessor_kind,
+        method_name,
+        &insertion.method_indent,
+        &insertion.body_indent,
+        php_version,
     );
 
-    Some(WorkspaceEdit {
-        changes: Some(changes),
-        document_changes: None,
-        change_annotations: None,
-    })
+    Some(generated_methods_workspace_edit(
+        uri,
+        insertion,
+        vec![accessor],
+    ))
 }
 
 fn semantic_tokens_legend() -> SemanticTokensLegend {
@@ -13869,12 +14466,17 @@ impl LanguageServer for PhpLspBackend {
             params.context.only.as_ref(),
             &CodeActionKind::REFACTOR_REWRITE,
         );
+        let wants_generate_members = code_action_kind_allowed(
+            params.context.only.as_ref(),
+            &CodeActionKind::REFACTOR_REWRITE,
+        );
         let wants_implement_missing_methods =
             code_action_kind_allowed(params.context.only.as_ref(), &CodeActionKind::QUICKFIX);
 
         if !wants_quickfix
             && !wants_organize_imports
             && !wants_add_return_type
+            && !wants_generate_members
             && !wants_implement_missing_methods
         {
             return Ok(Some(vec![]));
@@ -13885,7 +14487,13 @@ impl LanguageServer for PhpLspBackend {
         let php_version = *self.php_version.lock().await;
         let document_version = self.current_document_version(&uri_str);
 
-        let (source, file_symbols, add_return_type_actions, implement_missing_methods_actions) = {
+        let (
+            source,
+            file_symbols,
+            add_return_type_actions,
+            generate_member_actions,
+            implement_missing_methods_actions,
+        ) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(Some(vec![])),
@@ -13918,6 +14526,43 @@ impl LanguageServer for PhpLspBackend {
             } else {
                 Vec::new()
             };
+            let generate_member_actions = if wants_generate_members {
+                let range = lsp_range_to_byte_range(&source, params.range);
+                let mut actions = Vec::new();
+                if let Some(class_sym) = concrete_class_symbol_at_range(&file_symbols, range) {
+                    if let Some(action) = build_generate_constructor_action(
+                        uri.clone(),
+                        &source,
+                        &file_symbols,
+                        class_sym,
+                        params.range,
+                        document_version,
+                    ) {
+                        actions.push(action);
+                    }
+                }
+                if let Some(property) = property_symbol_at_range(&file_symbols, range) {
+                    let parent_is_class =
+                        property.parent_fqn.as_deref().is_some_and(|parent_fqn| {
+                            file_symbols.symbols.iter().any(|sym| {
+                                sym.fqn == parent_fqn
+                                    && sym.kind == php_lsp_types::PhpSymbolKind::Class
+                            })
+                        });
+                    if parent_is_class {
+                        actions.extend(build_generate_accessor_actions(
+                            uri.clone(),
+                            &self.index,
+                            property,
+                            params.range,
+                            document_version,
+                        ));
+                    }
+                }
+                actions
+            } else {
+                Vec::new()
+            };
             let implement_missing_methods_actions = if wants_implement_missing_methods {
                 let range = lsp_range_to_byte_range(&source, params.range);
                 concrete_class_symbol_at_range(&file_symbols, range)
@@ -13941,12 +14586,14 @@ impl LanguageServer for PhpLspBackend {
                 source,
                 file_symbols,
                 add_return_type_actions,
+                generate_member_actions,
                 implement_missing_methods_actions,
             )
         };
 
         let mut actions = Vec::new();
         actions.extend(add_return_type_actions);
+        actions.extend(generate_member_actions);
         actions.extend(implement_missing_methods_actions);
 
         if wants_organize_imports {
@@ -14167,6 +14814,120 @@ impl LanguageServer for PhpLspBackend {
                     &source,
                     class_sym,
                     &missing_methods,
+                    php_version,
+                )
+                .or_else(|| Some(empty_workspace_edit()));
+            }
+            (
+                CodeActionDataKind::GenerateConstructor,
+                CodeActionDataExtra::GenerateConstructor { class_fqn },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let (source, file_symbols) = match self.open_files.get(&uri) {
+                    Some(parser) => {
+                        let source = parser.source();
+                        let file_symbols = match parser.tree() {
+                            Some(tree) => self
+                                .index
+                                .file_symbols
+                                .get(&uri)
+                                .map(|entry| entry.value().clone())
+                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
+                            None => {
+                                params.edit = Some(empty_workspace_edit());
+                                return Ok(params);
+                            }
+                        };
+                        (source, file_symbols)
+                    }
+                    None => {
+                        params.edit = Some(empty_workspace_edit());
+                        return Ok(params);
+                    }
+                };
+
+                let Some(class_sym) = file_symbols.symbols.iter().find(|sym| {
+                    sym.fqn == class_fqn && sym.kind == php_lsp_types::PhpSymbolKind::Class
+                }) else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let php_version = *self.php_version.lock().await;
+                params.edit = generate_constructor_edit(
+                    uri_value,
+                    &source,
+                    &file_symbols,
+                    class_sym,
+                    php_version,
+                )
+                .or_else(|| Some(empty_workspace_edit()));
+            }
+            (
+                CodeActionDataKind::GenerateAccessor,
+                CodeActionDataExtra::GenerateAccessor {
+                    property_fqn,
+                    accessor_kind,
+                    method_name,
+                },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let (source, file_symbols) = match self.open_files.get(&uri) {
+                    Some(parser) => {
+                        let source = parser.source();
+                        let file_symbols = match parser.tree() {
+                            Some(tree) => self
+                                .index
+                                .file_symbols
+                                .get(&uri)
+                                .map(|entry| entry.value().clone())
+                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
+                            None => {
+                                params.edit = Some(empty_workspace_edit());
+                                return Ok(params);
+                            }
+                        };
+                        (source, file_symbols)
+                    }
+                    None => {
+                        params.edit = Some(empty_workspace_edit());
+                        return Ok(params);
+                    }
+                };
+
+                let Some(property) = file_symbols.symbols.iter().find(|sym| {
+                    sym.fqn == property_fqn && sym.kind == php_lsp_types::PhpSymbolKind::Property
+                }) else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let php_version = *self.php_version.lock().await;
+                params.edit = generate_accessor_edit(
+                    uri_value,
+                    &source,
+                    &file_symbols,
+                    property,
+                    accessor_kind,
+                    &method_name,
                     php_version,
                 )
                 .or_else(|| Some(empty_workspace_edit()));
