@@ -4147,8 +4147,123 @@ fn render_method_param(param: &php_lsp_types::ParamInfo, php_version: PhpVersion
     text
 }
 
+#[derive(Debug, Clone, Default)]
+struct MethodContractMetadata {
+    doc_comment: Option<String>,
+    attributes: Vec<String>,
+}
+
+fn method_attribute_bracket_delta(line: &str) -> isize {
+    let mut delta = 0isize;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '#' if chars.peek() == Some(&'[') => {
+                chars.next();
+                delta += 1;
+            }
+            '[' => delta += 1,
+            ']' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
+fn collect_attribute_groups(text: &str) -> Vec<String> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0isize;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if current.is_empty() {
+            if !trimmed.starts_with("#[") {
+                continue;
+            }
+            depth = 0;
+        }
+
+        current.push(trimmed.trim_end().to_string());
+        depth += method_attribute_bracket_delta(trimmed);
+        if depth <= 0 {
+            groups.push(current.join("\n"));
+            current.clear();
+            depth = 0;
+        }
+    }
+
+    groups
+}
+
+fn preceding_attribute_source(source: &str, method_start: usize) -> &str {
+    let search_start = source[..method_start]
+        .rfind("\n#[")
+        .map(|idx| idx + 1)
+        .or_else(|| source[..method_start].rfind("\n    #[").map(|idx| idx + 1))
+        .unwrap_or(method_start);
+    source.get(search_start..method_start).unwrap_or("")
+}
+
+fn method_contract_metadata(
+    method: &php_lsp_types::SymbolInfo,
+    declaration_source: Option<&str>,
+) -> MethodContractMetadata {
+    let Some(source) = declaration_source else {
+        return MethodContractMetadata {
+            doc_comment: method.doc_comment.clone(),
+            attributes: Vec::new(),
+        };
+    };
+    let Some(method_start) = byte_offset_for_line_col(source, method.range.0, method.range.1)
+    else {
+        return MethodContractMetadata {
+            doc_comment: method.doc_comment.clone(),
+            attributes: Vec::new(),
+        };
+    };
+    let Some(method_end) = byte_offset_for_line_col(source, method.range.2, method.range.3) else {
+        return MethodContractMetadata {
+            doc_comment: method.doc_comment.clone(),
+            attributes: Vec::new(),
+        };
+    };
+
+    let mut attribute_source = String::new();
+    if let Some((_, doc_end)) = symbol_doc_comment_span(source, method) {
+        attribute_source.push_str(source.get(doc_end..method_start).unwrap_or(""));
+    } else {
+        attribute_source.push_str(preceding_attribute_source(source, method_start));
+    }
+    if let Some(method_text) = source.get(method_start..method_end) {
+        if let Some(function_offset) = method_text.find("function") {
+            attribute_source.push_str(method_text.get(..function_offset).unwrap_or(""));
+        }
+    }
+
+    let mut attributes = collect_attribute_groups(&attribute_source);
+    attributes.sort();
+    attributes.dedup();
+
+    MethodContractMetadata {
+        doc_comment: method.doc_comment.clone(),
+        attributes,
+    }
+}
+
+fn render_reindented_block(block: &str, indent: &str) -> String {
+    let mut text = String::new();
+    for line in block.lines() {
+        text.push_str(indent);
+        text.push_str(line.trim_start());
+        text.push('\n');
+    }
+    text
+}
+
 fn render_missing_method_stub(
     method: &php_lsp_types::SymbolInfo,
+    metadata: Option<&MethodContractMetadata>,
     method_indent: &str,
     body_indent: &str,
     php_version: PhpVersion,
@@ -4174,6 +4289,18 @@ fn render_missing_method_stub(
         .join(", ");
 
     let mut text = String::new();
+    if let Some(metadata) = metadata {
+        if let Some(doc_comment) = metadata.doc_comment.as_deref() {
+            let content_lines = phpdoc_content_lines(doc_comment);
+            if !content_lines.is_empty() {
+                text.push_str(&render_phpdoc_comment(method_indent, &content_lines));
+                text.push('\n');
+            }
+        }
+        for attribute in &metadata.attributes {
+            text.push_str(&render_reindented_block(attribute, method_indent));
+        }
+    }
     text.push_str(method_indent);
     text.push_str(visibility);
     text.push(' ');
@@ -4352,6 +4479,7 @@ fn implement_missing_methods_edit(
     source: &str,
     class_sym: &php_lsp_types::SymbolInfo,
     missing_methods: &[Arc<php_lsp_types::SymbolInfo>],
+    metadata_by_fqn: &HashMap<String, MethodContractMetadata>,
     php_version: PhpVersion,
 ) -> Option<WorkspaceEdit> {
     if missing_methods.is_empty() {
@@ -4364,6 +4492,7 @@ fn implement_missing_methods_edit(
         .map(|method| {
             render_missing_method_stub(
                 method,
+                metadata_by_fqn.get(&method.fqn),
                 &insertion.method_indent,
                 &insertion.body_indent,
                 php_version,
@@ -16284,11 +16413,22 @@ impl LanguageServer for PhpLspBackend {
                 let php_version = *self.php_version.lock().await;
                 let missing_methods =
                     missing_implementation_methods(&self.index, &file_symbols, class_sym);
+                let mut metadata_by_fqn = HashMap::new();
+                for method in &missing_methods {
+                    let declaration_source = self
+                        .source_for_uri(&method.uri, "implement missing methods source read")
+                        .await;
+                    metadata_by_fqn.insert(
+                        method.fqn.clone(),
+                        method_contract_metadata(method, declaration_source.as_deref()),
+                    );
+                }
                 params.edit = implement_missing_methods_edit(
                     uri_value,
                     &source,
                     class_sym,
                     &missing_methods,
+                    &metadata_by_fqn,
                     php_version,
                 )
                 .or_else(|| Some(empty_workspace_edit()));

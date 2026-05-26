@@ -1327,6 +1327,21 @@ PR-052 ─→ PR-053
   - Regression: e2e covers interface methods, abstract parent methods, multiple interfaces, static/by-ref/variadic/default params, and inherited already implemented methods.
   - Validation: `cargo fmt --all --check`, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
+- [x] **IE-010S** Code action: implement missing methods Supported coverage *(done 2026-05-26)*
+  - Довести feature matrix для `textDocument/codeAction` implement missing methods до `Supported`.
+  - Переносить meaningful PHPDoc контракт из interface/abstract method в generated stub.
+  - Переносить method attributes из source declaration, когда это безопасно для concrete implementation.
+  - Сохранять analyzer-specific generic/template param/return metadata, если native signature его не выражает.
+  - Не генерировать invalid private abstract/interface methods; сохранять корректную public/protected visibility.
+  - Добавить regression tests на PHPDoc/attributes, generic PHPDoc metadata, defaults/by-ref/variadic/static, diamond duplicate requirements, and no action when already implemented.
+  - Implemented: generated stubs re-render inherited PHPDoc with target-class indentation.
+  - Implemented: generated stubs preserve analyzer-specific contract tags such as `@template`, refined `@param`, refined `@return`, `@throws`, and `@phpstan-return`.
+  - Implemented: generated stubs preserve method attributes attached to interface/abstract declarations.
+  - Implemented: resolve reads declaration sources from open files or disk to extract attribute metadata while keeping stale-version no-op behavior.
+  - Docs: `docs/lsp-features.md` now marks implement missing methods as `Supported`.
+  - Regression: e2e covers interface/abstract PHPDoc and attributes, generic/analyzer metadata, native-safe signatures, static/by-ref/variadic/default params, inherited concrete method suppression, and no action when all methods are implemented.
+  - Validation: `cargo fmt --all --check`, targeted implement-missing e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
+
 - [x] **IE-011** Code actions: generate constructor, getters, setters *(done 2026-05-26)*
   - Generate constructor для non-static properties без existing `__construct`.
   - Учитывать readonly/promoted properties и nullable/default values.

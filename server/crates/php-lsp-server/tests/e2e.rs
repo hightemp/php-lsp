@@ -4361,17 +4361,62 @@ interface CountableThing extends Logger
     public function count(): int;
 }
 
+interface RepositoryContract
+{
+    /**
+     * Find entity by id.
+     *
+     * @template T of object
+     * @param positive-int $id Entity id.
+     * @return T|null Entity or null.
+     * @throws \RuntimeException
+     * @phpstan-return T|null
+     */
+    #[Audit('read')]
+    public function find(int $id): ?object;
+}
+
 abstract class Base
 {
     public function log(string $message): void
     {
     }
 
+    /**
+     * Build base value.
+     *
+     * @param int $value Base value.
+     * @return non-empty-string|null
+     */
+    #[BaseContract]
     abstract protected function base(int $value = 0): ?string;
 }
 
-class Demo extends Base implements CountableThing, Factory
+class Demo extends Base implements CountableThing, Factory, RepositoryContract
 {
+}
+
+class Complete extends Base implements CountableThing, Factory, RepositoryContract
+{
+    protected function base(int $value = 0): ?string
+    {
+        return null;
+    }
+
+    public function count(): int
+    {
+        return 0;
+    }
+
+    public static function make(?string &$name, int ...$ids): array
+    {
+        return [];
+    }
+
+    public function find(int $id): ?object
+    {
+        return null;
+    }
 }
 "#;
     let uri = "file:///test/ImplementMissingMethods.php";
@@ -4387,7 +4432,7 @@ class Demo extends Base implements CountableThing, Factory
         .ready()
         .await
         .unwrap()
-        .call(code_action_request(2, uri, 28, 0, 28, 0, json!([])))
+        .call(code_action_request(2, uri, 49, 0, 49, 0, json!([])))
         .await
         .unwrap();
     let result = extract_result(resp);
@@ -4396,7 +4441,7 @@ class Demo extends Base implements CountableThing, Factory
         .iter()
         .find(|action| {
             action.get("title").and_then(|value| value.as_str())
-                == Some("Implement 3 missing methods")
+                == Some("Implement 4 missing methods")
         })
         .cloned()
         .unwrap_or_else(|| panic!("expected implement missing methods action, got: {}", result));
@@ -4429,8 +4474,27 @@ class Demo extends Base implements CountableThing, Factory
         new_text
     );
     assert!(
+        new_text.contains("Build base value.")
+            && new_text.contains("@return non-empty-string|null")
+            && new_text.contains("#[BaseContract]"),
+        "expected abstract parent PHPDoc and attribute metadata, got: {}",
+        new_text
+    );
+    assert!(
         new_text.contains("public function count(): int"),
         "expected interface method stub, got: {}",
+        new_text
+    );
+    assert!(
+        new_text.contains("Find entity by id.")
+            && new_text.contains("@template T of object")
+            && new_text.contains("@param positive-int $id Entity id.")
+            && new_text.contains("@return T|null Entity or null.")
+            && new_text.contains("@throws \\RuntimeException")
+            && new_text.contains("@phpstan-return T|null")
+            && new_text.contains("#[Audit('read')]")
+            && new_text.contains("public function find(int $id): ?object"),
+        "expected interface PHPDoc, analyzer metadata, attribute, and native-safe signature, got: {}",
         new_text
     );
     assert!(
@@ -4447,6 +4511,27 @@ class Demo extends Base implements CountableThing, Factory
         new_text.contains("throw new \\BadMethodCallException('Not implemented yet.');"),
         "expected safe throwing body, got: {}",
         new_text
+    );
+
+    let complete_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(4, uri, 53, 0, 53, 0, json!([])))
+        .await
+        .unwrap();
+    let complete_result = extract_result(complete_resp);
+    assert!(
+        !complete_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(|action| action
+                .get("title")
+                .and_then(|value| value.as_str())
+                .is_some_and(|title| title.starts_with("Implement "))),
+        "complete implementation should not offer implement-missing action, got: {}",
+        complete_result
     );
 
     service
