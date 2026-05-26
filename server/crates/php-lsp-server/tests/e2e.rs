@@ -662,6 +662,30 @@ fn extract_result(response: Option<tower_lsp::jsonrpc::Response>) -> serde_json:
     serialized.get("result").cloned().unwrap_or(json!(null))
 }
 
+fn inlay_hint_label_text(hint: &serde_json::Value) -> Option<String> {
+    let label = hint.get("label")?;
+    if let Some(label) = label.as_str() {
+        return Some(label.to_string());
+    }
+    label.as_array().map(|parts| {
+        parts
+            .iter()
+            .filter_map(|part| part.get("value").and_then(|value| value.as_str()))
+            .collect::<String>()
+    })
+}
+
+fn inlay_hint_has_label_part_location(hint: &serde_json::Value, value: &str) -> bool {
+    hint.get("label")
+        .and_then(|label| label.as_array())
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("value").and_then(|value| value.as_str()) == Some(value)
+                    && part.get("location").is_some()
+            })
+        })
+}
+
 /// Helper to extract the "error.message" field from a JSON-RPC response.
 fn extract_error_message(response: Option<tower_lsp::jsonrpc::Response>) -> Option<String> {
     let resp = response?;
@@ -3257,6 +3281,20 @@ class Repository {
     public function find(): User { return new User(); }
 }
 
+class PortingProcess {}
+
+class PortingRequest {
+    public function getPortingProcess(): ?PortingProcess { return new PortingProcess(); }
+}
+
+abstract class SoapHandler {
+    protected function ensureProcessCreated(): ?PortingProcess { return new PortingProcess(); }
+}
+
+abstract class BaseHandler extends SoapHandler {
+    protected function updatePortingProcess(): bool { return true; }
+}
+
 function run(Repository $repo): void {
     $created = new User();
     $found = $repo->find();
@@ -3266,6 +3304,14 @@ function run(Repository $repo): void {
         $copy = $item;
     }
     $count = 1;
+}
+
+class CdbHandler extends BaseHandler {
+    public function handle(PortingRequest $portingRequest): void {
+        $portingProcess = $portingRequest->getPortingProcess();
+        $recipientProcess = $this->ensureProcessCreated();
+        $recipientProcessUpdated = $this->updatePortingProcess();
+    }
 }
 "#;
     let uri = "file:///test/local-variable-inlay-hints.php";
@@ -3282,30 +3328,77 @@ function run(Repository $repo): void {
         .ready()
         .await
         .unwrap()
-        .call(inlay_hint_request(2, uri, 0, 0, 22, 0))
+        .call(inlay_hint_request(2, uri, 0, 0, 45, 0))
         .await
         .unwrap();
     let result = extract_result(response);
     let hints = result.as_array().expect("expected inlay hint array");
-    let labels: Vec<&str> = hints
-        .iter()
-        .filter_map(|hint| hint.get("label").and_then(|label| label.as_str()))
-        .collect();
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
 
     assert!(
-        labels.iter().filter(|label| **label == ": User").count() >= 3,
+        labels
+            .iter()
+            .filter(|label| label.as_str() == ": User")
+            .count()
+            >= 3,
         "expected User local variable type hints, got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&": array<int, User>"),
+        labels.iter().any(|label| label == ": array<int, User>"),
         "expected PHPDoc generic local variable type hint, got: {:?}",
         labels
     );
     assert!(
-        !labels.contains(&": int"),
+        labels.iter().any(|label| label == ": ?PortingProcess"),
+        "expected nullable PortingProcess method-return hint, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == ": bool"),
+        "expected bool method-return hint, got: {:?}",
+        labels
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": bool")
+                && hint
+                    .get("tooltip")
+                    .and_then(|tooltip| tooltip.as_str())
+                    .is_some_and(|tooltip| tooltip.contains("bool"))
+        }),
+        "expected bool local variable hint tooltip to include the inferred type: {}",
+        result
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": ?PortingProcess")
+                && hint
+                    .get("tooltip")
+                    .and_then(|tooltip| tooltip.as_str())
+                    .is_some_and(|tooltip| tooltip.contains("App\\PortingProcess"))
+        }),
+        "expected PortingProcess local variable hint tooltip to include the target FQN: {}",
+        result
+    );
+    assert!(
+        !labels.iter().any(|label| label == ": int"),
         "scalar assignment should not produce a noisy local variable hint: {:?}",
         labels
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|hint| inlay_hint_has_label_part_location(hint, "User")),
+        "expected object local variable hint label to include a navigable User location: {}",
+        result
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|hint| inlay_hint_has_label_part_location(hint, "PortingProcess")),
+        "expected nullable PortingProcess hint label to include a navigable type location: {}",
+        result
     );
 
     service

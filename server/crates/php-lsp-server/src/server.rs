@@ -9595,6 +9595,7 @@ fn collect_call_argument_inlay_hints(
         node.kind(),
         "function_call_expression"
             | "member_call_expression"
+            | "nullsafe_member_call_expression"
             | "scoped_call_expression"
             | "object_creation_expression"
     ) {
@@ -9639,7 +9640,9 @@ fn call_target_name_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
         "function_call_expression" => node
             .child_by_field_name("function")
             .or_else(|| node.named_child(0)),
-        "member_call_expression" | "scoped_call_expression" => member_reference_name_node(node),
+        "member_call_expression" | "nullsafe_member_call_expression" | "scoped_call_expression" => {
+            member_reference_name_node(node)
+        }
         "object_creation_expression" => object_creation_class_node(node),
         _ => None,
     }
@@ -9744,7 +9747,7 @@ fn add_assignment_variable_type_inlay_hint(
         return;
     }
 
-    add_local_variable_type_inlay_hint(ctx, left, right.end_byte(), hints, seen);
+    add_local_variable_type_inlay_hint(ctx, left, right.end_byte(), Some(right), hints, seen);
 }
 
 fn add_foreach_variable_type_inlay_hint(
@@ -9760,33 +9763,29 @@ fn add_foreach_variable_type_inlay_hint(
         return;
     }
 
-    add_local_variable_type_inlay_hint(ctx, value_node, value_node.end_byte(), hints, seen);
+    add_local_variable_type_inlay_hint(ctx, value_node, value_node.end_byte(), None, hints, seen);
+}
+
+#[derive(Debug, Clone)]
+struct LocalVariableInlayType {
+    display: String,
+    target_fqn: Option<String>,
 }
 
 fn add_local_variable_type_inlay_hint(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
     usage_start: usize,
+    rhs_node: Option<tree_sitter::Node>,
     hints: &mut Vec<InlayHint>,
     seen: &mut HashSet<(u32, u32, String)>,
 ) {
     let Some(variable_name) = variable_text_for_node(ctx.source, variable_node) else {
         return;
     };
-    let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
-    };
-    let Some(info) = infer_variable_hover_info_at_node(
-        variable_node,
-        ctx.source,
-        ctx.file_symbols,
-        usage_start,
-        &variable_name,
-        Some(&resolver),
-    ) else {
-        return;
-    };
-    let Some(label_type) = local_variable_inlay_type_label(&info, ctx.file_symbols) else {
+    let Some(type_hint) =
+        local_variable_inlay_type(ctx, variable_node, usage_start, &variable_name, rhs_node)
+    else {
         return;
     };
 
@@ -9796,23 +9795,139 @@ fn add_local_variable_type_inlay_hint(
         ctx.utf16_index
             .byte_col_to_utf16(end.row as u32, end.column as u32),
     );
-    let label = format!(": {}", label_type);
-    if !seen.insert((position.line, position.character, label.clone())) {
+    let label_text = format!(": {}", type_hint.display);
+    if !seen.insert((position.line, position.character, label_text)) {
         return;
     }
 
     hints.push(InlayHint {
         position,
-        label: InlayHintLabel::String(label),
+        label: local_variable_inlay_label(ctx, &type_hint),
         kind: Some(InlayHintKind::TYPE),
         text_edits: None,
-        tooltip: Some(InlayHintTooltip::String(
-            "Inferred local variable type".to_string(),
-        )),
+        tooltip: Some(InlayHintTooltip::String(local_variable_inlay_tooltip(
+            &type_hint,
+        ))),
         padding_left: Some(false),
         padding_right: Some(true),
         data: None,
     });
+}
+
+fn local_variable_inlay_type(
+    ctx: &InlayHintContext<'_>,
+    variable_node: tree_sitter::Node,
+    usage_start: usize,
+    variable_name: &str,
+    rhs_node: Option<tree_sitter::Node>,
+) -> Option<LocalVariableInlayType> {
+    if let Some(type_hint) =
+        rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
+    {
+        return Some(type_hint);
+    }
+
+    let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
+    };
+    let info = infer_variable_hover_info_at_node(
+        variable_node,
+        ctx.source,
+        ctx.file_symbols,
+        usage_start,
+        variable_name,
+        Some(&resolver),
+    )?;
+
+    local_variable_inlay_type_from_hover_info(&info, ctx.file_symbols)
+}
+
+fn local_variable_inlay_type_from_expression(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<LocalVariableInlayType> {
+    let expression = normalized_expression_node(expression);
+    match expression.kind() {
+        "object_creation_expression" => {
+            local_variable_inlay_type_from_new_expression(ctx, expression)
+        }
+        "function_call_expression"
+        | "member_call_expression"
+        | "nullsafe_member_call_expression"
+        | "scoped_call_expression" => {
+            local_variable_inlay_type_from_call_expression(ctx, expression)
+        }
+        "variable_name" => local_variable_inlay_type_from_variable_expression(ctx, expression),
+        _ => None,
+    }
+}
+
+fn local_variable_inlay_type_from_new_expression(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<LocalVariableInlayType> {
+    let class_node = object_creation_class_node(expression)?;
+    let class_name = node_text(ctx.source, class_node).trim();
+    let fqn = resolve_class_name_pub(class_name, ctx.file_symbols)
+        .trim_start_matches('\\')
+        .to_string();
+    if fqn.is_empty() {
+        return None;
+    }
+
+    Some(LocalVariableInlayType {
+        display: shorten_inlay_type_display(&fqn, ctx.file_symbols),
+        target_fqn: Some(fqn),
+    })
+}
+
+fn local_variable_inlay_type_from_call_expression(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<LocalVariableInlayType> {
+    let name_node = call_target_name_node(expression)?;
+    let (sym_at_pos, symbol) = resolve_reference_symbol_at_node(
+        ctx.tree,
+        ctx.source,
+        name_node,
+        ctx.file_symbols,
+        ctx.index,
+    )?;
+    if !matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+    ) {
+        return None;
+    }
+
+    let return_type = symbol.signature.as_ref()?.return_type.as_ref()?;
+    let owner_fqn = sym_at_pos
+        .fqn
+        .rsplit_once("::")
+        .map(|(owner, _)| owner)
+        .or(symbol.parent_fqn.as_deref())
+        .unwrap_or_default();
+    local_variable_inlay_type_from_type_info(ctx, owner_fqn, &symbol.uri, return_type, true)
+}
+
+fn local_variable_inlay_type_from_variable_expression(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<LocalVariableInlayType> {
+    let variable_name = variable_text_for_node(ctx.source, expression)?;
+    let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
+    };
+    let info = infer_variable_hover_info_at_node(
+        expression,
+        ctx.source,
+        ctx.file_symbols,
+        expression.start_byte(),
+        &variable_name,
+        Some(&resolver),
+    )?;
+
+    local_variable_inlay_type_from_hover_info(&info, ctx.file_symbols)
 }
 
 fn is_plain_assignment_expression(
@@ -9856,10 +9971,10 @@ fn variable_node_in_foreach_part_for_inlay<'tree>(
     None
 }
 
-fn local_variable_inlay_type_label(
+fn local_variable_inlay_type_from_hover_info(
     info: &php_lsp_parser::resolve::VariableHoverInfo,
     file_symbols: &php_lsp_types::FileSymbols,
-) -> Option<String> {
+) -> Option<LocalVariableInlayType> {
     let display = info
         .type_display
         .as_deref()
@@ -9869,7 +9984,246 @@ fn local_variable_inlay_type_label(
         return None;
     }
 
-    Some(shorten_inlay_type_display(display, file_symbols))
+    let target_fqn = info.resolved_type_fqn.as_ref().and_then(|fqn| {
+        type_display_has_single_object_target(display).then(|| {
+            fqn.trim_start_matches('\\')
+                .trim_start_matches('?')
+                .to_string()
+        })
+    });
+
+    Some(LocalVariableInlayType {
+        display: shorten_inlay_type_display(display, file_symbols),
+        target_fqn,
+    })
+}
+
+fn local_variable_inlay_type_from_type_info(
+    ctx: &InlayHintContext<'_>,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+    allow_scalar: bool,
+) -> Option<LocalVariableInlayType> {
+    if !is_explicit_local_variable_type_hint(type_info) {
+        return None;
+    }
+
+    let display =
+        local_variable_type_info_display(ctx.index, owner_fqn, uri, type_info, ctx.file_symbols);
+    if display.trim().is_empty()
+        || (!allow_scalar && !is_useful_local_variable_type_hint(display.as_str()))
+    {
+        return None;
+    }
+
+    Some(LocalVariableInlayType {
+        display,
+        target_fqn: single_inlay_target_fqn_from_type_info(ctx.index, owner_fqn, uri, type_info),
+    })
+}
+
+fn local_variable_type_info_display(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> String {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            local_variable_simple_type_display(index, owner_fqn, uri, name, file_symbols)
+        }
+        php_lsp_types::TypeInfo::Generic { base, args } => {
+            let base =
+                local_variable_simple_type_display(index, owner_fqn, uri, base, file_symbols);
+            let args = args
+                .iter()
+                .map(|arg| {
+                    local_variable_type_info_display(index, owner_fqn, uri, arg, file_symbols)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{base}<{args}>")
+        }
+        php_lsp_types::TypeInfo::Union(types) => types
+            .iter()
+            .map(|type_info| {
+                local_variable_type_info_display(index, owner_fqn, uri, type_info, file_symbols)
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
+        php_lsp_types::TypeInfo::Intersection(types) => types
+            .iter()
+            .map(|type_info| {
+                local_variable_type_info_display(index, owner_fqn, uri, type_info, file_symbols)
+            })
+            .collect::<Vec<_>>()
+            .join("&"),
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            format!(
+                "?{}",
+                local_variable_type_info_display(index, owner_fqn, uri, inner, file_symbols)
+            )
+        }
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
+            shorten_inlay_type_display(owner_fqn, file_symbols)
+        }
+        php_lsp_types::TypeInfo::Parent_ => "parent".to_string(),
+        php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::Callable { .. }
+        | php_lsp_types::TypeInfo::ClassString(_)
+        | php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull
+        | php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed => type_info.to_string(),
+    }
+}
+
+fn local_variable_simple_type_display(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    name: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> String {
+    let name = name.trim();
+    let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+    if matches!(lower.as_str(), "self" | "static") && !owner_fqn.is_empty() {
+        return shorten_inlay_type_display(owner_fqn, file_symbols);
+    }
+    if lower == "parent" {
+        return "parent".to_string();
+    }
+    if is_builtin_type_name(name) {
+        return name.trim_start_matches('\\').to_string();
+    }
+
+    simple_type_fqn_from_index(index, uri, name)
+        .map(|fqn| shorten_inlay_type_display(&fqn, file_symbols))
+        .unwrap_or_else(|| shorten_inlay_type_display(name, file_symbols))
+}
+
+fn single_inlay_target_fqn_from_type_info(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> Option<String> {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+            if matches!(lower.as_str(), "self" | "static") && !owner_fqn.is_empty() {
+                return Some(owner_fqn.trim_start_matches('\\').to_string());
+            }
+            if lower == "parent" || is_builtin_type_name(name) {
+                return None;
+            }
+            simple_type_fqn_from_index(index, uri, name)
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            single_inlay_target_fqn_from_type_info(index, owner_fqn, uri, inner)
+        }
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_
+            if !owner_fqn.is_empty() =>
+        {
+            Some(owner_fqn.trim_start_matches('\\').to_string())
+        }
+        _ => None,
+    }
+}
+
+fn is_explicit_local_variable_type_hint(type_info: &php_lsp_types::TypeInfo) -> bool {
+    match type_info {
+        php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed
+        | php_lsp_types::TypeInfo::LiteralNull => false,
+        php_lsp_types::TypeInfo::Simple(name) => {
+            let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+            !matches!(lower.as_str(), "mixed" | "void" | "never" | "null")
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => is_explicit_local_variable_type_hint(inner),
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            types.iter().any(is_explicit_local_variable_type_hint)
+        }
+        _ => true,
+    }
+}
+
+fn type_display_has_single_object_target(display: &str) -> bool {
+    let display = display.trim().trim_start_matches('?');
+    !display.is_empty()
+        && !display.contains(['<', '>', '{', '}', '|', '&', '(', ')', ',', ' '])
+        && !is_scalar_local_variable_type_hint(display)
+}
+
+fn local_variable_inlay_label(
+    ctx: &InlayHintContext<'_>,
+    type_hint: &LocalVariableInlayType,
+) -> InlayHintLabel {
+    if let Some(location) = type_hint
+        .target_fqn
+        .as_deref()
+        .and_then(|fqn| location_for_inlay_type_fqn(ctx.index, fqn))
+    {
+        let mut parts = vec![InlayHintLabelPart {
+            value: ": ".to_string(),
+            ..Default::default()
+        }];
+        let clickable_value = if let Some(rest) = type_hint.display.strip_prefix('?') {
+            parts.push(InlayHintLabelPart {
+                value: "?".to_string(),
+                ..Default::default()
+            });
+            rest.to_string()
+        } else {
+            type_hint.display.clone()
+        };
+
+        parts.push(InlayHintLabelPart {
+            value: clickable_value,
+            tooltip: type_hint
+                .target_fqn
+                .as_ref()
+                .map(|fqn| InlayHintLabelPartTooltip::String(fqn.clone())),
+            location: Some(location),
+            command: None,
+        });
+
+        return InlayHintLabel::LabelParts(parts);
+    }
+
+    InlayHintLabel::String(format!(": {}", type_hint.display))
+}
+
+fn local_variable_inlay_tooltip(type_hint: &LocalVariableInlayType) -> String {
+    let type_text = type_hint
+        .target_fqn
+        .as_deref()
+        .unwrap_or(type_hint.display.as_str());
+    format!("Inferred local variable type: {type_text}")
+}
+
+fn location_for_inlay_type_fqn(index: &WorkspaceIndex, fqn: &str) -> Option<Location> {
+    let symbol = index.resolve_fqn(fqn.trim_start_matches('\\'))?;
+    if !matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+    ) {
+        return None;
+    }
+    Some(Location::new(
+        symbol.uri.parse::<Uri>().ok()?,
+        range_from_tuple(symbol.selection_range),
+    ))
 }
 
 fn shorten_inlay_type_display(display: &str, file_symbols: &php_lsp_types::FileSymbols) -> String {

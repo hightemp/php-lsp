@@ -1716,6 +1716,35 @@ PR-052 ─→ PR-053
     `cargo test --all`, `cargo fmt --all --check`,
     `cargo clippy --all-targets -- -D warnings`.
 
+- [x] **IE-032B** Inlay hints: real-project method-return types and clickable labels *(done 2026-05-26)*
+  - Reproduce missing local variable type hints from
+    `/home/apanov/Projects/bdpn-ui/app/src/Soap/Inbound/Handler/CdbHandler.php`.
+  - Fix assignments such as `$portingProcess = $portingRequest->getPortingProcess();`
+    where the RHS method return type is known through indexed project symbols
+    but the local file fallback does not carry the full return `TypeInfo`.
+  - Use `InlayHintLabelPart` for object-like local variable type hints when the
+    target class can be resolved, so clients can navigate from the hint label to
+    the type definition where supported.
+  - Keep string labels for generic/shape/scalar-safe hints that do not have one
+    unambiguous class location.
+  - Add regression coverage using a fixture modeled after the real
+    `PortingProcess` / `RecipientProcess` assignments.
+  - Implemented: local variable assignment hints now prefer exact RHS
+    expression return types from indexed function/method symbols before falling
+    back to local variable hover inference.
+  - Implemented: explicit scalar method returns such as `bool` can now be shown
+    without re-enabling noisy literal assignment hints such as `$count = 1`.
+  - Implemented: object-like type hints use `InlayHintLabelPart` with a
+    definition `location` and label-part tooltip when the target type has one
+    unambiguous indexed class/interface/trait/enum symbol.
+  - Implemented: local variable type hint tooltips now include the concrete
+    inferred type text or target FQN.
+  - Regression: e2e covers `?PortingProcess` and `bool` method-return hints
+    plus navigable label parts for `User` and `PortingProcess`.
+  - Validation: `cargo test -p php-lsp-server --test e2e test_inlay_hints`,
+    `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
+
 - [ ] **IE-033** Shape-aware completion and definition
   - Array shape keys from PHPDoc/literal arrays should appear in `$arr['...']` completion.
   - Object shape properties should appear in `$obj->...` where modeled.
