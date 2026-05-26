@@ -292,6 +292,7 @@ Fix dry-run mode:
 - Exit code `0` means no edits would be produced, `1` means execution or
   configuration error, and `2` means edits would be produced.
 - The fix command does not run project formatters.
+- CI and local example scripts are documented in [CLI And CI Usage](docs/cli-ci.md).
 
 ## Commands
 
@@ -310,6 +311,8 @@ The extension contributes these VS Code commands:
   cache model, diagnostics pipeline, and runtime configuration behavior.
 - [Configuration](docs/configuration.md): `.php-lsp.toml` discovery,
   precedence, schema, and examples.
+- [CLI and CI usage](docs/cli-ci.md): GitHub Actions reporting and local CLI
+  examples.
 - [LSP feature matrix](docs/lsp-features.md): supported, partial, and
   unsupported LSP behavior.
 - [Performance guide](docs/performance.md): baseline methodology, profiling

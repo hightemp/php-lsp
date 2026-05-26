@@ -9,6 +9,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VSIX="${1:-}"
 
 if [[ -z "$VSIX" ]]; then
@@ -209,6 +211,10 @@ assert.strictEqual(typeof extensionModule.activate, "function", "extension.js mu
 assert.strictEqual(typeof extensionModule.deactivate, "function", "extension.js must export deactivate()");
 
 const context = {
+  extension: {
+    packageJSON: packageJson,
+  },
+  extensionPath: extensionRoot,
   asAbsolutePath(relativePath) {
     return path.join(extensionRoot, relativePath);
   },
@@ -220,3 +226,13 @@ Promise.resolve(extensionModule.deactivate()).then(() => {
   console.log("VSIX smoke test passed");
 });
 NODE
+
+if [[ "$(uname -s)" == "Linux" ]] && grep -Fxq "extension/bin/linux-x64/php-lsp" "$CONTENTS"; then
+    unzip -q "$VSIX" extension/bin/linux-x64/php-lsp -d "$TMP_DIR"
+    chmod +x "$TMP_DIR/extension/bin/linux-x64/php-lsp"
+    "$REPO_ROOT/scripts/smoke-cli.sh" \
+        "$TMP_DIR/extension/bin/linux-x64/php-lsp" \
+        "$REPO_ROOT/test-fixtures/basic"
+else
+    echo "Skipping packaged binary CLI smoke on $(uname -s)"
+fi

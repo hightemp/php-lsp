@@ -1587,11 +1587,29 @@ PR-052 ─→ PR-053
     formatter provider is advertised.
   - Validation: docs Cyrillic check for public English docs, `git diff --check`.
 
-- [ ] **IE-024** CI интеграция для CLI
+- [x] **IE-024** CI интеграция для CLI *(done 2026-05-26)*
   - Добавить docs на английском: пример GitHub Actions `php-lsp analyze`.
   - Добавить package smoke, что binary subcommands работают в release build.
   - Не включать CLI analyze в текущий project CI как required gate до стабилизации false positives.
   - Добавить scripts/examples для локального запуска на fixture и anonymized large workspace.
+  - Implemented: `docs/cli-ci.md` with a report-only GitHub Actions example for
+    `php-lsp analyze --format github`, including exit-code behavior and
+    guidance to keep `continue-on-error` until diagnostics are stable.
+  - Implemented: `scripts/smoke-cli.sh` to smoke an existing release binary
+    through `--version`, top-level help, `analyze --help`, `fix --help`,
+    `init-config`, real JSON `analyze`, and JSON `fix --dry-run`.
+  - Implemented: `scripts/smoke-vsix.sh` now extracts the packaged
+    `linux-x64` binary on Linux and runs the CLI smoke against the VSIX payload;
+    the existing VS Code activation smoke now supplies `context.extension`.
+  - Implemented: `scripts/examples/run-cli-analyze-fixture.sh` and
+    `scripts/examples/run-cli-analyze-large-workspace.sh`; the large-workspace
+    script writes an anonymized JSON report.
+  - Preserved: current project CI does not run `php-lsp analyze` as a required
+    gate.
+  - Validation: shell syntax checks, release binary build, `scripts/smoke-cli.sh`
+    on `test-fixtures/basic`, both example scripts, single-platform VSIX package
+    smoke with CLI payload check, docs Cyrillic check, `cargo fmt --all --check`,
+    `git diff --check`.
 
 ### Неделя 4: deep type intelligence (2026-06-29 → 2026-07-05)
 
