@@ -3511,6 +3511,9 @@ enum CodeActionDataKind {
     ImplementMissingMethods,
     GenerateConstructor,
     GenerateAccessor,
+    ChangeVisibility,
+    PromoteConstructorParameter,
+    UpdatePhpDoc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3540,6 +3543,16 @@ enum CodeActionDataExtra {
         property_fqn: String,
         accessor_kind: AccessorKind,
         method_name: String,
+    },
+    ChangeVisibility {
+        symbol_fqn: String,
+        target_visibility: php_lsp_types::Visibility,
+    },
+    PromoteConstructorParameter {
+        property_fqn: String,
+    },
+    UpdatePhpDoc {
+        symbol_fqn: String,
     },
 }
 
@@ -3756,6 +3769,90 @@ fn build_generate_accessor_actions(
     }
 
     actions
+}
+
+fn visibility_text(visibility: php_lsp_types::Visibility) -> &'static str {
+    match visibility {
+        php_lsp_types::Visibility::Public => "public",
+        php_lsp_types::Visibility::Protected => "protected",
+        php_lsp_types::Visibility::Private => "private",
+    }
+}
+
+fn member_symbol_at_range(
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&php_lsp_types::SymbolInfo> {
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|sym| {
+            matches!(
+                sym.kind,
+                php_lsp_types::PhpSymbolKind::Method
+                    | php_lsp_types::PhpSymbolKind::Property
+                    | php_lsp_types::PhpSymbolKind::ClassConstant
+            )
+        })
+        .find(|sym| {
+            byte_range_contains(sym.range, range) || byte_ranges_overlap(sym.selection_range, range)
+        })
+}
+
+fn symbol_supports_visibility_change(symbol: &php_lsp_types::SymbolInfo) -> bool {
+    matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Method
+            | php_lsp_types::PhpSymbolKind::Property
+            | php_lsp_types::PhpSymbolKind::ClassConstant
+    ) && !symbol.modifiers.is_builtin
+}
+
+fn build_change_visibility_actions(
+    uri: Uri,
+    symbol: &php_lsp_types::SymbolInfo,
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Vec<CodeActionOrCommand> {
+    if !symbol_supports_visibility_change(symbol) {
+        return Vec::new();
+    }
+
+    [
+        php_lsp_types::Visibility::Public,
+        php_lsp_types::Visibility::Protected,
+        php_lsp_types::Visibility::Private,
+    ]
+    .into_iter()
+    .filter(|visibility| *visibility != symbol.visibility)
+    .filter_map(|target_visibility| {
+        let data = serde_json::to_value(CodeActionData {
+            action_kind: CodeActionDataKind::ChangeVisibility,
+            uri: uri.as_str().to_string(),
+            range: request_range,
+            document_version,
+            extra: CodeActionDataExtra::ChangeVisibility {
+                symbol_fqn: symbol.fqn.clone(),
+                target_visibility,
+            },
+        })
+        .ok()?;
+
+        Some(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!(
+                "Change visibility to {}",
+                visibility_text(target_visibility)
+            ),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            diagnostics: None,
+            edit: None,
+            command: None,
+            is_preferred: Some(false),
+            disabled: None,
+            data: Some(data),
+        }))
+    })
+    .collect()
 }
 
 fn concrete_class_symbol_at_range(
@@ -4694,6 +4791,1018 @@ fn generate_accessor_edit(
         insertion,
         vec![accessor],
     ))
+}
+
+fn lsp_range_for_byte_offsets(source: &str, start: usize, end: usize) -> Range {
+    let (start_line, start_byte_col) = line_col_for_byte_offset(source, start);
+    let (end_line, end_byte_col) = line_col_for_byte_offset(source, end);
+    let utf16_index = Utf16LineIndex::new(source);
+    Range {
+        start: Position::new(
+            start_line,
+            utf16_index.byte_col_to_utf16(start_line, start_byte_col),
+        ),
+        end: Position::new(
+            end_line,
+            utf16_index.byte_col_to_utf16(end_line, end_byte_col),
+        ),
+    }
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn find_visibility_token(
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Option<(usize, usize)> {
+    let start = byte_offset_for_line_col(source, symbol.range.0, symbol.range.1)?;
+    let end = byte_offset_for_line_col(source, symbol.range.2, symbol.range.3)?;
+    let text = source.get(start..end)?;
+    for keyword in ["public", "protected", "private"] {
+        let mut search_offset = 0usize;
+        while let Some(relative) = text.get(search_offset..)?.find(keyword) {
+            let token_start = search_offset + relative;
+            let token_end = token_start + keyword.len();
+            let before = token_start
+                .checked_sub(1)
+                .and_then(|idx| text.as_bytes().get(idx))
+                .copied();
+            let after = text.as_bytes().get(token_end).copied();
+            if before.is_none_or(|byte| !is_ident_byte(byte))
+                && after.is_none_or(|byte| !is_ident_byte(byte))
+            {
+                return Some((start + token_start, start + token_end));
+            }
+            search_offset = token_end;
+        }
+    }
+    None
+}
+
+fn change_visibility_edit(
+    uri: Uri,
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    target_visibility: php_lsp_types::Visibility,
+) -> Option<WorkspaceEdit> {
+    if !symbol_supports_visibility_change(symbol) || symbol.visibility == target_visibility {
+        return Some(empty_workspace_edit());
+    }
+
+    let (start, end, new_text) =
+        if let Some((token_start, token_end)) = find_visibility_token(source, symbol) {
+            (
+                token_start,
+                token_end,
+                visibility_text(target_visibility).to_string(),
+            )
+        } else {
+            let insert_at = byte_offset_for_line_col(source, symbol.range.0, symbol.range.1)?;
+            (
+                insert_at,
+                insert_at,
+                format!("{} ", visibility_text(target_visibility)),
+            )
+        };
+
+    let mut changes = HashMap::new();
+    changes.insert(
+        uri,
+        vec![TextEdit {
+            range: lsp_range_for_byte_offsets(source, start, end),
+            new_text,
+        }],
+    );
+
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    })
+}
+
+fn line_full_span(source: &str, start: usize, end: usize) -> (usize, usize) {
+    let line_start = source[..start].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let line_end = source[end..]
+        .find('\n')
+        .map(|idx| end + idx + 1)
+        .unwrap_or(source.len());
+    (line_start, line_end)
+}
+
+fn find_matching_delimiter(
+    text: &str,
+    open_offset: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in text
+        .char_indices()
+        .skip_while(|(idx, _)| *idx < open_offset)
+    {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            _ if ch == open => depth += 1,
+            _ if ch == close => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_spans(text: &str, base_offset: usize) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                spans.push((base_offset + start, base_offset + idx));
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    spans.push((base_offset + start, base_offset + text.len()));
+    spans
+}
+
+fn variable_name_in_parameter(param_text: &str) -> Option<String> {
+    let bytes = param_text.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'$' {
+            let start = idx + 1;
+            let mut end = start;
+            while end < bytes.len() && is_ident_byte(bytes[end]) {
+                end += 1;
+            }
+            if end > start {
+                return Some(param_text[start..end].to_string());
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn constructor_symbol<'a>(
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    class_fqn: &str,
+) -> Option<&'a php_lsp_types::SymbolInfo> {
+    direct_method_symbols_from_file(file_symbols, class_fqn)
+        .into_iter()
+        .find(|method| method.name.eq_ignore_ascii_case("__construct"))
+}
+
+#[derive(Clone)]
+struct ConstructorParamSpan {
+    name: String,
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+fn constructor_param_spans(
+    source: &str,
+    constructor: &php_lsp_types::SymbolInfo,
+) -> Option<Vec<ConstructorParamSpan>> {
+    let start = byte_offset_for_line_col(source, constructor.range.0, constructor.range.1)?;
+    let end = byte_offset_for_line_col(source, constructor.range.2, constructor.range.3)?;
+    let method_text = source.get(start..end)?;
+    let open_relative = method_text.find('(')?;
+    let close_relative = find_matching_delimiter(method_text, open_relative, '(', ')')?;
+    let params_start = start + open_relative + 1;
+    let params_end = start + close_relative;
+    let params_text = source.get(params_start..params_end)?;
+
+    Some(
+        split_top_level_spans(params_text, params_start)
+            .into_iter()
+            .filter_map(|(span_start, span_end)| {
+                let raw = source.get(span_start..span_end)?;
+                let text = raw.trim();
+                if text.is_empty() {
+                    return None;
+                }
+                let leading_ws = raw.len().saturating_sub(raw.trim_start().len());
+                let trailing_ws = raw.len().saturating_sub(raw.trim_end().len());
+                let trimmed_start = span_start + leading_ws;
+                let trimmed_end = span_end.saturating_sub(trailing_ws);
+                Some(ConstructorParamSpan {
+                    name: variable_name_in_parameter(text)?,
+                    start: trimmed_start,
+                    end: trimmed_end,
+                    text: text.to_string(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn constructor_body_span(
+    source: &str,
+    constructor: &php_lsp_types::SymbolInfo,
+) -> Option<(usize, usize)> {
+    let start = byte_offset_for_line_col(source, constructor.range.0, constructor.range.1)?;
+    let end = byte_offset_for_line_col(source, constructor.range.2, constructor.range.3)?;
+    let method_text = source.get(start..end)?;
+    let open_paren = method_text.find('(')?;
+    let close_paren = find_matching_delimiter(method_text, open_paren, '(', ')')?;
+    let after_params = method_text.get(close_paren..)?;
+    let open_brace_relative = after_params.find('{')? + close_paren;
+    let close_brace_relative = find_matching_delimiter(method_text, open_brace_relative, '{', '}')?;
+    Some((
+        start + open_brace_relative + 1,
+        start + close_brace_relative,
+    ))
+}
+
+fn property_declaration_is_safe_to_remove(
+    source: &str,
+    property: &php_lsp_types::SymbolInfo,
+) -> bool {
+    if property.doc_comment.is_some() {
+        return false;
+    }
+    let Some(start) = byte_offset_for_line_col(source, property.range.0, property.range.1) else {
+        return false;
+    };
+    let Some(end) = byte_offset_for_line_col(source, property.range.2, property.range.3) else {
+        return false;
+    };
+    let Some(text) = source.get(start..end) else {
+        return false;
+    };
+    if text.contains("#[") {
+        return false;
+    }
+    let before_semicolon = text
+        .split_once(';')
+        .map(|(before, _)| before)
+        .unwrap_or(text);
+    !before_semicolon.contains(',')
+}
+
+fn property_promotion_prefix(property: &php_lsp_types::SymbolInfo) -> String {
+    let mut parts = vec![visibility_text(property.visibility)];
+    if property.modifiers.is_readonly {
+        parts.push("readonly");
+    }
+    parts.join(" ")
+}
+
+fn parameter_is_already_promoted(param_text: &str) -> bool {
+    let before_var = param_text.split('$').next().unwrap_or("");
+    before_var
+        .split_whitespace()
+        .any(|part| matches!(part, "public" | "protected" | "private"))
+}
+
+fn find_constructor_assignment_line(
+    source: &str,
+    constructor: &php_lsp_types::SymbolInfo,
+    property_name: &str,
+) -> Option<(usize, usize)> {
+    let (body_start, body_end) = constructor_body_span(source, constructor)?;
+    let body = source.get(body_start..body_end)?;
+    let expected = format!("$this->{} = ${};", property_name, property_name);
+    let mut matches = Vec::new();
+    let mut cursor = body_start;
+    for line in body.split_inclusive('\n') {
+        let line_start = cursor;
+        let line_end = cursor + line.len();
+        cursor = line_end;
+        let trimmed = line.trim();
+        if trimmed == expected {
+            matches.push((line_start, line_end));
+        } else if trimmed.contains(&format!("$this->{}", property_name)) && trimmed.contains('=') {
+            return None;
+        }
+    }
+
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
+struct PromoteConstructorParameterPlan {
+    property_delete: (usize, usize),
+    param_replace: (usize, usize, String),
+    assignment_delete: (usize, usize),
+}
+
+fn promote_constructor_parameter_plan(
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    property: &php_lsp_types::SymbolInfo,
+) -> Option<PromoteConstructorParameterPlan> {
+    if property.kind != php_lsp_types::PhpSymbolKind::Property
+        || property.modifiers.is_static
+        || !property_declaration_is_safe_to_remove(source, property)
+    {
+        return None;
+    }
+    let class_fqn = property.parent_fqn.as_deref()?;
+    let constructor = constructor_symbol(file_symbols, class_fqn)?;
+    let param = constructor_param_spans(source, constructor)?
+        .into_iter()
+        .find(|param| param.name == property.name)?;
+    if parameter_is_already_promoted(&param.text) {
+        return None;
+    }
+
+    let property_start = byte_offset_for_line_col(source, property.range.0, property.range.1)?;
+    let property_end = byte_offset_for_line_col(source, property.range.2, property.range.3)?;
+    let property_delete = line_full_span(source, property_start, property_end);
+    let assignment_delete = find_constructor_assignment_line(source, constructor, &property.name)?;
+    let promoted_param = format!("{} {}", property_promotion_prefix(property), param.text);
+
+    Some(PromoteConstructorParameterPlan {
+        property_delete,
+        param_replace: (param.start, param.end, promoted_param),
+        assignment_delete,
+    })
+}
+
+fn property_for_constructor_param_at_range<'a>(
+    source: &str,
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&'a php_lsp_types::SymbolInfo> {
+    let point = byte_offset_for_line_col(source, range.0, range.1)?;
+    for class_sym in file_symbols
+        .symbols
+        .iter()
+        .filter(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Class)
+    {
+        let Some(constructor) = constructor_symbol(file_symbols, &class_sym.fqn) else {
+            continue;
+        };
+        let Some(param) = constructor_param_spans(source, constructor).and_then(|params| {
+            params
+                .into_iter()
+                .find(|param| point >= param.start && point <= param.end)
+        }) else {
+            continue;
+        };
+        if let Some(property) = direct_property_symbols_from_file(file_symbols, &class_sym.fqn)
+            .into_iter()
+            .find(|property| property.name == param.name)
+        {
+            return Some(property);
+        }
+    }
+    None
+}
+
+fn build_promote_constructor_parameter_action(
+    uri: Uri,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    property: &php_lsp_types::SymbolInfo,
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Option<CodeActionOrCommand> {
+    promote_constructor_parameter_plan(source, file_symbols, property)?;
+    let data = serde_json::to_value(CodeActionData {
+        action_kind: CodeActionDataKind::PromoteConstructorParameter,
+        uri: uri.as_str().to_string(),
+        range: request_range,
+        document_version,
+        extra: CodeActionDataExtra::PromoteConstructorParameter {
+            property_fqn: property.fqn.clone(),
+        },
+    })
+    .ok()?;
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Promote constructor parameter `${}`", property.name),
+        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+        diagnostics: None,
+        edit: None,
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: Some(data),
+    }))
+}
+
+fn promote_constructor_parameter_edit(
+    uri: Uri,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    property: &php_lsp_types::SymbolInfo,
+) -> Option<WorkspaceEdit> {
+    let plan = promote_constructor_parameter_plan(source, file_symbols, property)?;
+    let mut edits = vec![
+        TextEdit {
+            range: lsp_range_for_byte_offsets(source, plan.param_replace.0, plan.param_replace.1),
+            new_text: plan.param_replace.2,
+        },
+        TextEdit {
+            range: lsp_range_for_byte_offsets(
+                source,
+                plan.assignment_delete.0,
+                plan.assignment_delete.1,
+            ),
+            new_text: String::new(),
+        },
+        TextEdit {
+            range: lsp_range_for_byte_offsets(
+                source,
+                plan.property_delete.0,
+                plan.property_delete.1,
+            ),
+            new_text: String::new(),
+        },
+    ];
+    edits.sort_by(|left, right| {
+        (right.range.start.line, right.range.start.character)
+            .cmp(&(left.range.start.line, left.range.start.character))
+    });
+
+    let mut changes = HashMap::new();
+    changes.insert(uri, edits);
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    })
+}
+
+fn callable_symbol_at_range(
+    file_symbols: &php_lsp_types::FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&php_lsp_types::SymbolInfo> {
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|sym| {
+            matches!(
+                sym.kind,
+                php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+            ) && !sym.modifiers.is_builtin
+        })
+        .find(|sym| {
+            byte_range_contains(sym.range, range) || byte_ranges_overlap(sym.selection_range, range)
+        })
+}
+
+#[derive(Clone)]
+struct DesiredPhpDocParam {
+    name: String,
+    type_text: String,
+    variable_text: String,
+    description: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum PhpDocReturnUpdate {
+    Preserve,
+    Remove,
+    Replace(String),
+}
+
+struct UpdatePhpDocPlan {
+    start: usize,
+    end: usize,
+    new_text: String,
+}
+
+fn phpdoc_line_starts_with_tag(line: &str, tag: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix(tag) else {
+        return false;
+    };
+    rest.is_empty() || rest.chars().next().is_some_and(|ch| ch.is_whitespace())
+}
+
+fn phpdoc_line_is_tag(line: &str) -> bool {
+    line.trim_start().starts_with('@')
+}
+
+fn phpdoc_content_lines(doc_comment: &str) -> Vec<String> {
+    let raw_lines: Vec<&str> = doc_comment.lines().collect();
+    let mut lines = Vec::new();
+
+    for raw in raw_lines.iter() {
+        let trimmed_start = raw.trim_start();
+        if let Some(rest) = trimmed_start.strip_prefix("/**") {
+            let rest = rest.trim_start();
+            let rest = rest.strip_suffix("*/").map(str::trim_end).unwrap_or(rest);
+            if !rest.is_empty() {
+                lines.push(rest.to_string());
+            }
+            continue;
+        }
+
+        if trimmed_start.starts_with("*/") {
+            continue;
+        }
+
+        if let Some(rest) = trimmed_start.strip_prefix('*') {
+            lines.push(
+                rest.strip_prefix(' ')
+                    .unwrap_or(rest)
+                    .trim_end()
+                    .to_string(),
+            );
+        } else {
+            lines.push(trimmed_start.trim_end().to_string());
+        }
+    }
+
+    lines
+}
+
+fn normalize_phpdoc_content_lines(lines: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut previous_blank = true;
+
+    for line in lines {
+        let line = line.trim_end().to_string();
+        let is_blank = line.trim().is_empty();
+        if is_blank {
+            if !previous_blank {
+                out.push(String::new());
+            }
+            previous_blank = true;
+        } else {
+            out.push(line);
+            previous_blank = false;
+        }
+    }
+
+    while out.last().is_some_and(|line| line.trim().is_empty()) {
+        out.pop();
+    }
+
+    out
+}
+
+fn phpdoc_managed_insert_index(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .position(|line| phpdoc_line_is_tag(line))
+        .unwrap_or(lines.len())
+}
+
+fn render_phpdoc_param_line(param: &DesiredPhpDocParam) -> String {
+    let mut line = format!(
+        "@param {} {}",
+        param.type_text.trim(),
+        param.variable_text.trim()
+    );
+    if let Some(description) = param.description.as_deref().filter(|desc| !desc.is_empty()) {
+        line.push(' ');
+        line.push_str(description);
+    }
+    line
+}
+
+fn render_managed_phpdoc_lines(
+    params: &[DesiredPhpDocParam],
+    return_update: &PhpDocReturnUpdate,
+) -> Vec<String> {
+    let mut lines = params
+        .iter()
+        .map(render_phpdoc_param_line)
+        .collect::<Vec<_>>();
+    if let PhpDocReturnUpdate::Replace(return_type) = return_update {
+        lines.push(format!("@return {}", return_type));
+    }
+    lines
+}
+
+fn update_phpdoc_content_lines(
+    existing_lines: Vec<String>,
+    managed_lines: Vec<String>,
+    manage_return: bool,
+) -> Vec<String> {
+    let mut filtered = Vec::new();
+    let mut insert_at = None;
+
+    for line in existing_lines {
+        let managed = phpdoc_line_starts_with_tag(&line, "@param")
+            || (manage_return && phpdoc_line_starts_with_tag(&line, "@return"));
+        if managed {
+            if insert_at.is_none() {
+                insert_at = Some(filtered.len());
+            }
+            continue;
+        }
+        filtered.push(line);
+    }
+
+    let insert_at = insert_at.unwrap_or_else(|| phpdoc_managed_insert_index(&filtered));
+    let mut out = Vec::new();
+    out.extend(filtered[..insert_at].iter().cloned());
+    if !managed_lines.is_empty() {
+        if out.last().is_some_and(|line| !line.trim().is_empty()) {
+            out.push(String::new());
+        }
+        out.extend(managed_lines);
+    }
+    out.extend(filtered[insert_at..].iter().cloned());
+
+    normalize_phpdoc_content_lines(out)
+}
+
+fn render_phpdoc_comment(indent: &str, content_lines: &[String]) -> String {
+    let mut text = String::new();
+    text.push_str(indent);
+    text.push_str("/**\n");
+    for line in content_lines {
+        text.push_str(indent);
+        if line.trim().is_empty() {
+            text.push_str(" *\n");
+        } else {
+            text.push_str(" * ");
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    text.push_str(indent);
+    text.push_str(" */");
+    text
+}
+
+fn line_start_offset(source: &str, offset: usize) -> usize {
+    source[..offset].rfind('\n').map(|idx| idx + 1).unwrap_or(0)
+}
+
+fn line_end_offset(source: &str, offset: usize) -> usize {
+    source[offset..]
+        .find('\n')
+        .map(|idx| offset + idx)
+        .unwrap_or(source.len())
+}
+
+fn line_indent_at_offset(source: &str, offset: usize) -> String {
+    let line_start = line_start_offset(source, offset);
+    let line_end = line_end_offset(source, line_start);
+    leading_ascii_whitespace(source.get(line_start..line_end).unwrap_or(""))
+}
+
+fn symbol_doc_comment_span(
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Option<(usize, usize)> {
+    let doc_comment = symbol.doc_comment.as_deref()?;
+    let declaration_start = byte_offset_for_line_col(source, symbol.range.0, symbol.range.1)?;
+    let search = source.get(..declaration_start)?;
+    let start = search.rfind(doc_comment)?;
+    Some((start, start + doc_comment.len()))
+}
+
+fn symbol_has_native_return_type(source: &str, symbol: &php_lsp_types::SymbolInfo) -> bool {
+    if !matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+    ) {
+        return false;
+    }
+
+    let Some(start) = byte_offset_for_line_col(source, symbol.range.0, symbol.range.1) else {
+        return false;
+    };
+    let Some(end) = byte_offset_for_line_col(source, symbol.range.2, symbol.range.3) else {
+        return false;
+    };
+    let Some(text) = source.get(start..end) else {
+        return false;
+    };
+    let Some(open_paren) = text.find('(') else {
+        return false;
+    };
+    let Some(close_paren) = find_matching_delimiter(text, open_paren, '(', ')') else {
+        return false;
+    };
+    text.get(close_paren + 1..)
+        .is_some_and(|after_params| after_params.trim_start().starts_with(':'))
+}
+
+fn phpdoc_return_update(source: &str, symbol: &php_lsp_types::SymbolInfo) -> PhpDocReturnUpdate {
+    if !symbol_has_native_return_type(source, symbol) {
+        return PhpDocReturnUpdate::Preserve;
+    }
+
+    match symbol
+        .signature
+        .as_ref()
+        .and_then(|sig| sig.return_type.as_ref())
+    {
+        Some(php_lsp_types::TypeInfo::Void) => PhpDocReturnUpdate::Remove,
+        Some(return_type) => PhpDocReturnUpdate::Replace(return_type.to_string()),
+        None => PhpDocReturnUpdate::Preserve,
+    }
+}
+
+fn phpdoc_param_variable_text(param: &php_lsp_types::ParamInfo) -> String {
+    let mut text = String::new();
+    if param.is_by_ref {
+        text.push('&');
+    }
+    if param.is_variadic {
+        text.push_str("...");
+    }
+    text.push('$');
+    text.push_str(&param.name);
+    text
+}
+
+fn desired_phpdoc_params(
+    signature: &php_lsp_types::Signature,
+    existing_doc: Option<&php_lsp_types::PhpDoc>,
+) -> Vec<DesiredPhpDocParam> {
+    let has_native_param_types = signature
+        .params
+        .iter()
+        .any(|param| param.type_info.is_some());
+    let has_existing_param_tags = existing_doc.is_some_and(|doc| !doc.params.is_empty());
+    if !has_existing_param_tags && !has_native_param_types {
+        return Vec::new();
+    }
+
+    let mut existing_by_name = HashMap::new();
+    if let Some(doc) = existing_doc {
+        for param in &doc.params {
+            existing_by_name.entry(param.name.clone()).or_insert(param);
+        }
+    }
+
+    signature
+        .params
+        .iter()
+        .map(|param| {
+            let existing = existing_by_name.get(&param.name).copied();
+            let type_text = param
+                .type_info
+                .as_ref()
+                .map(ToString::to_string)
+                .or_else(|| {
+                    existing
+                        .and_then(|doc_param| doc_param.type_info.as_ref())
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_else(|| "mixed".to_string());
+
+            DesiredPhpDocParam {
+                name: param.name.clone(),
+                type_text,
+                variable_text: phpdoc_param_variable_text(param),
+                description: existing.and_then(|doc_param| doc_param.description.clone()),
+            }
+        })
+        .collect()
+}
+
+fn phpdoc_params_need_update(
+    existing_doc: Option<&php_lsp_types::PhpDoc>,
+    desired_params: &[DesiredPhpDocParam],
+) -> bool {
+    let Some(existing_doc) = existing_doc else {
+        return !desired_params.is_empty();
+    };
+    if existing_doc.params.len() != desired_params.len() {
+        return true;
+    }
+
+    existing_doc
+        .params
+        .iter()
+        .zip(desired_params.iter())
+        .any(|(existing, desired)| {
+            existing.name != desired.name
+                || existing
+                    .type_info
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref()
+                    != Some(desired.type_text.as_str())
+        })
+}
+
+fn phpdoc_return_needs_update(
+    existing_doc: Option<&php_lsp_types::PhpDoc>,
+    return_update: &PhpDocReturnUpdate,
+) -> bool {
+    match return_update {
+        PhpDocReturnUpdate::Preserve => false,
+        PhpDocReturnUpdate::Remove => existing_doc.is_some_and(|doc| doc.return_type.is_some()),
+        PhpDocReturnUpdate::Replace(return_type) => {
+            existing_doc
+                .and_then(|doc| doc.return_type.as_ref())
+                .map(ToString::to_string)
+                .as_deref()
+                != Some(return_type.as_str())
+        }
+    }
+}
+
+fn update_phpdoc_existing_plan(
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    desired_params: &[DesiredPhpDocParam],
+    return_update: &PhpDocReturnUpdate,
+) -> Option<UpdatePhpDocPlan> {
+    let doc_comment = symbol.doc_comment.as_deref()?;
+    let (doc_start, doc_end) = symbol_doc_comment_span(source, symbol)?;
+    let manage_return = !matches!(return_update, PhpDocReturnUpdate::Preserve);
+    let managed_lines = render_managed_phpdoc_lines(desired_params, return_update);
+    let content_lines = update_phpdoc_content_lines(
+        phpdoc_content_lines(doc_comment),
+        managed_lines,
+        manage_return,
+    );
+
+    let line_start = line_start_offset(source, doc_start);
+    let line_end = line_end_offset(source, doc_end);
+    let line_prefix = source.get(line_start..doc_start).unwrap_or("");
+    let line_suffix = source.get(doc_end..line_end).unwrap_or("");
+    let starts_standalone = line_prefix.trim().is_empty();
+    let ends_standalone = line_suffix.trim().is_empty();
+
+    if content_lines.is_empty() {
+        let (start, end) = if starts_standalone && ends_standalone {
+            line_full_span(source, doc_start, doc_end)
+        } else {
+            (doc_start, doc_end)
+        };
+        return Some(UpdatePhpDocPlan {
+            start,
+            end,
+            new_text: String::new(),
+        });
+    }
+
+    let start = if starts_standalone {
+        line_start
+    } else {
+        doc_start
+    };
+    let indent = if starts_standalone { line_prefix } else { "" };
+
+    Some(UpdatePhpDocPlan {
+        start,
+        end: doc_end,
+        new_text: render_phpdoc_comment(indent, &content_lines),
+    })
+}
+
+fn update_phpdoc_create_plan(
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    desired_params: &[DesiredPhpDocParam],
+    return_update: &PhpDocReturnUpdate,
+) -> Option<UpdatePhpDocPlan> {
+    let managed_lines = render_managed_phpdoc_lines(desired_params, return_update);
+    if managed_lines.is_empty() {
+        return None;
+    }
+
+    let declaration_start = byte_offset_for_line_col(source, symbol.range.0, symbol.range.1)?;
+    let insert_at = line_start_offset(source, declaration_start);
+    let indent = line_indent_at_offset(source, declaration_start);
+    let mut new_text = render_phpdoc_comment(&indent, &managed_lines);
+    new_text.push('\n');
+
+    Some(UpdatePhpDocPlan {
+        start: insert_at,
+        end: insert_at,
+        new_text,
+    })
+}
+
+fn update_phpdoc_from_signature_plan(
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Option<UpdatePhpDocPlan> {
+    if !matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+    ) || symbol.modifiers.is_builtin
+    {
+        return None;
+    }
+
+    let signature = symbol.signature.as_ref()?;
+    let existing_doc = symbol.doc_comment.as_deref().map(parse_phpdoc);
+    let desired_params = desired_phpdoc_params(signature, existing_doc.as_ref());
+    let return_update = phpdoc_return_update(source, symbol);
+    let params_need_update = phpdoc_params_need_update(existing_doc.as_ref(), &desired_params);
+    let return_needs_update = phpdoc_return_needs_update(existing_doc.as_ref(), &return_update);
+
+    if !params_need_update && !return_needs_update {
+        return None;
+    }
+
+    if symbol.doc_comment.is_some() {
+        update_phpdoc_existing_plan(source, symbol, &desired_params, &return_update)
+    } else {
+        update_phpdoc_create_plan(source, symbol, &desired_params, &return_update)
+    }
+}
+
+fn build_update_phpdoc_from_signature_action(
+    uri: Uri,
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    request_range: Range,
+    document_version: Option<i32>,
+) -> Option<CodeActionOrCommand> {
+    update_phpdoc_from_signature_plan(source, symbol)?;
+    let data = serde_json::to_value(CodeActionData {
+        action_kind: CodeActionDataKind::UpdatePhpDoc,
+        uri: uri.as_str().to_string(),
+        range: request_range,
+        document_version,
+        extra: CodeActionDataExtra::UpdatePhpDoc {
+            symbol_fqn: symbol.fqn.clone(),
+        },
+    })
+    .ok()?;
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: "Update PHPDoc from signature".to_string(),
+        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+        diagnostics: None,
+        edit: None,
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: Some(data),
+    }))
+}
+
+fn update_phpdoc_from_signature_edit(
+    uri: Uri,
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Option<WorkspaceEdit> {
+    let plan = update_phpdoc_from_signature_plan(source, symbol)?;
+    let mut changes = HashMap::new();
+    changes.insert(
+        uri,
+        vec![TextEdit {
+            range: lsp_range_for_byte_offsets(source, plan.start, plan.end),
+            new_text: plan.new_text,
+        }],
+    );
+
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    })
 }
 
 fn semantic_tokens_legend() -> SemanticTokensLegend {
@@ -14529,6 +15638,16 @@ impl LanguageServer for PhpLspBackend {
             let generate_member_actions = if wants_generate_members {
                 let range = lsp_range_to_byte_range(&source, params.range);
                 let mut actions = Vec::new();
+                let visibility_symbol = property_symbol_at_range(&file_symbols, range)
+                    .or_else(|| member_symbol_at_range(&file_symbols, range));
+                if let Some(symbol) = visibility_symbol {
+                    actions.extend(build_change_visibility_actions(
+                        uri.clone(),
+                        symbol,
+                        params.range,
+                        document_version,
+                    ));
+                }
                 if let Some(class_sym) = concrete_class_symbol_at_range(&file_symbols, range) {
                     if let Some(action) = build_generate_constructor_action(
                         uri.clone(),
@@ -14557,6 +15676,33 @@ impl LanguageServer for PhpLspBackend {
                             params.range,
                             document_version,
                         ));
+                    }
+                }
+                let promote_property =
+                    property_symbol_at_range(&file_symbols, range).or_else(|| {
+                        property_for_constructor_param_at_range(&source, &file_symbols, range)
+                    });
+                if let Some(property) = promote_property {
+                    if let Some(action) = build_promote_constructor_parameter_action(
+                        uri.clone(),
+                        &source,
+                        &file_symbols,
+                        property,
+                        params.range,
+                        document_version,
+                    ) {
+                        actions.push(action);
+                    }
+                }
+                if let Some(symbol) = callable_symbol_at_range(&file_symbols, range) {
+                    if let Some(action) = build_update_phpdoc_from_signature_action(
+                        uri.clone(),
+                        &source,
+                        symbol,
+                        params.range,
+                        document_version,
+                    ) {
+                        actions.push(action);
                     }
                 }
                 actions
@@ -14931,6 +16077,158 @@ impl LanguageServer for PhpLspBackend {
                     php_version,
                 )
                 .or_else(|| Some(empty_workspace_edit()));
+            }
+            (
+                CodeActionDataKind::ChangeVisibility,
+                CodeActionDataExtra::ChangeVisibility {
+                    symbol_fqn,
+                    target_visibility,
+                },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let (source, file_symbols) = match self.open_files.get(&uri) {
+                    Some(parser) => {
+                        let source = parser.source();
+                        let file_symbols = match parser.tree() {
+                            Some(tree) => self
+                                .index
+                                .file_symbols
+                                .get(&uri)
+                                .map(|entry| entry.value().clone())
+                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
+                            None => {
+                                params.edit = Some(empty_workspace_edit());
+                                return Ok(params);
+                            }
+                        };
+                        (source, file_symbols)
+                    }
+                    None => {
+                        params.edit = Some(empty_workspace_edit());
+                        return Ok(params);
+                    }
+                };
+
+                let Some(symbol) = file_symbols
+                    .symbols
+                    .iter()
+                    .find(|sym| sym.fqn == symbol_fqn)
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                params.edit = change_visibility_edit(uri_value, &source, symbol, target_visibility)
+                    .or_else(|| Some(empty_workspace_edit()));
+            }
+            (
+                CodeActionDataKind::PromoteConstructorParameter,
+                CodeActionDataExtra::PromoteConstructorParameter { property_fqn },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let (source, file_symbols) = match self.open_files.get(&uri) {
+                    Some(parser) => {
+                        let source = parser.source();
+                        let file_symbols = match parser.tree() {
+                            Some(tree) => self
+                                .index
+                                .file_symbols
+                                .get(&uri)
+                                .map(|entry| entry.value().clone())
+                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
+                            None => {
+                                params.edit = Some(empty_workspace_edit());
+                                return Ok(params);
+                            }
+                        };
+                        (source, file_symbols)
+                    }
+                    None => {
+                        params.edit = Some(empty_workspace_edit());
+                        return Ok(params);
+                    }
+                };
+
+                let Some(property) = file_symbols.symbols.iter().find(|sym| {
+                    sym.fqn == property_fqn && sym.kind == php_lsp_types::PhpSymbolKind::Property
+                }) else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                params.edit =
+                    promote_constructor_parameter_edit(uri_value, &source, &file_symbols, property)
+                        .or_else(|| Some(empty_workspace_edit()));
+            }
+            (
+                CodeActionDataKind::UpdatePhpDoc,
+                CodeActionDataExtra::UpdatePhpDoc { symbol_fqn },
+            ) => {
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
+
+                let Ok(uri_value) = uri.parse::<Uri>() else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                let (source, file_symbols) = match self.open_files.get(&uri) {
+                    Some(parser) => {
+                        let source = parser.source();
+                        let file_symbols = match parser.tree() {
+                            Some(tree) => self
+                                .index
+                                .file_symbols
+                                .get(&uri)
+                                .map(|entry| entry.value().clone())
+                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
+                            None => {
+                                params.edit = Some(empty_workspace_edit());
+                                return Ok(params);
+                            }
+                        };
+                        (source, file_symbols)
+                    }
+                    None => {
+                        params.edit = Some(empty_workspace_edit());
+                        return Ok(params);
+                    }
+                };
+
+                let Some(symbol) = file_symbols.symbols.iter().find(|sym| {
+                    sym.fqn == symbol_fqn
+                        && matches!(
+                            sym.kind,
+                            php_lsp_types::PhpSymbolKind::Function
+                                | php_lsp_types::PhpSymbolKind::Method
+                        )
+                }) else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+
+                params.edit = update_phpdoc_from_signature_edit(uri_value, &source, symbol)
+                    .or_else(|| Some(empty_workspace_edit()));
             }
             _ => {
                 params.edit = Some(empty_workspace_edit());

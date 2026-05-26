@@ -4804,6 +4804,562 @@ class ExistingMembers
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_code_action_change_visibility_and_promote_constructor_parameter() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "8.2" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let visibility_code = r#"<?php
+namespace App;
+
+class VisibilityDemo
+{
+    private string $name;
+    protected const FLAG = true;
+
+    public function run(): void
+    {
+    }
+
+    public function __construct(private int $id)
+    {
+    }
+}
+"#;
+    let visibility_uri = "file:///test/VisibilityDemo.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(visibility_uri, visibility_code))
+        .await
+        .unwrap();
+
+    let property_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            2,
+            visibility_uri,
+            ((5, 20), (5, 24)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let property_result = extract_result(property_resp);
+    let property_action = property_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Change visibility to protected")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected property visibility action, got: {}",
+                property_result
+            )
+        });
+    let property_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(3, property_action))
+        .await
+        .unwrap();
+    let property_resolved = extract_result(property_resolve);
+    assert_eq!(
+        property_resolved["edit"]["changes"][visibility_uri][0]["newText"].as_str(),
+        Some("protected")
+    );
+
+    let const_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            4,
+            visibility_uri,
+            ((6, 20), (6, 24)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let const_result = extract_result(const_resp);
+    assert!(
+        const_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(
+                |action| action.get("title").and_then(|value| value.as_str())
+                    == Some("Change visibility to public")
+            ),
+        "expected class constant visibility action, got: {}",
+        const_result
+    );
+
+    let method_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            5,
+            visibility_uri,
+            ((8, 20), (8, 23)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let method_result = extract_result(method_resp);
+    assert!(
+        method_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(
+                |action| action.get("title").and_then(|value| value.as_str())
+                    == Some("Change visibility to private")
+            ),
+        "expected method visibility action, got: {}",
+        method_result
+    );
+
+    let promoted_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            6,
+            visibility_uri,
+            ((12, 43), (12, 45)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let promoted_result = extract_result(promoted_resp);
+    let promoted_action = promoted_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Change visibility to public")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected promoted property visibility action, got: {}",
+                promoted_result
+            )
+        });
+    let promoted_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(7, promoted_action))
+        .await
+        .unwrap();
+    let promoted_resolved = extract_result(promoted_resolve);
+    assert_eq!(
+        promoted_resolved["edit"]["changes"][visibility_uri][0]["newText"].as_str(),
+        Some("public")
+    );
+
+    let promote_code = r#"<?php
+namespace App;
+
+class PromoteDemo
+{
+    private readonly string $name;
+    private int $age;
+
+    public function __construct(string $name, int $age)
+    {
+        $this->name = $name;
+        $this->age = $age;
+    }
+}
+"#;
+    let promote_uri = "file:///test/PromoteDemo.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(promote_uri, promote_code))
+        .await
+        .unwrap();
+
+    let promote_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            8,
+            promote_uri,
+            ((8, 40), (8, 44)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let promote_result = extract_result(promote_resp);
+    let promote_action = promote_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Promote constructor parameter `$name`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected promote action, got: {}", promote_result));
+    assert!(
+        promote_action.get("edit").is_none(),
+        "promote action should resolve lazily, got: {}",
+        promote_action
+    );
+    let promote_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(9, promote_action))
+        .await
+        .unwrap();
+    let promote_resolved = extract_result(promote_resolve);
+    let promote_edits = promote_resolved["edit"]["changes"][promote_uri]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected promote edits, got: {}", promote_resolved));
+    assert!(
+        promote_edits
+            .iter()
+            .any(|edit| edit["newText"].as_str() == Some("private readonly string $name")),
+        "expected promoted parameter replacement, got: {}",
+        promote_resolved
+    );
+    assert!(
+        promote_edits
+            .iter()
+            .filter(|edit| edit["newText"].as_str() == Some(""))
+            .count()
+            == 2,
+        "expected property and assignment deletions, got: {}",
+        promote_resolved
+    );
+
+    let complex_code = r#"<?php
+namespace App;
+
+class ComplexPromotion
+{
+    private string $title;
+
+    public function __construct(string $title)
+    {
+        $this->title = trim($title);
+    }
+}
+"#;
+    let complex_uri = "file:///test/ComplexPromotion.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(complex_uri, complex_code))
+        .await
+        .unwrap();
+    let complex_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            10,
+            complex_uri,
+            ((7, 40), (7, 45)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let complex_result = extract_result(complex_resp);
+    assert!(
+        !complex_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(|action| action
+                .get("title")
+                .and_then(|value| value.as_str())
+                .is_some_and(|title| title.starts_with("Promote constructor parameter"))),
+        "complex assignment should suppress promote action, got: {}",
+        complex_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_update_phpdoc_from_signature() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "8.2" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let create_code = r#"<?php
+namespace App;
+
+function makeLabel(string $name, ?int &$count, bool ...$flags): string
+{
+    return $name;
+}
+"#;
+    let create_uri = "file:///test/CreatePhpDoc.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(create_uri, create_code))
+        .await
+        .unwrap();
+
+    let create_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            2,
+            create_uri,
+            ((3, 9), (3, 18)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let create_result = extract_result(create_resp);
+    let create_action = create_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Update PHPDoc from signature")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected create PHPDoc action, got: {}", create_result));
+    assert!(
+        create_action.get("edit").is_none(),
+        "update PHPDoc action should resolve lazily, got: {}",
+        create_action
+    );
+    let create_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(3, create_action))
+        .await
+        .unwrap();
+    let create_resolved = extract_result(create_resolve);
+    let create_text = create_resolved["edit"]["changes"][create_uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected create PHPDoc edit, got: {}", create_resolved));
+    assert!(
+        create_text.contains("@param string $name")
+            && create_text.contains("@param ?int &$count")
+            && create_text.contains("@param bool ...$flags")
+            && create_text.contains("@return string"),
+        "expected generated PHPDoc to mirror the signature, got: {}",
+        create_text
+    );
+
+    let patch_code = r#"<?php
+namespace App;
+
+class DocDemo
+{
+    /**
+     * Build a value.
+     *
+     * @template T
+     * @param int $stale Drop me.
+     * @param array<int, string> $items Items.
+     * @return int
+     * @throws \RuntimeException
+     * @deprecated Use other.
+     */
+    public function build(string $name, array $items): void
+    {
+    }
+}
+"#;
+    let patch_uri = "file:///test/PatchPhpDoc.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(patch_uri, patch_code))
+        .await
+        .unwrap();
+
+    let patch_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            4,
+            patch_uri,
+            ((15, 20), (15, 25)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let patch_result = extract_result(patch_resp);
+    let patch_action = patch_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Update PHPDoc from signature")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected patch PHPDoc action, got: {}", patch_result));
+    let patch_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(5, patch_action))
+        .await
+        .unwrap();
+    let patch_resolved = extract_result(patch_resolve);
+    let patch_text = patch_resolved["edit"]["changes"][patch_uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected patch PHPDoc edit, got: {}", patch_resolved));
+    assert!(
+        patch_text.contains("Build a value.")
+            && patch_text.contains("@template T")
+            && patch_text.contains("@param string $name")
+            && patch_text.contains("@param array $items Items.")
+            && patch_text.contains("@throws \\RuntimeException")
+            && patch_text.contains("@deprecated Use other."),
+        "expected updated PHPDoc to preserve summary and unrelated tags, got: {}",
+        patch_text
+    );
+    assert!(
+        !patch_text.contains("$stale") && !patch_text.contains("@return"),
+        "expected stale param and redundant void return to be removed, got: {}",
+        patch_text
+    );
+
+    let current_code = r#"<?php
+namespace App;
+
+/**
+ * @param string $name
+ * @return string
+ */
+function current(string $name): string
+{
+    return $name;
+}
+"#;
+    let current_uri = "file:///test/CurrentPhpDoc.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(current_uri, current_code))
+        .await
+        .unwrap();
+    let current_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            6,
+            current_uri,
+            ((7, 9), (7, 16)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let current_result = extract_result(current_resp);
+    assert!(
+        !current_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .any(
+                |action| action.get("title").and_then(|value| value.as_str())
+                    == Some("Update PHPDoc from signature")
+            ),
+        "up-to-date PHPDoc should not offer update action, got: {}",
+        current_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_action_organize_imports_sorts_groups_and_removes_unused() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

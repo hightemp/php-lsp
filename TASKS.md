@@ -1342,7 +1342,7 @@ PR-052 ─→ PR-053
   - Regression: e2e covers constructor generation, nullable default params, readonly/static properties, bool getter naming, setter generation, existing constructor suppression, and existing accessor suppression.
   - Validation: `cargo fmt --all --check`, targeted generate-members e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
-- [ ] **IE-012** Code actions: change visibility и promote constructor parameter
+- [x] **IE-012** Code actions: change visibility и promote constructor parameter *(done 2026-05-26)*
   - Change visibility для method/property/class constant/promoted property.
   - Предлагать только альтернативные visibility и сохранять modifiers order.
   - Promote constructor parameter:
@@ -1352,14 +1352,28 @@ PR-052 ─→ PR-053
     - удалить property declaration и assignment безопасно
   - Guard: не предлагать при complex assignment, multiple assignments, attributes/comments that cannot be moved safely.
   - Tests на простые и отказные сценарии.
+  - Implemented: lazy visibility refactors for methods, properties, class constants, and promoted properties; resolve replaces existing visibility token or inserts one before modifiers.
+  - Implemented: safe constructor property promotion for the simple pattern `property + constructor param + $this->prop = $param`.
+  - Guards: promotion is suppressed for static properties, already promoted params, multi-property declarations, doc-comment/attribute properties, missing constructor param, missing exact assignment, and complex/multiple assignments.
+  - Docs: `docs/lsp-features.md` documents visibility and constructor-promotion refactors.
+  - Regression: e2e covers property/method/constant/promoted-property visibility changes, lazy promote resolve edits, and refusal for complex assignment.
+  - Validation: `cargo fmt --all --check`, targeted IE-012 e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
-- [ ] **IE-013** Code action: update PHPDoc from signature
+- [x] **IE-013** Code action: update PHPDoc from signature *(done 2026-05-26)*
   - Синхронизировать `@param` с actual params: add missing, remove stale, reorder.
   - Синхронизировать `@return`: add/update/remove redundant `void`.
   - Сохранять summary и unrelated tags.
   - Не удалять `@template`, `@throws`, `@deprecated`, `@property`, `@method`.
   - Учитывать promoted params, variadic, by-ref, nullable/union/intersection/generic display.
   - Tests на create new docblock и patch existing docblock.
+  - Implemented: lazy `Update PHPDoc from signature` refactor for functions and methods, resolved through `codeAction/resolve`.
+  - Implemented: creates a new docblock from typed signatures, including by-ref and variadic parameter tokens plus non-void native return types.
+  - Implemented: patches existing docblocks by reordering actual params, adding missing params, removing stale params, and updating/removing native-return-driven `@return`.
+  - Guard: does not add noisy `@param mixed` tags when a docblock only has return docs and the signature has no native parameter types.
+  - Preserves: summaries and unrelated tags such as `@template`, `@throws`, `@deprecated`, `@property`, and `@method`.
+  - Docs: `docs/lsp-features.md` documents PHPDoc signature sync.
+  - Regression: e2e covers docblock creation, existing docblock patching, summary/unrelated tag preservation, stale param removal, redundant `void` return removal, by-ref/variadic params, and no action for already-current PHPDoc.
+  - Validation: `cargo fmt --all --check`, targeted IE-013 e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
 - [ ] **IE-014** Refactor actions: extract variable, extract constant, inline variable
   - Использовать `codeAction/resolve`, потому что selection analysis может быть дорогим.
