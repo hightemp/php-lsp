@@ -1460,6 +1460,94 @@ class CdbHandler extends BaseHandler {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_local_variable_class_string_template_return_type() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_marker = r#"<?php
+namespace App;
+
+class Widget {}
+
+class ServiceLocator {
+    /**
+     * @template T of object
+     * @param class-string<T> $class
+     * @return ($class is class-string<T> ? T : object)
+     */
+    public function make($class) {}
+}
+
+function run(ServiceLocator $locator): void {
+    $ma/*made*/de = $locator->make(Widget::class);
+}
+"#;
+    let marker = "/*made*/";
+    let marker_offset = code_with_marker
+        .find(marker)
+        .expect("test code should contain marker");
+    let prefix = code_with_marker[..marker_offset].replace(marker, "");
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let character = (prefix.len() - line_start) as u32;
+    let code = code_with_marker.replace(marker, "");
+    let uri = "file:///test/hover-class-string-template-return.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, line, character))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let hover = hover_markdown_value(&result);
+    assert!(
+        hover.contains("Widget $made"),
+        "expected class-string template hover to resolve Widget, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("[`Widget`](<file:///test/hover-class-string-template-return.php#L4>)"),
+        "expected clickable Widget type link, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_goto_definition() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -2065,6 +2153,96 @@ class BlankValidator
     assert!(
         !labels.contains(&"validatedBy"),
         "instance method should stay hidden for ClassName:: completion"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_completion_member_access_after_class_string_template_factory() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_marker = r#"<?php
+namespace App;
+
+class Widget {
+    public function render(): string { return ''; }
+}
+
+class ServiceLocator {
+    /**
+     * @template T of object
+     * @param class-string<T> $class
+     * @return T
+     */
+    public function make($class) {}
+}
+
+function run(ServiceLocator $locator): void {
+    $locator->make(Widget::class)->/*caret*/
+}
+"#;
+    let marker = "/*caret*/";
+    let offset = code_with_marker
+        .find(marker)
+        .expect("test code should contain caret marker");
+    let code = code_with_marker.replace(marker, "");
+    let prefix = &code[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let character = (prefix.len() - line_start) as u32;
+    let uri = "file:///test/completion-class-string-template-factory.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, uri, line, character))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let items = completion_items_from_result(&result);
+    let labels: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .collect();
+    assert!(
+        labels.contains(&"render"),
+        "expected completion after class-string<T> factory to include Widget::render, got: {:?}; result: {}",
+        labels,
+        result
     );
 
     service
@@ -3406,9 +3584,26 @@ async fn test_inlay_hints_for_local_variable_types() {
 namespace App;
 
 class User {}
+class Widget {}
 
 class Repository {
     public function find(): User { return new User(); }
+}
+
+class ServiceLocator {
+    /**
+     * @template T of object
+     * @param class-string<T> $class
+     * @return T
+     */
+    public function make($class) {}
+
+    /**
+     * @template T of object
+     * @param class-string<T>|string $class
+     * @return ($class is class-string<T> ? T : object)
+     */
+    public function conditional($class) {}
 }
 
 class PortingProcess {}
@@ -3436,6 +3631,15 @@ function run(Repository $repo): void {
     $count = 1;
 }
 
+function resolve(ServiceLocator $locator, string $unknownClass): void {
+    $made = $locator->make(Widget::class);
+    $conditional = $locator->conditional(Widget::class);
+    /** @var class-string<Widget> $widgetClass */
+    $widgetClass = Widget::class;
+    $fromVariable = $locator->make($widgetClass);
+    $fallback = $locator->conditional($unknownClass);
+}
+
 class CdbHandler extends BaseHandler {
     public function handle(PortingRequest $portingRequest, \stdClass $message, DonorProcess $donorProcess): void {
         $portingProcess = $portingRequest->getPortingProcess();
@@ -3460,7 +3664,7 @@ class CdbHandler extends BaseHandler {
         .ready()
         .await
         .unwrap()
-        .call(inlay_hint_request(2, uri, 0, 0, 45, 0))
+        .call(inlay_hint_request(2, uri, 0, 0, 68, 0))
         .await
         .unwrap();
     let result = extract_result(response);
@@ -3479,6 +3683,20 @@ class CdbHandler extends BaseHandler {
     assert!(
         labels.iter().any(|label| label == ": array<int, User>"),
         "expected PHPDoc generic local variable type hint, got: {:?}",
+        labels
+    );
+    assert!(
+        labels
+            .iter()
+            .filter(|label| label.as_str() == ": Widget")
+            .count()
+            >= 3,
+        "expected class-string template and conditional return hints, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == ": T|object"),
+        "expected unresolved conditional return fallback union hint, got: {:?}",
         labels
     );
     assert!(

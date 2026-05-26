@@ -888,6 +888,16 @@ fn apply_phpdoc_to_signature(signature: &mut Signature, doc_comment: &str) {
 
     // Mark [optional] params with a synthetic default value
     for phpdoc_param in &phpdoc.params {
+        if let Some(sig_param) = signature
+            .params
+            .iter_mut()
+            .find(|p| p.name == phpdoc_param.name)
+        {
+            if let Some(type_info) = phpdoc_param.type_info.as_ref() {
+                sig_param.type_info = Some(type_info.clone());
+            }
+        }
+
         let is_optional = phpdoc_param
             .description
             .as_deref()
@@ -1006,6 +1016,29 @@ fn resolve_template_type_info_in_file(
         TypeInfo::ClassString(Some(inner)) => TypeInfo::ClassString(Some(Box::new(
             resolve_template_type_info_in_file(*inner, file_symbols, template_names),
         ))),
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => TypeInfo::Conditional {
+            subject,
+            target: Box::new(resolve_template_type_info_in_file(
+                *target,
+                file_symbols,
+                template_names,
+            )),
+            if_type: Box::new(resolve_template_type_info_in_file(
+                *if_type,
+                file_symbols,
+                template_names,
+            )),
+            else_type: Box::new(resolve_template_type_info_in_file(
+                *else_type,
+                file_symbols,
+                template_names,
+            )),
+        },
         TypeInfo::Union(types) => TypeInfo::Union(
             types
                 .into_iter()
@@ -1979,6 +2012,12 @@ class Factory {
         assert_eq!(
             func.signature.as_ref().unwrap().return_type,
             Some(TypeInfo::Simple("TResult".to_string()))
+        );
+        assert_eq!(
+            func.signature.as_ref().unwrap().params[0].type_info,
+            Some(TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple(
+                "TResult".to_string()
+            )))))
         );
 
         let method = syms

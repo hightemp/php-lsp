@@ -519,6 +519,17 @@ impl WorkspaceIndex {
                 self.expand_type_aliases(inner, scope, visited),
             ))),
             TypeInfo::ClassString(None) => TypeInfo::ClassString(None),
+            TypeInfo::Conditional {
+                subject,
+                target,
+                if_type,
+                else_type,
+            } => TypeInfo::Conditional {
+                subject: subject.clone(),
+                target: Box::new(self.expand_type_aliases(target, scope, visited)),
+                if_type: Box::new(self.expand_type_aliases(if_type, scope, visited)),
+                else_type: Box::new(self.expand_type_aliases(else_type, scope, visited)),
+            },
             TypeInfo::Union(types) => TypeInfo::Union(
                 types
                     .iter()
@@ -859,6 +870,32 @@ fn resolve_alias_type_names_in_file(
             resolve_alias_type_names_in_file(inner, file_symbols, alias_names, template_names),
         ))),
         TypeInfo::ClassString(None) => TypeInfo::ClassString(None),
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => TypeInfo::Conditional {
+            subject: subject.clone(),
+            target: Box::new(resolve_alias_type_names_in_file(
+                target,
+                file_symbols,
+                alias_names,
+                template_names,
+            )),
+            if_type: Box::new(resolve_alias_type_names_in_file(
+                if_type,
+                file_symbols,
+                alias_names,
+                template_names,
+            )),
+            else_type: Box::new(resolve_alias_type_names_in_file(
+                else_type,
+                file_symbols,
+                alias_names,
+                template_names,
+            )),
+        },
         TypeInfo::Union(types) => TypeInfo::Union(
             types
                 .iter()
@@ -1000,6 +1037,17 @@ fn substitute_type_info(type_info: &TypeInfo, substitutions: &TemplateSubstituti
             TypeInfo::ClassString(Some(Box::new(substitute_type_info(inner, substitutions))))
         }
         TypeInfo::ClassString(None) => TypeInfo::ClassString(None),
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => TypeInfo::Conditional {
+            subject: subject.clone(),
+            target: Box::new(substitute_type_info(target, substitutions)),
+            if_type: Box::new(substitute_type_info(if_type, substitutions)),
+            else_type: Box::new(substitute_type_info(else_type, substitutions)),
+        },
         TypeInfo::Union(types) => TypeInfo::Union(
             types
                 .iter()

@@ -1756,6 +1756,10 @@ fn resolve_phpdoc_var_type(
                 Some(resolve_class_name(base, file_symbols))
             }
         }
+        TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => resolve_phpdoc_var_type(if_type, context_node, source, file_symbols)
+            .or_else(|| resolve_phpdoc_var_type(else_type, context_node, source, file_symbols)),
         TypeInfo::ClassString(_)
         | TypeInfo::ArrayShape(_)
         | TypeInfo::Callable { .. }
@@ -2013,6 +2017,10 @@ fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) -> Opt
             .find_map(|ty| iterable_value_type_info(ty, key_text)),
         TypeInfo::Generic { base, args } => generic_value_type_arg(base, args).cloned(),
         TypeInfo::ArrayShape(items) => array_shape_value_type(items, key_text).cloned(),
+        TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => iterable_value_type_info(if_type, key_text)
+            .or_else(|| iterable_value_type_info(else_type, key_text)),
         _ => None,
     }
 }

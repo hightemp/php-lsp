@@ -87,11 +87,11 @@ tools.
 | Diagnostics: built-in semantic | Supported | Unknown symbols, unused code, duplicate symbols, member access, type compatibility, override signatures, PHP-version checks. Without Composer/vendor metadata, external framework symbols can be reported as unknown; highly dynamic framework members such as some Eloquent relation APIs remain best-effort. |
 | Diagnostics: PHPStan | Partial | Optional external command, timeout-bound, JSON output required. |
 | Diagnostics: Psalm | Partial | Optional external command, timeout-bound, JSON output required. |
-| `textDocument/hover` | Supported | Symbols, signatures, types, PHPDoc, variables, deprecation, PHPDoc virtual members, and expanded indexed PHPDoc type aliases in signatures. |
-| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, and expanded member signature aliases. |
+| `textDocument/hover` | Supported | Symbols, signatures, types, PHPDoc, variables, deprecation, PHPDoc virtual members, expanded indexed PHPDoc type aliases, and call-site `class-string<T>` / conditional return inference. |
+| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, expanded member signature aliases, and member chains after `class-string<T>` factory calls. |
 | `completionItem/resolve` | Supported | Enriches PHPDoc virtual member completions. |
 | `textDocument/signatureHelp` | Supported | Functions, methods, constructors, and active parameter tracking. |
-| `textDocument/inlayHint` | Supported | Argument labels, inferred PHPDoc parameter/return hints, and useful inferred local variable type hints for assignments and foreach values. |
+| `textDocument/inlayHint` | Supported | Argument labels, inferred PHPDoc parameter/return hints, and useful inferred local variable type hints for assignments, foreach values, `class-string<T>` factories, and conditional returns. |
 | `textDocument/codeLens` | Partial | Reference-count lenses for symbols. Counts use indexed references but can still be expensive across very large workspaces. |
 | `textDocument/foldingRange` | Supported | PHP structures, comments, arrays, namespaces, and blocks. |
 | `textDocument/semanticTokens/full` | Supported | Full semantic token snapshots with result IDs. |

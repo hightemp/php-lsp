@@ -276,6 +276,9 @@ Current evidence:
   for common repository and collection member types.
 - `IE-031` added PHPStan/Psalm `@phpstan-type`/`@psalm-type` and imported
   type alias expansion for indexed signatures, with cycle guards.
+- `IE-032` added PHPStan/Psalm conditional return parsing, `class-string<T>`
+  call-site template binding, fallback branch unions, and coverage for hover,
+  local variable inlay hints, and completion chains after factory calls.
 - `PV-012` fixed a real Symfony false positive for promoted constructor
   properties accessed through a `self`-typed parameter
   (`withDefaults(self $defaults)` then `$defaults->objectManager`).

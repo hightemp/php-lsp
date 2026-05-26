@@ -677,6 +677,10 @@ fn parse_type_string(s: &str) -> TypeInfo {
         return TypeInfo::Intersection(parts);
     }
 
+    if let Some(conditional) = parse_conditional_type(s) {
+        return conditional;
+    }
+
     if let Some(inner) = s.strip_prefix('?') {
         return TypeInfo::Nullable(Box::new(parse_type_string(inner)));
     }
@@ -707,6 +711,37 @@ fn parse_type_string(s: &str) -> TypeInfo {
         "class-string" => TypeInfo::ClassString(None),
         _ => TypeInfo::Simple(s.to_string()),
     }
+}
+
+fn parse_conditional_type(s: &str) -> Option<TypeInfo> {
+    let s = strip_enclosing_parentheses(s).unwrap_or(s).trim();
+    let question = find_top_level_char(s, '?')?;
+    let colon = find_top_level_char_from(s, ':', question + 1)?;
+    let condition = s[..question].trim();
+    let if_type = s[question + 1..colon].trim();
+    let else_type = s[colon + 1..].trim();
+    if condition.is_empty() || if_type.is_empty() || else_type.is_empty() {
+        return None;
+    }
+
+    let (subject, target) = split_conditional_is_condition(condition)?;
+    Some(TypeInfo::Conditional {
+        subject: subject.to_string(),
+        target: Box::new(parse_type_string(target)),
+        if_type: Box::new(parse_type_string(if_type)),
+        else_type: Box::new(parse_type_string(else_type)),
+    })
+}
+
+fn split_conditional_is_condition(condition: &str) -> Option<(&str, &str)> {
+    let needle = " is ";
+    let idx = find_top_level_str(condition, needle)?;
+    let subject = condition[..idx].trim();
+    let target = condition[idx + needle.len()..].trim();
+    if subject.is_empty() || target.is_empty() {
+        return None;
+    }
+    Some((subject, target))
 }
 
 fn parse_generic_type(s: &str) -> Option<TypeInfo> {
@@ -988,6 +1023,60 @@ fn split_top_level(s: &str, delimiter: char) -> Option<Vec<&str>> {
 }
 
 fn find_top_level_char(s: &str, needle: char) -> Option<usize> {
+    find_top_level_char_from(s, needle, 0)
+}
+
+fn find_top_level_char_from(s: &str, needle: char, start: usize) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in s.char_indices() {
+        if idx < start {
+            continue;
+        }
+
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        let nested = paren_depth > 0 || angle_depth > 0 || bracket_depth > 0 || brace_depth > 0;
+        if ch == needle && !nested {
+            return Some(idx);
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn find_top_level_str(s: &str, needle: &str) -> Option<usize> {
     let mut paren_depth = 0usize;
     let mut angle_depth = 0usize;
     let mut bracket_depth = 0usize;
@@ -1013,7 +1102,7 @@ fn find_top_level_char(s: &str, needle: char) -> Option<usize> {
         }
 
         let nested = paren_depth > 0 || angle_depth > 0 || bracket_depth > 0 || brace_depth > 0;
-        if ch == needle && !nested {
+        if !nested && s[idx..].starts_with(needle) {
             return Some(idx);
         }
 
@@ -1188,6 +1277,27 @@ mod tests {
     fn test_parse_return() {
         let doc = parse_phpdoc("/**\n * @return string|null\n */");
         assert!(matches!(doc.return_type, Some(TypeInfo::Union(_))));
+    }
+
+    #[test]
+    fn test_parse_conditional_return_type() {
+        let doc = parse_phpdoc("/**\n * @return ($class is class-string<T> ? T : object)\n */");
+        let Some(TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        }) = doc.return_type
+        else {
+            panic!("expected conditional return type");
+        };
+        assert_eq!(subject, "$class");
+        assert_eq!(
+            *target,
+            TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple("T".to_string()))))
+        );
+        assert_eq!(*if_type, TypeInfo::Simple("T".to_string()));
+        assert_eq!(*else_type, TypeInfo::Simple("object".to_string()));
     }
 
     #[test]

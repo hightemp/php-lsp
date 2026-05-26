@@ -1601,6 +1601,41 @@ impl PhpLspBackend {
             })
     }
 
+    fn resolve_completion_member_call_type(
+        &self,
+        class_fqn: &str,
+        member_name: &str,
+        member_text: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+    ) -> Option<String> {
+        let symbol = self
+            .index
+            .resolve_member(&format!("{}::{}", class_fqn, member_name))
+            .or_else(|| {
+                let member_fqn = format!("{}::{}", class_fqn, member_name);
+                file_symbols.symbols.iter().find_map(|sym| {
+                    (sym.fqn == member_fqn
+                        || (sym.parent_fqn.as_deref() == Some(class_fqn)
+                            && sym.name == member_name))
+                        .then(|| Arc::new(sym.clone()))
+                })
+            })?;
+        let signature = symbol.signature.as_ref()?;
+        let return_type = signature.return_type.as_ref()?;
+        let arguments =
+            completion_call_arguments_by_param(member_text, signature, file_symbols, &self.index);
+        let template_names: HashSet<String> = symbol
+            .templates
+            .iter()
+            .map(|template| template.name.clone())
+            .collect();
+        let substitutions =
+            call_site_template_substitutions(&arguments, signature, &template_names);
+        let resolved =
+            resolve_call_site_type_info(return_type, &arguments, &template_names, &substitutions);
+        type_info_fqn_from_index(&self.index, class_fqn, &symbol.uri, &resolved)
+    }
+
     fn infer_completion_object_type(
         &self,
         object_expr: &str,
@@ -1716,8 +1751,19 @@ impl PhpLspBackend {
             } else {
                 format!("${}", member_name)
             };
-            class_fqn =
-                self.resolve_completion_member_type(&class_fqn, &lookup_name, file_symbols)?;
+            class_fqn = if is_method_call {
+                self.resolve_completion_member_call_type(
+                    &class_fqn,
+                    &lookup_name,
+                    member,
+                    file_symbols,
+                )
+                .or_else(|| {
+                    self.resolve_completion_member_type(&class_fqn, &lookup_name, file_symbols)
+                })?
+            } else {
+                self.resolve_completion_member_type(&class_fqn, &lookup_name, file_symbols)?
+            };
         }
 
         Some(class_fqn)
@@ -3060,6 +3106,10 @@ fn first_type_definition_fqn(
         php_lsp_types::TypeInfo::ClassString(Some(inner)) => {
             first_type_definition_fqn(inner, file_symbols, current_class_fqn)
         }
+        php_lsp_types::TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => first_type_definition_fqn(if_type, file_symbols, current_class_fqn)
+            .or_else(|| first_type_definition_fqn(else_type, file_symbols, current_class_fqn)),
         php_lsp_types::TypeInfo::ArrayShape(items) => items.iter().find_map(|item| {
             first_type_definition_fqn(&item.value, file_symbols, current_class_fqn)
         }),
@@ -3553,6 +3603,7 @@ fn return_type_hint_is_supported(
         | php_lsp_types::TypeInfo::ArrayShape(_)
         | php_lsp_types::TypeInfo::Callable { .. }
         | php_lsp_types::TypeInfo::ClassString(_)
+        | php_lsp_types::TypeInfo::Conditional { .. }
         | php_lsp_types::TypeInfo::LiteralString(_)
         | php_lsp_types::TypeInfo::LiteralInt(_)
         | php_lsp_types::TypeInfo::LiteralFloat(_) => false,
@@ -4404,9 +4455,11 @@ fn native_type_hint_text(
 fn render_method_param(param: &php_lsp_types::ParamInfo, php_version: PhpVersion) -> String {
     let mut text = String::new();
     if let Some(type_info) = &param.type_info {
-        if let Some(type_text) =
-            native_type_hint_text(type_info, php_version, TypeHintPosition::Parameter)
-        {
+        if let Some(type_text) = generated_member_native_type_hint_text(
+            type_info,
+            php_version,
+            TypeHintPosition::Parameter,
+        ) {
             text.push_str(&type_text);
             text.push(' ');
         }
@@ -9915,7 +9968,790 @@ fn local_variable_inlay_type_from_call_expression(
         .map(|(owner, _)| owner)
         .or(symbol.parent_fqn.as_deref())
         .unwrap_or_default();
-    local_variable_inlay_type_from_type_info(ctx, owner_fqn, &symbol.uri, return_type, true)
+    let return_type = resolve_call_site_return_type(ctx, expression, &symbol, return_type);
+    local_variable_inlay_type_from_type_info(ctx, owner_fqn, &symbol.uri, &return_type, true)
+}
+
+fn completion_call_arguments_by_param(
+    member_text: &str,
+    signature: &php_lsp_types::Signature,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+) -> HashMap<String, php_lsp_types::TypeInfo> {
+    let mut arguments = HashMap::new();
+    let Some(args_text) = call_arguments_text(member_text) else {
+        return arguments;
+    };
+
+    for (arg_index, raw_arg) in split_top_level_argument_texts(args_text)
+        .into_iter()
+        .enumerate()
+    {
+        let (name, value) = split_named_argument_text(raw_arg);
+        let Some(param) = signature_param_for_call_arg(signature, arg_index, name) else {
+            continue;
+        };
+        let Some(type_info) = call_site_argument_type_from_text(value, file_symbols, index) else {
+            continue;
+        };
+        arguments.insert(param.name.trim_start_matches('$').to_string(), type_info);
+    }
+
+    arguments
+}
+
+fn call_arguments_text(member_text: &str) -> Option<&str> {
+    let open = member_text.find('(')?;
+    let close = matching_paren_in_text(member_text, open)?;
+    Some(member_text[open + 1..close].trim())
+}
+
+fn matching_paren_in_text(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in text[open..].char_indices() {
+        let idx = open + idx;
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn split_top_level_argument_texts(args_text: &str) -> Vec<&str> {
+    split_top_level_text(args_text, ',')
+}
+
+fn split_named_argument_text(arg_text: &str) -> (Option<&str>, &str) {
+    let arg_text = arg_text.trim();
+    let Some(colon) = find_named_argument_colon(arg_text) else {
+        return (None, arg_text);
+    };
+    let name = arg_text[..colon].trim();
+    let value = arg_text[colon + 1..].trim();
+    if name.is_empty() || value.is_empty() {
+        (None, arg_text)
+    } else {
+        (Some(name), value)
+    }
+}
+
+fn find_named_argument_colon(arg_text: &str) -> Option<usize> {
+    split_top_level_text_scan(arg_text, |idx, ch, nested| {
+        if ch != ':' || nested {
+            return None;
+        }
+        let prev = arg_text[..idx].chars().next_back();
+        let next = arg_text[idx + ch.len_utf8()..].chars().next();
+        (prev != Some(':') && next != Some(':')).then_some(idx)
+    })
+}
+
+fn call_site_argument_type_from_text(
+    raw: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+) -> Option<php_lsp_types::TypeInfo> {
+    let raw = raw.trim();
+    let lower = raw.to_ascii_lowercase();
+
+    if let Some(class_fqn) = class_string_fqn_from_expression_text(raw, file_symbols, index) {
+        return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
+            php_lsp_types::TypeInfo::Simple(class_fqn),
+        ))));
+    }
+
+    if let Some(value) = unquote_php_string_literal(raw) {
+        let resolved = resolve_class_name_pub(&value, file_symbols)
+            .trim_start_matches('\\')
+            .to_string();
+        if index.resolve_fqn(&resolved).is_some()
+            || file_symbols
+                .symbols
+                .iter()
+                .any(|symbol| symbol.fqn == resolved)
+        {
+            return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
+                php_lsp_types::TypeInfo::Simple(resolved),
+            ))));
+        }
+        return Some(php_lsp_types::TypeInfo::LiteralString(raw.to_string()));
+    }
+
+    if lower == "true" {
+        return Some(php_lsp_types::TypeInfo::LiteralBool(true));
+    }
+    if lower == "false" {
+        return Some(php_lsp_types::TypeInfo::LiteralBool(false));
+    }
+    if lower == "null" {
+        return Some(php_lsp_types::TypeInfo::LiteralNull);
+    }
+
+    let numeric = lower.trim_start_matches(['+', '-']);
+    if numeric.parse::<i64>().is_ok() {
+        return Some(php_lsp_types::TypeInfo::LiteralInt(raw.to_string()));
+    }
+    if numeric.parse::<f64>().is_ok() && numeric.contains('.') {
+        return Some(php_lsp_types::TypeInfo::LiteralFloat(raw.to_string()));
+    }
+
+    None
+}
+
+fn unquote_php_string_literal(raw: &str) -> Option<String> {
+    if raw.len() < 2 {
+        return None;
+    }
+    let quote = raw.as_bytes()[0] as char;
+    if !matches!(quote, '\'' | '"') || !raw.ends_with(quote) {
+        return None;
+    }
+    Some(raw[1..raw.len() - 1].replace("\\\\", "\\"))
+}
+
+fn split_top_level_text(text: &str, delimiter: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in text.char_indices() {
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        let nested = paren_depth > 0 || angle_depth > 0 || bracket_depth > 0 || brace_depth > 0;
+        if ch == delimiter && !nested {
+            let part = text[start..idx].trim();
+            if !part.is_empty() {
+                parts.push(part);
+            }
+            start = idx + ch.len_utf8();
+            continue;
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    let part = text[start..].trim();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
+fn split_top_level_text_scan<T>(
+    text: &str,
+    mut f: impl FnMut(usize, char, bool) -> Option<T>,
+) -> Option<T> {
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in text.char_indices() {
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        let nested = paren_depth > 0 || angle_depth > 0 || bracket_depth > 0 || brace_depth > 0;
+        if let Some(value) = f(idx, ch, nested) {
+            return Some(value);
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn resolve_call_site_return_type(
+    ctx: &InlayHintContext<'_>,
+    call_node: tree_sitter::Node,
+    symbol: &php_lsp_types::SymbolInfo,
+    return_type: &php_lsp_types::TypeInfo,
+) -> php_lsp_types::TypeInfo {
+    let Some(signature) = symbol.signature.as_ref() else {
+        return return_type.clone();
+    };
+
+    let arguments = call_site_arguments_by_param(ctx, call_node, signature);
+    let template_names: HashSet<String> = symbol
+        .templates
+        .iter()
+        .map(|template| template.name.clone())
+        .collect();
+    let substitutions = call_site_template_substitutions(&arguments, signature, &template_names);
+    resolve_call_site_type_info(return_type, &arguments, &template_names, &substitutions)
+}
+
+fn call_site_arguments_by_param(
+    ctx: &InlayHintContext<'_>,
+    call_node: tree_sitter::Node,
+    signature: &php_lsp_types::Signature,
+) -> HashMap<String, php_lsp_types::TypeInfo> {
+    let mut arguments = HashMap::new();
+    for (arg_index, arg) in call_arguments(call_node, ctx.source)
+        .into_iter()
+        .enumerate()
+    {
+        let Some(param) = signature_param_for_call_arg(signature, arg_index, arg.name.as_deref())
+        else {
+            continue;
+        };
+        let Some(type_info) = call_site_argument_type(ctx, arg.value_node) else {
+            continue;
+        };
+        arguments.insert(param.name.trim_start_matches('$').to_string(), type_info);
+    }
+    arguments
+}
+
+fn call_site_argument_type(
+    ctx: &InlayHintContext<'_>,
+    node: tree_sitter::Node,
+) -> Option<php_lsp_types::TypeInfo> {
+    let node = normalized_expression_node(node);
+    let raw = node_text(ctx.source, node).trim();
+    let lower = raw.to_ascii_lowercase();
+
+    if let Some(class_fqn) = class_string_fqn_from_expression_text(raw, ctx.file_symbols, ctx.index)
+    {
+        return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
+            php_lsp_types::TypeInfo::Simple(class_fqn),
+        ))));
+    }
+
+    if let Some(value) = unquote_php_string_literal(raw) {
+        let resolved = resolve_class_name_pub(&value, ctx.file_symbols)
+            .trim_start_matches('\\')
+            .to_string();
+        if ctx.index.resolve_fqn(&resolved).is_some()
+            || ctx
+                .file_symbols
+                .symbols
+                .iter()
+                .any(|symbol| symbol.fqn == resolved)
+        {
+            return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
+                php_lsp_types::TypeInfo::Simple(resolved),
+            ))));
+        }
+        return Some(php_lsp_types::TypeInfo::LiteralString(raw.to_string()));
+    }
+    if node.kind().contains("string") {
+        return Some(php_lsp_types::TypeInfo::LiteralString(raw.to_string()));
+    }
+    if lower == "true" {
+        return Some(php_lsp_types::TypeInfo::LiteralBool(true));
+    }
+    if lower == "false" {
+        return Some(php_lsp_types::TypeInfo::LiteralBool(false));
+    }
+    if lower == "null" {
+        return Some(php_lsp_types::TypeInfo::LiteralNull);
+    }
+
+    let numeric = lower.trim_start_matches(['+', '-']);
+    if numeric.parse::<i64>().is_ok() {
+        return Some(php_lsp_types::TypeInfo::LiteralInt(raw.to_string()));
+    }
+    if numeric.parse::<f64>().is_ok() && numeric.contains('.') {
+        return Some(php_lsp_types::TypeInfo::LiteralFloat(raw.to_string()));
+    }
+
+    if node.kind() == "object_creation_expression" {
+        let class_node = object_creation_class_node(node)?;
+        let class_name = node_text(ctx.source, class_node).trim();
+        let fqn = resolve_class_name_pub(class_name, ctx.file_symbols)
+            .trim_start_matches('\\')
+            .to_string();
+        if !fqn.is_empty() {
+            return Some(php_lsp_types::TypeInfo::Simple(fqn));
+        }
+    }
+
+    if node.kind() == "variable_name" {
+        return call_site_variable_phpdoc_type(ctx, node);
+    }
+
+    None
+}
+
+fn class_string_fqn_from_expression_text(
+    raw: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+) -> Option<String> {
+    let class_name = raw.trim().strip_suffix("::class")?.trim();
+    if class_name.is_empty() {
+        return None;
+    }
+
+    let fqn = resolve_class_name_pub(class_name, file_symbols)
+        .trim_start_matches('\\')
+        .to_string();
+    (index.resolve_fqn(&fqn).is_some()
+        || file_symbols.symbols.iter().any(|symbol| symbol.fqn == fqn))
+    .then_some(fqn)
+}
+
+fn call_site_variable_phpdoc_type(
+    ctx: &InlayHintContext<'_>,
+    node: tree_sitter::Node,
+) -> Option<php_lsp_types::TypeInfo> {
+    let variable_name = variable_text_for_node(ctx.source, node)?;
+    let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
+    };
+    let info = infer_variable_hover_info_at_node(
+        node,
+        ctx.source,
+        ctx.file_symbols,
+        node.start_byte(),
+        &variable_name,
+        Some(&resolver),
+    )?;
+    let phpdoc = parse_phpdoc(info.phpdoc_comment.as_deref()?);
+    phpdoc
+        .var_type
+        .map(|type_info| resolve_call_site_type_names(&type_info, ctx.file_symbols))
+}
+
+fn call_site_template_substitutions(
+    arguments: &HashMap<String, php_lsp_types::TypeInfo>,
+    signature: &php_lsp_types::Signature,
+    template_names: &HashSet<String>,
+) -> HashMap<String, php_lsp_types::TypeInfo> {
+    let mut substitutions = HashMap::new();
+    for param in &signature.params {
+        let Some(param_type) = param.type_info.as_ref() else {
+            continue;
+        };
+        let Some(arg_type) = arguments.get(param.name.trim_start_matches('$')) else {
+            continue;
+        };
+        bind_template_type_info(param_type, arg_type, template_names, &mut substitutions);
+    }
+    substitutions
+}
+
+fn resolve_call_site_type_info(
+    type_info: &php_lsp_types::TypeInfo,
+    arguments: &HashMap<String, php_lsp_types::TypeInfo>,
+    template_names: &HashSet<String>,
+    substitutions: &HashMap<String, php_lsp_types::TypeInfo>,
+) -> php_lsp_types::TypeInfo {
+    let substituted = substitute_call_site_type_info(type_info, substitutions);
+    match substituted {
+        php_lsp_types::TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => {
+            let subject_key = subject.trim().trim_start_matches('$');
+            let Some(actual) = arguments.get(subject_key) else {
+                return conditional_union_fallback(*if_type, *else_type);
+            };
+            let mut branch_substitutions = substitutions.clone();
+            if type_pattern_matches_actual(
+                &target,
+                actual,
+                template_names,
+                &mut branch_substitutions,
+            ) {
+                substitute_call_site_type_info(&if_type, &branch_substitutions)
+            } else {
+                substitute_call_site_type_info(&else_type, &branch_substitutions)
+            }
+        }
+        other => other,
+    }
+}
+
+fn conditional_union_fallback(
+    if_type: php_lsp_types::TypeInfo,
+    else_type: php_lsp_types::TypeInfo,
+) -> php_lsp_types::TypeInfo {
+    if if_type == else_type {
+        if_type
+    } else {
+        php_lsp_types::TypeInfo::Union(vec![if_type, else_type])
+    }
+}
+
+fn substitute_call_site_type_info(
+    type_info: &php_lsp_types::TypeInfo,
+    substitutions: &HashMap<String, php_lsp_types::TypeInfo>,
+) -> php_lsp_types::TypeInfo {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => substitutions
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| php_lsp_types::TypeInfo::Simple(name.clone())),
+        php_lsp_types::TypeInfo::Generic { base, args } => php_lsp_types::TypeInfo::Generic {
+            base: base.clone(),
+            args: args
+                .iter()
+                .map(|arg| substitute_call_site_type_info(arg, substitutions))
+                .collect(),
+        },
+        php_lsp_types::TypeInfo::ArrayShape(items) => php_lsp_types::TypeInfo::ArrayShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: substitute_call_site_type_info(&item.value, substitutions),
+                })
+                .collect(),
+        ),
+        php_lsp_types::TypeInfo::Callable {
+            params,
+            return_type,
+        } => php_lsp_types::TypeInfo::Callable {
+            params: params
+                .iter()
+                .map(|param| substitute_call_site_type_info(param, substitutions))
+                .collect(),
+            return_type: return_type.as_ref().map(|return_type| {
+                Box::new(substitute_call_site_type_info(return_type, substitutions))
+            }),
+        },
+        php_lsp_types::TypeInfo::ClassString(Some(inner)) => {
+            php_lsp_types::TypeInfo::ClassString(Some(Box::new(substitute_call_site_type_info(
+                inner,
+                substitutions,
+            ))))
+        }
+        php_lsp_types::TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => php_lsp_types::TypeInfo::Conditional {
+            subject: subject.clone(),
+            target: Box::new(substitute_call_site_type_info(target, substitutions)),
+            if_type: Box::new(substitute_call_site_type_info(if_type, substitutions)),
+            else_type: Box::new(substitute_call_site_type_info(else_type, substitutions)),
+        },
+        php_lsp_types::TypeInfo::Union(types) => php_lsp_types::TypeInfo::Union(
+            types
+                .iter()
+                .map(|type_info| substitute_call_site_type_info(type_info, substitutions))
+                .collect(),
+        ),
+        php_lsp_types::TypeInfo::Intersection(types) => php_lsp_types::TypeInfo::Intersection(
+            types
+                .iter()
+                .map(|type_info| substitute_call_site_type_info(type_info, substitutions))
+                .collect(),
+        ),
+        php_lsp_types::TypeInfo::Nullable(inner) => php_lsp_types::TypeInfo::Nullable(Box::new(
+            substitute_call_site_type_info(inner, substitutions),
+        )),
+        php_lsp_types::TypeInfo::ClassString(None)
+        | php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull
+        | php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed
+        | php_lsp_types::TypeInfo::Self_
+        | php_lsp_types::TypeInfo::Static_
+        | php_lsp_types::TypeInfo::Parent_ => type_info.clone(),
+    }
+}
+
+fn bind_template_type_info(
+    pattern: &php_lsp_types::TypeInfo,
+    actual: &php_lsp_types::TypeInfo,
+    template_names: &HashSet<String>,
+    substitutions: &mut HashMap<String, php_lsp_types::TypeInfo>,
+) {
+    match (pattern, actual) {
+        (php_lsp_types::TypeInfo::Simple(name), actual) if template_names.contains(name) => {
+            substitutions
+                .entry(name.clone())
+                .or_insert_with(|| actual.clone());
+        }
+        (
+            php_lsp_types::TypeInfo::ClassString(Some(pattern_inner)),
+            php_lsp_types::TypeInfo::ClassString(Some(actual_inner)),
+        ) => bind_template_type_info(pattern_inner, actual_inner, template_names, substitutions),
+        (
+            php_lsp_types::TypeInfo::Generic {
+                base: pattern_base,
+                args: pattern_args,
+            },
+            php_lsp_types::TypeInfo::Generic {
+                base: actual_base,
+                args: actual_args,
+            },
+        ) if pattern_base.eq_ignore_ascii_case(actual_base) => {
+            for (pattern_arg, actual_arg) in pattern_args.iter().zip(actual_args.iter()) {
+                bind_template_type_info(pattern_arg, actual_arg, template_names, substitutions);
+            }
+        }
+        (php_lsp_types::TypeInfo::Nullable(pattern_inner), actual) => {
+            bind_template_type_info(pattern_inner, actual, template_names, substitutions);
+        }
+        (php_lsp_types::TypeInfo::Union(patterns), actual)
+        | (php_lsp_types::TypeInfo::Intersection(patterns), actual) => {
+            for pattern in patterns {
+                bind_template_type_info(pattern, actual, template_names, substitutions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn type_pattern_matches_actual(
+    pattern: &php_lsp_types::TypeInfo,
+    actual: &php_lsp_types::TypeInfo,
+    template_names: &HashSet<String>,
+    substitutions: &mut HashMap<String, php_lsp_types::TypeInfo>,
+) -> bool {
+    match (pattern, actual) {
+        (php_lsp_types::TypeInfo::Mixed, _) => true,
+        (php_lsp_types::TypeInfo::Simple(name), actual) if template_names.contains(name) => {
+            substitutions
+                .entry(name.clone())
+                .or_insert_with(|| actual.clone());
+            true
+        }
+        (php_lsp_types::TypeInfo::Simple(expected), php_lsp_types::TypeInfo::Simple(actual)) => {
+            same_type_name(expected, actual)
+        }
+        (
+            php_lsp_types::TypeInfo::ClassString(Some(pattern_inner)),
+            php_lsp_types::TypeInfo::ClassString(Some(actual_inner)),
+        ) => {
+            type_pattern_matches_actual(pattern_inner, actual_inner, template_names, substitutions)
+        }
+        (php_lsp_types::TypeInfo::ClassString(None), php_lsp_types::TypeInfo::ClassString(_)) => {
+            true
+        }
+        (
+            php_lsp_types::TypeInfo::Generic {
+                base: expected_base,
+                args: expected_args,
+            },
+            php_lsp_types::TypeInfo::Generic {
+                base: actual_base,
+                args: actual_args,
+            },
+        ) if same_type_name(expected_base, actual_base)
+            && expected_args.len() == actual_args.len() =>
+        {
+            expected_args
+                .iter()
+                .zip(actual_args.iter())
+                .all(|(expected_arg, actual_arg)| {
+                    type_pattern_matches_actual(
+                        expected_arg,
+                        actual_arg,
+                        template_names,
+                        substitutions,
+                    )
+                })
+        }
+        (php_lsp_types::TypeInfo::Union(types), actual) => types.iter().any(|type_info| {
+            let mut branch_substitutions = substitutions.clone();
+            let matches = type_pattern_matches_actual(
+                type_info,
+                actual,
+                template_names,
+                &mut branch_substitutions,
+            );
+            if matches {
+                *substitutions = branch_substitutions;
+            }
+            matches
+        }),
+        (php_lsp_types::TypeInfo::Intersection(types), actual) => types.iter().all(|type_info| {
+            type_pattern_matches_actual(type_info, actual, template_names, substitutions)
+        }),
+        (php_lsp_types::TypeInfo::Nullable(_), php_lsp_types::TypeInfo::LiteralNull) => true,
+        (php_lsp_types::TypeInfo::Nullable(inner), actual) => {
+            type_pattern_matches_actual(inner, actual, template_names, substitutions)
+        }
+        (
+            php_lsp_types::TypeInfo::LiteralString(expected),
+            php_lsp_types::TypeInfo::LiteralString(actual),
+        )
+        | (
+            php_lsp_types::TypeInfo::LiteralInt(expected),
+            php_lsp_types::TypeInfo::LiteralInt(actual),
+        )
+        | (
+            php_lsp_types::TypeInfo::LiteralFloat(expected),
+            php_lsp_types::TypeInfo::LiteralFloat(actual),
+        ) => expected == actual,
+        (
+            php_lsp_types::TypeInfo::LiteralBool(expected),
+            php_lsp_types::TypeInfo::LiteralBool(actual),
+        ) => expected == actual,
+        (php_lsp_types::TypeInfo::LiteralNull, php_lsp_types::TypeInfo::LiteralNull) => true,
+        _ => false,
+    }
+}
+
+fn resolve_call_site_type_names(
+    type_info: &php_lsp_types::TypeInfo,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> php_lsp_types::TypeInfo {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) if is_builtin_type_name(name) => {
+            php_lsp_types::TypeInfo::Simple(name.clone())
+        }
+        php_lsp_types::TypeInfo::Simple(name) => php_lsp_types::TypeInfo::Simple(
+            resolve_class_name_pub(name, file_symbols)
+                .trim_start_matches('\\')
+                .to_string(),
+        ),
+        php_lsp_types::TypeInfo::Generic { base, args } => php_lsp_types::TypeInfo::Generic {
+            base: if is_builtin_type_name(base) {
+                base.clone()
+            } else {
+                resolve_class_name_pub(base, file_symbols)
+                    .trim_start_matches('\\')
+                    .to_string()
+            },
+            args: args
+                .iter()
+                .map(|arg| resolve_call_site_type_names(arg, file_symbols))
+                .collect(),
+        },
+        php_lsp_types::TypeInfo::ClassString(Some(inner)) => php_lsp_types::TypeInfo::ClassString(
+            Some(Box::new(resolve_call_site_type_names(inner, file_symbols))),
+        ),
+        php_lsp_types::TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => php_lsp_types::TypeInfo::Conditional {
+            subject: subject.clone(),
+            target: Box::new(resolve_call_site_type_names(target, file_symbols)),
+            if_type: Box::new(resolve_call_site_type_names(if_type, file_symbols)),
+            else_type: Box::new(resolve_call_site_type_names(else_type, file_symbols)),
+        },
+        php_lsp_types::TypeInfo::Union(types) => php_lsp_types::TypeInfo::Union(
+            types
+                .iter()
+                .map(|type_info| resolve_call_site_type_names(type_info, file_symbols))
+                .collect(),
+        ),
+        php_lsp_types::TypeInfo::Intersection(types) => php_lsp_types::TypeInfo::Intersection(
+            types
+                .iter()
+                .map(|type_info| resolve_call_site_type_names(type_info, file_symbols))
+                .collect(),
+        ),
+        php_lsp_types::TypeInfo::Nullable(inner) => php_lsp_types::TypeInfo::Nullable(Box::new(
+            resolve_call_site_type_names(inner, file_symbols),
+        )),
+        php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::Callable { .. }
+        | php_lsp_types::TypeInfo::ClassString(None)
+        | php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull
+        | php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed
+        | php_lsp_types::TypeInfo::Self_
+        | php_lsp_types::TypeInfo::Static_
+        | php_lsp_types::TypeInfo::Parent_ => type_info.clone(),
+    }
+}
+
+fn same_type_name(left: &str, right: &str) -> bool {
+    left.trim_start_matches('\\')
+        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
 }
 
 fn local_variable_inlay_type_from_cast_expression(
@@ -10283,6 +11119,15 @@ fn local_variable_type_info_display(
                 local_variable_type_info_display(index, owner_fqn, uri, inner, file_symbols)
             )
         }
+        php_lsp_types::TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => [if_type.as_ref(), else_type.as_ref()]
+            .into_iter()
+            .map(|type_info| {
+                local_variable_type_info_display(index, owner_fqn, uri, type_info, file_symbols)
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
         php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
             shorten_inlay_type_display(owner_fqn, file_symbols)
         }
@@ -13396,6 +14241,12 @@ fn type_info_accepts_inferred_type(
         php_lsp_types::TypeInfo::Union(types) => types.iter().any(|type_info| {
             type_info_accepts_inferred_type(type_info, actual, file_symbols, index)
         }),
+        php_lsp_types::TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => {
+            type_info_accepts_inferred_type(if_type, actual, file_symbols, index)
+                || type_info_accepts_inferred_type(else_type, actual, file_symbols, index)
+        }
         php_lsp_types::TypeInfo::Intersection(_) => true,
         php_lsp_types::TypeInfo::Simple(name) => {
             simple_type_accepts_inferred_type(name, actual, file_symbols, index)
@@ -13723,6 +14574,13 @@ fn normalized_type_info_for_override(
                 .join(", ");
             format!("{}<{}>", base, args)
         }
+        php_lsp_types::TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => format!(
+            "conditional({}|{})",
+            normalized_type_info_for_override(if_type, file_symbols, owner_fqn),
+            normalized_type_info_for_override(else_type, file_symbols, owner_fqn)
+        ),
         php_lsp_types::TypeInfo::ArrayShape(_)
         | php_lsp_types::TypeInfo::Callable { .. }
         | php_lsp_types::TypeInfo::ClassString(_)

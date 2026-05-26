@@ -1673,7 +1673,7 @@ PR-052 ─→ PR-053
     `cargo clippy --all-targets -- -D warnings`, docs Cyrillic check,
     `git diff --check`.
 
-- [ ] **IE-032** Conditional return types и class-string templates
+- [x] **IE-032** Conditional return types и class-string templates *(done 2026-05-26)*
   - Parse PHPStan/Psalm conditional return syntax: `($arg is Foo ? A : B)`.
   - Resolve branch when call-site argument is:
     - literal string/int/bool/null
@@ -1682,6 +1682,47 @@ PR-052 ─→ PR-053
   - `class-string<T>` argument should bind `T` for return type.
   - Fallback: unresolved condition returns union of branches.
   - Tests: service locator `make(Foo::class): Foo`, conditional factory, fallback union.
+
+- [x] **IE-032E** Conditional return types and `class-string<T>` call-site inference *(done 2026-05-26)*
+  - Extend PHPDoc/type parsing so return types can preserve PHPStan/Psalm
+    conditional syntax like `($name is class-string<T> ? T : object)`.
+  - Bind `class-string<T>` template arguments from call-site expressions such
+    as `Foo::class`, string literals, and variables with known class-string
+    type where existing local inference can prove it.
+  - Resolve conditional return branches when the tested argument is a known
+    literal/class-string; otherwise expose a stable union fallback of both
+    branches.
+  - Thread the resolved call-site return type through hover/completion/inlay
+    paths that already consume indexed function and method return `TypeInfo`.
+  - Add parser/index/server e2e coverage for service-locator `make(Foo::class)`,
+    conditional factories, and unresolved fallback unions.
+  - Implemented: `TypeInfo` now models PHPStan/Psalm conditional return types
+    and the PHPDoc parser preserves `($arg is Type ? A : B)` instead of
+    flattening it into a simple string.
+  - Implemented: PHPDoc `@param` types enrich indexed function/method
+    signatures, so `class-string<T>` can bind `T` even when the PHP native
+    parameter type is omitted or broader than the PHPDoc contract.
+  - Implemented: call-site return resolution binds `class-string<T>` from
+    `Foo::class`, string literals that resolve to indexed class symbols, and
+    local variables with known PHPDoc `class-string` types.
+  - Implemented: conditional returns choose a known branch when possible and
+    expose a deterministic `if|else` union fallback when the subject argument
+    is unresolved.
+  - Implemented: local variable hover/inlay paths and member completion chains
+    reuse the call-site return resolver, including
+    `$locator->make(Widget::class)->...` completion.
+  - Implemented: cache schema version bumped because indexed `TypeInfo`
+    serialization gained a new variant.
+  - Regression: parser tests cover conditional return parsing and PHPDoc param
+    template metadata; e2e tests cover inlay hints, hover links, completion
+    chains, service-locator factories, conditional factories, and fallback
+    unions.
+  - Docs: `README.md`, `docs/lsp-features.md`, and
+    `docs/production-risk-register.md` mention the new call-site inference.
+  - Validation: `cargo test -p php-lsp-parser`, targeted e2e inlay, hover,
+    and completion tests, `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, docs Cyrillic check,
+    `git diff --check`.
 
 - [x] **IE-032A** Inlay hints: inferred local variable types *(done 2026-05-26)*
   - Extend `textDocument/inlayHint` with Rust-style `: Type` hints after local

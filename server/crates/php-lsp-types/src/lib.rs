@@ -74,6 +74,12 @@ pub enum TypeInfo {
         return_type: Option<Box<TypeInfo>>,
     },
     ClassString(Option<Box<TypeInfo>>),
+    Conditional {
+        subject: String,
+        target: Box<TypeInfo>,
+        if_type: Box<TypeInfo>,
+        else_type: Box<TypeInfo>,
+    },
     LiteralString(String),
     LiteralInt(String),
     LiteralFloat(String),
@@ -115,6 +121,16 @@ impl std::fmt::Display for TypeInfo {
             }
             TypeInfo::ClassString(Some(inner)) => write!(f, "class-string<{}>", inner),
             TypeInfo::ClassString(None) => write!(f, "class-string"),
+            TypeInfo::Conditional {
+                subject,
+                target,
+                if_type,
+                else_type,
+            } => write!(
+                f,
+                "({} is {} ? {} : {})",
+                subject, target, if_type, else_type
+            ),
             TypeInfo::LiteralString(value) => write!(f, "{}", value),
             TypeInfo::LiteralInt(value) => write!(f, "{}", value),
             TypeInfo::LiteralFloat(value) => write!(f, "{}", value),
@@ -418,6 +434,18 @@ mod tests {
         assert_eq!(
             TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple("User".into())))).to_string(),
             "class-string<User>"
+        );
+        assert_eq!(
+            TypeInfo::Conditional {
+                subject: "$class".into(),
+                target: Box::new(TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple(
+                    "T".into()
+                ))))),
+                if_type: Box::new(TypeInfo::Simple("T".into())),
+                else_type: Box::new(TypeInfo::Simple("object".into())),
+            }
+            .to_string(),
+            "($class is class-string<T> ? T : object)"
         );
         assert_eq!(
             TypeInfo::Callable {
