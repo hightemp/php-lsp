@@ -4064,6 +4064,32 @@ enum TypeHintPosition {
     Return,
 }
 
+fn php_identifier_part_is_valid(part: &str) -> bool {
+    let mut chars = part.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn simple_native_type_hint_text(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains('-') {
+        return None;
+    }
+
+    let without_leading_slash = trimmed.trim_start_matches('\\');
+    if without_leading_slash
+        .split('\\')
+        .all(php_identifier_part_is_valid)
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
 fn native_type_hint_text(
     type_info: &php_lsp_types::TypeInfo,
     php_version: PhpVersion,
@@ -4072,7 +4098,7 @@ fn native_type_hint_text(
     use php_lsp_types::TypeInfo;
 
     match type_info {
-        TypeInfo::Simple(name) => Some(name.clone()),
+        TypeInfo::Simple(name) => simple_native_type_hint_text(name),
         TypeInfo::Self_ | TypeInfo::Parent_ => Some(type_info.to_string()),
         TypeInfo::Static_ if position == TypeHintPosition::Return && php_version.at_least(8, 0) => {
             Some("static".to_string())
@@ -4558,6 +4584,134 @@ fn property_type_info(property: &php_lsp_types::SymbolInfo) -> Option<&php_lsp_t
         .and_then(|signature| signature.return_type.as_ref())
 }
 
+#[derive(Debug, Clone)]
+struct PropertyDocType {
+    type_info: Option<php_lsp_types::TypeInfo>,
+    type_text: String,
+    description: Option<String>,
+}
+
+fn property_doc_type(property: &php_lsp_types::SymbolInfo) -> Option<PropertyDocType> {
+    let doc_comment = property.doc_comment.as_deref()?;
+    let parsed = parse_phpdoc(doc_comment);
+
+    for tag in ["@var", "@phpstan-var", "@psalm-var"] {
+        for line in phpdoc_content_lines(doc_comment) {
+            let Some(rest) = phpdoc_tag_rest(&line, tag) else {
+                continue;
+            };
+            let Some(type_end) = consume_phpdoc_type_expr(rest) else {
+                continue;
+            };
+            let type_text = rest[..type_end].trim();
+            if type_text.is_empty() {
+                continue;
+            }
+
+            let after_type = rest[type_end..].trim_start();
+            let mut description = after_type;
+            if let Some((name_start, name_end)) = find_phpdoc_variable_token_span(after_type) {
+                let variable_text = after_type[name_start..name_end].trim();
+                let Some(name) = phpdoc_variable_name_from_token(variable_text) else {
+                    continue;
+                };
+                if name != property.name {
+                    continue;
+                }
+                description = after_type[name_end..].trim_start();
+            }
+
+            return Some(PropertyDocType {
+                type_info: (tag == "@var").then(|| parsed.var_type.clone()).flatten(),
+                type_text: type_text.to_string(),
+                description: (!description.is_empty()).then(|| description.to_string()),
+            });
+        }
+    }
+
+    None
+}
+
+fn generated_member_native_type_hint_text(
+    type_info: &php_lsp_types::TypeInfo,
+    php_version: PhpVersion,
+    position: TypeHintPosition,
+) -> Option<String> {
+    use php_lsp_types::TypeInfo;
+
+    if let Some(native) = native_type_hint_text(type_info, php_version, position) {
+        return Some(native);
+    }
+
+    match type_info {
+        TypeInfo::Generic { base, .. } => {
+            let base_lower = base.to_ascii_lowercase();
+            match base_lower.as_str() {
+                "array" | "list" | "non-empty-array" | "non-empty-list" => {
+                    Some("array".to_string())
+                }
+                "class-string" => Some("string".to_string()),
+                _ => simple_native_type_hint_text(base),
+            }
+        }
+        TypeInfo::ArrayShape(_) => Some("array".to_string()),
+        TypeInfo::Callable { .. } => Some("callable".to_string()),
+        TypeInfo::ClassString(_) => Some("string".to_string()),
+        TypeInfo::LiteralString(_) => Some("string".to_string()),
+        TypeInfo::LiteralInt(_) => Some("int".to_string()),
+        TypeInfo::LiteralFloat(_) => Some("float".to_string()),
+        TypeInfo::LiteralBool(_) => Some("bool".to_string()),
+        TypeInfo::Simple(name) => match name.to_ascii_lowercase().as_str() {
+            "positive-int" | "negative-int" | "non-negative-int" | "non-positive-int"
+            | "non-zero-int" => Some("int".to_string()),
+            "non-empty-string" | "numeric-string" | "literal-string" | "lowercase-string"
+            | "class-string" => Some("string".to_string()),
+            "non-empty-array" | "list" | "non-empty-list" => Some("array".to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn property_contract_type_text(property: &php_lsp_types::SymbolInfo) -> Option<PropertyDocType> {
+    let doc_type = property_doc_type(property);
+    let native_type = property_type_info(property);
+
+    if let Some(doc_type) = doc_type {
+        if let (Some(doc_info), Some(native)) = (doc_type.type_info.as_ref(), native_type) {
+            if type_info_refines_native(doc_info, native) {
+                return Some(doc_type);
+            }
+        }
+        if native_type.map(ToString::to_string).as_deref() != Some(doc_type.type_text.as_str()) {
+            return Some(doc_type);
+        }
+    }
+
+    native_type.map(|type_info| PropertyDocType {
+        type_info: Some(type_info.clone()),
+        type_text: type_info.to_string(),
+        description: None,
+    })
+}
+
+fn property_doc_type_needed(
+    property: &php_lsp_types::SymbolInfo,
+    php_version: PhpVersion,
+    position: TypeHintPosition,
+) -> Option<PropertyDocType> {
+    let contract = property_contract_type_text(property)?;
+    let native_hint = contract.type_info.as_ref().and_then(|type_info| {
+        generated_member_native_type_hint_text(type_info, php_version, position)
+    });
+
+    if native_hint.as_deref() == Some(contract.type_text.as_str()) {
+        None
+    } else {
+        Some(contract)
+    }
+}
+
 fn type_info_contains_bool(type_info: &php_lsp_types::TypeInfo) -> bool {
     use php_lsp_types::TypeInfo;
 
@@ -4731,10 +4885,17 @@ fn constructor_generation_properties<'a>(
 
 fn render_constructor_param(property: &ConstructorProperty<'_>, php_version: PhpVersion) -> String {
     let mut text = String::new();
-    if let Some(type_info) = property_type_info(property.symbol) {
-        if let Some(type_text) =
-            native_type_hint_text(type_info, php_version, TypeHintPosition::Parameter)
-        {
+    let contract_type = property_contract_type_text(property.symbol);
+    let type_info = contract_type
+        .as_ref()
+        .and_then(|contract| contract.type_info.as_ref())
+        .or_else(|| property_type_info(property.symbol));
+    if let Some(type_info) = type_info {
+        if let Some(type_text) = generated_member_native_type_hint_text(
+            type_info,
+            php_version,
+            TypeHintPosition::Parameter,
+        ) {
             text.push_str(&type_text);
             text.push(' ');
         }
@@ -4746,6 +4907,25 @@ fn render_constructor_param(property: &ConstructorProperty<'_>, php_version: Php
         text.push_str(default_value);
     }
     text
+}
+
+fn render_phpdoc_type_line(
+    tag: &str,
+    type_text: &str,
+    variable_name: Option<&str>,
+    description: Option<&str>,
+) -> String {
+    let mut line = format!("{} {}", tag, type_text.trim());
+    if let Some(variable_name) = variable_name {
+        line.push(' ');
+        line.push('$');
+        line.push_str(variable_name);
+    }
+    if let Some(description) = description.filter(|description| !description.is_empty()) {
+        line.push(' ');
+        line.push_str(description);
+    }
+    line
 }
 
 fn render_constructor_method(
@@ -4761,6 +4941,26 @@ fn render_constructor_method(
         .join(", ");
 
     let mut text = String::new();
+    let doc_lines = properties
+        .iter()
+        .filter_map(|property| {
+            let doc_type = property_doc_type_needed(
+                property.symbol,
+                php_version,
+                TypeHintPosition::Parameter,
+            )?;
+            Some(render_phpdoc_type_line(
+                "@param",
+                &doc_type.type_text,
+                Some(&property.symbol.name),
+                doc_type.description.as_deref(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if !doc_lines.is_empty() {
+        text.push_str(&render_phpdoc_comment(method_indent, &doc_lines));
+        text.push('\n');
+    }
     text.push_str(method_indent);
     text.push_str("public function __construct(");
     text.push_str(&params);
@@ -4789,8 +4989,38 @@ fn render_accessor_method(
     php_version: PhpVersion,
 ) -> String {
     let is_static = property.modifiers.is_static;
-    let type_hint = property_type_info(property);
+    let contract_type = property_contract_type_text(property);
+    let type_hint = contract_type
+        .as_ref()
+        .and_then(|contract| contract.type_info.as_ref())
+        .or_else(|| property_type_info(property));
     let mut text = String::new();
+    let doc_type = property_doc_type_needed(
+        property,
+        php_version,
+        match accessor_kind {
+            AccessorKind::Getter => TypeHintPosition::Return,
+            AccessorKind::Setter => TypeHintPosition::Parameter,
+        },
+    );
+    if let Some(doc_type) = doc_type.as_ref() {
+        let line = match accessor_kind {
+            AccessorKind::Getter => render_phpdoc_type_line(
+                "@return",
+                &doc_type.type_text,
+                None,
+                doc_type.description.as_deref(),
+            ),
+            AccessorKind::Setter => render_phpdoc_type_line(
+                "@param",
+                &doc_type.type_text,
+                Some(&property.name),
+                doc_type.description.as_deref(),
+            ),
+        };
+        text.push_str(&render_phpdoc_comment(method_indent, &[line]));
+        text.push('\n');
+    }
     text.push_str(method_indent);
     text.push_str("public ");
     if is_static {
@@ -4803,7 +5033,11 @@ fn render_accessor_method(
         AccessorKind::Getter => {
             text.push_str("()");
             if let Some(return_type) = type_hint.and_then(|type_info| {
-                native_type_hint_text(type_info, php_version, TypeHintPosition::Return)
+                generated_member_native_type_hint_text(
+                    type_info,
+                    php_version,
+                    TypeHintPosition::Return,
+                )
             }) {
                 text.push_str(": ");
                 text.push_str(&return_type);
@@ -4826,7 +5060,11 @@ fn render_accessor_method(
         AccessorKind::Setter => {
             text.push('(');
             if let Some(param_type) = type_hint.and_then(|type_info| {
-                native_type_hint_text(type_info, php_version, TypeHintPosition::Parameter)
+                generated_member_native_type_hint_text(
+                    type_info,
+                    php_version,
+                    TypeHintPosition::Parameter,
+                )
             }) {
                 text.push_str(&param_type);
                 text.push(' ');
@@ -5896,6 +6134,29 @@ fn type_info_refines_native(
 
     match (phpdoc_type, native_type) {
         (_, TypeInfo::Mixed) => true,
+        (TypeInfo::Simple(phpdoc), TypeInfo::Simple(native)) => {
+            let phpdoc = phpdoc.trim_start_matches('\\').to_ascii_lowercase();
+            let native = native.trim_start_matches('\\').to_ascii_lowercase();
+            phpdoc == native
+                || matches!(
+                    (phpdoc.as_str(), native.as_str()),
+                    (
+                        "positive-int"
+                            | "negative-int"
+                            | "non-negative-int"
+                            | "non-positive-int"
+                            | "non-zero-int",
+                        "int"
+                    ) | (
+                        "non-empty-string"
+                            | "numeric-string"
+                            | "literal-string"
+                            | "lowercase-string"
+                            | "class-string",
+                        "string"
+                    ) | ("non-empty-array" | "list" | "non-empty-list", "array")
+                )
+        }
         (TypeInfo::Generic { base, .. }, TypeInfo::Simple(native)) => {
             type_name_eq(base, native)
                 || (native.eq_ignore_ascii_case("array")

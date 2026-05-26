@@ -1357,6 +1357,22 @@ PR-052 ─→ PR-053
   - Regression: e2e covers constructor generation, nullable default params, readonly/static properties, bool getter naming, setter generation, existing constructor suppression, and existing accessor suppression.
   - Validation: `cargo fmt --all --check`, targeted generate-members e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
+- [x] **IE-011S** Code actions: generate members Supported coverage *(done 2026-05-26)*
+  - Довести feature matrix для `textDocument/codeAction` generate members до `Supported`.
+  - Generate constructor должен сохранять richer PHPDoc/property metadata через generated constructor PHPDoc, когда native signature не может выразить generic/analyzer-specific types.
+  - Generate getter/setter должен добавлять PHPDoc contract для refined property types, сохраняя native-safe signatures.
+  - Учитывать attributes/PHPDoc on properties без unsafe переносов на параметры, но не терять type contract в generated members.
+  - Поддержать untyped properties with `@var`, generic array/list/class-string/callable/array-shape PHPDoc types, static properties, readonly suppression, nullable/default values.
+  - Добавить regression tests на constructor/getter/setter PHPDoc metadata, static/refined types, existing method suppression, and no action when constructor exists.
+  - Implemented: constructor generation adds `@param` PHPDoc for property types that are richer than native PHP can express.
+  - Implemented: getter generation adds `@return` PHPDoc for refined property types while keeping native-safe return hints.
+  - Implemented: setter generation adds `@param` PHPDoc for refined property types while keeping native-safe parameter hints.
+  - Implemented: generated members understand regular `@var`, `@phpstan-var`, and `@psalm-var` property tags, including descriptions.
+  - Implemented: PHPDoc pseudo-types such as `positive-int`, generic arrays/lists, class-string lists, callable/array-shape-style contracts are kept in PHPDoc and never emitted as invalid native hints.
+  - Docs: `docs/lsp-features.md` now marks generate members as `Supported`.
+  - Regression: e2e covers refined constructor PHPDoc, getter/setter PHPDoc, analyzer var tags, native-safe hints, static properties, readonly setter suppression, bool getter naming, existing constructor/accessor suppression, nullable/default values, and static accessors.
+  - Validation: `cargo fmt --all --check`, targeted generate-members e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
+
 - [x] **IE-012** Code actions: change visibility и promote constructor parameter *(done 2026-05-26)*
   - Change visibility для method/property/class constant/promoted property.
   - Предлагать только альтернативные visibility и сохранять modifiers order.

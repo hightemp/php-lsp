@@ -4792,6 +4792,200 @@ class GenerateMembers
         static_getter_text
     );
 
+    let advanced_code = r#"<?php
+namespace App;
+
+class AdvancedMembers
+{
+    /** @var array<int, string> Items by id. */
+    private array $items = [];
+
+    /** @var positive-int Identifier. */
+    private $id;
+
+    /** @phpstan-var non-empty-list<class-string> Classes. */
+    private static array $classes = [];
+}
+"#;
+    let advanced_uri = "file:///test/AdvancedMembers.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(advanced_uri, advanced_code))
+        .await
+        .unwrap();
+
+    let advanced_constructor_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            10,
+            advanced_uri,
+            ((3, 6), (3, 21)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let advanced_constructor_result = extract_result(advanced_constructor_resp);
+    let advanced_constructor_action = advanced_constructor_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Generate constructor")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected advanced constructor action, got: {}",
+                advanced_constructor_result
+            )
+        });
+    let advanced_constructor_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(11, advanced_constructor_action))
+        .await
+        .unwrap();
+    let advanced_constructor_resolved = extract_result(advanced_constructor_resolve);
+    let advanced_constructor_text = advanced_constructor_resolved["edit"]["changes"][advanced_uri]
+        [0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected advanced constructor edit, got: {}",
+                advanced_constructor_resolved
+            )
+        });
+    assert!(
+        advanced_constructor_text.contains("@param array<int, string> $items Items by id.")
+            && advanced_constructor_text.contains("@param positive-int $id Identifier.")
+            && advanced_constructor_text
+                .contains("public function __construct(array $items, int $id)")
+            && !advanced_constructor_text.contains("classes"),
+        "expected constructor PHPDoc with refined types and native-safe params, got: {}",
+        advanced_constructor_text
+    );
+
+    let items_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            12,
+            advanced_uri,
+            ((6, 20), (6, 26)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let items_result = extract_result(items_resp);
+    let items_actions = items_result.as_array().expect("code actions array");
+    let items_getter_action = items_actions
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Generate getter `getItems`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected items getter action, got: {}", items_result));
+    let items_setter_action = items_actions
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Generate setter `setItems`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected items setter action, got: {}", items_result));
+    let items_getter_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(13, items_getter_action))
+        .await
+        .unwrap();
+    let items_getter_resolved = extract_result(items_getter_resolve);
+    let items_getter_text = items_getter_resolved["edit"]["changes"][advanced_uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected items getter edit, got: {}", items_getter_resolved));
+    assert!(
+        items_getter_text.contains("@return array<int, string> Items by id.")
+            && items_getter_text.contains("public function getItems(): array"),
+        "expected getter PHPDoc with refined return type, got: {}",
+        items_getter_text
+    );
+    let items_setter_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(14, items_setter_action))
+        .await
+        .unwrap();
+    let items_setter_resolved = extract_result(items_setter_resolve);
+    let items_setter_text = items_setter_resolved["edit"]["changes"][advanced_uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected items setter edit, got: {}", items_setter_resolved));
+    assert!(
+        items_setter_text.contains("@param array<int, string> $items Items by id.")
+            && items_setter_text.contains("public function setItems(array $items): void"),
+        "expected setter PHPDoc with refined param type, got: {}",
+        items_setter_text
+    );
+
+    let classes_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            15,
+            advanced_uri,
+            ((12, 30), (12, 37)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let classes_result = extract_result(classes_resp);
+    let classes_getter_action = classes_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Generate getter `getClasses`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected classes getter action, got: {}", classes_result));
+    let classes_getter_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(16, classes_getter_action))
+        .await
+        .unwrap();
+    let classes_getter_resolved = extract_result(classes_getter_resolve);
+    let classes_getter_text = classes_getter_resolved["edit"]["changes"][advanced_uri][0]
+        ["newText"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected classes getter edit, got: {}",
+                classes_getter_resolved
+            )
+        });
+    assert!(
+        classes_getter_text.contains("@return non-empty-list<class-string> Classes.")
+            && classes_getter_text.contains("public static function getClasses(): array")
+            && classes_getter_text.contains("return self::$classes;"),
+        "expected static getter PHPDoc from analyzer var tag, got: {}",
+        classes_getter_text
+    );
+
     let existing_code = r#"<?php
 namespace App;
 
@@ -4828,7 +5022,7 @@ class ExistingMembers
         .await
         .unwrap()
         .call(code_action_request_with_only(
-            10,
+            17,
             existing_uri,
             ((3, 6), (3, 21)),
             json!([]),
@@ -4855,7 +5049,7 @@ class ExistingMembers
         .await
         .unwrap()
         .call(code_action_request_with_only(
-            11,
+            18,
             existing_uri,
             ((5, 19), (5, 25)),
             json!([]),
