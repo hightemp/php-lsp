@@ -20,7 +20,7 @@ The format is intentionally operational: every risk is tied to an owner task in
 | R-006 | `didChange` debounce/version ordering | High | `PR-020`, `PR-050` | Mitigated |
 | R-007 | Version-aware stubs | Medium | `PR-030`, `PR-011` | Mitigated |
 | R-008 | Lazy vendor indexing scale validation | Medium | `PR-012`, `PR-011`, `PV-014` | Partially mitigated |
-| R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041`, `PV-012` | Accepted limitation |
+| R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041`, `IE-030`, `PV-012` | Accepted limitation |
 | R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052` | Mitigated |
 
 ## Risks
@@ -272,6 +272,8 @@ Current evidence:
 - `PR-032`/`PR-033` added `@property`, `@property-read`, `@property-write`, and `@method` virtual members in LSP UI.
 - `PR-040`/`PR-041` extended `TypeInfo` and inference for common production PHPDoc/PHP expression patterns.
 - `PR-042` reduced framework-heavy diagnostics false positives for common Symfony/Laravel/Doctrine/PHPUnit patterns.
+- `IE-030` added PHPDoc template metadata and generic inheritance substitution
+  for common repository and collection member types.
 - `PV-012` fixed a real Symfony false positive for promoted constructor
   properties accessed through a `self`-typed parameter
   (`withDefaults(self $defaults)` then `$defaults->objectManager`).
@@ -281,14 +283,15 @@ Current evidence:
 Impact:
 
 - Completion/definition/diagnostics are materially better for PHPDoc-heavy projects, but still not a full static analyzer type system.
-- Complex framework magic, templates, fluent generics, project-specific dynamic
-  behavior, and missing Composer/vendor metadata can still need PHPStan/Psalm or
+- Complex framework magic, fluent generics, project-specific dynamic behavior,
+  and missing Composer/vendor metadata can still need PHPStan/Psalm or
   diagnostic category tuning.
 
 Mitigation:
 
 - `PR-031`-`PR-034`: PHPDoc parser, virtual members, and e2e coverage.
-- `PR-040`-`PR-042`: richer type model, inference, and framework false-positive reductions.
+- `PR-040`-`PR-042`, `IE-030`: richer type model, inference, PHPDoc template
+  metadata, and framework false-positive reductions.
 - `PV-012`: added regression coverage for `self`/`static` parameter type
   resolution before member diagnostics.
 

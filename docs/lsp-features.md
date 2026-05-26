@@ -38,7 +38,7 @@ tools.
 |---|---|---|
 | `textDocument/definition` | Supported | Handles indexed symbols, local variables, `$this`, constructors, PHPDoc virtual members, and lazy vendor fallback. |
 | `textDocument/declaration` | Supported | Goes to import declarations when applicable, otherwise falls back to definition. |
-| `textDocument/typeDefinition` | Supported | Resolves variable/member/function return types where inferred or indexed. |
+| `textDocument/typeDefinition` | Supported | Resolves variable/member/function return types where inferred or indexed, including common PHPDoc generic inheritance substitutions. |
 | `textDocument/implementation` | Supported | Interface/trait/base type to implementations, and method implementation lookup. |
 | `textDocument/references` | Partial | Uses indexed per-file references for symbols and same-scope references for local variables. Workspace-wide references can still be expensive on large workspaces. |
 | `textDocument/documentHighlight` | Supported | Local variables and non-local symbols in the current document. |

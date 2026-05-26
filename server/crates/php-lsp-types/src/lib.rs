@@ -179,6 +179,40 @@ pub struct Signature {
     pub return_type: Option<TypeInfo>,
 }
 
+/// Variance declared for a PHPDoc template parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum TemplateVariance {
+    #[default]
+    Invariant,
+    Covariant,
+    Contravariant,
+}
+
+/// A `@template` declaration from PHPDoc.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TemplateParam {
+    pub name: String,
+    pub bound: Option<TypeInfo>,
+    pub variance: TemplateVariance,
+}
+
+/// The PHPDoc tag that binds template arguments to another type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TemplateBindingKind {
+    Extends,
+    Implements,
+    Use,
+    Mixin,
+}
+
+/// A generic relation declared by `@extends`, `@implements`, `@use`, or `@mixin`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TemplateBinding {
+    pub kind: TemplateBindingKind,
+    pub target: String,
+    pub args: Vec<TypeInfo>,
+}
+
 /// Parsed PHPDoc information.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhpDoc {
@@ -190,6 +224,8 @@ pub struct PhpDoc {
     pub deprecated: Option<String>,
     pub properties: Vec<PhpDocProperty>,
     pub methods: Vec<PhpDocMethod>,
+    pub templates: Vec<TemplateParam>,
+    pub template_bindings: Vec<TemplateBinding>,
 }
 
 /// A @param tag from PHPDoc.
@@ -277,6 +313,12 @@ pub struct SymbolInfo {
     /// Used trait FQNs (`use SomeTrait;` inside class/trait bodies)
     #[serde(default)]
     pub traits: Vec<String>,
+    /// Template parameters declared on this class/function/method.
+    #[serde(default)]
+    pub templates: Vec<TemplateParam>,
+    /// PHPDoc generic bindings declared on this class-like symbol.
+    #[serde(default)]
+    pub template_bindings: Vec<TemplateBinding>,
 }
 
 /// A use statement in a PHP file.

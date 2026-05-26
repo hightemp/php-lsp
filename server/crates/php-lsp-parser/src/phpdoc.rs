@@ -1,11 +1,12 @@
 //! PHPDoc comment parser.
 //!
 //! Extracts type information and documentation from PHPDoc comments.
-//! Supports: @param, @return, @var, @throws, @deprecated, @property, @method.
+//! Supports: @param, @return, @var, @throws, @deprecated, @property, @method,
+//! @template, @extends, @implements, @use, and @mixin.
 
 use php_lsp_types::{
     ArrayShapeItem, PhpDoc, PhpDocMethod, PhpDocParam, PhpDocProperty, PhpDocPropertyAccess,
-    TypeInfo,
+    TemplateBinding, TemplateBindingKind, TemplateParam, TemplateVariance, TypeInfo,
 };
 
 /// Parse a PHPDoc comment string into structured data.
@@ -71,7 +72,11 @@ fn strip_comment_markers(comment: &str) -> Vec<String> {
 }
 
 fn parse_tag(line: &str, doc: &mut PhpDoc) {
-    if let Some(rest) = line.strip_prefix("@param") {
+    if let Some((rest, variance)) = template_tag(line) {
+        parse_template_tag(rest, variance, doc);
+    } else if let Some((rest, kind)) = template_binding_tag(line) {
+        parse_template_binding_tag(rest, kind, doc);
+    } else if let Some(rest) = line.strip_prefix("@param") {
         parse_param_tag(rest.trim(), doc);
     } else if let Some(rest) = line.strip_prefix("@return") {
         let rest = rest.trim();
@@ -103,6 +108,73 @@ fn parse_tag(line: &str, doc: &mut PhpDoc) {
     }
 }
 
+fn strip_exact_tag<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(tag)?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest.trim())
+    } else {
+        None
+    }
+}
+
+fn template_tag(line: &str) -> Option<(&str, TemplateVariance)> {
+    for tag in [
+        "@template-covariant",
+        "@phpstan-template-covariant",
+        "@psalm-template-covariant",
+    ] {
+        if let Some(rest) = strip_exact_tag(line, tag) {
+            return Some((rest, TemplateVariance::Covariant));
+        }
+    }
+
+    for tag in [
+        "@template-contravariant",
+        "@phpstan-template-contravariant",
+        "@psalm-template-contravariant",
+    ] {
+        if let Some(rest) = strip_exact_tag(line, tag) {
+            return Some((rest, TemplateVariance::Contravariant));
+        }
+    }
+
+    for tag in ["@template", "@phpstan-template", "@psalm-template"] {
+        if let Some(rest) = strip_exact_tag(line, tag) {
+            return Some((rest, TemplateVariance::Invariant));
+        }
+    }
+
+    None
+}
+
+fn template_binding_tag(line: &str) -> Option<(&str, TemplateBindingKind)> {
+    for tag in ["@extends", "@phpstan-extends", "@psalm-extends"] {
+        if let Some(rest) = strip_exact_tag(line, tag) {
+            return Some((rest, TemplateBindingKind::Extends));
+        }
+    }
+
+    for tag in ["@implements", "@phpstan-implements", "@psalm-implements"] {
+        if let Some(rest) = strip_exact_tag(line, tag) {
+            return Some((rest, TemplateBindingKind::Implements));
+        }
+    }
+
+    for tag in ["@use", "@phpstan-use", "@psalm-use"] {
+        if let Some(rest) = strip_exact_tag(line, tag) {
+            return Some((rest, TemplateBindingKind::Use));
+        }
+    }
+
+    for tag in ["@mixin", "@phpstan-mixin", "@psalm-mixin"] {
+        if let Some(rest) = strip_exact_tag(line, tag) {
+            return Some((rest, TemplateBindingKind::Mixin));
+        }
+    }
+
+    None
+}
+
 fn strip_param_prefix(s: &str) -> &str {
     s.strip_prefix("&...$")
         .or_else(|| s.strip_prefix("...$"))
@@ -122,6 +194,84 @@ fn parse_param_tag(rest: &str, doc: &mut PhpDoc) {
         type_info: type_str.map(parse_type_string),
         description: desc,
     });
+}
+
+fn parse_template_tag(rest: &str, variance: TemplateVariance, doc: &mut PhpDoc) {
+    let rest = rest.trim();
+    let Some((name, remaining)) = split_first_word(rest) else {
+        return;
+    };
+
+    let name = name.trim_start_matches('$').trim();
+    if !is_valid_template_name(name) {
+        return;
+    }
+
+    let remaining = remaining.trim_start();
+    let bound = remaining
+        .strip_prefix("of ")
+        .or_else(|| remaining.strip_prefix("as "))
+        .and_then(|bound| {
+            split_type_prefix(bound).map(|(type_str, _)| parse_type_string(type_str))
+        });
+
+    doc.templates.push(TemplateParam {
+        name: name.to_string(),
+        bound,
+        variance,
+    });
+}
+
+fn split_first_word(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    for (idx, ch) in s.char_indices() {
+        if ch.is_whitespace() {
+            return Some((&s[..idx], &s[idx + ch.len_utf8()..]));
+        }
+    }
+    Some((s, ""))
+}
+
+fn is_valid_template_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn parse_template_binding_tag(rest: &str, kind: TemplateBindingKind, doc: &mut PhpDoc) {
+    let Some((type_str, _)) = split_type_prefix(rest) else {
+        return;
+    };
+
+    let type_info = parse_type_string(type_str);
+    if let Some(binding) = template_binding_from_type(type_info, kind) {
+        doc.template_bindings.push(binding);
+    }
+}
+
+fn template_binding_from_type(
+    type_info: TypeInfo,
+    kind: TemplateBindingKind,
+) -> Option<TemplateBinding> {
+    match type_info {
+        TypeInfo::Generic { base, args } => Some(TemplateBinding {
+            kind,
+            target: base,
+            args,
+        }),
+        TypeInfo::Simple(target) => Some(TemplateBinding {
+            kind,
+            target,
+            args: Vec::new(),
+        }),
+        _ => None,
+    }
 }
 
 fn parse_var_tag(rest: &str, doc: &mut PhpDoc) {
@@ -1150,6 +1300,52 @@ mod tests {
         assert_eq!(items[1].value, TypeInfo::LiteralInt("1".to_string()));
         assert_eq!(items[2].value, TypeInfo::LiteralBool(true));
         assert_eq!(items[3].value, TypeInfo::LiteralFloat("1.5".to_string()));
+    }
+
+    #[test]
+    fn test_parse_template_tags_with_bounds_and_variance() {
+        let doc = parse_phpdoc(
+            "/**\n * @template T of Entity\n * @template-covariant TItem as object\n * @template-contravariant TConsumer\n */",
+        );
+
+        assert_eq!(doc.templates.len(), 3);
+        assert_eq!(doc.templates[0].name, "T");
+        assert_eq!(doc.templates[0].variance, TemplateVariance::Invariant);
+        assert_eq!(
+            doc.templates[0].bound,
+            Some(TypeInfo::Simple("Entity".to_string()))
+        );
+        assert_eq!(doc.templates[1].name, "TItem");
+        assert_eq!(doc.templates[1].variance, TemplateVariance::Covariant);
+        assert_eq!(
+            doc.templates[1].bound,
+            Some(TypeInfo::Simple("object".to_string()))
+        );
+        assert_eq!(doc.templates[2].variance, TemplateVariance::Contravariant);
+    }
+
+    #[test]
+    fn test_parse_template_binding_tags() {
+        let doc = parse_phpdoc(
+            "/**\n * @extends Repository<int, User>\n * @implements IteratorAggregate<int, User>\n * @use Auditable<User>\n * @mixin Builder<User>\n */",
+        );
+
+        assert_eq!(doc.template_bindings.len(), 4);
+        assert_eq!(doc.template_bindings[0].kind, TemplateBindingKind::Extends);
+        assert_eq!(doc.template_bindings[0].target, "Repository");
+        assert_eq!(
+            doc.template_bindings[0].args,
+            vec![
+                TypeInfo::Simple("int".to_string()),
+                TypeInfo::Simple("User".to_string())
+            ]
+        );
+        assert_eq!(
+            doc.template_bindings[1].kind,
+            TemplateBindingKind::Implements
+        );
+        assert_eq!(doc.template_bindings[2].kind, TemplateBindingKind::Use);
+        assert_eq!(doc.template_bindings[3].kind, TemplateBindingKind::Mixin);
     }
 
     #[test]

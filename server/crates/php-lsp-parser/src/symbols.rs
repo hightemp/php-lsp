@@ -403,6 +403,8 @@ fn extract_class_like(
 
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
+    let templates = phpdoc_templates(doc_comment.as_deref());
+    let template_bindings = phpdoc_template_bindings(doc_comment.as_deref(), result);
 
     // Extract extends (base_clause) and implements (class_interface_clause)
     let extends_fqns = extract_base_clause(node, source, result);
@@ -427,6 +429,8 @@ fn extract_class_like(
         extends: extends_fqns,
         implements: implements_fqns,
         traits: trait_fqns,
+        templates,
+        template_bindings,
     };
     result.symbols.push(sym);
 
@@ -490,6 +494,7 @@ fn extract_method(
     let visibility = extract_visibility(node, source);
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
+    let templates = phpdoc_templates(doc_comment.as_deref());
     let mut signature = extract_signature(node, source, php_version);
 
     // Apply PHPDoc fallbacks: @return type and [optional] params
@@ -512,6 +517,8 @@ fn extract_method(
         extends: vec![],
         implements: vec![],
         traits: vec![],
+        templates,
+        template_bindings: vec![],
     });
 
     // Emit Property symbols for promoted constructor parameters.
@@ -553,6 +560,8 @@ fn extract_method(
                         extends: vec![],
                         implements: vec![],
                         traits: vec![],
+                        templates: vec![],
+                        template_bindings: vec![],
                     });
                 }
             }
@@ -579,6 +588,7 @@ fn extract_function(
     let name = node_text(name_node, source).to_string();
     let fqn = make_fqn(current_ns, &name);
     let doc_comment = find_doc_comment(node, source);
+    let templates = phpdoc_templates(doc_comment.as_deref());
     let mut signature = extract_signature(node, source, php_version);
 
     // Apply PHPDoc fallbacks: @return type and [optional] params
@@ -601,6 +611,8 @@ fn extract_function(
         extends: vec![],
         implements: vec![],
         traits: vec![],
+        templates,
+        template_bindings: vec![],
     });
 }
 
@@ -657,6 +669,8 @@ fn extract_properties(
                     extends: vec![],
                     implements: vec![],
                     traits: vec![],
+                    templates: vec![],
+                    template_bindings: vec![],
                 });
             }
         }
@@ -708,6 +722,8 @@ fn extract_class_constants(
                     extends: vec![],
                     implements: vec![],
                     traits: vec![],
+                    templates: vec![],
+                    template_bindings: vec![],
                 });
             }
         }
@@ -755,6 +771,8 @@ fn extract_global_constants(
                     extends: vec![],
                     implements: vec![],
                     traits: vec![],
+                    templates: vec![],
+                    template_bindings: vec![],
                 });
             }
         }
@@ -796,6 +814,8 @@ fn extract_enum_case(
         extends: vec![],
         implements: vec![],
         traits: vec![],
+        templates: vec![],
+        template_bindings: vec![],
     });
 }
 
@@ -832,6 +852,167 @@ fn apply_phpdoc_to_signature(signature: &mut Signature, doc_comment: &str) {
             }
         }
     }
+}
+
+fn phpdoc_templates(doc_comment: Option<&str>) -> Vec<TemplateParam> {
+    doc_comment
+        .map(crate::phpdoc::parse_phpdoc)
+        .map(|doc| doc.templates)
+        .unwrap_or_default()
+}
+
+fn phpdoc_template_bindings(
+    doc_comment: Option<&str>,
+    file_symbols: &FileSymbols,
+) -> Vec<TemplateBinding> {
+    doc_comment
+        .map(crate::phpdoc::parse_phpdoc)
+        .map(|doc| {
+            let template_names: std::collections::HashSet<String> = doc
+                .templates
+                .into_iter()
+                .map(|template| template.name)
+                .collect();
+            doc.template_bindings
+                .into_iter()
+                .map(|mut binding| {
+                    binding.target = resolve_class_name_in_file(&binding.target, file_symbols);
+                    binding.args = binding
+                        .args
+                        .into_iter()
+                        .map(|arg| {
+                            resolve_template_type_info_in_file(arg, file_symbols, &template_names)
+                        })
+                        .collect();
+                    binding
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn resolve_template_type_info_in_file(
+    type_info: TypeInfo,
+    file_symbols: &FileSymbols,
+    template_names: &std::collections::HashSet<String>,
+) -> TypeInfo {
+    match type_info {
+        TypeInfo::Simple(name)
+            if template_names.contains(&name) || is_phpdoc_builtin_type(&name) =>
+        {
+            TypeInfo::Simple(name)
+        }
+        TypeInfo::Simple(name) => TypeInfo::Simple(resolve_class_name_in_file(&name, file_symbols)),
+        TypeInfo::Generic { base, args } => {
+            let base = if template_names.contains(&base) || is_phpdoc_builtin_type(&base) {
+                base
+            } else {
+                resolve_class_name_in_file(&base, file_symbols)
+            };
+            TypeInfo::Generic {
+                base,
+                args: args
+                    .into_iter()
+                    .map(|arg| {
+                        resolve_template_type_info_in_file(arg, file_symbols, template_names)
+                    })
+                    .collect(),
+            }
+        }
+        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+            items
+                .into_iter()
+                .map(|item| ArrayShapeItem {
+                    key: item.key,
+                    optional: item.optional,
+                    value: resolve_template_type_info_in_file(
+                        item.value,
+                        file_symbols,
+                        template_names,
+                    ),
+                })
+                .collect(),
+        ),
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => TypeInfo::Callable {
+            params: params
+                .into_iter()
+                .map(|param| {
+                    resolve_template_type_info_in_file(param, file_symbols, template_names)
+                })
+                .collect(),
+            return_type: return_type.map(|return_type| {
+                Box::new(resolve_template_type_info_in_file(
+                    *return_type,
+                    file_symbols,
+                    template_names,
+                ))
+            }),
+        },
+        TypeInfo::ClassString(Some(inner)) => TypeInfo::ClassString(Some(Box::new(
+            resolve_template_type_info_in_file(*inner, file_symbols, template_names),
+        ))),
+        TypeInfo::Union(types) => TypeInfo::Union(
+            types
+                .into_iter()
+                .map(|type_info| {
+                    resolve_template_type_info_in_file(type_info, file_symbols, template_names)
+                })
+                .collect(),
+        ),
+        TypeInfo::Intersection(types) => TypeInfo::Intersection(
+            types
+                .into_iter()
+                .map(|type_info| {
+                    resolve_template_type_info_in_file(type_info, file_symbols, template_names)
+                })
+                .collect(),
+        ),
+        TypeInfo::Nullable(inner) => TypeInfo::Nullable(Box::new(
+            resolve_template_type_info_in_file(*inner, file_symbols, template_names),
+        )),
+        TypeInfo::ClassString(None)
+        | TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed
+        | TypeInfo::Self_
+        | TypeInfo::Static_
+        | TypeInfo::Parent_ => type_info,
+    }
+}
+
+fn is_phpdoc_builtin_type(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches('\\').to_ascii_lowercase().as_str(),
+        "array"
+            | "bool"
+            | "boolean"
+            | "callable"
+            | "false"
+            | "float"
+            | "int"
+            | "integer"
+            | "iterable"
+            | "list"
+            | "mixed"
+            | "never"
+            | "null"
+            | "object"
+            | "resource"
+            | "scalar"
+            | "self"
+            | "static"
+            | "string"
+            | "true"
+            | "void"
+    )
 }
 
 fn phpdoc_var_type_for_property(doc_comment: &str, raw_property_name: &str) -> Option<TypeInfo> {
@@ -1629,6 +1810,99 @@ function demo(
         assert_eq!(cls.fqn, "App\\Foo");
         assert_eq!(cls.extends, vec!["App\\Base\\BaseClass".to_string()]);
         assert!(cls.implements.is_empty());
+    }
+
+    #[test]
+    fn test_extract_class_template_metadata() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App;
+
+use Vendor\Repository\BaseRepository;
+use Vendor\Entity\User;
+
+/**
+ * @template TEntity of object
+ * @extends BaseRepository<TEntity>
+ * @mixin \Vendor\Builder<User>
+ */
+class UserRepository extends BaseRepository {}
+"#,
+        );
+        let cls = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Class)
+            .unwrap();
+
+        assert_eq!(cls.templates.len(), 1);
+        assert_eq!(cls.templates[0].name, "TEntity");
+        assert_eq!(
+            cls.templates[0].bound,
+            Some(TypeInfo::Simple("object".to_string()))
+        );
+        assert_eq!(cls.template_bindings.len(), 2);
+        assert_eq!(cls.template_bindings[0].kind, TemplateBindingKind::Extends);
+        assert_eq!(
+            cls.template_bindings[0].target,
+            "Vendor\\Repository\\BaseRepository"
+        );
+        assert_eq!(
+            cls.template_bindings[0].args,
+            vec![TypeInfo::Simple("TEntity".to_string())]
+        );
+        assert_eq!(cls.template_bindings[1].kind, TemplateBindingKind::Mixin);
+        assert_eq!(cls.template_bindings[1].target, "Vendor\\Builder");
+        assert_eq!(
+            cls.template_bindings[1].args,
+            vec![TypeInfo::Simple("Vendor\\Entity\\User".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_extract_function_and_method_templates() {
+        let syms = parse_and_extract(
+            r#"<?php
+/**
+ * @template TResult
+ * @param class-string<TResult> $class
+ * @return TResult
+ */
+function make(string $class) {}
+
+class Factory {
+    /**
+     * @template TItem
+     * @return TItem
+     */
+    public function item() {}
+}
+"#,
+        );
+
+        let func = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Function)
+            .unwrap();
+        assert_eq!(func.templates.len(), 1);
+        assert_eq!(func.templates[0].name, "TResult");
+        assert_eq!(
+            func.signature.as_ref().unwrap().return_type,
+            Some(TypeInfo::Simple("TResult".to_string()))
+        );
+
+        let method = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Method)
+            .unwrap();
+        assert_eq!(method.templates.len(), 1);
+        assert_eq!(method.templates[0].name, "TItem");
+        assert_eq!(
+            method.signature.as_ref().unwrap().return_type,
+            Some(TypeInfo::Simple("TItem".to_string()))
+        );
     }
 
     #[test]

@@ -1613,7 +1613,7 @@ PR-052 ─→ PR-053
 
 ### Неделя 4: deep type intelligence (2026-06-29 → 2026-07-05)
 
-- [ ] **IE-030** Template model для classes/functions/methods
+- [x] **IE-030** Template model для classes/functions/methods *(done 2026-05-26)*
   - Расширить symbol model:
     - class-level template params with bounds
     - method/function-level template params
@@ -1622,6 +1622,29 @@ PR-052 ─→ PR-053
   - Type parser должен распознавать `@template`, `@template-covariant`, `@template-contravariant`.
   - Inheritance resolver должен подставлять generic args при lookup members.
   - Tests: generic repository, collection item type, inherited generic method return.
+  - Implemented: `TemplateParam`, `TemplateVariance`, `TemplateBindingKind`, and
+    `TemplateBinding` in shared types; `PhpDoc` and `SymbolInfo` now carry
+    template metadata.
+  - Implemented: PHPDoc parsing for `@template`, `@template-covariant`,
+    `@template-contravariant`, plus PHPStan/Psalm-prefixed variants.
+  - Implemented: PHPDoc generic bindings from `@extends`, `@implements`,
+    `@use`, and `@mixin`, with target and argument type resolution in the
+    declaring file context.
+  - Implemented: inherited member lookup and `get_members` substitute template
+    arguments through extends/implements/trait/mixin edges; method-local
+    templates shadow inherited substitutions.
+  - Implemented: cache schema version bump to invalidate older symbol snapshots
+    without template metadata.
+  - Regression: parser tests cover template params, variance, bindings, and
+    symbol extraction; index tests cover generic repository and collection item
+    inherited return type substitution.
+  - Docs: `README.md`, `docs/lsp-features.md`, and
+    `docs/production-risk-register.md` mention the new best-effort PHPDoc
+    template support.
+  - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-parser`,
+    `cargo test -p php-lsp-index`, `cargo test --all`,
+    `cargo clippy --all-targets -- -D warnings`, docs Cyrillic check,
+    `git diff --check`.
 
 - [ ] **IE-031** Type aliases и imported aliases
   - Поддержать `@phpstan-type`, `@psalm-type`, `@phpstan-import-type`, `@psalm-import-type`.

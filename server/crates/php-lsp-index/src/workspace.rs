@@ -1,8 +1,13 @@
 //! Global workspace symbol index.
 
 use dashmap::DashMap;
-use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo, SymbolReference};
-use std::sync::Arc;
+use php_lsp_types::{
+    ArrayShapeItem, FileSymbols, PhpSymbolKind, Signature, SymbolInfo, SymbolReference,
+    TemplateBindingKind, TypeInfo,
+};
+use std::{collections::HashMap, sync::Arc};
+
+type TemplateSubstitutions = HashMap<String, TypeInfo>;
 
 /// Global index of all symbols in the workspace.
 pub struct WorkspaceIndex {
@@ -130,7 +135,13 @@ impl WorkspaceIndex {
     /// found directly on the given class.
     pub fn resolve_member(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
         let (class_fqn, member_name) = fqn.rsplit_once("::")?;
-        self.resolve_member_in_hierarchy(class_fqn, member_name, fqn, &mut Vec::new())
+        self.resolve_member_in_hierarchy(
+            class_fqn,
+            member_name,
+            fqn,
+            &mut Vec::new(),
+            &TemplateSubstitutions::new(),
+        )
     }
 
     /// Internal helper: resolve member walking the inheritance chain.
@@ -141,6 +152,7 @@ impl WorkspaceIndex {
         member_name: &str,
         original_fqn: &str,
         visited: &mut Vec<String>,
+        substitutions: &TemplateSubstitutions,
     ) -> Option<Arc<SymbolInfo>> {
         if visited.contains(&class_fqn.to_string()) {
             return None;
@@ -150,7 +162,7 @@ impl WorkspaceIndex {
         let members = self.get_direct_members(class_fqn);
         // Prefer exact FQN match first
         if let Some(sym) = members.iter().find(|m| m.fqn == original_fqn) {
-            return Some(sym.clone());
+            return Some(substitute_symbol_arc(sym.clone(), substitutions));
         }
         // Fallback: match by name (for cases where caller doesn't know exact FQN form)
         // Property names in SymbolInfo are stored without '$' prefix, so strip it for comparison
@@ -159,32 +171,69 @@ impl WorkspaceIndex {
             .iter()
             .find(|m| m.name == member_name || m.name == bare_name)
         {
-            return Some(sym.clone());
+            return Some(substitute_symbol_arc(sym.clone(), substitutions));
         }
 
         // Walk the class hierarchy: look up extends and implements
         if let Some(class_sym) = self.types.get(class_fqn).map(|r| r.value().clone()) {
             // Try traits first: their members are mixed into the class/trait body.
             for trait_fqn in &class_sym.traits {
-                if let Some(sym) =
-                    self.resolve_member_in_hierarchy(trait_fqn, member_name, original_fqn, visited)
-                {
+                let edge_substitutions =
+                    self.template_substitutions_for_edge(&class_sym, trait_fqn, substitutions);
+                if let Some(sym) = self.resolve_member_in_hierarchy(
+                    trait_fqn,
+                    member_name,
+                    original_fqn,
+                    visited,
+                    &edge_substitutions,
+                ) {
+                    return Some(sym);
+                }
+            }
+            // Try PHPDoc mixins as member providers.
+            for mixin_fqn in class_sym
+                .template_bindings
+                .iter()
+                .filter(|binding| binding.kind == TemplateBindingKind::Mixin)
+                .map(|binding| binding.target.as_str())
+            {
+                let edge_substitutions =
+                    self.template_substitutions_for_edge(&class_sym, mixin_fqn, substitutions);
+                if let Some(sym) = self.resolve_member_in_hierarchy(
+                    mixin_fqn,
+                    member_name,
+                    original_fqn,
+                    visited,
+                    &edge_substitutions,
+                ) {
                     return Some(sym);
                 }
             }
             // Try parent classes (extends)
             for parent_fqn in &class_sym.extends {
-                if let Some(sym) =
-                    self.resolve_member_in_hierarchy(parent_fqn, member_name, original_fqn, visited)
-                {
+                let edge_substitutions =
+                    self.template_substitutions_for_edge(&class_sym, parent_fqn, substitutions);
+                if let Some(sym) = self.resolve_member_in_hierarchy(
+                    parent_fqn,
+                    member_name,
+                    original_fqn,
+                    visited,
+                    &edge_substitutions,
+                ) {
                     return Some(sym);
                 }
             }
             // Try implemented interfaces
             for iface_fqn in &class_sym.implements {
-                if let Some(sym) =
-                    self.resolve_member_in_hierarchy(iface_fqn, member_name, original_fqn, visited)
-                {
+                let edge_substitutions =
+                    self.template_substitutions_for_edge(&class_sym, iface_fqn, substitutions);
+                if let Some(sym) = self.resolve_member_in_hierarchy(
+                    iface_fqn,
+                    member_name,
+                    original_fqn,
+                    visited,
+                    &edge_substitutions,
+                ) {
                     return Some(sym);
                 }
             }
@@ -221,7 +270,12 @@ impl WorkspaceIndex {
     /// Includes inherited members from parent classes and interfaces.
     pub fn get_members(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
         let mut members = Vec::new();
-        self.collect_members_recursive(type_fqn, &mut members, &mut Vec::new());
+        self.collect_members_recursive(
+            type_fqn,
+            &mut members,
+            &mut Vec::new(),
+            &TemplateSubstitutions::new(),
+        );
         members
     }
 
@@ -251,6 +305,7 @@ impl WorkspaceIndex {
         type_fqn: &str,
         members: &mut Vec<Arc<SymbolInfo>>,
         visited: &mut Vec<String>,
+        substitutions: &TemplateSubstitutions,
     ) {
         if visited.contains(&type_fqn.to_string()) {
             return;
@@ -259,20 +314,70 @@ impl WorkspaceIndex {
 
         // Collect direct members
         let direct = self.get_direct_members(type_fqn);
-        members.extend(direct);
+        members.extend(
+            direct
+                .into_iter()
+                .map(|sym| substitute_symbol_arc(sym, substitutions)),
+        );
 
         // Recurse into parent classes and interfaces
         if let Some(class_sym) = self.types.get(type_fqn).map(|r| r.value().clone()) {
             for trait_fqn in &class_sym.traits {
-                self.collect_members_recursive(trait_fqn, members, visited);
+                let edge_substitutions =
+                    self.template_substitutions_for_edge(&class_sym, trait_fqn, substitutions);
+                self.collect_members_recursive(trait_fqn, members, visited, &edge_substitutions);
+            }
+            for mixin_fqn in class_sym
+                .template_bindings
+                .iter()
+                .filter(|binding| binding.kind == TemplateBindingKind::Mixin)
+                .map(|binding| binding.target.as_str())
+            {
+                let edge_substitutions =
+                    self.template_substitutions_for_edge(&class_sym, mixin_fqn, substitutions);
+                self.collect_members_recursive(mixin_fqn, members, visited, &edge_substitutions);
             }
             for parent_fqn in &class_sym.extends {
-                self.collect_members_recursive(parent_fqn, members, visited);
+                let edge_substitutions =
+                    self.template_substitutions_for_edge(&class_sym, parent_fqn, substitutions);
+                self.collect_members_recursive(parent_fqn, members, visited, &edge_substitutions);
             }
             for iface_fqn in &class_sym.implements {
-                self.collect_members_recursive(iface_fqn, members, visited);
+                let edge_substitutions =
+                    self.template_substitutions_for_edge(&class_sym, iface_fqn, substitutions);
+                self.collect_members_recursive(iface_fqn, members, visited, &edge_substitutions);
             }
         }
+    }
+
+    fn template_substitutions_for_edge(
+        &self,
+        from: &SymbolInfo,
+        target_fqn: &str,
+        inherited: &TemplateSubstitutions,
+    ) -> TemplateSubstitutions {
+        let Some(binding) = from
+            .template_bindings
+            .iter()
+            .find(|binding| same_fqn(&binding.target, target_fqn))
+        else {
+            return TemplateSubstitutions::new();
+        };
+
+        let Some(target) = self
+            .types
+            .get(target_fqn)
+            .map(|entry| entry.value().clone())
+        else {
+            return TemplateSubstitutions::new();
+        };
+
+        target
+            .templates
+            .iter()
+            .zip(binding.args.iter())
+            .map(|(template, arg)| (template.name.clone(), substitute_type_info(arg, inherited)))
+            .collect()
     }
 
     fn collect_type_hierarchy_symbols(
@@ -303,6 +408,123 @@ impl WorkspaceIndex {
     }
 }
 
+fn same_fqn(left: &str, right: &str) -> bool {
+    left.trim_start_matches('\\') == right.trim_start_matches('\\')
+}
+
+fn substitute_symbol_arc(
+    symbol: Arc<SymbolInfo>,
+    substitutions: &TemplateSubstitutions,
+) -> Arc<SymbolInfo> {
+    if substitutions.is_empty() {
+        return symbol;
+    }
+
+    let mut scoped = substitutions.clone();
+    for template in &symbol.templates {
+        scoped.remove(&template.name);
+    }
+    if scoped.is_empty() {
+        return symbol;
+    }
+
+    let mut substituted = (*symbol).clone();
+    substituted.signature = substituted
+        .signature
+        .as_ref()
+        .map(|signature| substitute_signature(signature, &scoped));
+    Arc::new(substituted)
+}
+
+fn substitute_signature(signature: &Signature, substitutions: &TemplateSubstitutions) -> Signature {
+    Signature {
+        params: signature
+            .params
+            .iter()
+            .map(|param| {
+                let mut param = param.clone();
+                param.type_info = param
+                    .type_info
+                    .as_ref()
+                    .map(|type_info| substitute_type_info(type_info, substitutions));
+                param
+            })
+            .collect(),
+        return_type: signature
+            .return_type
+            .as_ref()
+            .map(|type_info| substitute_type_info(type_info, substitutions)),
+    }
+}
+
+fn substitute_type_info(type_info: &TypeInfo, substitutions: &TemplateSubstitutions) -> TypeInfo {
+    match type_info {
+        TypeInfo::Simple(name) => substitutions
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| TypeInfo::Simple(name.clone())),
+        TypeInfo::Generic { base, args } => TypeInfo::Generic {
+            base: base.clone(),
+            args: args
+                .iter()
+                .map(|arg| substitute_type_info(arg, substitutions))
+                .collect(),
+        },
+        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+            items
+                .iter()
+                .map(|item| ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: substitute_type_info(&item.value, substitutions),
+                })
+                .collect(),
+        ),
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => TypeInfo::Callable {
+            params: params
+                .iter()
+                .map(|param| substitute_type_info(param, substitutions))
+                .collect(),
+            return_type: return_type
+                .as_ref()
+                .map(|return_type| Box::new(substitute_type_info(return_type, substitutions))),
+        },
+        TypeInfo::ClassString(Some(inner)) => {
+            TypeInfo::ClassString(Some(Box::new(substitute_type_info(inner, substitutions))))
+        }
+        TypeInfo::ClassString(None) => TypeInfo::ClassString(None),
+        TypeInfo::Union(types) => TypeInfo::Union(
+            types
+                .iter()
+                .map(|type_info| substitute_type_info(type_info, substitutions))
+                .collect(),
+        ),
+        TypeInfo::Intersection(types) => TypeInfo::Intersection(
+            types
+                .iter()
+                .map(|type_info| substitute_type_info(type_info, substitutions))
+                .collect(),
+        ),
+        TypeInfo::Nullable(inner) => {
+            TypeInfo::Nullable(Box::new(substitute_type_info(inner, substitutions)))
+        }
+        TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed
+        | TypeInfo::Self_
+        | TypeInfo::Static_
+        | TypeInfo::Parent_ => type_info.clone(),
+    }
+}
+
 impl Default for WorkspaceIndex {
     fn default() -> Self {
         Self::new()
@@ -330,6 +552,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         }
     }
 
@@ -349,6 +573,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         }
     }
 
@@ -446,6 +672,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let file_symbols = FileSymbols {
             namespace: Some("App".to_string()),
@@ -490,6 +718,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let parent_method = SymbolInfo {
             name: "okResponse".to_string(),
@@ -506,6 +736,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let parent_file = FileSymbols {
             namespace: Some("App".to_string()),
@@ -530,6 +762,8 @@ mod tests {
             extends: vec!["App\\SoapHandler".to_string()],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let child_file = FileSymbols {
             namespace: Some("App".to_string()),
@@ -572,6 +806,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let trait_method = SymbolInfo {
             name: "assertOk".to_string(),
@@ -588,6 +824,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         index.update_file(
             "file:///trait.php",
@@ -613,6 +851,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec!["App\\Assertions".to_string()],
+            templates: vec![],
+            template_bindings: vec![],
         };
         index.update_file(
             "file:///class.php",
@@ -648,6 +888,8 @@ mod tests {
             extends: vec!["B".to_string()],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let class_b = SymbolInfo {
             name: "B".to_string(),
@@ -664,6 +906,8 @@ mod tests {
             extends: vec!["A".to_string()],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let file_a = FileSymbols {
             namespace: None,
@@ -705,6 +949,8 @@ mod tests {
             extends: vec!["Vendor\\TestCase".to_string()],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let child_file = FileSymbols {
             namespace: Some("App".to_string()),
@@ -735,6 +981,8 @@ mod tests {
             extends: vec!["Vendor\\BaseAssert".to_string()],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let parent_method = SymbolInfo {
             name: "doSetUp".to_string(),
@@ -751,6 +999,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let parent_file = FileSymbols {
             namespace: Some("Vendor".to_string()),
@@ -783,6 +1033,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let gp_method = SymbolInfo {
             name: "createStub".to_string(),
@@ -799,6 +1051,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         };
         let gp_file = FileSymbols {
             namespace: Some("Vendor".to_string()),
@@ -814,5 +1068,149 @@ mod tests {
             "grandparent method should resolve through inheritance chain"
         );
         assert_eq!(found.unwrap().name, "createStub");
+    }
+
+    #[test]
+    fn test_template_substitution_for_generic_repository_method() {
+        let index = WorkspaceIndex::new();
+
+        let mut repository = make_class("Repository", "App\\Repository", "file:///repo.php");
+        repository.kind = PhpSymbolKind::Interface;
+        repository.templates = vec![TemplateParam {
+            name: "TEntity".to_string(),
+            bound: Some(TypeInfo::Simple("object".to_string())),
+            variance: TemplateVariance::Covariant,
+        }];
+        let repository_method = SymbolInfo {
+            name: "find".to_string(),
+            fqn: "App\\Repository::find".to_string(),
+            kind: PhpSymbolKind::Method,
+            uri: "file:///repo.php".to_string(),
+            range: (3, 4, 3, 40),
+            selection_range: (3, 20, 3, 24),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: Some(Signature {
+                params: vec![],
+                return_type: Some(TypeInfo::Simple("TEntity".to_string())),
+            }),
+            parent_fqn: Some("App\\Repository".to_string()),
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
+        };
+        index.update_file(
+            "file:///repo.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![repository, repository_method],
+            },
+        );
+
+        let mut user_repository = make_class(
+            "UserRepository",
+            "App\\UserRepository",
+            "file:///user_repo.php",
+        );
+        user_repository.implements = vec!["App\\Repository".to_string()];
+        user_repository.template_bindings = vec![TemplateBinding {
+            kind: TemplateBindingKind::Implements,
+            target: "App\\Repository".to_string(),
+            args: vec![TypeInfo::Simple("App\\User".to_string())],
+        }];
+        index.update_file(
+            "file:///user_repo.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![user_repository],
+            },
+        );
+
+        let found = index
+            .resolve_fqn("App\\UserRepository::find")
+            .expect("generic inherited method should resolve");
+        assert_eq!(
+            found
+                .signature
+                .as_ref()
+                .and_then(|sig| sig.return_type.clone()),
+            Some(TypeInfo::Simple("App\\User".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_template_substitution_for_collection_item_type() {
+        let index = WorkspaceIndex::new();
+
+        let mut collection = make_class("Collection", "App\\Collection", "file:///collection.php");
+        collection.templates = vec![TemplateParam {
+            name: "TItem".to_string(),
+            bound: None,
+            variance: TemplateVariance::Covariant,
+        }];
+        let first_method = SymbolInfo {
+            name: "first".to_string(),
+            fqn: "App\\Collection::first".to_string(),
+            kind: PhpSymbolKind::Method,
+            uri: "file:///collection.php".to_string(),
+            range: (3, 4, 3, 40),
+            selection_range: (3, 20, 3, 25),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: Some(Signature {
+                params: vec![],
+                return_type: Some(TypeInfo::Simple("TItem".to_string())),
+            }),
+            parent_fqn: Some("App\\Collection".to_string()),
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
+        };
+        index.update_file(
+            "file:///collection.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![collection, first_method],
+            },
+        );
+
+        let mut user_collection =
+            make_class("UserCollection", "App\\UserCollection", "file:///users.php");
+        user_collection.extends = vec!["App\\Collection".to_string()];
+        user_collection.template_bindings = vec![TemplateBinding {
+            kind: TemplateBindingKind::Extends,
+            target: "App\\Collection".to_string(),
+            args: vec![TypeInfo::Simple("App\\User".to_string())],
+        }];
+        index.update_file(
+            "file:///users.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![user_collection],
+            },
+        );
+
+        let members = index.get_members("App\\UserCollection");
+        let first = members
+            .iter()
+            .find(|member| member.name == "first")
+            .expect("inherited collection method should be returned");
+        assert_eq!(
+            first
+                .signature
+                .as_ref()
+                .and_then(|signature| signature.return_type.clone()),
+            Some(TypeInfo::Simple("App\\User".to_string()))
+        );
     }
 }

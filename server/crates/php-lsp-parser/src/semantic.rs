@@ -1502,6 +1502,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         })
     }
 
@@ -1524,6 +1526,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         })
     }
 

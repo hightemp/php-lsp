@@ -768,6 +768,8 @@ mod tests {
             extends: vec![],
             implements: vec![],
             traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
         }
     }
 
@@ -820,6 +822,8 @@ mod tests {
                 extends: vec![],
                 implements: vec![],
                 traits: vec![],
+                templates: vec![],
+                template_bindings: vec![],
             }],
         };
         index.update_file("file:///test.php", file_symbols.clone());
@@ -908,6 +912,8 @@ mod tests {
                 extends: vec![],
                 implements: vec![],
                 traits: vec![],
+                templates: vec![],
+                template_bindings: vec![],
             }],
         };
         let index = WorkspaceIndex::new();
@@ -943,6 +949,8 @@ mod tests {
                     extends: vec![],
                     implements: vec![],
                     traits: vec![],
+                    templates: vec![],
+                    template_bindings: vec![],
                 },
                 SymbolInfo {
                     name: "test".to_string(),
@@ -962,6 +970,8 @@ mod tests {
                     extends: vec![],
                     implements: vec![],
                     traits: vec![],
+                    templates: vec![],
+                    template_bindings: vec![],
                 },
             ],
         };
