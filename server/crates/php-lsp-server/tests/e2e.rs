@@ -5291,7 +5291,7 @@ class DocDemo
         patch_text.contains("Build a value.")
             && patch_text.contains("@template T")
             && patch_text.contains("@param string $name")
-            && patch_text.contains("@param array $items Items.")
+            && patch_text.contains("@param array<int, string> $items Items.")
             && patch_text.contains("@throws \\RuntimeException")
             && patch_text.contains("@deprecated Use other."),
         "expected updated PHPDoc to preserve summary and unrelated tags, got: {}",
@@ -5301,6 +5301,187 @@ class DocDemo
         !patch_text.contains("$stale") && !patch_text.contains("@return"),
         "expected stale param and redundant void return to be removed, got: {}",
         patch_text
+    );
+
+    let supported_code = r#"<?php
+namespace App;
+
+class SupportedDoc
+{
+    /**
+     * @phpstan-template T of object
+     * @psalm-param list<string> $names Analyzer-specific param.
+     * @param string $name Old name.
+     * @return array<int, string> Labels.
+     * @phpstan-return non-empty-array<int, string>
+     */
+    public function labels(string &$name): array
+    {
+        return [$name];
+    }
+
+    /**
+     * @param string $title Title.
+     */
+    public function __construct(private readonly string $title, public ?int $age = null)
+    {
+    }
+}
+"#;
+    let supported_uri = "file:///test/SupportedPhpDoc.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(supported_uri, supported_code))
+        .await
+        .unwrap();
+
+    let rich_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            6,
+            supported_uri,
+            ((12, 20), (12, 26)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let rich_result = extract_result(rich_resp);
+    let rich_action = rich_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Update PHPDoc from signature")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected rich PHPDoc action, got: {}", rich_result));
+    let rich_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(7, rich_action))
+        .await
+        .unwrap();
+    let rich_resolved = extract_result(rich_resolve);
+    let rich_text = rich_resolved["edit"]["changes"][supported_uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected rich PHPDoc edit, got: {}", rich_resolved));
+    assert!(
+        rich_text.contains("@phpstan-template T of object")
+            && rich_text.contains("@psalm-param list<string> $names Analyzer-specific param.")
+            && rich_text.contains("@param string &$name Old name.")
+            && rich_text.contains("@return array<int, string> Labels.")
+            && rich_text.contains("@phpstan-return non-empty-array<int, string>"),
+        "expected PHPDoc sync to preserve analyzer tags, generic return precision, return description, and by-ref param token, got: {}",
+        rich_text
+    );
+
+    let promoted_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            8,
+            supported_uri,
+            ((20, 40), (20, 45)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let promoted_result = extract_result(promoted_resp);
+    let promoted_action = promoted_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Update PHPDoc from signature")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected promoted PHPDoc action, got: {}", promoted_result));
+    let promoted_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(9, promoted_action))
+        .await
+        .unwrap();
+    let promoted_resolved = extract_result(promoted_resolve);
+    let promoted_text = promoted_resolved["edit"]["changes"][supported_uri][0]["newText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected promoted PHPDoc edit, got: {}", promoted_resolved));
+    assert!(
+        promoted_text.contains("@param string $title Title.")
+            && promoted_text.contains("@param ?int $age"),
+        "expected promoted constructor params in PHPDoc sync, got: {}",
+        promoted_text
+    );
+
+    let redundant_code = r#"<?php
+namespace App;
+
+/** @return void */
+function done(): void
+{
+}
+"#;
+    let redundant_uri = "file:///test/RedundantPhpDoc.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(redundant_uri, redundant_code))
+        .await
+        .unwrap();
+    let redundant_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            10,
+            redundant_uri,
+            ((4, 9), (4, 13)),
+            json!([]),
+            vec!["refactor.rewrite"],
+        ))
+        .await
+        .unwrap();
+    let redundant_result = extract_result(redundant_resp);
+    let redundant_action = redundant_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Update PHPDoc from signature")
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected redundant PHPDoc action, got: {}",
+                redundant_result
+            )
+        });
+    let redundant_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(11, redundant_action))
+        .await
+        .unwrap();
+    let redundant_resolved = extract_result(redundant_resolve);
+    assert_eq!(
+        redundant_resolved["edit"]["changes"][redundant_uri][0]["newText"].as_str(),
+        Some(""),
+        "expected redundant PHPDoc-only block to be removed, got: {}",
+        redundant_resolved
     );
 
     let current_code = r#"<?php
@@ -5328,7 +5509,7 @@ function current(string $name): string
         .await
         .unwrap()
         .call(code_action_request_with_only(
-            6,
+            12,
             current_uri,
             ((7, 9), (7, 16)),
             json!([]),

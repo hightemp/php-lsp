@@ -1375,6 +1375,22 @@ PR-052 ─→ PR-053
   - Regression: e2e covers docblock creation, existing docblock patching, summary/unrelated tag preservation, stale param removal, redundant `void` return removal, by-ref/variadic params, and no action for already-current PHPDoc.
   - Validation: `cargo fmt --all --check`, targeted IE-013 e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
 
+- [x] **IE-013S** Code action: PHPDoc signature sync Supported coverage *(done 2026-05-26)*
+  - Довести feature matrix для `textDocument/codeAction` PHPDoc signature sync до `Supported`.
+  - Сохранять descriptions у `@param` и `@return` при обновлении типов/порядка.
+  - Поддержать constructor/promoted params, by-ref, variadic, nullable/union/intersection/native types без потери tokens.
+  - Удалять redundant PHPDoc только когда после sync не остается meaningful content.
+  - Сохранять все unrelated tags, включая analyzer-specific `@phpstan-*` и `@psalm-*`.
+  - Добавить regression tests на supported edge cases и отсутствие лишних actions.
+  - Implemented: `@return` descriptions are preserved when return types are updated or re-rendered during param sync.
+  - Implemented: existing richer analyzer-friendly PHPDoc types are preserved when they refine broad native types, e.g. `array<int, Foo>` for native `array`.
+  - Implemented: sync detects and fixes parameter token drift such as missing `&` or `...`, not only type/name drift.
+  - Implemented: constructor promoted parameters participate in PHPDoc sync without leaking visibility/modifier tokens into `@param`.
+  - Implemented: redundant PHPDoc-only blocks are removed only when no summary or unrelated tags remain after sync.
+  - Docs: `docs/lsp-features.md` now marks PHPDoc signature sync as `Supported`.
+  - Regression: e2e covers return description preservation, generic precision preservation, analyzer-specific tag preservation, by-ref token correction, promoted constructor params, redundant docblock removal, and no action for already-current PHPDoc.
+  - Validation: `cargo fmt --all --check`, targeted IE-013 e2e, targeted code-action e2e tests, `cargo test -p php-lsp-server`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, docs Cyrillic check, `git diff --check`.
+
 - [ ] **IE-014** Refactor actions: extract variable, extract constant, inline variable
   - Использовать `codeAction/resolve`, потому что selection analysis может быть дорогим.
   - Extract variable:

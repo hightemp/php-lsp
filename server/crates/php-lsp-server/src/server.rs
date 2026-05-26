@@ -5305,10 +5305,16 @@ struct DesiredPhpDocParam {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+struct DesiredPhpDocReturn {
+    type_text: String,
+    description: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 enum PhpDocReturnUpdate {
     Preserve,
     Remove,
-    Replace(String),
+    Replace(DesiredPhpDocReturn),
 }
 
 struct UpdatePhpDocPlan {
@@ -5361,6 +5367,211 @@ fn phpdoc_content_lines(doc_comment: &str) -> Vec<String> {
     }
 
     lines
+}
+
+fn next_non_whitespace(text: &str, start: usize) -> Option<char> {
+    text.get(start..)?.chars().find(|ch| !ch.is_whitespace())
+}
+
+fn consume_phpdoc_type_expr(rest: &str) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut last_significant: Option<char> = None;
+    let mut end = 0usize;
+
+    for (idx, ch) in rest.char_indices() {
+        let ch_end = idx + ch.len_utf8();
+
+        if let Some(quote_ch) = quote {
+            end = ch_end;
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            last_significant = Some(ch);
+            end = ch_end;
+            continue;
+        }
+
+        let nested = paren_depth > 0 || angle_depth > 0 || bracket_depth > 0 || brace_depth > 0;
+        if ch.is_whitespace() && !nested {
+            let next = next_non_whitespace(rest, ch_end);
+            if matches!(next, Some('|') | Some('&'))
+                || matches!(last_significant, Some('|') | Some('&') | Some(':'))
+            {
+                end = ch_end;
+                continue;
+            }
+            break;
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+
+        if !ch.is_whitespace() {
+            last_significant = Some(ch);
+        }
+        end = ch_end;
+    }
+
+    (end > 0).then_some(end)
+}
+
+fn find_phpdoc_variable_token_span(rest: &str) -> Option<(usize, usize)> {
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in rest.char_indices() {
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        let nested = paren_depth > 0 || angle_depth > 0 || bracket_depth > 0 || brace_depth > 0;
+        if ch == '$' && !nested {
+            let mut name_end = idx + ch.len_utf8();
+            let mut has_name = false;
+            for (offset, name_ch) in rest[name_end..].char_indices() {
+                if name_ch.is_ascii_alphanumeric() || name_ch == '_' {
+                    has_name = true;
+                    name_end = idx + ch.len_utf8() + offset + name_ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+
+            if !has_name {
+                continue;
+            }
+
+            let prefix = &rest[..idx];
+            let name_start = if prefix.ends_with("&...") {
+                idx - 4
+            } else if prefix.ends_with("...") {
+                idx - 3
+            } else if prefix.ends_with('&') {
+                idx - 1
+            } else {
+                idx
+            };
+
+            return Some((name_start, name_end));
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn phpdoc_tag_rest<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix(tag)?;
+    if rest.is_empty() || rest.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
+}
+
+fn phpdoc_variable_name_from_token(token: &str) -> Option<String> {
+    let token = token
+        .trim()
+        .strip_prefix("&...")
+        .or_else(|| token.trim().strip_prefix("..."))
+        .or_else(|| token.trim().strip_prefix('&'))
+        .unwrap_or_else(|| token.trim());
+    let name = token.strip_prefix('$')?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn existing_phpdoc_param_variable_texts(doc_comment: Option<&str>) -> HashMap<String, String> {
+    let mut variables = HashMap::new();
+    let Some(doc_comment) = doc_comment else {
+        return variables;
+    };
+
+    for line in phpdoc_content_lines(doc_comment) {
+        let Some(rest) = phpdoc_tag_rest(&line, "@param") else {
+            continue;
+        };
+        let Some((start, end)) = find_phpdoc_variable_token_span(rest) else {
+            continue;
+        };
+        let variable_text = rest[start..end].trim().to_string();
+        if let Some(name) = phpdoc_variable_name_from_token(&variable_text) {
+            variables.entry(name).or_insert(variable_text);
+        }
+    }
+
+    variables
+}
+
+fn existing_phpdoc_return_description(doc_comment: Option<&str>) -> Option<String> {
+    let doc_comment = doc_comment?;
+    for line in phpdoc_content_lines(doc_comment) {
+        let Some(rest) = phpdoc_tag_rest(&line, "@return") else {
+            continue;
+        };
+        let end = consume_phpdoc_type_expr(rest)?;
+        let description = rest[end..].trim();
+        return (!description.is_empty()).then(|| description.to_string());
+    }
+
+    None
 }
 
 fn normalize_phpdoc_content_lines(lines: Vec<String>) -> Vec<String> {
@@ -5416,8 +5627,17 @@ fn render_managed_phpdoc_lines(
         .iter()
         .map(render_phpdoc_param_line)
         .collect::<Vec<_>>();
-    if let PhpDocReturnUpdate::Replace(return_type) = return_update {
-        lines.push(format!("@return {}", return_type));
+    if let PhpDocReturnUpdate::Replace(return_doc) = return_update {
+        let mut line = format!("@return {}", return_doc.type_text.trim());
+        if let Some(description) = return_doc
+            .description
+            .as_deref()
+            .filter(|desc| !desc.is_empty())
+        {
+            line.push(' ');
+            line.push_str(description);
+        }
+        lines.push(line);
     }
     lines
 }
@@ -5530,7 +5750,94 @@ fn symbol_has_native_return_type(source: &str, symbol: &php_lsp_types::SymbolInf
         .is_some_and(|after_params| after_params.trim_start().starts_with(':'))
 }
 
-fn phpdoc_return_update(source: &str, symbol: &php_lsp_types::SymbolInfo) -> PhpDocReturnUpdate {
+fn type_name_eq(left: &str, right: &str) -> bool {
+    left.trim_start_matches('\\')
+        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
+}
+
+fn type_info_refines_native(
+    phpdoc_type: &php_lsp_types::TypeInfo,
+    native_type: &php_lsp_types::TypeInfo,
+) -> bool {
+    use php_lsp_types::TypeInfo;
+
+    if phpdoc_type == native_type {
+        return true;
+    }
+
+    match (phpdoc_type, native_type) {
+        (_, TypeInfo::Mixed) => true,
+        (TypeInfo::Generic { base, .. }, TypeInfo::Simple(native)) => {
+            type_name_eq(base, native)
+                || (native.eq_ignore_ascii_case("array")
+                    && matches!(
+                        base.to_ascii_lowercase().as_str(),
+                        "list" | "non-empty-list" | "non-empty-array"
+                    ))
+        }
+        (TypeInfo::ArrayShape(_), TypeInfo::Simple(native)) => native.eq_ignore_ascii_case("array"),
+        (TypeInfo::Callable { .. }, TypeInfo::Simple(native)) => {
+            native.eq_ignore_ascii_case("callable")
+        }
+        (TypeInfo::ClassString(_), TypeInfo::Simple(native)) => {
+            native.eq_ignore_ascii_case("string") || native.eq_ignore_ascii_case("class-string")
+        }
+        (TypeInfo::Nullable(phpdoc_inner), TypeInfo::Nullable(native_inner)) => {
+            type_info_refines_native(phpdoc_inner, native_inner)
+        }
+        (TypeInfo::Union(phpdoc_parts), TypeInfo::Nullable(native_inner)) => {
+            let mut has_null = false;
+            let mut has_refined_inner = false;
+            for part in phpdoc_parts {
+                match part {
+                    TypeInfo::LiteralNull => has_null = true,
+                    other if type_info_refines_native(other, native_inner) => {
+                        has_refined_inner = true;
+                    }
+                    _ => return false,
+                }
+            }
+            has_null && has_refined_inner
+        }
+        (TypeInfo::Nullable(phpdoc_inner), TypeInfo::Union(native_parts)) => {
+            native_parts
+                .iter()
+                .any(|part| matches!(part, TypeInfo::LiteralNull))
+                && native_parts
+                    .iter()
+                    .any(|part| type_info_refines_native(phpdoc_inner, part))
+        }
+        (TypeInfo::Union(phpdoc_parts), TypeInfo::Union(native_parts)) => {
+            phpdoc_parts.iter().all(|phpdoc_part| {
+                native_parts
+                    .iter()
+                    .any(|native_part| type_info_refines_native(phpdoc_part, native_part))
+            })
+        }
+        _ => false,
+    }
+}
+
+fn preferred_phpdoc_type_text(
+    native_type: Option<&php_lsp_types::TypeInfo>,
+    existing_phpdoc_type: Option<&php_lsp_types::TypeInfo>,
+) -> Option<String> {
+    match (native_type, existing_phpdoc_type) {
+        (Some(native), Some(existing)) if type_info_refines_native(existing, native) => {
+            Some(existing.to_string())
+        }
+        (Some(native), _) => Some(native.to_string()),
+        (None, Some(existing)) => Some(existing.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn phpdoc_return_update(
+    source: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    existing_doc: Option<&php_lsp_types::PhpDoc>,
+    existing_description: Option<String>,
+) -> PhpDocReturnUpdate {
     if !symbol_has_native_return_type(source, symbol) {
         return PhpDocReturnUpdate::Preserve;
     }
@@ -5541,7 +5848,17 @@ fn phpdoc_return_update(source: &str, symbol: &php_lsp_types::SymbolInfo) -> Php
         .and_then(|sig| sig.return_type.as_ref())
     {
         Some(php_lsp_types::TypeInfo::Void) => PhpDocReturnUpdate::Remove,
-        Some(return_type) => PhpDocReturnUpdate::Replace(return_type.to_string()),
+        Some(return_type) => {
+            let type_text = preferred_phpdoc_type_text(
+                Some(return_type),
+                existing_doc.and_then(|doc| doc.return_type.as_ref()),
+            )
+            .unwrap_or_else(|| return_type.to_string());
+            PhpDocReturnUpdate::Replace(DesiredPhpDocReturn {
+                type_text,
+                description: existing_description,
+            })
+        }
         None => PhpDocReturnUpdate::Preserve,
     }
 }
@@ -5584,16 +5901,11 @@ fn desired_phpdoc_params(
         .iter()
         .map(|param| {
             let existing = existing_by_name.get(&param.name).copied();
-            let type_text = param
-                .type_info
-                .as_ref()
-                .map(ToString::to_string)
-                .or_else(|| {
-                    existing
-                        .and_then(|doc_param| doc_param.type_info.as_ref())
-                        .map(ToString::to_string)
-                })
-                .unwrap_or_else(|| "mixed".to_string());
+            let type_text = preferred_phpdoc_type_text(
+                param.type_info.as_ref(),
+                existing.and_then(|doc_param| doc_param.type_info.as_ref()),
+            )
+            .unwrap_or_else(|| "mixed".to_string());
 
             DesiredPhpDocParam {
                 name: param.name.clone(),
@@ -5608,6 +5920,7 @@ fn desired_phpdoc_params(
 fn phpdoc_params_need_update(
     existing_doc: Option<&php_lsp_types::PhpDoc>,
     desired_params: &[DesiredPhpDocParam],
+    existing_variable_texts: &HashMap<String, String>,
 ) -> bool {
     let Some(existing_doc) = existing_doc else {
         return !desired_params.is_empty();
@@ -5622,6 +5935,9 @@ fn phpdoc_params_need_update(
         .zip(desired_params.iter())
         .any(|(existing, desired)| {
             existing.name != desired.name
+                || existing_variable_texts
+                    .get(&existing.name)
+                    .is_none_or(|variable_text| variable_text != &desired.variable_text)
                 || existing
                     .type_info
                     .as_ref()
@@ -5638,12 +5954,12 @@ fn phpdoc_return_needs_update(
     match return_update {
         PhpDocReturnUpdate::Preserve => false,
         PhpDocReturnUpdate::Remove => existing_doc.is_some_and(|doc| doc.return_type.is_some()),
-        PhpDocReturnUpdate::Replace(return_type) => {
+        PhpDocReturnUpdate::Replace(return_doc) => {
             existing_doc
                 .and_then(|doc| doc.return_type.as_ref())
                 .map(ToString::to_string)
                 .as_deref()
-                != Some(return_type.as_str())
+                != Some(return_doc.type_text.as_str())
         }
     }
 }
@@ -5736,9 +6052,22 @@ fn update_phpdoc_from_signature_plan(
 
     let signature = symbol.signature.as_ref()?;
     let existing_doc = symbol.doc_comment.as_deref().map(parse_phpdoc);
+    let existing_variable_texts =
+        existing_phpdoc_param_variable_texts(symbol.doc_comment.as_deref());
+    let existing_return_description =
+        existing_phpdoc_return_description(symbol.doc_comment.as_deref());
     let desired_params = desired_phpdoc_params(signature, existing_doc.as_ref());
-    let return_update = phpdoc_return_update(source, symbol);
-    let params_need_update = phpdoc_params_need_update(existing_doc.as_ref(), &desired_params);
+    let return_update = phpdoc_return_update(
+        source,
+        symbol,
+        existing_doc.as_ref(),
+        existing_return_description,
+    );
+    let params_need_update = phpdoc_params_need_update(
+        existing_doc.as_ref(),
+        &desired_params,
+        &existing_variable_texts,
+    );
     let return_needs_update = phpdoc_return_needs_update(existing_doc.as_ref(), &return_update);
 
     if !params_need_update && !return_needs_update {
