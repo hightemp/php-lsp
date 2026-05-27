@@ -163,11 +163,15 @@ fn shutdown_request(id: i64) -> Request {
 }
 
 fn did_open_notification(uri: &str, text: &str) -> Request {
+    did_open_notification_with_language(uri, "php", text)
+}
+
+fn did_open_notification_with_language(uri: &str, language_id: &str, text: &str) -> Request {
     Request::build("textDocument/didOpen")
         .params(json!({
             "textDocument": {
                 "uri": uri,
-                "languageId": "php",
+                "languageId": language_id,
                 "version": 1,
                 "text": text
             }
@@ -2288,6 +2292,154 @@ class BlankValidator
         "instance method should stay hidden for ClassName:: completion"
     );
 
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_blade_template_virtual_php_hover_completion_diagnostics_and_tokens() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root =
+        std::env::temp_dir().join(format!("php-lsp-blade-template-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("app")).unwrap();
+    fs::create_dir_all(tmp_root.join("resources/views")).unwrap();
+
+    let php_uri = format!("file://{}", tmp_root.join("app/User.php").to_string_lossy());
+    let blade_uri = format!(
+        "file://{}",
+        tmp_root
+            .join("resources/views/show.blade.php")
+            .to_string_lossy()
+    );
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let php_code = "<?php\nclass User { public function getName(): string { return ''; } }\n";
+    let completion_marker = "/*complete*/";
+    let blade_with_marker = format!(
+        "<div>{{{{ User::class }}}}</div>\n@foreach ($items as $item)\n<span>{{{{ (new User())->get{} }}}}</span>\n@endforeach\n",
+        completion_marker
+    );
+    let completion_offset = blade_with_marker
+        .find(completion_marker)
+        .expect("test Blade should contain completion marker");
+    let blade = blade_with_marker.replace(completion_marker, "");
+    let completion_prefix = &blade[..completion_offset];
+    let completion_line = completion_prefix
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u32;
+    let completion_line_start = completion_prefix
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let completion_character = (completion_prefix.len() - completion_line_start) as u32;
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&php_uri, php_code))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &blade_uri, "blade", &blade,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &blade_uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "plain HTML around Blade expressions should not produce whole-file diagnostics"
+    );
+
+    let hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, &blade_uri, 0, 9))
+        .await
+        .unwrap();
+    let hover = extract_result(hover_resp);
+    let hover_text = hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(
+        hover_text.contains("class User"),
+        "expected class hover inside Blade echo, got: {}",
+        hover
+    );
+    assert_eq!(
+        hover["range"]["start"]["line"].as_u64(),
+        Some(0),
+        "hover range should be mapped back to original template line, got: {}",
+        hover
+    );
+
+    let completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            3,
+            &blade_uri,
+            completion_line,
+            completion_character,
+        ))
+        .await
+        .unwrap();
+    let completion = extract_result(completion_resp);
+    let labels: Vec<String> = completion_items_from_result(&completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "getName"),
+        "expected Blade echo completion to include User::getName, got: {:?}",
+        labels
+    );
+
+    let tokens_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(semantic_tokens_full_request(4, &blade_uri))
+        .await
+        .unwrap();
+    let tokens = decode_semantic_tokens(&extract_result(tokens_resp));
+    assert!(
+        tokens.iter().any(|(line, start, len, token_type, _)| {
+            (*line, *start, *len, *token_type) == (1, 0, 8, 11)
+        }),
+        "expected @foreach keyword semantic token mapped to original template, got: {:?}",
+        tokens
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
     service
         .ready()
         .await

@@ -852,6 +852,8 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
     documentSelector: [
       { scheme: "file", language: "php" },
       { scheme: "untitled", language: "php" },
+      { scheme: "file", language: "blade" },
+      { scheme: "untitled", language: "blade" },
     ],
     synchronize: {
       fileEvents: [

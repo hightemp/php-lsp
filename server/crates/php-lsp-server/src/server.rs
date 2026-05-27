@@ -4,6 +4,10 @@ use crate::config::{
     global_config_candidates, load_toml_settings, merge_json_objects, normalize_client_settings,
     PROJECT_CONFIG_FILE_NAME,
 };
+use crate::template::{
+    is_blade_template_language_id, is_blade_template_uri, preprocess_blade_template,
+    TemplateDocument,
+};
 use dashmap::DashMap;
 use php_lsp_completion::context::detect_context;
 use php_lsp_completion::provider::provide_completions;
@@ -942,6 +946,8 @@ pub struct PhpLspBackend {
     client: Client,
     /// Open document parsers (URI string → FileParser).
     open_files: Arc<DashMap<String, FileParser>>,
+    /// Open Blade-like template documents backed by virtual PHP parsers.
+    template_documents: Arc<DashMap<String, TemplateDocument>>,
     /// Latest LSP document version observed for each open document.
     document_versions: Arc<DashMap<String, i32>>,
     /// Per-document debounce tasks for fast diagnostics after didChange.
@@ -1009,6 +1015,7 @@ impl PhpLspBackend {
         PhpLspBackend {
             client,
             open_files: Arc::new(DashMap::new()),
+            template_documents: Arc::new(DashMap::new()),
             document_versions: Arc::new(DashMap::new()),
             diagnostic_debounce_tasks: Arc::new(Mutex::new(HashMap::new())),
             analyzer_runs: Arc::new(Mutex::new(HashMap::new())),
@@ -1053,6 +1060,21 @@ impl PhpLspBackend {
 
     fn current_document_version(&self, uri_str: &str) -> Option<i32> {
         self.document_versions.get(uri_str).map(|version| *version)
+    }
+
+    fn template_document(&self, uri_str: &str) -> Option<TemplateDocument> {
+        self.template_documents
+            .get(uri_str)
+            .map(|document| document.value().clone())
+    }
+
+    fn open_template_document(&self, uri_str: &str, text: &str) -> FileParser {
+        let template = preprocess_blade_template(text);
+        let mut parser = FileParser::new();
+        parser.parse_full(template.virtual_source());
+        self.template_documents
+            .insert(uri_str.to_string(), template);
+        parser
     }
 
     fn accept_document_version(&self, uri_str: &str, incoming: i32) -> bool {
@@ -1147,6 +1169,7 @@ impl PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         let client = self.client.clone();
         let open_files = self.open_files.clone();
+        let template_documents = self.template_documents.clone();
         let document_versions = self.document_versions.clone();
         let index = self.index.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
@@ -1162,15 +1185,26 @@ impl PhpLspBackend {
                 return;
             }
 
-            let diagnostics = compute_open_file_diagnostics(
+            let template_document = template_documents
+                .get(&task_uri_str)
+                .map(|template| template.value().clone());
+            let effective_diagnostics_mode = if template_document.is_some() {
+                DiagnosticsMode::SyntaxOnly
+            } else {
+                diagnostics_mode
+            };
+            let mut diagnostics = compute_open_file_diagnostics(
                 &task_uri_str,
                 &open_files,
                 &index,
-                diagnostics_mode,
+                effective_diagnostics_mode,
                 diagnostic_severity,
                 php_version,
                 Some(version),
             );
+            if let Some(template) = template_document {
+                diagnostics = template.map_diagnostics_to_original(diagnostics);
+            }
 
             if document_versions.get(&task_uri_str).map(|current| *current) == Some(version) {
                 client
@@ -1577,6 +1611,7 @@ impl PhpLspBackend {
         let client = self.client.clone();
         let index = self.index.clone();
         let open_files = self.open_files.clone();
+        let template_documents = self.template_documents.clone();
         let reindex_document_versions = self.document_versions.clone();
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
@@ -1665,15 +1700,26 @@ impl PhpLspBackend {
                     let version = reindex_document_versions
                         .get(&uri_str)
                         .map(|current| *current);
-                    let diags = compute_diagnostics_with_config_for_version(
+                    let template_document = template_documents
+                        .get(&uri_str)
+                        .map(|template| template.value().clone());
+                    let effective_diagnostics_mode = if template_document.is_some() {
+                        DiagnosticsMode::SyntaxOnly
+                    } else {
+                        diagnostics_mode
+                    };
+                    let mut diags = compute_diagnostics_with_config_for_version(
                         &uri_str,
                         &entry,
                         &reindex_index,
-                        diagnostics_mode,
+                        effective_diagnostics_mode,
                         diagnostic_severity,
                         php_version,
                         version,
                     );
+                    if let Some(template) = template_document {
+                        diags = template.map_diagnostics_to_original(diags);
+                    }
                     if reindex_document_versions
                         .get(&uri_str)
                         .map(|current| *current)
@@ -2784,10 +2830,12 @@ impl PhpLspBackend {
     /// Publish diagnostics for a file.
     async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
+        let template_document = self.template_document(&uri_str);
         let version = self.current_document_version(&uri_str);
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
-        let should_preresolve_dependencies =
-            diagnostics_mode == DiagnosticsMode::BasicSemantic && *self.index_vendor.lock().await;
+        let should_preresolve_dependencies = template_document.is_none()
+            && diagnostics_mode == DiagnosticsMode::BasicSemantic
+            && *self.index_vendor.lock().await;
 
         // Pre-resolve use statements via lazy indexing so that vendor classes
         // are available for the synchronous `compute_diagnostics` resolver.
@@ -2827,21 +2875,32 @@ impl PhpLspBackend {
 
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let php_version = *self.php_version.lock().await;
+        let effective_diagnostics_mode = if template_document.is_some() {
+            DiagnosticsMode::SyntaxOnly
+        } else {
+            diagnostics_mode
+        };
         let mut diagnostics = compute_open_file_diagnostics(
             &uri_str,
             &self.open_files,
             &self.index,
-            diagnostics_mode,
+            effective_diagnostics_mode,
             diagnostic_severity,
             php_version,
             version,
         );
+        if let Some(template) = &template_document {
+            diagnostics = template.map_diagnostics_to_original(diagnostics);
+        }
 
         let has_syntax_errors = diagnostics.iter().any(|diagnostic| {
             diagnostic.source.as_deref() == Some("php-lsp")
                 && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
         });
-        if diagnostics_mode == DiagnosticsMode::BasicSemantic && !has_syntax_errors {
+        if template_document.is_none()
+            && diagnostics_mode == DiagnosticsMode::BasicSemantic
+            && !has_syntax_errors
+        {
             let analyzer_token = self.start_analyzer_run(&uri_str).await;
             diagnostics.extend(
                 self.phpstan_diagnostics_for_uri(uri, analyzer_token.clone())
@@ -2907,6 +2966,14 @@ impl PhpLspBackend {
     async fn reindex_php_file(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
         if !uri_is_php_file(uri) {
+            return;
+        }
+        if is_blade_template_uri(&uri_str) {
+            self.index.remove_file(&uri_str);
+            self.semantic_tokens_cache.lock().await.remove(&uri_str);
+            if self.template_documents.contains_key(&uri_str) {
+                self.publish_diagnostics(uri).await;
+            }
             return;
         }
 
@@ -2984,6 +3051,7 @@ impl PhpLspBackend {
         self.index.remove_file(&uri_str);
         self.vendor_file_lru.lock().await.remove(&uri_str);
         self.open_files.remove(&uri_str);
+        self.template_documents.remove(&uri_str);
         self.document_versions.remove(&uri_str);
         self.cancel_debounced_diagnostics(&uri_str).await;
         self.cancel_analyzer_run(&uri_str).await;
@@ -3007,6 +3075,10 @@ impl PhpLspBackend {
             .open_files
             .remove(&old_uri_str)
             .map(|(_, parser)| parser);
+        let moved_template = self
+            .template_documents
+            .remove(&old_uri_str)
+            .map(|(_, template)| template);
         let moved_version = self
             .document_versions
             .remove(&old_uri_str)
@@ -3026,6 +3098,29 @@ impl PhpLspBackend {
         }
 
         if !new_is_php {
+            return;
+        }
+
+        if is_blade_template_uri(new_uri.as_str()) {
+            let new_uri_str = new_uri.as_str().to_string();
+            if let Some(parser) = moved_parser {
+                self.open_files.insert(new_uri_str.clone(), parser);
+            }
+            if let Some(template) = moved_template {
+                self.template_documents
+                    .insert(new_uri_str.clone(), template);
+            }
+            if let Some(version) = moved_version {
+                self.document_versions.insert(new_uri_str.clone(), version);
+            }
+            self.index.remove_file(&new_uri_str);
+            self.semantic_tokens_cache.lock().await.remove(&new_uri_str);
+            self.publish_diagnostics(new_uri).await;
+            return;
+        }
+
+        if moved_template.is_some() {
+            self.reindex_php_file(new_uri).await;
             return;
         }
 
@@ -8313,6 +8408,57 @@ fn update_phpdoc_from_signature_edit(
         document_changes: None,
         change_annotations: None,
     })
+}
+
+fn map_goto_definition_response_for_template(
+    current_uri: &str,
+    template: &TemplateDocument,
+    response: GotoDefinitionResponse,
+) -> GotoDefinitionResponse {
+    match response {
+        GotoDefinitionResponse::Scalar(location) => GotoDefinitionResponse::Scalar(
+            map_location_for_template(current_uri, template, location),
+        ),
+        GotoDefinitionResponse::Array(locations) => GotoDefinitionResponse::Array(
+            locations
+                .into_iter()
+                .map(|location| map_location_for_template(current_uri, template, location))
+                .collect(),
+        ),
+        GotoDefinitionResponse::Link(links) => GotoDefinitionResponse::Link(
+            links
+                .into_iter()
+                .map(|mut link| {
+                    if link.target_uri.as_str() == current_uri {
+                        if let Some(range) =
+                            template.map_virtual_range_to_original(link.target_range)
+                        {
+                            link.target_range = range;
+                        }
+                        if let Some(range) =
+                            template.map_virtual_range_to_original(link.target_selection_range)
+                        {
+                            link.target_selection_range = range;
+                        }
+                    }
+                    link
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn map_location_for_template(
+    current_uri: &str,
+    template: &TemplateDocument,
+    mut location: Location,
+) -> Location {
+    if location.uri.as_str() == current_uri {
+        if let Some(range) = template.map_virtual_range_to_original(location.range) {
+            location.range = range;
+        }
+    }
+    location
 }
 
 fn semantic_tokens_legend() -> SemanticTokensLegend {
@@ -19164,6 +19310,7 @@ impl LanguageServer for PhpLspBackend {
         let client = self.client.clone();
         let index = self.index.clone();
         let open_files = self.open_files.clone();
+        let template_documents = self.template_documents.clone();
         let reindex_document_versions = self.document_versions.clone();
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
@@ -19247,15 +19394,26 @@ impl LanguageServer for PhpLspBackend {
                     let version = reindex_document_versions
                         .get(&uri_str)
                         .map(|current| *current);
-                    let diags = compute_diagnostics_with_config_for_version(
+                    let template_document = template_documents
+                        .get(&uri_str)
+                        .map(|template| template.value().clone());
+                    let effective_diagnostics_mode = if template_document.is_some() {
+                        DiagnosticsMode::SyntaxOnly
+                    } else {
+                        diagnostics_mode
+                    };
+                    let mut diags = compute_diagnostics_with_config_for_version(
                         &uri_str,
                         &entry,
                         &reindex_index,
-                        diagnostics_mode,
+                        effective_diagnostics_mode,
                         diagnostic_severity,
                         php_version,
                         version,
                     );
+                    if let Some(template) = template_document {
+                        diags = template.map_diagnostics_to_original(diags);
+                    }
                     if reindex_document_versions
                         .get(&uri_str)
                         .map(|current| *current)
@@ -19449,6 +19607,8 @@ impl LanguageServer for PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         let text = &params.text_document.text;
         let version = params.text_document.version;
+        let is_template = is_blade_template_uri(&uri_str)
+            || is_blade_template_language_id(&params.text_document.language_id);
 
         tracing::debug!("didOpen: {}", uri_str);
         self.log_trace(&format!("didOpen: {}", uri_str)).await;
@@ -19457,6 +19617,15 @@ impl LanguageServer for PhpLspBackend {
         self.cancel_analyzer_run(&uri_str).await;
         self.cancel_formatter_run(&uri_str).await;
 
+        if is_template {
+            let parser = self.open_template_document(&uri_str, text);
+            self.index.remove_file(&uri_str);
+            self.open_files.insert(uri_str, parser);
+            self.publish_diagnostics(&uri).await;
+            return;
+        }
+
+        self.template_documents.remove(&uri_str);
         let mut parser = FileParser::new();
         parser.parse_full(text);
 
@@ -19496,6 +19665,23 @@ impl LanguageServer for PhpLspBackend {
         }
         self.cancel_analyzer_run(&uri_str).await;
         self.cancel_formatter_run(&uri_str).await;
+
+        if let Some(template) = self.template_document(&uri_str) {
+            let updated = params
+                .content_changes
+                .iter()
+                .fold(template, |template, change| {
+                    template.apply_change(change.range, &change.text)
+                });
+            let mut parser = FileParser::new();
+            parser.parse_full(updated.virtual_source());
+            self.template_documents.insert(uri_str.clone(), updated);
+            self.index.remove_file(&uri_str);
+            self.open_files.insert(uri_str.clone(), parser);
+            self.semantic_tokens_cache.lock().await.remove(&uri_str);
+            self.schedule_fast_diagnostics(uri, version).await;
+            return;
+        }
 
         let excluded = if let Some(path) = uri_to_path(&uri_str) {
             self.path_is_excluded_by_config(&path).await
@@ -19539,6 +19725,7 @@ impl LanguageServer for PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         tracing::debug!("didClose: {}", uri_str);
         self.open_files.remove(&uri_str);
+        self.template_documents.remove(&uri_str);
         self.document_versions.remove(&uri_str);
         self.cancel_debounced_diagnostics(&uri_str).await;
         self.cancel_analyzer_run(&uri_str).await;
@@ -19805,7 +19992,16 @@ impl LanguageServer for PhpLspBackend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let uri_str = uri.as_str().to_string();
-        let pos = params.text_document_position_params.position;
+        let original_pos = params.text_document_position_params.position;
+        let template_document = self.template_document(&uri_str);
+        let pos = if let Some(template) = &template_document {
+            match template.map_original_position_to_virtual(original_pos) {
+                Some(pos) => pos,
+                None => return Ok(None),
+            }
+        } else {
+            original_pos
+        };
         tracing::debug!("hover: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position and local variable hover info inside a block so DashMap guard is dropped.
@@ -20117,7 +20313,12 @@ impl LanguageServer for PhpLspBackend {
             None
         };
 
-        Ok(result)
+        Ok(result.map(|mut hover| {
+            if let (Some(template), Some(range)) = (&template_document, hover.range) {
+                hover.range = template.map_virtual_range_to_original(range);
+            }
+            hover
+        }))
     }
 
     async fn goto_declaration(
@@ -20399,7 +20600,16 @@ impl LanguageServer for PhpLspBackend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let uri_str = uri.as_str().to_string();
-        let pos = params.text_document_position_params.position;
+        let original_pos = params.text_document_position_params.position;
+        let template_document = self.template_document(&uri_str);
+        let pos = if let Some(template) = &template_document {
+            match template.map_original_position_to_virtual(original_pos) {
+                Some(pos) => pos,
+                None => return Ok(None),
+            }
+        } else {
+            original_pos
+        };
         tracing::debug!("gotoDefinition: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position inside a block so DashMap guard is dropped
@@ -20478,10 +20688,16 @@ impl LanguageServer for PhpLspBackend {
         };
 
         if let Some(def) = shape_def {
-            let range = Range {
+            let mut range = Range {
                 start: Position::new(def.0, def.1),
                 end: Position::new(def.2, def.3),
             };
+            if let Some(template) = &template_document {
+                let Some(mapped) = template.map_virtual_range_to_original(range) else {
+                    return Ok(None);
+                };
+                range = mapped;
+            }
             return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri,
                 range,
@@ -20489,10 +20705,16 @@ impl LanguageServer for PhpLspBackend {
         }
 
         if let Some((target_uri, def)) = this_class_def {
-            let range = Range {
+            let mut range = Range {
                 start: Position::new(def.0, def.1),
                 end: Position::new(def.2, def.3),
             };
+            if let Some(template) = &template_document {
+                let Some(mapped) = template.map_virtual_range_to_original(range) else {
+                    return Ok(None);
+                };
+                range = mapped;
+            }
             return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri: target_uri.parse::<Uri>().unwrap_or_else(|_| uri.clone()),
                 range,
@@ -20501,10 +20723,16 @@ impl LanguageServer for PhpLspBackend {
 
         // Local variable definition (same file/scope).
         if let Some(def) = local_var_def {
-            let range = Range {
+            let mut range = Range {
                 start: Position::new(def.0, def.1),
                 end: Position::new(def.2, def.3),
             };
+            if let Some(template) = &template_document {
+                let Some(mapped) = template.map_virtual_range_to_original(range) else {
+                    return Ok(None);
+                };
+                range = mapped;
+            }
             return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri,
                 range,
@@ -20627,7 +20855,13 @@ impl LanguageServer for PhpLspBackend {
             result
         };
 
-        Ok(result)
+        Ok(result.map(|response| {
+            if let Some(template) = &template_document {
+                map_goto_definition_response_for_template(&uri_str, template, response)
+            } else {
+                response
+            }
+        }))
     }
 
     async fn document_highlight(
@@ -21887,7 +22121,12 @@ impl LanguageServer for PhpLspBackend {
                 Some(parser) => parser,
                 None => return Ok(None),
             };
+            let template_document = self.template_document(&uri_str);
             match semantic_tokens_for_parser(&parser) {
+                Some(data) if template_document.is_some() => template_document
+                    .as_ref()
+                    .expect("checked above")
+                    .map_semantic_tokens_to_original(data),
                 Some(data) => data,
                 None => return Ok(None),
             }
@@ -21920,7 +22159,12 @@ impl LanguageServer for PhpLspBackend {
                 Some(parser) => parser,
                 None => return Ok(None),
             };
+            let template_document = self.template_document(&uri_str);
             match semantic_tokens_for_parser(&parser) {
+                Some(data) if template_document.is_some() => template_document
+                    .as_ref()
+                    .expect("checked above")
+                    .map_semantic_tokens_to_original(data),
                 Some(data) => data,
                 None => return Ok(None),
             }
@@ -21959,8 +22203,16 @@ impl LanguageServer for PhpLspBackend {
                 Some(parser) => parser,
                 None => return Ok(None),
             };
-            match semantic_tokens_for_parser_range(&parser, params.range) {
-                Some(data) => data,
+            let template_document = self.template_document(&uri_str);
+            match semantic_tokens_for_parser(&parser) {
+                Some(data) if template_document.is_some() => template_document
+                    .as_ref()
+                    .expect("checked above")
+                    .map_semantic_tokens_range_to_original(data, params.range),
+                Some(_) => match semantic_tokens_for_parser_range(&parser, params.range) {
+                    Some(data) => data,
+                    None => return Ok(None),
+                },
                 None => return Ok(None),
             }
         };
@@ -22972,7 +23224,16 @@ impl LanguageServer for PhpLspBackend {
             .uri
             .as_str()
             .to_string();
-        let pos = params.text_document_position.position;
+        let original_pos = params.text_document_position.position;
+        let template_document = self.template_document(&uri_str);
+        let pos = if let Some(template) = &template_document {
+            match template.map_original_position_to_virtual(original_pos) {
+                Some(pos) => pos,
+                None => return Ok(None),
+            }
+        } else {
+            original_pos
+        };
         tracing::debug!("completion: {}:{}:{}", uri_str, pos.line, pos.character);
 
         let (tree, source) = {
@@ -23144,11 +23405,12 @@ impl LanguageServer for PhpLspBackend {
             }
         }
 
-        let enable_auto_imports = matches!(
-            context,
-            php_lsp_completion::context::CompletionContext::Free { .. }
-                | php_lsp_completion::context::CompletionContext::Namespace { .. }
-        );
+        let enable_auto_imports = template_document.is_none()
+            && matches!(
+                context,
+                php_lsp_completion::context::CompletionContext::Free { .. }
+                    | php_lsp_completion::context::CompletionContext::Namespace { .. }
+            );
 
         // Convert lsp_types::CompletionItem to ls_types::CompletionItem
         // We need to map between the two different type systems

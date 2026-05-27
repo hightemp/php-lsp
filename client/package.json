@@ -20,7 +20,9 @@
     "Programming Languages"
   ],
   "activationEvents": [
+    "onLanguage:blade",
     "onLanguage:php",
+    "workspaceContains:**/*.blade.php",
     "workspaceContains:**/composer.json"
   ],
   "main": "./out/extension.js",
@@ -358,6 +360,19 @@
         }
       }
     },
+    "languages": [
+      {
+        "id": "blade",
+        "aliases": [
+          "Blade",
+          "blade"
+        ],
+        "extensions": [
+          ".blade.php"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
     "commands": [
       {
         "command": "phpLsp.restartServer",

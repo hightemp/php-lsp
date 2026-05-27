@@ -7,5 +7,6 @@ pub mod config;
 pub mod fix;
 mod framework;
 mod server;
+mod template;
 
 pub use server::PhpLspBackend;

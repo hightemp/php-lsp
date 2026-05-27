@@ -2032,7 +2032,7 @@ PR-052 ─→ PR-053
   - Validation: `cargo test --all`, `cargo fmt --all --check`,
     `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **IE-044** Blade-like template support via virtual PHP + source map
+- [x] **IE-044** Blade-like template support via virtual PHP + source map *(done 2026-05-27)*
   - Add document selector for template language only if client packaging contributes/activates it safely.
   - Preprocess template into virtual PHP while preserving source map.
   - Map diagnostics, hover, completion, semantic tokens back to original template ranges.
@@ -2042,6 +2042,19 @@ PR-052 ─→ PR-053
     - comments/directives as semantic tokens
   - Do not advertise full template support until diagnostics/source-map edge cases are stable.
   - Tests: source map range conversion, hover/completion in echo, diagnostics no false whole-file range.
+  - Implemented: safe VS Code `blade` language contribution and LSP document
+    selector for `.blade.php` / untitled Blade documents.
+  - Implemented: Blade-like virtual PHP preprocessing with source maps for
+    escaped/raw echo blocks, `@if`/`@elseif`/`@else`/`@endif`,
+    `@foreach`/`@endforeach`, `@isset`, and `@empty`.
+  - Implemented: mapped diagnostics, hover, definition, completion, and
+    semantic tokens back to original template ranges; template diagnostics are
+    syntax-only for now to avoid noisy unknown view-variable reports.
+  - Implemented: comments and directives as semantic tokens; `.blade.php` files
+    are not indexed as ordinary PHP by watched/file-operation paths.
+  - Validation: `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `npm run lint`,
+    `npm run build`, `git diff --check`.
 
 - [ ] **IE-044A** Symfony/Twig template support via static model + source map
   - Treat Twig as a separate template language target, not as Blade-compatible syntax.
