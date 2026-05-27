@@ -23,7 +23,8 @@ use php_lsp_parser::resolve::{
     infer_variable_type_at_position_with_resolvers,
     infer_variable_type_info_at_position_with_resolvers, local_variable_names_at_position,
     resolve_class_name_pub, symbol_at_position, symbol_at_position_with_resolvers,
-    variable_definition_at_position, CallableParameterContext, RefKind, SymbolAtPosition,
+    variable_definition_at_position, CallableParamTypeResolver, CallableParameterContext,
+    MemberTypeResolver, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
     find_missing_return_type_candidates, MissingReturnTypeCandidate,
@@ -39,6 +40,7 @@ use php_lsp_parser::signature_help::signature_help_context_at_position;
 use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,10 +61,152 @@ const FILE_IO_SLOW_WARNING_MS: u64 = 100;
 const FILE_IO_TIMEOUT_MS: u64 = 15_000;
 const DIAGNOSTIC_PHASE_SLOW_WARNING_MS: u64 = 500;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RequestTypeCacheKey {
+    uri: String,
+    document_version: Option<i32>,
+    range: (u32, u32, u32, u32),
+    context: &'static str,
+    expected_context: String,
+}
+
+#[derive(Debug)]
+struct RequestTypeCache {
+    uri: String,
+    document_version: Option<i32>,
+    string_values: RefCell<HashMap<RequestTypeCacheKey, Option<String>>>,
+    type_info_values: RefCell<HashMap<RequestTypeCacheKey, Option<php_lsp_types::TypeInfo>>>,
+    inferred_expr_values: RefCell<HashMap<RequestTypeCacheKey, Option<InferredExprType>>>,
+    symbol_values: RefCell<HashMap<RequestTypeCacheKey, Option<SymbolAtPosition>>>,
+    local_inlay_values: RefCell<HashMap<RequestTypeCacheKey, Option<LocalVariableInlayType>>>,
+}
+
+impl RequestTypeCache {
+    fn new(uri: impl Into<String>, document_version: Option<i32>) -> Self {
+        Self {
+            uri: uri.into(),
+            document_version,
+            string_values: RefCell::new(HashMap::new()),
+            type_info_values: RefCell::new(HashMap::new()),
+            inferred_expr_values: RefCell::new(HashMap::new()),
+            symbol_values: RefCell::new(HashMap::new()),
+            local_inlay_values: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn key(
+        &self,
+        range: (u32, u32, u32, u32),
+        context: &'static str,
+        expected_context: impl Into<String>,
+    ) -> RequestTypeCacheKey {
+        RequestTypeCacheKey {
+            uri: self.uri.clone(),
+            document_version: self.document_version,
+            range,
+            context,
+            expected_context: expected_context.into(),
+        }
+    }
+
+    fn cached_string(
+        &self,
+        range: (u32, u32, u32, u32),
+        context: &'static str,
+        expected_context: impl Into<String>,
+        compute: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let key = self.key(range, context, expected_context);
+        if let Some(value) = self.string_values.borrow().get(&key).cloned() {
+            return value;
+        }
+
+        let value = compute();
+        self.string_values.borrow_mut().insert(key, value.clone());
+        value
+    }
+
+    fn cached_type_info(
+        &self,
+        range: (u32, u32, u32, u32),
+        context: &'static str,
+        expected_context: impl Into<String>,
+        compute: impl FnOnce() -> Option<php_lsp_types::TypeInfo>,
+    ) -> Option<php_lsp_types::TypeInfo> {
+        let key = self.key(range, context, expected_context);
+        if let Some(value) = self.type_info_values.borrow().get(&key).cloned() {
+            return value;
+        }
+
+        let value = compute();
+        self.type_info_values
+            .borrow_mut()
+            .insert(key, value.clone());
+        value
+    }
+
+    fn cached_inferred_expr(
+        &self,
+        range: (u32, u32, u32, u32),
+        context: &'static str,
+        expected_context: impl Into<String>,
+        compute: impl FnOnce() -> Option<InferredExprType>,
+    ) -> Option<InferredExprType> {
+        let key = self.key(range, context, expected_context);
+        if let Some(value) = self.inferred_expr_values.borrow().get(&key).cloned() {
+            return value;
+        }
+
+        let value = compute();
+        self.inferred_expr_values
+            .borrow_mut()
+            .insert(key, value.clone());
+        value
+    }
+
+    fn cached_symbol(
+        &self,
+        line: u32,
+        byte_col: u32,
+        context: &'static str,
+        expected_context: impl Into<String>,
+        compute: impl FnOnce() -> Option<SymbolAtPosition>,
+    ) -> Option<SymbolAtPosition> {
+        let key = self.key((line, byte_col, line, byte_col), context, expected_context);
+        if let Some(value) = self.symbol_values.borrow().get(&key).cloned() {
+            return value;
+        }
+
+        let value = compute();
+        self.symbol_values.borrow_mut().insert(key, value.clone());
+        value
+    }
+
+    fn cached_local_inlay(
+        &self,
+        range: (u32, u32, u32, u32),
+        context: &'static str,
+        expected_context: impl Into<String>,
+        compute: impl FnOnce() -> Option<LocalVariableInlayType>,
+    ) -> Option<LocalVariableInlayType> {
+        let key = self.key(range, context, expected_context);
+        if let Some(value) = self.local_inlay_values.borrow().get(&key).cloned() {
+            return value;
+        }
+
+        let value = compute();
+        self.local_inlay_values
+            .borrow_mut()
+            .insert(key, value.clone());
+        value
+    }
+}
+
 struct CompletionInferenceContext<'a> {
     tree: &'a tree_sitter::Tree,
     source: &'a str,
     file_symbols: &'a php_lsp_types::FileSymbols,
+    type_cache: &'a RequestTypeCache,
     line: u32,
     byte_col: u32,
 }
@@ -1024,6 +1168,7 @@ impl PhpLspBackend {
                 diagnostics_mode,
                 diagnostic_severity,
                 php_version,
+                Some(version),
             );
 
             if document_versions.get(&task_uri_str).map(|current| *current) == Some(version) {
@@ -1519,13 +1664,14 @@ impl PhpLspBackend {
                     let version = reindex_document_versions
                         .get(&uri_str)
                         .map(|current| *current);
-                    let diags = compute_diagnostics_with_config(
+                    let diags = compute_diagnostics_with_config_for_version(
                         &uri_str,
                         &entry,
                         &reindex_index,
                         diagnostics_mode,
                         diagnostic_severity,
                         php_version,
+                        version,
                     );
                     if reindex_document_versions
                         .get(&uri_str)
@@ -1609,41 +1755,73 @@ impl PhpLspBackend {
             })
     }
 
+    fn resolve_completion_member_type_cached(
+        &self,
+        class_fqn: &str,
+        member_name: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        type_cache: &RequestTypeCache,
+    ) -> Option<String> {
+        type_cache.cached_string(
+            (0, 0, 0, 0),
+            "completion-member-type",
+            format!("{class_fqn}::{member_name}"),
+            || self.resolve_completion_member_type(class_fqn, member_name, file_symbols),
+        )
+    }
+
     fn resolve_completion_member_call_type(
         &self,
         class_fqn: &str,
         member_name: &str,
         member_text: &str,
         file_symbols: &php_lsp_types::FileSymbols,
+        type_cache: &RequestTypeCache,
     ) -> Option<String> {
-        let symbol = self
-            .index
-            .resolve_member(&format!("{}::{}", class_fqn, member_name))
-            .or_else(|| {
-                let member_fqn = format!("{}::{}", class_fqn, member_name);
-                file_symbols.symbols.iter().find_map(|sym| {
-                    (sym.fqn == member_fqn
-                        || (sym.parent_fqn.as_deref() == Some(class_fqn)
-                            && sym.name == member_name))
-                        .then(|| Arc::new(sym.clone()))
-                })
-            })?;
-        let signature = symbol.signature.as_ref()?;
-        let return_type = signature.return_type.as_ref()?;
-        let arguments =
-            completion_call_arguments_by_param(member_text, signature, file_symbols, &self.index);
-        let template_names: HashSet<String> = symbol
-            .templates
-            .iter()
-            .map(|template| template.name.clone())
-            .collect();
-        let substitutions =
-            call_site_template_substitutions(&arguments, signature, &template_names);
-        let resolved =
-            resolve_call_site_type_info(return_type, &arguments, &template_names, &substitutions);
-        type_info_fqn_from_index(&self.index, class_fqn, &symbol.uri, &resolved)
+        type_cache.cached_string(
+            (0, 0, 0, 0),
+            "completion-member-call-type",
+            format!("{class_fqn}::{member_name}:{member_text}"),
+            || {
+                let symbol = self
+                    .index
+                    .resolve_member(&format!("{}::{}", class_fqn, member_name))
+                    .or_else(|| {
+                        let member_fqn = format!("{}::{}", class_fqn, member_name);
+                        file_symbols.symbols.iter().find_map(|sym| {
+                            (sym.fqn == member_fqn
+                                || (sym.parent_fqn.as_deref() == Some(class_fqn)
+                                    && sym.name == member_name))
+                                .then(|| Arc::new(sym.clone()))
+                        })
+                    })?;
+                let signature = symbol.signature.as_ref()?;
+                let return_type = signature.return_type.as_ref()?;
+                let arguments = completion_call_arguments_by_param(
+                    member_text,
+                    signature,
+                    file_symbols,
+                    &self.index,
+                );
+                let template_names: HashSet<String> = symbol
+                    .templates
+                    .iter()
+                    .map(|template| template.name.clone())
+                    .collect();
+                let substitutions =
+                    call_site_template_substitutions(&arguments, signature, &template_names);
+                let resolved = resolve_call_site_type_info(
+                    return_type,
+                    &arguments,
+                    &template_names,
+                    &substitutions,
+                );
+                type_info_fqn_from_index(&self.index, class_fqn, &symbol.uri, &resolved)
+            },
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn infer_completion_object_type(
         &self,
         object_expr: &str,
@@ -1652,40 +1830,51 @@ impl PhpLspBackend {
         file_symbols: &php_lsp_types::FileSymbols,
         line: u32,
         byte_col: u32,
+        type_cache: &RequestTypeCache,
     ) -> Option<String> {
-        let object_expr = object_expr.trim();
-        if let Some(class_fqn) = infer_new_expression_type(object_expr, file_symbols) {
-            return Some(class_fqn);
-        }
+        type_cache.cached_string(
+            (line, byte_col, line, byte_col),
+            "completion-object-type",
+            object_expr,
+            || {
+                let object_expr = object_expr.trim();
+                if let Some(class_fqn) = infer_new_expression_type(object_expr, file_symbols) {
+                    return Some(class_fqn);
+                }
 
-        if object_expr.contains("->") || object_expr.contains("?->") {
-            return self.infer_completion_member_chain_type(
-                object_expr,
-                tree,
-                source,
-                file_symbols,
-                line,
-                byte_col,
-            );
-        }
+                if object_expr.contains("->") || object_expr.contains("?->") {
+                    return self.infer_completion_member_chain_type(
+                        object_expr,
+                        tree,
+                        source,
+                        file_symbols,
+                        line,
+                        byte_col,
+                        type_cache,
+                    );
+                }
 
-        if object_expr == "$this" {
-            current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
-                .or_else(|| current_class_fqn(file_symbols))
-        } else if object_expr.starts_with('$') {
-            self.infer_completion_variable_type(
-                tree,
-                source,
-                file_symbols,
-                line,
-                byte_col,
-                object_expr,
-            )
-        } else {
-            None
-        }
+                if object_expr == "$this" {
+                    current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
+                        .or_else(|| current_class_fqn(file_symbols))
+                } else if object_expr.starts_with('$') {
+                    self.infer_completion_variable_type(
+                        tree,
+                        source,
+                        file_symbols,
+                        line,
+                        byte_col,
+                        object_expr,
+                        type_cache,
+                    )
+                } else {
+                    None
+                }
+            },
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn infer_completion_variable_type(
         &self,
         tree: &tree_sitter::Tree,
@@ -1694,25 +1883,39 @@ impl PhpLspBackend {
         line: u32,
         byte_col: u32,
         var_name: &str,
+        type_cache: &RequestTypeCache,
     ) -> Option<String> {
-        let resolve_member_type = |class_fqn: &str, member_name: &str| {
-            self.resolve_completion_member_type(class_fqn, member_name, file_symbols)
-        };
-        let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-            resolve_callable_parameter_type_from_index(&self.index, file_symbols, ctx)
-        };
-        infer_variable_type_at_position_with_resolvers(
-            tree,
-            source,
-            file_symbols,
-            line,
-            byte_col,
+        type_cache.cached_string(
+            (line, byte_col, line, byte_col),
+            "completion-variable-type",
             var_name,
-            Some(&resolve_member_type),
-            Some(&callable_param_resolver),
+            || {
+                let resolve_member_type = |class_fqn: &str, member_name: &str| {
+                    self.resolve_completion_member_type_cached(
+                        class_fqn,
+                        member_name,
+                        file_symbols,
+                        type_cache,
+                    )
+                };
+                let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+                    resolve_callable_parameter_type_from_index(&self.index, file_symbols, ctx)
+                };
+                infer_variable_type_at_position_with_resolvers(
+                    tree,
+                    source,
+                    file_symbols,
+                    line,
+                    byte_col,
+                    var_name,
+                    Some(&resolve_member_type),
+                    Some(&callable_param_resolver),
+                )
+            },
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn infer_completion_member_chain_type(
         &self,
         object_expr: &str,
@@ -1721,64 +1924,84 @@ impl PhpLspBackend {
         file_symbols: &php_lsp_types::FileSymbols,
         line: u32,
         byte_col: u32,
+        type_cache: &RequestTypeCache,
     ) -> Option<String> {
-        let normalized = object_expr.replace("?->", "->");
-        let mut parts = normalized.split("->");
-        let base_expr = parts.next()?.trim();
-        let mut class_fqn = if base_expr == "$this" {
-            current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
-                .or_else(|| current_class_fqn(file_symbols))?
-        } else if base_expr.starts_with('$') {
-            self.infer_completion_variable_type(
-                tree,
-                source,
-                file_symbols,
-                line,
-                byte_col,
-                base_expr,
-            )?
-        } else {
-            infer_new_expression_type(base_expr, file_symbols)?
-        };
+        type_cache.cached_string(
+            (line, byte_col, line, byte_col),
+            "completion-member-chain-type",
+            object_expr,
+            || {
+                let normalized = object_expr.replace("?->", "->");
+                let mut parts = normalized.split("->");
+                let base_expr = parts.next()?.trim();
+                let mut class_fqn = if base_expr == "$this" {
+                    current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
+                        .or_else(|| current_class_fqn(file_symbols))?
+                } else if base_expr.starts_with('$') {
+                    self.infer_completion_variable_type(
+                        tree,
+                        source,
+                        file_symbols,
+                        line,
+                        byte_col,
+                        base_expr,
+                        type_cache,
+                    )?
+                } else {
+                    infer_new_expression_type(base_expr, file_symbols)?
+                };
 
-        for raw_member in parts {
-            let member = raw_member.trim();
-            if member.is_empty() {
-                return None;
-            }
+                for raw_member in parts {
+                    let member = raw_member.trim();
+                    if member.is_empty() {
+                        return None;
+                    }
 
-            let is_method_call = member.contains('(');
-            let member_name = member
-                .split('(')
-                .next()
-                .unwrap_or(member)
-                .trim()
-                .trim_start_matches('$');
-            if member_name.is_empty() {
-                return None;
-            }
+                    let is_method_call = member.contains('(');
+                    let member_name = member
+                        .split('(')
+                        .next()
+                        .unwrap_or(member)
+                        .trim()
+                        .trim_start_matches('$');
+                    if member_name.is_empty() {
+                        return None;
+                    }
 
-            let lookup_name = if is_method_call {
-                member_name.to_string()
-            } else {
-                format!("${}", member_name)
-            };
-            class_fqn = if is_method_call {
-                self.resolve_completion_member_call_type(
-                    &class_fqn,
-                    &lookup_name,
-                    member,
-                    file_symbols,
-                )
-                .or_else(|| {
-                    self.resolve_completion_member_type(&class_fqn, &lookup_name, file_symbols)
-                })?
-            } else {
-                self.resolve_completion_member_type(&class_fqn, &lookup_name, file_symbols)?
-            };
-        }
+                    let lookup_name = if is_method_call {
+                        member_name.to_string()
+                    } else {
+                        format!("${}", member_name)
+                    };
+                    class_fqn = if is_method_call {
+                        self.resolve_completion_member_call_type(
+                            &class_fqn,
+                            &lookup_name,
+                            member,
+                            file_symbols,
+                            type_cache,
+                        )
+                        .or_else(|| {
+                            self.resolve_completion_member_type_cached(
+                                &class_fqn,
+                                &lookup_name,
+                                file_symbols,
+                                type_cache,
+                            )
+                        })?
+                    } else {
+                        self.resolve_completion_member_type_cached(
+                            &class_fqn,
+                            &lookup_name,
+                            file_symbols,
+                            type_cache,
+                        )?
+                    };
+                }
 
-        Some(class_fqn)
+                Some(class_fqn)
+            },
+        )
     }
 
     fn infer_completion_type_info(
@@ -1786,21 +2009,37 @@ impl PhpLspBackend {
         ctx: &CompletionInferenceContext<'_>,
         expr: &str,
     ) -> Option<php_lsp_types::TypeInfo> {
-        let resolve_member_type = |class_fqn: &str, member_name: &str| {
-            self.resolve_completion_member_type(class_fqn, member_name, ctx.file_symbols)
-        };
-        let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
-            resolve_callable_parameter_type_from_index(&self.index, ctx.file_symbols, callable_ctx)
-        };
-        infer_variable_type_info_at_position_with_resolvers(
-            ctx.tree,
-            ctx.source,
-            ctx.file_symbols,
-            ctx.line,
-            ctx.byte_col,
+        ctx.type_cache.cached_type_info(
+            (ctx.line, ctx.byte_col, ctx.line, ctx.byte_col),
+            "completion-type-info",
             expr,
-            Some(&resolve_member_type),
-            Some(&callable_param_resolver),
+            || {
+                let resolve_member_type = |class_fqn: &str, member_name: &str| {
+                    self.resolve_completion_member_type_cached(
+                        class_fqn,
+                        member_name,
+                        ctx.file_symbols,
+                        ctx.type_cache,
+                    )
+                };
+                let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
+                    resolve_callable_parameter_type_from_index(
+                        &self.index,
+                        ctx.file_symbols,
+                        callable_ctx,
+                    )
+                };
+                infer_variable_type_info_at_position_with_resolvers(
+                    ctx.tree,
+                    ctx.source,
+                    ctx.file_symbols,
+                    ctx.line,
+                    ctx.byte_col,
+                    expr,
+                    Some(&resolve_member_type),
+                    Some(&callable_param_resolver),
+                )
+            },
         )
     }
 
@@ -2447,6 +2686,7 @@ impl PhpLspBackend {
             diagnostics_mode,
             diagnostic_severity,
             php_version,
+            version,
         );
 
         let has_syntax_errors = diagnostics.iter().any(|diagnostic| {
@@ -9654,7 +9894,10 @@ fn byte_ranges_overlap(left: (u32, u32, u32, u32), right: (u32, u32, u32, u32)) 
     (left.0, left.1) <= (right.2, right.3) && (right.0, right.1) <= (left.2, left.3)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inlay_hints(
+    uri_str: &str,
+    document_version: Option<i32>,
     tree: &tree_sitter::Tree,
     source: &str,
     file_symbols: &php_lsp_types::FileSymbols,
@@ -9665,11 +9908,13 @@ fn inlay_hints(
     let utf16_index = Utf16LineIndex::new(source);
     let byte_range = lsp_range_to_byte_range(source, requested_range);
     let mut hints = Vec::new();
+    let type_cache = RequestTypeCache::new(uri_str, document_version);
     let ctx = InlayHintContext {
         tree,
         source,
         file_symbols,
         index,
+        type_cache: &type_cache,
         utf16_index: &utf16_index,
         requested_range: byte_range,
     };
@@ -9712,6 +9957,7 @@ struct InlayHintContext<'a> {
     source: &'a str,
     file_symbols: &'a php_lsp_types::FileSymbols,
     index: &'a WorkspaceIndex,
+    type_cache: &'a RequestTypeCache,
     utf16_index: &'a Utf16LineIndex,
     requested_range: (u32, u32, u32, u32),
 }
@@ -9729,9 +9975,7 @@ fn collect_call_argument_inlay_hints(
             | "scoped_call_expression"
             | "object_creation_expression"
     ) {
-        if let Some(callable) =
-            resolve_callable_for_inlay_hint(ctx.tree, node, ctx.source, ctx.file_symbols, ctx.index)
-        {
+        if let Some(callable) = resolve_callable_for_inlay_hint(ctx, node) {
             add_call_argument_inlay_hints(
                 node,
                 &callable,
@@ -9750,14 +9994,18 @@ fn collect_call_argument_inlay_hints(
 }
 
 fn resolve_callable_for_inlay_hint(
-    tree: &tree_sitter::Tree,
+    ctx: &InlayHintContext<'_>,
     node: tree_sitter::Node,
-    source: &str,
-    file_symbols: &php_lsp_types::FileSymbols,
-    index: &WorkspaceIndex,
 ) -> Option<Arc<php_lsp_types::SymbolInfo>> {
     let name_node = call_target_name_node(node)?;
-    let (_, sym) = resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)?;
+    let (_, sym) = resolve_reference_symbol_at_node_cached(
+        ctx.tree,
+        ctx.source,
+        name_node,
+        ctx.file_symbols,
+        ctx.index,
+        ctx.type_cache,
+    )?;
     matches!(
         sym.kind,
         php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
@@ -9958,29 +10206,45 @@ fn local_variable_inlay_type(
     variable_name: &str,
     rhs_node: Option<tree_sitter::Node>,
 ) -> Option<LocalVariableInlayType> {
-    if let Some(type_hint) =
-        rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
-    {
-        return Some(type_hint);
-    }
+    ctx.type_cache.cached_local_inlay(
+        node_range_node(variable_node),
+        "local-variable-inlay",
+        format!("{variable_name}:{usage_start}"),
+        || {
+            if let Some(type_hint) =
+                rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
+            {
+                return Some(type_hint);
+            }
 
-    let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
-    };
-    let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
-        resolve_callable_parameter_type_from_index(ctx.index, ctx.file_symbols, callable_ctx)
-    };
-    let info = infer_variable_hover_info_at_node_with_resolvers(
-        variable_node,
-        ctx.source,
-        ctx.file_symbols,
-        usage_start,
-        variable_name,
-        Some(&resolver),
-        Some(&callable_param_resolver),
-    )?;
+            let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+                ctx.type_cache.cached_string(
+                    (0, 0, 0, 0),
+                    "member-type",
+                    format!("{class_fqn}::{member_name}"),
+                    || resolve_member_type_from_index(ctx.index, class_fqn, member_name),
+                )
+            };
+            let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
+                resolve_callable_parameter_type_from_index(
+                    ctx.index,
+                    ctx.file_symbols,
+                    callable_ctx,
+                )
+            };
+            let info = infer_variable_hover_info_at_node_with_resolvers(
+                variable_node,
+                ctx.source,
+                ctx.file_symbols,
+                usage_start,
+                variable_name,
+                Some(&resolver),
+                Some(&callable_param_resolver),
+            )?;
 
-    local_variable_type_from_hover_info(&info, ctx.file_symbols, false)
+            local_variable_type_from_hover_info(&info, ctx.file_symbols, false)
+        },
+    )
 }
 
 fn local_variable_inlay_type_from_expression(
@@ -10028,12 +10292,13 @@ fn local_variable_inlay_type_from_call_expression(
     expression: tree_sitter::Node,
 ) -> Option<LocalVariableInlayType> {
     let name_node = call_target_name_node(expression)?;
-    let (sym_at_pos, symbol) = resolve_reference_symbol_at_node(
+    let (sym_at_pos, symbol) = resolve_reference_symbol_at_node_cached(
         ctx.tree,
         ctx.source,
         name_node,
         ctx.file_symbols,
         ctx.index,
+        ctx.type_cache,
     )?;
     if !matches!(
         symbol.kind,
@@ -10370,6 +10635,18 @@ fn call_site_argument_type(
     node: tree_sitter::Node,
 ) -> Option<php_lsp_types::TypeInfo> {
     let node = normalized_expression_node(node);
+    ctx.type_cache.cached_type_info(
+        node_range_node(node),
+        "call-site-argument-type",
+        node.kind(),
+        || call_site_argument_type_uncached(ctx, node),
+    )
+}
+
+fn call_site_argument_type_uncached(
+    ctx: &InlayHintContext<'_>,
+    node: tree_sitter::Node,
+) -> Option<php_lsp_types::TypeInfo> {
     let raw = node_text(ctx.source, node).trim();
     let lower = raw.to_ascii_lowercase();
 
@@ -10460,7 +10737,12 @@ fn call_site_variable_phpdoc_type(
 ) -> Option<php_lsp_types::TypeInfo> {
     let variable_name = variable_text_for_node(ctx.source, node)?;
     let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
+        ctx.type_cache.cached_string(
+            (0, 0, 0, 0),
+            "member-type",
+            format!("{class_fqn}::{member_name}"),
+            || resolve_member_type_from_index(ctx.index, class_fqn, member_name),
+        )
     };
     let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
         resolve_callable_parameter_type_from_index(ctx.index, ctx.file_symbols, callable_ctx)
@@ -10992,7 +11274,12 @@ fn local_variable_inlay_type_from_variable_expression(
 ) -> Option<LocalVariableInlayType> {
     let variable_name = variable_text_for_node(ctx.source, expression)?;
     let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
+        ctx.type_cache.cached_string(
+            (0, 0, 0, 0),
+            "member-type",
+            format!("{class_fqn}::{member_name}"),
+            || resolve_member_type_from_index(ctx.index, class_fqn, member_name),
+        )
     };
     let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
         resolve_callable_parameter_type_from_index(ctx.index, ctx.file_symbols, callable_ctx)
@@ -11061,7 +11348,12 @@ fn local_variable_hover_data(
         assignment_rhs_for_variable_hover(variable_node, &variable_name, usage_start, ctx.source);
 
     let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-        resolve_member_type_from_index(ctx.index, class_fqn, member_name)
+        ctx.type_cache.cached_string(
+            (0, 0, 0, 0),
+            "member-type",
+            format!("{class_fqn}::{member_name}"),
+            || resolve_member_type_from_index(ctx.index, class_fqn, member_name),
+        )
     };
     let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
         resolve_callable_parameter_type_from_index(ctx.index, ctx.file_symbols, callable_ctx)
@@ -12578,6 +12870,7 @@ fn compute_open_file_diagnostics(
     diagnostics_mode: DiagnosticsMode,
     diagnostic_severity: DiagnosticSeverityConfig,
     php_version: PhpVersion,
+    document_version: Option<i32>,
 ) -> Vec<Diagnostic> {
     if let Some(parser) = open_files.get(uri_str) {
         compute_source_diagnostics_on_dedicated_stack(
@@ -12587,6 +12880,7 @@ fn compute_open_file_diagnostics(
             diagnostics_mode,
             diagnostic_severity,
             php_version,
+            document_version,
         )
     } else {
         vec![]
@@ -12600,6 +12894,7 @@ fn compute_source_diagnostics_on_dedicated_stack(
     diagnostics_mode: DiagnosticsMode,
     diagnostic_severity: DiagnosticSeverityConfig,
     php_version: PhpVersion,
+    document_version: Option<i32>,
 ) -> Vec<Diagnostic> {
     let thread_name = format!("php-lsp-diagnostics:{uri_str}");
     let handle = match std::thread::Builder::new()
@@ -12608,13 +12903,14 @@ fn compute_source_diagnostics_on_dedicated_stack(
         .spawn(move || {
             let mut parser = FileParser::new();
             parser.parse_full(&source);
-            compute_diagnostics_with_config(
+            compute_diagnostics_with_config_for_version(
                 &uri_str,
                 &parser,
                 &index,
                 diagnostics_mode,
                 diagnostic_severity,
                 php_version,
+                document_version,
             )
         }) {
         Ok(handle) => handle,
@@ -12724,6 +13020,26 @@ pub(crate) fn compute_diagnostics_with_config(
     diagnostic_severity: DiagnosticSeverityConfig,
     php_version: PhpVersion,
 ) -> Vec<Diagnostic> {
+    compute_diagnostics_with_config_for_version(
+        uri_str,
+        parser,
+        index,
+        diagnostics_mode,
+        diagnostic_severity,
+        php_version,
+        None,
+    )
+}
+
+fn compute_diagnostics_with_config_for_version(
+    uri_str: &str,
+    parser: &FileParser,
+    index: &WorkspaceIndex,
+    diagnostics_mode: DiagnosticsMode,
+    diagnostic_severity: DiagnosticSeverityConfig,
+    php_version: PhpVersion,
+    document_version: Option<i32>,
+) -> Vec<Diagnostic> {
     let diagnostics_started = Instant::now();
     if diagnostics_mode == DiagnosticsMode::Off {
         return vec![];
@@ -12735,6 +13051,7 @@ pub(crate) fn compute_diagnostics_with_config(
     };
     let source = parser.source();
     let utf16_index = Utf16LineIndex::new(&source);
+    let type_cache = RequestTypeCache::new(uri_str, document_version);
 
     // Syntax errors (ERROR / MISSING nodes)
     let lsp_diags = extract_syntax_errors(tree, &source);
@@ -12801,7 +13118,14 @@ pub(crate) fn compute_diagnostics_with_config(
     {
         let members_started = Instant::now();
         diagnostics.extend(apply_diagnostic_category(
-            member_access_diagnostics(tree, &source, &file_symbols, index, &utf16_index),
+            member_access_diagnostics(
+                tree,
+                &source,
+                &file_symbols,
+                index,
+                &utf16_index,
+                &type_cache,
+            ),
             DiagnosticCategory::Members,
             diagnostic_severity,
         ));
@@ -12814,7 +13138,14 @@ pub(crate) fn compute_diagnostics_with_config(
     {
         let types_started = Instant::now();
         diagnostics.extend(apply_diagnostic_category(
-            type_compatibility_diagnostics(tree, &source, &file_symbols, index, &utf16_index),
+            type_compatibility_diagnostics(
+                tree,
+                &source,
+                &file_symbols,
+                index,
+                &utf16_index,
+                &type_cache,
+            ),
             DiagnosticCategory::TypeCompatibility,
             diagnostic_severity,
         ));
@@ -12971,6 +13302,7 @@ fn member_access_diagnostics(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     walk_member_access_diagnostics(
@@ -12980,11 +13312,13 @@ fn member_access_diagnostics(
         file_symbols,
         index,
         utf16_index,
+        type_cache,
         &mut diagnostics,
     );
     diagnostics
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_member_access_diagnostics(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
@@ -12992,6 +13326,7 @@ fn walk_member_access_diagnostics(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if matches!(
@@ -13009,6 +13344,7 @@ fn walk_member_access_diagnostics(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         );
     }
@@ -13022,11 +13358,13 @@ fn walk_member_access_diagnostics(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_member_access_node(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
@@ -13034,6 +13372,7 @@ fn check_member_access_node(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if node_inside_anonymous_class_body(node, source) {
@@ -13048,17 +13387,24 @@ fn check_member_access_node(
     }
     let pos = name_node.start_position();
     let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-        resolve_member_type_from_index(index, class_fqn, member_name)
+        type_cache.cached_string(
+            (0, 0, 0, 0),
+            "member-type",
+            format!("{class_fqn}::{member_name}"),
+            || resolve_member_type_from_index(index, class_fqn, member_name),
+        )
     };
     let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
         resolve_callable_parameter_type_from_index(index, file_symbols, ctx)
     };
-    let Some(sym_at_pos) = symbol_at_position_with_resolvers(
+    let Some(sym_at_pos) = symbol_at_position_with_request_cache(
+        type_cache,
         tree,
         source,
         pos.row as u32,
         pos.column as u32,
         file_symbols,
+        "diagnostic-member-access",
         Some(&member_type_resolver),
         Some(&callable_param_resolver),
     ) else {
@@ -13078,7 +13424,14 @@ fn check_member_access_node(
 
     let Some(resolved) = resolve_member_for_ref_kind(index, &sym_at_pos) else {
         if is_phpunit_testcase_helper_call(&sym_at_pos, file_symbols, index)
-            || is_phpunit_test_double_api_call(tree, source, file_symbols, index, &sym_at_pos)
+            || is_phpunit_test_double_api_call(
+                tree,
+                source,
+                file_symbols,
+                index,
+                type_cache,
+                &sym_at_pos,
+            )
             || is_missing_parent_constructor_call(&sym_at_pos)
             || is_enum_builtin_method_call(index, &sym_at_pos)
             || is_dynamic_member_access(index, file_symbols, &sym_at_pos)
@@ -13205,6 +13558,7 @@ fn is_phpunit_test_double_api_call(
     source: &str,
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
+    type_cache: &RequestTypeCache,
     sym_at_pos: &SymbolAtPosition,
 ) -> bool {
     if sym_at_pos.ref_kind != RefKind::MethodCall
@@ -13225,7 +13579,14 @@ fn is_phpunit_test_double_api_call(
     let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         phpunit_testcase_factory_return_type(member_name)
             .map(str::to_string)
-            .or_else(|| resolve_member_type_from_index(index, class_fqn, member_name))
+            .or_else(|| {
+                type_cache.cached_string(
+                    (0, 0, 0, 0),
+                    "member-type",
+                    format!("{class_fqn}::{member_name}"),
+                    || resolve_member_type_from_index(index, class_fqn, member_name),
+                )
+            })
     };
 
     infer_property_type_from_assignments(
@@ -13873,6 +14234,7 @@ fn type_compatibility_diagnostics(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     walk_type_compatibility_diagnostics(
@@ -13882,11 +14244,13 @@ fn type_compatibility_diagnostics(
         file_symbols,
         index,
         utf16_index,
+        type_cache,
         &mut diagnostics,
     );
     diagnostics
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_type_compatibility_diagnostics(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
@@ -13894,6 +14258,7 @@ fn walk_type_compatibility_diagnostics(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match node.kind() {
@@ -13904,6 +14269,7 @@ fn walk_type_compatibility_diagnostics(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         ),
         "member_call_expression" | "scoped_call_expression" => {
@@ -13914,6 +14280,7 @@ fn walk_type_compatibility_diagnostics(
                 file_symbols,
                 index,
                 utf16_index,
+                type_cache,
                 diagnostics,
             )
         }
@@ -13924,6 +14291,7 @@ fn walk_type_compatibility_diagnostics(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         ),
         "return_statement" => check_return_type_compatibility(
@@ -13932,6 +14300,7 @@ fn walk_type_compatibility_diagnostics(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         ),
         "assignment_expression" => check_property_assignment_type_compatibility(
@@ -13941,6 +14310,7 @@ fn walk_type_compatibility_diagnostics(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         ),
         _ => {}
@@ -13955,11 +14325,13 @@ fn walk_type_compatibility_diagnostics(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_function_call_type_compatibility(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
@@ -13967,6 +14339,7 @@ fn check_function_call_type_compatibility(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(name_node) = node
@@ -13975,9 +14348,14 @@ fn check_function_call_type_compatibility(
     else {
         return;
     };
-    let Some((_, sym)) =
-        resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)
-    else {
+    let Some((_, sym)) = resolve_reference_symbol_at_node_cached(
+        tree,
+        source,
+        name_node,
+        file_symbols,
+        index,
+        type_cache,
+    ) else {
         return;
     };
 
@@ -13989,11 +14367,13 @@ fn check_function_call_type_compatibility(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_member_call_type_compatibility(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
@@ -14001,14 +14381,20 @@ fn check_member_call_type_compatibility(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(name_node) = member_reference_name_node(node) else {
         return;
     };
-    let Some((_, sym)) =
-        resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)
-    else {
+    let Some((_, sym)) = resolve_reference_symbol_at_node_cached(
+        tree,
+        source,
+        name_node,
+        file_symbols,
+        index,
+        type_cache,
+    ) else {
         return;
     };
 
@@ -14020,11 +14406,13 @@ fn check_member_call_type_compatibility(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_constructor_type_compatibility(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
@@ -14032,14 +14420,20 @@ fn check_constructor_type_compatibility(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(name_node) = object_creation_class_node(node) else {
         return;
     };
-    let Some((_, sym)) =
-        resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)
-    else {
+    let Some((_, sym)) = resolve_reference_symbol_at_node_cached(
+        tree,
+        source,
+        name_node,
+        file_symbols,
+        index,
+        type_cache,
+    ) else {
         return;
     };
 
@@ -14051,11 +14445,13 @@ fn check_constructor_type_compatibility(
             file_symbols,
             index,
             utf16_index,
+            type_cache,
             diagnostics,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_call_argument_types(
     call_node: tree_sitter::Node,
     callable: &php_lsp_types::SymbolInfo,
@@ -14063,6 +14459,7 @@ fn check_call_argument_types(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(signature) = callable.signature.as_ref() else {
@@ -14084,7 +14481,9 @@ fn check_call_argument_types(
         let Some(expected) = param.type_info.as_ref() else {
             continue;
         };
-        let Some(actual) = infer_expression_type(arg.value_node, source, file_symbols) else {
+        let Some(actual) =
+            infer_expression_type_cached(arg.value_node, source, file_symbols, type_cache)
+        else {
             continue;
         };
 
@@ -14107,6 +14506,7 @@ fn check_return_type_compatibility(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if node_inside_anonymous_class_body(node, source) {
@@ -14131,7 +14531,8 @@ fn check_return_type_compatibility(
     ) {
         return;
     }
-    let Some(actual) = infer_expression_type(expr_node, source, file_symbols) else {
+    let Some(actual) = infer_expression_type_cached(expr_node, source, file_symbols, type_cache)
+    else {
         return;
     };
 
@@ -14147,6 +14548,7 @@ fn check_return_type_compatibility(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_property_assignment_type_compatibility(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
@@ -14154,6 +14556,7 @@ fn check_property_assignment_type_compatibility(
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
+    type_cache: &RequestTypeCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(left_node) = node
@@ -14177,9 +14580,14 @@ fn check_property_assignment_type_compatibility(
     let Some(name_node) = member_reference_name_node(left_node) else {
         return;
     };
-    let Some((_, property)) =
-        resolve_reference_symbol_at_node(tree, source, name_node, file_symbols, index)
-    else {
+    let Some((_, property)) = resolve_reference_symbol_at_node_cached(
+        tree,
+        source,
+        name_node,
+        file_symbols,
+        index,
+        type_cache,
+    ) else {
         return;
     };
 
@@ -14193,7 +14601,8 @@ fn check_property_assignment_type_compatibility(
     else {
         return;
     };
-    let Some(actual) = infer_expression_type(right_node, source, file_symbols) else {
+    let Some(actual) = infer_expression_type_cached(right_node, source, file_symbols, type_cache)
+    else {
         return;
     };
 
@@ -14236,6 +14645,73 @@ fn resolve_reference_symbol_at_node(
         pos.row as u32,
         pos.column as u32,
         file_symbols,
+        Some(&member_type_resolver),
+        Some(&callable_param_resolver),
+    )?;
+    let resolved = index.resolve_fqn(&sym_at_pos.fqn)?;
+    Some((sym_at_pos, resolved))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn symbol_at_position_with_request_cache(
+    type_cache: &RequestTypeCache,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    line: u32,
+    byte_col: u32,
+    file_symbols: &php_lsp_types::FileSymbols,
+    expected_context: &'static str,
+    member_type_resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<SymbolAtPosition> {
+    type_cache.cached_symbol(
+        line,
+        byte_col,
+        "symbol-at-position",
+        expected_context,
+        || {
+            symbol_at_position_with_resolvers(
+                tree,
+                source,
+                line,
+                byte_col,
+                file_symbols,
+                member_type_resolver,
+                callable_resolver,
+            )
+        },
+    )
+}
+
+fn resolve_reference_symbol_at_node_cached(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    node: tree_sitter::Node,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    type_cache: &RequestTypeCache,
+) -> Option<(SymbolAtPosition, Arc<php_lsp_types::SymbolInfo>)> {
+    let pos = node.start_position();
+    let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+        type_cache.cached_string(
+            (0, 0, 0, 0),
+            "member-type",
+            format!("{class_fqn}::{member_name}"),
+            || resolve_member_type_from_index(index, class_fqn, member_name),
+        )
+    };
+    let callable_param_resolver =
+        |ctx: CallableParameterContext<'_>| -> Option<php_lsp_types::TypeInfo> {
+            resolve_callable_parameter_type_from_index(index, file_symbols, ctx)
+        };
+    let sym_at_pos = symbol_at_position_with_request_cache(
+        type_cache,
+        tree,
+        source,
+        pos.row as u32,
+        pos.column as u32,
+        file_symbols,
+        "reference-symbol",
         Some(&member_type_resolver),
         Some(&callable_param_resolver),
     )?;
@@ -14367,6 +14843,21 @@ fn containing_callable_symbol(
                 sym.range.3.saturating_sub(sym.range.1),
             )
         })
+}
+
+fn infer_expression_type_cached(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    type_cache: &RequestTypeCache,
+) -> Option<InferredExprType> {
+    let normalized = normalized_expression_node(node);
+    type_cache.cached_inferred_expr(
+        node_range_node(normalized),
+        "diagnostic-expression-type",
+        normalized.kind(),
+        || infer_expression_type(normalized, source, file_symbols),
+    )
 }
 
 fn infer_expression_type(
@@ -18274,13 +18765,14 @@ impl LanguageServer for PhpLspBackend {
                     let version = reindex_document_versions
                         .get(&uri_str)
                         .map(|current| *current);
-                    let diags = compute_diagnostics_with_config(
+                    let diags = compute_diagnostics_with_config_for_version(
                         &uri_str,
                         &entry,
                         &reindex_index,
                         diagnostics_mode,
                         diagnostic_severity,
                         php_version,
+                        version,
                     );
                     if reindex_document_versions
                         .get(&uri_str)
@@ -18857,22 +19349,31 @@ impl LanguageServer for PhpLspBackend {
                 .get(&uri_str)
                 .map(|entry| entry.value().clone())
                 .unwrap_or_default();
+            let type_cache =
+                RequestTypeCache::new(&uri_str, self.current_document_version(&uri_str));
 
             // Build a cross-file type resolver for method chain resolution
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-                self.resolve_member_type(class_fqn, member_name)
+                type_cache.cached_string(
+                    (0, 0, 0, 0),
+                    "member-type",
+                    format!("{class_fqn}::{member_name}"),
+                    || self.resolve_member_type(class_fqn, member_name),
+                )
             };
             let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
                 resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
             };
 
             // Find symbol at cursor position (with resolver for chains)
-            let sym_at_pos = match symbol_at_position_with_resolvers(
+            let sym_at_pos = match symbol_at_position_with_request_cache(
+                &type_cache,
                 tree,
                 &source,
                 pos.line,
                 byte_col,
                 &file_symbols,
+                "hover",
                 Some(&resolver),
                 Some(&callable_param_resolver),
             ) {
@@ -18885,6 +19386,7 @@ impl LanguageServer for PhpLspBackend {
                     source: &source,
                     file_symbols: &file_symbols,
                     index: &self.index,
+                    type_cache: &type_cache,
                     utf16_index: &utf16_index,
                     requested_range: (0, 0, u32::MAX, u32::MAX),
                 };
@@ -20782,6 +21284,8 @@ impl LanguageServer for PhpLspBackend {
                 .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
 
             inlay_hints(
+                &uri_str,
+                self.current_document_version(&uri_str),
                 tree,
                 &source,
                 &file_symbols,
@@ -21183,13 +21687,14 @@ impl LanguageServer for PhpLspBackend {
             };
             let diagnostics_mode = *self.diagnostics_mode.lock().await;
             let diagnostic_severity = *self.diagnostic_severity.lock().await;
-            compute_diagnostics_with_config(
+            compute_diagnostics_with_config_for_version(
                 &uri_str,
                 &parser,
                 &self.index,
                 diagnostics_mode,
                 diagnostic_severity,
                 php_version,
+                self.current_document_version(&uri_str),
             )
             .into_iter()
             .filter(|diag| range_overlaps(diag.range, params.range))
@@ -21910,6 +22415,7 @@ impl LanguageServer for PhpLspBackend {
         };
         let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
         let file_symbols = extract_file_symbols(&tree, &source, &uri_str);
+        let type_cache = RequestTypeCache::new(&uri_str, self.current_document_version(&uri_str));
 
         // Detect completion context
         let context = detect_context(&tree, &source, pos.line, byte_col, &file_symbols);
@@ -21927,6 +22433,7 @@ impl LanguageServer for PhpLspBackend {
                         &file_symbols,
                         pos.line,
                         byte_col,
+                        &type_cache,
                     )
                 }),
                 object_expr,
@@ -21959,6 +22466,7 @@ impl LanguageServer for PhpLspBackend {
             tree: &tree,
             source: &source,
             file_symbols: &file_symbols,
+            type_cache: &type_cache,
             line: pos.line,
             byte_col,
         };
@@ -22223,6 +22731,7 @@ impl LanguageServer for PhpLspBackend {
 mod tests {
     use super::*;
     use php_lsp_types::*;
+    use std::cell::Cell;
 
     fn make_symbol(
         name: &str,
@@ -22264,6 +22773,71 @@ mod tests {
             }
         }
         line_start + col as usize
+    }
+
+    #[test]
+    fn test_request_type_cache_reuses_same_expression_context() {
+        let cache = RequestTypeCache::new("file:///test.php", Some(7));
+        let calls = Cell::new(0usize);
+
+        let first = cache.cached_type_info((3, 4, 3, 10), "completion-type-info", "$user", || {
+            calls.set(calls.get() + 1);
+            Some(TypeInfo::Simple("App\\User".to_string()))
+        });
+        let second = cache.cached_type_info((3, 4, 3, 10), "completion-type-info", "$user", || {
+            calls.set(calls.get() + 1);
+            Some(TypeInfo::Simple("App\\Other".to_string()))
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first, Some(TypeInfo::Simple("App\\User".to_string())));
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn test_request_type_cache_stores_negative_results() {
+        let cache = RequestTypeCache::new("file:///test.php", Some(7));
+        let calls = Cell::new(0usize);
+
+        let first = cache.cached_string((0, 0, 0, 0), "member-type", "App\\User::missing", || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        let second = cache.cached_string((0, 0, 0, 0), "member-type", "App\\User::missing", || {
+            calls.set(calls.get() + 1);
+            Some("App\\Never".to_string())
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first, None);
+        assert_eq!(second, None);
+    }
+
+    #[test]
+    fn test_request_type_cache_separates_context_and_document_version() {
+        let first_cache = RequestTypeCache::new("file:///test.php", Some(7));
+        let second_cache = RequestTypeCache::new("file:///test.php", Some(8));
+        let calls = Cell::new(0usize);
+
+        let first =
+            first_cache.cached_type_info((3, 4, 3, 10), "completion-type-info", "$user", || {
+                calls.set(calls.get() + 1);
+                Some(TypeInfo::Simple("App\\User".to_string()))
+            });
+        let different_context =
+            first_cache.cached_type_info((3, 4, 3, 10), "call-site-argument-type", "$user", || {
+                calls.set(calls.get() + 1);
+                Some(TypeInfo::Simple("App\\Request".to_string()))
+            });
+        let different_version =
+            second_cache.cached_type_info((3, 4, 3, 10), "completion-type-info", "$user", || {
+                calls.set(calls.get() + 1);
+                Some(TypeInfo::Simple("App\\UserV2".to_string()))
+            });
+
+        assert_eq!(calls.get(), 3);
+        assert_ne!(first, different_context);
+        assert_ne!(first, different_version);
     }
 
     #[test]

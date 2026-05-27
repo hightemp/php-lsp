@@ -1920,12 +1920,33 @@ PR-052 ─→ PR-053
     `docs/production-risk-register.md` mention callback and generator foreach
     inference.
 
-- [ ] **IE-035** Per-request expression type cache
+- [x] **IE-035** Per-request expression type cache *(done 2026-05-27)*
   - Add request-local cache for expression/member type resolution.
   - Key by URI, document version, byte range, expected context.
   - Use only within one request or one diagnostics pass; do not persist until invalidation story is proven.
   - Benchmark before/after on completion, diagnostics, references-heavy fixture.
   - Must not change visible behavior except latency.
+  - Implemented: added a `RequestTypeCache` scoped to a single request or
+    diagnostics pass, with keys containing URI, document version, byte range,
+    resolver context, and expected-context text.
+  - Implemented: completion now reuses cached member types, member-chain
+    results, variable type inference, shape type-info inference, and call-site
+    member return resolution within one completion request.
+  - Implemented: inlay hints and local variable hover helper paths reuse cached
+    member type lookups, call-site argument type inference, callable target
+    resolution, and local variable inlay type results within one request.
+  - Implemented: semantic member/type diagnostics reuse cached
+    symbol-at-position, member type, and simple expression type inference
+    within one diagnostics pass.
+  - Guard: cache is not stored on `PhpLspBackend`, is recreated per request or
+    diagnostics pass, and negative lookups are cached only inside that scope.
+  - Regression: server unit tests cover cache hits, negative-result caching, and
+    separation by expected context and document version.
+  - Benchmark: warmed before/after timings on targeted scenarios:
+    completion `0.09s -> 0.08s`, diagnostics `0.09s -> 0.10s`, references
+    `0.10s -> 0.10s`; no visible behavior change was observed.
+  - Validation: `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`.
 
 ### Неделя 5: framework-aware providers and template files (2026-07-06 → 2026-07-12)
 
