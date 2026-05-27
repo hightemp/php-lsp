@@ -1950,13 +1950,24 @@ PR-052 ─→ PR-053
 
 ### Неделя 5: framework-aware providers and template files (2026-07-06 → 2026-07-12)
 
-- [ ] **IE-040** Ввести `VirtualMemberProvider` / framework adapter архитектуру
+- [x] **IE-040** Ввести `VirtualMemberProvider` / framework adapter архитектуру *(done 2026-05-27)*
   - Общий trait/provider слой для synthetic methods/properties/string keys.
   - Providers получают readonly context: workspace root, composer metadata, indexed symbols, file content when already open/available.
   - Providers не должны bootstrapping приложение, подключать database или выполнять user code.
   - Results должны иметь source ranges или synthetic metadata for hover/completion/definition.
   - Cache/invalidation: per workspace config/composer fingerprint + watched relevant files.
   - Tests: provider ordering, duplicate merge, cache invalidation.
+  - Implemented: added a static framework provider layer with readonly
+    `FrameworkProviderContext`, `VirtualMemberProvider`, virtual member/string-key
+    contracts, synthetic/source metadata shape, deterministic provider ordering,
+    duplicate merge rules, and fingerprinted request cache invalidation.
+  - Implemented: moved existing Doctrine repository, Symfony controller helper,
+    and Laravel/Eloquent dynamic member suppressions behind default providers.
+  - Regression: diagnostics still allow existing framework-heavy Symfony/Laravel
+    patterns while unknown member diagnostics remain unchanged for non-provider
+    members.
+  - Validation: `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`.
 
 - [ ] **IE-041** Laravel/Eloquent-like model virtual properties
   - Detect model classes structurally: inheritance/interface/known framework symbols from Composer, not hardcoded project paths.
@@ -1999,6 +2010,37 @@ PR-052 ─→ PR-053
   - Do not advertise full template support until diagnostics/source-map edge cases are stable.
   - Tests: source map range conversion, hover/completion in echo, diagnostics no false whole-file range.
 
+- [ ] **IE-044A** Symfony/Twig template support via static model + source map
+  - Treat Twig as a separate template language target, not as Blade-compatible syntax.
+  - Add safe client activation/document selector for `.twig` / `.html.twig` files.
+  - Build a conservative Twig parser/preprocessor that can map Twig ranges to
+    virtual PHP ranges and back without executing user code or booting Symfony.
+  - Support first:
+    - `{{ expr }}` hover/completion for variables and simple member chains
+    - `{% if %}`, `{% for item in items %}`, `{% set name = expr %}`
+    - comments, blocks, extends/include/embed/use/import tags as semantic tokens
+    - `{% include %}` / `{% extends %}` / `{% embed %}` template path completion
+      and definition through static template file lookup
+  - Infer template variables from static PHP call sites where possible:
+    - `render('path.html.twig', ['name' => $expr])`
+    - controller/helper methods that pass a template name plus context array
+    - array-shape-like context types when already known by the PHP type engine
+  - Add a `TwigTemplateContextProvider` under the framework/provider layer so
+    Symfony-specific behavior does not leak into the core parser.
+  - Keep unsupported Twig filters/functions/tests as `mixed` unless a static
+    provider can resolve them; do not run Twig extensions or service container code.
+  - Map diagnostics back only when source ranges are precise; otherwise suppress
+    uncertain virtual-PHP diagnostics instead of reporting noisy whole-template
+    errors.
+  - Tests:
+    - source-map roundtrip for Twig output/control blocks
+    - hover/completion for variables passed from PHP `render(...)`
+    - `{% for item in items %}` item type inference from array/list context
+    - template include/extends completion and go-to-definition
+    - diagnostics suppression for unsupported dynamic Twig constructs.
+  - Documentation: update English `README.md`, `docs/lsp-features.md`, and
+    risk/limitation docs after implementation.
+
 - [ ] **IE-045** Final acceptance for intelligence milestone
   - Run full validation:
     - `cd server && cargo fmt --all --check`
@@ -2036,6 +2078,8 @@ IE-035 ─→ IE-045
 IE-040 ─→ IE-041 ─→ IE-042
 IE-040 ─→ IE-043
 IE-040 ─→ IE-044
+IE-040 ─→ IE-044A
+IE-043 ─→ IE-044A
 IE-001 ─→ IE-045
 IE-010 ─→ IE-045
 IE-020 ─→ IE-045

@@ -13052,6 +13052,7 @@ fn compute_diagnostics_with_config_for_version(
     let source = parser.source();
     let utf16_index = Utf16LineIndex::new(&source);
     let type_cache = RequestTypeCache::new(uri_str, document_version);
+    let framework_cache = crate::framework::FrameworkProviderCache::default();
 
     // Syntax errors (ERROR / MISSING nodes)
     let lsp_diags = extract_syntax_errors(tree, &source);
@@ -13125,6 +13126,7 @@ fn compute_diagnostics_with_config_for_version(
                 index,
                 &utf16_index,
                 &type_cache,
+                &framework_cache,
             ),
             DiagnosticCategory::Members,
             diagnostic_severity,
@@ -13303,6 +13305,7 @@ fn member_access_diagnostics(
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
     type_cache: &RequestTypeCache,
+    framework_cache: &crate::framework::FrameworkProviderCache,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     walk_member_access_diagnostics(
@@ -13313,6 +13316,7 @@ fn member_access_diagnostics(
         index,
         utf16_index,
         type_cache,
+        framework_cache,
         &mut diagnostics,
     );
     diagnostics
@@ -13327,6 +13331,7 @@ fn walk_member_access_diagnostics(
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
     type_cache: &RequestTypeCache,
+    framework_cache: &crate::framework::FrameworkProviderCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if matches!(
@@ -13345,6 +13350,7 @@ fn walk_member_access_diagnostics(
             index,
             utf16_index,
             type_cache,
+            framework_cache,
             diagnostics,
         );
     }
@@ -13359,6 +13365,7 @@ fn walk_member_access_diagnostics(
             index,
             utf16_index,
             type_cache,
+            framework_cache,
             diagnostics,
         );
     }
@@ -13373,6 +13380,7 @@ fn check_member_access_node(
     index: &WorkspaceIndex,
     utf16_index: &Utf16LineIndex,
     type_cache: &RequestTypeCache,
+    framework_cache: &crate::framework::FrameworkProviderCache,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if node_inside_anonymous_class_body(node, source) {
@@ -13434,7 +13442,7 @@ fn check_member_access_node(
             )
             || is_missing_parent_constructor_call(&sym_at_pos)
             || is_enum_builtin_method_call(index, &sym_at_pos)
-            || is_dynamic_member_access(index, file_symbols, &sym_at_pos)
+            || is_dynamic_member_access(index, file_symbols, &sym_at_pos, framework_cache)
         {
             return;
         }
@@ -13653,6 +13661,7 @@ fn is_dynamic_member_access(
     index: &WorkspaceIndex,
     file_symbols: &php_lsp_types::FileSymbols,
     sym_at_pos: &SymbolAtPosition,
+    framework_cache: &crate::framework::FrameworkProviderCache,
 ) -> bool {
     let Some((class_fqn, member_name)) = sym_at_pos.fqn.rsplit_once("::") else {
         return false;
@@ -13666,16 +13675,21 @@ fn is_dynamic_member_access(
         return true;
     }
 
+    let framework_query = crate::framework::VirtualMemberQuery::from_ref_kind(
+        class_fqn,
+        member_name,
+        sym_at_pos.ref_kind,
+    );
+    let framework_ctx = crate::framework::FrameworkProviderContext::new(index)
+        .with_workspace(None, None)
+        .with_file(Some(file_symbols), None)
+        .with_relevant_files(&[]);
+    let framework_registry = crate::framework::default_framework_provider_registry();
+
     if sym_at_pos.ref_kind == RefKind::MethodCall {
-        return is_doctrine_repository_dynamic_method(index, class_fqn, member_name)
-            || is_laravel_eloquent_dynamic_member(
-                index,
-                class_fqn,
-                member_name,
-                sym_at_pos.ref_kind,
-            )
-            || is_symfony_controller_helper_method(index, class_fqn, member_name)
-            || is_unindexed_imported_type(index, file_symbols, class_fqn);
+        return framework_query.is_some_and(|query| {
+            framework_cache.has_virtual_member(&framework_registry, &framework_ctx, &query)
+        }) || is_unindexed_imported_type(index, file_symbols, class_fqn);
     }
 
     if sym_at_pos.ref_kind != RefKind::PropertyAccess {
@@ -13686,7 +13700,9 @@ fn is_dynamic_member_access(
         return true;
     }
 
-    if is_laravel_eloquent_dynamic_member(index, class_fqn, member_name, sym_at_pos.ref_kind) {
+    if framework_query.is_some_and(|query| {
+        framework_cache.has_virtual_member(&framework_registry, &framework_ctx, &query)
+    }) {
         return true;
     }
 
@@ -13719,123 +13735,6 @@ fn is_enum_builtin_method_call(index: &WorkspaceIndex, sym_at_pos: &SymbolAtPosi
         .types
         .get(class_fqn.trim_start_matches('\\'))
         .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
-}
-
-fn is_doctrine_repository_dynamic_method(
-    index: &WorkspaceIndex,
-    class_fqn: &str,
-    member_name: &str,
-) -> bool {
-    class_is_or_extends(index, class_fqn, "Doctrine\\ORM\\EntityRepository")
-        && (member_name.starts_with("findBy")
-            || member_name.starts_with("findOneBy")
-            || member_name.starts_with("countBy"))
-}
-
-fn is_symfony_controller_helper_method(
-    index: &WorkspaceIndex,
-    class_fqn: &str,
-    member_name: &str,
-) -> bool {
-    if !class_is_or_extends(
-        index,
-        class_fqn,
-        "Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController",
-    ) {
-        return false;
-    }
-
-    matches!(
-        member_name.to_ascii_lowercase().as_str(),
-        "render"
-            | "renderform"
-            | "json"
-            | "redirect"
-            | "redirecttoroute"
-            | "redirecttourl"
-            | "forward"
-            | "generateurl"
-            | "addflash"
-            | "getuser"
-            | "isgranted"
-            | "denyaccessunlessgranted"
-            | "createform"
-            | "createformbuilder"
-            | "getparameter"
-    )
-}
-
-fn is_laravel_eloquent_dynamic_member(
-    index: &WorkspaceIndex,
-    class_fqn: &str,
-    member_name: &str,
-    ref_kind: RefKind,
-) -> bool {
-    let is_model = class_is_or_extends(index, class_fqn, "Illuminate\\Database\\Eloquent\\Model");
-    let is_builder =
-        class_is_or_extends(index, class_fqn, "Illuminate\\Database\\Eloquent\\Builder")
-            || class_is_or_extends(index, class_fqn, "Illuminate\\Database\\Query\\Builder")
-            || class_is_or_extends(
-                index,
-                class_fqn,
-                "Illuminate\\Database\\Eloquent\\Relations\\Relation",
-            );
-
-    match ref_kind {
-        RefKind::MethodCall => {
-            (is_model || is_builder) && is_laravel_eloquent_dynamic_method(member_name)
-        }
-        RefKind::PropertyAccess => is_model,
-        _ => false,
-    }
-}
-
-fn is_laravel_eloquent_dynamic_method(member_name: &str) -> bool {
-    let lower = member_name.to_ascii_lowercase();
-    lower.starts_with("where")
-        || lower.starts_with("orwhere")
-        || lower.starts_with("wherehas")
-        || lower.starts_with("orwherehas")
-        || lower.starts_with("withwherehas")
-        || lower.starts_with("doesnthave")
-        || lower.starts_with("ordoesnthave")
-        || matches!(
-            lower.as_str(),
-            "query"
-                | "newquery"
-                | "newmodelquery"
-                | "newquerywithoutrelationships"
-                | "find"
-                | "findorfail"
-                | "findmany"
-                | "first"
-                | "firstorfail"
-                | "firstornew"
-                | "firstorcreate"
-                | "updateorcreate"
-                | "create"
-                | "forcecreate"
-                | "save"
-                | "push"
-                | "update"
-                | "delete"
-                | "destroy"
-                | "restore"
-                | "with"
-                | "without"
-                | "load"
-                | "loadmissing"
-                | "pluck"
-                | "count"
-                | "exists"
-                | "paginate"
-                | "simplepaginate"
-        )
-}
-
-fn class_is_or_extends(index: &WorkspaceIndex, class_fqn: &str, target_class: &str) -> bool {
-    fqn_matches(class_fqn, target_class)
-        || class_extends_or_implements(index, class_fqn, target_class, &mut Vec::new())
 }
 
 fn class_has_unindexed_ancestor(
