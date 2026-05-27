@@ -1992,13 +1992,26 @@ PR-052 ─→ PR-053
   - Validation: `cargo test --all`, `cargo fmt --all --check`,
     `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **IE-042** Laravel/Eloquent-like relations, scopes, builders
+- [x] **IE-042** Laravel/Eloquent-like relations, scopes, builders *(done 2026-05-27)*
   - Infer relationship methods returning relation generics and expose related model properties where safe.
   - Add `*_count` virtual properties for known relationships.
   - Local scopes: `scopeActive($query)` exposes `active()` on builder-like chains.
   - Custom builder detection through return types/attributes/static factory methods where available.
   - Support fluent `query()->where()->first()` style chains via generics, not one-off method names.
   - Tests: belongs-to/has-many-like fixtures, local scope, custom builder, relation count.
+  - Implemented: Eloquent relation methods are detected from relation return
+    types and static relation factories, then exposed as `*_count` virtual
+    properties with source ranges.
+  - Implemented: local scopes are exposed as virtual methods on models and
+    custom builders; model `query()` / `newQuery()` dynamic methods now return
+    a detected custom builder when available.
+  - Implemented: custom builder detection uses model factory return types and
+    `UseEloquentBuilder(...::class)` attributes when source is available.
+  - Implemented: completion/type inference now asks framework virtual members
+    for method return types and can infer static factory calls like
+    `User::query()->...`.
+  - Validation: `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
 - [ ] **IE-043** Framework string-key intelligence
   - Completion + definition for string keys where files are static and discoverable:

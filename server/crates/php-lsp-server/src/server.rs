@@ -204,6 +204,7 @@ impl RequestTypeCache {
 
 struct CompletionInferenceContext<'a> {
     tree: &'a tree_sitter::Tree,
+    source_uri: &'a str,
     source: &'a str,
     file_symbols: &'a php_lsp_types::FileSymbols,
     type_cache: &'a RequestTypeCache,
@@ -1737,6 +1738,8 @@ impl PhpLspBackend {
         class_fqn: &str,
         member_name: &str,
         file_symbols: &php_lsp_types::FileSymbols,
+        source_uri: Option<&str>,
+        source: Option<&str>,
     ) -> Option<String> {
         self.resolve_member_type(class_fqn, member_name)
             .or_else(|| {
@@ -1753,6 +1756,16 @@ impl PhpLspBackend {
                     }
                 })
             })
+            .or_else(|| {
+                framework_virtual_member_type_fqn(
+                    &self.index,
+                    class_fqn,
+                    member_name,
+                    source_uri,
+                    Some(file_symbols),
+                    source,
+                )
+            })
     }
 
     fn resolve_completion_member_type_cached(
@@ -1760,13 +1773,23 @@ impl PhpLspBackend {
         class_fqn: &str,
         member_name: &str,
         file_symbols: &php_lsp_types::FileSymbols,
+        source_uri: Option<&str>,
+        source: Option<&str>,
         type_cache: &RequestTypeCache,
     ) -> Option<String> {
         type_cache.cached_string(
             (0, 0, 0, 0),
             "completion-member-type",
             format!("{class_fqn}::{member_name}"),
-            || self.resolve_completion_member_type(class_fqn, member_name, file_symbols),
+            || {
+                self.resolve_completion_member_type(
+                    class_fqn,
+                    member_name,
+                    file_symbols,
+                    source_uri,
+                    source,
+                )
+            },
         )
     }
 
@@ -1826,6 +1849,7 @@ impl PhpLspBackend {
         &self,
         object_expr: &str,
         tree: &tree_sitter::Tree,
+        source_uri: &str,
         source: &str,
         file_symbols: &php_lsp_types::FileSymbols,
         line: u32,
@@ -1841,11 +1865,28 @@ impl PhpLspBackend {
                 if let Some(class_fqn) = infer_new_expression_type(object_expr, file_symbols) {
                     return Some(class_fqn);
                 }
+                if let Some(class_fqn) = infer_static_call_expression_type(
+                    object_expr,
+                    file_symbols,
+                    |class_fqn, method_name| {
+                        self.resolve_completion_member_type_cached(
+                            class_fqn,
+                            method_name,
+                            file_symbols,
+                            Some(source_uri),
+                            Some(source),
+                            type_cache,
+                        )
+                    },
+                ) {
+                    return Some(class_fqn);
+                }
 
                 if object_expr.contains("->") || object_expr.contains("?->") {
                     return self.infer_completion_member_chain_type(
                         object_expr,
                         tree,
+                        source_uri,
                         source,
                         file_symbols,
                         line,
@@ -1860,6 +1901,7 @@ impl PhpLspBackend {
                 } else if object_expr.starts_with('$') {
                     self.infer_completion_variable_type(
                         tree,
+                        source_uri,
                         source,
                         file_symbols,
                         line,
@@ -1878,6 +1920,7 @@ impl PhpLspBackend {
     fn infer_completion_variable_type(
         &self,
         tree: &tree_sitter::Tree,
+        source_uri: &str,
         source: &str,
         file_symbols: &php_lsp_types::FileSymbols,
         line: u32,
@@ -1895,6 +1938,8 @@ impl PhpLspBackend {
                         class_fqn,
                         member_name,
                         file_symbols,
+                        Some(source_uri),
+                        Some(source),
                         type_cache,
                     )
                 };
@@ -1920,6 +1965,7 @@ impl PhpLspBackend {
         &self,
         object_expr: &str,
         tree: &tree_sitter::Tree,
+        source_uri: &str,
         source: &str,
         file_symbols: &php_lsp_types::FileSymbols,
         line: u32,
@@ -1940,6 +1986,7 @@ impl PhpLspBackend {
                 } else if base_expr.starts_with('$') {
                     self.infer_completion_variable_type(
                         tree,
+                        source_uri,
                         source,
                         file_symbols,
                         line,
@@ -1948,7 +1995,22 @@ impl PhpLspBackend {
                         type_cache,
                     )?
                 } else {
-                    infer_new_expression_type(base_expr, file_symbols)?
+                    infer_new_expression_type(base_expr, file_symbols).or_else(|| {
+                        infer_static_call_expression_type(
+                            base_expr,
+                            file_symbols,
+                            |class_fqn, method_name| {
+                                self.resolve_completion_member_type_cached(
+                                    class_fqn,
+                                    method_name,
+                                    file_symbols,
+                                    Some(source_uri),
+                                    Some(source),
+                                    type_cache,
+                                )
+                            },
+                        )
+                    })?
                 };
 
                 for raw_member in parts {
@@ -1986,6 +2048,8 @@ impl PhpLspBackend {
                                 &class_fqn,
                                 &lookup_name,
                                 file_symbols,
+                                Some(source_uri),
+                                Some(source),
                                 type_cache,
                             )
                         })?
@@ -1994,6 +2058,8 @@ impl PhpLspBackend {
                             &class_fqn,
                             &lookup_name,
                             file_symbols,
+                            Some(source_uri),
+                            Some(source),
                             type_cache,
                         )?
                     };
@@ -2019,6 +2085,8 @@ impl PhpLspBackend {
                         class_fqn,
                         member_name,
                         ctx.file_symbols,
+                        Some(ctx.source_uri),
+                        Some(ctx.source),
                         ctx.type_cache,
                     )
                 };
@@ -15665,6 +15733,43 @@ fn framework_virtual_member_candidates(
     registry.virtual_member_candidates(&ctx, class_fqn, kind)
 }
 
+fn framework_virtual_member_type_fqn(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+    source_uri: Option<&str>,
+    file_symbols: Option<&php_lsp_types::FileSymbols>,
+    source: Option<&str>,
+) -> Option<String> {
+    let kind = if member_name.starts_with('$') {
+        crate::framework::VirtualMemberKind::Property
+    } else {
+        crate::framework::VirtualMemberKind::Method
+    };
+    let query = crate::framework::VirtualMemberQuery {
+        owner_fqn: class_fqn.to_string(),
+        member_name: member_name.to_string(),
+        kind,
+    };
+    let ctx = crate::framework::FrameworkProviderContext::new(index)
+        .with_source_uri(source_uri)
+        .with_file(file_symbols, source)
+        .with_relevant_files(&[]);
+    let registry = crate::framework::default_framework_provider_registry();
+    let cache = crate::framework::FrameworkProviderCache::default();
+    let member = cache
+        .virtual_members(&registry, &ctx, &query)
+        .into_iter()
+        .next()?;
+    let type_info = member.type_info.as_ref()?;
+    let uri = file_symbols
+        .and_then(|symbols| symbols.symbols.first())
+        .map(|symbol| symbol.uri.as_str())
+        .or(source_uri)
+        .unwrap_or("");
+    type_info_fqn_from_index(index, class_fqn, uri, type_info)
+}
+
 fn phpdoc_property_tag(access: php_lsp_types::PhpDocPropertyAccess) -> &'static str {
     match access {
         php_lsp_types::PhpDocPropertyAccess::ReadWrite => "@property",
@@ -16850,6 +16955,37 @@ fn infer_new_expression_type(
             .trim_start_matches('\\')
             .to_string(),
     )
+}
+
+fn infer_static_call_expression_type<F>(
+    expr: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    mut resolver: F,
+) -> Option<String>
+where
+    F: FnMut(&str, &str) -> Option<String>,
+{
+    let expr = trim_balanced_outer_parens(expr.trim());
+    let (class_expr, after_scope) = expr.split_once("::")?;
+    let class_name = class_expr.trim();
+    if class_name.is_empty() || matches!(class_name, "self" | "static" | "parent") {
+        return None;
+    }
+
+    let method_name_end = after_scope
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_alphanumeric() && ch != '_').then_some(idx))
+        .unwrap_or(after_scope.len());
+    let method_name = after_scope[..method_name_end].trim();
+    if method_name.is_empty() || after_scope[method_name_end..].trim_start().chars().next()? != '('
+    {
+        return None;
+    }
+
+    let class_fqn = resolve_class_name_pub(class_name, file_symbols)
+        .trim_start_matches('\\')
+        .to_string();
+    resolver(&class_fqn, method_name)
 }
 
 fn trim_balanced_outer_parens(mut text: &str) -> &str {
@@ -22604,6 +22740,7 @@ impl LanguageServer for PhpLspBackend {
                     self.infer_completion_object_type(
                         &object_expr,
                         &tree,
+                        &uri_str,
                         &source,
                         &file_symbols,
                         pos.line,
@@ -22639,6 +22776,7 @@ impl LanguageServer for PhpLspBackend {
 
         let inference_ctx = CompletionInferenceContext {
             tree: &tree,
+            source_uri: &uri_str,
             source: &source,
             file_symbols: &file_symbols,
             type_cache: &type_cache,
@@ -22685,12 +22823,34 @@ impl LanguageServer for PhpLspBackend {
                     Some(&uri_str),
                     Some(&file_symbols),
                     Some(&source),
-                    Some(crate::framework::VirtualMemberKind::Property),
+                    None,
                 ) {
                     let label = member.name.trim_start_matches('$').to_string();
                     if seen_labels.insert(label) {
                         lsp_items.push(framework_virtual_completion_item(&member, member_prefix));
                     }
+                }
+            }
+        }
+        if let php_lsp_completion::context::CompletionContext::StaticAccess {
+            class_fqn,
+            member_prefix,
+            ..
+        } = &context
+        {
+            let mut seen_labels: HashSet<String> =
+                lsp_items.iter().map(|item| item.label.clone()).collect();
+            for member in framework_virtual_member_candidates(
+                &self.index,
+                class_fqn,
+                Some(&uri_str),
+                Some(&file_symbols),
+                Some(&source),
+                Some(crate::framework::VirtualMemberKind::Method),
+            ) {
+                let label = member.name.trim_start_matches('$').to_string();
+                if seen_labels.insert(label) {
+                    lsp_items.push(framework_virtual_completion_item(&member, member_prefix));
                 }
             }
         }
@@ -23057,6 +23217,39 @@ mod tests {
         assert_eq!(
             infer_new_expression_type("((new TypeGuess(Foo::class)))", &file_symbols).as_deref(),
             Some("Symfony\\Component\\Form\\Guess\\TypeGuess")
+        );
+    }
+
+    #[test]
+    fn test_infer_static_call_expression_type_with_resolver() {
+        let file_symbols = FileSymbols {
+            namespace: Some("App\\Models".to_string()),
+            use_statements: vec![UseStatement {
+                fqn: "App\\Database\\UserBuilder".to_string(),
+                alias: None,
+                kind: UseKind::Class,
+                range: (0, 0, 0, 0),
+            }],
+            symbols: vec![],
+            ..Default::default()
+        };
+
+        let inferred = infer_static_call_expression_type(
+            "User::query()",
+            &file_symbols,
+            |class_fqn, method_name| {
+                assert_eq!(class_fqn, "App\\Models\\User");
+                assert_eq!(method_name, "query");
+                Some("App\\Database\\UserBuilder".to_string())
+            },
+        );
+
+        assert_eq!(inferred.as_deref(), Some("App\\Database\\UserBuilder"));
+        assert!(
+            infer_static_call_expression_type("User::class", &file_symbols, |_, _| {
+                Some("never".to_string())
+            })
+            .is_none()
         );
     }
 

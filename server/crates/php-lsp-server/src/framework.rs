@@ -7,8 +7,10 @@
 use php_lsp_index::composer::NamespaceMap;
 use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::phpdoc::parse_phpdoc;
-use php_lsp_parser::resolve::RefKind;
-use php_lsp_types::{FileSymbols, PhpDocPropertyAccess, PhpSymbolKind, SymbolInfo, TypeInfo};
+use php_lsp_parser::resolve::{resolve_class_name, RefKind};
+use php_lsp_types::{
+    FileSymbols, PhpDocPropertyAccess, PhpSymbolKind, SymbolInfo, TemplateBindingKind, TypeInfo,
+};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -603,8 +605,47 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
         let is_builder = is_laravel_builder(ctx, &query.owner_fqn);
 
         let accepted = match query.kind {
-            VirtualMemberKind::Method => {
-                (is_model || is_builder) && is_laravel_eloquent_dynamic_method(&query.member_name)
+            VirtualMemberKind::Method if is_model => {
+                if let Some(scope) =
+                    laravel_scope_virtual_method(ctx, &query.owner_fqn, &query.member_name)
+                {
+                    return vec![scope];
+                }
+                if is_laravel_eloquent_dynamic_method(&query.member_name) {
+                    let mut member = VirtualMember::synthetic(
+                        self.id(),
+                        &query.owner_fqn,
+                        &query.member_name,
+                        query.kind,
+                        "Laravel Eloquent dynamic method",
+                    );
+                    member.type_info = laravel_model_dynamic_method_return_type(
+                        ctx,
+                        &query.owner_fqn,
+                        &query.member_name,
+                    );
+                    return vec![member];
+                }
+                false
+            }
+            VirtualMemberKind::Method if is_builder => {
+                if let Some(scope) =
+                    laravel_builder_scope_virtual_method(ctx, &query.owner_fqn, &query.member_name)
+                {
+                    return vec![scope];
+                }
+                if is_laravel_eloquent_dynamic_method(&query.member_name) {
+                    let mut member = VirtualMember::synthetic(
+                        self.id(),
+                        &query.owner_fqn,
+                        &query.member_name,
+                        query.kind,
+                        "Laravel Eloquent builder dynamic method",
+                    );
+                    member.type_info = Some(TypeInfo::Simple(query.owner_fqn.clone()));
+                    return vec![member];
+                }
+                false
             }
             VirtualMemberKind::Property if is_model => {
                 let member_name = query.member_name.trim_start_matches('$');
@@ -624,6 +665,7 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
                     || is_model
             }
             VirtualMemberKind::StaticProperty | VirtualMemberKind::ClassConstant => false,
+            VirtualMemberKind::Method => false,
             VirtualMemberKind::Property => false,
         };
 
@@ -647,13 +689,31 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
         kind: Option<VirtualMemberKind>,
     ) -> Vec<VirtualMember> {
         if !is_laravel_model(ctx, class_fqn) {
-            return Vec::new();
+            if !is_laravel_builder(ctx, class_fqn) {
+                return Vec::new();
+            }
+            if kind.is_some_and(|kind| kind != VirtualMemberKind::Method) {
+                return Vec::new();
+            }
+            return laravel_builder_scope_virtual_methods(ctx, class_fqn);
         }
-        if kind.is_some_and(|kind| kind != VirtualMemberKind::Property) {
+        if kind.is_some_and(|kind| {
+            !matches!(
+                kind,
+                VirtualMemberKind::Property | VirtualMemberKind::Method
+            )
+        }) {
             return Vec::new();
         }
 
-        laravel_model_virtual_properties(ctx, class_fqn)
+        let mut members = Vec::new();
+        if kind.is_none() || kind == Some(VirtualMemberKind::Property) {
+            members.extend(laravel_model_virtual_properties(ctx, class_fqn));
+        }
+        if kind.is_none() || kind == Some(VirtualMemberKind::Method) {
+            members.extend(laravel_scope_virtual_methods(ctx, class_fqn));
+        }
+        members
     }
 }
 
@@ -681,6 +741,7 @@ fn laravel_model_virtual_properties(
         collect_phpdoc_properties(ctx, &owner, &mut properties, &mut seen);
         collect_laravel_accessor_properties(ctx, &owner, &mut properties, &mut seen);
         collect_laravel_source_properties(ctx, &owner, &mut properties, &mut seen);
+        collect_laravel_relation_count_properties(ctx, &owner, &mut properties, &mut seen);
     }
 
     properties
@@ -851,6 +912,611 @@ fn collect_laravel_source_properties(
             push_laravel_property(properties, seen, member);
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct LaravelRelation {
+    name: String,
+    related_model: Option<String>,
+    source: Option<VirtualMemberSource>,
+}
+
+fn collect_laravel_relation_count_properties(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &std::sync::Arc<SymbolInfo>,
+    properties: &mut Vec<VirtualMember>,
+    seen: &mut HashMap<VirtualMemberIdentity, usize>,
+) {
+    for relation in laravel_model_relations_for_owner(ctx, owner) {
+        let property_name = format!("{}_count", studly_to_snake(&relation.name));
+        let detail = relation
+            .related_model
+            .as_ref()
+            .map(|model| format!("Laravel relation count for {} ({})", relation.name, model))
+            .unwrap_or_else(|| format!("Laravel relation count for {}", relation.name));
+        let member = laravel_property_from_source(
+            owner,
+            &property_name,
+            Some(TypeInfo::Simple("int".to_string())),
+            detail,
+            relation.source,
+        );
+        push_laravel_property(properties, seen, member);
+    }
+}
+
+fn laravel_model_relations_for_owner(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &std::sync::Arc<SymbolInfo>,
+) -> Vec<LaravelRelation> {
+    ctx.index
+        .get_members(&owner.fqn)
+        .into_iter()
+        .filter(|member| {
+            member.parent_fqn.as_deref() == Some(owner.fqn.as_str())
+                && member.kind == PhpSymbolKind::Method
+                && !member.modifiers.is_static
+        })
+        .filter_map(|method| laravel_relation_from_method(ctx, owner, &method))
+        .collect()
+}
+
+fn laravel_relation_from_method(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &SymbolInfo,
+    method: &SymbolInfo,
+) -> Option<LaravelRelation> {
+    if method.name == "casts"
+        || method.name.starts_with("__")
+        || scope_method_name(&method.name).is_some()
+        || legacy_accessor_property_name(&method.name).is_some()
+        || modern_attribute_get_type(method).is_some()
+    {
+        return None;
+    }
+
+    let return_type = method
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.return_type.as_ref());
+    let related_from_return = return_type
+        .and_then(|type_info| laravel_relation_related_model_from_type_info(ctx, owner, type_info));
+    let returns_relation =
+        return_type.is_some_and(|type_info| is_laravel_relation_type_info(ctx, owner, type_info));
+    let related_from_source = laravel_relation_related_model_from_source(ctx, owner, method);
+
+    if !returns_relation && related_from_source.is_none() {
+        return None;
+    }
+
+    Some(LaravelRelation {
+        name: method.name.clone(),
+        related_model: related_from_return.or(related_from_source),
+        source: property_source_range(method),
+    })
+}
+
+fn laravel_relation_related_model_from_type_info(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &SymbolInfo,
+    type_info: &TypeInfo,
+) -> Option<String> {
+    match type_info {
+        TypeInfo::Generic { base, args }
+            if resolve_type_name_to_fqn(ctx, owner, base)
+                .as_deref()
+                .is_some_and(|fqn| is_laravel_relation_fqn(ctx, fqn)) =>
+        {
+            args.iter()
+                .find_map(|arg| type_info_to_fqn(ctx, owner, arg))
+        }
+        TypeInfo::Nullable(inner) => {
+            laravel_relation_related_model_from_type_info(ctx, owner, inner)
+        }
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            types.iter().find_map(|type_info| {
+                laravel_relation_related_model_from_type_info(ctx, owner, type_info)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_laravel_relation_type_info(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &SymbolInfo,
+    type_info: &TypeInfo,
+) -> bool {
+    match type_info {
+        TypeInfo::Simple(name) => resolve_type_name_to_fqn(ctx, owner, name)
+            .as_deref()
+            .is_some_and(|fqn| is_laravel_relation_fqn(ctx, fqn)),
+        TypeInfo::Generic { base, .. } => resolve_type_name_to_fqn(ctx, owner, base)
+            .as_deref()
+            .is_some_and(|fqn| is_laravel_relation_fqn(ctx, fqn)),
+        TypeInfo::Nullable(inner) => is_laravel_relation_type_info(ctx, owner, inner),
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
+            .iter()
+            .any(|type_info| is_laravel_relation_type_info(ctx, owner, type_info)),
+        _ => false,
+    }
+}
+
+fn is_laravel_relation_fqn(ctx: &FrameworkProviderContext<'_>, fqn: &str) -> bool {
+    ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\Relation")
+        || matches!(
+            fqn.trim_start_matches('\\')
+                .rsplit('\\')
+                .next()
+                .unwrap_or(fqn),
+            "Relation"
+                | "BelongsTo"
+                | "BelongsToMany"
+                | "HasMany"
+                | "HasManyThrough"
+                | "HasOne"
+                | "HasOneThrough"
+                | "MorphMany"
+                | "MorphOne"
+                | "MorphTo"
+                | "MorphToMany"
+                | "MorphedByMany"
+        )
+}
+
+fn laravel_relation_related_model_from_source(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &SymbolInfo,
+    method: &SymbolInfo,
+) -> Option<String> {
+    let text = source_for_symbol(ctx, method)?;
+    let text = source_text_for_range(text, method.range)?;
+    for factory in LARAVEL_RELATION_FACTORIES {
+        let mut search_start = 0usize;
+        let needle = format!("{factory}(");
+        while let Some(relative) = text[search_start..].find(&needle) {
+            let args_start = search_start + relative + needle.len();
+            let first_arg = first_call_argument_text(&text[args_start..])?;
+            if let Some(model) = class_reference_text_to_fqn(ctx, owner, first_arg) {
+                return Some(model);
+            }
+            search_start = args_start;
+        }
+    }
+    None
+}
+
+const LARAVEL_RELATION_FACTORIES: &[&str] = &[
+    "belongsTo",
+    "belongsToMany",
+    "hasMany",
+    "hasManyThrough",
+    "hasOne",
+    "hasOneThrough",
+    "morphMany",
+    "morphOne",
+    "morphTo",
+    "morphToMany",
+    "morphedByMany",
+];
+
+fn first_call_argument_text(text_after_open_paren: &str) -> Option<&str> {
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    for (idx, ch) in text_after_open_paren.char_indices() {
+        if let Some(active_quote) = quote {
+            if ch == '\\' {
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' => depth += 1,
+            ')' if depth == 0 => return Some(text_after_open_paren[..idx].trim()),
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return Some(text_after_open_paren[..idx].trim()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn class_reference_text_to_fqn(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &SymbolInfo,
+    text: &str,
+) -> Option<String> {
+    let text = text.trim();
+    if let Some(class_pos) = text.find("::class") {
+        let before = text[..class_pos].trim();
+        let class_name = before
+            .rsplit(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '\\'))
+            .next()
+            .unwrap_or(before)
+            .trim();
+        return resolve_type_name_to_fqn(ctx, owner, class_name);
+    }
+
+    if (text.starts_with('\'') && text.ends_with('\''))
+        || (text.starts_with('"') && text.ends_with('"'))
+    {
+        return resolve_type_name_to_fqn(ctx, owner, &text[1..text.len().saturating_sub(1)]);
+    }
+
+    None
+}
+
+fn laravel_scope_virtual_method(
+    ctx: &FrameworkProviderContext<'_>,
+    model_fqn: &str,
+    member_name: &str,
+) -> Option<VirtualMember> {
+    laravel_scope_virtual_methods(ctx, model_fqn)
+        .into_iter()
+        .find(|member| member.name.eq_ignore_ascii_case(member_name))
+}
+
+fn laravel_scope_virtual_methods(
+    ctx: &FrameworkProviderContext<'_>,
+    model_fqn: &str,
+) -> Vec<VirtualMember> {
+    let mut methods = Vec::new();
+    let mut seen = HashMap::<VirtualMemberIdentity, usize>::new();
+    for owner in ctx.index.get_type_hierarchy_symbols(model_fqn) {
+        collect_laravel_scope_methods(
+            ctx,
+            &owner,
+            model_fqn,
+            laravel_builder_type_for_model(ctx, model_fqn),
+            &mut methods,
+            &mut seen,
+        );
+    }
+    methods
+}
+
+fn laravel_builder_scope_virtual_method(
+    ctx: &FrameworkProviderContext<'_>,
+    builder_fqn: &str,
+    member_name: &str,
+) -> Option<VirtualMember> {
+    laravel_builder_scope_virtual_methods(ctx, builder_fqn)
+        .into_iter()
+        .find(|member| member.name.eq_ignore_ascii_case(member_name))
+}
+
+fn laravel_builder_scope_virtual_methods(
+    ctx: &FrameworkProviderContext<'_>,
+    builder_fqn: &str,
+) -> Vec<VirtualMember> {
+    let Some(model_fqn) = laravel_model_for_builder(ctx, builder_fqn) else {
+        return Vec::new();
+    };
+
+    let mut methods = Vec::new();
+    let mut seen = HashMap::<VirtualMemberIdentity, usize>::new();
+    for owner in ctx.index.get_type_hierarchy_symbols(&model_fqn) {
+        collect_laravel_scope_methods(
+            ctx,
+            &owner,
+            builder_fqn,
+            Some(TypeInfo::Simple(builder_fqn.to_string())),
+            &mut methods,
+            &mut seen,
+        );
+    }
+    methods
+}
+
+fn collect_laravel_scope_methods(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &std::sync::Arc<SymbolInfo>,
+    exposed_owner_fqn: &str,
+    return_type: Option<TypeInfo>,
+    methods: &mut Vec<VirtualMember>,
+    seen: &mut HashMap<VirtualMemberIdentity, usize>,
+) {
+    for method in ctx
+        .index
+        .get_members(&owner.fqn)
+        .into_iter()
+        .filter(|member| {
+            member.parent_fqn.as_deref() == Some(owner.fqn.as_str())
+                && member.kind == PhpSymbolKind::Method
+                && !member.modifiers.is_static
+        })
+    {
+        let Some(scope_name) = scope_method_name(&method.name) else {
+            continue;
+        };
+        let mut member = VirtualMember::synthetic(
+            LARAVEL_ELOQUENT_PROVIDER.id(),
+            exposed_owner_fqn,
+            &scope_name,
+            VirtualMemberKind::Method,
+            format!("Laravel local scope from {}::{}", owner.fqn, method.name),
+        );
+        member.type_info = return_type.clone();
+        member.sources.push(VirtualMemberSource::SourceRange {
+            uri: method.uri.clone(),
+            range: method.selection_range,
+        });
+        push_virtual_member(methods, seen, member);
+    }
+}
+
+fn scope_method_name(method_name: &str) -> Option<String> {
+    let suffix = method_name.strip_prefix("scope")?;
+    if suffix.is_empty() {
+        return None;
+    }
+    Some(lowercase_first(suffix))
+}
+
+fn lowercase_first(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    out.extend(first.to_lowercase());
+    out.push_str(chars.as_str());
+    out
+}
+
+fn push_virtual_member(
+    members: &mut Vec<VirtualMember>,
+    seen: &mut HashMap<VirtualMemberIdentity, usize>,
+    member: VirtualMember,
+) {
+    let identity = member.identity();
+    if let Some(index) = seen.get(&identity).copied() {
+        members[index].merge_from(member);
+    } else {
+        seen.insert(identity, members.len());
+        members.push(member);
+    }
+}
+
+fn laravel_model_dynamic_method_return_type(
+    ctx: &FrameworkProviderContext<'_>,
+    model_fqn: &str,
+    method_name: &str,
+) -> Option<TypeInfo> {
+    let lower = method_name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "query" | "newquery" | "newmodelquery" | "newquerywithoutrelationships"
+    ) || lower.starts_with("where")
+        || lower.starts_with("orwhere")
+        || lower.starts_with("wherehas")
+        || lower.starts_with("orwherehas")
+        || lower.starts_with("withwherehas")
+        || lower.starts_with("doesnthave")
+        || lower.starts_with("ordoesnthave")
+    {
+        return laravel_builder_type_for_model(ctx, model_fqn);
+    }
+
+    if matches!(
+        lower.as_str(),
+        "find" | "findorfail" | "first" | "firstorfail" | "firstornew" | "firstorcreate" | "create"
+    ) {
+        return Some(TypeInfo::Simple(model_fqn.to_string()));
+    }
+
+    if matches!(lower.as_str(), "count") {
+        return Some(TypeInfo::Simple("int".to_string()));
+    }
+
+    None
+}
+
+fn laravel_builder_type_for_model(
+    ctx: &FrameworkProviderContext<'_>,
+    model_fqn: &str,
+) -> Option<TypeInfo> {
+    laravel_custom_builder_for_model(ctx, model_fqn)
+        .map(TypeInfo::Simple)
+        .or_else(|| {
+            Some(TypeInfo::Generic {
+                base: "Illuminate\\Database\\Eloquent\\Builder".to_string(),
+                args: vec![TypeInfo::Simple(model_fqn.to_string())],
+            })
+        })
+}
+
+fn laravel_custom_builder_for_model(
+    ctx: &FrameworkProviderContext<'_>,
+    model_fqn: &str,
+) -> Option<String> {
+    for owner in ctx.index.get_type_hierarchy_symbols(model_fqn) {
+        if let Some(builder) = laravel_custom_builder_from_attribute(ctx, &owner) {
+            return Some(builder);
+        }
+
+        for method in ctx
+            .index
+            .get_members(&owner.fqn)
+            .into_iter()
+            .filter(|member| {
+                member.parent_fqn.as_deref() == Some(owner.fqn.as_str())
+                    && member.kind == PhpSymbolKind::Method
+                    && matches!(
+                        member.name.as_str(),
+                        "newEloquentBuilder" | "newModelQuery" | "newQuery" | "query"
+                    )
+            })
+        {
+            let Some(return_type) = method
+                .signature
+                .as_ref()
+                .and_then(|signature| signature.return_type.as_ref())
+            else {
+                continue;
+            };
+            let Some(builder_fqn) = type_info_to_fqn(ctx, &owner, return_type) else {
+                continue;
+            };
+            if is_laravel_builder(ctx, &builder_fqn)
+                && !is_default_laravel_builder_fqn(&builder_fqn)
+            {
+                return Some(builder_fqn);
+            }
+        }
+    }
+
+    None
+}
+
+fn laravel_custom_builder_from_attribute(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &SymbolInfo,
+) -> Option<String> {
+    let source = source_for_symbol(ctx, owner)?;
+    let class_text = source_text_for_range(source, owner.range)?;
+    let attr_pos = class_text.find("UseEloquentBuilder")?;
+    let after_attr = &class_text[attr_pos..];
+    let open = after_attr.find('(')?;
+    let first_arg = first_call_argument_text(&after_attr[open + 1..])?;
+    class_reference_text_to_fqn(ctx, owner, first_arg)
+}
+
+fn is_default_laravel_builder_fqn(fqn: &str) -> bool {
+    matches!(
+        fqn.trim_start_matches('\\'),
+        "Illuminate\\Database\\Eloquent\\Builder" | "Illuminate\\Database\\Query\\Builder"
+    )
+}
+
+fn laravel_model_for_builder(
+    ctx: &FrameworkProviderContext<'_>,
+    builder_fqn: &str,
+) -> Option<String> {
+    let builder = ctx
+        .index
+        .types
+        .get(builder_fqn.trim_start_matches('\\'))
+        .map(|entry| entry.value().clone())?;
+
+    for binding in &builder.template_bindings {
+        if !matches!(
+            binding.kind,
+            TemplateBindingKind::Extends
+                | TemplateBindingKind::Implements
+                | TemplateBindingKind::Mixin
+        ) {
+            continue;
+        }
+        if is_laravel_builder(ctx, &binding.target) {
+            if let Some(model) = binding
+                .args
+                .iter()
+                .find_map(|arg| type_info_to_fqn(ctx, &builder, arg))
+            {
+                return Some(model);
+            }
+        }
+    }
+
+    for entry in ctx.index.types.iter() {
+        let symbol = entry.value();
+        if symbol.kind != PhpSymbolKind::Class || !is_laravel_model(ctx, &symbol.fqn) {
+            continue;
+        }
+        if laravel_custom_builder_for_model(ctx, &symbol.fqn)
+            .as_deref()
+            .is_some_and(|custom_builder| fqn_matches(custom_builder, builder_fqn))
+        {
+            return Some(symbol.fqn.clone());
+        }
+    }
+
+    None
+}
+
+fn type_info_to_fqn(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &SymbolInfo,
+    type_info: &TypeInfo,
+) -> Option<String> {
+    match type_info {
+        TypeInfo::Simple(name) => resolve_type_name_to_fqn(ctx, owner, name),
+        TypeInfo::Generic { base, .. } => resolve_type_name_to_fqn(ctx, owner, base),
+        TypeInfo::Nullable(inner) => type_info_to_fqn(ctx, owner, inner),
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
+            .iter()
+            .find_map(|type_info| type_info_to_fqn(ctx, owner, type_info)),
+        TypeInfo::ClassString(Some(inner)) => type_info_to_fqn(ctx, owner, inner),
+        TypeInfo::Self_ | TypeInfo::Static_ => Some(owner.fqn.clone()),
+        TypeInfo::Parent_ => owner.extends.first().cloned(),
+        _ => None,
+    }
+}
+
+fn resolve_type_name_to_fqn(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &SymbolInfo,
+    type_name: &str,
+) -> Option<String> {
+    let type_name = type_name.trim().trim_start_matches('\\');
+    if type_name.is_empty() || is_builtin_type_name(type_name) {
+        return None;
+    }
+    if type_name.contains(['|', '&', '<', '>', '{', '}', '(', ')', ',', ' ']) {
+        return None;
+    }
+    if type_name.contains('\\') {
+        return Some(type_name.to_string());
+    }
+
+    if let Some(file_symbols) = ctx.index.file_symbols.get(owner.uri.as_str()) {
+        return Some(resolve_class_name(type_name, file_symbols.value()));
+    }
+    if ctx
+        .source_uri
+        .is_some_and(|source_uri| source_uri == owner.uri.as_str())
+    {
+        if let Some(file_symbols) = ctx.file_symbols {
+            return Some(resolve_class_name(type_name, file_symbols));
+        }
+    }
+
+    Some(type_name.to_string())
+}
+
+fn is_builtin_type_name(type_name: &str) -> bool {
+    matches!(
+        type_name
+            .trim_start_matches('\\')
+            .to_ascii_lowercase()
+            .as_str(),
+        "array"
+            | "bool"
+            | "boolean"
+            | "callable"
+            | "double"
+            | "false"
+            | "float"
+            | "int"
+            | "integer"
+            | "iterable"
+            | "mixed"
+            | "never"
+            | "null"
+            | "object"
+            | "real"
+            | "resource"
+            | "self"
+            | "static"
+            | "string"
+            | "true"
+            | "void"
+    )
 }
 
 fn laravel_property_from_symbol(
@@ -1634,6 +2300,202 @@ class User extends Model
         assert_eq!(
             members[0].detail.as_deref(),
             Some("Laravel Eloquent dynamic member")
+        );
+    }
+
+    #[test]
+    fn laravel_relations_expose_count_properties_and_scopes() {
+        let uri = "file:///laravel-relations.php";
+        let source = r#"<?php
+namespace Illuminate\Database\Eloquent;
+class Model {}
+class Builder {}
+
+namespace Illuminate\Database\Eloquent\Relations;
+class Relation {}
+class HasMany extends Relation {}
+class BelongsTo extends Relation {}
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class User extends Model
+{
+    public function posts(): HasMany
+    {
+        return $this->hasMany(Post::class);
+    }
+
+    public function team(): BelongsTo
+    {
+        return $this->belongsTo(Team::class);
+    }
+
+    public function scopeActive($query): void
+    {
+    }
+}
+
+class Post extends Model
+{
+    protected $casts = ['title' => 'string'];
+}
+
+class Team extends Model {}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        let file_symbols = extract_file_symbols(parser.tree().unwrap(), source, uri);
+        let index = WorkspaceIndex::new();
+        index.update_file(uri, file_symbols.clone());
+
+        let registry = default_framework_provider_registry();
+        let ctx = FrameworkProviderContext::new(&index)
+            .with_source_uri(Some(uri))
+            .with_file(Some(&file_symbols), Some(source));
+        let candidates = registry.virtual_member_candidates(&ctx, "App\\Models\\User", None);
+        let by_name: HashMap<_, _> = candidates
+            .iter()
+            .map(|member| (member.name.as_str(), member))
+            .collect();
+
+        assert_eq!(
+            by_name
+                .get("posts_count")
+                .and_then(|property| property.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("int")
+        );
+        assert_eq!(
+            by_name
+                .get("team_count")
+                .and_then(|property| property.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("int")
+        );
+        assert!(
+            by_name
+                .get("active")
+                .is_some_and(|member| member.kind == VirtualMemberKind::Method),
+            "local scope should be exposed as active()"
+        );
+
+        let active = registry.virtual_members(
+            &ctx,
+            &VirtualMemberQuery {
+                owner_fqn: "App\\Models\\User".to_string(),
+                member_name: "active".to_string(),
+                kind: VirtualMemberKind::Method,
+            },
+        );
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].name, "active");
+    }
+
+    #[test]
+    fn laravel_custom_builder_exposes_scopes_and_query_return_type() {
+        let uri = "file:///laravel-builder.php";
+        let source = r#"<?php
+namespace Illuminate\Database\Eloquent;
+class Model {}
+/**
+ * @template TModel
+ */
+class Builder
+{
+    /**
+     * @return TModel
+     */
+    public function first() {}
+}
+
+namespace App\Database;
+
+use Illuminate\Database\Eloquent\Builder;
+
+/**
+ * @extends Builder<\App\Models\User>
+ */
+class UserBuilder extends Builder {}
+
+namespace App\Models;
+
+use App\Database\UserBuilder;
+use Illuminate\Database\Eloquent\Model;
+
+class User extends Model
+{
+    public function newEloquentBuilder($query): UserBuilder
+    {
+        return new UserBuilder();
+    }
+
+    public function scopeActive($query): void
+    {
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        let file_symbols = extract_file_symbols(parser.tree().unwrap(), source, uri);
+        let index = WorkspaceIndex::new();
+        index.update_file(uri, file_symbols.clone());
+
+        let registry = default_framework_provider_registry();
+        let ctx = FrameworkProviderContext::new(&index)
+            .with_source_uri(Some(uri))
+            .with_file(Some(&file_symbols), Some(source));
+
+        let query = registry.virtual_members(
+            &ctx,
+            &VirtualMemberQuery {
+                owner_fqn: "App\\Models\\User".to_string(),
+                member_name: "query".to_string(),
+                kind: VirtualMemberKind::Method,
+            },
+        );
+        assert_eq!(
+            query
+                .first()
+                .and_then(|member| member.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("App\\Database\\UserBuilder")
+        );
+
+        let builder_scope = registry.virtual_members(
+            &ctx,
+            &VirtualMemberQuery {
+                owner_fqn: "App\\Database\\UserBuilder".to_string(),
+                member_name: "active".to_string(),
+                kind: VirtualMemberKind::Method,
+            },
+        );
+        assert_eq!(
+            builder_scope
+                .first()
+                .and_then(|member| member.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("App\\Database\\UserBuilder")
+        );
+
+        let first = index
+            .resolve_fqn("App\\Database\\UserBuilder::first")
+            .expect("generic inherited builder method should resolve");
+        assert_eq!(
+            first
+                .signature
+                .as_ref()
+                .and_then(|signature| signature.return_type.clone()),
+            Some(TypeInfo::Simple("App\\Models\\User".to_string()))
         );
     }
 
