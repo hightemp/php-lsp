@@ -505,12 +505,14 @@ impl FrameworkProviderCache {
 static DOCTRINE_REPOSITORY_PROVIDER: DoctrineRepositoryProvider = DoctrineRepositoryProvider;
 static SYMFONY_CONTROLLER_PROVIDER: SymfonyControllerProvider = SymfonyControllerProvider;
 static LARAVEL_ELOQUENT_PROVIDER: LaravelEloquentProvider = LaravelEloquentProvider;
+static LARAVEL_STRING_KEY_PROVIDER: LaravelStringKeyProvider = LaravelStringKeyProvider;
 
 pub(crate) fn default_framework_provider_registry() -> FrameworkProviderRegistry<'static> {
     FrameworkProviderRegistry::new(vec![
         &DOCTRINE_REPOSITORY_PROVIDER,
         &SYMFONY_CONTROLLER_PROVIDER,
         &LARAVEL_ELOQUENT_PROVIDER,
+        &LARAVEL_STRING_KEY_PROVIDER,
     ])
 }
 
@@ -714,6 +716,49 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
             members.extend(laravel_scope_virtual_methods(ctx, class_fqn));
         }
         members
+    }
+}
+
+struct LaravelStringKeyProvider;
+
+impl VirtualMemberProvider for LaravelStringKeyProvider {
+    fn id(&self) -> &'static str {
+        "laravel.string-keys"
+    }
+
+    fn priority(&self) -> u16 {
+        50
+    }
+
+    fn virtual_members(
+        &self,
+        _ctx: &FrameworkProviderContext<'_>,
+        _query: &VirtualMemberQuery,
+    ) -> Vec<VirtualMember> {
+        Vec::new()
+    }
+
+    fn string_keys(
+        &self,
+        ctx: &FrameworkProviderContext<'_>,
+        query: &FrameworkStringKeyQuery,
+    ) -> Vec<FrameworkStringKey> {
+        let Some(root) = ctx.workspace_root else {
+            return Vec::new();
+        };
+        if !is_laravel_string_key_layout(root) {
+            return Vec::new();
+        }
+
+        let mut keys = match query.domain.as_str() {
+            "config" => collect_laravel_config_keys(self.id(), root, &query.prefix),
+            "route" => collect_laravel_route_keys(self.id(), root, &query.prefix),
+            "translation" => collect_laravel_translation_keys(self.id(), root, &query.prefix),
+            "view" => collect_laravel_view_keys(self.id(), root, &query.prefix),
+            _ => Vec::new(),
+        };
+        keys.sort_by(|left, right| left.key.cmp(&right.key));
+        keys
     }
 }
 
@@ -1842,6 +1887,387 @@ fn is_laravel_eloquent_dynamic_method(member_name: &str) -> bool {
         )
 }
 
+#[derive(Debug, Clone)]
+struct StaticStringKey {
+    key: String,
+    range: (u32, u32, u32, u32),
+}
+
+fn is_laravel_string_key_layout(root: &Path) -> bool {
+    root.join("artisan").is_file()
+        || root.join("config").is_dir()
+        || root.join("routes").is_dir()
+        || root.join("resources/views").is_dir()
+        || root.join("resources/lang").is_dir()
+        || root.join("lang").is_dir()
+}
+
+fn collect_laravel_config_keys(
+    provider_id: &'static str,
+    root: &Path,
+    prefix: &str,
+) -> Vec<FrameworkStringKey> {
+    let config_dir = root.join("config");
+    let mut keys = Vec::new();
+    for path in collect_static_files(&config_dir, &["php"], 512) {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let uri = path_to_file_uri(&path);
+        for parsed in parse_php_array_key_paths(&source) {
+            let key = format!("{}.{}", stem, parsed.key);
+            if key.starts_with(prefix) {
+                keys.push(framework_string_key(
+                    provider_id,
+                    key,
+                    "Laravel config key",
+                    uri.clone(),
+                    parsed.range,
+                ));
+            }
+        }
+    }
+    keys
+}
+
+fn collect_laravel_route_keys(
+    provider_id: &'static str,
+    root: &Path,
+    prefix: &str,
+) -> Vec<FrameworkStringKey> {
+    let routes_dir = root.join("routes");
+    let mut keys = Vec::new();
+    for path in collect_static_files(&routes_dir, &["php"], 512) {
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let uri = path_to_file_uri(&path);
+        for parsed in parse_named_call_string_args(&source, "name") {
+            if parsed.key.starts_with(prefix) {
+                keys.push(framework_string_key(
+                    provider_id,
+                    parsed.key,
+                    "Laravel route name",
+                    uri.clone(),
+                    parsed.range,
+                ));
+            }
+        }
+    }
+    keys
+}
+
+fn collect_laravel_translation_keys(
+    provider_id: &'static str,
+    root: &Path,
+    prefix: &str,
+) -> Vec<FrameworkStringKey> {
+    let mut keys = Vec::new();
+    for lang_root in [root.join("resources/lang"), root.join("lang")] {
+        if !lang_root.is_dir() {
+            continue;
+        }
+        for path in collect_static_files(&lang_root, &["php"], 2048) {
+            let Ok(relative) = path.strip_prefix(&lang_root) else {
+                continue;
+            };
+            let mut components = relative.components();
+            if components.next().is_none() {
+                continue;
+            }
+            let relative_without_locale = components.as_path();
+            let Some(file_key) = php_key_from_relative_path(relative_without_locale) else {
+                continue;
+            };
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let uri = path_to_file_uri(&path);
+            for parsed in parse_php_array_key_paths(&source) {
+                let key = format!("{}.{}", file_key, parsed.key);
+                if key.starts_with(prefix) {
+                    keys.push(framework_string_key(
+                        provider_id,
+                        key,
+                        "Laravel translation key",
+                        uri.clone(),
+                        parsed.range,
+                    ));
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn collect_laravel_view_keys(
+    provider_id: &'static str,
+    root: &Path,
+    prefix: &str,
+) -> Vec<FrameworkStringKey> {
+    let view_dir = root.join("resources/views");
+    let mut keys = Vec::new();
+    for path in collect_static_files(&view_dir, &["php"], 4096) {
+        let Ok(relative) = path.strip_prefix(&view_dir) else {
+            continue;
+        };
+        let Some(key) = view_key_from_relative_path(relative) else {
+            continue;
+        };
+        if key.starts_with(prefix) {
+            keys.push(framework_string_key(
+                provider_id,
+                key,
+                "Laravel view template",
+                path_to_file_uri(&path),
+                (0, 0, 0, 0),
+            ));
+        }
+    }
+    keys
+}
+
+fn framework_string_key(
+    provider_id: &'static str,
+    key: String,
+    detail: &'static str,
+    uri: String,
+    range: (u32, u32, u32, u32),
+) -> FrameworkStringKey {
+    FrameworkStringKey {
+        key,
+        detail: Some(detail.to_string()),
+        provider_ids: vec![provider_id],
+        sources: vec![VirtualMemberSource::SourceRange { uri, range }],
+    }
+}
+
+fn collect_static_files(root: &Path, extensions: &[&str], limit: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_static_files_recursive(root, extensions, limit, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_static_files_recursive(
+    root: &Path,
+    extensions: &[&str],
+    limit: usize,
+    files: &mut Vec<PathBuf>,
+) {
+    if files.len() >= limit || !root.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if files.len() >= limit {
+            return;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_static_files_recursive(&path, extensions, limit, files);
+        } else if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                extensions
+                    .iter()
+                    .any(|expected| ext.eq_ignore_ascii_case(expected))
+            })
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn parse_php_array_key_paths(source: &str) -> Vec<StaticStringKey> {
+    let mut keys = Vec::new();
+    parse_php_array_key_paths_in(source, 0, source.len(), &[], &mut keys);
+    keys
+}
+
+fn parse_php_array_key_paths_in(
+    source: &str,
+    start: usize,
+    end: usize,
+    path: &[String],
+    keys: &mut Vec<StaticStringKey>,
+) {
+    let mut index = start;
+    while index < end {
+        let Some((value, quote_start, quote_end)) = next_quoted_string(source, index) else {
+            break;
+        };
+        if quote_start >= end {
+            break;
+        }
+
+        let after_quote = skip_ascii_ws(source, quote_end);
+        if !source[after_quote..].starts_with("=>") {
+            index = quote_end;
+            continue;
+        }
+
+        let mut full_path = path.to_vec();
+        full_path.push(value);
+        let key = full_path.join(".");
+        keys.push(StaticStringKey {
+            key,
+            range: range_for_offsets(source, quote_start + 1, quote_end.saturating_sub(1)),
+        });
+
+        let value_start = skip_ascii_ws(source, after_quote + 2);
+        if source[value_start..].starts_with('[') {
+            if let Some(close) = find_matching_delimiter(source, value_start, '[', ']') {
+                parse_php_array_key_paths_in(source, value_start + 1, close, &full_path, keys);
+                index = close + 1;
+                continue;
+            }
+        } else if source[value_start..].starts_with("array") {
+            let after_array = skip_ascii_ws(source, value_start + "array".len());
+            if source[after_array..].starts_with('(') {
+                if let Some(close) = find_matching_delimiter(source, after_array, '(', ')') {
+                    parse_php_array_key_paths_in(source, after_array + 1, close, &full_path, keys);
+                    index = close + 1;
+                    continue;
+                }
+            }
+        }
+
+        index = quote_end;
+    }
+}
+
+fn parse_named_call_string_args(source: &str, call_name: &str) -> Vec<StaticStringKey> {
+    let mut keys = Vec::new();
+    let mut index = 0usize;
+    let needle = format!("{call_name}(");
+    while let Some(relative) = source[index..].find(&needle) {
+        let name_start = index + relative;
+        if name_start > 0 {
+            let previous = source[..name_start].chars().next_back().unwrap_or_default();
+            if previous.is_alphanumeric() || previous == '_' {
+                index = name_start + call_name.len();
+                continue;
+            }
+        }
+        let arg_start = skip_ascii_ws(source, name_start + needle.len());
+        if let Some((value, quote_start, quote_end)) = next_quoted_string(source, arg_start) {
+            if quote_start == arg_start {
+                keys.push(StaticStringKey {
+                    key: value,
+                    range: range_for_offsets(source, quote_start + 1, quote_end.saturating_sub(1)),
+                });
+            }
+        }
+        index = name_start + needle.len();
+    }
+    keys
+}
+
+fn php_key_from_relative_path(path: &Path) -> Option<String> {
+    let without_ext = path.with_extension("");
+    path_components_to_dot_key(&without_ext)
+}
+
+fn view_key_from_relative_path(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let without_suffix = file_name
+        .strip_suffix(".blade.php")
+        .or_else(|| file_name.strip_suffix(".php"))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let combined = if parent.as_os_str().is_empty() {
+        PathBuf::from(without_suffix)
+    } else {
+        parent.join(without_suffix)
+    };
+    path_components_to_dot_key(&combined)
+}
+
+fn path_components_to_dot_key(path: &Path) -> Option<String> {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("."))
+}
+
+fn skip_ascii_ws(source: &str, mut index: usize) -> usize {
+    while index < source.len() && source.as_bytes()[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn find_matching_delimiter(
+    source: &str,
+    open_index: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in source[open_index..].char_indices() {
+        let idx = open_index + idx;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn range_for_offsets(source: &str, start: usize, end: usize) -> (u32, u32, u32, u32) {
+    let (start_line, start_col) = line_col_for_offset(source, start);
+    let (end_line, end_col) = line_col_for_offset(source, end);
+    (start_line, start_col, end_line, end_col)
+}
+
+fn line_col_for_offset(source: &str, target: usize) -> (u32, u32) {
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    for (idx, ch) in source.char_indices() {
+        if idx >= target {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = idx + ch.len_utf8();
+        }
+    }
+    (line, target.saturating_sub(line_start) as u32)
+}
+
+fn path_to_file_uri(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
 fn normalize_fqn(fqn: &str) -> String {
     fqn.trim_start_matches('\\').to_string()
 }
@@ -2497,6 +2923,110 @@ class User extends Model
                 .and_then(|signature| signature.return_type.clone()),
             Some(TypeInfo::Simple("App\\Models\\User".to_string()))
         );
+    }
+
+    #[test]
+    fn laravel_string_key_provider_scans_static_project_files() {
+        let tmp = std::env::temp_dir().join(format!("php-lsp-string-keys-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("config")).unwrap();
+        fs::create_dir_all(tmp.join("routes")).unwrap();
+        fs::create_dir_all(tmp.join("resources/lang/en")).unwrap();
+        fs::create_dir_all(tmp.join("resources/views/users")).unwrap();
+
+        fs::write(
+            tmp.join("config/app.php"),
+            "<?php\nreturn ['name' => 'Demo', 'mail' => ['from' => ['address' => 'x']]];\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("routes/web.php"),
+            "<?php\nRoute::get('/dashboard', DashboardController::class)->name('dashboard.home');\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("resources/lang/en/messages.php"),
+            "<?php\nreturn ['welcome' => ['title' => 'Welcome']];\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("resources/views/users/show.blade.php"),
+            "<h1>{{ $user->name }}</h1>\n",
+        )
+        .unwrap();
+
+        let index = WorkspaceIndex::new();
+        let ctx = FrameworkProviderContext::new(&index).with_workspace(Some(tmp.as_path()), None);
+        let registry = default_framework_provider_registry();
+
+        let config = registry.string_keys(
+            &ctx,
+            &FrameworkStringKeyQuery {
+                domain: "config".to_string(),
+                prefix: "app.mail.".to_string(),
+            },
+        );
+        assert!(
+            config.iter().any(|key| key.key == "app.mail.from.address"),
+            "config tree should expose nested keys: {:?}",
+            config
+        );
+        assert!(
+            config.iter().any(|key| key
+                .sources
+                .iter()
+                .any(|source| matches!(source, VirtualMemberSource::SourceRange { .. }))),
+            "config keys should retain source ranges"
+        );
+
+        let routes = registry.string_keys(
+            &ctx,
+            &FrameworkStringKeyQuery {
+                domain: "route".to_string(),
+                prefix: "dashboard.".to_string(),
+            },
+        );
+        assert!(routes.iter().any(|key| key.key == "dashboard.home"));
+
+        let translations = registry.string_keys(
+            &ctx,
+            &FrameworkStringKeyQuery {
+                domain: "translation".to_string(),
+                prefix: "messages.welcome.".to_string(),
+            },
+        );
+        assert!(
+            translations
+                .iter()
+                .any(|key| key.key == "messages.welcome.title"),
+            "nested translations should be exposed: {:?}",
+            translations
+        );
+
+        let views = registry.string_keys(
+            &ctx,
+            &FrameworkStringKeyQuery {
+                domain: "view".to_string(),
+                prefix: "users.".to_string(),
+            },
+        );
+        assert!(views.iter().any(|key| key.key == "users.show"));
+
+        let unknown = tmp.join("unknown");
+        fs::create_dir_all(&unknown).unwrap();
+        let unknown_ctx =
+            FrameworkProviderContext::new(&index).with_workspace(Some(unknown.as_path()), None);
+        assert!(registry
+            .string_keys(
+                &unknown_ctx,
+                &FrameworkStringKeyQuery {
+                    domain: "view".to_string(),
+                    prefix: String::new(),
+                },
+            )
+            .is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     struct StaticStringKeyProvider;

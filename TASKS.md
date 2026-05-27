@@ -2013,7 +2013,7 @@ PR-052 ─→ PR-053
   - Validation: `cargo test --all`, `cargo fmt --all --check`,
     `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
-- [ ] **IE-043** Framework string-key intelligence
+- [x] **IE-043** Framework string-key intelligence *(done 2026-05-27)*
   - Completion + definition for string keys where files are static and discoverable:
     - config keys
     - route names
@@ -2023,6 +2023,14 @@ PR-052 ─→ PR-053
   - Use file parsers or conservative static scanners.
   - Add providers only in recognized project layout; otherwise no suggestions.
   - Tests: config tree, route declarations, nested translations, view file lookup.
+  - Implemented: static Laravel-style string-key provider for `config`,
+    route names, PHP translation arrays, and `resources/views` template names.
+  - Implemented: completion inside recognized string literal calls and
+    go-to-definition to the static key/template source.
+  - Safety: provider only activates for recognized project layouts and uses
+    conservative filesystem scanners; no project code execution.
+  - Validation: `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
 - [ ] **IE-044** Blade-like template support via virtual PHP + source map
   - Add document selector for template language only if client packaging contributes/activates it safely.

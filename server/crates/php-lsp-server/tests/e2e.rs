@@ -2029,6 +2029,139 @@ echo $
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_framework_string_key_completion_and_definition() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-framework-string-keys-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("config")).unwrap();
+    fs::create_dir_all(tmp_root.join("resources/views/users")).unwrap();
+    fs::create_dir_all(tmp_root.join("app")).unwrap();
+    fs::write(
+        tmp_root.join("config/app.php"),
+        "<?php\nreturn ['name' => 'Demo'];\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp_root.join("resources/views/users/show.blade.php"),
+        "<h1>User</h1>\n",
+    )
+    .unwrap();
+
+    let code_with_markers = r#"<?php
+function run(): void {
+    config('app./*config*/');
+    view('users.show/*viewdef*/');
+}
+"#;
+    let markers = ["/*config*/", "/*viewdef*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for known_marker in markers {
+            prefix = prefix.replace(known_marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (config_line, config_character) = marker_position("/*config*/");
+    let (view_line, view_character) = marker_position("/*viewdef*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+
+    let app_path = tmp_root.join("app/StringKeys.php");
+    fs::write(&app_path, &code).unwrap();
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let app_uri = format!("file://{}", app_path.to_string_lossy());
+    let view_uri = format!(
+        "file://{}",
+        tmp_root
+            .join("resources/views/users/show.blade.php")
+            .to_string_lossy()
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&app_uri, &code))
+        .await
+        .unwrap();
+
+    let completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            2,
+            &app_uri,
+            config_line,
+            config_character,
+        ))
+        .await
+        .unwrap();
+    let completion_result = extract_result(completion_resp);
+    let completion_items = completion_items_from_result(&completion_result);
+    let app_name = completion_items
+        .iter()
+        .find(|item| item.get("label").and_then(|label| label.as_str()) == Some("app.name"))
+        .expect("config key completion should include app.name");
+    assert_eq!(
+        app_name.get("insertText").and_then(|value| value.as_str()),
+        Some("name")
+    );
+
+    let definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(3, &app_uri, view_line, view_character))
+        .await
+        .unwrap();
+    let definition_result = extract_result(definition_resp);
+    assert_eq!(
+        definition_result.get("uri").and_then(|uri| uri.as_str()),
+        Some(view_uri.as_str()),
+        "view key definition should jump to the template file"
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_static_class_labels_inside_chained_call() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

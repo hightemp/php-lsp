@@ -2530,6 +2530,63 @@ impl PhpLspBackend {
         })
     }
 
+    fn framework_string_key_items(
+        &self,
+        workspace_root: Option<&Path>,
+        namespace_map: Option<&NamespaceMap>,
+        uri_str: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        source: &str,
+        context: &FrameworkStringKeyAtPosition,
+    ) -> Vec<lsp_types::CompletionItem> {
+        let Some(workspace_root) = workspace_root else {
+            return Vec::new();
+        };
+        let framework_ctx = crate::framework::FrameworkProviderContext::new(&self.index)
+            .with_workspace(Some(workspace_root), namespace_map)
+            .with_source_uri(Some(uri_str))
+            .with_file(Some(file_symbols), Some(source))
+            .with_relevant_files(&[]);
+        let registry = crate::framework::default_framework_provider_registry();
+        let query = crate::framework::FrameworkStringKeyQuery {
+            domain: context.domain.to_string(),
+            prefix: context.prefix.clone(),
+        };
+
+        registry
+            .string_keys(&framework_ctx, &query)
+            .into_iter()
+            .map(|key| framework_string_key_completion_item(&key, &context.prefix))
+            .collect()
+    }
+
+    async fn framework_string_key_location(
+        &self,
+        uri_str: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        source: &str,
+        context: &FrameworkStringKeyAtPosition,
+    ) -> Option<Location> {
+        let workspace_root = self.workspace_root_for_uri(uri_str).await?;
+        let namespace_map = self.namespace_map.lock().await.clone();
+        let framework_ctx = crate::framework::FrameworkProviderContext::new(&self.index)
+            .with_workspace(Some(workspace_root.as_path()), namespace_map.as_ref())
+            .with_source_uri(Some(uri_str))
+            .with_file(Some(file_symbols), Some(source))
+            .with_relevant_files(&[]);
+        let registry = crate::framework::default_framework_provider_registry();
+        let query = crate::framework::FrameworkStringKeyQuery {
+            domain: context.domain.to_string(),
+            prefix: context.key.clone(),
+        };
+
+        registry
+            .string_keys(&framework_ctx, &query)
+            .into_iter()
+            .find(|key| key.key == context.key)
+            .and_then(|key| framework_string_key_source_location(&key))
+    }
+
     fn type_definition_fqn_for_symbol(
         &self,
         symbol: &php_lsp_types::SymbolInfo,
@@ -15625,6 +15682,13 @@ struct PhpDocVirtualMember {
     is_static: bool,
 }
 
+#[derive(Debug, Clone)]
+struct FrameworkStringKeyAtPosition {
+    domain: &'static str,
+    prefix: String,
+    key: String,
+}
+
 fn phpdoc_virtual_member_for_symbol(
     index: &WorkspaceIndex,
     sym: &SymbolAtPosition,
@@ -15958,6 +16022,179 @@ fn framework_virtual_completion_item(
         }),
         ..Default::default()
     }
+}
+
+fn framework_string_key_completion_item(
+    key: &crate::framework::FrameworkStringKey,
+    prefix: &str,
+) -> lsp_types::CompletionItem {
+    let insert_text = key
+        .key
+        .strip_prefix(prefix)
+        .unwrap_or(key.key.as_str())
+        .to_string();
+    lsp_types::CompletionItem {
+        label: key.key.clone(),
+        kind: Some(lsp_types::CompletionItemKind::VALUE),
+        detail: key.detail.clone(),
+        insert_text: Some(insert_text),
+        sort_text: Some(format!("1_{}", key.key.to_ascii_lowercase())),
+        filter_text: Some(key.key.clone()),
+        data: Some(serde_json::json!({
+            "kind": "framework-string-key",
+            "domain": key.provider_ids.first().copied().unwrap_or("framework"),
+            "key": key.key.as_str(),
+        })),
+        ..Default::default()
+    }
+}
+
+fn framework_string_key_source_location(
+    key: &crate::framework::FrameworkStringKey,
+) -> Option<Location> {
+    let (uri, range) = key.sources.iter().find_map(|source| match source {
+        crate::framework::VirtualMemberSource::SourceRange { uri, range } => {
+            Some((uri.clone(), *range))
+        }
+        crate::framework::VirtualMemberSource::Synthetic { .. } => None,
+    })?;
+    Some(Location {
+        uri: uri.parse::<Uri>().ok()?,
+        range: Range {
+            start: Position::new(range.0, range.1),
+            end: Position::new(range.2, range.3),
+        },
+    })
+}
+
+fn framework_string_key_context_at_position(
+    source: &str,
+    line: u32,
+    byte_col: u32,
+) -> Option<FrameworkStringKeyAtPosition> {
+    let offset = byte_offset_for_line_col(source, line, byte_col)?;
+    let bounds = string_literal_bounds_at_offset(source, offset)?;
+    let domain = framework_string_key_domain_before_string(source, bounds.quote_start)?;
+    let prefix = source.get(bounds.content_start..offset)?.to_string();
+    let key = source
+        .get(bounds.content_start..bounds.content_end)
+        .unwrap_or(prefix.as_str())
+        .to_string();
+    Some(FrameworkStringKeyAtPosition {
+        domain,
+        prefix,
+        key,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StringLiteralBounds {
+    quote_start: usize,
+    content_start: usize,
+    content_end: usize,
+}
+
+fn string_literal_bounds_at_offset(source: &str, offset: usize) -> Option<StringLiteralBounds> {
+    let mut quote: Option<(char, usize)> = None;
+    let mut escaped = false;
+    for (idx, ch) in source.char_indices() {
+        if idx >= offset {
+            break;
+        }
+        if let Some((active_quote, _)) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some((ch, idx));
+        }
+    }
+
+    let (quote_char, quote_start) = quote?;
+    let content_start = quote_start + quote_char.len_utf8();
+    if offset < content_start {
+        return None;
+    }
+    let content_end = find_unescaped_quote(source, offset, quote_char)
+        .unwrap_or_else(|| line_end_offset(source, offset));
+    Some(StringLiteralBounds {
+        quote_start,
+        content_start,
+        content_end,
+    })
+}
+
+fn find_unescaped_quote(source: &str, start: usize, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (relative, ch) in source.get(start..)?.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return Some(start + relative);
+        } else if ch == '\n' {
+            return None;
+        }
+    }
+    None
+}
+
+fn framework_string_key_domain_before_string(
+    source: &str,
+    quote_start: usize,
+) -> Option<&'static str> {
+    let open_paren = previous_non_ws_char(source, quote_start)?;
+    if source.as_bytes().get(open_paren).copied()? != b'(' {
+        return None;
+    }
+
+    let name_end = previous_non_ws_char(source, open_paren)?;
+    let name_start = scan_identifier_start(source, name_end + 1);
+    let raw_name = source.get(name_start..=name_end)?.trim_start_matches('\\');
+    let before_name = source.get(..name_start)?.trim_end();
+
+    match raw_name {
+        "config" => Some("config"),
+        "route" => Some("route"),
+        "view" => Some("view"),
+        "__" | "trans" | "trans_choice" => Some("translation"),
+        "name" if before_name.ends_with("->") => Some("route"),
+        "get" if before_name.ends_with("Lang::") => Some("translation"),
+        "make" if before_name.ends_with("View::") => Some("view"),
+        _ => None,
+    }
+}
+
+fn previous_non_ws_char(source: &str, before: usize) -> Option<usize> {
+    source
+        .get(..before)?
+        .char_indices()
+        .rev()
+        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))
+}
+
+fn scan_identifier_start(source: &str, end_exclusive: usize) -> usize {
+    let mut start = end_exclusive;
+    for (idx, ch) in source
+        .get(..end_exclusive)
+        .unwrap_or("")
+        .char_indices()
+        .rev()
+    {
+        if ch.is_alphanumeric() || ch == '_' || ch == '\\' {
+            start = idx;
+        } else {
+            break;
+        }
+    }
+    start
 }
 
 fn phpdoc_extra_markdown_sections(phpdoc: &php_lsp_types::PhpDoc) -> Vec<String> {
@@ -20166,7 +20403,15 @@ impl LanguageServer for PhpLspBackend {
         tracing::debug!("gotoDefinition: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position inside a block so DashMap guard is dropped
-        let (sym_at_pos, local_var_def, this_class_def, shape_def, file_symbols, source) = {
+        let (
+            sym_at_pos,
+            local_var_def,
+            this_class_def,
+            shape_def,
+            framework_string_key_context,
+            file_symbols,
+            source,
+        ) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -20199,6 +20444,8 @@ impl LanguageServer for PhpLspBackend {
                 .map(|d| range_byte_to_utf16(&source, d));
             let shape_def = shape_definition_at_position(&source, pos.line, byte_col)
                 .map(|d| range_byte_to_utf16(&source, d));
+            let framework_string_key_context =
+                framework_string_key_context_at_position(&source, pos.line, byte_col);
             let sym = symbol_at_position_with_resolvers(
                 tree,
                 &source,
@@ -20224,6 +20471,7 @@ impl LanguageServer for PhpLspBackend {
                 local_var_def,
                 this_class_def,
                 shape_def,
+                framework_string_key_context,
                 file_symbols,
                 source,
             )
@@ -20261,6 +20509,20 @@ impl LanguageServer for PhpLspBackend {
                 uri,
                 range,
             })));
+        }
+
+        if let Some(ref framework_string_key_context) = framework_string_key_context {
+            if let Some(location) = self
+                .framework_string_key_location(
+                    &uri_str,
+                    &file_symbols,
+                    &source,
+                    framework_string_key_context,
+                )
+                .await
+            {
+                return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+            }
         }
 
         let sym_at_pos = match sym_at_pos {
@@ -22726,6 +22988,17 @@ impl LanguageServer for PhpLspBackend {
         };
         let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
         let file_symbols = extract_file_symbols(&tree, &source, &uri_str);
+        let framework_string_key_context =
+            framework_string_key_context_at_position(&source, pos.line, byte_col);
+        let (framework_workspace_root, framework_namespace_map) =
+            if framework_string_key_context.is_some() {
+                (
+                    self.workspace_root_for_uri(&uri_str).await,
+                    self.namespace_map.lock().await.clone(),
+                )
+            } else {
+                (None, None)
+            };
         let type_cache = RequestTypeCache::new(&uri_str, self.current_document_version(&uri_str));
 
         // Detect completion context
@@ -22754,7 +23027,9 @@ impl LanguageServer for PhpLspBackend {
             other => other,
         };
 
-        if context == php_lsp_completion::context::CompletionContext::None {
+        if context == php_lsp_completion::context::CompletionContext::None
+            && framework_string_key_context.is_none()
+        {
             return Ok(None);
         }
 
@@ -22785,13 +23060,27 @@ impl LanguageServer for PhpLspBackend {
         };
 
         // Get completion items from the provider
-        let mut lsp_items = match &context {
-            php_lsp_completion::context::CompletionContext::ArrayKey {
-                array_expr,
-                key_prefix,
-            } => self.shape_key_completion_items(&inference_ctx, array_expr, key_prefix),
-            _ => provide_completions(&context, &self.index, &file_symbols),
+        let mut lsp_items = if framework_string_key_context.is_some() {
+            Vec::new()
+        } else {
+            match &context {
+                php_lsp_completion::context::CompletionContext::ArrayKey {
+                    array_expr,
+                    key_prefix,
+                } => self.shape_key_completion_items(&inference_ctx, array_expr, key_prefix),
+                _ => provide_completions(&context, &self.index, &file_symbols),
+            }
         };
+        if let Some(ref framework_string_key_context) = framework_string_key_context {
+            lsp_items.extend(self.framework_string_key_items(
+                framework_workspace_root.as_deref(),
+                framework_namespace_map.as_ref(),
+                &uri_str,
+                &file_symbols,
+                &source,
+                framework_string_key_context,
+            ));
+        }
         if let php_lsp_completion::context::CompletionContext::Variable { prefix } = &context {
             add_local_variable_completion_items(
                 &mut lsp_items,
@@ -23251,6 +23540,38 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn test_framework_string_key_context_detection() {
+        let source = "<?php\nconfig('app.na');\nroute('dashboard.home');\n__('messages.welcome');\nview('users.show');\nRoute::get('/')->name('admin.index');\n";
+
+        let config = framework_string_key_context_at_position(source, 1, 14)
+            .expect("config string key context");
+        assert_eq!(config.domain, "config");
+        assert_eq!(config.prefix, "app.na");
+        assert_eq!(config.key, "app.na");
+
+        let route = framework_string_key_context_at_position(source, 2, 11)
+            .expect("route string key context");
+        assert_eq!(route.domain, "route");
+        assert_eq!(route.prefix, "dash");
+        assert_eq!(route.key, "dashboard.home");
+
+        let translation = framework_string_key_context_at_position(source, 3, 13)
+            .expect("translation string key context");
+        assert_eq!(translation.domain, "translation");
+        assert_eq!(translation.prefix, "messages.");
+
+        let view = framework_string_key_context_at_position(source, 4, 12)
+            .expect("view string key context");
+        assert_eq!(view.domain, "view");
+        assert_eq!(view.key, "users.show");
+
+        let route_name = framework_string_key_context_at_position(source, 5, 29)
+            .expect("route declaration name context");
+        assert_eq!(route_name.domain, "route");
+        assert_eq!(route_name.key, "admin.index");
     }
 
     #[test]
