@@ -21,9 +21,9 @@ use php_lsp_parser::references::{
 use php_lsp_parser::resolve::{
     infer_property_type_from_assignments, infer_variable_hover_info_at_node,
     infer_variable_type_at_position, infer_variable_type_at_position_with_resolver,
-    local_variable_names_at_position, resolve_class_name_pub, symbol_at_position,
-    symbol_at_position_with_resolver, variable_definition_at_position,
-    variable_hover_info_at_position, RefKind, SymbolAtPosition,
+    infer_variable_type_info_at_position_with_resolver, local_variable_names_at_position,
+    resolve_class_name_pub, symbol_at_position, symbol_at_position_with_resolver,
+    variable_definition_at_position, variable_hover_info_at_position, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
     find_missing_return_type_candidates, MissingReturnTypeCandidate,
@@ -58,6 +58,14 @@ const HEAVY_REQUEST_YIELD_INTERVAL: usize = 32;
 const FILE_IO_SLOW_WARNING_MS: u64 = 100;
 const FILE_IO_TIMEOUT_MS: u64 = 15_000;
 const DIAGNOSTIC_PHASE_SLOW_WARNING_MS: u64 = 500;
+
+struct CompletionInferenceContext<'a> {
+    tree: &'a tree_sitter::Tree,
+    source: &'a str,
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    line: u32,
+    byte_col: u32,
+}
 const MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT: usize = 64;
 const DIAGNOSTIC_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
@@ -1769,6 +1777,61 @@ impl PhpLspBackend {
         Some(class_fqn)
     }
 
+    fn infer_completion_type_info(
+        &self,
+        ctx: &CompletionInferenceContext<'_>,
+        expr: &str,
+    ) -> Option<php_lsp_types::TypeInfo> {
+        let resolve_member_type = |class_fqn: &str, member_name: &str| {
+            self.resolve_completion_member_type(class_fqn, member_name, ctx.file_symbols)
+        };
+        infer_variable_type_info_at_position_with_resolver(
+            ctx.tree,
+            ctx.source,
+            ctx.file_symbols,
+            ctx.line,
+            ctx.byte_col,
+            expr,
+            &resolve_member_type,
+        )
+    }
+
+    fn shape_key_completion_items(
+        &self,
+        ctx: &CompletionInferenceContext<'_>,
+        array_expr: &str,
+        key_prefix: &str,
+    ) -> Vec<lsp_types::CompletionItem> {
+        let Some(type_info) = self.infer_completion_type_info(ctx, array_expr) else {
+            return Vec::new();
+        };
+
+        shape_completion_items_from_type_info(&type_info, ShapeCompletionKind::ArrayKey, key_prefix)
+    }
+
+    fn add_object_shape_completion_items(
+        &self,
+        items: &mut Vec<lsp_types::CompletionItem>,
+        ctx: &CompletionInferenceContext<'_>,
+        object_expr: &str,
+        member_prefix: &str,
+    ) {
+        let Some(type_info) = self.infer_completion_type_info(ctx, object_expr) else {
+            return;
+        };
+
+        let mut seen: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
+        for item in shape_completion_items_from_type_info(
+            &type_info,
+            ShapeCompletionKind::ObjectProperty,
+            member_prefix,
+        ) {
+            if seen.insert(item.label.clone()) {
+                items.push(item);
+            }
+        }
+    }
+
     /// Resolve a FQN, falling back to lazy vendor indexing if not found.
     async fn resolve_fqn_lazy(
         &self,
@@ -3110,7 +3173,8 @@ fn first_type_definition_fqn(
             if_type, else_type, ..
         } => first_type_definition_fqn(if_type, file_symbols, current_class_fqn)
             .or_else(|| first_type_definition_fqn(else_type, file_symbols, current_class_fqn)),
-        php_lsp_types::TypeInfo::ArrayShape(items) => items.iter().find_map(|item| {
+        php_lsp_types::TypeInfo::ArrayShape(items)
+        | php_lsp_types::TypeInfo::ObjectShape(items) => items.iter().find_map(|item| {
             first_type_definition_fqn(&item.value, file_symbols, current_class_fqn)
         }),
         php_lsp_types::TypeInfo::Callable {
@@ -3601,6 +3665,7 @@ fn return_type_hint_is_supported(
         }
         php_lsp_types::TypeInfo::Generic { .. }
         | php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::ObjectShape(_)
         | php_lsp_types::TypeInfo::Callable { .. }
         | php_lsp_types::TypeInfo::ClassString(_)
         | php_lsp_types::TypeInfo::Conditional { .. }
@@ -4963,6 +5028,7 @@ fn generated_member_native_type_hint_text(
             }
         }
         TypeInfo::ArrayShape(_) => Some("array".to_string()),
+        TypeInfo::ObjectShape(_) => Some("object".to_string()),
         TypeInfo::Callable { .. } => Some("callable".to_string()),
         TypeInfo::ClassString(_) => Some("string".to_string()),
         TypeInfo::LiteralString(_) => Some("string".to_string()),
@@ -7492,6 +7558,9 @@ fn type_info_refines_native(
                     ))
         }
         (TypeInfo::ArrayShape(_), TypeInfo::Simple(native)) => native.eq_ignore_ascii_case("array"),
+        (TypeInfo::ObjectShape(_), TypeInfo::Simple(native)) => {
+            native.eq_ignore_ascii_case("object")
+        }
         (TypeInfo::Callable { .. }, TypeInfo::Simple(native)) => {
             native.eq_ignore_ascii_case("callable")
         }
@@ -10484,6 +10553,16 @@ fn substitute_call_site_type_info(
                 })
                 .collect(),
         ),
+        php_lsp_types::TypeInfo::ObjectShape(items) => php_lsp_types::TypeInfo::ObjectShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: substitute_call_site_type_info(&item.value, substitutions),
+                })
+                .collect(),
+        ),
         php_lsp_types::TypeInfo::Callable {
             params,
             return_type,
@@ -10733,6 +10812,7 @@ fn resolve_call_site_type_names(
             resolve_call_site_type_names(inner, file_symbols),
         )),
         php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::ObjectShape(_)
         | php_lsp_types::TypeInfo::Callable { .. }
         | php_lsp_types::TypeInfo::ClassString(None)
         | php_lsp_types::TypeInfo::LiteralString(_)
@@ -11133,6 +11213,7 @@ fn local_variable_type_info_display(
         }
         php_lsp_types::TypeInfo::Parent_ => "parent".to_string(),
         php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::ObjectShape(_)
         | php_lsp_types::TypeInfo::Callable { .. }
         | php_lsp_types::TypeInfo::ClassString(_)
         | php_lsp_types::TypeInfo::LiteralString(_)
@@ -14255,6 +14336,7 @@ fn type_info_accepts_inferred_type(
             simple_type_accepts_inferred_type(base, actual, file_symbols, index)
         }
         php_lsp_types::TypeInfo::ArrayShape(_) => actual.comparable == "array",
+        php_lsp_types::TypeInfo::ObjectShape(_) => actual.comparable == "object",
         php_lsp_types::TypeInfo::Callable { .. } => actual.comparable == "callable",
         php_lsp_types::TypeInfo::ClassString(_) => actual.comparable == "string",
         php_lsp_types::TypeInfo::LiteralString(value)
@@ -14582,6 +14664,7 @@ fn normalized_type_info_for_override(
             normalized_type_info_for_override(else_type, file_symbols, owner_fqn)
         ),
         php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::ObjectShape(_)
         | php_lsp_types::TypeInfo::Callable { .. }
         | php_lsp_types::TypeInfo::ClassString(_)
         | php_lsp_types::TypeInfo::LiteralString(_)
@@ -15162,6 +15245,811 @@ fn byte_offset_to_line_col(source: &str, byte_offset: usize) -> (u32, u32) {
     }
 
     (line, byte_offset.saturating_sub(line_start) as u32)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeCompletionKind {
+    ArrayKey,
+    ObjectProperty,
+}
+
+fn shape_completion_items_from_type_info(
+    type_info: &php_lsp_types::TypeInfo,
+    kind: ShapeCompletionKind,
+    prefix: &str,
+) -> Vec<lsp_types::CompletionItem> {
+    let mut shape_items = Vec::new();
+    let mut seen = HashSet::new();
+    collect_shape_completion_items(type_info, kind, &mut seen, &mut shape_items);
+
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut completion_items = shape_items
+        .into_iter()
+        .filter(|item| {
+            item.key
+                .as_deref()
+                .is_some_and(|key| key.to_ascii_lowercase().starts_with(&prefix_lower))
+        })
+        .filter_map(|item| {
+            let key = item.key?;
+            let detail = match kind {
+                ShapeCompletionKind::ArrayKey => {
+                    if item.optional {
+                        format!("optional array shape key: {}", item.value)
+                    } else {
+                        format!("array shape key: {}", item.value)
+                    }
+                }
+                ShapeCompletionKind::ObjectProperty => {
+                    if item.optional {
+                        format!("optional object shape property: {}", item.value)
+                    } else {
+                        format!("object shape property: {}", item.value)
+                    }
+                }
+            };
+            Some(lsp_types::CompletionItem {
+                label: key.clone(),
+                kind: Some(match kind {
+                    ShapeCompletionKind::ArrayKey => lsp_types::CompletionItemKind::FIELD,
+                    ShapeCompletionKind::ObjectProperty => lsp_types::CompletionItemKind::PROPERTY,
+                }),
+                detail: Some(detail),
+                sort_text: Some(format!(
+                    "01_{}_{}",
+                    completion_prefix_rank_for_text(&key, prefix),
+                    key.to_ascii_lowercase()
+                )),
+                filter_text: Some(key.clone()),
+                insert_text: Some(key),
+                commit_characters: Some(match kind {
+                    ShapeCompletionKind::ArrayKey => vec!["'".to_string(), "\"".to_string()],
+                    ShapeCompletionKind::ObjectProperty => {
+                        vec!["(".to_string(), ";".to_string(), ",".to_string()]
+                    }
+                }),
+                ..Default::default()
+            })
+        })
+        .collect::<Vec<_>>();
+    completion_items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text).then(a.label.cmp(&b.label)));
+    completion_items
+}
+
+fn collect_shape_completion_items(
+    type_info: &php_lsp_types::TypeInfo,
+    kind: ShapeCompletionKind,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<php_lsp_types::ArrayShapeItem>,
+) {
+    match type_info {
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            collect_shape_completion_items(inner, kind, seen, out);
+        }
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            for ty in types {
+                collect_shape_completion_items(ty, kind, seen, out);
+            }
+        }
+        php_lsp_types::TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => {
+            collect_shape_completion_items(if_type, kind, seen, out);
+            collect_shape_completion_items(else_type, kind, seen, out);
+        }
+        php_lsp_types::TypeInfo::ArrayShape(items) if kind == ShapeCompletionKind::ArrayKey => {
+            collect_named_shape_items(items, seen, out);
+        }
+        php_lsp_types::TypeInfo::ObjectShape(items)
+            if kind == ShapeCompletionKind::ObjectProperty =>
+        {
+            collect_named_shape_items(items, seen, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_named_shape_items(
+    items: &[php_lsp_types::ArrayShapeItem],
+    seen: &mut HashSet<String>,
+    out: &mut Vec<php_lsp_types::ArrayShapeItem>,
+) {
+    for item in items {
+        let Some(key) = item.key.as_ref() else {
+            continue;
+        };
+        if seen.insert(normalize_shape_key_text(key)) {
+            out.push(item.clone());
+        }
+    }
+}
+
+fn completion_prefix_rank_for_text(label: &str, prefix: &str) -> u8 {
+    if prefix.is_empty() {
+        return 0;
+    }
+    let label = label.to_ascii_lowercase();
+    let prefix = prefix.to_ascii_lowercase();
+    if label == prefix {
+        0
+    } else if label.starts_with(&prefix) {
+        1
+    } else {
+        2
+    }
+}
+
+fn normalize_shape_key_text(key: &str) -> String {
+    key.trim()
+        .trim_end_matches('?')
+        .trim_matches(|ch| ch == '\'' || ch == '"')
+        .to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeDefinitionKind {
+    Array,
+    Object,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShapePathSegment {
+    key: String,
+    kind: ShapeDefinitionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShapeDefinitionAccess {
+    root_var: String,
+    segments: Vec<ShapePathSegment>,
+}
+
+fn shape_definition_at_position(
+    source: &str,
+    line: u32,
+    byte_col: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let usage_byte = line_col_to_byte_offset(source, line, byte_col)?;
+    let access = array_shape_key_access_at_position(source, line, byte_col)
+        .or_else(|| object_shape_property_access_at_position(source, line, byte_col))?;
+    phpdoc_shape_key_range_before_usage(source, &access, usage_byte)
+        .or_else(|| literal_array_shape_key_range_before_usage(source, &access, usage_byte))
+        .map(|(start, end)| byte_offsets_to_range(source, start, end))
+}
+
+fn line_col_to_byte_offset(source: &str, line: u32, byte_col: u32) -> Option<usize> {
+    let mut offset = 0usize;
+    for (idx, row) in source.split_inclusive('\n').enumerate() {
+        let row_without_newline = row.trim_end_matches('\n');
+        if idx == line as usize {
+            return Some(offset + (byte_col as usize).min(row_without_newline.len()));
+        }
+        offset += row.len();
+    }
+    (line as usize == source.lines().count()).then_some(source.len())
+}
+
+fn line_bounds_at(source: &str, line: u32) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for (idx, row) in source.split_inclusive('\n').enumerate() {
+        let end = offset + row.trim_end_matches('\n').len();
+        if idx == line as usize {
+            return Some((offset, end));
+        }
+        offset += row.len();
+    }
+    None
+}
+
+fn array_shape_key_access_at_position(
+    source: &str,
+    line: u32,
+    byte_col: u32,
+) -> Option<ShapeDefinitionAccess> {
+    let (line_start, line_end) = line_bounds_at(source, line)?;
+    let offset = line_start + byte_col as usize;
+    if offset > line_end {
+        return None;
+    }
+    let line_text = &source[line_start..line_end];
+    let rel = offset.saturating_sub(line_start);
+    let quote_start = line_text[..rel].rfind(['\'', '"'])?;
+    let quote = line_text.as_bytes().get(quote_start).copied()? as char;
+    let before_quote = &line_text[..quote_start];
+    let bracket = before_quote.rfind('[')?;
+    if !before_quote[bracket + 1..].trim().is_empty() {
+        return None;
+    }
+
+    let key_start = quote_start + quote.len_utf8();
+    let key_end = line_text[key_start..]
+        .find(quote)
+        .map(|idx| key_start + idx)
+        .unwrap_or(rel);
+    if rel < key_start || rel > key_end {
+        return None;
+    }
+    let key = normalize_shape_key_text(&line_text[key_start..key_end]);
+    if key.is_empty() {
+        return None;
+    }
+
+    let array_expr = extract_shape_base_expr(&line_text[..bracket])?;
+    let (root_var, mut segments) = shape_array_expr_segments(&array_expr)
+        .unwrap_or_else(|| (normalize_shape_root_var(&array_expr), Vec::new()));
+    if !root_var.starts_with('$') {
+        return None;
+    }
+    segments.push(ShapePathSegment {
+        key,
+        kind: ShapeDefinitionKind::Array,
+    });
+    Some(ShapeDefinitionAccess { root_var, segments })
+}
+
+fn object_shape_property_access_at_position(
+    source: &str,
+    line: u32,
+    byte_col: u32,
+) -> Option<ShapeDefinitionAccess> {
+    let (line_start, line_end) = line_bounds_at(source, line)?;
+    let offset = line_start + byte_col as usize;
+    if offset > line_end {
+        return None;
+    }
+    let line_text = &source[line_start..line_end];
+    let rel = offset.saturating_sub(line_start);
+    let (name_start, name_end) = identifier_bounds_at(line_text, rel)?;
+    let name = &line_text[name_start..name_end];
+    if name.is_empty() {
+        return None;
+    }
+
+    let before_name = line_text[..name_start].trim_end();
+    let (object_text, arrow_len) = if let Some(object_text) = before_name.strip_suffix("?->") {
+        (object_text, 3)
+    } else if let Some(object_text) = before_name.strip_suffix("->") {
+        (object_text, 2)
+    } else {
+        return None;
+    };
+    if arrow_len == 0 {
+        return None;
+    }
+
+    let object_expr = extract_shape_base_expr(object_text)?;
+    let (root_var, mut segments) = shape_array_expr_segments(&object_expr)
+        .unwrap_or_else(|| (normalize_shape_root_var(&object_expr), Vec::new()));
+    if !root_var.starts_with('$') {
+        return None;
+    }
+    segments.push(ShapePathSegment {
+        key: name.to_string(),
+        kind: ShapeDefinitionKind::Object,
+    });
+    Some(ShapeDefinitionAccess { root_var, segments })
+}
+
+fn identifier_bounds_at(text: &str, offset: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    if offset > bytes.len() {
+        return None;
+    }
+    let mut start = offset.min(bytes.len());
+    while start > 0 {
+        let ch = bytes[start - 1] as char;
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = offset.min(bytes.len());
+    while end < bytes.len() {
+        let ch = bytes[end] as char;
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    (start < end).then_some((start, end))
+}
+
+fn extract_shape_base_expr(text: &str) -> Option<String> {
+    let trimmed = text.trim_end();
+    let mut start = trimmed.len();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (idx, ch) in trimmed.char_indices().rev() {
+        match ch {
+            ')' => {
+                paren_depth += 1;
+                start = idx;
+                continue;
+            }
+            '(' if paren_depth > 0 => {
+                paren_depth -= 1;
+                start = idx;
+                continue;
+            }
+            ']' => {
+                bracket_depth += 1;
+                start = idx;
+                continue;
+            }
+            '[' if bracket_depth > 0 => {
+                bracket_depth -= 1;
+                start = idx;
+                continue;
+            }
+            _ if paren_depth > 0 || bracket_depth > 0 => {
+                start = idx;
+                continue;
+            }
+            _ => {}
+        }
+
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '\\' | '-' | '>' | '?') {
+            start = idx;
+        } else {
+            break;
+        }
+    }
+
+    let expr = trimmed[start..].trim();
+    (!expr.is_empty()).then(|| expr.to_string())
+}
+
+fn shape_array_expr_segments(expr: &str) -> Option<(String, Vec<ShapePathSegment>)> {
+    let expr = expr.trim();
+    let bracket = expr.find('[')?;
+    let root_var = normalize_shape_root_var(expr[..bracket].trim());
+    if !root_var.starts_with('$') {
+        return None;
+    }
+
+    let mut segments = Vec::new();
+    let mut idx = bracket;
+    while idx < expr.len() {
+        while idx < expr.len() && expr.as_bytes()[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx >= expr.len() || expr.as_bytes()[idx] != b'[' {
+            break;
+        }
+        let close = find_matching_pair(expr, idx, '[', ']').unwrap_or(expr.len());
+        let key_text = expr[idx + 1..close].trim();
+        let key = normalize_shape_key_text(key_text);
+        if !key.is_empty() {
+            segments.push(ShapePathSegment {
+                key,
+                kind: ShapeDefinitionKind::Array,
+            });
+        }
+        if close >= expr.len() {
+            break;
+        }
+        idx = close + 1;
+    }
+
+    Some((root_var, segments))
+}
+
+fn normalize_shape_root_var(expr: &str) -> String {
+    let expr = expr.trim();
+    if expr.starts_with('$') {
+        expr.to_string()
+    } else {
+        format!("${expr}")
+    }
+}
+
+fn phpdoc_shape_key_range_before_usage(
+    source: &str,
+    access: &ShapeDefinitionAccess,
+    usage_byte: usize,
+) -> Option<(usize, usize)> {
+    let mut search_end = usage_byte.min(source.len());
+    while let Some(open) = source[..search_end].rfind("/**") {
+        let Some(close_rel) = source[open..].find("*/") else {
+            break;
+        };
+        let close = open + close_rel + 2;
+        if close > usage_byte {
+            search_end = open;
+            continue;
+        }
+        let comment = &source[open..close];
+        if comment.contains("@var") && comment.contains(&access.root_var) {
+            if let Some(range) = find_shape_path_range_in_text(comment, open, &access.segments) {
+                return Some(range);
+            }
+        }
+        search_end = open;
+    }
+
+    None
+}
+
+fn literal_array_shape_key_range_before_usage(
+    source: &str,
+    access: &ShapeDefinitionAccess,
+    usage_byte: usize,
+) -> Option<(usize, usize)> {
+    if access
+        .segments
+        .iter()
+        .any(|segment| segment.kind != ShapeDefinitionKind::Array)
+    {
+        return None;
+    }
+
+    let mut search_end = usage_byte.min(source.len());
+    while let Some(var_pos) = source[..search_end].rfind(&access.root_var) {
+        if let Some(array_start) = assignment_array_literal_start(source, var_pos, &access.root_var)
+        {
+            if let Some(range) =
+                find_literal_array_path_range(source, array_start, &access.segments)
+            {
+                return Some(range);
+            }
+        }
+        search_end = var_pos;
+    }
+
+    None
+}
+
+fn assignment_array_literal_start(source: &str, var_pos: usize, var_name: &str) -> Option<usize> {
+    let mut idx = var_pos + var_name.len();
+    idx = skip_ascii_whitespace(source, idx);
+    if source.as_bytes().get(idx).copied()? != b'='
+        || source.as_bytes().get(idx + 1).copied() == Some(b'=')
+    {
+        return None;
+    }
+    idx = skip_ascii_whitespace(source, idx + 1);
+    if source[idx..].starts_with('[') || source[idx..].starts_with("array(") {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+fn skip_ascii_whitespace(source: &str, mut idx: usize) -> usize {
+    while idx < source.len() && source.as_bytes()[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    idx
+}
+
+fn find_literal_array_path_range(
+    source: &str,
+    array_start: usize,
+    segments: &[ShapePathSegment],
+) -> Option<(usize, usize)> {
+    let (body_start, body_end) = literal_array_body_range(source, array_start)?;
+    find_literal_array_key_range_in_body(source, body_start, body_end, segments)
+}
+
+fn literal_array_body_range(source: &str, array_start: usize) -> Option<(usize, usize)> {
+    if source[array_start..].starts_with('[') {
+        let close = find_matching_pair(source, array_start, '[', ']')?;
+        return Some((array_start + 1, close));
+    }
+    if source[array_start..].starts_with("array(") {
+        let open = array_start + "array".len();
+        let close = find_matching_pair(source, open, '(', ')')?;
+        return Some((open + 1, close));
+    }
+    None
+}
+
+fn find_literal_array_key_range_in_body(
+    source: &str,
+    body_start: usize,
+    body_end: usize,
+    segments: &[ShapePathSegment],
+) -> Option<(usize, usize)> {
+    let segment = segments.first()?;
+    for (item_start, item_end) in split_top_level_ranges(source, body_start, body_end, ',') {
+        let arrow = find_top_level_needle(source, item_start, item_end, "=>")?;
+        let (key, key_start, key_end) = shape_key_from_raw_range(source, item_start, arrow)?;
+        if key != segment.key {
+            continue;
+        }
+        if segments.len() == 1 {
+            return Some((key_start, key_end));
+        }
+        let value_start = skip_ascii_whitespace(source, arrow + 2);
+        if let Some(range) = find_literal_array_path_range(source, value_start, &segments[1..]) {
+            return Some(range);
+        }
+    }
+
+    None
+}
+
+fn find_shape_path_range_in_text(
+    text: &str,
+    text_abs_start: usize,
+    segments: &[ShapePathSegment],
+) -> Option<(usize, usize)> {
+    let segment = segments.first()?;
+    let prefix = match segment.kind {
+        ShapeDefinitionKind::Array => "array{",
+        ShapeDefinitionKind::Object => "object{",
+    };
+    let mut search_start = 0usize;
+    while let Some(prefix_rel) = text[search_start..].find(prefix) {
+        let shape_start = search_start + prefix_rel;
+        let open = shape_start + prefix.len() - 1;
+        let Some(close) = find_matching_pair(text, open, '{', '}') else {
+            search_start = shape_start + prefix.len();
+            continue;
+        };
+        if let Some(range) =
+            find_shape_key_range_in_body(text, text_abs_start, open + 1, close, segments)
+        {
+            return Some(range);
+        }
+        search_start = close + 1;
+    }
+
+    None
+}
+
+fn find_shape_key_range_in_body(
+    text: &str,
+    text_abs_start: usize,
+    body_start: usize,
+    body_end: usize,
+    segments: &[ShapePathSegment],
+) -> Option<(usize, usize)> {
+    let segment = segments.first()?;
+    for (item_start, item_end) in split_top_level_ranges(text, body_start, body_end, ',') {
+        let Some(colon) = find_top_level_char_in_range(text, item_start, item_end, ':') else {
+            continue;
+        };
+        let (key, key_start, key_end) = shape_key_from_raw_range(text, item_start, colon)?;
+        if key != segment.key {
+            continue;
+        }
+        if segments.len() == 1 {
+            return Some((text_abs_start + key_start, text_abs_start + key_end));
+        }
+        if let Some(range) = find_shape_path_range_in_text(
+            &text[colon + 1..item_end],
+            text_abs_start + colon + 1,
+            &segments[1..],
+        ) {
+            return Some(range);
+        }
+    }
+
+    None
+}
+
+fn shape_key_from_raw_range(
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Option<(String, usize, usize)> {
+    let mut key_start = start;
+    let mut key_end = end;
+    while key_start < key_end && text.as_bytes()[key_start].is_ascii_whitespace() {
+        key_start += 1;
+    }
+    while key_end > key_start && text.as_bytes()[key_end - 1].is_ascii_whitespace() {
+        key_end -= 1;
+    }
+    if key_end > key_start && text.as_bytes()[key_end - 1] == b'?' {
+        key_end -= 1;
+        while key_end > key_start && text.as_bytes()[key_end - 1].is_ascii_whitespace() {
+            key_end -= 1;
+        }
+    }
+    if key_end > key_start + 1 {
+        let first = text.as_bytes()[key_start];
+        let last = text.as_bytes()[key_end - 1];
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            key_start += 1;
+            key_end -= 1;
+        }
+    }
+    let key = normalize_shape_key_text(&text[key_start..key_end]);
+    (!key.is_empty()).then_some((key, key_start, key_end))
+}
+
+fn split_top_level_ranges(
+    text: &str,
+    start: usize,
+    end: usize,
+    delimiter: char,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut item_start = start;
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (rel, ch) in text[start..end].char_indices() {
+        let idx = start + rel;
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+
+        if ch == delimiter
+            && paren_depth == 0
+            && angle_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+        {
+            ranges.push((item_start, idx));
+            item_start = idx + ch.len_utf8();
+        }
+    }
+    ranges.push((item_start, end));
+    ranges
+}
+
+fn find_top_level_char_in_range(
+    text: &str,
+    start: usize,
+    end: usize,
+    needle: char,
+) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (rel, ch) in text[start..end].char_indices() {
+        let idx = start + rel;
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == needle
+            && paren_depth == 0
+            && angle_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+        {
+            return Some(idx);
+        }
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_top_level_needle(text: &str, start: usize, end: usize, needle: &str) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (rel, ch) in text[start..end].char_indices() {
+        let idx = start + rel;
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if paren_depth == 0
+            && angle_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+            && text[idx..end].starts_with(needle)
+        {
+            return Some(idx);
+        }
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_matching_pair(text: &str, open: usize, open_ch: char, close_ch: char) -> Option<usize> {
+    if !text[open..].starts_with(open_ch) {
+        return None;
+    }
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for (rel, ch) in text[open..].char_indices() {
+        let idx = open + rel;
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == open_ch {
+            depth += 1;
+        } else if ch == close_ch {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
 }
 
 fn add_local_variable_completion_items(
@@ -18345,7 +19233,7 @@ impl LanguageServer for PhpLspBackend {
         tracing::debug!("gotoDefinition: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position inside a block so DashMap guard is dropped
-        let (sym_at_pos, local_var_def, this_class_def) = {
+        let (sym_at_pos, local_var_def, this_class_def, shape_def) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -18373,6 +19261,8 @@ impl LanguageServer for PhpLspBackend {
 
             let local_var_def = variable_definition_at_position(tree, &source, pos.line, byte_col)
                 .map(|d| range_byte_to_utf16(&source, d));
+            let shape_def = shape_definition_at_position(&source, pos.line, byte_col)
+                .map(|d| range_byte_to_utf16(&source, d));
             let sym = symbol_at_position_with_resolver(
                 tree,
                 &source,
@@ -18392,8 +19282,19 @@ impl LanguageServer for PhpLspBackend {
                     None
                 }
             });
-            (sym, local_var_def, this_class_def)
+            (sym, local_var_def, this_class_def, shape_def)
         };
+
+        if let Some(def) = shape_def {
+            let range = Range {
+                start: Position::new(def.0, def.1),
+                end: Position::new(def.2, def.3),
+            };
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                uri,
+                range,
+            })));
+        }
 
         if let Some((target_uri, def)) = this_class_def {
             let range = Range {
@@ -20879,8 +21780,22 @@ impl LanguageServer for PhpLspBackend {
             self.lazy_index_class_dependencies(&class_fqn).await;
         }
 
+        let inference_ctx = CompletionInferenceContext {
+            tree: &tree,
+            source: &source,
+            file_symbols: &file_symbols,
+            line: pos.line,
+            byte_col,
+        };
+
         // Get completion items from the provider
-        let mut lsp_items = provide_completions(&context, &self.index, &file_symbols);
+        let mut lsp_items = match &context {
+            php_lsp_completion::context::CompletionContext::ArrayKey {
+                array_expr,
+                key_prefix,
+            } => self.shape_key_completion_items(&inference_ctx, array_expr, key_prefix),
+            _ => provide_completions(&context, &self.index, &file_symbols),
+        };
         if let php_lsp_completion::context::CompletionContext::Variable { prefix } = &context {
             add_local_variable_completion_items(
                 &mut lsp_items,
@@ -20889,6 +21804,19 @@ impl LanguageServer for PhpLspBackend {
                 pos.line,
                 byte_col,
                 prefix,
+            );
+        }
+        if let php_lsp_completion::context::CompletionContext::MemberAccess {
+            object_expr,
+            member_prefix,
+            ..
+        } = &context
+        {
+            self.add_object_shape_completion_items(
+                &mut lsp_items,
+                &inference_ctx,
+                object_expr,
+                member_prefix,
             );
         }
 

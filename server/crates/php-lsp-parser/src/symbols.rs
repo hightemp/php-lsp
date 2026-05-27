@@ -4,6 +4,7 @@
 //! traits, enums, functions, methods, properties, constants, namespace and use statements.
 
 use php_lsp_types::*;
+use std::collections::HashSet;
 use tree_sitter::{Node, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -981,20 +982,16 @@ fn resolve_template_type_info_in_file(
                     .collect(),
             }
         }
-        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
-            items
-                .into_iter()
-                .map(|item| ArrayShapeItem {
-                    key: item.key,
-                    optional: item.optional,
-                    value: resolve_template_type_info_in_file(
-                        item.value,
-                        file_symbols,
-                        template_names,
-                    ),
-                })
-                .collect(),
-        ),
+        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(resolve_shape_items_in_file(
+            items,
+            file_symbols,
+            template_names,
+        )),
+        TypeInfo::ObjectShape(items) => TypeInfo::ObjectShape(resolve_shape_items_in_file(
+            items,
+            file_symbols,
+            template_names,
+        )),
         TypeInfo::Callable {
             params,
             return_type,
@@ -1071,6 +1068,21 @@ fn resolve_template_type_info_in_file(
         | TypeInfo::Static_
         | TypeInfo::Parent_ => type_info,
     }
+}
+
+fn resolve_shape_items_in_file(
+    items: Vec<ArrayShapeItem>,
+    file_symbols: &FileSymbols,
+    template_names: &HashSet<String>,
+) -> Vec<ArrayShapeItem> {
+    items
+        .into_iter()
+        .map(|item| ArrayShapeItem {
+            key: item.key,
+            optional: item.optional,
+            value: resolve_template_type_info_in_file(item.value, file_symbols, template_names),
+        })
+        .collect()
 }
 
 fn is_phpdoc_builtin_type(name: &str) -> bool {

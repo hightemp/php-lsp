@@ -36,7 +36,7 @@ tools.
 
 | LSP feature | Status | Notes |
 |---|---|---|
-| `textDocument/definition` | Supported | Handles indexed symbols, local variables, `$this`, constructors, PHPDoc virtual members, and lazy vendor fallback. |
+| `textDocument/definition` | Supported | Handles indexed symbols, local variables, `$this`, constructors, PHPDoc virtual members, PHPDoc/literal shape keys, and lazy vendor fallback. |
 | `textDocument/declaration` | Supported | Goes to import declarations when applicable, otherwise falls back to definition. |
 | `textDocument/typeDefinition` | Supported | Resolves variable/member/function return types where inferred or indexed, including common PHPDoc generic inheritance substitutions and PHPStan/Psalm type alias expansion. |
 | `textDocument/implementation` | Supported | Interface/trait/base type to implementations, and method implementation lookup. |
@@ -88,7 +88,7 @@ tools.
 | Diagnostics: PHPStan | Partial | Optional external command, timeout-bound, JSON output required. |
 | Diagnostics: Psalm | Partial | Optional external command, timeout-bound, JSON output required. |
 | `textDocument/hover` | Supported | Symbols, signatures, types, PHPDoc, variables, deprecation, PHPDoc virtual members, expanded indexed PHPDoc type aliases, and call-site `class-string<T>` / conditional return inference. |
-| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, expanded member signature aliases, and member chains after `class-string<T>` factory calls. |
+| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, expanded member signature aliases, shape keys/properties from PHPDoc and literal arrays, and member chains after `class-string<T>` factory calls. |
 | `completionItem/resolve` | Supported | Enriches PHPDoc virtual member completions. |
 | `textDocument/signatureHelp` | Supported | Functions, methods, constructors, and active parameter tracking. |
 | `textDocument/inlayHint` | Supported | Argument labels, inferred PHPDoc parameter/return hints, and useful inferred local variable type hints for assignments, foreach values, `class-string<T>` factories, and conditional returns. |
@@ -103,7 +103,7 @@ tools.
 - Namespace/class rewrites during file rename.
 - Native formatter implementation.
 - Full PHP static analyzer replacement.
-- Complete generic/template/type-alias/array-shape type system parity with
+- Complete generic/template/type-alias/shape type system parity with
   PHPStan/Psalm.
 - Guaranteed sublinear references/rename/codeLens performance on very large
   workspaces without additional reference-index sharding or aggregation.

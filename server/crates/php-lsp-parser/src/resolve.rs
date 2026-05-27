@@ -194,18 +194,16 @@ pub fn infer_variable_type_at_position(
     character: u32,
     var_name: &str,
 ) -> Option<String> {
-    let root = tree.root_node();
-    let point = Point::new(line as usize, character as usize);
-    let node = find_node_at_point(root, point).unwrap_or(root);
-    let usage_start = position_to_byte(source, line, character);
-    let normalized = normalize_var_name(var_name);
-    let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
-    if let Some(resolved) =
-        infer_textual_array_access_type(scope, &normalized, usage_start, source, file_symbols, None)
-    {
-        return Some(resolved);
-    }
-    infer_variable_type_in_scope(scope, &normalized, usage_start, source, file_symbols, None)
+    infer_variable_type_at_position_internal(
+        tree,
+        source,
+        file_symbols,
+        line,
+        character,
+        var_name,
+        None,
+    )
+    .resolved_type_fqn
 }
 
 /// Infer variable type by name before a given position, using an external member resolver.
@@ -222,30 +220,92 @@ pub fn infer_variable_type_at_position_with_resolver(
     var_name: &str,
     resolver: MemberTypeResolver<'_>,
 ) -> Option<String> {
+    infer_variable_type_at_position_internal(
+        tree,
+        source,
+        file_symbols,
+        line,
+        character,
+        var_name,
+        Some(resolver),
+    )
+    .resolved_type_fqn
+}
+
+/// Infer full PHPDoc/native type information for a variable-like expression
+/// before a given position.
+///
+/// This keeps shape/generic metadata for features that need more than an object
+/// FQN, for example array-shape key completion.
+pub fn infer_variable_type_info_at_position(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    line: u32,
+    character: u32,
+    var_name: &str,
+) -> Option<TypeInfo> {
+    infer_variable_type_at_position_internal(
+        tree,
+        source,
+        file_symbols,
+        line,
+        character,
+        var_name,
+        None,
+    )
+    .type_info
+}
+
+/// Infer full type information by name before a given position, using an
+/// external member resolver.
+pub fn infer_variable_type_info_at_position_with_resolver(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    line: u32,
+    character: u32,
+    var_name: &str,
+    resolver: MemberTypeResolver<'_>,
+) -> Option<TypeInfo> {
+    infer_variable_type_at_position_internal(
+        tree,
+        source,
+        file_symbols,
+        line,
+        character,
+        var_name,
+        Some(resolver),
+    )
+    .type_info
+}
+
+fn infer_variable_type_at_position_internal(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    line: u32,
+    character: u32,
+    var_name: &str,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> VariableInference {
     let root = tree.root_node();
     let point = Point::new(line as usize, character as usize);
     let node = find_node_at_point(root, point).unwrap_or(root);
     let usage_start = position_to_byte(source, line, character);
-    let normalized = normalize_var_name(var_name);
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
-    if let Some(resolved) = infer_textual_array_access_type(
-        scope,
-        &normalized,
-        usage_start,
-        source,
-        file_symbols,
-        Some(resolver),
-    ) {
-        return Some(resolved);
-    }
-    infer_variable_type_in_scope(
-        scope,
-        &normalized,
-        usage_start,
-        source,
-        file_symbols,
-        Some(resolver),
-    )
+    infer_textual_expression_type_info(scope, var_name, usage_start, source, file_symbols, resolver)
+        .unwrap_or_else(|| {
+            let normalized = normalize_var_name(var_name);
+            infer_variable_in_scope(
+                scope,
+                &normalized,
+                usage_start,
+                source,
+                file_symbols,
+                resolver,
+            )
+        })
 }
 
 /// Infer hover-style type information for a variable at an arbitrary usage byte.
@@ -1302,7 +1362,21 @@ fn find_variable_inference_before_usage(
 
         // Assignment inference: $var = <expr>;
         if let Some(right) = assignment_rhs {
-            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols, resolver) {
+            if let Some(type_info) =
+                infer_literal_array_shape_type(right, source, file_symbols, resolver)
+            {
+                inferred = Some((
+                    stmt.start_byte(),
+                    VariableInference {
+                        type_display: Some(type_info.to_string()),
+                        resolved_type_fqn: None,
+                        phpdoc_comment: None,
+                        type_info: Some(type_info),
+                    },
+                ));
+            } else if let Some(resolved) =
+                try_resolve_object_type(right, source, file_symbols, resolver)
+            {
                 let type_info = Some(TypeInfo::Simple(resolved.clone()));
                 inferred = Some((
                     stmt.start_byte(),
@@ -1390,7 +1464,21 @@ fn find_nested_variable_inference_before_usage(
         ) {
             inferred = Some((child.start_byte(), doc_info));
         } else if let Some(right) = assignment_rhs {
-            if let Some(resolved) = try_resolve_object_type(right, source, file_symbols, resolver) {
+            if let Some(type_info) =
+                infer_literal_array_shape_type(right, source, file_symbols, resolver)
+            {
+                inferred = Some((
+                    child.start_byte(),
+                    VariableInference {
+                        type_display: Some(type_info.to_string()),
+                        resolved_type_fqn: None,
+                        phpdoc_comment: None,
+                        type_info: Some(type_info),
+                    },
+                ));
+            } else if let Some(resolved) =
+                try_resolve_object_type(right, source, file_symbols, resolver)
+            {
                 inferred = Some((
                     child.start_byte(),
                     VariableInference {
@@ -1762,6 +1850,7 @@ fn resolve_phpdoc_var_type(
             .or_else(|| resolve_phpdoc_var_type(else_type, context_node, source, file_symbols)),
         TypeInfo::ClassString(_)
         | TypeInfo::ArrayShape(_)
+        | TypeInfo::ObjectShape(_)
         | TypeInfo::Callable { .. }
         | TypeInfo::LiteralString(_)
         | TypeInfo::LiteralInt(_)
@@ -1911,6 +2000,203 @@ fn infer_expression_type_info(
     }
 }
 
+fn infer_literal_array_shape_type(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let text = source[node.byte_range()].trim();
+    infer_literal_array_shape_text(text, node, source, file_symbols, resolver)
+}
+
+fn infer_literal_array_shape_text(
+    text: &str,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let (body, _) = literal_array_body(text)?;
+    let mut items = Vec::new();
+    for part in split_top_level_text(body, ',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let arrow = find_top_level_text(part, "=>")?;
+        let key_text = part[..arrow].trim();
+        let value_text = part[arrow + 2..].trim();
+        let key = normalize_array_access_key(key_text)?;
+        let value =
+            infer_literal_value_type_text(value_text, context_node, source, file_symbols, resolver);
+        items.push(php_lsp_types::ArrayShapeItem {
+            key: Some(key),
+            optional: false,
+            value,
+        });
+    }
+
+    (!items.is_empty()).then_some(TypeInfo::ArrayShape(items))
+}
+
+fn infer_literal_value_type_text(
+    text: &str,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> TypeInfo {
+    let text = text.trim();
+    if let Some(shape) =
+        infer_literal_array_shape_text(text, context_node, source, file_symbols, resolver)
+    {
+        return shape;
+    }
+    if let Some(class_name) = text
+        .strip_prefix("new ")
+        .and_then(|rest| rest.split(['(', ' ', '\n', '\t']).next())
+        .filter(|name| !name.is_empty())
+    {
+        return TypeInfo::Simple(resolve_class_name(class_name, file_symbols));
+    }
+    if matches!(text, "true" | "false") {
+        return TypeInfo::LiteralBool(text == "true");
+    }
+    if text == "null" {
+        return TypeInfo::LiteralNull;
+    }
+    if text.starts_with(['\'', '"']) {
+        return TypeInfo::Simple("string".to_string());
+    }
+    if text.parse::<i64>().is_ok() {
+        return TypeInfo::Simple("int".to_string());
+    }
+    if text.parse::<f64>().is_ok() {
+        return TypeInfo::Simple("float".to_string());
+    }
+
+    TypeInfo::Mixed
+}
+
+fn literal_array_body(text: &str) -> Option<(&str, char)> {
+    let text = text.trim();
+    if let Some(body) = text
+        .strip_prefix('[')
+        .and_then(|body| body.strip_suffix(']'))
+    {
+        return Some((body, ']'));
+    }
+    let body = text
+        .strip_prefix("array(")
+        .and_then(|body| body.strip_suffix(')'))?;
+    Some((body, ')'))
+}
+
+fn split_top_level_text(s: &str, delimiter: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in s.char_indices() {
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+
+        if ch == delimiter
+            && paren_depth == 0
+            && angle_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+        {
+            parts.push(s[start..idx].trim());
+            start = idx + ch.len_utf8();
+        }
+    }
+
+    parts.push(s[start..].trim());
+    parts
+}
+
+fn find_top_level_text(s: &str, needle: &str) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in s.char_indices() {
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        if paren_depth == 0
+            && angle_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+            && s[idx..].starts_with(needle)
+        {
+            return Some(idx);
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn foreach_value_inference(
     stmt: Node,
     var_name: &str,
@@ -1972,16 +2258,22 @@ fn variable_node_in_foreach_part<'a>(node: Node<'a>, source: &str) -> Option<Nod
     None
 }
 
-fn infer_textual_array_access_type(
+fn infer_textual_expression_type_info(
     scope_node: Node,
     expr_text: &str,
     usage_start: usize,
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
-) -> Option<String> {
-    let (base_var, key_text) = parse_textual_array_access(expr_text)?;
-    let base = infer_variable_in_scope(
+) -> Option<VariableInference> {
+    let expr_text = expr_text.trim();
+    let (base_var, keys) = parse_textual_array_access_chain(expr_text)
+        .unwrap_or_else(|| (normalize_var_name(expr_text), Vec::new()));
+    if !base_var.starts_with('$') {
+        return None;
+    }
+
+    let mut inference = infer_variable_in_scope(
         scope_node,
         &base_var,
         usage_start,
@@ -1989,24 +2281,94 @@ fn infer_textual_array_access_type(
         file_symbols,
         resolver,
     );
-    let base_type = base.type_info.as_ref()?;
-    let value_type = iterable_value_type_info(base_type, key_text.as_deref())?;
-    resolve_phpdoc_var_type(&value_type, scope_node, source, file_symbols)
+    if keys.is_empty() {
+        return inference.has_data().then_some(inference);
+    }
+
+    let mut value_type = inference.type_info.take()?;
+    for key_text in &keys {
+        value_type = iterable_value_type_info(&value_type, key_text.as_deref())?;
+    }
+    let resolved_type_fqn = resolve_phpdoc_var_type(&value_type, scope_node, source, file_symbols);
+    Some(VariableInference {
+        type_display: Some(value_type.to_string()),
+        resolved_type_fqn,
+        phpdoc_comment: None,
+        type_info: Some(value_type),
+    })
 }
 
-fn parse_textual_array_access(expr_text: &str) -> Option<(String, Option<String>)> {
+fn parse_textual_array_access_chain(expr_text: &str) -> Option<(String, Vec<Option<String>>)> {
     let bracket = expr_text.find('[')?;
     let base = expr_text[..bracket].trim();
     if !base.starts_with('$') || base.len() <= 1 {
         return None;
     }
-    let key = expr_text[bracket + 1..]
-        .split(']')
-        .next()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_string);
-    Some((normalize_var_name(base), key))
+
+    let mut keys = Vec::new();
+    let mut idx = bracket;
+    let bytes = expr_text.as_bytes();
+    while idx < expr_text.len() {
+        while idx < expr_text.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx >= expr_text.len() || bytes[idx] != b'[' {
+            break;
+        }
+        let content_start = idx + 1;
+        let content_end = find_matching_textual_bracket(expr_text, idx).unwrap_or(expr_text.len());
+        let key = expr_text[content_start..content_end]
+            .trim()
+            .split(']')
+            .next()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string);
+        keys.push(key);
+        if content_end >= expr_text.len() {
+            break;
+        }
+        idx = content_end + 1;
+    }
+
+    (!keys.is_empty()).then(|| (normalize_var_name(base), keys))
+}
+
+fn find_matching_textual_bracket(text: &str, open: usize) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for (idx, ch) in text[open..].char_indices() {
+        let idx = open + idx;
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) -> Option<TypeInfo> {
@@ -2759,6 +3121,19 @@ mod tests {
         infer_variable_type_at_position(tree, code, &file_symbols, line, col, var_name)
     }
 
+    fn parse_and_infer_var_type_info_at(
+        code: &str,
+        line: u32,
+        col: u32,
+        var_name: &str,
+    ) -> Option<TypeInfo> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        infer_variable_type_info_at_position(tree, code, &file_symbols, line, col, var_name)
+    }
+
     fn parse_and_variable_hover_info(code: &str, line: u32, col: u32) -> Option<VariableHoverInfo> {
         let mut parser = FileParser::new();
         parser.parse_full(code);
@@ -3378,6 +3753,43 @@ function run(): void {
         let inferred = parse_and_infer_var_type_at(code, 8, 16, "$users[0]")
             .expect("array access object type should be inferred for completion");
         assert_eq!(inferred, "App\\Entity\\User");
+    }
+
+    #[test]
+    fn test_infer_nested_array_shape_type_info_from_phpdoc_access_text() {
+        let code = r#"<?php
+function run(): void {
+    /** @var array{meta: array{city: string, zip?: int}} $row */
+    $row = [];
+    $row['meta']['
+}
+"#;
+        let inferred = parse_and_infer_var_type_info_at(code, 4, 18, "$row['meta']")
+            .expect("nested array shape should be inferred");
+        let TypeInfo::ArrayShape(items) = inferred else {
+            panic!("expected nested array shape");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key.as_deref(), Some("city"));
+        assert_eq!(items[1].key.as_deref(), Some("zip"));
+        assert!(items[1].optional);
+    }
+
+    #[test]
+    fn test_infer_literal_array_shape_type_info() {
+        let code = r#"<?php
+function run(): void {
+    $row = ['foo' => 1, 'meta' => ['city' => 'Paris']];
+    $row['meta']['
+}
+"#;
+        let inferred = parse_and_infer_var_type_info_at(code, 3, 18, "$row['meta']")
+            .expect("literal nested array shape should be inferred");
+        let TypeInfo::ArrayShape(items) = inferred else {
+            panic!("expected literal nested array shape");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key.as_deref(), Some("city"));
     }
 
     #[test]

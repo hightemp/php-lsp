@@ -1860,12 +1860,35 @@ PR-052 ─→ PR-053
     `cargo clippy --all-targets -- -D warnings`, `npm run lint`,
     `npm run build`, `git diff --check`.
 
-- [ ] **IE-033** Shape-aware completion and definition
+- [x] **IE-033** Shape-aware completion and definition *(done 2026-05-27)*
   - Array shape keys from PHPDoc/literal arrays should appear in `$arr['...']` completion.
   - Object shape properties should appear in `$obj->...` where modeled.
   - Go-to-definition for shape key should jump to PHPDoc/literal declaration where practical.
   - Preserve nested shapes and optional keys best-effort.
   - Tests: `array{foo: User, bar?: int}`, nested shape, list shape ignored for key completion.
+  - Implemented: PHPDoc parser and shared `TypeInfo` now preserve
+    `object{...}` shapes alongside existing `array{...}` shapes; cache schema
+    was bumped because serialized type metadata changed.
+  - Implemented: local inference keeps array-shape metadata from PHPDoc and
+    literal array assignments, including nested literal arrays.
+  - Implemented: completion inside `$arr['...']` returns PHPDoc/literal array
+    shape keys, nested shape keys, and optional keys while ignoring list-like
+    generics for key completion.
+  - Implemented: completion after `$obj->` returns modeled `object{...}`
+    properties without requiring an indexed class symbol.
+  - Implemented: go-to-definition on shape keys jumps to the PHPDoc shape key
+    or literal array key declaration where the source range can be recovered.
+  - Regression: parser tests cover object-shape parsing, nested PHPDoc array
+    shape inference, and literal array-shape inference; completion context
+    tests cover array-key contexts; e2e covers PHPDoc/literal array key
+    completion, object-shape property completion, nested shapes, list
+    suppression, and definition targets.
+  - Docs: `README.md`, `docs/lsp-features.md`, and
+    `docs/production-risk-register.md` mention shape-aware
+    completion/definition.
+  - Validation: `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, docs Cyrillic check,
+    `git diff --check`.
 
 - [ ] **IE-034** Closure, foreach, and collection callback inference
   - Infer closure/arrow-function params from callable parameter types.

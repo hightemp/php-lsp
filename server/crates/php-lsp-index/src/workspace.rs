@@ -493,16 +493,12 @@ impl WorkspaceIndex {
                     other => other,
                 }
             }
-            TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
-                items
-                    .iter()
-                    .map(|item| ArrayShapeItem {
-                        key: item.key.clone(),
-                        optional: item.optional,
-                        value: self.expand_type_aliases(&item.value, scope, visited),
-                    })
-                    .collect(),
-            ),
+            TypeInfo::ArrayShape(items) => {
+                TypeInfo::ArrayShape(self.expand_shape_items(items, scope, visited))
+            }
+            TypeInfo::ObjectShape(items) => {
+                TypeInfo::ObjectShape(self.expand_shape_items(items, scope, visited))
+            }
             TypeInfo::Callable {
                 params,
                 return_type,
@@ -557,6 +553,22 @@ impl WorkspaceIndex {
             | TypeInfo::Static_
             | TypeInfo::Parent_ => type_info.clone(),
         }
+    }
+
+    fn expand_shape_items(
+        &self,
+        items: &[ArrayShapeItem],
+        scope: &TypeAliasScope,
+        visited: &mut Vec<TypeAliasVisit>,
+    ) -> Vec<ArrayShapeItem> {
+        items
+            .iter()
+            .map(|item| ArrayShapeItem {
+                key: item.key.clone(),
+                optional: item.optional,
+                value: self.expand_type_aliases(&item.value, scope, visited),
+            })
+            .collect()
     }
 
     fn type_alias_for_name(
@@ -842,6 +854,21 @@ fn resolve_alias_type_names_in_file(
                 })
                 .collect(),
         ),
+        TypeInfo::ObjectShape(items) => TypeInfo::ObjectShape(
+            items
+                .iter()
+                .map(|item| ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: resolve_alias_type_names_in_file(
+                        &item.value,
+                        file_symbols,
+                        alias_names,
+                        template_names,
+                    ),
+                })
+                .collect(),
+        ),
         TypeInfo::Callable {
             params,
             return_type,
@@ -1012,6 +1039,16 @@ fn substitute_type_info(type_info: &TypeInfo, substitutions: &TemplateSubstituti
                 .collect(),
         },
         TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+            items
+                .iter()
+                .map(|item| ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: substitute_type_info(&item.value, substitutions),
+                })
+                .collect(),
+        ),
+        TypeInfo::ObjectShape(items) => TypeInfo::ObjectShape(
             items
                 .iter()
                 .map(|item| ArrayShapeItem {

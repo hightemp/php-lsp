@@ -69,6 +69,7 @@ pub enum TypeInfo {
         args: Vec<TypeInfo>,
     },
     ArrayShape(Vec<ArrayShapeItem>),
+    ObjectShape(Vec<ArrayShapeItem>),
     Callable {
         params: Vec<TypeInfo>,
         return_type: Option<Box<TypeInfo>>,
@@ -107,6 +108,10 @@ impl std::fmt::Display for TypeInfo {
             TypeInfo::ArrayShape(items) => {
                 let parts: Vec<String> = items.iter().map(|item| item.to_string()).collect();
                 write!(f, "array{{{}}}", parts.join(", "))
+            }
+            TypeInfo::ObjectShape(items) => {
+                let parts: Vec<String> = items.iter().map(|item| item.to_string()).collect();
+                write!(f, "object{{{}}}", parts.join(", "))
             }
             TypeInfo::Callable {
                 params,

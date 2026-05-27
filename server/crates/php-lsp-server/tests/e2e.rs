@@ -2255,6 +2255,247 @@ function run(ServiceLocator $locator): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_shape_aware_completion_and_definition() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+namespace App;
+
+class User {
+    public function name(): string { return ''; }
+}
+
+function run(): void {
+    /** @var array{foo: User, bar?: int, meta: array{city: string}} $row */
+    $row = [];
+    /** @var list<User> $users */
+    $users = [];
+    /** @var object{title: string, owner?: User} $shape */
+    $shape = (object)[];
+
+    $row['/*array*/'];
+    $row['meta']['/*nested*/'];
+    $users['/*list*/'];
+    $shape->/*object*/;
+    $row['foo/*phpdocdef*/']->name();
+    $literal = ['literal' => 1, 'nested' => ['leaf' => true]];
+    $literal['/*literal*/'];
+    $literal['nested']['leaf/*literaldef*/'];
+}
+"#;
+    let markers = [
+        "/*array*/",
+        "/*nested*/",
+        "/*list*/",
+        "/*object*/",
+        "/*phpdocdef*/",
+        "/*literal*/",
+        "/*literaldef*/",
+    ];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for known_marker in markers {
+            prefix = prefix.replace(known_marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/shape-aware-completion.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let (array_line, array_character) = marker_position("/*array*/");
+    let array_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, uri, array_line, array_character))
+        .await
+        .unwrap();
+    let array_result = extract_result(array_completion);
+    let array_labels: Vec<String> = completion_items_from_result(&array_result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        array_labels.contains(&"foo".to_string()) && array_labels.contains(&"bar".to_string()),
+        "array shape completion should include foo/bar, got: {:?}; result: {}",
+        array_labels,
+        array_result
+    );
+
+    let (nested_line, nested_character) = marker_position("/*nested*/");
+    let nested_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(3, uri, nested_line, nested_character))
+        .await
+        .unwrap();
+    let nested_result = extract_result(nested_completion);
+    let nested_labels: Vec<String> = completion_items_from_result(&nested_result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        nested_labels.contains(&"city".to_string()),
+        "nested array shape completion should include city, got: {:?}; result: {}",
+        nested_labels,
+        nested_result
+    );
+
+    let (list_line, list_character) = marker_position("/*list*/");
+    let list_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(4, uri, list_line, list_character))
+        .await
+        .unwrap();
+    let list_result = extract_result(list_completion);
+    let list_labels: Vec<String> = completion_items_from_result(&list_result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        list_labels.is_empty(),
+        "list<T> should not produce shape key completion, got: {:?}; result: {}",
+        list_labels,
+        list_result
+    );
+
+    let (object_line, object_character) = marker_position("/*object*/");
+    let object_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(5, uri, object_line, object_character))
+        .await
+        .unwrap();
+    let object_result = extract_result(object_completion);
+    let object_labels: Vec<String> = completion_items_from_result(&object_result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        object_labels.contains(&"title".to_string())
+            && object_labels.contains(&"owner".to_string()),
+        "object shape completion should include title/owner, got: {:?}; result: {}",
+        object_labels,
+        object_result
+    );
+
+    let (literal_line, literal_character) = marker_position("/*literal*/");
+    let literal_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(6, uri, literal_line, literal_character))
+        .await
+        .unwrap();
+    let literal_result = extract_result(literal_completion);
+    let literal_labels: Vec<String> = completion_items_from_result(&literal_result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        literal_labels.contains(&"literal".to_string())
+            && literal_labels.contains(&"nested".to_string()),
+        "literal array shape completion should include literal/nested, got: {:?}; result: {}",
+        literal_labels,
+        literal_result
+    );
+
+    let (phpdoc_def_line, phpdoc_def_character) = marker_position("/*phpdocdef*/");
+    let phpdoc_definition = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            7,
+            uri,
+            phpdoc_def_line,
+            phpdoc_def_character,
+        ))
+        .await
+        .unwrap();
+    let phpdoc_definition_result = extract_result(phpdoc_definition);
+    assert_eq!(
+        phpdoc_definition_result["range"]["start"]["line"].as_u64(),
+        Some(8),
+        "PHPDoc shape key definition should point to @var shape, got: {}",
+        phpdoc_definition_result
+    );
+
+    let (literal_def_line, literal_def_character) = marker_position("/*literaldef*/");
+    let literal_definition = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            8,
+            uri,
+            literal_def_line,
+            literal_def_character,
+        ))
+        .await
+        .unwrap();
+    let literal_definition_result = extract_result(literal_definition);
+    assert_eq!(
+        literal_definition_result["range"]["start"]["line"].as_u64(),
+        Some(20),
+        "literal shape key definition should point to array key declaration, got: {}",
+        literal_definition_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_member_access_from_inline_phpdoc_var() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

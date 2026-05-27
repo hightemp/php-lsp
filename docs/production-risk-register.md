@@ -279,6 +279,9 @@ Current evidence:
 - `IE-032` added PHPStan/Psalm conditional return parsing, `class-string<T>`
   call-site template binding, fallback branch unions, and coverage for hover,
   local variable inlay hints, and completion chains after factory calls.
+- `IE-033` added shape-aware completion and definition for PHPDoc
+  `array{...}` / `object{...}` shapes and literal array shapes, including
+  nested shape keys and optional keys.
 - `PV-012` fixed a real Symfony false positive for promoted constructor
   properties accessed through a `self`-typed parameter
   (`withDefaults(self $defaults)` then `$defaults->objectManager`).
@@ -287,7 +290,7 @@ Current evidence:
 
 Impact:
 
-- Completion/definition/diagnostics are materially better for PHPDoc-heavy projects, but still not a full static analyzer type system.
+- Completion/definition/diagnostics are materially better for PHPDoc-heavy projects, including shape-heavy code, but still not a full static analyzer type system.
 - Complex framework magic, fluent generics, project-specific dynamic behavior,
   and missing Composer/vendor metadata can still need PHPStan/Psalm or
   diagnostic category tuning.
@@ -297,6 +300,8 @@ Mitigation:
 - `PR-031`-`PR-034`: PHPDoc parser, virtual members, and e2e coverage.
 - `PR-040`-`PR-042`, `IE-030`/`IE-031`: richer type model, inference, PHPDoc
   template/type-alias metadata, and framework false-positive reductions.
+- `IE-033`: shape-aware key/property completion and go-to-definition coverage
+  for PHPDoc and literal array shapes.
 - `PV-012`: added regression coverage for `self`/`static` parameter type
   resolution before member diagnostics.
 

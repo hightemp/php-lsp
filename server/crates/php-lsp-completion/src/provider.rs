@@ -143,6 +143,7 @@ pub fn provide_completions(
             class_expr,
             member_prefix,
         } => provide_static_completions(class_fqn, class_expr, member_prefix, index, file_symbols),
+        CompletionContext::ArrayKey { .. } => vec![],
         CompletionContext::Variable { prefix } => {
             provide_variable_completions(prefix, file_symbols)
         }

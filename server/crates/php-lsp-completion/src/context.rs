@@ -29,6 +29,14 @@ pub enum CompletionContext {
         class_fqn: String,
     },
 
+    /// Inside an array key string: `$row['...']`.
+    ArrayKey {
+        /// The array expression before the current `[...]`.
+        array_expr: String,
+        /// The key prefix already typed inside the quote.
+        key_prefix: String,
+    },
+
     /// After `$`: variable name completion.
     Variable {
         /// Partial variable name typed so far (without $).
@@ -91,6 +99,11 @@ pub fn detect_context(
 
     // Check for `::` static access
     if let Some(ctx) = check_static_access(text_before, &node, source, file_symbols) {
+        return ctx;
+    }
+
+    // Check for array-shape key access inside `$row['...']`.
+    if let Some(ctx) = check_array_key_access(text_before) {
         return ctx;
     }
 
@@ -157,6 +170,38 @@ fn check_member_access(text_before: &str, node: &Node, source: &str) -> Option<C
     }
 
     None
+}
+
+/// Check for `$row['...` array key completion.
+fn check_array_key_access(text_before: &str) -> Option<CompletionContext> {
+    let trimmed = text_before.trim_end();
+    let quote_pos = trimmed.rfind(['\'', '"'])?;
+    let quote = trimmed.as_bytes().get(quote_pos).copied()? as char;
+    let before_quote = &trimmed[..quote_pos];
+    let bracket_pos = before_quote.rfind('[')?;
+    if !before_quote[bracket_pos + 1..].trim().is_empty() {
+        return None;
+    }
+    let key_prefix = &trimmed[quote_pos + quote.len_utf8()..];
+    if key_prefix.contains(quote) || key_prefix.contains(']') {
+        return None;
+    }
+    if !key_prefix
+        .chars()
+        .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == '\\')
+    {
+        return None;
+    }
+
+    let array_expr = extract_object_expr(trimmed[..bracket_pos].trim_end());
+    if array_expr.is_empty() {
+        return None;
+    }
+
+    Some(CompletionContext::ArrayKey {
+        array_expr,
+        key_prefix: key_prefix.to_string(),
+    })
 }
 
 /// Check for `::` static access pattern.
@@ -475,6 +520,38 @@ mod tests {
                 assert_eq!(member_prefix, "");
             }
             other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_array_key_context_inside_string_key() {
+        let code = "<?php\n$row['fo";
+        let ctx = detect(code, 1, 8);
+        match ctx {
+            CompletionContext::ArrayKey {
+                array_expr,
+                key_prefix,
+            } => {
+                assert_eq!(array_expr, "$row");
+                assert_eq!(key_prefix, "fo");
+            }
+            other => panic!("Expected ArrayKey, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_array_key_context_keeps_nested_array_access_base() {
+        let code = "<?php\n$row['meta']['";
+        let ctx = detect(code, 1, 14);
+        match ctx {
+            CompletionContext::ArrayKey {
+                array_expr,
+                key_prefix,
+            } => {
+                assert_eq!(array_expr, "$row['meta']");
+                assert_eq!(key_prefix, "");
+            }
+            other => panic!("Expected ArrayKey, got {:?}", other),
         }
     }
 

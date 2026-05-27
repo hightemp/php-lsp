@@ -689,7 +689,7 @@ fn parse_type_string(s: &str) -> TypeInfo {
         return parse_type_string(inner);
     }
 
-    if let Some(shape) = parse_array_shape_type(s) {
+    if let Some(shape) = parse_shape_type(s) {
         return shape;
     }
 
@@ -830,10 +830,21 @@ fn split_generic_type(s: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn parse_array_shape_type(s: &str) -> Option<TypeInfo> {
-    let body = s
+fn parse_shape_type(s: &str) -> Option<TypeInfo> {
+    let (shape_kind, body) = if let Some(body) = s
         .strip_prefix("array{")
-        .and_then(|body| body.strip_suffix('}'))?;
+        .and_then(|body| body.strip_suffix('}'))
+    {
+        ("array", body)
+    } else if let Some(body) = s
+        .strip_prefix("object{")
+        .and_then(|body| body.strip_suffix('}'))
+    {
+        ("object", body)
+    } else {
+        return None;
+    };
+
     let items = split_top_level(body, ',')
         .unwrap_or_else(|| vec![body.trim()])
         .into_iter()
@@ -841,7 +852,11 @@ fn parse_array_shape_type(s: &str) -> Option<TypeInfo> {
         .map(parse_array_shape_item)
         .collect::<Vec<_>>();
 
-    Some(TypeInfo::ArrayShape(items))
+    match shape_kind {
+        "array" => Some(TypeInfo::ArrayShape(items)),
+        "object" => Some(TypeInfo::ObjectShape(items)),
+        _ => None,
+    }
 }
 
 fn parse_array_shape_item(s: &str) -> ArrayShapeItem {
@@ -1499,6 +1514,19 @@ mod tests {
         assert_eq!(items[1].value, TypeInfo::LiteralInt("1".to_string()));
         assert_eq!(items[2].value, TypeInfo::LiteralBool(true));
         assert_eq!(items[3].value, TypeInfo::LiteralFloat("1.5".to_string()));
+    }
+
+    #[test]
+    fn test_parse_object_shape() {
+        let doc = parse_phpdoc("/**\n * @var object{user: User, id?: int} $row\n */");
+        let Some(TypeInfo::ObjectShape(items)) = doc.var_type else {
+            panic!("expected object shape");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key.as_deref(), Some("user"));
+        assert_eq!(items[0].value, TypeInfo::Simple("User".to_string()));
+        assert_eq!(items[1].key.as_deref(), Some("id"));
+        assert!(items[1].optional);
     }
 
     #[test]
