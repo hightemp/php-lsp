@@ -1969,7 +1969,7 @@ PR-052 ─→ PR-053
   - Validation: `cargo test --all`, `cargo fmt --all --check`,
     `cargo clippy --all-targets -- -D warnings`.
 
-- [ ] **IE-041** Laravel/Eloquent-like model virtual properties
+- [x] **IE-041** Laravel/Eloquent-like model virtual properties *(done 2026-05-27)*
   - Detect model classes structurally: inheritance/interface/known framework symbols from Composer, not hardcoded project paths.
   - Sources:
     - `@property*` PHPDoc
@@ -1979,6 +1979,18 @@ PR-052 ─→ PR-053
     - `$fillable`, `$guarded`, `$hidden`, `$visible` as weak mixed fallback.
   - Respect `__get`/`__set` and `reportMagicProperties`-like setting.
   - Tests: casts, accessors, property docs, magic property diagnostics.
+  - Implemented: Laravel/Eloquent provider now exposes concrete virtual
+    properties from PHPDoc, `$casts`, `casts()`, legacy accessors, modern
+    `Attribute<TGet,TSet>` accessors, and weak mixed fallbacks from fillable /
+    guarded / hidden / visible arrays.
+  - Implemented: framework virtual properties are wired into member diagnostics,
+    member completion, hover, go-to-definition when a source range exists, and
+    rename rejection.
+  - Magic handling: Eloquent model properties keep the conservative magic
+    fallback for diagnostics while completion lists only statically discovered
+    properties.
+  - Validation: `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
 
 - [ ] **IE-042** Laravel/Eloquent-like relations, scopes, builders
   - Infer relationship methods returning relation generics and expose related model properties where safe.

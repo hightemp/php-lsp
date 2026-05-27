@@ -6,8 +6,9 @@
 
 use php_lsp_index::composer::NamespaceMap;
 use php_lsp_index::workspace::WorkspaceIndex;
+use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::resolve::RefKind;
-use php_lsp_types::{FileSymbols, TypeInfo};
+use php_lsp_types::{FileSymbols, PhpDocPropertyAccess, PhpSymbolKind, SymbolInfo, TypeInfo};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -80,6 +81,7 @@ pub(crate) struct VirtualMember {
     pub(crate) fqn: String,
     pub(crate) kind: VirtualMemberKind,
     pub(crate) type_info: Option<TypeInfo>,
+    pub(crate) access: Option<PhpDocPropertyAccess>,
     pub(crate) detail: Option<String>,
     pub(crate) provider_ids: Vec<&'static str>,
     pub(crate) sources: Vec<VirtualMemberSource>,
@@ -95,12 +97,21 @@ impl VirtualMember {
     ) -> Self {
         let owner_fqn = owner_fqn.into();
         let name = member_name.into();
+        let fqn = match kind {
+            VirtualMemberKind::Property | VirtualMemberKind::StaticProperty => {
+                format!("{}::${}", owner_fqn, name.trim_start_matches('$'))
+            }
+            VirtualMemberKind::Method | VirtualMemberKind::ClassConstant => {
+                format!("{}::{}", owner_fqn, name)
+            }
+        };
         Self {
-            fqn: format!("{}::{}", owner_fqn, name),
+            fqn,
             name,
             owner_fqn,
             kind,
             type_info: None,
+            access: None,
             detail: Some(detail.into()),
             provider_ids: vec![provider_id],
             sources: vec![VirtualMemberSource::Synthetic {
@@ -121,6 +132,9 @@ impl VirtualMember {
     fn merge_from(&mut self, other: Self) {
         if self.type_info.is_none() {
             self.type_info = other.type_info;
+        }
+        if self.access.is_none() {
+            self.access = other.access;
         }
         if self.detail.is_none() {
             self.detail = other.detail;
@@ -192,6 +206,7 @@ pub(crate) struct FrameworkProviderContext<'a> {
     pub(crate) workspace_root: Option<&'a Path>,
     pub(crate) namespace_map: Option<&'a NamespaceMap>,
     pub(crate) index: &'a WorkspaceIndex,
+    pub(crate) source_uri: Option<&'a str>,
     pub(crate) file_symbols: Option<&'a FileSymbols>,
     pub(crate) source: Option<&'a str>,
     pub(crate) relevant_files: &'a [PathBuf],
@@ -203,6 +218,7 @@ impl<'a> FrameworkProviderContext<'a> {
             workspace_root: None,
             namespace_map: None,
             index,
+            source_uri: None,
             file_symbols: None,
             source: None,
             relevant_files: &[],
@@ -229,6 +245,11 @@ impl<'a> FrameworkProviderContext<'a> {
         self
     }
 
+    pub(crate) fn with_source_uri(mut self, source_uri: Option<&'a str>) -> Self {
+        self.source_uri = source_uri;
+        self
+    }
+
     pub(crate) fn with_relevant_files(mut self, relevant_files: &'a [PathBuf]) -> Self {
         self.relevant_files = relevant_files;
         self
@@ -241,6 +262,7 @@ impl<'a> FrameworkProviderContext<'a> {
                 .namespace_map
                 .map(hash_namespace_map)
                 .unwrap_or_default(),
+            source_hash: self.source.map(hash_source).unwrap_or_default(),
             relevant_files_hash: hash_relevant_files(self.relevant_files),
         }
     }
@@ -290,6 +312,7 @@ impl<'a> FrameworkProviderContext<'a> {
 struct FrameworkProviderFingerprint {
     workspace_hash: u64,
     composer_hash: u64,
+    source_hash: u64,
     relevant_files_hash: u64,
 }
 
@@ -305,6 +328,15 @@ pub(crate) trait VirtualMemberProvider {
         ctx: &FrameworkProviderContext<'_>,
         query: &VirtualMemberQuery,
     ) -> Vec<VirtualMember>;
+
+    fn virtual_member_candidates(
+        &self,
+        _ctx: &FrameworkProviderContext<'_>,
+        _class_fqn: &str,
+        _kind: Option<VirtualMemberKind>,
+    ) -> Vec<VirtualMember> {
+        Vec::new()
+    }
 
     #[allow(dead_code)]
     fn string_keys(
@@ -336,6 +368,30 @@ impl<'a> FrameworkProviderRegistry<'a> {
 
         for provider in &self.providers {
             for member in provider.virtual_members(ctx, query) {
+                let identity = member.identity();
+                if let Some(index) = seen.get(&identity).copied() {
+                    merged[index].merge_from(member);
+                } else {
+                    seen.insert(identity, merged.len());
+                    merged.push(member);
+                }
+            }
+        }
+
+        merged
+    }
+
+    pub(crate) fn virtual_member_candidates(
+        &self,
+        ctx: &FrameworkProviderContext<'_>,
+        class_fqn: &str,
+        kind: Option<VirtualMemberKind>,
+    ) -> Vec<VirtualMember> {
+        let mut merged: Vec<VirtualMember> = Vec::new();
+        let mut seen = HashMap::<VirtualMemberIdentity, usize>::new();
+
+        for provider in &self.providers {
+            for member in provider.virtual_member_candidates(ctx, class_fqn, kind) {
                 let identity = member.identity();
                 if let Some(index) = seen.get(&identity).copied() {
                     merged[index].merge_from(member);
@@ -543,22 +599,32 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
         ctx: &FrameworkProviderContext<'_>,
         query: &VirtualMemberQuery,
     ) -> Vec<VirtualMember> {
-        let is_model =
-            ctx.class_is_or_extends(&query.owner_fqn, "Illuminate\\Database\\Eloquent\\Model");
-        let is_builder = ctx
-            .class_is_or_extends(&query.owner_fqn, "Illuminate\\Database\\Eloquent\\Builder")
-            || ctx.class_is_or_extends(&query.owner_fqn, "Illuminate\\Database\\Query\\Builder")
-            || ctx.class_is_or_extends(
-                &query.owner_fqn,
-                "Illuminate\\Database\\Eloquent\\Relations\\Relation",
-            );
+        let is_model = is_laravel_model(ctx, &query.owner_fqn);
+        let is_builder = is_laravel_builder(ctx, &query.owner_fqn);
 
         let accepted = match query.kind {
             VirtualMemberKind::Method => {
                 (is_model || is_builder) && is_laravel_eloquent_dynamic_method(&query.member_name)
             }
-            VirtualMemberKind::Property => is_model,
+            VirtualMemberKind::Property if is_model => {
+                let member_name = query.member_name.trim_start_matches('$');
+                let properties = laravel_model_virtual_properties(ctx, &query.owner_fqn);
+                if let Some(property) = properties
+                    .into_iter()
+                    .find(|property| property.name.trim_start_matches('$') == member_name)
+                {
+                    return vec![property];
+                }
+                // Eloquent models expose attributes through Model::__get/__set at runtime.
+                // If vendor symbols are absent, keep the conservative pre-IE-041 fallback
+                // for diagnostics while completion still lists only statically discovered
+                // properties.
+                class_has_magic_property_method(ctx, &query.owner_fqn, "__get")
+                    || class_has_magic_property_method(ctx, &query.owner_fqn, "__set")
+                    || is_model
+            }
             VirtualMemberKind::StaticProperty | VirtualMemberKind::ClassConstant => false,
+            VirtualMemberKind::Property => false,
         };
 
         if !accepted {
@@ -573,6 +639,469 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
             "Laravel Eloquent dynamic member",
         )]
     }
+
+    fn virtual_member_candidates(
+        &self,
+        ctx: &FrameworkProviderContext<'_>,
+        class_fqn: &str,
+        kind: Option<VirtualMemberKind>,
+    ) -> Vec<VirtualMember> {
+        if !is_laravel_model(ctx, class_fqn) {
+            return Vec::new();
+        }
+        if kind.is_some_and(|kind| kind != VirtualMemberKind::Property) {
+            return Vec::new();
+        }
+
+        laravel_model_virtual_properties(ctx, class_fqn)
+    }
+}
+
+fn is_laravel_model(ctx: &FrameworkProviderContext<'_>, class_fqn: &str) -> bool {
+    ctx.class_is_or_extends(class_fqn, "Illuminate\\Database\\Eloquent\\Model")
+}
+
+fn is_laravel_builder(ctx: &FrameworkProviderContext<'_>, class_fqn: &str) -> bool {
+    ctx.class_is_or_extends(class_fqn, "Illuminate\\Database\\Eloquent\\Builder")
+        || ctx.class_is_or_extends(class_fqn, "Illuminate\\Database\\Query\\Builder")
+        || ctx.class_is_or_extends(
+            class_fqn,
+            "Illuminate\\Database\\Eloquent\\Relations\\Relation",
+        )
+}
+
+fn laravel_model_virtual_properties(
+    ctx: &FrameworkProviderContext<'_>,
+    class_fqn: &str,
+) -> Vec<VirtualMember> {
+    let mut properties = Vec::new();
+    let mut seen = HashMap::<VirtualMemberIdentity, usize>::new();
+
+    for owner in ctx.index.get_type_hierarchy_symbols(class_fqn) {
+        collect_phpdoc_properties(ctx, &owner, &mut properties, &mut seen);
+        collect_laravel_accessor_properties(ctx, &owner, &mut properties, &mut seen);
+        collect_laravel_source_properties(ctx, &owner, &mut properties, &mut seen);
+    }
+
+    properties
+}
+
+fn push_laravel_property(
+    properties: &mut Vec<VirtualMember>,
+    seen: &mut HashMap<VirtualMemberIdentity, usize>,
+    property: VirtualMember,
+) {
+    let identity = property.identity();
+    if let Some(index) = seen.get(&identity).copied() {
+        properties[index].merge_from(property);
+    } else {
+        seen.insert(identity, properties.len());
+        properties.push(property);
+    }
+}
+
+fn collect_phpdoc_properties(
+    _ctx: &FrameworkProviderContext<'_>,
+    owner: &std::sync::Arc<SymbolInfo>,
+    properties: &mut Vec<VirtualMember>,
+    seen: &mut HashMap<VirtualMemberIdentity, usize>,
+) {
+    let Some(doc_comment) = owner.doc_comment.as_deref() else {
+        return;
+    };
+    let phpdoc = parse_phpdoc(doc_comment);
+    for property in phpdoc.properties {
+        let mut member = VirtualMember::synthetic(
+            LARAVEL_ELOQUENT_PROVIDER.id(),
+            &owner.fqn,
+            &property.name,
+            VirtualMemberKind::Property,
+            "Laravel model PHPDoc property",
+        );
+        member.type_info = property.type_info;
+        member.access = Some(property.access);
+        member.detail = Some(match member.type_info.as_ref() {
+            Some(type_info) => format!("{} {}", phpdoc_property_tag(property.access), type_info),
+            None => phpdoc_property_tag(property.access).to_string(),
+        });
+        if let Some(description) = property.description {
+            member.detail = Some(match member.detail {
+                Some(detail) => format!("{detail} - {description}"),
+                None => description,
+            });
+        }
+        push_laravel_property(properties, seen, member);
+    }
+}
+
+fn collect_laravel_accessor_properties(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &std::sync::Arc<SymbolInfo>,
+    properties: &mut Vec<VirtualMember>,
+    seen: &mut HashMap<VirtualMemberIdentity, usize>,
+) {
+    let members = ctx.index.get_members(&owner.fqn);
+    for method in members.iter().filter(|member| {
+        member.parent_fqn.as_deref() == Some(owner.fqn.as_str())
+            && member.kind == PhpSymbolKind::Method
+    }) {
+        if let Some(property_name) = legacy_accessor_property_name(&method.name) {
+            let mut member = laravel_property_from_symbol(
+                owner,
+                &property_name,
+                method
+                    .signature
+                    .as_ref()
+                    .and_then(|signature| signature.return_type.clone())
+                    .or(Some(TypeInfo::Mixed)),
+                "Laravel legacy accessor property",
+                Some(method),
+            );
+            member.access = Some(PhpDocPropertyAccess::ReadOnly);
+            push_laravel_property(properties, seen, member);
+            continue;
+        }
+
+        if let Some(type_info) = modern_attribute_get_type(method) {
+            let property_name = method.name.clone();
+            let mut member = laravel_property_from_symbol(
+                owner,
+                &property_name,
+                Some(type_info),
+                "Laravel Attribute accessor property",
+                Some(method),
+            );
+            member.access = Some(PhpDocPropertyAccess::ReadOnly);
+            push_laravel_property(properties, seen, member);
+        }
+    }
+}
+
+fn collect_laravel_source_properties(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &std::sync::Arc<SymbolInfo>,
+    properties: &mut Vec<VirtualMember>,
+    seen: &mut HashMap<VirtualMemberIdentity, usize>,
+) {
+    let Some(source) = source_for_symbol(ctx, owner) else {
+        return;
+    };
+
+    let members = ctx.index.get_members(&owner.fqn);
+    for property in members.iter().filter(|member| {
+        member.parent_fqn.as_deref() == Some(owner.fqn.as_str())
+            && member.kind == PhpSymbolKind::Property
+    }) {
+        match property.name.as_str() {
+            "casts" => {
+                let Some(text) = source_text_for_range(source, property.range) else {
+                    continue;
+                };
+                for (name, cast_value) in parse_array_string_pairs(text) {
+                    let source_range = property_source_range(property);
+                    let member = laravel_property_from_source(
+                        owner,
+                        &name,
+                        cast_value_to_type(&cast_value).or(Some(TypeInfo::Mixed)),
+                        "Laravel $casts property",
+                        source_range,
+                    );
+                    push_laravel_property(properties, seen, member);
+                }
+            }
+            "fillable" | "guarded" | "hidden" | "visible" => {
+                let Some(text) = source_text_for_range(source, property.range) else {
+                    continue;
+                };
+                for name in parse_array_string_values(text) {
+                    if name == "*" {
+                        continue;
+                    }
+                    let source_range = property_source_range(property);
+                    let member = laravel_property_from_source(
+                        owner,
+                        &name,
+                        Some(TypeInfo::Mixed),
+                        format!("Laravel ${} weak property fallback", property.name),
+                        source_range,
+                    );
+                    push_laravel_property(properties, seen, member);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for method in members.iter().filter(|member| {
+        member.parent_fqn.as_deref() == Some(owner.fqn.as_str())
+            && member.kind == PhpSymbolKind::Method
+            && member.name == "casts"
+    }) {
+        let Some(text) = source_text_for_range(source, method.range) else {
+            continue;
+        };
+        for (name, cast_value) in parse_array_string_pairs(text) {
+            let member = laravel_property_from_source(
+                owner,
+                &name,
+                cast_value_to_type(&cast_value).or(Some(TypeInfo::Mixed)),
+                "Laravel casts() method",
+                property_source_range(method),
+            );
+            push_laravel_property(properties, seen, member);
+        }
+    }
+}
+
+fn laravel_property_from_symbol(
+    owner: &SymbolInfo,
+    property_name: &str,
+    type_info: Option<TypeInfo>,
+    detail: impl Into<String>,
+    source_symbol: Option<&SymbolInfo>,
+) -> VirtualMember {
+    let mut member = VirtualMember::synthetic(
+        LARAVEL_ELOQUENT_PROVIDER.id(),
+        &owner.fqn,
+        property_name,
+        VirtualMemberKind::Property,
+        detail,
+    );
+    member.type_info = type_info;
+    if let Some(source_symbol) = source_symbol {
+        member.sources.push(VirtualMemberSource::SourceRange {
+            uri: source_symbol.uri.clone(),
+            range: source_symbol.selection_range,
+        });
+    }
+    member
+}
+
+fn laravel_property_from_source(
+    owner: &SymbolInfo,
+    property_name: &str,
+    type_info: Option<TypeInfo>,
+    detail: impl Into<String>,
+    source: Option<VirtualMemberSource>,
+) -> VirtualMember {
+    let mut member = VirtualMember::synthetic(
+        LARAVEL_ELOQUENT_PROVIDER.id(),
+        &owner.fqn,
+        property_name,
+        VirtualMemberKind::Property,
+        detail,
+    );
+    member.type_info = type_info;
+    if let Some(source) = source {
+        member.sources.push(source);
+    }
+    member
+}
+
+fn property_source_range(symbol: &SymbolInfo) -> Option<VirtualMemberSource> {
+    Some(VirtualMemberSource::SourceRange {
+        uri: symbol.uri.clone(),
+        range: symbol.selection_range,
+    })
+}
+
+fn source_for_symbol<'a>(
+    ctx: &'a FrameworkProviderContext<'a>,
+    symbol: &SymbolInfo,
+) -> Option<&'a str> {
+    let source = ctx.source?;
+    if ctx
+        .source_uri
+        .is_some_and(|source_uri| source_uri == symbol.uri.as_str())
+    {
+        return Some(source);
+    }
+
+    if ctx.source_uri.is_none() {
+        return Some(source);
+    }
+
+    None
+}
+
+fn source_text_for_range(source: &str, range: (u32, u32, u32, u32)) -> Option<&str> {
+    let start = byte_offset_for_line_col(source, range.0, range.1)?;
+    let end = byte_offset_for_line_col(source, range.2, range.3)?;
+    source.get(start..end)
+}
+
+fn byte_offset_for_line_col(source: &str, line: u32, byte_col: u32) -> Option<usize> {
+    let mut offset = 0usize;
+    for (idx, segment) in source.split_inclusive('\n').enumerate() {
+        if idx == line as usize {
+            let candidate = offset + byte_col as usize;
+            return (candidate <= source.len()).then_some(candidate);
+        }
+        offset += segment.len();
+    }
+    (line == source.lines().count() as u32 && byte_col == 0).then_some(source.len())
+}
+
+fn parse_array_string_values(text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut index = 0usize;
+    while let Some((value, _start, end)) = next_quoted_string(text, index) {
+        values.push(value);
+        index = end;
+    }
+    values
+}
+
+fn parse_array_string_pairs(text: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut index = 0usize;
+
+    while let Some((key, _key_start, key_end)) = next_quoted_string(text, index) {
+        let Some(arrow_relative) = text[key_end..].find("=>") else {
+            index = key_end;
+            continue;
+        };
+        let value_start = key_end + arrow_relative + 2;
+        if let Some((value, _start, end)) = next_cast_value(text, value_start) {
+            pairs.push((key, value));
+            index = end;
+        } else {
+            index = value_start;
+        }
+    }
+
+    pairs
+}
+
+fn next_cast_value(text: &str, start: usize) -> Option<(String, usize, usize)> {
+    let rest = text.get(start..)?;
+    let leading_ws = rest.len() - rest.trim_start().len();
+    let token_start = start + leading_ws;
+    let first = text[token_start..].chars().next()?;
+    if first == '\'' || first == '"' {
+        return next_quoted_string(text, token_start);
+    }
+
+    let token_end = text[token_start..]
+        .find([',', ']', ')', '\n'])
+        .map(|offset| token_start + offset)
+        .unwrap_or(text.len());
+    let value = text[token_start..token_end].trim();
+    (!value.is_empty()).then(|| (value.to_string(), token_start, token_end))
+}
+
+fn next_quoted_string(text: &str, start: usize) -> Option<(String, usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    while index < bytes.len() {
+        let quote = bytes[index];
+        if quote == b'\'' || quote == b'"' {
+            let mut value = String::new();
+            let mut cursor = index + 1;
+            while cursor < bytes.len() {
+                let ch = bytes[cursor] as char;
+                if bytes[cursor] == b'\\' {
+                    if cursor + 1 < bytes.len() {
+                        value.push(bytes[cursor + 1] as char);
+                        cursor += 2;
+                        continue;
+                    }
+                    return None;
+                }
+                if bytes[cursor] == quote {
+                    return Some((value, index, cursor + 1));
+                }
+                value.push(ch);
+                cursor += 1;
+            }
+            return None;
+        }
+        index += 1;
+    }
+    None
+}
+
+fn cast_value_to_type(value: &str) -> Option<TypeInfo> {
+    let mut normalized = value.trim().trim_matches(['\'', '"']).to_string();
+    if let Some(class_name) = normalized.strip_suffix("::class") {
+        return Some(TypeInfo::Simple(
+            class_name.trim_start_matches('\\').to_string(),
+        ));
+    }
+    if let Some(rest) = normalized.strip_prefix("encrypted:") {
+        normalized = rest.to_string();
+    }
+    let base = normalized
+        .split(':')
+        .next()
+        .unwrap_or(normalized.as_str())
+        .to_ascii_lowercase();
+
+    match base.as_str() {
+        "int" | "integer" => Some(TypeInfo::Simple("int".to_string())),
+        "real" | "float" | "double" => Some(TypeInfo::Simple("float".to_string())),
+        "decimal" | "string" => Some(TypeInfo::Simple("string".to_string())),
+        "bool" | "boolean" => Some(TypeInfo::Simple("bool".to_string())),
+        "array" | "json" => Some(TypeInfo::Simple("array".to_string())),
+        "object" => Some(TypeInfo::Simple("object".to_string())),
+        "collection" => Some(TypeInfo::Simple(
+            "Illuminate\\Support\\Collection".to_string(),
+        )),
+        "date" | "datetime" | "immutable_date" | "immutable_datetime" | "timestamp" => {
+            Some(TypeInfo::Simple("Carbon\\CarbonInterface".to_string()))
+        }
+        _ if normalized.contains('\\') => Some(TypeInfo::Simple(
+            normalized.trim_start_matches('\\').to_string(),
+        )),
+        _ => None,
+    }
+}
+
+fn legacy_accessor_property_name(method_name: &str) -> Option<String> {
+    let stem = method_name.strip_prefix("get")?.strip_suffix("Attribute")?;
+    (!stem.is_empty()).then(|| studly_to_snake(stem))
+}
+
+fn modern_attribute_get_type(method: &SymbolInfo) -> Option<TypeInfo> {
+    let return_type = method.signature.as_ref()?.return_type.as_ref()?;
+    match return_type {
+        TypeInfo::Generic { base, args } if type_name_ends_with(base, "Attribute") => {
+            args.first().cloned().or(Some(TypeInfo::Mixed))
+        }
+        TypeInfo::Simple(base) if type_name_ends_with(base, "Attribute") => Some(TypeInfo::Mixed),
+        _ => None,
+    }
+}
+
+fn type_name_ends_with(type_name: &str, suffix: &str) -> bool {
+    type_name
+        .trim_start_matches('\\')
+        .rsplit('\\')
+        .next()
+        .is_some_and(|name| name == suffix)
+}
+
+fn studly_to_snake(value: &str) -> String {
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if ch.is_uppercase() && idx > 0 {
+            out.push('_');
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+fn class_has_magic_property_method(
+    ctx: &FrameworkProviderContext<'_>,
+    class_fqn: &str,
+    method_name: &str,
+) -> bool {
+    ctx.index.get_members(class_fqn).into_iter().any(|member| {
+        member.kind == PhpSymbolKind::Method
+            && member.name.eq_ignore_ascii_case(method_name)
+            && !member.modifiers.is_static
+    })
 }
 
 fn is_symfony_controller_helper(member_name: &str) -> bool {
@@ -594,6 +1123,14 @@ fn is_symfony_controller_helper(member_name: &str) -> bool {
             | "createformbuilder"
             | "getparameter"
     )
+}
+
+fn phpdoc_property_tag(access: PhpDocPropertyAccess) -> &'static str {
+    match access {
+        PhpDocPropertyAccess::ReadWrite => "@property",
+        PhpDocPropertyAccess::ReadOnly => "@property-read",
+        PhpDocPropertyAccess::WriteOnly => "@property-write",
+    }
 }
 
 fn is_laravel_eloquent_dynamic_method(member_name: &str) -> bool {
@@ -662,6 +1199,13 @@ fn hash_workspace_root(root: Option<&Path>) -> u64 {
     hasher.finish()
 }
 
+fn hash_source(source: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    source.len().hash(&mut hasher);
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn hash_namespace_map(namespace_map: &NamespaceMap) -> u64 {
     let mut hasher = DefaultHasher::new();
     let mut entries = Vec::new();
@@ -726,6 +1270,8 @@ fn hash_relevant_files(paths: &[PathBuf]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use php_lsp_parser::parser::FileParser;
+    use php_lsp_parser::symbols::extract_file_symbols;
     use php_lsp_types::{PhpSymbolKind, SymbolInfo};
     use std::cell::Cell;
     use std::fs;
@@ -917,6 +1463,178 @@ mod tests {
                 query
             );
         }
+    }
+
+    #[test]
+    fn laravel_model_virtual_properties_cover_static_sources() {
+        let uri = "file:///laravel-model.php";
+        let source = r#"<?php
+namespace Illuminate\Database\Eloquent;
+class Model {}
+
+namespace Illuminate\Database\Eloquent\Casts;
+class Attribute {}
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+
+/**
+ * @property-read string $slug
+ */
+class User extends Model
+{
+    protected $fillable = ['name'];
+    protected $hidden = ['secret_token'];
+    protected $casts = [
+        'is_admin' => 'boolean',
+        'meta' => 'array',
+        'joined_at' => 'datetime',
+    ];
+
+    protected function casts(): array
+    {
+        return ['score' => 'integer'];
+    }
+
+    public function getFullNameAttribute(): string
+    {
+        return '';
+    }
+
+    /**
+     * @return Attribute<int, int>
+     */
+    protected function age()
+    {
+        return Attribute::make(get: fn () => 1);
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        let file_symbols = extract_file_symbols(parser.tree().unwrap(), source, uri);
+        let index = WorkspaceIndex::new();
+        index.update_file(uri, file_symbols.clone());
+
+        let registry = default_framework_provider_registry();
+        let ctx = FrameworkProviderContext::new(&index)
+            .with_source_uri(Some(uri))
+            .with_file(Some(&file_symbols), Some(source));
+        let candidates = registry.virtual_member_candidates(
+            &ctx,
+            "App\\Models\\User",
+            Some(VirtualMemberKind::Property),
+        );
+        let by_name: HashMap<_, _> = candidates
+            .iter()
+            .map(|property| (property.name.as_str(), property))
+            .collect();
+
+        assert_eq!(
+            by_name
+                .get("slug")
+                .and_then(|property| property.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("string")
+        );
+        assert_eq!(
+            by_name
+                .get("is_admin")
+                .and_then(|property| property.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("bool")
+        );
+        assert_eq!(
+            by_name
+                .get("meta")
+                .and_then(|property| property.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("array")
+        );
+        assert_eq!(
+            by_name
+                .get("score")
+                .and_then(|property| property.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("int")
+        );
+        assert_eq!(
+            by_name
+                .get("full_name")
+                .and_then(|property| property.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("string")
+        );
+        assert_eq!(
+            by_name
+                .get("age")
+                .and_then(|property| property.type_info.as_ref())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("int")
+        );
+        assert!(matches!(
+            by_name
+                .get("name")
+                .and_then(|property| property.type_info.as_ref()),
+            Some(TypeInfo::Mixed)
+        ));
+        assert!(matches!(
+            by_name
+                .get("secret_token")
+                .and_then(|property| property.type_info.as_ref()),
+            Some(TypeInfo::Mixed)
+        ));
+        assert!(
+            by_name.get("is_admin").is_some_and(|property| property
+                .sources
+                .iter()
+                .any(|source| matches!(source, VirtualMemberSource::SourceRange { .. }))),
+            "$casts property should retain a source range"
+        );
+    }
+
+    #[test]
+    fn laravel_model_unknown_property_uses_magic_fallback_for_diagnostics() {
+        let index = WorkspaceIndex::new();
+        let uri = "file:///magic-model.php";
+        index.update_file(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    class_symbol("Illuminate\\Database\\Eloquent\\Model", Vec::new()),
+                    class_symbol(
+                        "App\\Models\\User",
+                        vec!["Illuminate\\Database\\Eloquent\\Model"],
+                    ),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let ctx = FrameworkProviderContext::new(&index);
+        let registry = default_framework_provider_registry();
+        let query = VirtualMemberQuery {
+            owner_fqn: "App\\Models\\User".to_string(),
+            member_name: "$not_declared".to_string(),
+            kind: VirtualMemberKind::Property,
+        };
+
+        let members = registry.virtual_members(&ctx, &query);
+
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0].detail.as_deref(),
+            Some("Laravel Eloquent dynamic member")
+        );
     }
 
     struct StaticStringKeyProvider;

@@ -2439,6 +2439,29 @@ impl PhpLspBackend {
         })
     }
 
+    async fn framework_virtual_member_location(
+        &self,
+        member: &crate::framework::VirtualMember,
+    ) -> Option<Location> {
+        let (uri, range) = member.sources.iter().find_map(|source| match source {
+            crate::framework::VirtualMemberSource::SourceRange { uri, range } => {
+                Some((uri.clone(), *range))
+            }
+            crate::framework::VirtualMemberSource::Synthetic { .. } => None,
+        })?;
+        let source = self
+            .source_for_uri(&uri, "framework virtual member source read")
+            .await?;
+        let utf16_range = range_byte_to_utf16(&source, range);
+        Some(Location {
+            uri: uri.parse::<Uri>().ok()?,
+            range: Range {
+                start: Position::new(utf16_range.0, utf16_range.1),
+                end: Position::new(utf16_range.2, utf16_range.3),
+            },
+        })
+    }
+
     fn type_definition_fqn_for_symbol(
         &self,
         symbol: &php_lsp_types::SymbolInfo,
@@ -13120,6 +13143,7 @@ fn compute_diagnostics_with_config_for_version(
         let members_started = Instant::now();
         diagnostics.extend(apply_diagnostic_category(
             member_access_diagnostics(
+                uri_str,
                 tree,
                 &source,
                 &file_symbols,
@@ -13298,7 +13322,9 @@ fn diagnostic_at_byte_range(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn member_access_diagnostics(
+    uri_str: &str,
     tree: &tree_sitter::Tree,
     source: &str,
     file_symbols: &php_lsp_types::FileSymbols,
@@ -13311,6 +13337,7 @@ fn member_access_diagnostics(
     walk_member_access_diagnostics(
         tree,
         tree.root_node(),
+        uri_str,
         source,
         file_symbols,
         index,
@@ -13326,6 +13353,7 @@ fn member_access_diagnostics(
 fn walk_member_access_diagnostics(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
+    uri_str: &str,
     source: &str,
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
@@ -13345,6 +13373,7 @@ fn walk_member_access_diagnostics(
         check_member_access_node(
             tree,
             node,
+            uri_str,
             source,
             file_symbols,
             index,
@@ -13360,6 +13389,7 @@ fn walk_member_access_diagnostics(
         walk_member_access_diagnostics(
             tree,
             child,
+            uri_str,
             source,
             file_symbols,
             index,
@@ -13375,6 +13405,7 @@ fn walk_member_access_diagnostics(
 fn check_member_access_node(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
+    uri_str: &str,
     source: &str,
     file_symbols: &php_lsp_types::FileSymbols,
     index: &WorkspaceIndex,
@@ -13442,7 +13473,14 @@ fn check_member_access_node(
             )
             || is_missing_parent_constructor_call(&sym_at_pos)
             || is_enum_builtin_method_call(index, &sym_at_pos)
-            || is_dynamic_member_access(index, file_symbols, &sym_at_pos, framework_cache)
+            || is_dynamic_member_access(
+                index,
+                file_symbols,
+                uri_str,
+                source,
+                &sym_at_pos,
+                framework_cache,
+            )
         {
             return;
         }
@@ -13660,6 +13698,8 @@ fn phpunit_test_double_type_has_method(class_fqn: &str, member_name: &str) -> bo
 fn is_dynamic_member_access(
     index: &WorkspaceIndex,
     file_symbols: &php_lsp_types::FileSymbols,
+    uri_str: &str,
+    source: &str,
     sym_at_pos: &SymbolAtPosition,
     framework_cache: &crate::framework::FrameworkProviderCache,
 ) -> bool {
@@ -13681,8 +13721,9 @@ fn is_dynamic_member_access(
         sym_at_pos.ref_kind,
     );
     let framework_ctx = crate::framework::FrameworkProviderContext::new(index)
+        .with_source_uri(Some(uri_str))
         .with_workspace(None, None)
-        .with_file(Some(file_symbols), None)
+        .with_file(Some(file_symbols), Some(source))
         .with_relevant_files(&[]);
     let framework_registry = crate::framework::default_framework_provider_registry();
 
@@ -15586,6 +15627,44 @@ fn phpdoc_virtual_member(
     None
 }
 
+fn framework_virtual_member_for_symbol(
+    index: &WorkspaceIndex,
+    sym: &SymbolAtPosition,
+    source_uri: Option<&str>,
+    file_symbols: Option<&php_lsp_types::FileSymbols>,
+    source: Option<&str>,
+) -> Option<crate::framework::VirtualMember> {
+    let (class_fqn, member_name) = sym.fqn.rsplit_once("::")?;
+    let query =
+        crate::framework::VirtualMemberQuery::from_ref_kind(class_fqn, member_name, sym.ref_kind)?;
+    let ctx = crate::framework::FrameworkProviderContext::new(index)
+        .with_source_uri(source_uri)
+        .with_file(file_symbols, source)
+        .with_relevant_files(&[]);
+    let registry = crate::framework::default_framework_provider_registry();
+    let cache = crate::framework::FrameworkProviderCache::default();
+    cache
+        .virtual_members(&registry, &ctx, &query)
+        .into_iter()
+        .next()
+}
+
+fn framework_virtual_member_candidates(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    source_uri: Option<&str>,
+    file_symbols: Option<&php_lsp_types::FileSymbols>,
+    source: Option<&str>,
+    kind: Option<crate::framework::VirtualMemberKind>,
+) -> Vec<crate::framework::VirtualMember> {
+    let ctx = crate::framework::FrameworkProviderContext::new(index)
+        .with_source_uri(source_uri)
+        .with_file(file_symbols, source)
+        .with_relevant_files(&[]);
+    let registry = crate::framework::default_framework_provider_registry();
+    registry.virtual_member_candidates(&ctx, class_fqn, kind)
+}
+
 fn phpdoc_property_tag(access: php_lsp_types::PhpDocPropertyAccess) -> &'static str {
     match access {
         php_lsp_types::PhpDocPropertyAccess::ReadWrite => "@property",
@@ -15597,6 +15676,18 @@ fn phpdoc_property_tag(access: php_lsp_types::PhpDocPropertyAccess) -> &'static 
 fn phpdoc_virtual_completion_data(item: &CompletionItem) -> Option<(&str, &str, &str)> {
     let data = item.data.as_ref()?;
     if data.get("kind")?.as_str()? != "phpdoc-virtual-member" {
+        return None;
+    }
+    Some((
+        data.get("ownerFqn")?.as_str()?,
+        data.get("memberKind")?.as_str()?,
+        data.get("memberName")?.as_str()?,
+    ))
+}
+
+fn framework_virtual_completion_data(item: &CompletionItem) -> Option<(&str, &str, &str)> {
+    let data = item.data.as_ref()?;
+    if data.get("kind")?.as_str()? != "framework-virtual-member" {
         return None;
     }
     Some((
@@ -15643,6 +15734,125 @@ fn phpdoc_virtual_member_markdown(member: &PhpDocVirtualMember) -> String {
         content.push('\n');
     }
     content
+}
+
+fn framework_virtual_member_detail(member: &crate::framework::VirtualMember) -> String {
+    match member.kind {
+        crate::framework::VirtualMemberKind::Property
+        | crate::framework::VirtualMemberKind::StaticProperty => {
+            let access = member
+                .access
+                .map(phpdoc_property_tag)
+                .unwrap_or("@property");
+            match member.type_info.as_ref() {
+                Some(type_info) => format!("{} {}", access, type_info),
+                None => access.to_string(),
+            }
+        }
+        crate::framework::VirtualMemberKind::Method => member
+            .type_info
+            .as_ref()
+            .map(|type_info| format!("(): {}", type_info))
+            .unwrap_or_else(|| "()".to_string()),
+        crate::framework::VirtualMemberKind::ClassConstant => "class constant".to_string(),
+    }
+}
+
+fn framework_virtual_member_markdown(member: &crate::framework::VirtualMember) -> String {
+    let mut content = String::new();
+    content.push_str("```php\n");
+    match member.kind {
+        crate::framework::VirtualMemberKind::Property
+        | crate::framework::VirtualMemberKind::StaticProperty => {
+            let access = member
+                .access
+                .map(phpdoc_property_tag)
+                .unwrap_or("@property");
+            content.push_str(access);
+            if let Some(ref type_info) = member.type_info {
+                content.push(' ');
+                content.push_str(&type_info.to_string());
+            }
+            content.push_str(" $");
+            content.push_str(member.name.trim_start_matches('$'));
+        }
+        crate::framework::VirtualMemberKind::Method => {
+            content.push_str("@method ");
+            if let Some(ref type_info) = member.type_info {
+                content.push_str(&type_info.to_string());
+                content.push(' ');
+            }
+            content.push_str(&member.name);
+            content.push_str("()");
+        }
+        crate::framework::VirtualMemberKind::ClassConstant => {
+            content.push_str("const ");
+            content.push_str(&member.name);
+        }
+    }
+    content.push_str("\n```\n");
+    if let Some(ref detail) = member.detail {
+        content.push_str("\n---\n\n");
+        content.push_str(detail);
+        content.push('\n');
+    }
+    content
+}
+
+fn framework_virtual_completion_item(
+    member: &crate::framework::VirtualMember,
+    member_prefix: &str,
+) -> lsp_types::CompletionItem {
+    let label = member.name.trim_start_matches('$').to_string();
+    let rank = if label.starts_with(member_prefix) {
+        "0"
+    } else if label
+        .to_ascii_lowercase()
+        .contains(&member_prefix.to_ascii_lowercase())
+    {
+        "1"
+    } else {
+        "2"
+    };
+
+    lsp_types::CompletionItem {
+        label: label.clone(),
+        kind: Some(match member.kind {
+            crate::framework::VirtualMemberKind::Method => lsp_types::CompletionItemKind::METHOD,
+            crate::framework::VirtualMemberKind::Property
+            | crate::framework::VirtualMemberKind::StaticProperty => {
+                lsp_types::CompletionItemKind::PROPERTY
+            }
+            crate::framework::VirtualMemberKind::ClassConstant => {
+                lsp_types::CompletionItemKind::CONSTANT
+            }
+        }),
+        detail: Some(framework_virtual_member_detail(member)),
+        documentation: Some(lsp_types::Documentation::MarkupContent(
+            lsp_types::MarkupContent {
+                kind: lsp_types::MarkupKind::Markdown,
+                value: framework_virtual_member_markdown(member),
+            },
+        )),
+        sort_text: Some(format!("2_{}_{}", rank, label.to_ascii_lowercase())),
+        filter_text: Some(format!("{} {}", label, member.fqn)),
+        data: Some(serde_json::json!({
+            "kind": "framework-virtual-member",
+            "ownerFqn": member.owner_fqn.as_str(),
+            "memberKind": match member.kind {
+                crate::framework::VirtualMemberKind::Method => "method",
+                crate::framework::VirtualMemberKind::Property
+                    | crate::framework::VirtualMemberKind::StaticProperty => "property",
+                crate::framework::VirtualMemberKind::ClassConstant => "constant",
+            },
+            "memberName": member.name.as_str(),
+        })),
+        commit_characters: Some(match member.kind {
+            crate::framework::VirtualMemberKind::Method => vec!["(".to_string()],
+            _ => vec![";".to_string(), ",".to_string()],
+        }),
+        ..Default::default()
+    }
 }
 
 fn phpdoc_extra_markdown_sections(phpdoc: &php_lsp_types::PhpDoc) -> Vec<String> {
@@ -19226,7 +19436,7 @@ impl LanguageServer for PhpLspBackend {
         tracing::debug!("hover: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position and local variable hover info inside a block so DashMap guard is dropped.
-        let (sym_at_pos, local_var_hover) = {
+        let (sym_at_pos, local_var_hover, file_symbols, source) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -19295,7 +19505,7 @@ impl LanguageServer for PhpLspBackend {
                 None
             };
 
-            (sym_at_pos, local_var_hover)
+            (sym_at_pos, local_var_hover, file_symbols, source)
         };
 
         // Look up symbol in index (with lazy vendor fallback)
@@ -19322,6 +19532,17 @@ impl LanguageServer for PhpLspBackend {
 
         let virtual_member = if symbol_info.is_none() {
             phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)
+        } else {
+            None
+        };
+        let framework_virtual_member = if symbol_info.is_none() && virtual_member.is_none() {
+            framework_virtual_member_for_symbol(
+                &self.index,
+                &sym_at_pos,
+                Some(&uri_str),
+                Some(&file_symbols),
+                Some(&source),
+            )
         } else {
             None
         };
@@ -19460,6 +19681,18 @@ impl LanguageServer for PhpLspBackend {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: phpdoc_virtual_member_markdown(&virtual_member),
+                }),
+                range: Some(range),
+            })
+        } else if let Some(virtual_member) = framework_virtual_member {
+            let range = Range {
+                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
+                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
+            };
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: framework_virtual_member_markdown(&virtual_member),
                 }),
                 range: Some(range),
             })
@@ -19797,7 +20030,7 @@ impl LanguageServer for PhpLspBackend {
         tracing::debug!("gotoDefinition: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position inside a block so DashMap guard is dropped
-        let (sym_at_pos, local_var_def, this_class_def, shape_def) = {
+        let (sym_at_pos, local_var_def, this_class_def, shape_def, file_symbols, source) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -19850,7 +20083,14 @@ impl LanguageServer for PhpLspBackend {
                     None
                 }
             });
-            (sym, local_var_def, this_class_def, shape_def)
+            (
+                sym,
+                local_var_def,
+                this_class_def,
+                shape_def,
+                file_symbols,
+                source,
+            )
         };
 
         if let Some(def) = shape_def {
@@ -19939,6 +20179,16 @@ impl LanguageServer for PhpLspBackend {
             phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)
         {
             self.phpdoc_virtual_member_location(&virtual_member)
+                .await
+                .map(GotoDefinitionResponse::Scalar)
+        } else if let Some(virtual_member) = framework_virtual_member_for_symbol(
+            &self.index,
+            &sym_at_pos,
+            Some(&uri_str),
+            Some(&file_symbols),
+            Some(&source),
+        ) {
+            self.framework_virtual_member_location(&virtual_member)
                 .await
                 .map(GotoDefinitionResponse::Scalar)
         } else {
@@ -20867,6 +21117,20 @@ impl LanguageServer for PhpLspBackend {
                 "Cannot rename PHPDoc virtual members",
             ));
         }
+        if resolved_for_rename.is_none()
+            && framework_virtual_member_for_symbol(
+                &self.index,
+                &sym,
+                Some(&uri_str),
+                Some(&file_symbols),
+                Some(&source),
+            )
+            .is_some()
+        {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "Cannot rename framework virtual members",
+            ));
+        }
 
         // Resolve symbol under cursor
         let (target_fqn, target_kind, _old_name) = {
@@ -21000,6 +21264,18 @@ impl LanguageServer for PhpLspBackend {
                 let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
                 if resolved.is_none()
                     && phpdoc_virtual_member_for_symbol(&self.index, &sym).is_some()
+                {
+                    return Ok(None);
+                }
+                if resolved.is_none()
+                    && framework_virtual_member_for_symbol(
+                        &self.index,
+                        &sym,
+                        Some(&uri_str),
+                        Some(&file_symbols),
+                        Some(&source),
+                    )
+                    .is_some()
                 {
                     return Ok(None);
                 }
@@ -22391,7 +22667,7 @@ impl LanguageServer for PhpLspBackend {
         if let php_lsp_completion::context::CompletionContext::MemberAccess {
             object_expr,
             member_prefix,
-            ..
+            class_fqn,
         } = &context
         {
             self.add_object_shape_completion_items(
@@ -22400,6 +22676,23 @@ impl LanguageServer for PhpLspBackend {
                 object_expr,
                 member_prefix,
             );
+            if let Some(class_fqn) = class_fqn {
+                let mut seen_labels: HashSet<String> =
+                    lsp_items.iter().map(|item| item.label.clone()).collect();
+                for member in framework_virtual_member_candidates(
+                    &self.index,
+                    class_fqn,
+                    Some(&uri_str),
+                    Some(&file_symbols),
+                    Some(&source),
+                    Some(crate::framework::VirtualMemberKind::Property),
+                ) {
+                    let label = member.name.trim_start_matches('$').to_string();
+                    if seen_labels.insert(label) {
+                        lsp_items.push(framework_virtual_completion_item(&member, member_prefix));
+                    }
+                }
+            }
         }
 
         let enable_auto_imports = matches!(
@@ -22476,6 +22769,10 @@ impl LanguageServer for PhpLspBackend {
     }
 
     async fn completion_resolve(&self, mut item: CompletionItem) -> Result<CompletionItem> {
+        if framework_virtual_completion_data(&item).is_some() {
+            return Ok(item);
+        }
+
         let virtual_data =
             phpdoc_virtual_completion_data(&item).map(|(owner_fqn, member_kind, member_name)| {
                 (
