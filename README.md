@@ -39,6 +39,9 @@ phpstorm-stubs support.
   chains, and local variable type inlay hints.
 - Shape-aware inference for PHPDoc `array{...}` / `object{...}` and literal
   array shapes in completion and key navigation.
+- Closure and arrow-function parameter inference from `callable(...)`
+  signatures, including generic map/filter-style collection callbacks and
+  `array_map`-style helpers.
 - Override signature and PHP-version compatibility diagnostics.
 - Optional PHPStan and Psalm diagnostics through configured external commands.
 - Per-category diagnostic severity controls for unknown symbols, unused code,
@@ -181,8 +184,10 @@ phpstorm-stubs support.
   references and rename are local-scope oriented.
 - Type inference includes common PHPDoc generic inheritance bindings,
   `class-string<T>` call-site bindings, conditional return fallbacks, and
-  class/file-scoped PHPStan/Psalm type aliases plus best-effort PHPDoc/literal
-  shapes, but it is still shallow compared with mature PHP static analyzers.
+  class/file-scoped PHPStan/Psalm type aliases, callback parameter inference,
+  `Generator<TKey,TValue>` foreach key/value inference, and best-effort
+  PHPDoc/literal shapes, but it is still shallow compared with mature PHP
+  static analyzers.
 - Built-in semantic diagnostics depend on indexed project and vendor symbols.
   If Composer/vendor metadata is absent, external framework classes can be
   reported as unknown; dynamic framework APIs such as some Eloquent relation

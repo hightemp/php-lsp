@@ -19,11 +19,11 @@ use php_lsp_parser::references::{
     find_variable_references_at_position,
 };
 use php_lsp_parser::resolve::{
-    infer_property_type_from_assignments, infer_variable_hover_info_at_node,
-    infer_variable_type_at_position, infer_variable_type_at_position_with_resolver,
-    infer_variable_type_info_at_position_with_resolver, local_variable_names_at_position,
-    resolve_class_name_pub, symbol_at_position, symbol_at_position_with_resolver,
-    variable_definition_at_position, variable_hover_info_at_position, RefKind, SymbolAtPosition,
+    infer_property_type_from_assignments, infer_variable_hover_info_at_node_with_resolvers,
+    infer_variable_type_at_position_with_resolvers,
+    infer_variable_type_info_at_position_with_resolvers, local_variable_names_at_position,
+    resolve_class_name_pub, symbol_at_position, symbol_at_position_with_resolvers,
+    variable_definition_at_position, CallableParameterContext, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
     find_missing_return_type_candidates, MissingReturnTypeCandidate,
@@ -1698,14 +1698,18 @@ impl PhpLspBackend {
         let resolve_member_type = |class_fqn: &str, member_name: &str| {
             self.resolve_completion_member_type(class_fqn, member_name, file_symbols)
         };
-        infer_variable_type_at_position_with_resolver(
+        let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+            resolve_callable_parameter_type_from_index(&self.index, file_symbols, ctx)
+        };
+        infer_variable_type_at_position_with_resolvers(
             tree,
             source,
             file_symbols,
             line,
             byte_col,
             var_name,
-            &resolve_member_type,
+            Some(&resolve_member_type),
+            Some(&callable_param_resolver),
         )
     }
 
@@ -1785,14 +1789,18 @@ impl PhpLspBackend {
         let resolve_member_type = |class_fqn: &str, member_name: &str| {
             self.resolve_completion_member_type(class_fqn, member_name, ctx.file_symbols)
         };
-        infer_variable_type_info_at_position_with_resolver(
+        let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
+            resolve_callable_parameter_type_from_index(&self.index, ctx.file_symbols, callable_ctx)
+        };
+        infer_variable_type_info_at_position_with_resolvers(
             ctx.tree,
             ctx.source,
             ctx.file_symbols,
             ctx.line,
             ctx.byte_col,
             expr,
-            &resolve_member_type,
+            Some(&resolve_member_type),
+            Some(&callable_param_resolver),
         )
     }
 
@@ -9959,13 +9967,17 @@ fn local_variable_inlay_type(
     let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         resolve_member_type_from_index(ctx.index, class_fqn, member_name)
     };
-    let info = infer_variable_hover_info_at_node(
+    let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
+        resolve_callable_parameter_type_from_index(ctx.index, ctx.file_symbols, callable_ctx)
+    };
+    let info = infer_variable_hover_info_at_node_with_resolvers(
         variable_node,
         ctx.source,
         ctx.file_symbols,
         usage_start,
         variable_name,
         Some(&resolver),
+        Some(&callable_param_resolver),
     )?;
 
     local_variable_type_from_hover_info(&info, ctx.file_symbols, false)
@@ -10450,18 +10462,129 @@ fn call_site_variable_phpdoc_type(
     let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         resolve_member_type_from_index(ctx.index, class_fqn, member_name)
     };
-    let info = infer_variable_hover_info_at_node(
+    let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
+        resolve_callable_parameter_type_from_index(ctx.index, ctx.file_symbols, callable_ctx)
+    };
+    let info = infer_variable_hover_info_at_node_with_resolvers(
         node,
         ctx.source,
         ctx.file_symbols,
         node.start_byte(),
         &variable_name,
         Some(&resolver),
+        Some(&callable_param_resolver),
     )?;
     let phpdoc = parse_phpdoc(info.phpdoc_comment.as_deref()?);
     phpdoc
         .var_type
         .map(|type_info| resolve_call_site_type_names(&type_info, ctx.file_symbols))
+}
+
+fn resolve_callable_parameter_type_from_index(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    ctx: CallableParameterContext<'_>,
+) -> Option<php_lsp_types::TypeInfo> {
+    let symbol = index.resolve_fqn(ctx.target_fqn)?;
+    let signature = symbol.signature.as_ref()?;
+    let callable_param =
+        signature_param_for_call_arg(signature, ctx.argument_index, ctx.argument_name)?;
+    let expected = callable_param.type_info.as_ref()?;
+    let template_names = callable_template_names_from_index(index, &symbol, ctx.target_fqn);
+    let mut substitutions = receiver_template_substitutions_from_index(index, file_symbols, &ctx);
+
+    for arg in ctx.argument_types {
+        if arg.argument_index == ctx.argument_index {
+            continue;
+        }
+        let Some(param) = signature_param_for_call_arg(
+            signature,
+            arg.argument_index,
+            arg.argument_name.as_deref(),
+        ) else {
+            continue;
+        };
+        let Some(param_type) = param.type_info.as_ref() else {
+            continue;
+        };
+        bind_template_type_info(
+            param_type,
+            &arg.type_info,
+            &template_names,
+            &mut substitutions,
+        );
+    }
+
+    let expected = substitute_call_site_type_info(expected, &substitutions);
+    callable_param_type_from_type_info(&expected, ctx.parameter_index)
+}
+
+fn callable_template_names_from_index(
+    index: &WorkspaceIndex,
+    symbol: &php_lsp_types::SymbolInfo,
+    target_fqn: &str,
+) -> HashSet<String> {
+    let mut names = symbol
+        .templates
+        .iter()
+        .map(|template| template.name.clone())
+        .collect::<HashSet<_>>();
+    if let Some((class_fqn, _)) = target_fqn.rsplit_once("::") {
+        if let Some(class_symbol) = index.resolve_fqn(class_fqn) {
+            names.extend(
+                class_symbol
+                    .templates
+                    .iter()
+                    .map(|template| template.name.clone()),
+            );
+        }
+    }
+    names
+}
+
+fn receiver_template_substitutions_from_index(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    ctx: &CallableParameterContext<'_>,
+) -> HashMap<String, php_lsp_types::TypeInfo> {
+    let mut substitutions = HashMap::new();
+    let Some((class_fqn, _)) = ctx.target_fqn.rsplit_once("::") else {
+        return substitutions;
+    };
+    let Some(php_lsp_types::TypeInfo::Generic { base, args }) = ctx.receiver_type else {
+        return substitutions;
+    };
+    let resolved_base = resolve_class_name_pub(base, file_symbols)
+        .trim_start_matches('\\')
+        .to_string();
+    if resolved_base != class_fqn.trim_start_matches('\\') {
+        return substitutions;
+    }
+    let Some(class_symbol) = index.resolve_fqn(class_fqn) else {
+        return substitutions;
+    };
+    for (template, arg) in class_symbol.templates.iter().zip(args.iter()) {
+        substitutions.insert(template.name.clone(), arg.clone());
+    }
+    substitutions
+}
+
+fn callable_param_type_from_type_info(
+    type_info: &php_lsp_types::TypeInfo,
+    parameter_index: usize,
+) -> Option<php_lsp_types::TypeInfo> {
+    match type_info {
+        php_lsp_types::TypeInfo::Callable { params, .. } => params.get(parameter_index).cloned(),
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            callable_param_type_from_type_info(inner, parameter_index)
+        }
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            types.iter().find_map(|type_info| {
+                callable_param_type_from_type_info(type_info, parameter_index)
+            })
+        }
+        _ => None,
+    }
 }
 
 fn call_site_template_substitutions(
@@ -10871,13 +10994,17 @@ fn local_variable_inlay_type_from_variable_expression(
     let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         resolve_member_type_from_index(ctx.index, class_fqn, member_name)
     };
-    let info = infer_variable_hover_info_at_node(
+    let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
+        resolve_callable_parameter_type_from_index(ctx.index, ctx.file_symbols, callable_ctx)
+    };
+    let info = infer_variable_hover_info_at_node_with_resolvers(
         expression,
         ctx.source,
         ctx.file_symbols,
         expression.start_byte(),
         &variable_name,
         Some(&resolver),
+        Some(&callable_param_resolver),
     )?;
 
     local_variable_type_from_hover_info(&info, ctx.file_symbols, false)
@@ -10936,13 +11063,17 @@ fn local_variable_hover_data(
     let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         resolve_member_type_from_index(ctx.index, class_fqn, member_name)
     };
-    let parser_info = infer_variable_hover_info_at_node(
+    let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
+        resolve_callable_parameter_type_from_index(ctx.index, ctx.file_symbols, callable_ctx)
+    };
+    let parser_info = infer_variable_hover_info_at_node_with_resolvers(
         variable_node,
         ctx.source,
         ctx.file_symbols,
         usage_start,
         &variable_name,
         Some(&resolver),
+        Some(&callable_param_resolver),
     );
     let type_hint = rhs_node
         .and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
@@ -12919,13 +13050,17 @@ fn check_member_access_node(
     let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         resolve_member_type_from_index(index, class_fqn, member_name)
     };
-    let Some(sym_at_pos) = symbol_at_position_with_resolver(
+    let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+        resolve_callable_parameter_type_from_index(index, file_symbols, ctx)
+    };
+    let Some(sym_at_pos) = symbol_at_position_with_resolvers(
         tree,
         source,
         pos.row as u32,
         pos.column as u32,
         file_symbols,
         Some(&member_type_resolver),
+        Some(&callable_param_resolver),
     ) else {
         return;
     };
@@ -14091,13 +14226,18 @@ fn resolve_reference_symbol_at_node(
     let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         resolve_member_type_from_index(index, class_fqn, member_name)
     };
-    let sym_at_pos = symbol_at_position_with_resolver(
+    let callable_param_resolver =
+        |ctx: CallableParameterContext<'_>| -> Option<php_lsp_types::TypeInfo> {
+            resolve_callable_parameter_type_from_index(index, file_symbols, ctx)
+        };
+    let sym_at_pos = symbol_at_position_with_resolvers(
         tree,
         source,
         pos.row as u32,
         pos.column as u32,
         file_symbols,
         Some(&member_type_resolver),
+        Some(&callable_param_resolver),
     )?;
     let resolved = index.resolve_fqn(&sym_at_pos.fqn)?;
     Some((sym_at_pos, resolved))
@@ -18722,15 +18862,19 @@ impl LanguageServer for PhpLspBackend {
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
+            let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+            };
 
             // Find symbol at cursor position (with resolver for chains)
-            let sym_at_pos = match symbol_at_position_with_resolver(
+            let sym_at_pos = match symbol_at_position_with_resolvers(
                 tree,
                 &source,
                 pos.line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
+                Some(&callable_param_resolver),
             ) {
                 Some(s) => s,
                 None => return Ok(None),
@@ -19028,33 +19172,48 @@ impl LanguageServer for PhpLspBackend {
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
+            let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+            };
 
-            let sym_at_pos = symbol_at_position_with_resolver(
+            let sym_at_pos = symbol_at_position_with_resolvers(
                 tree,
                 &source,
                 pos.line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
+                Some(&callable_param_resolver),
             );
             let variable_type_fqn = if let Some(sym) = &sym_at_pos {
                 if sym.ref_kind == RefKind::Variable {
-                    variable_hover_info_at_position(
+                    variable_name_node_at_range(
                         tree,
                         &source,
-                        &file_symbols,
-                        pos.line,
-                        byte_col,
+                        (pos.line, byte_col, pos.line, byte_col),
                     )
+                    .and_then(|variable_node| {
+                        infer_variable_hover_info_at_node_with_resolvers(
+                            variable_node,
+                            &source,
+                            &file_symbols,
+                            variable_node.start_byte(),
+                            &sym.name,
+                            Some(&resolver),
+                            Some(&callable_param_resolver),
+                        )
+                    })
                     .and_then(|info| info.resolved_type_fqn)
                     .or_else(|| {
-                        infer_variable_type_at_position(
+                        infer_variable_type_at_position_with_resolvers(
                             tree,
                             &source,
                             &file_symbols,
                             pos.line,
                             byte_col,
                             &sym.name,
+                            Some(&resolver),
+                            Some(&callable_param_resolver),
                         )
                     })
                 } else {
@@ -19145,13 +19304,17 @@ impl LanguageServer for PhpLspBackend {
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
-            let Some(sym_at_pos) = symbol_at_position_with_resolver(
+            let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+            };
+            let Some(sym_at_pos) = symbol_at_position_with_resolvers(
                 tree,
                 &source,
                 pos.line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
+                Some(&callable_param_resolver),
             ) else {
                 return Ok(None);
             };
@@ -19258,18 +19421,22 @@ impl LanguageServer for PhpLspBackend {
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
+            let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+            };
 
             let local_var_def = variable_definition_at_position(tree, &source, pos.line, byte_col)
                 .map(|d| range_byte_to_utf16(&source, d));
             let shape_def = shape_definition_at_position(&source, pos.line, byte_col)
                 .map(|d| range_byte_to_utf16(&source, d));
-            let sym = symbol_at_position_with_resolver(
+            let sym = symbol_at_position_with_resolvers(
                 tree,
                 &source,
                 pos.line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
+                Some(&callable_param_resolver),
             );
             let this_class_def = sym.as_ref().and_then(|sym| {
                 if sym.ref_kind == RefKind::Variable && sym.name == "$this" {
@@ -19632,13 +19799,17 @@ impl LanguageServer for PhpLspBackend {
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
-            let sym_at_pos = symbol_at_position_with_resolver(
+            let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+            };
+            let sym_at_pos = symbol_at_position_with_resolvers(
                 tree,
                 &source,
                 pos.line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
+                Some(&callable_param_resolver),
             );
             let allow_containing_fallback = sym_at_pos
                 .as_ref()
@@ -19846,13 +20017,17 @@ impl LanguageServer for PhpLspBackend {
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
-            let sym_at_pos = symbol_at_position_with_resolver(
+            let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+            };
+            let sym_at_pos = symbol_at_position_with_resolvers(
                 tree,
                 &source,
                 pos.line,
                 byte_col,
                 &file_symbols,
                 Some(&resolver),
+                Some(&callable_param_resolver),
             );
             let candidate = sym_at_pos.as_ref().and_then(|sym| match sym.ref_kind {
                 RefKind::ClassName => Some(sym.fqn.clone()),

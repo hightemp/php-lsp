@@ -4011,6 +4011,164 @@ class CdbHandler extends BaseHandler {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_callback_parameter_inference_from_indexed_signatures() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let definitions = r#"<?php
+namespace App;
+
+class User {
+    public function getName(): string { return ''; }
+}
+
+/**
+ * @template TItem
+ */
+class ExternalCollection {
+    /**
+     * @template TResult
+     * @param callable(TItem): TResult $callback
+     * @return ExternalCollection<TResult>
+     */
+    public function map(callable $callback): self { return $this; }
+}
+
+/**
+ * @template TItem
+ * @template TResult
+ * @param callable(TItem): TResult $callback
+ * @param array<int, TItem> $items
+ * @return array<int, TResult>
+ */
+function external_map(callable $callback, array $items): array { return []; }
+"#;
+
+    let usage = r#"<?php
+namespace App;
+
+function run(): void {
+    /** @var ExternalCollection<User> $users */
+    $users = loadUsers();
+    $users->map(fn($user) => $user->getName());
+
+    /** @var array<int, User> $arrayUsers */
+    $arrayUsers = [];
+    external_map(fn($mappedUser) => $mappedUser->getName(), $arrayUsers);
+}
+"#;
+
+    let defs_uri = "file:///test/callback-definitions.php";
+    let usage_uri = "file:///test/callback-usage.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(defs_uri, definitions))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(usage_uri, usage))
+        .await
+        .unwrap();
+
+    let find_line_col = |needle: &str| -> (u32, u32) {
+        for (line, row) in usage.lines().enumerate() {
+            if let Some(col) = row.find(needle) {
+                return (line as u32, col as u32);
+            }
+        }
+        panic!("needle not found: {needle}");
+    };
+
+    let (collection_line, collection_col) = find_line_col("$user) =>");
+    let collection_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            usage_uri,
+            collection_line,
+            collection_col + 1,
+        ))
+        .await
+        .unwrap();
+    let collection_hover_text = hover_markdown_value(&extract_result(collection_hover));
+    assert!(
+        collection_hover_text.contains("User $user"),
+        "collection callback parameter hover should infer User, got: {}",
+        collection_hover_text
+    );
+
+    let (function_line, function_col) = find_line_col("$mappedUser) =>");
+    let function_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, usage_uri, function_line, function_col + 1))
+        .await
+        .unwrap();
+    let function_hover_text = hover_markdown_value(&extract_result(function_hover));
+    assert!(
+        function_hover_text.contains("User $mappedUser"),
+        "function callback parameter hover should infer User, got: {}",
+        function_hover_text
+    );
+
+    let (method_line, method_col) = find_line_col("$mappedUser->getName");
+    let definition = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            4,
+            usage_uri,
+            method_line,
+            method_col + "$mappedUser->".len() as u32,
+        ))
+        .await
+        .unwrap();
+    let definition_result = extract_result(definition);
+    assert_eq!(
+        definition_result
+            .get("uri")
+            .and_then(|value| value.as_str()),
+        Some(defs_uri),
+        "callback parameter method definition should resolve through indexed signature: {}",
+        definition_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_folding_ranges_for_php_structures() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

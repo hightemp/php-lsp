@@ -1890,12 +1890,35 @@ PR-052 ─→ PR-053
     `cargo clippy --all-targets -- -D warnings`, docs Cyrillic check,
     `git diff --check`.
 
-- [ ] **IE-034** Closure, foreach, and collection callback inference
+- [x] **IE-034** Closure, foreach, and collection callback inference *(done 2026-05-27)*
   - Infer closure/arrow-function params from callable parameter types.
   - Infer foreach key/value from `iterable<TKey,TValue>`, `array<TKey,TValue>`, `Generator<TKey,TValue,...>`.
   - Recognize common map/filter/reduce callback patterns through generic method signatures, not hardcoded project classes.
   - Ensure closure scopes do not leak variables into outer scope.
   - Tests: collection-like generic class fixture, array_map, foreach generator.
+  - Implemented: untyped closure and arrow-function parameters infer from
+    expected `callable(...)` parameter types at function/method call sites.
+  - Implemented: callback parameter inference binds templates from actual call
+    arguments such as `array<int, User>` and from receiver generics such as
+    `Collection<User>`, so map/filter-style methods work through signatures
+    instead of hardcoded collection classes.
+  - Implemented: server hover, definition, diagnostics, completion, and inlay
+    paths pass indexed callable-parameter resolution so callbacks work when
+    helper functions or collection classes live in another indexed file.
+  - Implemented: `foreach ($iterable as $key => $value)` now infers keys and
+    values from `array<TKey,TValue>`, `iterable<TKey,TValue>`,
+    `Generator<TKey,TValue,...>`, list-like types, collection-like generics,
+    and array shapes best-effort.
+  - Guard: closure parameter inference stays scoped to the closure/arrow
+    function and does not leak inferred variables into the outer scope.
+  - Regression: parser tests cover array-map-style helpers, generic collection
+    map/filter callbacks, closure scope isolation, and generator key/value
+    foreach inference.
+  - Regression: server e2e covers callback hover and go-to-definition through
+    indexed helper/collection signatures in separate files.
+  - Docs: `README.md`, `docs/lsp-features.md`, and
+    `docs/production-risk-register.md` mention callback and generator foreach
+    inference.
 
 - [ ] **IE-035** Per-request expression type cache
   - Add request-local cache for expression/member type resolution.

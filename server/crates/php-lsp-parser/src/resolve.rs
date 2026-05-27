@@ -5,9 +5,9 @@
 //! and use statements.
 
 use crate::phpdoc::parse_phpdoc;
-use php_lsp_types::{FileSymbols, TypeInfo, UseKind};
+use php_lsp_types::{FileSymbols, Signature, SymbolInfo, TypeInfo, UseKind};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Point, Tree};
 
 const MAX_OBJECT_TYPE_RESOLVE_DEPTH: usize = 64;
@@ -24,6 +24,31 @@ thread_local! {
 ///
 /// Returns the resolved type FQN (e.g., `"App\\TimerService"`) or None.
 pub type MemberTypeResolver<'a> = &'a dyn Fn(&str, &str) -> Option<String>;
+
+/// Context for resolving the expected type of an untyped closure/arrow-function
+/// parameter from the callable parameter at the call site.
+#[derive(Debug, Clone)]
+pub struct CallableArgumentType {
+    pub argument_index: usize,
+    pub argument_name: Option<String>,
+    pub type_info: TypeInfo,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallableParameterContext<'a> {
+    pub target_fqn: &'a str,
+    pub argument_index: usize,
+    pub argument_name: Option<&'a str>,
+    pub parameter_index: usize,
+    pub parameter_name: &'a str,
+    pub receiver_type: Option<&'a TypeInfo>,
+    pub argument_types: &'a [CallableArgumentType],
+}
+
+/// Callback for resolving closure/arrow-function parameter types from indexed
+/// function or method signatures.
+pub type CallableParamTypeResolver<'a> =
+    &'a dyn for<'ctx> Fn(CallableParameterContext<'ctx>) -> Option<TypeInfo>;
 
 /// Information about the symbol under the cursor.
 #[derive(Debug, Clone)]
@@ -116,13 +141,27 @@ pub fn symbol_at_position_with_resolver(
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
 ) -> Option<SymbolAtPosition> {
+    symbol_at_position_with_resolvers(tree, source, line, character, file_symbols, resolver, None)
+}
+
+/// Find the symbol at the given position, with optional cross-file type and
+/// callable-parameter resolvers.
+pub fn symbol_at_position_with_resolvers(
+    tree: &Tree,
+    source: &str,
+    line: u32,
+    character: u32,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<SymbolAtPosition> {
     let root = tree.root_node();
     let point = Point::new(line as usize, character as usize);
 
     // Find the most specific node at the position
     let node = find_node_at_point(root, point)?;
 
-    resolve_node(node, source, file_symbols, resolver)
+    resolve_node(node, source, file_symbols, resolver, callable_resolver)
 }
 
 /// Find local variable definition range for the variable under cursor.
@@ -202,6 +241,7 @@ pub fn infer_variable_type_at_position(
         character,
         var_name,
         None,
+        None,
     )
     .resolved_type_fqn
 }
@@ -220,7 +260,7 @@ pub fn infer_variable_type_at_position_with_resolver(
     var_name: &str,
     resolver: MemberTypeResolver<'_>,
 ) -> Option<String> {
-    infer_variable_type_at_position_internal(
+    infer_variable_type_at_position_with_resolvers(
         tree,
         source,
         file_symbols,
@@ -228,6 +268,32 @@ pub fn infer_variable_type_at_position_with_resolver(
         character,
         var_name,
         Some(resolver),
+        None,
+    )
+}
+
+/// Infer variable type by name before a given position, using external member
+/// and callable-parameter resolvers.
+#[allow(clippy::too_many_arguments)]
+pub fn infer_variable_type_at_position_with_resolvers(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    line: u32,
+    character: u32,
+    var_name: &str,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<String> {
+    infer_variable_type_at_position_internal(
+        tree,
+        source,
+        file_symbols,
+        line,
+        character,
+        var_name,
+        resolver,
+        callable_resolver,
     )
     .resolved_type_fqn
 }
@@ -253,6 +319,7 @@ pub fn infer_variable_type_info_at_position(
         character,
         var_name,
         None,
+        None,
     )
     .type_info
 }
@@ -268,7 +335,7 @@ pub fn infer_variable_type_info_at_position_with_resolver(
     var_name: &str,
     resolver: MemberTypeResolver<'_>,
 ) -> Option<TypeInfo> {
-    infer_variable_type_at_position_internal(
+    infer_variable_type_info_at_position_with_resolvers(
         tree,
         source,
         file_symbols,
@@ -276,10 +343,37 @@ pub fn infer_variable_type_info_at_position_with_resolver(
         character,
         var_name,
         Some(resolver),
+        None,
+    )
+}
+
+/// Infer full type information by name before a given position, using external
+/// member and callable-parameter resolvers.
+#[allow(clippy::too_many_arguments)]
+pub fn infer_variable_type_info_at_position_with_resolvers(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    line: u32,
+    character: u32,
+    var_name: &str,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    infer_variable_type_at_position_internal(
+        tree,
+        source,
+        file_symbols,
+        line,
+        character,
+        var_name,
+        resolver,
+        callable_resolver,
     )
     .type_info
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_variable_type_at_position_internal(
     tree: &Tree,
     source: &str,
@@ -288,24 +382,34 @@ fn infer_variable_type_at_position_internal(
     character: u32,
     var_name: &str,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> VariableInference {
     let root = tree.root_node();
     let point = Point::new(line as usize, character as usize);
     let node = find_node_at_point(root, point).unwrap_or(root);
     let usage_start = position_to_byte(source, line, character);
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
-    infer_textual_expression_type_info(scope, var_name, usage_start, source, file_symbols, resolver)
-        .unwrap_or_else(|| {
-            let normalized = normalize_var_name(var_name);
-            infer_variable_in_scope(
-                scope,
-                &normalized,
-                usage_start,
-                source,
-                file_symbols,
-                resolver,
-            )
-        })
+    infer_textual_expression_type_info(
+        scope,
+        var_name,
+        usage_start,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )
+    .unwrap_or_else(|| {
+        let normalized = normalize_var_name(var_name);
+        infer_variable_in_scope(
+            scope,
+            &normalized,
+            usage_start,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        )
+    })
 }
 
 /// Infer hover-style type information for a variable at an arbitrary usage byte.
@@ -320,6 +424,28 @@ pub fn infer_variable_hover_info_at_node(
     var_name: &str,
     resolver: Option<MemberTypeResolver<'_>>,
 ) -> Option<VariableHoverInfo> {
+    infer_variable_hover_info_at_node_with_resolvers(
+        context_node,
+        source,
+        file_symbols,
+        usage_start,
+        var_name,
+        resolver,
+        None,
+    )
+}
+
+/// Infer hover-style type information using external member and
+/// callable-parameter resolvers.
+pub fn infer_variable_hover_info_at_node_with_resolvers(
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    usage_start: usize,
+    var_name: &str,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<VariableHoverInfo> {
     let normalized = normalize_var_name(var_name);
     let scope =
         find_enclosing_function(context_node).unwrap_or_else(|| find_root_node(context_node));
@@ -330,6 +456,7 @@ pub fn infer_variable_hover_info_at_node(
         source,
         file_symbols,
         resolver,
+        callable_resolver,
     );
     if !inference.has_data() {
         return None;
@@ -366,8 +493,15 @@ pub fn variable_hover_info_at_position(
     let var_name = normalize_var_name(&source[node.byte_range()]);
     let usage_start = node.start_byte();
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
-    let inference =
-        infer_variable_in_scope(scope, &var_name, usage_start, source, file_symbols, None);
+    let inference = infer_variable_in_scope(
+        scope,
+        &var_name,
+        usage_start,
+        source,
+        file_symbols,
+        None,
+        None,
+    );
     if !inference.has_data() {
         return None;
     }
@@ -403,6 +537,7 @@ pub fn infer_property_type_from_assignments(
         prop_name,
         file_symbols,
         resolver,
+        None,
         &mut results,
     );
     results
@@ -416,6 +551,7 @@ fn find_all_property_assignment_types(
     prop_name: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
     results: &mut Vec<String>,
 ) {
     for i in 0..node.child_count() {
@@ -427,7 +563,8 @@ fn find_all_property_assignment_types(
         // Check expression_statement for property assignment
         if child.kind() == "expression_statement" {
             if let Some(rhs) = property_assignment_rhs(child, prop_name, source) {
-                if let Some(resolved) = try_resolve_object_type(rhs, source, file_symbols, resolver)
+                if let Some(resolved) =
+                    try_resolve_object_type(rhs, source, file_symbols, resolver, callable_resolver)
                 {
                     if !results.contains(&resolved) {
                         results.push(resolved);
@@ -450,6 +587,7 @@ fn find_all_property_assignment_types(
                 prop_name,
                 file_symbols,
                 resolver,
+                callable_resolver,
                 results,
             );
         }
@@ -574,6 +712,7 @@ fn resolve_node(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<SymbolAtPosition> {
     let parent = node.parent()?;
     let node_text = &source[node.byte_range()];
@@ -596,8 +735,9 @@ fn resolve_node(
                 } else {
                     format!("${}", node_text)
                 };
-                let class_fqn = object_field
-                    .and_then(|o| try_resolve_object_type(o, source, file_symbols, resolver));
+                let class_fqn = object_field.and_then(|o| {
+                    try_resolve_object_type(o, source, file_symbols, resolver, callable_resolver)
+                });
                 let fqn = if let Some(ref cls) = class_fqn {
                     format!("{}::{}", cls, property_name)
                 } else {
@@ -625,8 +765,9 @@ fn resolve_node(
             if name_field.map(|n| n.id()) == Some(node.id()) {
                 let object_text = object_field.map(|o| source[o.byte_range()].to_string());
                 // Try to resolve object type to build a proper FQN
-                let class_fqn = object_field
-                    .and_then(|o| try_resolve_object_type(o, source, file_symbols, resolver));
+                let class_fqn = object_field.and_then(|o| {
+                    try_resolve_object_type(o, source, file_symbols, resolver, callable_resolver)
+                });
                 let fqn = if let Some(ref cls) = class_fqn {
                     format!("{}::{}", cls, node_text)
                 } else {
@@ -731,7 +872,13 @@ fn resolve_node(
                     if name_field.map(|n| n.id()) == Some(node.id()) {
                         let object_text = object_field.map(|o| source[o.byte_range()].to_string());
                         let class_fqn = object_field.and_then(|o| {
-                            try_resolve_object_type(o, source, file_symbols, resolver)
+                            try_resolve_object_type(
+                                o,
+                                source,
+                                file_symbols,
+                                resolver,
+                                callable_resolver,
+                            )
                         });
                         let fqn = if let Some(ref cls) = class_fqn {
                             format!("{}::{}", cls, node_text)
@@ -994,6 +1141,7 @@ fn try_resolve_object_type<'a>(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<String> {
     OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| {
         let current = depth.get();
@@ -1002,7 +1150,13 @@ fn try_resolve_object_type<'a>(
         }
 
         depth.set(current + 1);
-        let result = try_resolve_object_type_inner(object_node, source, file_symbols, resolver);
+        let result = try_resolve_object_type_inner(
+            object_node,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        );
         depth.set(current);
         result
     })
@@ -1013,6 +1167,7 @@ fn try_resolve_object_type_inner<'a>(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<String> {
     let kind = object_node.kind();
     match kind {
@@ -1039,9 +1194,13 @@ fn try_resolve_object_type_inner<'a>(
             let child_count = object_node.named_child_count();
             for i in 0..child_count {
                 if let Some(child) = object_node.named_child(i) {
-                    if let Some(resolved) =
-                        try_resolve_object_type(child, source, file_symbols, resolver)
-                    {
+                    if let Some(resolved) = try_resolve_object_type(
+                        child,
+                        source,
+                        file_symbols,
+                        resolver,
+                        callable_resolver,
+                    ) {
                         return Some(resolved);
                     }
                 }
@@ -1055,7 +1214,14 @@ fn try_resolve_object_type_inner<'a>(
             if text == "$this" {
                 find_parent_class_fqn(object_node, source, file_symbols)
             } else {
-                infer_variable_type(object_node, text, source, file_symbols, resolver)
+                infer_variable_type(
+                    object_node,
+                    text,
+                    source,
+                    file_symbols,
+                    resolver,
+                    callable_resolver,
+                )
             }
         }
         // Name / qualified_name might be a class used as scope
@@ -1070,7 +1236,13 @@ fn try_resolve_object_type_inner<'a>(
             let prop_name = &source[name_field.byte_range()];
 
             // Resolve the object type first
-            let class_fqn = try_resolve_object_type(obj_field, source, file_symbols, resolver)?;
+            let class_fqn = try_resolve_object_type(
+                obj_field,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            )?;
 
             // Look up the property in the file's symbols to get its type
             let property_fqn_dollar = format!("{}::${}", class_fqn, prop_name);
@@ -1108,7 +1280,13 @@ fn try_resolve_object_type_inner<'a>(
             let method_name = &source[name_field.byte_range()];
 
             // Resolve the object type first
-            let class_fqn = try_resolve_object_type(obj_field, source, file_symbols, resolver)?;
+            let class_fqn = try_resolve_object_type(
+                obj_field,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            )?;
 
             // First: look up the method's return type in the current file's symbols
             let method_fqn = format!("{}::{}", class_fqn, method_name);
@@ -1159,6 +1337,7 @@ fn try_resolve_object_type_inner<'a>(
                                     prop_name_text,
                                     file_symbols,
                                     resolver,
+                                    callable_resolver,
                                     &mut alt_types,
                                 );
                                 for alt_type in &alt_types {
@@ -1183,7 +1362,13 @@ fn try_resolve_object_type_inner<'a>(
             let key_text = object_node
                 .named_child(1)
                 .map(|node| source[node.byte_range()].trim().to_string());
-            let base_type = infer_expression_type_info(base, source, file_symbols, resolver)?;
+            let base_type = infer_expression_type_info(
+                base,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            )?;
             let value_type = iterable_value_type_info(&base_type, key_text.as_deref())?;
             resolve_phpdoc_var_type(&value_type, object_node, source, file_symbols)
         }
@@ -1203,6 +1388,7 @@ fn infer_variable_type(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<String> {
     let scope = find_enclosing_function(var_node).unwrap_or_else(|| find_root_node(var_node));
     infer_variable_type_in_scope(
@@ -1212,6 +1398,7 @@ fn infer_variable_type(
         source,
         file_symbols,
         resolver,
+        callable_resolver,
     )
 }
 
@@ -1265,6 +1452,7 @@ fn infer_variable_type_in_scope(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<String> {
     infer_variable_in_scope(
         scope_node,
@@ -1273,6 +1461,7 @@ fn infer_variable_type_in_scope(
         source,
         file_symbols,
         resolver,
+        callable_resolver,
     )
     .resolved_type_fqn
 }
@@ -1315,6 +1504,7 @@ fn find_variable_inference_before_usage(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableInference> {
     let mut inferred: Option<(usize, VariableInference)> = None;
 
@@ -1353,18 +1543,28 @@ fn find_variable_inference_before_usage(
             continue;
         }
 
-        if let Some(foreach_info) =
-            foreach_value_inference(stmt, var_name, usage_start, source, file_symbols, resolver)
-        {
+        if let Some(foreach_info) = foreach_variable_inference(
+            stmt,
+            var_name,
+            usage_start,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        ) {
             inferred = Some((stmt.start_byte(), foreach_info));
             continue;
         }
 
         // Assignment inference: $var = <expr>;
         if let Some(right) = assignment_rhs {
-            if let Some(type_info) =
-                infer_literal_array_shape_type(right, source, file_symbols, resolver)
-            {
+            if let Some(type_info) = infer_literal_array_shape_type(
+                right,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            ) {
                 inferred = Some((
                     stmt.start_byte(),
                     VariableInference {
@@ -1375,7 +1575,7 @@ fn find_variable_inference_before_usage(
                     },
                 ));
             } else if let Some(resolved) =
-                try_resolve_object_type(right, source, file_symbols, resolver)
+                try_resolve_object_type(right, source, file_symbols, resolver, callable_resolver)
             {
                 let type_info = Some(TypeInfo::Simple(resolved.clone()));
                 inferred = Some((
@@ -1403,6 +1603,7 @@ fn find_variable_inference_before_usage(
                 source,
                 file_symbols,
                 resolver,
+                callable_resolver,
             ) {
                 inferred = Some((stmt.start_byte(), stmt_info));
                 continue;
@@ -1420,6 +1621,7 @@ fn find_variable_inference_before_usage(
                 source,
                 file_symbols,
                 resolver,
+                callable_resolver,
             ) {
                 inferred = Some((stmt.start_byte(), stmt_info));
             }
@@ -1437,6 +1639,7 @@ fn find_nested_variable_inference_before_usage(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableInference> {
     let mut inferred: Option<(usize, VariableInference)> = None;
 
@@ -1464,9 +1667,13 @@ fn find_nested_variable_inference_before_usage(
         ) {
             inferred = Some((child.start_byte(), doc_info));
         } else if let Some(right) = assignment_rhs {
-            if let Some(type_info) =
-                infer_literal_array_shape_type(right, source, file_symbols, resolver)
-            {
+            if let Some(type_info) = infer_literal_array_shape_type(
+                right,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            ) {
                 inferred = Some((
                     child.start_byte(),
                     VariableInference {
@@ -1477,7 +1684,7 @@ fn find_nested_variable_inference_before_usage(
                     },
                 ));
             } else if let Some(resolved) =
-                try_resolve_object_type(right, source, file_symbols, resolver)
+                try_resolve_object_type(right, source, file_symbols, resolver, callable_resolver)
             {
                 inferred = Some((
                     child.start_byte(),
@@ -1499,6 +1706,7 @@ fn find_nested_variable_inference_before_usage(
                 source,
                 file_symbols,
                 resolver,
+                callable_resolver,
             ) {
                 inferred = Some((child.start_byte(), child_info));
             }
@@ -1695,6 +1903,7 @@ fn infer_variable_in_scope(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> VariableInference {
     let mut inferred = VariableInference::default();
 
@@ -1722,6 +1931,20 @@ fn infer_variable_in_scope(
                                     inferred.type_info = Some(TypeInfo::Simple(resolved));
                                 }
                             }
+                            if inferred.type_info.is_none() {
+                                if let Some(callable_info) = infer_callable_parameter_inference(
+                                    scope_node,
+                                    param,
+                                    i,
+                                    var_name,
+                                    source,
+                                    file_symbols,
+                                    resolver,
+                                    callable_resolver,
+                                ) {
+                                    inferred = callable_info;
+                                }
+                            }
                             break;
                         }
                     }
@@ -1739,11 +1962,582 @@ fn infer_variable_in_scope(
         source,
         file_symbols,
         resolver,
+        callable_resolver,
     ) {
         inferred = stmt_info;
     }
 
     inferred
+}
+
+struct CallableArgumentSite {
+    target_fqn: String,
+    argument_index: usize,
+    argument_name: Option<String>,
+    receiver_type: Option<TypeInfo>,
+    argument_types: Vec<CallableArgumentType>,
+}
+
+#[derive(Debug, Clone)]
+struct CallArgument<'tree> {
+    value_node: Node<'tree>,
+    name: Option<String>,
+}
+
+fn call_arguments<'tree>(call_node: Node<'tree>, source: &str) -> Vec<CallArgument<'tree>> {
+    let arguments = if let Some(arguments) = call_node.child_by_field_name("arguments") {
+        arguments
+    } else {
+        let mut cursor = call_node.walk();
+        let found = call_node
+            .children(&mut cursor)
+            .find(|child| child.kind() == "arguments");
+        let Some(arguments) = found else {
+            return Vec::new();
+        };
+        arguments
+    };
+    if arguments.kind() != "arguments" {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+    let mut cursor = arguments.walk();
+    for child in arguments.named_children(&mut cursor) {
+        if child.kind() == "argument" {
+            result.push(CallArgument {
+                value_node: argument_value_node(child).unwrap_or(child),
+                name: argument_name(child, source),
+            });
+        }
+    }
+    result
+}
+
+fn argument_value_node(argument: Node) -> Option<Node> {
+    argument.child_by_field_name("value").or_else(|| {
+        let mut cursor = argument.walk();
+        argument.named_children(&mut cursor).last()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_callable_parameter_inference(
+    scope_node: Node,
+    param_node: Node,
+    parameter_index: usize,
+    var_name: &str,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<VariableInference> {
+    if !is_closure_scope_node(scope_node) {
+        return None;
+    }
+    let site = callable_argument_site_for_closure(
+        scope_node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )?;
+    let parameter_name = var_name.trim_start_matches('$');
+
+    let type_info = callable_param_type_from_local_signature(
+        &site,
+        parameter_index,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )
+    .or_else(|| {
+        let resolver = callable_resolver?;
+        resolver(CallableParameterContext {
+            target_fqn: &site.target_fqn,
+            argument_index: site.argument_index,
+            argument_name: site.argument_name.as_deref(),
+            parameter_index,
+            parameter_name,
+            receiver_type: site.receiver_type.as_ref(),
+            argument_types: &site.argument_types,
+        })
+    })?;
+
+    let resolved_type_fqn = resolve_phpdoc_var_type(&type_info, param_node, source, file_symbols);
+    Some(VariableInference {
+        type_display: Some(type_info.to_string()),
+        resolved_type_fqn,
+        phpdoc_comment: None,
+        type_info: Some(type_info),
+    })
+}
+
+fn is_closure_scope_node(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "arrow_function" | "anonymous_function" | "anonymous_function_creation_expression"
+    )
+}
+
+fn callable_argument_site_for_closure<'tree>(
+    closure_node: Node<'tree>,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<CallableArgumentSite> {
+    let argument = enclosing_argument_for_closure(closure_node)?;
+    let arguments = argument
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")?;
+    let call_node = arguments.parent()?;
+    let argument_index = argument_index(arguments, argument)?;
+    let argument_name = argument_name(argument, source);
+    let (target_fqn, receiver_type) =
+        callable_target_for_call(call_node, source, file_symbols, resolver, callable_resolver)?;
+    let argument_types =
+        callable_argument_types(call_node, source, file_symbols, resolver, callable_resolver);
+
+    Some(CallableArgumentSite {
+        target_fqn,
+        argument_index,
+        argument_name,
+        receiver_type,
+        argument_types,
+    })
+}
+
+fn callable_argument_types(
+    call_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Vec<CallableArgumentType> {
+    call_arguments(call_node, source)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(argument_index, arg)| {
+            let type_info = infer_expression_type_info(
+                arg.value_node,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            )?;
+            Some(CallableArgumentType {
+                argument_index,
+                argument_name: arg.name,
+                type_info,
+            })
+        })
+        .collect()
+}
+
+fn enclosing_argument_for_closure(mut node: Node) -> Option<Node> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "argument" {
+            return Some(parent);
+        }
+        if matches!(
+            parent.kind(),
+            "method_declaration" | "function_definition" | "program"
+        ) {
+            return None;
+        }
+        node = parent;
+    }
+    None
+}
+
+fn callable_target_for_call(
+    call_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<(String, Option<TypeInfo>)> {
+    match call_node.kind() {
+        "function_call_expression" => {
+            let function = call_node
+                .child_by_field_name("function")
+                .or_else(|| call_node.named_child(0))?;
+            Some((
+                resolve_function_name(&source[function.byte_range()], file_symbols),
+                None,
+            ))
+        }
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            let object = call_node.child_by_field_name("object")?;
+            let name = call_node.child_by_field_name("name")?;
+            let receiver_type = infer_expression_type_info(
+                object,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            );
+            let class_fqn = receiver_type
+                .as_ref()
+                .and_then(|type_info| {
+                    object_fqn_from_type_info(type_info, call_node, source, file_symbols)
+                })
+                .or_else(|| {
+                    try_resolve_object_type(
+                        object,
+                        source,
+                        file_symbols,
+                        resolver,
+                        callable_resolver,
+                    )
+                })?;
+            Some((
+                format!("{}::{}", class_fqn, &source[name.byte_range()]),
+                receiver_type,
+            ))
+        }
+        "scoped_call_expression" => {
+            let scope = call_node.child_by_field_name("scope")?;
+            let name = call_node.child_by_field_name("name")?;
+            let class_fqn = resolve_scope_class_name(
+                &source[scope.byte_range()],
+                call_node,
+                source,
+                file_symbols,
+            );
+            Some((
+                format!("{}::{}", class_fqn, &source[name.byte_range()]),
+                None,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn object_fqn_from_type_info(
+    type_info: &TypeInfo,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    match type_info {
+        TypeInfo::Simple(name) if !is_builtin_non_object_type(name) => {
+            Some(resolve_class_name(name, file_symbols))
+        }
+        TypeInfo::Generic { base, .. } if !is_builtin_non_object_type(base) => {
+            Some(resolve_class_name(base, file_symbols))
+        }
+        TypeInfo::Nullable(inner) => {
+            object_fqn_from_type_info(inner, context_node, source, file_symbols)
+        }
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            types.iter().find_map(|type_info| {
+                object_fqn_from_type_info(type_info, context_node, source, file_symbols)
+            })
+        }
+        TypeInfo::Self_ | TypeInfo::Static_ => {
+            find_parent_class_fqn(context_node, source, file_symbols)
+        }
+        _ => None,
+    }
+}
+
+fn callable_param_type_from_local_signature(
+    site: &CallableArgumentSite,
+    parameter_index: usize,
+    _source: &str,
+    file_symbols: &FileSymbols,
+    _resolver: Option<MemberTypeResolver<'_>>,
+    _callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let symbol = file_symbols
+        .symbols
+        .iter()
+        .find(|symbol| symbol.fqn == site.target_fqn)?;
+    let signature = symbol.signature.as_ref()?;
+    callable_param_type_from_signature(signature, symbol, site, parameter_index, file_symbols)
+}
+
+fn callable_param_type_from_signature(
+    signature: &Signature,
+    symbol: &SymbolInfo,
+    site: &CallableArgumentSite,
+    parameter_index: usize,
+    file_symbols: &FileSymbols,
+) -> Option<TypeInfo> {
+    let callable_param = signature_param_for_call_arg(
+        signature,
+        site.argument_index,
+        site.argument_name.as_deref(),
+    )?;
+    let expected = callable_param.type_info.as_ref()?;
+    let template_names = callable_template_names(symbol, &site.target_fqn, file_symbols);
+    let mut substitutions = receiver_template_substitutions(
+        &site.target_fqn,
+        site.receiver_type.as_ref(),
+        file_symbols,
+    );
+
+    for arg in &site.argument_types {
+        if arg.argument_index == site.argument_index {
+            continue;
+        }
+        let Some(param) = signature_param_for_call_arg(
+            signature,
+            arg.argument_index,
+            arg.argument_name.as_deref(),
+        ) else {
+            continue;
+        };
+        let Some(param_type) = param.type_info.as_ref() else {
+            continue;
+        };
+        bind_template_type_info(
+            param_type,
+            &arg.type_info,
+            &template_names,
+            &mut substitutions,
+        );
+    }
+
+    let expected = substitute_type_info(expected, &substitutions);
+    callable_param_type(&expected, parameter_index)
+}
+
+fn signature_param_for_call_arg<'a>(
+    signature: &'a Signature,
+    arg_index: usize,
+    name: Option<&str>,
+) -> Option<&'a php_lsp_types::ParamInfo> {
+    if let Some(name) = name {
+        return signature.params.iter().find(|param| {
+            param
+                .name
+                .trim_start_matches('$')
+                .eq_ignore_ascii_case(name)
+        });
+    }
+
+    signature
+        .params
+        .get(arg_index)
+        .or_else(|| signature.params.last().filter(|param| param.is_variadic))
+}
+
+fn callable_template_names(
+    symbol: &SymbolInfo,
+    target_fqn: &str,
+    file_symbols: &FileSymbols,
+) -> HashSet<String> {
+    let mut names = symbol
+        .templates
+        .iter()
+        .map(|template| template.name.clone())
+        .collect::<HashSet<_>>();
+    if let Some((class_fqn, _)) = target_fqn.rsplit_once("::") {
+        if let Some(class_symbol) = file_symbols.symbols.iter().find(|sym| sym.fqn == class_fqn) {
+            names.extend(
+                class_symbol
+                    .templates
+                    .iter()
+                    .map(|template| template.name.clone()),
+            );
+        }
+    }
+    names
+}
+
+fn receiver_template_substitutions(
+    target_fqn: &str,
+    receiver_type: Option<&TypeInfo>,
+    file_symbols: &FileSymbols,
+) -> HashMap<String, TypeInfo> {
+    let mut substitutions = HashMap::new();
+    let Some((class_fqn, _)) = target_fqn.rsplit_once("::") else {
+        return substitutions;
+    };
+    let Some(TypeInfo::Generic { base, args }) = receiver_type else {
+        return substitutions;
+    };
+    let resolved_base = resolve_class_name(base, file_symbols);
+    if resolved_base.trim_start_matches('\\') != class_fqn.trim_start_matches('\\') {
+        return substitutions;
+    }
+    let Some(class_symbol) = file_symbols.symbols.iter().find(|sym| sym.fqn == class_fqn) else {
+        return substitutions;
+    };
+    for (template, arg) in class_symbol.templates.iter().zip(args.iter()) {
+        substitutions.insert(template.name.clone(), arg.clone());
+    }
+    substitutions
+}
+
+fn bind_template_type_info(
+    pattern: &TypeInfo,
+    actual: &TypeInfo,
+    template_names: &HashSet<String>,
+    substitutions: &mut HashMap<String, TypeInfo>,
+) {
+    match (pattern, actual) {
+        (TypeInfo::Simple(name), actual) if template_names.contains(name) => {
+            substitutions
+                .entry(name.clone())
+                .or_insert_with(|| actual.clone());
+        }
+        (TypeInfo::Nullable(pattern), actual) => {
+            bind_template_type_info(pattern, actual, template_names, substitutions);
+        }
+        (TypeInfo::Union(types), actual) | (TypeInfo::Intersection(types), actual) => {
+            for ty in types {
+                bind_template_type_info(ty, actual, template_names, substitutions);
+            }
+        }
+        (
+            TypeInfo::Generic {
+                base: pattern_base,
+                args: pattern_args,
+            },
+            TypeInfo::Generic {
+                base: actual_base,
+                args: actual_args,
+            },
+        ) if pattern_base.eq_ignore_ascii_case(actual_base) => {
+            for (pattern_arg, actual_arg) in pattern_args.iter().zip(actual_args.iter()) {
+                bind_template_type_info(pattern_arg, actual_arg, template_names, substitutions);
+            }
+        }
+        (TypeInfo::ClassString(Some(pattern_inner)), TypeInfo::ClassString(Some(actual_inner))) => {
+            bind_template_type_info(pattern_inner, actual_inner, template_names, substitutions)
+        }
+        (
+            TypeInfo::Callable {
+                params: pattern_params,
+                return_type: pattern_return,
+            },
+            TypeInfo::Callable {
+                params: actual_params,
+                return_type: actual_return,
+            },
+        ) => {
+            for (pattern_param, actual_param) in pattern_params.iter().zip(actual_params.iter()) {
+                bind_template_type_info(pattern_param, actual_param, template_names, substitutions);
+            }
+            if let (Some(pattern_return), Some(actual_return)) = (pattern_return, actual_return) {
+                bind_template_type_info(
+                    pattern_return,
+                    actual_return,
+                    template_names,
+                    substitutions,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn substitute_type_info(
+    type_info: &TypeInfo,
+    substitutions: &HashMap<String, TypeInfo>,
+) -> TypeInfo {
+    match type_info {
+        TypeInfo::Simple(name) => substitutions
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| TypeInfo::Simple(name.clone())),
+        TypeInfo::Generic { base, args } => TypeInfo::Generic {
+            base: base.clone(),
+            args: args
+                .iter()
+                .map(|arg| substitute_type_info(arg, substitutions))
+                .collect(),
+        },
+        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: substitute_type_info(&item.value, substitutions),
+                })
+                .collect(),
+        ),
+        TypeInfo::ObjectShape(items) => TypeInfo::ObjectShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: substitute_type_info(&item.value, substitutions),
+                })
+                .collect(),
+        ),
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => TypeInfo::Callable {
+            params: params
+                .iter()
+                .map(|param| substitute_type_info(param, substitutions))
+                .collect(),
+            return_type: return_type
+                .as_ref()
+                .map(|return_type| Box::new(substitute_type_info(return_type, substitutions))),
+        },
+        TypeInfo::ClassString(Some(inner)) => {
+            TypeInfo::ClassString(Some(Box::new(substitute_type_info(inner, substitutions))))
+        }
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => TypeInfo::Conditional {
+            subject: subject.clone(),
+            target: Box::new(substitute_type_info(target, substitutions)),
+            if_type: Box::new(substitute_type_info(if_type, substitutions)),
+            else_type: Box::new(substitute_type_info(else_type, substitutions)),
+        },
+        TypeInfo::Union(types) => TypeInfo::Union(
+            types
+                .iter()
+                .map(|ty| substitute_type_info(ty, substitutions))
+                .collect(),
+        ),
+        TypeInfo::Intersection(types) => TypeInfo::Intersection(
+            types
+                .iter()
+                .map(|ty| substitute_type_info(ty, substitutions))
+                .collect(),
+        ),
+        TypeInfo::Nullable(inner) => {
+            TypeInfo::Nullable(Box::new(substitute_type_info(inner, substitutions)))
+        }
+        TypeInfo::ClassString(None)
+        | TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed
+        | TypeInfo::Self_
+        | TypeInfo::Static_
+        | TypeInfo::Parent_ => type_info.clone(),
+    }
+}
+
+fn callable_param_type(type_info: &TypeInfo, parameter_index: usize) -> Option<TypeInfo> {
+    match type_info {
+        TypeInfo::Callable { params, .. } => params.get(parameter_index).cloned(),
+        TypeInfo::Nullable(inner) => callable_param_type(inner, parameter_index),
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
+            .iter()
+            .find_map(|ty| callable_param_type(ty, parameter_index)),
+        _ => None,
+    }
 }
 
 fn find_preceding_phpdoc_comment<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str> {
@@ -1926,14 +2720,19 @@ fn infer_expression_type_info(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
     match node.kind() {
         "parenthesized_expression" => {
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
-                    if let Some(type_info) =
-                        infer_expression_type_info(child, source, file_symbols, resolver)
-                    {
+                    if let Some(type_info) = infer_expression_type_info(
+                        child,
+                        source,
+                        file_symbols,
+                        resolver,
+                        callable_resolver,
+                    ) {
                         return Some(type_info);
                     }
                 }
@@ -1950,6 +2749,7 @@ fn infer_expression_type_info(
                 source,
                 file_symbols,
                 resolver,
+                callable_resolver,
             )
             .type_info
         }
@@ -1969,7 +2769,8 @@ fn infer_expression_type_info(
         "member_access_expression" | "nullsafe_member_access_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
-            let class_fqn = try_resolve_object_type(object, source, file_symbols, resolver)?;
+            let class_fqn =
+                try_resolve_object_type(object, source, file_symbols, resolver, callable_resolver)?;
             let prop_fqn = format!("{}::${}", class_fqn, &source[name.byte_range()]);
             file_symbols.symbols.iter().find_map(|sym| {
                 (sym.fqn == prop_fqn)
@@ -1980,7 +2781,8 @@ fn infer_expression_type_info(
         "member_call_expression" | "nullsafe_member_call_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
-            let class_fqn = try_resolve_object_type(object, source, file_symbols, resolver)?;
+            let class_fqn =
+                try_resolve_object_type(object, source, file_symbols, resolver, callable_resolver)?;
             let method_fqn = format!("{}::{}", class_fqn, &source[name.byte_range()]);
             file_symbols.symbols.iter().find_map(|sym| {
                 (sym.fqn == method_fqn)
@@ -1993,7 +2795,13 @@ fn infer_expression_type_info(
             let key_text = node
                 .named_child(1)
                 .map(|node| source[node.byte_range()].trim().to_string());
-            let base_type = infer_expression_type_info(base, source, file_symbols, resolver)?;
+            let base_type = infer_expression_type_info(
+                base,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            )?;
             iterable_value_type_info(&base_type, key_text.as_deref())
         }
         _ => None,
@@ -2005,9 +2813,17 @@ fn infer_literal_array_shape_type(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
     let text = source[node.byte_range()].trim();
-    infer_literal_array_shape_text(text, node, source, file_symbols, resolver)
+    infer_literal_array_shape_text(
+        text,
+        node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )
 }
 
 fn infer_literal_array_shape_text(
@@ -2016,6 +2832,7 @@ fn infer_literal_array_shape_text(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
     let (body, _) = literal_array_body(text)?;
     let mut items = Vec::new();
@@ -2028,8 +2845,14 @@ fn infer_literal_array_shape_text(
         let key_text = part[..arrow].trim();
         let value_text = part[arrow + 2..].trim();
         let key = normalize_array_access_key(key_text)?;
-        let value =
-            infer_literal_value_type_text(value_text, context_node, source, file_symbols, resolver);
+        let value = infer_literal_value_type_text(
+            value_text,
+            context_node,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        );
         items.push(php_lsp_types::ArrayShapeItem {
             key: Some(key),
             optional: false,
@@ -2046,11 +2869,17 @@ fn infer_literal_value_type_text(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> TypeInfo {
     let text = text.trim();
-    if let Some(shape) =
-        infer_literal_array_shape_text(text, context_node, source, file_symbols, resolver)
-    {
+    if let Some(shape) = infer_literal_array_shape_text(
+        text,
+        context_node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    ) {
         return shape;
     }
     if let Some(class_name) = text
@@ -2197,13 +3026,14 @@ fn find_top_level_text(s: &str, needle: &str) -> Option<usize> {
     None
 }
 
-fn foreach_value_inference(
+fn foreach_variable_inference(
     stmt: Node,
     var_name: &str,
     usage_start: usize,
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableInference> {
     if stmt.kind() != "foreach_statement"
         || usage_start < stmt.start_byte()
@@ -2212,20 +3042,37 @@ fn foreach_value_inference(
         return None;
     }
 
-    let value_node = foreach_value_variable_node(stmt, source)?;
-    if normalize_var_name(&source[value_node.byte_range()]) != var_name {
+    let key_node = foreach_key_variable_node(stmt, source)
+        .filter(|key_node| normalize_var_name(&source[key_node.byte_range()]) == var_name);
+    let value_node = foreach_value_variable_node(stmt, source)
+        .filter(|value_node| normalize_var_name(&source[value_node.byte_range()]) == var_name);
+    if key_node.is_none() && value_node.is_none() {
         return None;
     }
 
     let iterable_node = foreach_iterable_node(stmt)?;
-    let iterable_type = infer_expression_type_info(iterable_node, source, file_symbols, resolver)?;
-    let value_type = iterable_value_type_info(&iterable_type, None)?;
-    let resolved_type_fqn = resolve_phpdoc_var_type(&value_type, stmt, source, file_symbols);
+    let iterable_type = infer_expression_type_info(
+        iterable_node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )?;
+
+    let (type_info, variable_node) = if let Some(key_node) = key_node {
+        (iterable_key_type_info(&iterable_type)?, key_node)
+    } else {
+        let value_node = value_node?;
+        (iterable_value_type_info(&iterable_type, None)?, value_node)
+    };
+
+    let resolved_type_fqn =
+        resolve_phpdoc_var_type(&type_info, variable_node, source, file_symbols);
     Some(VariableInference {
-        type_display: Some(value_type.to_string()),
+        type_display: Some(type_info.to_string()),
         resolved_type_fqn,
         phpdoc_comment: None,
-        type_info: Some(value_type),
+        type_info: Some(type_info),
     })
 }
 
@@ -2242,6 +3089,14 @@ fn foreach_value_variable_node<'a>(stmt: Node<'a>, source: &str) -> Option<Node<
         value => value,
     };
     variable_node_in_foreach_part(value_expr, source)
+}
+
+fn foreach_key_variable_node<'a>(stmt: Node<'a>, source: &str) -> Option<Node<'a>> {
+    let pair = stmt.named_child(1)?;
+    if pair.kind() != "pair" {
+        return None;
+    }
+    variable_node_in_foreach_part(pair.named_child(0)?, source)
 }
 
 fn variable_node_in_foreach_part<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
@@ -2265,6 +3120,7 @@ fn infer_textual_expression_type_info(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableInference> {
     let expr_text = expr_text.trim();
     let (base_var, keys) = parse_textual_array_access_chain(expr_text)
@@ -2280,6 +3136,7 @@ fn infer_textual_expression_type_info(
         source,
         file_symbols,
         resolver,
+        callable_resolver,
     );
     if keys.is_empty() {
         return inference.has_data().then_some(inference);
@@ -2387,6 +3244,21 @@ fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) -> Opt
     }
 }
 
+fn iterable_key_type_info(type_info: &TypeInfo) -> Option<TypeInfo> {
+    match type_info {
+        TypeInfo::Nullable(inner) => iterable_key_type_info(inner),
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            types.iter().find_map(iterable_key_type_info)
+        }
+        TypeInfo::Generic { base, args } => generic_key_type_arg(base, args),
+        TypeInfo::ArrayShape(items) => array_shape_key_type(items),
+        TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => iterable_key_type_info(if_type).or_else(|| iterable_key_type_info(else_type)),
+        _ => None,
+    }
+}
+
 fn generic_value_type_arg<'a>(base: &str, args: &'a [TypeInfo]) -> Option<&'a TypeInfo> {
     if args.is_empty() {
         return None;
@@ -2408,6 +3280,41 @@ fn generic_value_type_arg<'a>(base: &str, args: &'a [TypeInfo]) -> Option<&'a Ty
     };
 
     args.get(value_arg_index)
+}
+
+fn generic_key_type_arg(base: &str, args: &[TypeInfo]) -> Option<TypeInfo> {
+    let base = base.trim_start_matches('\\').to_ascii_lowercase();
+    match base.as_str() {
+        "array" | "iterable" | "traversable" | "iterator" | "iteratoraggregate" | "generator"
+            if args.len() > 1 =>
+        {
+            args.first().cloned()
+        }
+        "list" | "non-empty-list" => Some(TypeInfo::Simple("int".to_string())),
+        _ if (base.ends_with("\\collection") || base.ends_with("collection")) && args.len() > 1 => {
+            args.first().cloned()
+        }
+        _ => None,
+    }
+}
+
+fn array_shape_key_type(items: &[php_lsp_types::ArrayShapeItem]) -> Option<TypeInfo> {
+    let mut keys = items
+        .iter()
+        .filter_map(|item| item.key.as_deref())
+        .map(|key| {
+            if key.parse::<i64>().is_ok() {
+                TypeInfo::LiteralInt(key.to_string())
+            } else {
+                TypeInfo::LiteralString(format!("'{}'", key))
+            }
+        })
+        .collect::<Vec<_>>();
+    match keys.len() {
+        0 => None,
+        1 => keys.pop(),
+        _ => Some(TypeInfo::Union(keys)),
+    }
 }
 
 fn array_shape_value_type<'a>(
@@ -3671,6 +4578,124 @@ function run(): void {
         let result = parse_and_resolve(code, line, col).expect("foreach value should resolve");
         assert_eq!(result.fqn, "App\\Entity\\User::getName");
         assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_foreach_key_and_value_from_phpdoc_generator() {
+        let code = r#"<?php
+namespace App;
+
+class User {
+    public function getName(): string { return ''; }
+}
+
+function run(): void {
+    /** @var \Generator<string, User, mixed, void> $users */
+    $users = loadUsers();
+    foreach ($users as $id => $user) {
+        $id;
+        $user->getName();
+    }
+}
+"#;
+        let (user_line, user_col) = find_line_col(code, "getName");
+        let result =
+            parse_and_resolve(code, user_line, user_col).expect("generator value should resolve");
+        assert_eq!(result.fqn, "App\\User::getName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+
+        let (id_line, id_col) = find_line_col(code, "$id;");
+        let inferred = parse_and_infer_var_type_info_at(code, id_line, id_col + 2, "$id")
+            .expect("generator key should infer");
+        assert_eq!(inferred, TypeInfo::Simple("string".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_array_map_style_callback_parameter_from_callable_signature() {
+        let code = r#"<?php
+namespace App;
+
+class User {
+    public function getName(): string { return ''; }
+}
+
+/**
+ * @template TItem
+ * @template TResult
+ * @param callable(TItem): TResult $callback
+ * @param array<int, TItem> $items
+ * @return array<int, TResult>
+ */
+function map_values(callable $callback, array $items): array { return []; }
+
+function run(): void {
+    /** @var array<int, User> $users */
+    $users = [];
+    map_values(fn($user) => $user->getName(), $users);
+    $user->getName();
+}
+"#;
+        let (line, col) = find_line_col(code, "$user->getName(),");
+        let result = parse_and_resolve(code, line, col + "$user->".len() as u32)
+            .expect("callback parameter method should resolve");
+        assert_eq!(result.fqn, "App\\User::getName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+
+        let (outside_line, outside_col) = find_line_col(code, "$user->getName();");
+        let outside = parse_and_resolve(code, outside_line, outside_col + "$user->".len() as u32)
+            .expect("outside method still has a syntactic symbol");
+        assert_ne!(
+            outside.fqn, "App\\User::getName",
+            "closure parameter type must not leak into outer scope"
+        );
+    }
+
+    #[test]
+    fn test_resolve_collection_callback_parameter_from_receiver_generic_signature() {
+        let code = r#"<?php
+namespace App;
+
+class User {
+    public function getName(): string { return ''; }
+}
+
+/**
+ * @template TItem
+ */
+class Collection {
+    /**
+     * @template TResult
+     * @param callable(TItem): TResult $callback
+     * @return Collection<TResult>
+     */
+    public function map(callable $callback): self { return $this; }
+
+    /**
+     * @param callable(TItem): bool $callback
+     * @return Collection<TItem>
+     */
+    public function filter(callable $callback): self { return $this; }
+}
+
+function run(): void {
+    /** @var Collection<User> $users */
+    $users = loadUsers();
+    $users->map(fn($user) => $user->getName());
+    $users->filter(function ($user): bool {
+        return '' !== $user->getName();
+    });
+}
+"#;
+        let (map_line, map_col) = find_line_col(code, "$user->getName());");
+        let map_result = parse_and_resolve(code, map_line, map_col + "$user->".len() as u32)
+            .expect("map callback parameter method should resolve");
+        assert_eq!(map_result.fqn, "App\\User::getName");
+
+        let (filter_line, filter_col) = find_line_col(code, "$user->getName();");
+        let filter_result =
+            parse_and_resolve(code, filter_line, filter_col + "$user->".len() as u32)
+                .expect("filter callback parameter method should resolve");
+        assert_eq!(filter_result.fqn, "App\\User::getName");
     }
 
     #[test]

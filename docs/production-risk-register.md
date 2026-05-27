@@ -282,6 +282,10 @@ Current evidence:
 - `IE-033` added shape-aware completion and definition for PHPDoc
   `array{...}` / `object{...}` shapes and literal array shapes, including
   nested shape keys and optional keys.
+- `IE-034` added closure/arrow callback parameter inference from
+  `callable(...)` signatures, generic collection callback signatures,
+  `array_map`-style helper signatures, and `Generator<TKey,TValue>` foreach
+  key/value inference.
 - `PV-012` fixed a real Symfony false positive for promoted constructor
   properties accessed through a `self`-typed parameter
   (`withDefaults(self $defaults)` then `$defaults->objectManager`).
