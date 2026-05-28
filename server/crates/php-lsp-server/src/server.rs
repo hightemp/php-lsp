@@ -25733,6 +25733,111 @@ function run(Box $box): void {
     }
 
     #[test]
+    fn test_compute_diagnostics_allows_phpdoc_array_suffix_argument_type() {
+        let uri = "file:///phpdoc-array-suffix.php";
+        let code = r#"<?php
+namespace App;
+
+/**
+ * @param mixed[] $context
+ */
+function logInfo(array $context = []): void {}
+
+function run(string $soapRequest): void {
+    logInfo([$soapRequest]);
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("Type mismatch")),
+            "PHPDoc T[] should accept array literals, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_psr_logger_context_array_suffix_type() {
+        let uri = "file:///logger-context.php";
+        let code = r#"<?php
+namespace Psr\Log;
+
+interface LoggerInterface
+{
+    /**
+     * @param mixed[] $context
+     */
+    public function info(string $message, array $context = []): void;
+}
+
+namespace App;
+
+use Psr\Log\LoggerInterface;
+
+final class DeactivateConfirmService
+{
+    public function __construct(private LoggerInterface $logger) {}
+
+    public function run(string $soapRequest): void
+    {
+        $this->logger->info('Prepared Deactivate Confirm SOAP request', [$soapRequest]);
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+
+        let index = WorkspaceIndex::new();
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        for unexpected in [
+            "Type mismatch for Psr\\Log\\LoggerInterface::info argument $context",
+            "Unknown method: Psr\\Log\\LoggerInterface::info",
+        ] {
+            assert!(
+                !messages.iter().any(|message| message.contains(unexpected)),
+                "Did not expect `{}` in diagnostics, got: {:?}",
+                unexpected,
+                messages
+            );
+        }
+    }
+
+    #[test]
     fn test_compute_diagnostics_skips_uncertain_ternary_return_type() {
         let uri = "file:///ternary-return.php";
         let code = r#"<?php

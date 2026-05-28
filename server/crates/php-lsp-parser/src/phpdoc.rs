@@ -689,6 +689,10 @@ fn parse_type_string(s: &str) -> TypeInfo {
         return parse_type_string(inner);
     }
 
+    if let Some(array) = parse_array_suffix_type(s) {
+        return array;
+    }
+
     if let Some(shape) = parse_shape_type(s) {
         return shape;
     }
@@ -711,6 +715,18 @@ fn parse_type_string(s: &str) -> TypeInfo {
         "class-string" => TypeInfo::ClassString(None),
         _ => TypeInfo::Simple(s.to_string()),
     }
+}
+
+fn parse_array_suffix_type(s: &str) -> Option<TypeInfo> {
+    let inner = s.strip_suffix("[]")?.trim();
+    if inner.is_empty() {
+        return None;
+    }
+
+    Some(TypeInfo::Generic {
+        base: "array".to_string(),
+        args: vec![parse_type_string(inner)],
+    })
 }
 
 fn parse_conditional_type(s: &str) -> Option<TypeInfo> {
@@ -1406,6 +1422,32 @@ mod tests {
             "array<int, User>"
         );
         assert_eq!(doc.params[0].description.as_deref(), Some("The users"));
+    }
+
+    #[test]
+    fn test_parse_phpdoc_array_suffix_type() {
+        let doc = parse_phpdoc("/**\n * @param mixed[] $context\n * @return User[][]\n */");
+        assert_eq!(
+            doc.params[0].type_info,
+            Some(TypeInfo::Generic {
+                base: "array".to_string(),
+                args: vec![TypeInfo::Mixed],
+            })
+        );
+        assert_eq!(
+            doc.params[0].type_info.as_ref().unwrap().to_string(),
+            "array<mixed>"
+        );
+        assert_eq!(
+            doc.return_type,
+            Some(TypeInfo::Generic {
+                base: "array".to_string(),
+                args: vec![TypeInfo::Generic {
+                    base: "array".to_string(),
+                    args: vec![TypeInfo::Simple("User".to_string())],
+                }],
+            })
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 10;
+pub const CACHE_SCHEMA_VERSION: u32 = 11;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
