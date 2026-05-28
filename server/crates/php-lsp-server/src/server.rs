@@ -26,10 +26,10 @@ use php_lsp_parser::references::{
 use php_lsp_parser::resolve::{
     infer_property_type_from_assignments, infer_variable_hover_info_at_node_with_resolvers,
     infer_variable_type_at_position_with_resolvers,
-    infer_variable_type_info_at_position_with_resolvers, local_variable_names_at_position,
-    resolve_class_name_pub, symbol_at_position, symbol_at_position_with_resolvers,
-    variable_definition_at_position, CallableParamTypeResolver, CallableParameterContext,
-    MemberTypeResolver, RefKind, SymbolAtPosition,
+    infer_variable_type_info_at_position_with_resolvers, iterable_value_type_info,
+    local_variable_names_at_position, resolve_class_name_pub, symbol_at_position,
+    symbol_at_position_with_resolvers, variable_definition_at_position, CallableParamTypeResolver,
+    CallableParameterContext, MemberTypeResolver, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
     find_missing_return_type_candidates, MissingReturnTypeCandidate,
@@ -10626,6 +10626,10 @@ fn local_variable_inlay_type(
                 return Some(type_hint);
             }
 
+            if let Some(type_hint) = foreach_variable_inlay_type_from_index(ctx, variable_node) {
+                return Some(type_hint);
+            }
+
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 ctx.type_cache.cached_string(
                     (0, 0, 0, 0),
@@ -10675,6 +10679,108 @@ fn local_variable_inlay_type_from_expression(
         "variable_name" => local_variable_inlay_type_from_variable_expression(ctx, expression),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone)]
+struct IndexedExpressionTypeInfo {
+    type_info: php_lsp_types::TypeInfo,
+    owner_fqn: String,
+    uri: String,
+}
+
+fn foreach_variable_inlay_type_from_index(
+    ctx: &InlayHintContext<'_>,
+    variable_node: tree_sitter::Node,
+) -> Option<LocalVariableInlayType> {
+    let foreach_stmt = enclosing_foreach_statement_for_variable(ctx.source, variable_node)?;
+    let iterable_node = foreach_iterable_node_for_inlay(foreach_stmt)?;
+    let iterable_type = indexed_expression_type_info(ctx, iterable_node)?;
+    let value_type = iterable_value_type_info(&iterable_type.type_info, None)?;
+
+    local_variable_inlay_type_from_type_info(
+        ctx,
+        &iterable_type.owner_fqn,
+        &iterable_type.uri,
+        &value_type,
+        false,
+    )
+}
+
+fn enclosing_foreach_statement_for_variable<'tree>(
+    source: &str,
+    variable_node: tree_sitter::Node<'tree>,
+) -> Option<tree_sitter::Node<'tree>> {
+    let variable_name = variable_text_for_node(source, variable_node)?;
+    let mut current = variable_node;
+
+    loop {
+        if current.kind() == "foreach_statement" {
+            let value_node = foreach_value_variable_node_for_inlay(current, source)?;
+            if variable_text_for_node(source, value_node).as_deref() == Some(&variable_name)
+                && variable_node.start_byte() >= current.start_byte()
+                && variable_node.end_byte() <= current.end_byte()
+            {
+                return Some(current);
+            }
+        }
+        current = current.parent()?;
+    }
+}
+
+fn foreach_iterable_node_for_inlay(statement: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    (statement.kind() == "foreach_statement")
+        .then(|| statement.named_child(0))
+        .flatten()
+}
+
+fn indexed_expression_type_info(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<IndexedExpressionTypeInfo> {
+    let expression = normalized_expression_node(expression);
+    match expression.kind() {
+        "function_call_expression"
+        | "member_call_expression"
+        | "nullsafe_member_call_expression"
+        | "scoped_call_expression" => indexed_call_expression_type_info(ctx, expression),
+        _ => None,
+    }
+}
+
+fn indexed_call_expression_type_info(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<IndexedExpressionTypeInfo> {
+    let name_node = call_target_name_node(expression)?;
+    let (sym_at_pos, symbol) = resolve_reference_symbol_at_node_cached(
+        ctx.tree,
+        ctx.source,
+        name_node,
+        ctx.file_symbols,
+        ctx.index,
+        ctx.type_cache,
+    )?;
+    if !matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+    ) {
+        return None;
+    }
+
+    let return_type = symbol_effective_return_type(&symbol)?;
+    let owner_fqn = sym_at_pos
+        .fqn
+        .rsplit_once("::")
+        .map(|(owner, _)| owner.to_string())
+        .or_else(|| symbol.parent_fqn.clone())
+        .unwrap_or_default();
+    let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
+
+    Some(IndexedExpressionTypeInfo {
+        type_info,
+        owner_fqn,
+        uri: symbol.uri.clone(),
+    })
 }
 
 fn local_variable_inlay_type_from_new_expression(
@@ -11866,6 +11972,7 @@ fn local_variable_hover_data(
     );
     let type_hint = rhs_node
         .and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
+        .or_else(|| foreach_variable_inlay_type_from_index(ctx, variable_node))
         .or_else(|| {
             parser_info
                 .as_ref()
@@ -12166,7 +12273,7 @@ fn local_variable_simple_type_display(
         return name.trim_start_matches('\\').to_string();
     }
 
-    simple_type_fqn_from_index(index, uri, name)
+    simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, name)
         .map(|fqn| shorten_inlay_type_display(&fqn, file_symbols))
         .unwrap_or_else(|| shorten_inlay_type_display(name, file_symbols))
 }
@@ -12186,7 +12293,7 @@ fn single_inlay_target_fqn_from_type_info(
             if lower == "parent" || is_builtin_type_name(name) {
                 return None;
             }
-            simple_type_fqn_from_index(index, uri, name)
+            simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, name)
         }
         php_lsp_types::TypeInfo::Nullable(inner) => {
             single_inlay_target_fqn_from_type_info(index, owner_fqn, uri, inner)
@@ -12198,6 +12305,31 @@ fn single_inlay_target_fqn_from_type_info(
         }
         _ => None,
     }
+}
+
+fn simple_type_fqn_from_owner_or_index(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    type_name: &str,
+) -> Option<String> {
+    let type_name = type_name.trim();
+    if type_name.is_empty()
+        || type_name.starts_with('\\')
+        || type_name.contains('\\')
+        || is_builtin_type_name(type_name)
+    {
+        return simple_type_fqn_from_index(index, uri, type_name);
+    }
+
+    if let Some((owner_namespace, _)) = owner_fqn.rsplit_once('\\') {
+        let candidate = format!("{owner_namespace}\\{type_name}");
+        if index.resolve_fqn(&candidate).is_some() {
+            return Some(candidate);
+        }
+    }
+
+    simple_type_fqn_from_index(index, uri, type_name)
 }
 
 fn is_explicit_local_variable_type_hint(type_info: &php_lsp_types::TypeInfo) -> bool {
@@ -17883,7 +18015,7 @@ fn type_info_fqn_from_index(
                     return Some(raw.to_string());
                 }
             }
-            simple_type_fqn_from_index(index, uri, name)
+            simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, name)
         }
         php_lsp_types::TypeInfo::Nullable(inner) => {
             type_info_fqn_from_index(index, owner_fqn, uri, inner)
@@ -17892,7 +18024,7 @@ fn type_info_fqn_from_index(
             Some(owner_fqn.to_string())
         }
         php_lsp_types::TypeInfo::Generic { base, .. } if !is_builtin_type_name(base) => {
-            simple_type_fqn_from_index(index, uri, base)
+            simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, base)
         }
         php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
             types

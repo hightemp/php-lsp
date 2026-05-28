@@ -4727,6 +4727,139 @@ function parse(string $responseXml): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_foreach_value_inlay_and_hover_from_indexed_method_generic_return() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+namespace Doctrine\Common\Collections;
+
+interface Collection {}
+
+namespace App\Entity;
+
+use Doctrine\Common\Collections\Collection;
+
+class ReversePortingNumber {
+    public function getPhoneNumber(): string { return ''; }
+}
+
+class ReverseRequest {
+    /**
+     * @return Collection<int, ReversePortingNumber>
+     */
+    public function getReversePortingNumbers(): Collection {}
+}
+
+namespace App\Soap\Inbound\Handler;
+
+use App\Entity\ReverseRequest;
+
+function update(ReverseRequest $reverseRequest): void {
+    foreach ($reverseRequest->getReversePortingNumbers() as $port/*decl*/ingNumber) {
+        $pn = $porting/*usage*/Number->getPhoneNumber();
+    }
+}
+"#;
+    let markers = ["/*decl*/", "/*usage*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (usage_line, usage_character) = marker_position("/*usage*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/foreach-indexed-method-generic-return.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 30, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    let hints = inlay_result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+    assert!(
+        labels.iter().any(|label| label == ": ReversePortingNumber"),
+        "expected foreach value type hint from indexed method PHPDoc return, got: {:?}",
+        labels
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|hint| inlay_hint_has_label_part_location(hint, "ReversePortingNumber")),
+        "expected foreach value inlay hint to include a navigable type location: {}",
+        inlay_result
+    );
+
+    let hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, usage_line, usage_character))
+        .await
+        .unwrap();
+    let hover_result = extract_result(hover_response);
+    let hover = hover_markdown_value(&hover_result);
+    assert!(
+        hover.contains("ReversePortingNumber $portingNumber"),
+        "expected foreach value hover from indexed method PHPDoc return, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("[`ReversePortingNumber`](<file:///test/foreach-indexed-method-generic-return.php#L10>)"),
+        "expected clickable ReversePortingNumber type link in hover, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_callback_parameter_inference_from_indexed_signatures() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

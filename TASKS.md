@@ -2383,6 +2383,23 @@ type feedback as ordinary PHP variables and calls.
     bdpn-ui file confirmed inlay hints and hovers for `$xml`,
     `$xml->registerXPathNamespace()`, `$resultNodes`, and `$result->StatusCode`.
 
+- [x] **BDPN-011** Infer `foreach` value variables from indexed method return generics. *(done 2026-05-28)*
+  - Reproduction: `/home/apanov/Projects/bdpn-ui/app/src/Soap/Inbound/Handler/CompleteHandler.php`
+    inside `updateReverseRequestForComplete()`:
+    `foreach ($reverseRequest->getReversePortingNumbers() as $portingNumber)`.
+  - Original gaps: `$portingNumber` has no local variable inlay hint and no
+    hover type, even though `ReverseRequest::getReversePortingNumbers()` has
+    `@return Collection<int, ReversePortingNumber>`.
+  - Expected: `foreach` value inference should use generic iterable return
+    types resolved from indexed method symbols, so `$portingNumber` is inferred
+    as `ReversePortingNumber` without project-specific method-name hardcode.
+  - Delivered: `foreach` value inference now falls back to indexed call return
+    types, extracts the iterable value type from PHPDoc generics, and resolves
+    short PHPDoc class names relative to the declaring symbol namespace.
+  - Validation: focused e2e regression plus an in-process LSP check against the
+    bdpn-ui file confirmed the `: ReversePortingNumber` inlay hint, hover type,
+    and clickable type location for `$portingNumber`.
+
 ---
 
 ## Текущие задачи

@@ -3311,7 +3311,7 @@ fn find_matching_textual_bracket(text: &str, open: usize) -> Option<usize> {
     None
 }
 
-fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) -> Option<TypeInfo> {
+pub fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) -> Option<TypeInfo> {
     match type_info {
         TypeInfo::Nullable(inner) => iterable_value_type_info(inner, key_text),
         TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
