@@ -1,15 +1,17 @@
 use crate::server::{
     build_organize_imports_edit, collect_php_files, compute_diagnostics_with_config,
     discover_workspace_root_config, is_unused_import_diagnostic,
-    load_effective_configuration_settings, normalize_config_paths, path_to_uri, return_type_hint,
+    load_effective_configuration_settings, normalize_config_paths, return_type_hint,
     workspace_index_directories, DiagnosticSeverityConfig, DiagnosticsMode, PhpVersion,
 };
+use crate::util::lsp_text::{lsp_position_to_byte, text_at_lsp_range};
+use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::references::collect_symbol_references_in_file;
 use php_lsp_parser::return_type::find_missing_return_type_candidates;
 use php_lsp_parser::symbols::extract_file_symbols;
-use php_lsp_parser::utf16::{utf16_col_to_byte, Utf16LineIndex};
+use php_lsp_parser::utf16::Utf16LineIndex;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -935,30 +937,6 @@ fn display_path(path: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
-}
-
-fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
-    let byte_col = utf16_col_to_byte(source, position.line, position.character) as usize;
-    let mut offset = 0usize;
-
-    for (current_line, row) in source.split_inclusive('\n').enumerate() {
-        if current_line as u32 == position.line {
-            return Some(offset + byte_col.min(row.len()));
-        }
-        offset += row.len();
-    }
-
-    if position.line as usize == source.lines().count() {
-        Some(source.len())
-    } else {
-        None
-    }
-}
-
-fn text_at_lsp_range(source: &str, range: Range) -> Option<&str> {
-    let start = lsp_position_to_byte(source, range.start)?;
-    let end = lsp_position_to_byte(source, range.end)?;
-    source.get(start..end)
 }
 
 #[cfg(test)]

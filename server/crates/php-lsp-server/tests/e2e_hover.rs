@@ -1,0 +1,1778 @@
+mod support;
+
+use support::*;
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_open_file_and_hover() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    // Initialize
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    // Open a PHP file with a class
+    let code = r#"<?php
+namespace App;
+
+class Greeter {
+    /** Say hello to someone. */
+    public function greet(string $name): string {
+        return "Hello, $name!";
+    }
+}
+
+$g = new Greeter();
+$g->greet("World");
+"#;
+    let uri = "file:///test/Greeter.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    // Hover over "Greeter" in "new Greeter()"
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, 10, 12))
+        .await
+        .unwrap();
+
+    let result = extract_result(resp);
+    // Result should contain hover content with "class" and "Greeter"
+    if !result.is_null() {
+        let contents = result
+            .get("contents")
+            .and_then(|c| c.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            contents.contains("class") || contents.contains("Greeter"),
+            "hover should mention class or Greeter, got: {}",
+            contents
+        );
+    }
+
+    // Shutdown
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_local_variable_with_inline_phpdoc_var() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Baz {
+    public function test(): void {}
+}
+
+function makeBaz() {}
+
+function run(): void {
+    /**
+     * Local baz variable.
+     * @var Baz $baz2
+     */
+    $baz2 = makeBaz();
+    $baz2->test();
+}
+"#;
+    let uri = "file:///test/hover-var-phpdoc.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    // Hover on "$baz2" in "$baz2->test();"
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, 15, 6))
+        .await
+        .unwrap();
+
+    let result = extract_result(resp);
+    assert!(
+        !result.is_null(),
+        "hover should return content for local variable"
+    );
+
+    let contents = result
+        .get("contents")
+        .and_then(|c| c.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        contents.contains("$baz2") && contents.contains("Baz"),
+        "hover should include variable name and inferred type, got: {}",
+        contents
+    );
+    assert!(
+        contents.contains("Local baz variable.") || contents.contains("@var"),
+        "hover should include PHPDoc context, got: {}",
+        contents
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_inline_phpdoc_var_overrides_weak_assignment_inference_for_hover_and_inlay() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class User {}
+class UserRepository {}
+
+function maybeObject(): object|null { return null; }
+function repo(): object { return new \stdClass(); }
+
+function run(): void {
+    /** @var User|null $user */
+    $user = maybeObject();
+    $user;
+    /** @var UserRepository $repo */
+    $repo = repo();
+    $repo;
+}
+"#;
+    let uri = "file:///test/inline-phpdoc-overrides-weak-rhs.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 17, 0))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let hints = result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("User") && label.contains("null")),
+        "expected inline @var nullable User inlay to override object|null, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == ": UserRepository"),
+        "expected inline @var UserRepository inlay to override object, got: {:?}",
+        labels
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label == ": object|null" || label == ": object"),
+        "weak object RHS inference should not win over inline @var, got: {:?}",
+        labels
+    );
+
+    let user_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, 11, 5))
+        .await
+        .unwrap();
+    let user_result = extract_result(user_hover);
+    let user_contents = user_result
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    assert!(
+        user_contents.contains("$user")
+            && user_contents.contains("User")
+            && user_contents.contains("null"),
+        "expected declaration hover to use inline @var nullable User, got: {}",
+        user_contents
+    );
+
+    let repo_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(4, uri, 14, 5))
+        .await
+        .unwrap();
+    let repo_result = extract_result(repo_hover);
+    let repo_contents = repo_result
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    assert!(
+        repo_contents.contains("$repo") && repo_contents.contains("UserRepository"),
+        "expected declaration hover to use inline @var UserRepository, got: {}",
+        repo_contents
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_inline_phpdoc_var_hover_on_multiline_ternary_assignment_declaration() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class RegionChangeRequest {}
+
+function maybeRegion(): ?RegionChangeRequest { return null; }
+
+function run(bool $enabled): void {
+    /** @var RegionChangeRequest|null $regionChangeRequest */
+    $regionChangeRequest = $enabled
+        ? maybeRegion()
+        : null;
+}
+"#;
+    let uri = "file:///test/inline-phpdoc-ternary-declaration-hover.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 13, 0))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let hints = result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("RegionChangeRequest") && label.contains("null")),
+        "expected inline @var ternary inlay, got: {:?}",
+        labels
+    );
+
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, 9, 5))
+        .await
+        .unwrap();
+    let result = extract_result(hover);
+    let contents = result
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    assert!(
+        contents.contains("$regionChangeRequest")
+            && contents.contains("RegionChangeRequest")
+            && contents.contains("null"),
+        "expected declaration hover to use inline @var on multiline ternary, got: {}",
+        contents
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_local_variable_hover_for_array_shape_and_scalar_ternary_assignment() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+namespace App;
+
+class Request {}
+
+function update(string $npId, Request $request, bool $donor): void {
+    $con/*context*/text = [
+        'npId' => $npId,
+        'request' => $request,
+        'status' => 'transfered',
+    ];
+
+    $tra/*transition*/nsition = $donor
+        ? 'donor_receive_complete'
+        : 'recipient_receive_complete';
+}
+"#;
+    let markers = ["/*context*/", "/*transition*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (context_line, context_character) = marker_position("/*context*/");
+    let (transition_line, transition_character) = marker_position("/*transition*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/local-array-shape-and-ternary-hover.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 17, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    let hints = inlay_result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+    assert!(
+        labels.iter().any(|label| label.contains("array{")),
+        "expected array-shape inlay, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == ": string"),
+        "expected scalar ternary string inlay, got: {:?}",
+        labels
+    );
+
+    let context_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, context_line, context_character))
+        .await
+        .unwrap();
+    let context_result = extract_result(context_hover);
+    let context_text = hover_markdown_value(&context_result);
+    assert!(
+        context_text.contains("array{") && context_text.contains("$context"),
+        "expected array-shape local variable hover, got: {}",
+        context_text
+    );
+
+    let transition_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(4, uri, transition_line, transition_character))
+        .await
+        .unwrap();
+    let transition_result = extract_result(transition_hover);
+    let transition_text = hover_markdown_value(&transition_result);
+    assert!(
+        transition_text.contains("string $transition"),
+        "expected scalar ternary local variable hover, got: {}",
+        transition_text
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_local_variable_method_return_types_and_links() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+namespace App;
+
+class PortingProcess {}
+
+class PortingRequest {
+    public function getPortingProcess(): ?PortingProcess { return new PortingProcess(); }
+}
+
+class DonorProcess {
+    public function getCurrentPlace(): ?string { return 'si'; }
+}
+
+abstract class SoapHandler {
+    protected function ensureProcessCreated(): ?PortingProcess { return new PortingProcess(); }
+}
+
+abstract class BaseHandler extends SoapHandler {
+    protected function updatePortingProcess(): bool { return true; }
+}
+
+class CdbHandler extends BaseHandler {
+    public function handle(PortingRequest $portingRequest): void {
+        $recipient/*recipient*/Process = $this->ensureProcessCreated();
+        $recipientProcess/*updated*/Updated = $this->updatePortingProcess();
+    }
+}
+"#;
+    let markers = ["/*recipient*/", "/*updated*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (recipient_line, recipient_character) = marker_position("/*recipient*/");
+    let (updated_line, updated_character) = marker_position("/*updated*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/hover-local-method-return-types.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let recipient_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, recipient_line, recipient_character))
+        .await
+        .unwrap();
+    let recipient_result = extract_result(recipient_resp);
+    let recipient_hover = hover_markdown_value(&recipient_result);
+    assert!(
+        recipient_hover.contains("?PortingProcess $recipientProcess"),
+        "expected nullable PortingProcess variable hover, got: {}",
+        recipient_hover
+    );
+    assert!(
+        recipient_hover
+            .contains("?[`PortingProcess`](<file:///test/hover-local-method-return-types.php#L4>)"),
+        "expected clickable PortingProcess type link, got: {}",
+        recipient_hover
+    );
+
+    let updated_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, updated_line, updated_character))
+        .await
+        .unwrap();
+    let updated_result = extract_result(updated_resp);
+    let updated_hover = hover_markdown_value(&updated_result);
+    assert!(
+        updated_hover.contains("bool $recipientProcessUpdated"),
+        "expected bool variable hover from method return type, got: {}",
+        updated_hover
+    );
+    assert!(
+        updated_hover.contains("**Type:** `bool`"),
+        "expected bool type section, got: {}",
+        updated_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_inlay_hints_for_parameters_and_phpdoc_types() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+/**
+ * @param string $name
+ * @param int $count
+ * @return string
+ */
+function label($name, $count) { return $name; }
+
+class Formatter {
+    /**
+     * @param string $prefix
+     * @return string
+     */
+    public function format($prefix) { return $prefix; }
+}
+
+function run(Formatter $formatter): void {
+    label("Ada", 2);
+    $formatter->format("Hi");
+}
+"#;
+    let uri = "file:///test/inlay-hints.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 22, 0))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let hints = result.as_array().expect("expected inlay hint array");
+    let labels: Vec<&str> = hints
+        .iter()
+        .filter_map(|hint| hint.get("label").and_then(|label| label.as_str()))
+        .collect();
+
+    for expected in ["name:", "count:", "prefix:", ": string", ": int"] {
+        assert!(
+            labels.contains(&expected),
+            "expected `{}` in inlay hint labels, got: {:?}",
+            expected,
+            labels
+        );
+    }
+    assert!(
+        hints
+            .iter()
+            .any(|hint| hint.get("kind").and_then(|kind| kind.as_u64()) == Some(2)),
+        "expected parameter hint kind, got: {}",
+        result
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|hint| hint.get("kind").and_then(|kind| kind.as_u64()) == Some(1)),
+        "expected type hint kind, got: {}",
+        result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_inlay_hints_for_local_variable_types() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class User {}
+class Widget {}
+
+class Repository {
+    public function find(): User { return new User(); }
+}
+
+class ServiceLocator {
+    /**
+     * @template T of object
+     * @param class-string<T> $class
+     * @return T
+     */
+    public function make($class) {}
+
+    /**
+     * @template T of object
+     * @param class-string<T>|string $class
+     * @return ($class is class-string<T> ? T : object)
+     */
+    public function conditional($class) {}
+}
+
+class PortingProcess {}
+
+class PortingRequest {
+    public function getPortingProcess(): ?PortingProcess { return new PortingProcess(); }
+}
+
+abstract class SoapHandler {
+    protected function ensureProcessCreated(): ?PortingProcess { return new PortingProcess(); }
+}
+
+abstract class BaseHandler extends SoapHandler {
+    protected function updatePortingProcess(): bool { return true; }
+}
+
+function run(Repository $repo): void {
+    $created = new User();
+    $found = $repo->find();
+    /** @var array<int, User> $users */
+    $users = [];
+    foreach ($users as $item) {
+        $copy = $item;
+    }
+    $count = 1;
+}
+
+function resolve(ServiceLocator $locator, string $unknownClass): void {
+    $made = $locator->make(Widget::class);
+    $conditional = $locator->conditional(Widget::class);
+    /** @var class-string<Widget> $widgetClass */
+    $widgetClass = Widget::class;
+    $fromVariable = $locator->make($widgetClass);
+    $fallback = $locator->conditional($unknownClass);
+}
+
+class CdbHandler extends BaseHandler {
+    public function handle(PortingRequest $portingRequest, \stdClass $message, DonorProcess $donorProcess): void {
+        $portingProcess = $portingRequest->getPortingProcess();
+        $recipientProcess = $this->ensureProcessCreated();
+        $recipientProcessUpdated = $this->updatePortingProcess();
+        $requestId = (string)($message->NPRequestId ?? '');
+        $currentPlace = (string)$donorProcess->getCurrentPlace();
+    }
+}
+"#;
+    let uri = "file:///test/local-variable-inlay-hints.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 68, 0))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let hints = result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+
+    assert!(
+        labels
+            .iter()
+            .filter(|label| label.as_str() == ": User")
+            .count()
+            >= 3,
+        "expected User local variable type hints, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == ": array<int, User>"),
+        "expected PHPDoc generic local variable type hint, got: {:?}",
+        labels
+    );
+    assert!(
+        labels
+            .iter()
+            .filter(|label| label.as_str() == ": Widget")
+            .count()
+            >= 3,
+        "expected class-string template and conditional return hints, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == ": T|object"),
+        "expected unresolved conditional return fallback union hint, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == ": ?PortingProcess"),
+        "expected nullable PortingProcess method-return hint, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|label| label == ": bool"),
+        "expected bool method-return hint, got: {:?}",
+        labels
+    );
+    assert!(
+        labels
+            .iter()
+            .filter(|label| label.as_str() == ": string")
+            .count()
+            >= 2,
+        "expected explicit string cast local variable hints, got: {:?}",
+        labels
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": bool")
+                && hint
+                    .get("tooltip")
+                    .and_then(|tooltip| tooltip.as_str())
+                    .is_some_and(|tooltip| tooltip.contains("bool"))
+        }),
+        "expected bool local variable hint tooltip to include the inferred type: {}",
+        result
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": ?PortingProcess")
+                && hint
+                    .get("tooltip")
+                    .and_then(|tooltip| tooltip.as_str())
+                    .is_some_and(|tooltip| tooltip.contains("App\\PortingProcess"))
+        }),
+        "expected PortingProcess local variable hint tooltip to include the target FQN: {}",
+        result
+    );
+    assert!(
+        !labels.iter().any(|label| label == ": int"),
+        "scalar assignment should not produce a noisy local variable hint: {:?}",
+        labels
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|hint| inlay_hint_has_label_part_location(hint, "User")),
+        "expected object local variable hint label to include a navigable User location: {}",
+        result
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|hint| inlay_hint_has_label_part_location(hint, "PortingProcess")),
+        "expected nullable PortingProcess hint label to include a navigable type location: {}",
+        result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_simplexml_stubs_drive_inlay_hints_and_hovers() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+namespace {
+class SimpleXMLElement {
+    /** @return static */
+    private function __get($name) {}
+    /**
+     * @return static[]|false|null
+     */
+    public function xpath(string $expression): array|false|null { return []; }
+    public function registerXPathNamespace(string $prefix, string $namespace): bool { return true; }
+}
+
+function simplexml_load_string(string $data): SimpleXMLElement|false { return new SimpleXMLElement(); }
+}
+
+namespace App;
+
+function parse(string $responseXml): void {
+    $x/*xml*/ml = simplexml_load_string($responseXml);
+    if (false === $xml) {
+        return;
+    }
+    $xml->registerXPath/*method*/Namespace('s', 'urn');
+    $result/*nodes*/Nodes = $xml->xpath('//x');
+    /** @var \SimpleXMLElement $result */
+    $result = $resultNodes[0];
+    $status = (string)($result->Status/*prop*/Code ?? '');
+}
+"#;
+    let markers = ["/*xml*/", "/*method*/", "/*nodes*/", "/*prop*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (xml_line, xml_character) = marker_position("/*xml*/");
+    let (method_line, method_character) = marker_position("/*method*/");
+    let (nodes_line, nodes_character) = marker_position("/*nodes*/");
+    let (prop_line, prop_character) = marker_position("/*prop*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/simplexml-inlay-hover.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 30, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    let hints = inlay_result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == ": SimpleXMLElement|false"),
+        "expected simplexml_load_string return type hint, got: {:?}",
+        labels
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == ": array<SimpleXMLElement>|false|null"),
+        "expected xpath PHPDoc generic return type hint, got: {:?}",
+        labels
+    );
+
+    let xml_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(3, uri, xml_line, xml_character))
+            .await
+            .unwrap(),
+    );
+    let xml_hover = hover_markdown_value(&xml_hover);
+    assert!(
+        xml_hover.contains("SimpleXMLElement|false $xml"),
+        "expected local variable hover from global function fallback, got: {}",
+        xml_hover
+    );
+
+    let method_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(4, uri, method_line, method_character))
+            .await
+            .unwrap(),
+    );
+    let method_hover = hover_markdown_value(&method_hover);
+    assert!(
+        method_hover.contains("method SimpleXMLElement::registerXPathNamespace"),
+        "expected method hover on SimpleXMLElement receiver, got: {}",
+        method_hover
+    );
+
+    let nodes_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(5, uri, nodes_line, nodes_character))
+            .await
+            .unwrap(),
+    );
+    let nodes_hover = hover_markdown_value(&nodes_hover);
+    assert!(
+        nodes_hover.contains("array<SimpleXMLElement>|false|null $resultNodes"),
+        "expected local variable hover from xpath PHPDoc return type, got: {}",
+        nodes_hover
+    );
+
+    let prop_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(6, uri, prop_line, prop_character))
+            .await
+            .unwrap(),
+    );
+    let prop_hover = hover_markdown_value(&prop_hover);
+    assert!(
+        prop_hover.contains("property SimpleXMLElement::$StatusCode: SimpleXMLElement"),
+        "expected magic-property hover from __get return type, got: {}",
+        prop_hover
+    );
+    assert!(
+        prop_hover.contains("[`SimpleXMLElement`](<file:///test/simplexml-inlay-hover.php#L3>)"),
+        "expected clickable SimpleXMLElement type link in property hover, got: {}",
+        prop_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_foreach_value_inlay_and_hover_from_indexed_method_generic_return() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+namespace Doctrine\Common\Collections;
+
+interface Collection {}
+
+namespace App\Entity;
+
+use Doctrine\Common\Collections\Collection;
+
+class ReversePortingNumber {
+    public function getPhoneNumber(): string { return ''; }
+}
+
+class ReverseRequest {
+    /**
+     * @return Collection<int, ReversePortingNumber>
+     */
+    public function getReversePortingNumbers(): Collection {}
+}
+
+namespace App\Soap\Inbound\Handler;
+
+use App\Entity\ReverseRequest;
+
+function update(ReverseRequest $reverseRequest): void {
+    foreach ($reverseRequest->getReversePortingNumbers() as $port/*decl*/ingNumber) {
+        $pn = $porting/*usage*/Number->getPhoneNumber();
+    }
+}
+"#;
+    let markers = ["/*decl*/", "/*usage*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (usage_line, usage_character) = marker_position("/*usage*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/foreach-indexed-method-generic-return.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 30, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    let hints = inlay_result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+    assert!(
+        labels.iter().any(|label| label == ": ReversePortingNumber"),
+        "expected foreach value type hint from indexed method PHPDoc return, got: {:?}",
+        labels
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|hint| inlay_hint_has_label_part_location(hint, "ReversePortingNumber")),
+        "expected foreach value inlay hint to include a navigable type location: {}",
+        inlay_result
+    );
+
+    let hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, usage_line, usage_character))
+        .await
+        .unwrap();
+    let hover_result = extract_result(hover_response);
+    let hover = hover_markdown_value(&hover_result);
+    assert!(
+        hover.contains("ReversePortingNumber $portingNumber"),
+        "expected foreach value hover from indexed method PHPDoc return, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("[`ReversePortingNumber`](<file:///test/foreach-indexed-method-generic-return.php#L10>)"),
+        "expected clickable ReversePortingNumber type link in hover, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_foreach_value_inlay_and_hover_from_doctrine_collection_target_entity() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-doctrine-collection-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let entity_dir = tmp_root.join("src/Entity");
+    let handler_dir = tmp_root.join("src/Handler");
+    fs::create_dir_all(&entity_dir).unwrap();
+    fs::create_dir_all(&handler_dir).unwrap();
+
+    let entity_path = entity_dir.join("Order.php");
+    let entity_code = r#"<?php
+namespace App\Entity;
+
+use Doctrine\Common\Collections\Collection;
+use Doctrine\ORM\Mapping as ORM;
+
+class OrderItem {
+    public function getStatus(): ?OrderStatus { return new OrderStatus(); }
+    public function sku(): string { return ''; }
+}
+
+class OrderStatus {
+    public function name(): string { return ''; }
+}
+
+class Order {
+    #[ORM\OneToMany(
+        targetEntity: OrderItem::class,
+        mappedBy: 'order',
+        cascade: ['persist']
+    )]
+    private Collection $items;
+
+    public function getItems(): Collection {
+        return $this->items;
+    }
+}
+"#;
+    fs::write(&entity_path, entity_code).unwrap();
+
+    let handler_path = handler_dir.join("CompleteHandler.php");
+    let code_with_markers = r#"<?php
+namespace App\Handler;
+
+use App\Entity\Order;
+
+function update(Order $order): void {
+    foreach ($order->getItems() as $it/*decl*/em) {
+        $sku = $it/*usage*/em->sk/*sku*/u();
+        $st/*status*/atusName = $item->get/*getStatus*/Status()?->name();
+    }
+}
+"#;
+    let markers = [
+        "/*decl*/",
+        "/*usage*/",
+        "/*sku*/",
+        "/*status*/",
+        "/*getStatus*/",
+    ];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (usage_line, usage_character) = marker_position("/*usage*/");
+    let (sku_line, sku_character) = marker_position("/*sku*/");
+    let (status_line, status_character) = marker_position("/*status*/");
+    let (get_status_line, get_status_character) = marker_position("/*getStatus*/");
+    let mut handler_code = code_with_markers.to_string();
+    for marker in markers {
+        handler_code = handler_code.replace(marker, "");
+    }
+    fs::write(&handler_path, &handler_code).unwrap();
+
+    let entity_uri = format!("file://{}", entity_path.to_string_lossy());
+    let handler_uri = format!("file://{}", handler_path.to_string_lossy());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&entity_uri, entity_code))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&handler_uri, &handler_code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, &handler_uri, 0, 0, 10, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    let hints = inlay_result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+    assert!(
+        labels.iter().any(|label| label == ": OrderItem"),
+        "expected foreach value type hint from Doctrine targetEntity, got: {:?}",
+        labels
+    );
+
+    let hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, &handler_uri, usage_line, usage_character))
+        .await
+        .unwrap();
+    let hover_result = extract_result(hover_response);
+    let hover = hover_markdown_value(&hover_result);
+    assert!(
+        hover.contains("OrderItem $item"),
+        "expected foreach value hover from Doctrine targetEntity, got: {}",
+        hover
+    );
+
+    let sku_hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(4, &handler_uri, sku_line, sku_character))
+        .await
+        .unwrap();
+    let sku_hover_result = extract_result(sku_hover_response);
+    let sku_hover = hover_markdown_value(&sku_hover_result);
+    assert!(
+        sku_hover.contains("method App\\Entity\\OrderItem::sku") && sku_hover.contains(": string"),
+        "expected method hover from Doctrine targetEntity foreach receiver, got: {}",
+        sku_hover
+    );
+
+    let get_status_hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            5,
+            &handler_uri,
+            get_status_line,
+            get_status_character,
+        ))
+        .await
+        .unwrap();
+    let get_status_hover_result = extract_result(get_status_hover_response);
+    let get_status_hover = hover_markdown_value(&get_status_hover_result);
+    assert!(
+        get_status_hover.contains("method App\\Entity\\OrderItem::getStatus")
+            && get_status_hover.contains("?OrderStatus"),
+        "expected nullable method hover from Doctrine targetEntity foreach receiver, got: {}",
+        get_status_hover
+    );
+
+    let status_hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            6,
+            &handler_uri,
+            status_line,
+            status_character.saturating_sub(2),
+        ))
+        .await
+        .unwrap();
+    let status_hover_result = extract_result(status_hover_response);
+    let status_hover = hover_markdown_value(&status_hover_result);
+    assert!(
+        status_hover.contains("string $statusName"),
+        "expected follow-on member chain hover from Doctrine targetEntity foreach value, got: {}",
+        status_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_foreach_value_inlay_and_hover_from_array_keys_after_array_write() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+function handleRegionChangeRequestComplete(array $numbers): void {
+    $normalizedNumbers = [];
+    foreach ($numbers as $number) {
+        $normalizedNumber = preg_replace('/\D+/', '', is_scalar($number) ? (string)$number : '') ?? '';
+        if ('' !== $normalizedNumber) {
+            $normalizedNumbers[$normalizedNumber] = true;
+        }
+    }
+    $numbers = array_keys($normalizedNumbers);
+
+    foreach ($numbers as $phone/*decl*/Number) {
+        strlen($phone/*usage*/Number);
+    }
+}
+"#;
+    let markers = ["/*decl*/", "/*usage*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (usage_line, usage_character) = marker_position("/*usage*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/foreach-array-keys-normalized.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 20, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    let hints = inlay_result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+    assert!(
+        labels.iter().any(|label| label == ": string"),
+        "expected foreach value type hint from array_keys normalized array, got: {:?}",
+        labels
+    );
+
+    let hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, usage_line, usage_character))
+        .await
+        .unwrap();
+    let hover_result = extract_result(hover_response);
+    let hover = hover_markdown_value(&hover_result);
+    assert!(
+        hover.contains("string $phoneNumber"),
+        "expected foreach value hover from array_keys normalized array, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_callback_parameter_inference_from_indexed_signatures() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let definitions = r#"<?php
+namespace App;
+
+class User {
+    public function getName(): string { return ''; }
+}
+
+/**
+ * @template TItem
+ */
+class ExternalCollection {
+    /**
+     * @template TResult
+     * @param callable(TItem): TResult $callback
+     * @return ExternalCollection<TResult>
+     */
+    public function map(callable $callback): self { return $this; }
+}
+
+/**
+ * @template TItem
+ * @template TResult
+ * @param callable(TItem): TResult $callback
+ * @param array<int, TItem> $items
+ * @return array<int, TResult>
+ */
+function external_map(callable $callback, array $items): array { return []; }
+"#;
+
+    let usage = r#"<?php
+namespace App;
+
+function run(): void {
+    /** @var ExternalCollection<User> $users */
+    $users = loadUsers();
+    $users->map(fn($user) => $user->getName());
+
+    /** @var array<int, User> $arrayUsers */
+    $arrayUsers = [];
+    external_map(fn($mappedUser) => $mappedUser->getName(), $arrayUsers);
+}
+"#;
+
+    let defs_uri = "file:///test/callback-definitions.php";
+    let usage_uri = "file:///test/callback-usage.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(defs_uri, definitions))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(usage_uri, usage))
+        .await
+        .unwrap();
+
+    let find_line_col = |needle: &str| -> (u32, u32) {
+        for (line, row) in usage.lines().enumerate() {
+            if let Some(col) = row.find(needle) {
+                return (line as u32, col as u32);
+            }
+        }
+        panic!("needle not found: {needle}");
+    };
+
+    let (collection_line, collection_col) = find_line_col("$user) =>");
+    let collection_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            usage_uri,
+            collection_line,
+            collection_col + 1,
+        ))
+        .await
+        .unwrap();
+    let collection_hover_text = hover_markdown_value(&extract_result(collection_hover));
+    assert!(
+        collection_hover_text.contains("User $user"),
+        "collection callback parameter hover should infer User, got: {}",
+        collection_hover_text
+    );
+
+    let (function_line, function_col) = find_line_col("$mappedUser) =>");
+    let function_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, usage_uri, function_line, function_col + 1))
+        .await
+        .unwrap();
+    let function_hover_text = hover_markdown_value(&extract_result(function_hover));
+    assert!(
+        function_hover_text.contains("User $mappedUser"),
+        "function callback parameter hover should infer User, got: {}",
+        function_hover_text
+    );
+
+    let (method_line, method_col) = find_line_col("$mappedUser->getName");
+    let definition = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            4,
+            usage_uri,
+            method_line,
+            method_col + "$mappedUser->".len() as u32,
+        ))
+        .await
+        .unwrap();
+    let definition_result = extract_result(definition);
+    assert_eq!(
+        definition_result
+            .get("uri")
+            .and_then(|value| value.as_str()),
+        Some(defs_uri),
+        "callback parameter method definition should resolve through indexed signature: {}",
+        definition_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}

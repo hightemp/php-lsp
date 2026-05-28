@@ -145,7 +145,7 @@ test-server:
 	cd $(SERVER_DIR) && cargo test -p php-lsp-server
 
 test-e2e:
-	cd $(SERVER_DIR) && cargo test -p php-lsp-server --test e2e
+	cd $(SERVER_DIR) && cargo test -p php-lsp-server --tests
 
 # ─── Install into VS Code ────────────────────────────────────────
 VSIX := $(shell ls -t $(CLIENT_DIR)/*.vsix 2>/dev/null | head -1)

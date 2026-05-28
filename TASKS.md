@@ -3058,6 +3058,37 @@ while implementing these tasks.
 
 ## Текущие задачи
 
+- [x] **T-2026-05-28-document-split-structure** Document the new split server/test structure and update agent guidance. *(done 2026-05-28)*
+  - Scope: update existing English documentation only; do not create duplicate markdown files.
+  - Implementation target: document the new `php-lsp-server/src/lsp`, `src/indexing`, `src/util`, and split e2e test layout.
+  - Implementation target: update `AGENTS.md` where-to-look routes and test-selection commands so future agents use the new files instead of old `server.rs` / `tests/e2e.rs` assumptions.
+  - Implemented: updated `AGENTS.md` with the new `php-lsp-server` module map, focused e2e targets, and feature-specific "where to look" routes.
+  - Implemented: updated `docs/architecture.md` with the server crate layout, split e2e test layout, feature ownership map, and public entry point map.
+  - Implemented: updated `make test-e2e` to run the split e2e suite with `cargo test -p php-lsp-server --tests`.
+  - Validation: `make -n test-e2e`, stale e2e/server.rs reference scan, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-full-module-split** Split `php-lsp-server` into focused LSP/indexing modules and split the large e2e suite. *(done 2026-05-28)*
+  - Scope: make the structural split recommended in the architecture audit so future work does not need to read/edit the whole `server.rs` or `tests/e2e.rs`.
+  - Implementation target: introduce `src/lsp/` modules for feature-specific server helpers/handlers (`completion`, `hover`, `definition`, `references`, `rename`, `diagnostics`, `code_action`, `formatting`, `inlay_hints`, `semantic_tokens`, `hierarchy`, `document_symbols`, `folding`, `document_links`).
+  - Implementation target: introduce `src/indexing/` modules for workspace/vendor/stubs/cache indexing helpers.
+  - Implementation target: split `tests/e2e.rs` into focused e2e files with shared helpers in `tests/support/mod.rs`.
+  - Constraint: this is a behavior-preserving file/module extraction; do not change URI encoding, range semantics, diagnostics behavior, or completion behavior as part of this task.
+  - Implemented: moved `LanguageServer` request bodies into focused `src/lsp/*` modules while keeping `server.rs` as trait wiring/delegation.
+  - Implemented: moved code-action edit/refactor/import/PHPDoc helper internals into `src/lsp/code_action.rs` so `server.rs` no longer owns the largest code-action block.
+  - Implemented: moved workspace/file-operation handlers into `src/indexing/workspace.rs` and cache/stub/vendor helpers into `src/indexing/cache.rs`, `src/indexing/stubs.rs`, and `src/indexing/vendor.rs`.
+  - Implemented: replaced the single `tests/e2e.rs` with focused e2e targets plus shared helpers in `tests/support/mod.rs`.
+  - Validation: `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server`, `cargo fmt --all --check`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step1** Start splitting large server files into focused modules. *(done 2026-05-28)*
+  - Scope: make the first behavior-preserving code split from the large `server.rs`/CLI helper surface.
+  - Implementation target: introduce focused `php-lsp-server/src/util/` modules for shared URI and LSP range/text helpers and migrate existing users.
+  - Constraint: do not mix this with functional URI encoding changes from `PHA-002`; this task is only file/module extraction unless tests force a small compatibility fix.
+  - Follow-up: keep larger LSP feature-handler extraction (`lsp/completion.rs`, `lsp/hover.rs`, diagnostics, code actions, inlay hints) as separate incremental refactors.
+  - Implemented: added `src/util/uri.rs` for shared `path_to_uri` / `uri_to_path` helpers and moved the existing round-trip regression there.
+  - Implemented: added `src/util/lsp_text.rs` for shared `lsp_position_to_byte` / `text_at_lsp_range` helpers and removed duplicated implementations from `server.rs` and `fix.rs`.
+  - Implemented: migrated `server.rs`, `analyze.rs`, and `fix.rs` to use the new utility modules without changing URI semantics yet.
+  - Validation: `cargo fmt --all --check`, targeted util tests, `cargo check -p php-lsp-server`, and `cargo test -p php-lsp-server` passed.
+
 - [x] **T-2026-05-28-agent-onboarding** Improve agent-facing project guidance without duplicating existing docs. *(done 2026-05-28)*
   - Scope: update existing `AGENTS.md`, architecture/feature documentation, and build shortcuts so future Codex/LLM work has a concise project map, invariants, recipes, and test-selection guidance.
   - Constraint: do not create duplicate markdown files when an equivalent document already exists; extend existing files such as `AGENTS.md`, `docs/architecture.md`, `docs/lsp-features.md`, and `Makefile`.

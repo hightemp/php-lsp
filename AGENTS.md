@@ -25,6 +25,57 @@
 - `server/crates/php-lsp-server`
   - LSP server orchestration, CLI analyze/fix, configuration, framework heuristics, and template support.
   - Common entry files: `src/server.rs`, `src/config.rs`, `src/analyze.rs`, `src/fix.rs`, `src/framework.rs`, `src/template.rs`.
+  - LSP request bodies live in `src/lsp/`; `src/server.rs` owns `PhpLspBackend`, shared helper state, and `LanguageServer` trait wiring.
+  - Workspace/file-operation handlers and server-side cache/stub/vendor helpers live in `src/indexing/`.
+  - Shared server utilities live in `src/util/`.
+
+## `php-lsp-server` Layout
+
+- `src/server.rs`
+  - Defines `PhpLspBackend`, shared request caches, runtime configuration state, common inference/diagnostic helpers, and `LanguageServer` delegation.
+  - Keep new LSP feature request bodies out of this file unless they are only trait wiring.
+- `src/lsp/lifecycle.rs`
+  - `initialize` and `shutdown` behavior.
+- `src/lsp/diagnostics.rs`
+  - `didOpen`, `didChange`, `didSave`, `didClose` notification handlers.
+- `src/lsp/completion.rs`
+  - `textDocument/completion`, `completionItem/resolve`, and `textDocument/signatureHelp`.
+- `src/lsp/hover.rs`
+  - `textDocument/hover`, including local-variable and virtual-member markdown assembly.
+- `src/lsp/definition.rs`
+  - Definition, declaration, type definition, and implementation requests.
+- `src/lsp/references.rs`
+  - Document highlight, references, and reference-count code lens requests.
+- `src/lsp/rename.rs`
+  - Prepare rename and rename request handling.
+- `src/lsp/code_action.rs`
+  - Code actions, lazy code-action resolve, edit builders, generate-members/refactor/PHPDoc/import fix helpers.
+- `src/lsp/formatting.rs`
+  - Document/range/on-type formatting request handling.
+- `src/lsp/inlay_hints.rs`
+  - `textDocument/inlayHint` request handling.
+- `src/lsp/semantic_tokens.rs`
+  - Full, delta, and range semantic token request handling.
+- `src/lsp/hierarchy.rs`
+  - Call hierarchy and type hierarchy requests.
+- `src/lsp/document_symbols.rs`
+  - Document symbols, workspace symbols, selection range, and linked editing range.
+- `src/lsp/folding.rs`
+  - Folding range requests.
+- `src/lsp/document_links.rs`
+  - Static include/require document links.
+- `src/indexing/workspace.rs`
+  - `initialized`, workspace folders, watched files, configuration changes, and file-operation handlers.
+- `src/indexing/cache.rs`
+  - Server-side index cache config/hash helpers.
+- `src/indexing/stubs.rs`
+  - Server-side stub loading and stub cache-source helpers.
+- `src/indexing/vendor.rs`
+  - Vendor autoload metadata cache and lazy vendor file LRU helpers.
+- `src/util/uri.rs`
+  - Shared path/URI helpers. Current behavior intentionally preserves legacy URI semantics until `PHA-002`.
+- `src/util/lsp_text.rs`
+  - UTF-16 LSP position/range to source byte-offset helpers.
 
 ## Build, Test, and Development Commands
 - Rust server (from `server/`):
@@ -42,7 +93,7 @@
 - Existing root Makefile shortcuts:
   - `make check` runs server fmt/clippy, client lint, and Rust tests.
   - `make test-server` runs `php-lsp-server` crate tests.
-  - `make test-e2e` runs LSP e2e protocol tests.
+  - `make test-e2e` runs split LSP e2e protocol tests.
   - `make check-server` runs Rust fmt, clippy, and tests.
   - `make check-client` runs VS Code client lint/build.
 
@@ -84,7 +135,8 @@
 
 ## Testing Guidelines
 - Add Rust tests close to changed behavior and run `cargo test --all` before opening a PR.
-- End-to-end protocol tests are in `server/crates/php-lsp-server/tests/e2e.rs`.
+- End-to-end protocol tests are split across `server/crates/php-lsp-server/tests/e2e_*.rs`.
+- Shared e2e JSON-RPC harness helpers are in `server/crates/php-lsp-server/tests/support/mod.rs`.
 - Use descriptive test names (for example, `test_open_file_and_hover`).
 - For client-side changes, always run both `npm run lint` and `npm run build`.
 - Prefer focused unit tests for parser/index/completion changes and e2e tests only when behavior crosses crate or LSP protocol boundaries.
@@ -95,7 +147,8 @@
 - Symbol extraction/resolution: `cd server && cargo test -p php-lsp-parser symbols` or a focused resolver test.
 - Completion context/provider behavior: `cd server && cargo test -p php-lsp-completion`.
 - Workspace index/cache/stubs behavior: `cd server && cargo test -p php-lsp-index`.
-- LSP handler behavior: `cd server && cargo test -p php-lsp-server --test e2e <test_name>`.
+- All split LSP e2e tests: `cd server && cargo test -p php-lsp-server --tests`.
+- Focused LSP e2e tests: `cd server && cargo test -p php-lsp-server --test e2e_completion <test_name>` or the relevant `e2e_*` target.
 - Server helper/config behavior: `cd server && cargo test -p php-lsp-server <test_name>`.
 - Client behavior: `cd client && npm run lint && npm run build`.
 
@@ -103,18 +156,45 @@
 - Completion bugs:
   - `server/crates/php-lsp-completion/src/context.rs`
   - `server/crates/php-lsp-completion/src/provider.rs`
-  - `server/crates/php-lsp-server/src/server.rs`, search for `completion`.
+  - `server/crates/php-lsp-server/src/lsp/completion.rs`
+  - `server/crates/php-lsp-server/tests/e2e_completion.rs`
 - Hover, definition, declaration, and type definition bugs:
   - `server/crates/php-lsp-parser/src/resolve.rs`
-  - `server/crates/php-lsp-server/src/server.rs`, search for `hover`, `goto_definition`, `type_definition`.
+  - `server/crates/php-lsp-server/src/lsp/hover.rs`
+  - `server/crates/php-lsp-server/src/lsp/definition.rs`
+  - `server/crates/php-lsp-server/tests/e2e_hover.rs`
+  - `server/crates/php-lsp-server/tests/e2e_definition.rs`
 - Rename and references bugs:
   - `server/crates/php-lsp-parser/src/references.rs`
   - `server/crates/php-lsp-index/src/workspace.rs`
-  - `server/crates/php-lsp-server/src/server.rs`, search for `rename`, `references`.
+  - `server/crates/php-lsp-server/src/lsp/rename.rs`
+  - `server/crates/php-lsp-server/src/lsp/references.rs`
+  - `server/crates/php-lsp-server/tests/e2e_references.rs`
 - Diagnostics bugs:
   - `server/crates/php-lsp-parser/src/diagnostics.rs`
   - `server/crates/php-lsp-parser/src/semantic.rs`
-  - `server/crates/php-lsp-server/src/server.rs`, search for `compute_diagnostics`.
+  - `server/crates/php-lsp-server/src/lsp/diagnostics.rs`
+  - `server/crates/php-lsp-server/src/server.rs`, search for `compute_diagnostics` only for shared diagnostic helpers.
+  - `server/crates/php-lsp-server/tests/e2e_diagnostics.rs`
+- Code action/refactor bugs:
+  - `server/crates/php-lsp-server/src/lsp/code_action.rs`
+  - `server/crates/php-lsp-server/tests/e2e_code_actions.rs`
+- Inlay hint bugs:
+  - `server/crates/php-lsp-server/src/lsp/inlay_hints.rs`
+  - `server/crates/php-lsp-server/src/server.rs`, search for `LocalVariableInlayType` or shared type-inference helpers.
+  - `server/crates/php-lsp-server/tests/e2e_hover.rs`
+- Formatting bugs:
+  - `server/crates/php-lsp-server/src/lsp/formatting.rs`
+  - `server/crates/php-lsp-server/tests/e2e_formatting.rs`
+- Semantic token / symbol / folding / document link bugs:
+  - `server/crates/php-lsp-server/src/lsp/semantic_tokens.rs`
+  - `server/crates/php-lsp-server/src/lsp/document_symbols.rs`
+  - `server/crates/php-lsp-server/src/lsp/folding.rs`
+  - `server/crates/php-lsp-server/src/lsp/document_links.rs`
+  - `server/crates/php-lsp-server/tests/e2e_symbols.rs`
+- Hierarchy bugs:
+  - `server/crates/php-lsp-server/src/lsp/hierarchy.rs`
+  - `server/crates/php-lsp-server/tests/e2e_hierarchy.rs`
 - PHPDoc/type bugs:
   - `server/crates/php-lsp-parser/src/phpdoc.rs`
   - `server/crates/php-lsp-parser/src/symbols.rs`
@@ -124,10 +204,15 @@
   - `server/crates/php-lsp-index/src/composer.rs`
   - `server/crates/php-lsp-index/src/stubs.rs`
   - `server/crates/php-lsp-index/src/cache.rs`
-  - `server/crates/php-lsp-server/src/server.rs`, search for `lazy_index`, `vendor`, `stubs`, `cache`.
+  - `server/crates/php-lsp-server/src/indexing/workspace.rs`
+  - `server/crates/php-lsp-server/src/indexing/vendor.rs`
+  - `server/crates/php-lsp-server/src/indexing/stubs.rs`
+  - `server/crates/php-lsp-server/src/indexing/cache.rs`
+  - `server/crates/php-lsp-server/tests/e2e_indexing.rs`
 - Blade/Twig bugs:
   - `server/crates/php-lsp-server/src/template.rs`
-  - `server/crates/php-lsp-server/src/server.rs`, search for `TemplateDocument`, `twig`, `blade`.
+  - `server/crates/php-lsp-server/src/lsp/hover.rs`, `completion.rs`, `definition.rs`, and `semantic_tokens.rs` for template-aware LSP behavior.
+  - `server/crates/php-lsp-server/tests/e2e_templates.rs`
 
 ## Known Pitfalls
 - Do not confuse byte columns with UTF-16 columns.

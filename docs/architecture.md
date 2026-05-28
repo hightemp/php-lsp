@@ -18,6 +18,77 @@ which paths affect latency.
 The VS Code extension launches `php-lsp` over stdio. Server logs go to stderr
 through `tracing`, so they do not corrupt JSON-RPC messages.
 
+## Server Crate Layout
+
+The server crate is intentionally split by operational area. New code should
+prefer the focused module for its feature instead of growing `server.rs`.
+
+```text
+server/crates/php-lsp-server/src/
+  server.rs                  # PhpLspBackend state, shared helpers, LanguageServer delegation
+  lsp/
+    lifecycle.rs             # initialize/shutdown
+    diagnostics.rs           # didOpen/didChange/didSave/didClose
+    completion.rs            # completion, completion resolve, signature help
+    hover.rs                 # hover response assembly
+    definition.rs            # definition/declaration/typeDefinition/implementation
+    references.rs            # documentHighlight/references/codeLens
+    rename.rs                # prepareRename/rename
+    code_action.rs           # code actions, lazy resolve, edit/refactor helpers
+    formatting.rs            # document/range/on-type formatting
+    inlay_hints.rs           # inlayHint request handling
+    semantic_tokens.rs       # full/delta/range semantic tokens
+    hierarchy.rs             # call hierarchy and type hierarchy
+    document_symbols.rs      # document symbols, workspace symbols, selection/linked editing
+    folding.rs               # folding ranges
+    document_links.rs        # include/require document links
+  indexing/
+    workspace.rs             # initialized, workspace sync, watched files, file operations
+    cache.rs                 # server-side index cache config/hash helpers
+    stubs.rs                 # server-side stub loading helpers
+    vendor.rs                # vendor autoload cache and lazy vendor LRU helpers
+  util/
+    uri.rs                   # shared URI/path helpers
+    lsp_text.rs              # LSP UTF-16 range/position to byte-offset helpers
+```
+
+`server.rs` still contains shared inference, diagnostic, framework, and
+cross-feature helpers that are used by multiple LSP modules. When adding new
+request handling code, keep the `LanguageServer` trait method in `server.rs`
+as delegation and put the request body in `src/lsp/<feature>.rs`.
+
+## E2E Test Layout
+
+The protocol tests are split by feature area. Shared JSON-RPC request builders
+and response helpers live in `tests/support/mod.rs`.
+
+| Test target | Covers |
+|---|---|
+| `tests/e2e_initialize.rs` | initialize/shutdown, runtime configuration, project config trust. |
+| `tests/e2e_completion.rs` | completion, completion resolve, signature help, shape completion. |
+| `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
+| `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
+| `tests/e2e_references.rs` | document highlight, references, rename, code lens, cancellation. |
+| `tests/e2e_code_actions.rs` | quick fixes, organize imports, generate members, refactors, PHPDoc sync. |
+| `tests/e2e_diagnostics.rs` | diagnostics debounce/staleness, PHP version gates, vendor metadata refresh. |
+| `tests/e2e_formatting.rs` | document/range/on-type formatting. |
+| `tests/e2e_symbols.rs` | semantic tokens, document/workspace symbols, selection range, folding, document links. |
+| `tests/e2e_hierarchy.rs` | call hierarchy and type hierarchy. |
+| `tests/e2e_indexing.rs` | watched files, file operations, workspace folders, index-related inference. |
+| `tests/e2e_templates.rs` | Blade/Twig virtual PHP behavior. |
+
+Run all split protocol tests with:
+
+```bash
+cd server && cargo test -p php-lsp-server --tests
+```
+
+Run a focused target with:
+
+```bash
+cd server && cargo test -p php-lsp-server --test e2e_completion
+```
+
 ## Shared Invariants
 
 These invariants are intentionally called out because many LSP features cross
@@ -91,17 +162,17 @@ Disk cache: workspace / stubs / vendor
 
 | Feature area | LSP/server entry point | Parser/completion layer | Index/cache layer | Primary tests |
 |---|---|---|---|---|
-| Hover | `PhpLspBackend::hover` | `resolve.rs`, PHPDoc helpers | `workspace.rs` symbol lookup | `php-lsp-server/tests/e2e.rs` |
-| Definition/declaration/type definition | `goto_definition`, `goto_declaration`, `goto_type_definition` | `resolve.rs` | `workspace.rs`, lazy vendor lookup | e2e definition tests |
-| Completion | `completion`, `completion_resolve` | `php-lsp-completion/src/context.rs`, `provider.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + e2e |
-| Signature help | `signature_help` | call/member resolution helpers | `workspace.rs` signature lookup | e2e signature tests |
-| References/code lens | `references`, `code_lens`, `code_lens_resolve` | `references.rs` | `file_references` in `WorkspaceIndex` | e2e references/lens tests |
-| Rename | `prepare_rename`, `rename` | `references.rs`, local variable search | `file_references`, symbol lookup | e2e rename tests |
-| Diagnostics | open/change/save diagnostic paths | `diagnostics.rs`, `semantic.rs` | `workspace.rs` symbol resolution | parser unit tests + e2e |
-| Code actions/refactors | `code_action`, `code_action_resolve` | parser helpers, return type helpers | symbol/member lookup | server unit/e2e tests |
-| Inlay hints | `inlay_hint` | type inference and local variable scans | indexed signatures/types | e2e inlay hint tests |
-| Templates | template-aware LSP handlers | `template.rs` virtual PHP/source maps | Twig context scans | template e2e tests |
-| Stubs/vendor/cache | initialization, reindex, lazy index paths | symbol extraction | `stubs.rs`, `composer.rs`, `cache.rs` | index unit tests + e2e |
+| Hover | `src/lsp/hover.rs` | `resolve.rs`, PHPDoc helpers | `workspace.rs` symbol lookup | `tests/e2e_hover.rs` |
+| Definition/declaration/type definition | `src/lsp/definition.rs` | `resolve.rs` | `workspace.rs`, lazy vendor lookup | `tests/e2e_definition.rs` |
+| Completion | `src/lsp/completion.rs` | `php-lsp-completion/src/context.rs`, `provider.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + `tests/e2e_completion.rs` |
+| Signature help | `src/lsp/completion.rs` | call/member resolution helpers | `workspace.rs` signature lookup | `tests/e2e_completion.rs` |
+| References/code lens | `src/lsp/references.rs` | `references.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs` |
+| Rename | `src/lsp/rename.rs` | `references.rs`, local variable search | `file_references`, symbol lookup | `tests/e2e_references.rs` |
+| Diagnostics | `src/lsp/diagnostics.rs` plus shared helpers in `server.rs` | `diagnostics.rs`, `semantic.rs` | `workspace.rs` symbol resolution | parser unit tests + `tests/e2e_diagnostics.rs` |
+| Code actions/refactors | `src/lsp/code_action.rs` | parser helpers, return type helpers | symbol/member lookup | server unit tests + `tests/e2e_code_actions.rs` |
+| Inlay hints | `src/lsp/inlay_hints.rs` plus shared inference helpers in `server.rs` | type inference and local variable scans | indexed signatures/types | `tests/e2e_hover.rs` |
+| Templates | `template.rs` plus template-aware LSP handlers | virtual PHP/source maps | Twig context scans | `tests/e2e_templates.rs` |
+| Stubs/vendor/cache | `src/indexing/*` and lazy index paths | symbol extraction | `php-lsp-index::{stubs,composer,cache}` | index unit tests + `tests/e2e_indexing.rs` |
 
 ## Startup Flow
 
@@ -357,19 +428,20 @@ open-file p95 for hover/completion/definition stayed under 7 ms, while heavy
 
 ## Public Entry Points
 
-LSP request/notification handlers live on `PhpLspBackend` in
-`server/crates/php-lsp-server/src/server.rs`. The most important entry points
-are:
+`PhpLspBackend` implements `LanguageServer` in
+`server/crates/php-lsp-server/src/server.rs`, but those trait methods delegate
+to focused modules under `src/lsp/` and `src/indexing/`. The most important
+entry points are:
 
 | Area | Entry points |
 |---|---|
-| Lifecycle | `initialize`, `initialized`, `shutdown`. |
-| Document sync | `did_open`, `did_change`, `did_save`, `did_close`. |
-| Workspace sync | `did_change_configuration`, `did_change_workspace_folders`, `did_change_watched_files`, file operation handlers. |
-| Navigation | `hover`, `goto_definition`, `goto_declaration`, `goto_type_definition`, `goto_implementation`. |
-| Symbols and hierarchy | `document_symbol`, `symbol`, call hierarchy handlers, type hierarchy handlers. |
-| Editing | `prepare_rename`, `rename`, `code_action`, `code_action_resolve`, formatting handlers, on-type formatting. |
-| Intelligence | `completion`, `completion_resolve`, `signature_help`, `inlay_hint`, semantic token handlers, folding and selection range handlers. |
+| Lifecycle | `src/lsp/lifecycle.rs`, `src/indexing/workspace.rs`. |
+| Document sync | `src/lsp/diagnostics.rs`. |
+| Workspace sync | `src/indexing/workspace.rs`. |
+| Navigation | `src/lsp/hover.rs`, `src/lsp/definition.rs`. |
+| Symbols and hierarchy | `src/lsp/document_symbols.rs`, `src/lsp/hierarchy.rs`. |
+| Editing | `src/lsp/rename.rs`, `src/lsp/code_action.rs`, `src/lsp/formatting.rs`. |
+| Intelligence | `src/lsp/completion.rs`, `src/lsp/inlay_hints.rs`, `src/lsp/semantic_tokens.rs`, `src/lsp/folding.rs`. |
 
 Non-LSP command-line entry points are `analyze::run_analyze_cli` and
 `fix::run_fix_cli`.

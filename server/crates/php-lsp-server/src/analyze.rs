@@ -1,10 +1,11 @@
 use crate::server::{
     collect_php_files, compute_diagnostics_with_config, discover_workspace_root_config,
     lazy_resolvable_diagnostic_fqn, load_effective_configuration_settings, normalize_config_paths,
-    parse_vendor_autoload_map, path_is_excluded, path_to_uri, resolve_vendor_paths_from_map,
+    parse_vendor_autoload_map, path_is_excluded, resolve_vendor_paths_from_map,
     workspace_index_directories, DiagnosticSeverityConfig, DiagnosticsMode, PhpVersion,
     VendorAutoloadMap, VENDOR_PRELOAD_ENTRYPOINT_LIMIT,
 };
+use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::references::collect_symbol_references_in_file;
