@@ -291,13 +291,18 @@ Current evidence:
   (`withDefaults(self $defaults)` then `$defaults->objectManager`).
 - `PV-012` release audit confirms the new fixture and real Symfony
   `MapEntity.php` both publish 0 diagnostics.
+- `IE-044` / `IE-044A` added conservative Blade-like and Symfony/Twig template
+  document support through virtual PHP and source maps, including mapped
+  hover/completion/definition/diagnostics/semantic tokens for supported
+  template expressions and static Twig template path lookup.
 
 Impact:
 
 - Completion/definition/diagnostics are materially better for PHPDoc-heavy projects, including shape-heavy code, but still not a full static analyzer type system.
 - Complex framework magic, fluent generics, project-specific dynamic behavior,
-  and missing Composer/vendor metadata can still need PHPStan/Psalm or
-  diagnostic category tuning.
+  unsupported template filters/functions/tests, runtime template inheritance,
+  and missing Composer/vendor metadata can still need PHPStan/Psalm, framework
+  plugins, or diagnostic category tuning.
 
 Mitigation:
 
@@ -308,6 +313,8 @@ Mitigation:
   for PHPDoc and literal array shapes.
 - `PV-012`: added regression coverage for `self`/`static` parameter type
   resolution before member diagnostics.
+- `IE-044` / `IE-044A`: template diagnostics are mapped only when source ranges
+  are precise; generated or uncertain virtual-PHP ranges are suppressed.
 
 Exit signal:
 

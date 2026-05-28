@@ -2450,6 +2450,251 @@ async fn test_blade_template_virtual_php_hover_completion_diagnostics_and_tokens
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_template_context_hover_completion_definition_and_tokens() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root =
+        std::env::temp_dir().join(format!("php-lsp-twig-template-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/dashboard")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/shared")).unwrap();
+
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let user_path = tmp_root.join("src/Entity/User.php");
+    let controller_path = tmp_root.join("src/Controller/DashboardController.php");
+    let twig_path = tmp_root.join("templates/dashboard/show.html.twig");
+    let card_path = tmp_root.join("templates/shared/_card.html.twig");
+    let user_uri = format!("file://{}", user_path.to_string_lossy());
+    let controller_uri = format!("file://{}", controller_path.to_string_lossy());
+    let twig_uri = format!("file://{}", twig_path.to_string_lossy());
+    let card_uri = format!("file://{}", card_path.to_string_lossy());
+
+    let user_php = r#"<?php
+namespace App\Entity;
+
+class User
+{
+    public string $name = '';
+    public function getName(): string { return $this->name; }
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Entity\User;
+
+final class DashboardController
+{
+    public function show(): void
+    {
+        $this->render('dashboard/show.html.twig', [
+            'user' => new User(),
+            'users' => [new User()],
+        ]);
+    }
+}
+"#;
+    let complete_marker = "/*complete*/";
+    let template_marker = "/*template*/";
+    let twig_with_markers = format!(
+        "<h1>{{{{ user.name }}}}</h1>\n{{% for item in users %}}\n  {{{{ item.get{} }}}}\n{{% endfor %}}\n{{% include 'shared/_card.html.twig{}' %}}\n",
+        complete_marker, template_marker
+    );
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = twig_with_markers
+            .find(marker)
+            .expect("test Twig should contain marker");
+        let mut prefix = twig_with_markers[..marker_offset].to_string();
+        prefix = prefix.replace(complete_marker, "");
+        prefix = prefix.replace(template_marker, "");
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        (line, (prefix.len() - line_start) as u32)
+    };
+    let (completion_line, completion_character) = marker_position(complete_marker);
+    let (template_line, template_character) = marker_position(template_marker);
+    let twig = twig_with_markers
+        .replace(complete_marker, "")
+        .replace(template_marker, "");
+
+    fs::write(&user_path, user_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&twig_path, &twig).unwrap();
+    fs::write(&card_path, "<article>{{ user.name }}</article>\n").unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&user_uri, user_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&controller_uri, controller_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &twig_uri, "twig", &twig,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "Twig HTML/control blocks should not produce noisy diagnostics"
+    );
+
+    let hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, &twig_uri, 0, 8))
+        .await
+        .unwrap();
+    let hover = extract_result(hover_resp);
+    let hover_text = hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(
+        hover_text.contains("App\\Entity\\User") || hover_text.contains("User $user"),
+        "expected Twig context variable hover to include User type, got: {}",
+        hover
+    );
+
+    let definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(3, &twig_uri, 0, 13))
+        .await
+        .unwrap();
+    let definition = extract_result(definition_resp);
+    assert_eq!(
+        definition.get("uri").and_then(|uri| uri.as_str()),
+        Some(user_uri.as_str()),
+        "Twig member definition should jump to the PHP property"
+    );
+
+    let completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            4,
+            &twig_uri,
+            completion_line,
+            completion_character,
+        ))
+        .await
+        .unwrap();
+    let completion = extract_result(completion_resp);
+    let labels: Vec<String> = completion_items_from_result(&completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "getName"),
+        "expected Twig foreach item completion to include User::getName, got: {:?}",
+        labels
+    );
+
+    let template_completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            5,
+            &twig_uri,
+            template_line,
+            template_character,
+        ))
+        .await
+        .unwrap();
+    let template_completion = extract_result(template_completion_resp);
+    let template_labels: Vec<String> = completion_items_from_result(&template_completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        template_labels
+            .iter()
+            .any(|label| label == "shared/_card.html.twig"),
+        "expected Twig include path completion, got: {:?}",
+        template_labels
+    );
+
+    let template_definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            6,
+            &twig_uri,
+            template_line,
+            template_character,
+        ))
+        .await
+        .unwrap();
+    let template_definition = extract_result(template_definition_resp);
+    assert_eq!(
+        template_definition.get("uri").and_then(|uri| uri.as_str()),
+        Some(card_uri.as_str()),
+        "Twig include path definition should jump to the template file, got: {}",
+        template_definition
+    );
+
+    let tokens_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(semantic_tokens_full_request(7, &twig_uri))
+        .await
+        .unwrap();
+    let tokens = decode_semantic_tokens(&extract_result(tokens_resp));
+    assert!(
+        tokens.iter().any(|(line, start, len, token_type, _)| {
+            (*line, *start, *len, *token_type) == (1, 3, 3, 11)
+        }),
+        "expected Twig for keyword semantic token, got: {:?}",
+        tokens
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_member_access_after_class_string_template_factory() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

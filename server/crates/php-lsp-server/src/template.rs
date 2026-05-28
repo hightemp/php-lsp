@@ -1,15 +1,39 @@
 use php_lsp_parser::utf16::{utf16_col_to_byte, Utf16LineIndex};
 use tower_lsp::ls_types::{Position, Range, SemanticToken};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TemplateKind {
+    Blade,
+    Twig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TemplateVariableType {
+    pub(crate) name: String,
+    pub(crate) type_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TwigTemplatePathContext {
+    pub(crate) prefix: String,
+    pub(crate) key: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TemplateDocument {
+    kind: TemplateKind,
     original_source: String,
     virtual_source: String,
     source_map: TemplateSourceMap,
     semantic_tokens: Vec<TemplateSemanticToken>,
+    twig_variable_types: Vec<TemplateVariableType>,
 }
 
 impl TemplateDocument {
+    pub(crate) fn original_source(&self) -> &str {
+        &self.original_source
+    }
+
     pub(crate) fn virtual_source(&self) -> &str {
         &self.virtual_source
     }
@@ -109,7 +133,20 @@ impl TemplateDocument {
     pub(crate) fn apply_change(&self, range: Option<Range>, text: &str) -> Self {
         let mut source = self.original_source.clone();
         apply_text_change(&mut source, range, text);
-        preprocess_blade_template(&source)
+        match self.kind {
+            TemplateKind::Blade => preprocess_blade_template(&source),
+            TemplateKind::Twig => preprocess_twig_template(&source, &self.twig_variable_types),
+        }
+    }
+
+    pub(crate) fn twig_template_path_context_at_position(
+        &self,
+        position: Position,
+    ) -> Option<TwigTemplatePathContext> {
+        if self.kind != TemplateKind::Twig {
+            return None;
+        }
+        twig_template_path_context_at_position(&self.original_source, position)
     }
 }
 
@@ -127,16 +164,36 @@ struct TemplateSourceMap {
 }
 
 impl TemplateSourceMap {
-    fn push_segment(&mut self, original_start: usize, original_end: usize, virtual_start: usize) {
+    fn push_same_length_segment(
+        &mut self,
+        original_start: usize,
+        original_end: usize,
+        virtual_start: usize,
+    ) {
+        let len = original_end.saturating_sub(original_start);
+        self.push_segment(
+            original_start,
+            original_end,
+            virtual_start,
+            virtual_start + len,
+        );
+    }
+
+    fn push_segment(
+        &mut self,
+        original_start: usize,
+        original_end: usize,
+        virtual_start: usize,
+        virtual_end: usize,
+    ) {
         if original_end < original_start {
             return;
         }
-        let len = original_end.saturating_sub(original_start);
         self.segments.push(SourceMapSegment {
             original_start,
             original_end,
             virtual_start,
-            virtual_end: virtual_start + len,
+            virtual_end,
         });
     }
 
@@ -145,12 +202,7 @@ impl TemplateSourceMap {
             .segments
             .iter()
             .find(|segment| segment.original_start <= offset && offset <= segment.original_end)?;
-        Some(
-            segment.virtual_start
-                + offset
-                    .saturating_sub(segment.original_start)
-                    .min(segment.original_len()),
-        )
+        Some(segment.map_original_to_virtual(offset))
     }
 
     fn virtual_range_to_original(
@@ -166,10 +218,7 @@ impl TemplateSourceMap {
                 && segment.virtual_start <= virtual_start
                 && virtual_start <= segment.virtual_end
             {
-                let original = segment.original_start
-                    + virtual_start
-                        .saturating_sub(segment.virtual_start)
-                        .min(segment.original_len());
+                let original = segment.map_virtual_to_original(virtual_start);
                 return Some((original, original));
             }
 
@@ -184,14 +233,8 @@ impl TemplateSourceMap {
                 continue;
             }
 
-            let mapped_start = segment.original_start
-                + overlap_start
-                    .saturating_sub(segment.virtual_start)
-                    .min(segment.original_len());
-            let mapped_end = segment.original_start
-                + overlap_end
-                    .saturating_sub(segment.virtual_start)
-                    .min(segment.original_len());
+            let mapped_start = segment.map_virtual_to_original(overlap_start);
+            let mapped_end = segment.map_virtual_to_original(overlap_end);
             original_start =
                 Some(original_start.map_or(mapped_start, |current| current.min(mapped_start)));
             original_end = Some(original_end.map_or(mapped_end, |current| current.max(mapped_end)));
@@ -210,9 +253,48 @@ struct SourceMapSegment {
 }
 
 impl SourceMapSegment {
-    fn original_len(self) -> usize {
-        self.original_end.saturating_sub(self.original_start)
+    fn map_original_to_virtual(self, offset: usize) -> usize {
+        map_offset_between_ranges(
+            offset,
+            self.original_start,
+            self.original_end,
+            self.virtual_start,
+            self.virtual_end,
+        )
     }
+
+    fn map_virtual_to_original(self, offset: usize) -> usize {
+        map_offset_between_ranges(
+            offset,
+            self.virtual_start,
+            self.virtual_end,
+            self.original_start,
+            self.original_end,
+        )
+    }
+}
+
+fn map_offset_between_ranges(
+    offset: usize,
+    source_start: usize,
+    source_end: usize,
+    target_start: usize,
+    target_end: usize,
+) -> usize {
+    if offset <= source_start {
+        return target_start;
+    }
+    if offset >= source_end {
+        return target_end;
+    }
+
+    let source_len = source_end.saturating_sub(source_start);
+    let target_len = target_end.saturating_sub(target_start);
+    if source_len == 0 || target_len == 0 {
+        return target_start;
+    }
+
+    target_start + offset.saturating_sub(source_start) * target_len / source_len
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +315,14 @@ pub(crate) fn is_blade_template_uri(uri_str: &str) -> bool {
 
 pub(crate) fn is_blade_template_language_id(language_id: &str) -> bool {
     matches!(language_id, "blade" | "laravel-blade")
+}
+
+pub(crate) fn is_twig_template_uri(uri_str: &str) -> bool {
+    uri_str.ends_with(".twig")
+}
+
+pub(crate) fn is_twig_template_language_id(language_id: &str) -> bool {
+    matches!(language_id, "twig" | "html-twig")
 }
 
 pub(crate) fn preprocess_blade_template(source: &str) -> TemplateDocument {
@@ -316,11 +406,598 @@ pub(crate) fn preprocess_blade_template(source: &str) -> TemplateDocument {
     }
 
     TemplateDocument {
+        kind: TemplateKind::Blade,
         original_source: source.to_string(),
         virtual_source,
         source_map,
         semantic_tokens,
+        twig_variable_types: Vec::new(),
     }
+}
+
+pub(crate) fn preprocess_twig_template(
+    source: &str,
+    variable_types: &[TemplateVariableType],
+) -> TemplateDocument {
+    let mut virtual_source = String::new();
+    let mut source_map = TemplateSourceMap::default();
+    let mut semantic_tokens = Vec::new();
+    let mut offset = 0usize;
+
+    push_twig_context_prelude(&mut virtual_source, variable_types);
+
+    while offset < source.len() {
+        if source[offset..].starts_with("{#") {
+            let end = source[offset + 2..]
+                .find("#}")
+                .map(|relative| offset + 2 + relative + 2)
+                .unwrap_or(source.len());
+            semantic_tokens.push(TemplateSemanticToken {
+                original_start: offset,
+                original_end: end,
+                token_type: TOKEN_COMMENT,
+                token_modifiers_bitset: 0,
+            });
+            offset = end;
+            continue;
+        }
+
+        if source[offset..].starts_with("{{") {
+            if let Some(end) = source[offset + 2..]
+                .find("}}")
+                .map(|relative| offset + 2 + relative)
+            {
+                push_twig_expression_fragment(
+                    source,
+                    offset + 2,
+                    end,
+                    "<?php echo ",
+                    "; ?>\n",
+                    &mut virtual_source,
+                    &mut source_map,
+                );
+                offset = end + 2;
+                continue;
+            }
+        }
+
+        if source[offset..].starts_with("{%") {
+            if let Some(end) = source[offset + 2..]
+                .find("%}")
+                .map(|relative| offset + 2 + relative)
+            {
+                push_twig_tag_fragment(
+                    source,
+                    offset + 2,
+                    end,
+                    &mut virtual_source,
+                    &mut source_map,
+                    &mut semantic_tokens,
+                );
+                offset = end + 2;
+                continue;
+            }
+        }
+
+        offset += source[offset..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+
+    TemplateDocument {
+        kind: TemplateKind::Twig,
+        original_source: source.to_string(),
+        virtual_source,
+        source_map,
+        semantic_tokens,
+        twig_variable_types: variable_types.to_vec(),
+    }
+}
+
+fn push_twig_context_prelude(virtual_source: &mut String, variable_types: &[TemplateVariableType]) {
+    if variable_types.is_empty() {
+        return;
+    }
+
+    virtual_source.push_str("<?php\n");
+    for variable in variable_types {
+        if !is_valid_twig_identifier(&variable.name) || variable.type_text.trim().is_empty() {
+            continue;
+        }
+        virtual_source.push_str("/** @var ");
+        virtual_source.push_str(variable.type_text.trim());
+        virtual_source.push_str(" $");
+        virtual_source.push_str(&variable.name);
+        virtual_source.push_str(" */\n$");
+        virtual_source.push_str(&variable.name);
+        virtual_source.push_str(" = null;\n");
+    }
+    virtual_source.push_str("?>\n");
+}
+
+fn push_twig_expression_fragment(
+    source: &str,
+    original_start: usize,
+    original_end: usize,
+    prefix: &str,
+    suffix: &str,
+    virtual_source: &mut String,
+    source_map: &mut TemplateSourceMap,
+) {
+    let (expr_start, expr_end) = trim_ascii_range(source, original_start, original_end);
+    virtual_source.push_str(prefix);
+    append_converted_twig_expression(source, expr_start, expr_end, virtual_source, source_map);
+    virtual_source.push_str(suffix);
+}
+
+fn push_twig_tag_fragment(
+    source: &str,
+    content_start: usize,
+    content_end: usize,
+    virtual_source: &mut String,
+    source_map: &mut TemplateSourceMap,
+    semantic_tokens: &mut Vec<TemplateSemanticToken>,
+) {
+    let name_start = skip_ascii_ws_in_range(source, content_start, content_end);
+    let name_end = scan_identifier_end(source, name_start).min(content_end);
+    if name_end <= name_start {
+        return;
+    }
+    let Some(name) = source.get(name_start..name_end) else {
+        return;
+    };
+
+    semantic_tokens.push(TemplateSemanticToken {
+        original_start: name_start,
+        original_end: name_end,
+        token_type: TOKEN_KEYWORD,
+        token_modifiers_bitset: 0,
+    });
+
+    match name {
+        "if" | "elseif" => {
+            let (expr_start, expr_end) = trim_ascii_range(source, name_end, content_end);
+            if expr_start >= expr_end {
+                return;
+            }
+            if name == "if" {
+                virtual_source.push_str("<?php if (");
+            } else {
+                virtual_source.push_str("<?php elseif (");
+            }
+            append_converted_twig_expression(
+                source,
+                expr_start,
+                expr_end,
+                virtual_source,
+                source_map,
+            );
+            virtual_source.push_str("): ?>\n");
+        }
+        "else" => virtual_source.push_str("<?php else: ?>\n"),
+        "endif" => virtual_source.push_str("<?php endif; ?>\n"),
+        "for" => push_twig_for_fragment(source, name_end, content_end, virtual_source, source_map),
+        "endfor" => virtual_source.push_str("<?php endforeach; ?>\n"),
+        "set" => push_twig_set_fragment(source, name_end, content_end, virtual_source, source_map),
+        "block" | "endblock" | "extends" | "include" | "embed" | "endembed" | "use" | "import"
+        | "from" => {}
+        _ => {}
+    }
+}
+
+fn push_twig_for_fragment(
+    source: &str,
+    start: usize,
+    end: usize,
+    virtual_source: &mut String,
+    source_map: &mut TemplateSourceMap,
+) {
+    let rest_start = skip_ascii_ws_in_range(source, start, end);
+    let item_start = rest_start;
+    let item_end = scan_identifier_end(source, item_start).min(end);
+    if item_end <= item_start {
+        return;
+    }
+    let after_item = skip_ascii_ws_in_range(source, item_end, end);
+    if !source
+        .get(after_item..end)
+        .is_some_and(|rest| rest.starts_with("in"))
+    {
+        return;
+    }
+    let after_in = after_item + "in".len();
+    if source
+        .as_bytes()
+        .get(after_in)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return;
+    }
+    let collection_start = skip_ascii_ws_in_range(source, after_in, end);
+    let (collection_start, collection_end) = trim_ascii_range(source, collection_start, end);
+    if collection_start >= collection_end {
+        return;
+    }
+
+    virtual_source.push_str("<?php foreach (");
+    append_converted_twig_expression(
+        source,
+        collection_start,
+        collection_end,
+        virtual_source,
+        source_map,
+    );
+    virtual_source.push_str(" as ");
+    let virtual_item_start = virtual_source.len();
+    virtual_source.push('$');
+    virtual_source.push_str(source.get(item_start..item_end).unwrap_or(""));
+    source_map.push_segment(
+        item_start,
+        item_end,
+        virtual_item_start,
+        virtual_source.len(),
+    );
+    virtual_source.push_str("): ?>\n");
+}
+
+fn push_twig_set_fragment(
+    source: &str,
+    start: usize,
+    end: usize,
+    virtual_source: &mut String,
+    source_map: &mut TemplateSourceMap,
+) {
+    let name_start = skip_ascii_ws_in_range(source, start, end);
+    let name_end = scan_identifier_end(source, name_start).min(end);
+    if name_end <= name_start {
+        return;
+    }
+    let after_name = skip_ascii_ws_in_range(source, name_end, end);
+    if source.as_bytes().get(after_name) != Some(&b'=') {
+        return;
+    }
+    let (expr_start, expr_end) = trim_ascii_range(source, after_name + 1, end);
+    if expr_start >= expr_end {
+        return;
+    }
+
+    virtual_source.push_str("<?php ");
+    let virtual_name_start = virtual_source.len();
+    virtual_source.push('$');
+    virtual_source.push_str(source.get(name_start..name_end).unwrap_or(""));
+    source_map.push_segment(
+        name_start,
+        name_end,
+        virtual_name_start,
+        virtual_source.len(),
+    );
+    virtual_source.push_str(" = ");
+    append_converted_twig_expression(source, expr_start, expr_end, virtual_source, source_map);
+    virtual_source.push_str("; ?>\n");
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TwigExpressionSegment {
+    original_start: usize,
+    original_end: usize,
+    virtual_start: usize,
+    virtual_end: usize,
+}
+
+fn append_converted_twig_expression(
+    source: &str,
+    original_start: usize,
+    original_end: usize,
+    virtual_source: &mut String,
+    source_map: &mut TemplateSourceMap,
+) {
+    let virtual_base = virtual_source.len();
+    let (converted, segments) =
+        convert_twig_expression_to_php(source, original_start, original_end);
+    virtual_source.push_str(&converted);
+    for segment in segments {
+        source_map.push_segment(
+            segment.original_start,
+            segment.original_end,
+            virtual_base + segment.virtual_start,
+            virtual_base + segment.virtual_end,
+        );
+    }
+}
+
+fn convert_twig_expression_to_php(
+    source: &str,
+    original_start: usize,
+    original_end: usize,
+) -> (String, Vec<TwigExpressionSegment>) {
+    let mut converted = String::new();
+    let mut segments = Vec::new();
+    let mut offset = original_start;
+    let mut after_member_access = false;
+
+    while offset < original_end {
+        let Some(ch) = source[offset..original_end].chars().next() else {
+            break;
+        };
+
+        if ch == '|' {
+            break;
+        }
+
+        if ch == '\'' || ch == '"' {
+            let close = find_quoted_string_end(source, offset, original_end, ch)
+                .unwrap_or(original_end.saturating_sub(ch.len_utf8()));
+            let end = (close + ch.len_utf8()).min(original_end);
+            let virtual_start = converted.len();
+            converted.push_str(source.get(offset..end).unwrap_or(""));
+            segments.push(TwigExpressionSegment {
+                original_start: offset,
+                original_end: end,
+                virtual_start,
+                virtual_end: converted.len(),
+            });
+            offset = end;
+            after_member_access = false;
+            continue;
+        }
+
+        if ch == '.' {
+            let virtual_start = converted.len();
+            converted.push_str("->");
+            segments.push(TwigExpressionSegment {
+                original_start: offset,
+                original_end: offset + ch.len_utf8(),
+                virtual_start,
+                virtual_end: converted.len(),
+            });
+            offset += ch.len_utf8();
+            after_member_access = true;
+            continue;
+        }
+
+        if is_twig_identifier_start(ch) {
+            let ident_end = scan_twig_identifier_end(source, offset, original_end);
+            let ident = source.get(offset..ident_end).unwrap_or("");
+            let lower = ident.to_ascii_lowercase();
+            if matches!(lower.as_str(), "is" | "in") {
+                break;
+            }
+            if lower == "and" || lower == "or" || lower == "not" {
+                converted.push_str(match lower.as_str() {
+                    "and" => "&&",
+                    "or" => "||",
+                    "not" => "!",
+                    _ => ident,
+                });
+            } else if is_twig_literal(&lower)
+                || twig_next_non_ws_char(source, ident_end, original_end) == Some('(')
+                || after_member_access
+            {
+                let virtual_start = converted.len();
+                converted.push_str(ident);
+                segments.push(TwigExpressionSegment {
+                    original_start: offset,
+                    original_end: ident_end,
+                    virtual_start,
+                    virtual_end: converted.len(),
+                });
+            } else {
+                let virtual_start = converted.len();
+                converted.push('$');
+                converted.push_str(ident);
+                segments.push(TwigExpressionSegment {
+                    original_start: offset,
+                    original_end: ident_end,
+                    virtual_start,
+                    virtual_end: converted.len(),
+                });
+            }
+            offset = ident_end;
+            after_member_access = false;
+            continue;
+        }
+
+        converted.push(ch);
+        offset += ch.len_utf8();
+        if !ch.is_whitespace() {
+            after_member_access = false;
+        }
+    }
+
+    (converted, segments)
+}
+
+fn trim_ascii_range(source: &str, mut start: usize, mut end: usize) -> (usize, usize) {
+    while start < end
+        && source
+            .as_bytes()
+            .get(start)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        start += 1;
+    }
+    while end > start
+        && source
+            .as_bytes()
+            .get(end - 1)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        end -= 1;
+    }
+    (start, end)
+}
+
+fn skip_ascii_ws_in_range(source: &str, mut offset: usize, end: usize) -> usize {
+    while offset < end
+        && source
+            .as_bytes()
+            .get(offset)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        offset += 1;
+    }
+    offset
+}
+
+fn is_valid_twig_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    is_twig_identifier_start(first) && chars.all(is_twig_identifier_continue)
+}
+
+fn is_twig_identifier_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
+}
+
+fn is_twig_identifier_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn scan_twig_identifier_end(source: &str, start: usize, end: usize) -> usize {
+    let mut current = start;
+    for (relative, ch) in source[start..end].char_indices() {
+        if relative == 0 {
+            if !is_twig_identifier_start(ch) {
+                return start;
+            }
+        } else if !is_twig_identifier_continue(ch) {
+            break;
+        }
+        current = start + relative + ch.len_utf8();
+    }
+    current
+}
+
+fn is_twig_literal(lower: &str) -> bool {
+    matches!(lower, "true" | "false" | "null" | "none")
+}
+
+fn twig_next_non_ws_char(source: &str, mut offset: usize, end: usize) -> Option<char> {
+    while offset < end {
+        let ch = source[offset..end].chars().next()?;
+        if !ch.is_whitespace() {
+            return Some(ch);
+        }
+        offset += ch.len_utf8();
+    }
+    None
+}
+
+fn find_quoted_string_end(source: &str, start: usize, end: usize, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    let mut offset = start + quote.len_utf8();
+    while offset < end {
+        let ch = source[offset..end].chars().next()?;
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return Some(offset);
+        }
+        offset += ch.len_utf8();
+    }
+    None
+}
+
+fn twig_template_path_context_at_position(
+    source: &str,
+    position: Position,
+) -> Option<TwigTemplatePathContext> {
+    let offset = byte_offset_for_position(source, position)?;
+    let bounds = template_string_literal_bounds_at_offset(source, offset)?;
+    let (tag_start, tag_end) = twig_tag_bounds_containing(source, bounds.quote_start)?;
+    if bounds.quote_start >= tag_end {
+        return None;
+    }
+
+    let name_start = skip_ascii_ws_in_range(source, tag_start + 2, tag_end);
+    let name_end = scan_identifier_end(source, name_start).min(tag_end);
+    let name = source.get(name_start..name_end)?;
+    if !matches!(
+        name,
+        "include" | "extends" | "embed" | "use" | "import" | "from"
+    ) {
+        return None;
+    }
+
+    Some(TwigTemplatePathContext {
+        prefix: source.get(bounds.content_start..offset)?.to_string(),
+        key: source
+            .get(bounds.content_start..bounds.content_end)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn twig_tag_bounds_containing(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let open = source.get(..offset)?.rfind("{%")?;
+    let last_close_before = source.get(..offset)?.rfind("%}");
+    if last_close_before.is_some_and(|close| close > open) {
+        return None;
+    }
+    let close = source
+        .get(offset..)?
+        .find("%}")
+        .map(|relative| offset + relative)?;
+    Some((open, close))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TemplateStringLiteralBounds {
+    quote_start: usize,
+    content_start: usize,
+    content_end: usize,
+}
+
+fn template_string_literal_bounds_at_offset(
+    source: &str,
+    offset: usize,
+) -> Option<TemplateStringLiteralBounds> {
+    let mut quote: Option<(char, usize)> = None;
+    let mut escaped = false;
+    for (idx, ch) in source.char_indices() {
+        if idx >= offset {
+            break;
+        }
+        if let Some((active_quote, _)) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some((ch, idx));
+        }
+    }
+
+    let (quote_char, quote_start) = quote?;
+    let content_start = quote_start + quote_char.len_utf8();
+    if offset < content_start {
+        return None;
+    }
+    let content_end = find_quoted_string_end(source, offset, source.len(), quote_char)
+        .unwrap_or_else(|| line_end_offset(source, offset));
+    Some(TemplateStringLiteralBounds {
+        quote_start,
+        content_start,
+        content_end,
+    })
+}
+
+fn line_end_offset(source: &str, offset: usize) -> usize {
+    source[offset..]
+        .find('\n')
+        .map(|relative| offset + relative)
+        .unwrap_or(source.len())
 }
 
 fn push_mapped_php_fragment(
@@ -336,7 +1013,7 @@ fn push_mapped_php_fragment(
     virtual_source.push_str(prefix);
     virtual_source.push_str(source.get(original_start..original_end).unwrap_or(""));
     virtual_source.push_str(suffix);
-    source_map.push_segment(original_start, original_end, virtual_start);
+    source_map.push_same_length_segment(original_start, original_end, virtual_start);
 }
 
 fn push_directive_fragment(
@@ -757,5 +1434,66 @@ mod tests {
             .expect("mapped variable range");
         assert_eq!(original.start, Position::new(0, 8));
         assert_eq!(original.end, Position::new(0, 13));
+    }
+
+    #[test]
+    fn twig_echo_maps_variable_and_member_chain_to_virtual_php() {
+        let doc = preprocess_twig_template(
+            "<h1>{{ user.name }}</h1>\n",
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+        assert!(doc.virtual_source().contains("$user->name"));
+
+        let original_position = Position::new(0, 7);
+        let virtual_position = doc
+            .map_original_position_to_virtual(original_position)
+            .expect("Twig variable should map to virtual PHP variable");
+        let virtual_offset = byte_offset_for_position(doc.virtual_source(), virtual_position)
+            .expect("virtual position offset");
+        assert_eq!(
+            doc.virtual_source()
+                .get(virtual_offset..virtual_offset + "$user".len()),
+            Some("$user")
+        );
+    }
+
+    #[test]
+    fn twig_control_blocks_and_template_paths_are_detected() {
+        let doc = preprocess_twig_template(
+            "{% for item in users %}\n{{ item.name }}\n{% endfor %}\n{% include 'shared/card.html.twig' %}\n",
+            &[],
+        );
+        assert!(doc.virtual_source().contains("foreach ($users as $item)"));
+        assert!(doc.virtual_source().contains("$item->name"));
+
+        let context = doc
+            .twig_template_path_context_at_position(Position::new(3, 23))
+            .expect("include path context");
+        assert_eq!(context.key, "shared/card.html.twig");
+        assert_eq!(context.prefix, "shared/card");
+
+        let tokens = doc.map_semantic_tokens_to_original(Vec::new());
+        assert!(
+            tokens.iter().any(|token| token.token_type == TOKEN_KEYWORD),
+            "expected Twig keyword semantic tokens"
+        );
+    }
+
+    #[test]
+    fn twig_generated_context_diagnostics_are_unmapped() {
+        let doc = preprocess_twig_template(
+            "{{ user.name }}",
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+        let generated_prelude = Range::new(Position::new(1, 0), Position::new(1, 5));
+        assert!(doc
+            .map_virtual_range_to_original(generated_prelude)
+            .is_none());
     }
 }

@@ -2056,7 +2056,7 @@ PR-052 ─→ PR-053
     `cargo clippy --all-targets -- -D warnings`, `npm run lint`,
     `npm run build`, `git diff --check`.
 
-- [ ] **IE-044A** Symfony/Twig template support via static model + source map
+- [x] **IE-044A** Symfony/Twig template support via static model + source map *(done 2026-05-27)*
   - Treat Twig as a separate template language target, not as Blade-compatible syntax.
   - Add safe client activation/document selector for `.twig` / `.html.twig` files.
   - Build a conservative Twig parser/preprocessor that can map Twig ranges to
@@ -2086,6 +2086,30 @@ PR-052 ─→ PR-053
     - diagnostics suppression for unsupported dynamic Twig constructs.
   - Documentation: update English `README.md`, `docs/lsp-features.md`, and
     risk/limitation docs after implementation.
+  - Implemented: safe VS Code `twig` language contribution, activation, document
+    selector, and `.twig` watcher for `.twig` / `.html.twig` documents.
+  - Implemented: separate Twig virtual-PHP preprocessing and source maps for
+    `{{ expr }}`, `{% if %}` / `{% elseif %}` / `{% else %}` / `{% endif %}`,
+    `{% for item in items %}` / `{% endfor %}`, and `{% set name = expr %}`.
+  - Implemented: Twig comments and structural tags (`block`, `extends`,
+    `include`, `embed`, `use`, `import`, `from`) as semantic tokens.
+  - Implemented: static Symfony/Twig template name provider for `templates/**/*.twig`,
+    with completion and go-to-definition for include/extends/embed-style paths.
+  - Implemented: static Twig context variable inference from simple
+    `render('template.html.twig', ['name' => expr])` call sites, including
+    `new Class()` and simple arrays of new objects.
+  - Implemented: mapped hover, completion, definition, diagnostics, and semantic
+    tokens for supported Twig expression ranges; generated/uncertain virtual PHP
+    ranges remain suppressed.
+  - Regression: unit tests cover Twig source-map conversion, control blocks,
+    template-path contexts, and generated-context diagnostic suppression.
+  - Regression: e2e covers Twig context hover, member completion, PHP property
+    definition, include path completion/definition, diagnostics, and semantic tokens.
+  - Documentation: `README.md`, `docs/lsp-features.md`, `docs/architecture.md`,
+    and `docs/production-risk-register.md` updated in English.
+  - Validation: `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `npm run lint`,
+    `npm run build`, `git diff --check`.
 
 - [ ] **IE-045** Final acceptance for intelligence milestone
   - Run full validation:

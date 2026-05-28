@@ -854,10 +854,13 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
       { scheme: "untitled", language: "php" },
       { scheme: "file", language: "blade" },
       { scheme: "untitled", language: "blade" },
+      { scheme: "file", language: "twig" },
+      { scheme: "untitled", language: "twig" },
     ],
     synchronize: {
       fileEvents: [
         workspace.createFileSystemWatcher("**/*.php"),
+        workspace.createFileSystemWatcher("**/*.twig"),
         workspace.createFileSystemWatcher("**/.php-lsp.toml"),
       ],
     },

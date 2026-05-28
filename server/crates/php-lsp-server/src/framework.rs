@@ -504,6 +504,8 @@ impl FrameworkProviderCache {
 
 static DOCTRINE_REPOSITORY_PROVIDER: DoctrineRepositoryProvider = DoctrineRepositoryProvider;
 static SYMFONY_CONTROLLER_PROVIDER: SymfonyControllerProvider = SymfonyControllerProvider;
+static SYMFONY_TWIG_STRING_KEY_PROVIDER: SymfonyTwigStringKeyProvider =
+    SymfonyTwigStringKeyProvider;
 static LARAVEL_ELOQUENT_PROVIDER: LaravelEloquentProvider = LaravelEloquentProvider;
 static LARAVEL_STRING_KEY_PROVIDER: LaravelStringKeyProvider = LaravelStringKeyProvider;
 
@@ -511,6 +513,7 @@ pub(crate) fn default_framework_provider_registry() -> FrameworkProviderRegistry
     FrameworkProviderRegistry::new(vec![
         &DOCTRINE_REPOSITORY_PROVIDER,
         &SYMFONY_CONTROLLER_PROVIDER,
+        &SYMFONY_TWIG_STRING_KEY_PROVIDER,
         &LARAVEL_ELOQUENT_PROVIDER,
         &LARAVEL_STRING_KEY_PROVIDER,
     ])
@@ -584,6 +587,46 @@ impl VirtualMemberProvider for SymfonyControllerProvider {
             query.kind,
             "Symfony controller helper",
         )]
+    }
+}
+
+struct SymfonyTwigStringKeyProvider;
+
+impl VirtualMemberProvider for SymfonyTwigStringKeyProvider {
+    fn id(&self) -> &'static str {
+        "symfony.twig"
+    }
+
+    fn priority(&self) -> u16 {
+        35
+    }
+
+    fn virtual_members(
+        &self,
+        _ctx: &FrameworkProviderContext<'_>,
+        _query: &VirtualMemberQuery,
+    ) -> Vec<VirtualMember> {
+        Vec::new()
+    }
+
+    fn string_keys(
+        &self,
+        ctx: &FrameworkProviderContext<'_>,
+        query: &FrameworkStringKeyQuery,
+    ) -> Vec<FrameworkStringKey> {
+        if query.domain != "twig" {
+            return Vec::new();
+        }
+        let Some(root) = ctx.workspace_root else {
+            return Vec::new();
+        };
+        if !is_symfony_twig_layout(root) {
+            return Vec::new();
+        }
+
+        let mut keys = collect_symfony_twig_template_keys(self.id(), root, &query.prefix);
+        keys.sort_by(|left, right| left.key.cmp(&right.key));
+        keys
     }
 }
 
@@ -1902,6 +1945,12 @@ fn is_laravel_string_key_layout(root: &Path) -> bool {
         || root.join("lang").is_dir()
 }
 
+fn is_symfony_twig_layout(root: &Path) -> bool {
+    root.join("templates").is_dir()
+        || root.join("symfony.lock").is_file()
+        || root.join("bin/console").is_file()
+}
+
 fn collect_laravel_config_keys(
     provider_id: &'static str,
     root: &Path,
@@ -2022,6 +2071,33 @@ fn collect_laravel_view_keys(
                 provider_id,
                 key,
                 "Laravel view template",
+                path_to_file_uri(&path),
+                (0, 0, 0, 0),
+            ));
+        }
+    }
+    keys
+}
+
+fn collect_symfony_twig_template_keys(
+    provider_id: &'static str,
+    root: &Path,
+    prefix: &str,
+) -> Vec<FrameworkStringKey> {
+    let template_dir = root.join("templates");
+    let mut keys = Vec::new();
+    for path in collect_static_files(&template_dir, &["twig"], 4096) {
+        let Ok(relative) = path.strip_prefix(&template_dir) else {
+            continue;
+        };
+        let Some(key) = twig_template_key_from_relative_path(relative) else {
+            continue;
+        };
+        if key.starts_with(prefix) {
+            keys.push(framework_string_key(
+                provider_id,
+                key,
+                "Symfony Twig template",
                 path_to_file_uri(&path),
                 (0, 0, 0, 0),
             ));
@@ -2187,6 +2263,16 @@ fn view_key_from_relative_path(path: &Path) -> Option<String> {
         parent.join(without_suffix)
     };
     path_components_to_dot_key(&combined)
+}
+
+fn twig_template_key_from_relative_path(path: &Path) -> Option<String> {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 fn path_components_to_dot_key(path: &Path) -> Option<String> {

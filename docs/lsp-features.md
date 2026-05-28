@@ -36,7 +36,7 @@ tools.
 
 | LSP feature | Status | Notes |
 |---|---|---|
-| `textDocument/definition` | Supported | Handles indexed symbols, local variables, `$this`, constructors, PHPDoc virtual members, PHPDoc/literal shape keys, and lazy vendor fallback. |
+| `textDocument/definition` | Supported | Handles indexed symbols, local variables, `$this`, constructors, PHPDoc virtual members, PHPDoc/literal shape keys, static framework string keys, template paths, and lazy vendor fallback. |
 | `textDocument/declaration` | Supported | Goes to import declarations when applicable, otherwise falls back to definition. |
 | `textDocument/typeDefinition` | Supported | Resolves variable/member/function return types where inferred or indexed, including common PHPDoc generic inheritance substitutions and PHPStan/Psalm type alias expansion. |
 | `textDocument/implementation` | Supported | Interface/trait/base type to implementations, and method implementation lookup. |
@@ -87,8 +87,8 @@ tools.
 | Diagnostics: built-in semantic | Supported | Unknown symbols, unused code, duplicate symbols, member access, type compatibility, override signatures, PHP-version checks. Without Composer/vendor metadata, external framework symbols can be reported as unknown; highly dynamic framework members such as some Eloquent relation APIs remain best-effort. |
 | Diagnostics: PHPStan | Partial | Optional external command, timeout-bound, JSON output required. |
 | Diagnostics: Psalm | Partial | Optional external command, timeout-bound, JSON output required. |
-| `textDocument/hover` | Supported | Symbols, signatures, types, PHPDoc, variables, deprecation, PHPDoc virtual members, expanded indexed PHPDoc type aliases, call-site `class-string<T>` / conditional return inference, and closure callback parameter inference from `callable(...)` signatures. |
-| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, expanded member signature aliases, shape keys/properties from PHPDoc and literal arrays, callback parameter member chains, and member chains after `class-string<T>` factory calls. |
+| `textDocument/hover` | Supported | Symbols, signatures, types, PHPDoc, variables, deprecation, PHPDoc virtual members, expanded indexed PHPDoc type aliases, call-site `class-string<T>` / conditional return inference, closure callback parameter inference from `callable(...)` signatures, and mapped Blade/Twig expression hovers where virtual PHP can resolve the symbol. |
+| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, expanded member signature aliases, shape keys/properties from PHPDoc and literal arrays, framework string keys, Blade/Twig expression completions, Twig template path completions, callback parameter member chains, and member chains after `class-string<T>` factory calls. |
 | `completionItem/resolve` | Supported | Enriches PHPDoc virtual member completions. |
 | `textDocument/signatureHelp` | Supported | Functions, methods, constructors, and active parameter tracking. |
 | `textDocument/inlayHint` | Supported | Argument labels, inferred PHPDoc parameter/return hints, and useful inferred local variable type hints for assignments, foreach key/value variables, `class-string<T>` factories, callback parameters, and conditional returns. |
@@ -98,11 +98,21 @@ tools.
 | `textDocument/semanticTokens/full/delta` | Supported | Delta edits from previous full snapshots. |
 | `textDocument/semanticTokens/range` | Supported | Range semantic token requests for open files. |
 
+## Template Documents
+
+| Area | Status | Notes |
+|---|---|---|
+| Blade-like `.blade.php` documents | Partial | VS Code language contribution plus virtual PHP/source-map support for escaped/raw echo blocks and common `@if`, `@foreach`, `@isset`, and `@empty` control directives. Diagnostics are syntax-only on mapped virtual PHP to avoid noisy view-variable reports. |
+| Symfony/Twig `.twig` and `.html.twig` documents | Partial | Separate Twig language target with virtual PHP/source-map support for `{{ expr }}`, `{% if %}`, `{% for item in items %}`, `{% set name = expr %}`, comments, common block/include/extends/import semantic tokens, and static include/extends/embed path completion and definition. |
+| Twig context variables | Partial | Statically inferred from simple PHP `render('template.html.twig', ['name' => expr])` call sites. `new Class()` and simple arrays of new objects seed PHPDoc variables in virtual PHP. The server does not boot Symfony or execute Twig extensions. |
+
 ## Explicit Non-Goals For Current Milestone
 
 - Namespace/class rewrites during file rename.
 - Native formatter implementation.
 - Full PHP static analyzer replacement.
+- Full Blade/Twig engine parity, runtime template inheritance evaluation, or
+  execution of framework containers/extensions.
 - Complete generic/template/type-alias/shape type system parity with
   PHPStan/Psalm.
 - Guaranteed sublinear references/rename/codeLens performance on very large

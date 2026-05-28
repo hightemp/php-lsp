@@ -42,6 +42,11 @@ phpstorm-stubs support.
 - Closure and arrow-function parameter inference from `callable(...)`
   signatures, including generic map/filter-style collection callbacks and
   `array_map`-style helpers.
+- Framework-aware static providers for common Laravel string keys and Symfony
+  Twig template names without booting the application.
+- Blade-like and Symfony/Twig template documents use virtual PHP plus source
+  maps for conservative hover, completion, definition, diagnostics, and semantic
+  tokens in supported template expressions and control blocks.
 - Override signature and PHP-version compatibility diagnostics.
 - Optional PHPStan and Psalm diagnostics through configured external commands.
 - Per-category diagnostic severity controls for unknown symbols, unused code,
@@ -54,7 +59,8 @@ phpstorm-stubs support.
   PHPDoc virtual members.
 - Completion for classes, interfaces, traits, enums, functions, constants,
   methods, properties, variables, namespaces, keywords, snippets, PHPDoc virtual
-  members, shape keys/properties, and auto-import edits.
+  members, shape keys/properties, framework string keys, template paths, and
+  auto-import edits.
 - Completion resolve enriches PHPDoc virtual member completions.
 - Signature help for functions, methods, constructors, and active parameter
   tracking.
@@ -65,7 +71,8 @@ phpstorm-stubs support.
 ### Navigation
 
 - Go to definition for indexed symbols, local variables, `$this`, constructors,
-  PHPDoc virtual members, PHPDoc/literal shape keys, and lazy vendor fallback.
+  PHPDoc virtual members, PHPDoc/literal shape keys, static framework string
+  keys, template paths, and lazy vendor fallback.
 - Go to declaration for imports, with definition fallback.
 - Go to type definition for inferred variables, members, function returns, and
   indexed symbol types.
@@ -192,6 +199,11 @@ phpstorm-stubs support.
   If Composer/vendor metadata is absent, external framework classes can be
   reported as unknown; dynamic framework APIs such as some Eloquent relation
   members are best-effort.
+- Template support is conservative. Blade-like and Twig documents are not full
+  template-engine implementations; diagnostics are syntax-only on mapped virtual
+  PHP, Twig filters/functions/tests are treated as mixed unless statically
+  modeled, and Twig context variables are inferred only from static
+  `render(..., [...])` call sites and simple context expressions.
 - Diagnostics are optimized for editor feedback: file changes publish fast
   in-process diagnostics, while full diagnostics and optional external analyzer
   runs are used on open/save and reconfiguration.

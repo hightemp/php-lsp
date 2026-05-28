@@ -22,7 +22,9 @@
   "activationEvents": [
     "onLanguage:blade",
     "onLanguage:php",
+    "onLanguage:twig",
     "workspaceContains:**/*.blade.php",
+    "workspaceContains:**/*.twig",
     "workspaceContains:**/composer.json"
   ],
   "main": "./out/extension.js",
@@ -371,6 +373,18 @@
           ".blade.php"
         ],
         "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "twig",
+        "aliases": [
+          "Twig",
+          "twig"
+        ],
+        "extensions": [
+          ".twig",
+          ".html.twig"
+        ],
+        "configuration": "./twig-language-configuration.json"
       }
     ],
     "commands": [

@@ -116,6 +116,33 @@ On `textDocument/didClose`:
   analyzer runs for the URI are cleared.
 - Diagnostics are cleared in the client.
 
+## Template Documents
+
+Blade-like and Twig documents are kept out of the normal PHP workspace index.
+When an open document is recognized as a template, the server stores a
+`TemplateDocument` next to the virtual `FileParser`:
+
+- The original template source remains the LSP document source of truth.
+- A conservative preprocessor emits virtual PHP only for supported expression
+  and control-block ranges.
+- A source map converts template positions to virtual PHP positions for hover,
+  completion, definition, diagnostics, and semantic tokens, then maps returned
+  ranges back to the template.
+- Template diagnostics are syntax-only on mapped virtual PHP. Unmapped generated
+  PHP ranges are suppressed instead of reporting whole-template errors.
+
+Blade support covers escaped/raw echo blocks and common `@if`, `@foreach`,
+`@isset`, and `@empty` directives. Twig support is a separate language path for
+`.twig` / `.html.twig` files and covers `{{ expr }}`, `{% if %}`,
+`{% for item in items %}`, `{% set name = expr %}`, common structural tags, and
+static include/extends/embed path lookup.
+
+Twig context variables are inferred statically from simple PHP
+`render('template.html.twig', ['name' => expr])` call sites. The context scanner
+does not boot Symfony, evaluate Twig extensions, run user code, or read the
+service container. Unsupported Twig filters/functions/tests remain best-effort
+and are treated as mixed unless a static provider models them.
+
 ## Symbol Index
 
 `WorkspaceIndex` is a concurrent in-memory index:
