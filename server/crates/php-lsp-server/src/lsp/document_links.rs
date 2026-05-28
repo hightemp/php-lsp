@@ -1,5 +1,7 @@
 //! Document Links LSP handlers extracted from `server.rs`.
 
+use crate::util::lsp_text::range_from_byte_range;
+
 use super::super::*;
 use std::path::{Path, PathBuf};
 

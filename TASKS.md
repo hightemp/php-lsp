@@ -3058,6 +3058,18 @@ while implementing these tasks.
 
 ## Текущие задачи
 
+- [x] **T-2026-05-28-server-split-step3** Move hierarchy/reference helper logic out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep LSP response shapes, ranges, indexing, diagnostics, and inference behavior unchanged.
+  - Implementation target: move call/type hierarchy and implementation helper functions into `src/lsp/hierarchy.rs`.
+  - Implementation target: move code lens reference helper functions into `src/lsp/references.rs`.
+  - Implementation target: centralize small `Range` tuple conversion helpers where the focused LSP modules can share them.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused hierarchy/reference/symbol e2e tests or full `php-lsp-server` tests, clippy, and `git diff --check`.
+  - Implemented: moved call/type hierarchy, implementation-location, and outgoing/incoming call collection helpers into `src/lsp/hierarchy.rs`.
+  - Implemented: moved code-lens symbol filtering/title helpers into `src/lsp/references.rs`.
+  - Implemented: added shared `range_from_tuple` and `range_from_byte_range` helpers to `src/util/lsp_text.rs`.
+  - Result: `server.rs` reduced from 16,785 lines to 16,300 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo test -p php-lsp-server --test e2e_hierarchy --test e2e_references --test e2e_definition --test e2e_symbols`, and `git diff --check` passed.
+
 - [x] **T-2026-05-28-server-split-step2** Continue reducing `php-lsp-server/src/server.rs` by moving remaining pure helper blocks into focused modules. *(done 2026-05-28)*
   - Scope: behavior-preserving extraction only; do not change URI/range semantics, diagnostics, completion, or indexing behavior.
   - Implementation target: move small self-contained helper groups out of `server.rs` before touching complex inference/diagnostics code.

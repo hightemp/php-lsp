@@ -1,6 +1,7 @@
 //! Definition LSP handlers extracted from `server.rs`.
 
 use super::super::*;
+use super::hierarchy::{implementation_locations_for_method, implementation_locations_for_type};
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_goto_declaration(

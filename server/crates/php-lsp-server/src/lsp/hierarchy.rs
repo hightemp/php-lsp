@@ -1,6 +1,463 @@
 //! Hierarchy LSP handlers extracted from `server.rs`.
 
+use crate::util::lsp_text::{range_from_byte_range, range_from_tuple};
+
 use super::super::*;
+
+fn is_call_hierarchy_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
+    matches!(
+        kind,
+        php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+    )
+}
+
+fn is_call_hierarchy_ref_kind(ref_kind: RefKind) -> bool {
+    matches!(
+        ref_kind,
+        RefKind::FunctionCall | RefKind::MethodCall | RefKind::Constructor
+    )
+}
+
+fn call_hierarchy_item_from_symbol(sym: &php_lsp_types::SymbolInfo) -> Option<CallHierarchyItem> {
+    let uri = sym.uri.parse::<Uri>().ok()?;
+    Some(CallHierarchyItem {
+        name: sym.name.clone(),
+        kind: php_kind_to_lsp(sym.kind),
+        tags: sym
+            .modifiers
+            .is_deprecated
+            .then_some(vec![SymbolTag::DEPRECATED]),
+        detail: Some(call_hierarchy_detail(sym)),
+        uri,
+        range: range_from_tuple(sym.range),
+        selection_range: range_from_tuple(sym.selection_range),
+        data: Some(serde_json::json!({
+            "fqn": sym.fqn,
+            "kind": call_hierarchy_kind_key(sym.kind),
+        })),
+    })
+}
+
+fn call_hierarchy_detail(sym: &php_lsp_types::SymbolInfo) -> String {
+    if let Some(signature) = sym.signature.as_ref() {
+        let params: Vec<String> = signature
+            .params
+            .iter()
+            .map(format_signature_param)
+            .collect();
+        let mut detail = format!("{}({})", sym.fqn, params.join(", "));
+        if let Some(return_type) = signature.return_type.as_ref() {
+            detail.push_str(": ");
+            detail.push_str(&return_type.to_string());
+        }
+        detail
+    } else {
+        sym.fqn.clone()
+    }
+}
+
+pub(super) fn call_hierarchy_kind_key(kind: php_lsp_types::PhpSymbolKind) -> &'static str {
+    match kind {
+        php_lsp_types::PhpSymbolKind::Function => "function",
+        php_lsp_types::PhpSymbolKind::Method => "method",
+        php_lsp_types::PhpSymbolKind::Class => "class",
+        php_lsp_types::PhpSymbolKind::Interface => "interface",
+        php_lsp_types::PhpSymbolKind::Trait => "trait",
+        php_lsp_types::PhpSymbolKind::Enum => "enum",
+        php_lsp_types::PhpSymbolKind::Property => "property",
+        php_lsp_types::PhpSymbolKind::ClassConstant => "class_constant",
+        php_lsp_types::PhpSymbolKind::GlobalConstant => "global_constant",
+        php_lsp_types::PhpSymbolKind::EnumCase => "enum_case",
+        php_lsp_types::PhpSymbolKind::Namespace => "namespace",
+    }
+}
+
+fn call_hierarchy_kind_from_key(raw: &str) -> Option<php_lsp_types::PhpSymbolKind> {
+    match raw {
+        "function" => Some(php_lsp_types::PhpSymbolKind::Function),
+        "method" => Some(php_lsp_types::PhpSymbolKind::Method),
+        "class" => Some(php_lsp_types::PhpSymbolKind::Class),
+        "interface" => Some(php_lsp_types::PhpSymbolKind::Interface),
+        "trait" => Some(php_lsp_types::PhpSymbolKind::Trait),
+        "enum" => Some(php_lsp_types::PhpSymbolKind::Enum),
+        "property" => Some(php_lsp_types::PhpSymbolKind::Property),
+        "class_constant" => Some(php_lsp_types::PhpSymbolKind::ClassConstant),
+        "global_constant" => Some(php_lsp_types::PhpSymbolKind::GlobalConstant),
+        "enum_case" => Some(php_lsp_types::PhpSymbolKind::EnumCase),
+        "namespace" => Some(php_lsp_types::PhpSymbolKind::Namespace),
+        _ => None,
+    }
+}
+
+fn is_type_hierarchy_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
+    matches!(
+        kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+    )
+}
+
+fn type_hierarchy_item_from_symbol(sym: &php_lsp_types::SymbolInfo) -> Option<TypeHierarchyItem> {
+    if !is_type_hierarchy_symbol_kind(sym.kind) {
+        return None;
+    }
+    let uri = sym.uri.parse::<Uri>().ok()?;
+    Some(TypeHierarchyItem {
+        name: sym.name.clone(),
+        kind: php_kind_to_lsp(sym.kind),
+        tags: sym.modifiers.is_deprecated.then_some(SymbolTag::DEPRECATED),
+        detail: Some(sym.fqn.clone()),
+        uri,
+        range: range_from_tuple(sym.range),
+        selection_range: range_from_tuple(sym.selection_range),
+        data: Some(serde_json::json!({
+            "fqn": sym.fqn,
+            "kind": call_hierarchy_kind_key(sym.kind),
+        })),
+    })
+}
+
+fn type_hierarchy_symbol_from_item(
+    index: &WorkspaceIndex,
+    item: &TypeHierarchyItem,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    if let Some(data) = item.data.as_ref() {
+        if let Some(fqn) = data.get("fqn").and_then(|value| value.as_str()) {
+            if let Some(sym) = index.resolve_fqn(fqn) {
+                if is_type_hierarchy_symbol_kind(sym.kind) {
+                    return Some(sym);
+                }
+            }
+        }
+    }
+
+    let uri = item.uri.as_str();
+    let selection = (
+        item.selection_range.start.line,
+        item.selection_range.start.character,
+        item.selection_range.end.line,
+        item.selection_range.end.character,
+    );
+    index.file_symbols.get(uri).and_then(|file_symbols| {
+        file_symbols
+            .symbols
+            .iter()
+            .find(|sym| {
+                sym.name == item.name
+                    && sym.selection_range == selection
+                    && is_type_hierarchy_symbol_kind(sym.kind)
+            })
+            .cloned()
+            .map(Arc::new)
+    })
+}
+
+fn direct_type_subtypes(
+    index: &WorkspaceIndex,
+    target_fqn: &str,
+) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
+    let mut seen = HashSet::new();
+    let mut subtypes = Vec::new();
+
+    for entry in index.types.iter() {
+        let sym = entry.value().clone();
+        if !is_type_hierarchy_symbol_kind(sym.kind) || sym.fqn == target_fqn {
+            continue;
+        }
+        let matches_target = sym
+            .extends
+            .iter()
+            .chain(sym.implements.iter())
+            .any(|parent| parent == target_fqn);
+        if matches_target && seen.insert(sym.fqn.clone()) {
+            subtypes.push(sym);
+        }
+    }
+
+    subtypes.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+    subtypes
+}
+
+fn direct_type_parent_fqns(sym: &php_lsp_types::SymbolInfo) -> Vec<String> {
+    let mut seen = HashSet::new();
+    sym.extends
+        .iter()
+        .chain(sym.implements.iter())
+        .filter_map(|fqn| seen.insert(fqn.clone()).then_some(fqn.clone()))
+        .collect()
+}
+
+fn symbol_location(sym: &php_lsp_types::SymbolInfo) -> Option<Location> {
+    Some(Location {
+        uri: sym.uri.parse::<Uri>().ok()?,
+        range: range_from_tuple(sym.selection_range),
+    })
+}
+
+fn direct_symbol_by_fqn(
+    index: &WorkspaceIndex,
+    fqn: &str,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    index.file_symbols.iter().find_map(|entry| {
+        entry
+            .value()
+            .symbols
+            .iter()
+            .find(|sym| sym.fqn == fqn)
+            .cloned()
+            .map(Arc::new)
+    })
+}
+
+fn implementation_type_descendants(
+    index: &WorkspaceIndex,
+    target_fqn: &str,
+) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
+    let mut visited = HashSet::new();
+    let mut result = Vec::new();
+    collect_implementation_type_descendants(index, target_fqn, &mut visited, &mut result);
+    result.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+    result
+}
+
+fn collect_implementation_type_descendants(
+    index: &WorkspaceIndex,
+    target_fqn: &str,
+    visited: &mut HashSet<String>,
+    result: &mut Vec<Arc<php_lsp_types::SymbolInfo>>,
+) {
+    if !visited.insert(target_fqn.to_string()) {
+        return;
+    }
+
+    for subtype in direct_type_subtypes(index, target_fqn) {
+        if matches!(
+            subtype.kind,
+            php_lsp_types::PhpSymbolKind::Class | php_lsp_types::PhpSymbolKind::Enum
+        ) {
+            result.push(subtype.clone());
+        }
+        collect_implementation_type_descendants(index, &subtype.fqn, visited, result);
+    }
+}
+
+pub(super) fn implementation_locations_for_type(
+    index: &WorkspaceIndex,
+    target: &php_lsp_types::SymbolInfo,
+) -> Vec<Location> {
+    implementation_type_descendants(index, &target.fqn)
+        .into_iter()
+        .filter(|sym| !sym.modifiers.is_abstract)
+        .filter_map(|sym| symbol_location(&sym))
+        .collect()
+}
+
+pub(super) fn implementation_locations_for_method(
+    index: &WorkspaceIndex,
+    target: &php_lsp_types::SymbolInfo,
+) -> Vec<Location> {
+    let Some(parent_fqn) = target.parent_fqn.as_deref() else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut locations = Vec::new();
+
+    for subtype in implementation_type_descendants(index, parent_fqn) {
+        let member_fqn = format!("{}::{}", subtype.fqn, target.name);
+        let Some(method) = direct_symbol_by_fqn(index, &member_fqn) else {
+            continue;
+        };
+        if method.kind != php_lsp_types::PhpSymbolKind::Method || method.fqn == target.fqn {
+            continue;
+        }
+        if seen.insert(method.fqn.clone()) {
+            if let Some(location) = symbol_location(&method) {
+                locations.push(location);
+            }
+        }
+    }
+
+    locations.sort_by(|left, right| {
+        (
+            left.uri.as_str(),
+            left.range.start.line,
+            left.range.start.character,
+        )
+            .cmp(&(
+                right.uri.as_str(),
+                right.range.start.line,
+                right.range.start.character,
+            ))
+    });
+    locations
+}
+
+fn call_hierarchy_symbol_from_item(
+    index: &WorkspaceIndex,
+    item: &CallHierarchyItem,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    if let Some(data) = item.data.as_ref() {
+        if let Some(fqn) = data.get("fqn").and_then(|value| value.as_str()) {
+            if let Some(sym) = index.resolve_fqn(fqn) {
+                return Some(sym);
+            }
+        }
+    }
+
+    let uri = item.uri.as_str();
+    let selection = (
+        item.selection_range.start.line,
+        item.selection_range.start.character,
+        item.selection_range.end.line,
+        item.selection_range.end.character,
+    );
+    index.file_symbols.get(uri).and_then(|file_symbols| {
+        file_symbols
+            .symbols
+            .iter()
+            .find(|sym| {
+                sym.name == item.name
+                    && sym.selection_range == selection
+                    && is_call_hierarchy_symbol_kind(sym.kind)
+            })
+            .cloned()
+            .map(Arc::new)
+    })
+}
+
+fn call_hierarchy_target_from_item(
+    index: &WorkspaceIndex,
+    item: &CallHierarchyItem,
+) -> Option<(Arc<php_lsp_types::SymbolInfo>, php_lsp_types::PhpSymbolKind)> {
+    let sym = call_hierarchy_symbol_from_item(index, item)?;
+    let kind = item
+        .data
+        .as_ref()
+        .and_then(|data| data.get("kind"))
+        .and_then(|value| value.as_str())
+        .and_then(call_hierarchy_kind_from_key)
+        .unwrap_or(sym.kind);
+    Some((sym, kind))
+}
+
+fn incoming_call_hierarchy_for_file(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    target_fqn: &str,
+    target_kind: php_lsp_types::PhpSymbolKind,
+    calls_by_caller: &mut HashMap<String, (php_lsp_types::SymbolInfo, Vec<Range>)>,
+) {
+    let refs = find_references_in_file(tree, source, file_symbols, target_fqn, target_kind, false);
+
+    for reference in refs {
+        let Some(caller) = containing_callable_symbol(file_symbols, reference.range) else {
+            continue;
+        };
+        if caller.fqn == target_fqn {
+            continue;
+        }
+
+        calls_by_caller
+            .entry(caller.fqn.clone())
+            .or_insert_with(|| (caller.clone(), Vec::new()))
+            .1
+            .push(range_from_byte_range(source, reference.range));
+    }
+}
+
+struct OutgoingCallHierarchyContext<'a> {
+    tree: &'a tree_sitter::Tree,
+    source: &'a str,
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    index: &'a WorkspaceIndex,
+    caller_range: (u32, u32, u32, u32),
+}
+
+fn outgoing_call_hierarchy_for_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    caller: &php_lsp_types::SymbolInfo,
+) -> Vec<CallHierarchyOutgoingCall> {
+    let ctx = OutgoingCallHierarchyContext {
+        tree,
+        source,
+        file_symbols,
+        index,
+        caller_range: caller.range,
+    };
+    let mut calls_by_target: HashMap<String, (Arc<php_lsp_types::SymbolInfo>, Vec<Range>)> =
+        HashMap::new();
+    collect_outgoing_call_hierarchy(tree.root_node(), &ctx, &mut calls_by_target);
+
+    let mut calls: Vec<_> = calls_by_target
+        .into_values()
+        .filter_map(|(symbol, ranges)| {
+            Some(CallHierarchyOutgoingCall {
+                to: call_hierarchy_item_from_symbol(&symbol)?,
+                from_ranges: ranges,
+            })
+        })
+        .collect();
+    calls.sort_by(|left, right| left.to.name.cmp(&right.to.name));
+    calls
+}
+
+fn collect_outgoing_call_hierarchy(
+    node: tree_sitter::Node,
+    ctx: &OutgoingCallHierarchyContext<'_>,
+    calls_by_target: &mut HashMap<String, (Arc<php_lsp_types::SymbolInfo>, Vec<Range>)>,
+) {
+    let node_range = node_range_node(node);
+    if !byte_ranges_overlap(node_range, ctx.caller_range) {
+        return;
+    }
+
+    if matches!(node.kind(), "function_definition" | "method_declaration")
+        && node_range != ctx.caller_range
+        && byte_range_contains(ctx.caller_range, node_range)
+    {
+        return;
+    }
+
+    if matches!(
+        node.kind(),
+        "function_call_expression"
+            | "member_call_expression"
+            | "scoped_call_expression"
+            | "object_creation_expression"
+    ) {
+        if let Some(name_node) = call_target_name_node(node) {
+            if let Some((_, target)) = resolve_reference_symbol_at_node(
+                ctx.tree,
+                ctx.source,
+                name_node,
+                ctx.file_symbols,
+                ctx.index,
+            ) {
+                if is_call_hierarchy_symbol_kind(target.kind) {
+                    calls_by_target
+                        .entry(target.fqn.clone())
+                        .or_insert_with(|| (target.clone(), Vec::new()))
+                        .1
+                        .push(range_from_byte_range(
+                            ctx.source,
+                            node_range_node(name_node),
+                        ));
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_outgoing_call_hierarchy(child, ctx, calls_by_target);
+    }
+}
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_prepare_call_hierarchy(

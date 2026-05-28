@@ -1,6 +1,26 @@
 //! References LSP handlers extracted from `server.rs`.
 
 use super::super::*;
+use super::hierarchy::call_hierarchy_kind_key;
+
+fn is_code_lens_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
+    matches!(
+        kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+            | php_lsp_types::PhpSymbolKind::Method
+    )
+}
+
+fn reference_count_title(count: usize) -> String {
+    if count == 1 {
+        "1 reference".to_string()
+    } else {
+        format!("{} references", count)
+    }
+}
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_document_highlight(

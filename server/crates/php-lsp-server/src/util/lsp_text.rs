@@ -1,5 +1,16 @@
-use php_lsp_parser::utf16::utf16_col_to_byte;
+use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte};
 use tower_lsp::ls_types::{Position, Range};
+
+pub(crate) fn range_from_tuple(range: (u32, u32, u32, u32)) -> Range {
+    Range {
+        start: Position::new(range.0, range.1),
+        end: Position::new(range.2, range.3),
+    }
+}
+
+pub(crate) fn range_from_byte_range(source: &str, range: (u32, u32, u32, u32)) -> Range {
+    range_from_tuple(range_byte_to_utf16(source, range))
+}
 
 /// Convert an LSP UTF-16 position to a byte offset in `source`.
 pub(crate) fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
