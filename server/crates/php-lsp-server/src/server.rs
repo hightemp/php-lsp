@@ -10716,14 +10716,14 @@ fn local_variable_inlay_type_from_call_expression(
         return None;
     }
 
-    let return_type = symbol.signature.as_ref()?.return_type.as_ref()?;
+    let return_type = symbol_effective_return_type(&symbol)?;
     let owner_fqn = sym_at_pos
         .fqn
         .rsplit_once("::")
         .map(|(owner, _)| owner)
         .or(symbol.parent_fqn.as_deref())
         .unwrap_or_default();
-    let return_type = resolve_call_site_return_type(ctx, expression, &symbol, return_type);
+    let return_type = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
     local_variable_inlay_type_from_type_info(ctx, owner_fqn, &symbol.uri, &return_type, true)
 }
 
@@ -11015,6 +11015,94 @@ fn resolve_call_site_return_type(
         .collect();
     let substitutions = call_site_template_substitutions(&arguments, signature, &template_names);
     resolve_call_site_type_info(return_type, &arguments, &template_names, &substitutions)
+}
+
+fn symbol_effective_return_type(
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Option<php_lsp_types::TypeInfo> {
+    let native = symbol
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.return_type.as_ref());
+    let phpdoc = symbol
+        .doc_comment
+        .as_deref()
+        .and_then(|doc| parse_phpdoc(doc).return_type);
+
+    match (native, phpdoc) {
+        (Some(native), Some(phpdoc))
+            if type_info_specificity_score(&phpdoc) > type_info_specificity_score(native) =>
+        {
+            Some(phpdoc)
+        }
+        (Some(native), _) => Some(native.clone()),
+        (None, Some(phpdoc)) => Some(phpdoc),
+        (None, None) => None,
+    }
+}
+
+fn type_info_specificity_score(type_info: &php_lsp_types::TypeInfo) -> usize {
+    match type_info {
+        php_lsp_types::TypeInfo::Mixed
+        | php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::LiteralNull => 0,
+        php_lsp_types::TypeInfo::Simple(name) => {
+            if is_builtin_type_name(name) {
+                1
+            } else {
+                3
+            }
+        }
+        php_lsp_types::TypeInfo::Self_
+        | php_lsp_types::TypeInfo::Static_
+        | php_lsp_types::TypeInfo::Parent_ => 3,
+        php_lsp_types::TypeInfo::Nullable(inner) => type_info_specificity_score(inner),
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            types.iter().map(type_info_specificity_score).sum()
+        }
+        php_lsp_types::TypeInfo::Generic { args, .. } => {
+            4 + args.iter().map(type_info_specificity_score).sum::<usize>()
+        }
+        php_lsp_types::TypeInfo::ArrayShape(items) => {
+            5 + items
+                .iter()
+                .map(|item| type_info_specificity_score(&item.value))
+                .sum::<usize>()
+        }
+        php_lsp_types::TypeInfo::ObjectShape(items) => {
+            5 + items
+                .iter()
+                .map(|item| type_info_specificity_score(&item.value))
+                .sum::<usize>()
+        }
+        php_lsp_types::TypeInfo::Callable {
+            params,
+            return_type,
+        } => {
+            3 + params
+                .iter()
+                .map(type_info_specificity_score)
+                .sum::<usize>()
+                + return_type
+                    .as_ref()
+                    .map(|return_type| type_info_specificity_score(return_type))
+                    .unwrap_or_default()
+        }
+        php_lsp_types::TypeInfo::ClassString(inner) => {
+            3 + inner
+                .as_ref()
+                .map(|inner| type_info_specificity_score(inner))
+                .unwrap_or_default()
+        }
+        php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_) => 2,
+        php_lsp_types::TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => 3 + type_info_specificity_score(if_type) + type_info_specificity_score(else_type),
+    }
 }
 
 fn call_site_arguments_by_param(
@@ -12203,6 +12291,57 @@ fn local_variable_type_markdown(
         markdown_code_span(&type_hint.display),
         destination
     )
+}
+
+fn magic_property_hover_markdown(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    sym_at_pos: &SymbolAtPosition,
+) -> Option<String> {
+    if sym_at_pos.ref_kind != RefKind::PropertyAccess {
+        return None;
+    }
+    let (class_fqn, member_name) = sym_at_pos.fqn.rsplit_once("::")?;
+    let getter_fqn = format!("{class_fqn}::__get");
+    let getter = index.resolve_fqn(&getter_fqn)?;
+    if getter.kind != php_lsp_types::PhpSymbolKind::Method {
+        return None;
+    }
+    let return_type = symbol_effective_return_type(&getter)?;
+    if !is_explicit_local_variable_type_hint(&return_type) {
+        return None;
+    }
+
+    let owner_fqn = getter.parent_fqn.as_deref().unwrap_or(class_fqn);
+    let display =
+        local_variable_type_info_display(index, owner_fqn, &getter.uri, &return_type, file_symbols);
+    if display.trim().is_empty() {
+        return None;
+    }
+
+    let type_hint = LocalVariableInlayType {
+        display: display.clone(),
+        target_fqn: single_inlay_target_fqn_from_type_info(
+            index,
+            owner_fqn,
+            &getter.uri,
+            &return_type,
+        ),
+    };
+
+    let mut content = String::new();
+    content.push_str("```php\n");
+    content.push_str("property ");
+    content.push_str(class_fqn);
+    content.push_str("::");
+    content.push_str(member_name);
+    content.push_str(": ");
+    content.push_str(&display);
+    content.push_str("\n```\n");
+    content.push_str("\n**Type:** ");
+    content.push_str(&local_variable_type_markdown(index, &type_hint));
+    content.push('\n');
+    Some(content)
 }
 
 fn markdown_file_location_destination(symbol: &php_lsp_types::SymbolInfo) -> String {
@@ -14124,7 +14263,7 @@ fn is_dynamic_member_access(
     }
 
     if fqn_matches(class_fqn, "stdClass")
-        || fqn_matches(class_fqn, "SimpleXMLElement")
+        || class_has_magic_get(index, class_fqn)
         || is_phpunit_test_double_type(class_fqn)
     {
         return true;
@@ -14142,6 +14281,12 @@ fn is_dynamic_member_access(
             .types
             .get(class_fqn.trim_start_matches('\\'))
             .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
+}
+
+fn class_has_magic_get(index: &WorkspaceIndex, class_fqn: &str) -> bool {
+    index
+        .resolve_fqn(&format!("{}::__get", class_fqn.trim_start_matches('\\')))
+        .is_some_and(|symbol| symbol.kind == php_lsp_types::PhpSymbolKind::Method)
 }
 
 fn is_missing_parent_constructor_call(sym_at_pos: &SymbolAtPosition) -> bool {
@@ -14995,7 +15140,7 @@ fn resolve_reference_symbol_at_node(
         Some(&member_type_resolver),
         Some(&callable_param_resolver),
     )?;
-    let resolved = index.resolve_fqn(&sym_at_pos.fqn)?;
+    let resolved = resolve_symbol_at_position_from_index(index, &sym_at_pos)?;
     Some((sym_at_pos, resolved))
 }
 
@@ -15062,8 +15207,28 @@ fn resolve_reference_symbol_at_node_cached(
         Some(&member_type_resolver),
         Some(&callable_param_resolver),
     )?;
-    let resolved = index.resolve_fqn(&sym_at_pos.fqn)?;
+    let resolved = resolve_symbol_at_position_from_index(index, &sym_at_pos)?;
     Some((sym_at_pos, resolved))
+}
+
+fn resolve_symbol_at_position_from_index(
+    index: &WorkspaceIndex,
+    sym_at_pos: &SymbolAtPosition,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    if let Some(symbol) = index.resolve_fqn(&sym_at_pos.fqn) {
+        return Some(symbol);
+    }
+
+    if matches!(
+        sym_at_pos.ref_kind,
+        RefKind::FunctionCall | RefKind::GlobalConstant
+    ) {
+        if let Some((_, short_name)) = sym_at_pos.fqn.rsplit_once('\\') {
+            return index.resolve_fqn(short_name);
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -17660,6 +17825,10 @@ fn resolve_member_type_from_index(
     class_fqn: &str,
     member_name: &str,
 ) -> Option<String> {
+    if class_fqn.is_empty() {
+        return resolve_function_return_type_from_index(index, member_name);
+    }
+
     let member_fqn = format!("{}::{}", class_fqn, member_name);
     tracing::debug!("resolve_member_type: looking up {}", member_fqn);
 
@@ -17674,16 +17843,30 @@ fn resolve_member_type_from_index(
     symbol_return_type_fqn(index, class_fqn, &sym)
 }
 
+fn resolve_function_return_type_from_index(
+    index: &WorkspaceIndex,
+    function_fqn: &str,
+) -> Option<String> {
+    let sym = index.resolve_fqn(function_fqn).or_else(|| {
+        function_fqn
+            .rsplit_once('\\')
+            .and_then(|(_, short_name)| index.resolve_fqn(short_name))
+    })?;
+    if sym.kind != php_lsp_types::PhpSymbolKind::Function {
+        return None;
+    }
+    symbol_return_type_fqn(index, "", &sym)
+}
+
 fn symbol_return_type_fqn(
     index: &WorkspaceIndex,
     owner_fqn: &str,
     sym: &php_lsp_types::SymbolInfo,
 ) -> Option<String> {
-    let sig = sym.signature.as_ref()?;
-    let ret = sig.return_type.as_ref()?;
+    let ret = symbol_effective_return_type(sym)?;
     tracing::debug!("resolve_member_type: {} -> return type '{}'", sym.fqn, ret);
 
-    type_info_fqn_from_index(index, owner_fqn, &sym.uri, ret)
+    type_info_fqn_from_index(index, owner_fqn, &sym.uri, &ret)
 }
 
 fn type_info_fqn_from_index(
@@ -17693,7 +17876,15 @@ fn type_info_fqn_from_index(
     type_info: &php_lsp_types::TypeInfo,
 ) -> Option<String> {
     match type_info {
-        php_lsp_types::TypeInfo::Simple(name) => simple_type_fqn_from_index(index, uri, name),
+        php_lsp_types::TypeInfo::Simple(name) => {
+            if owner_fqn.is_empty() {
+                let raw = name.trim().trim_start_matches('\\');
+                if !raw.is_empty() && index.resolve_fqn(raw).is_some() {
+                    return Some(raw.to_string());
+                }
+            }
+            simple_type_fqn_from_index(index, uri, name)
+        }
         php_lsp_types::TypeInfo::Nullable(inner) => {
             type_info_fqn_from_index(index, owner_fqn, uri, inner)
         }
@@ -20764,6 +20955,14 @@ impl LanguageServer for PhpLspBackend {
         } else {
             None
         };
+        let magic_property_hover = if symbol_info.is_none()
+            && virtual_member.is_none()
+            && framework_virtual_member.is_none()
+        {
+            magic_property_hover_markdown(&self.index, &file_symbols, &sym_at_pos)
+        } else {
+            None
+        };
 
         let result = if let Some(sym) = symbol_info {
             // Build hover content
@@ -20911,6 +21110,18 @@ impl LanguageServer for PhpLspBackend {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: framework_virtual_member_markdown(&virtual_member),
+                }),
+                range: Some(range),
+            })
+        } else if let Some(content) = magic_property_hover {
+            let range = Range {
+                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
+                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
+            };
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: content,
                 }),
                 range: Some(range),
             })
@@ -26290,7 +26501,7 @@ final class EntityRepository extends BaseRepository
     #[test]
     fn test_compute_diagnostics_allows_simplexml_dynamic_properties() {
         let stub_uri = "phpstub://SimpleXML/SimpleXML.php";
-        let stub_code = "<?php\nclass SimpleXMLElement {}\n";
+        let stub_code = "<?php\nclass SimpleXMLElement { /** @return static */ private function __get($name) {} }\n";
         let uri = "file:///simplexml-dynamic-properties.php";
         let code = r#"<?php
 namespace App;

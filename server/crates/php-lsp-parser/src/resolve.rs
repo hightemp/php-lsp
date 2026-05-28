@@ -1171,6 +1171,9 @@ fn try_resolve_object_type_inner<'a>(
 ) -> Option<String> {
     let kind = object_node.kind();
     match kind {
+        "function_call_expression" => {
+            try_resolve_function_call_return_type(object_node, source, file_symbols, resolver)
+        }
         // Direct: new Foo()
         "object_creation_expression" => {
             // The class name is a named child with kind "name" or "qualified_name"
@@ -1587,6 +1590,20 @@ fn find_variable_inference_before_usage(
                         type_info,
                     },
                 ));
+            } else if let Some(type_info) =
+                infer_expression_type_info(right, source, file_symbols, resolver, callable_resolver)
+            {
+                let resolved_type_fqn =
+                    resolve_phpdoc_var_type(&type_info, right, source, file_symbols);
+                inferred = Some((
+                    stmt.start_byte(),
+                    VariableInference {
+                        type_display: Some(type_info.to_string()),
+                        resolved_type_fqn,
+                        phpdoc_comment: None,
+                        type_info: Some(type_info),
+                    },
+                ));
             }
         }
 
@@ -1693,6 +1710,20 @@ fn find_nested_variable_inference_before_usage(
                         resolved_type_fqn: Some(resolved.clone()),
                         phpdoc_comment: None,
                         type_info: Some(TypeInfo::Simple(resolved)),
+                    },
+                ));
+            } else if let Some(type_info) =
+                infer_expression_type_info(right, source, file_symbols, resolver, callable_resolver)
+            {
+                let resolved_type_fqn =
+                    resolve_phpdoc_var_type(&type_info, right, source, file_symbols);
+                inferred = Some((
+                    child.start_byte(),
+                    VariableInference {
+                        type_display: Some(type_info.to_string()),
+                        resolved_type_fqn,
+                        phpdoc_comment: None,
+                        type_info: Some(type_info),
                     },
                 ));
             }
@@ -2715,6 +2746,37 @@ fn resolve_symbol_type_info_to_object_fqn(
     }
 }
 
+fn try_resolve_function_call_return_type(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<String> {
+    let resolve_fn = resolver?;
+    match node.kind() {
+        "parenthesized_expression" => (0..node.named_child_count()).find_map(|i| {
+            let child = node.named_child(i)?;
+            try_resolve_function_call_return_type(child, source, file_symbols, resolver)
+        }),
+        "function_call_expression" => {
+            let function = node
+                .child_by_field_name("function")
+                .or_else(|| node.named_child(0))?;
+            let raw_name = source[function.byte_range()].trim();
+            if raw_name.is_empty() || function.kind() == "member_access_expression" {
+                return None;
+            }
+            let resolved = resolve_function_name(raw_name, file_symbols);
+            resolve_fn("", &resolved).or_else(|| {
+                (!raw_name.starts_with('\\') && !raw_name.contains('\\') && resolved != raw_name)
+                    .then(|| resolve_fn("", raw_name))
+                    .flatten()
+            })
+        }
+        _ => None,
+    }
+}
+
 fn infer_expression_type_info(
     node: Node,
     source: &str,
@@ -2766,17 +2828,30 @@ fn infer_expression_type_info(
             }
             None
         }
+        "function_call_expression" => {
+            try_resolve_function_call_return_type(node, source, file_symbols, resolver)
+                .map(TypeInfo::Simple)
+        }
         "member_access_expression" | "nullsafe_member_access_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
             let class_fqn =
                 try_resolve_object_type(object, source, file_symbols, resolver, callable_resolver)?;
             let prop_fqn = format!("{}::${}", class_fqn, &source[name.byte_range()]);
-            file_symbols.symbols.iter().find_map(|sym| {
-                (sym.fqn == prop_fqn)
-                    .then(|| sym.signature.as_ref()?.return_type.clone())
-                    .flatten()
-            })
+            file_symbols
+                .symbols
+                .iter()
+                .find_map(|sym| {
+                    (sym.fqn == prop_fqn)
+                        .then(|| sym.signature.as_ref()?.return_type.clone())
+                        .flatten()
+                })
+                .or_else(|| {
+                    resolver.and_then(|resolve_fn| {
+                        resolve_fn(&class_fqn, &format!("${}", &source[name.byte_range()]))
+                            .map(TypeInfo::Simple)
+                    })
+                })
         }
         "member_call_expression" | "nullsafe_member_call_expression" => {
             let object = node.child_by_field_name("object")?;
@@ -2784,11 +2859,19 @@ fn infer_expression_type_info(
             let class_fqn =
                 try_resolve_object_type(object, source, file_symbols, resolver, callable_resolver)?;
             let method_fqn = format!("{}::{}", class_fqn, &source[name.byte_range()]);
-            file_symbols.symbols.iter().find_map(|sym| {
-                (sym.fqn == method_fqn)
-                    .then(|| sym.signature.as_ref()?.return_type.clone())
-                    .flatten()
-            })
+            file_symbols
+                .symbols
+                .iter()
+                .find_map(|sym| {
+                    (sym.fqn == method_fqn)
+                        .then(|| sym.signature.as_ref()?.return_type.clone())
+                        .flatten()
+                })
+                .or_else(|| {
+                    resolver.and_then(|resolve_fn| {
+                        resolve_fn(&class_fqn, &source[name.byte_range()]).map(TypeInfo::Simple)
+                    })
+                })
         }
         "subscript_expression" => {
             let base = node.named_child(0)?;

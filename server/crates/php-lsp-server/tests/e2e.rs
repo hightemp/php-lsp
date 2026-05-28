@@ -4541,6 +4541,192 @@ class CdbHandler extends BaseHandler {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_simplexml_stubs_drive_inlay_hints_and_hovers() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+namespace {
+class SimpleXMLElement {
+    /** @return static */
+    private function __get($name) {}
+    /**
+     * @return static[]|false|null
+     */
+    public function xpath(string $expression): array|false|null { return []; }
+    public function registerXPathNamespace(string $prefix, string $namespace): bool { return true; }
+}
+
+function simplexml_load_string(string $data): SimpleXMLElement|false { return new SimpleXMLElement(); }
+}
+
+namespace App;
+
+function parse(string $responseXml): void {
+    $x/*xml*/ml = simplexml_load_string($responseXml);
+    if (false === $xml) {
+        return;
+    }
+    $xml->registerXPath/*method*/Namespace('s', 'urn');
+    $result/*nodes*/Nodes = $xml->xpath('//x');
+    /** @var \SimpleXMLElement $result */
+    $result = $resultNodes[0];
+    $status = (string)($result->Status/*prop*/Code ?? '');
+}
+"#;
+    let markers = ["/*xml*/", "/*method*/", "/*nodes*/", "/*prop*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (xml_line, xml_character) = marker_position("/*xml*/");
+    let (method_line, method_character) = marker_position("/*method*/");
+    let (nodes_line, nodes_character) = marker_position("/*nodes*/");
+    let (prop_line, prop_character) = marker_position("/*prop*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/simplexml-inlay-hover.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 30, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    let hints = inlay_result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == ": SimpleXMLElement|false"),
+        "expected simplexml_load_string return type hint, got: {:?}",
+        labels
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == ": array<SimpleXMLElement>|false|null"),
+        "expected xpath PHPDoc generic return type hint, got: {:?}",
+        labels
+    );
+
+    let xml_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(3, uri, xml_line, xml_character))
+            .await
+            .unwrap(),
+    );
+    let xml_hover = hover_markdown_value(&xml_hover);
+    assert!(
+        xml_hover.contains("SimpleXMLElement|false $xml"),
+        "expected local variable hover from global function fallback, got: {}",
+        xml_hover
+    );
+
+    let method_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(4, uri, method_line, method_character))
+            .await
+            .unwrap(),
+    );
+    let method_hover = hover_markdown_value(&method_hover);
+    assert!(
+        method_hover.contains("method SimpleXMLElement::registerXPathNamespace"),
+        "expected method hover on SimpleXMLElement receiver, got: {}",
+        method_hover
+    );
+
+    let nodes_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(5, uri, nodes_line, nodes_character))
+            .await
+            .unwrap(),
+    );
+    let nodes_hover = hover_markdown_value(&nodes_hover);
+    assert!(
+        nodes_hover.contains("array<SimpleXMLElement>|false|null $resultNodes"),
+        "expected local variable hover from xpath PHPDoc return type, got: {}",
+        nodes_hover
+    );
+
+    let prop_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(6, uri, prop_line, prop_character))
+            .await
+            .unwrap(),
+    );
+    let prop_hover = hover_markdown_value(&prop_hover);
+    assert!(
+        prop_hover.contains("property SimpleXMLElement::$StatusCode: SimpleXMLElement"),
+        "expected magic-property hover from __get return type, got: {}",
+        prop_hover
+    );
+    assert!(
+        prop_hover.contains("[`SimpleXMLElement`](<file:///test/simplexml-inlay-hover.php#L3>)"),
+        "expected clickable SimpleXMLElement type link in property hover, got: {}",
+        prop_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_callback_parameter_inference_from_indexed_signatures() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

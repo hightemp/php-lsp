@@ -2363,6 +2363,28 @@ Validation:
 
 ---
 
+## Milestone: bdpn-ui SimpleXML IDE intelligence (2026-05-28)
+
+Goal: make SimpleXML-heavy SOAP response parsing in bdpn-ui expose the same
+type feedback as ordinary PHP variables and calls.
+
+- [x] **BDPN-010** Infer SimpleXML variables, XPath results, and dynamic child access. *(done 2026-05-28)*
+  - Reproduction: `/home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/ListTechWindowsService.php`
+    inside `handleResponse()`.
+  - Original gaps: `$xml` has no local variable inlay hint and no hover type;
+    `$xml->registerXPathNamespace()` / `$xml->xpath()` do not expose method
+    hover; `$resultNodes` has no inlay hint/hover; `$result->StatusCode` has no
+    useful hover.
+  - Delivered: `simplexml_load_string($responseXml)` is resolved through the
+    generic PHP global-function fallback; `$xml->xpath(...)` uses the more
+    precise PHPDoc return (`array<SimpleXMLElement>|false|null`); dynamic child
+    access hovers through the generic `__get` return type.
+  - Validation: focused e2e regression plus an in-process LSP check against the
+    bdpn-ui file confirmed inlay hints and hovers for `$xml`,
+    `$xml->registerXPathNamespace()`, `$resultNodes`, and `$result->StatusCode`.
+
+---
+
 ## Текущие задачи
 
 - [x] **T-2026-05-28** Пройти `/home/apanov/Projects/bdpn-ui` PHP+Twig и найти текущие ошибки/false positives `php-lsp` *(done 2026-05-28)*
