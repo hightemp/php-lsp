@@ -1546,6 +1546,18 @@ fn find_variable_inference_before_usage(
             continue;
         }
 
+        if let Some(array_write_info) = array_write_inference_for_var(
+            stmt,
+            var_name,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        ) {
+            inferred = Some((stmt.start_byte(), array_write_info));
+            continue;
+        }
+
         if let Some(foreach_info) = foreach_variable_inference(
             stmt,
             var_name,
@@ -1683,6 +1695,15 @@ fn find_nested_variable_inference_before_usage(
             file_symbols,
         ) {
             inferred = Some((child.start_byte(), doc_info));
+        } else if let Some(array_write_info) = array_write_inference_for_var(
+            child,
+            var_name,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        ) {
+            inferred = Some((child.start_byte(), array_write_info));
         } else if let Some(right) = assignment_rhs {
             if let Some(type_info) = infer_literal_array_shape_type(
                 right,
@@ -1895,6 +1916,83 @@ fn assignment_rhs_for_var<'a>(stmt: Node<'a>, var_name: &str, source: &str) -> O
     } else {
         None
     }
+}
+
+fn array_write_inference_for_var(
+    stmt: Node,
+    var_name: &str,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<VariableInference> {
+    if stmt.kind() != "expression_statement" {
+        return None;
+    }
+
+    let expr = stmt.named_child(0)?;
+    if expr.kind() != "assignment_expression" {
+        return None;
+    }
+
+    let left = expr.child_by_field_name("left")?;
+    let right = expr.child_by_field_name("right")?;
+    let (base, key) = subscript_assignment_base_and_key(left)?;
+    if normalize_var_name(&source[base.byte_range()]) != var_name {
+        return None;
+    }
+
+    let key_type =
+        infer_array_key_expression_type(key, source, file_symbols, resolver, callable_resolver)
+            .unwrap_or_else(|| TypeInfo::Simple("array-key".to_string()));
+    let value_type =
+        infer_expression_type_info(right, source, file_symbols, resolver, callable_resolver)
+            .unwrap_or_else(|| {
+                infer_literal_value_type_text(
+                    &source[right.byte_range()],
+                    right,
+                    source,
+                    file_symbols,
+                    resolver,
+                    callable_resolver,
+                )
+            });
+    let type_info = TypeInfo::Generic {
+        base: "array".to_string(),
+        args: vec![key_type, value_type],
+    };
+
+    Some(VariableInference {
+        type_display: Some(type_info.to_string()),
+        resolved_type_fqn: None,
+        phpdoc_comment: None,
+        type_info: Some(type_info),
+    })
+}
+
+fn subscript_assignment_base_and_key(left: Node) -> Option<(Node, Node)> {
+    if left.kind() != "subscript_expression" {
+        return None;
+    }
+
+    let base = left.named_child(0)?;
+    if base.kind() != "variable_name" {
+        return None;
+    }
+    let key = left.named_child(1)?;
+    Some((base, key))
+}
+
+fn infer_array_key_expression_type(
+    key: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    infer_expression_type_info(key, source, file_symbols, resolver, callable_resolver)
+        .or_else(|| infer_literal_expression_type_info(key, source))
+        .map(|type_info| array_key_compatible_type_info(&type_info))
 }
 
 fn extract_preceding_phpdoc_var_inference(
@@ -2777,6 +2875,237 @@ fn try_resolve_function_call_return_type(
     }
 }
 
+fn infer_function_call_type_info(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let short_name = function_call_short_name(node, source)?;
+    match short_name.as_str() {
+        "array_keys" => {
+            let first_arg = call_arguments(node, source).first()?.value_node;
+            let array_type = infer_expression_type_info(
+                first_arg,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            )?;
+            let key_type = iterable_key_type_info(&array_type)
+                .map(|type_info| array_key_compatible_type_info(&type_info))
+                .unwrap_or_else(|| TypeInfo::Simple("array-key".to_string()));
+            Some(TypeInfo::Generic {
+                base: "list".to_string(),
+                args: vec![key_type],
+            })
+        }
+        "array_values" => {
+            let first_arg = call_arguments(node, source).first()?.value_node;
+            let array_type = infer_expression_type_info(
+                first_arg,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            )?;
+            let value_type = iterable_value_type_info(&array_type, None)?;
+            Some(TypeInfo::Generic {
+                base: "list".to_string(),
+                args: vec![value_type],
+            })
+        }
+        _ => try_resolve_function_call_return_type(node, source, file_symbols, resolver)
+            .map(|type_text| type_info_from_type_text(&type_text)),
+    }
+}
+
+fn function_call_short_name(node: Node, source: &str) -> Option<String> {
+    if node.kind() != "function_call_expression" {
+        return None;
+    }
+
+    let function = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))?;
+    if function.kind() == "member_access_expression" {
+        return None;
+    }
+
+    let raw_name = source[function.byte_range()].trim();
+    let short = raw_name
+        .trim_start_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or(raw_name)
+        .to_ascii_lowercase();
+    (!short.is_empty()).then_some(short)
+}
+
+fn infer_cast_expression_type_info(node: Node, source: &str) -> Option<TypeInfo> {
+    let text = source[node.byte_range()].trim_start();
+    let lower = text.to_ascii_lowercase();
+    let cast_type = if lower.starts_with("(string)") {
+        "string"
+    } else if lower.starts_with("(int)") || lower.starts_with("(integer)") {
+        "int"
+    } else if lower.starts_with("(float)")
+        || lower.starts_with("(double)")
+        || lower.starts_with("(real)")
+    {
+        "float"
+    } else if lower.starts_with("(bool)") || lower.starts_with("(boolean)") {
+        "bool"
+    } else if lower.starts_with("(array)") {
+        "array"
+    } else if lower.starts_with("(object)") {
+        "object"
+    } else {
+        return None;
+    };
+
+    Some(TypeInfo::Simple(cast_type.to_string()))
+}
+
+fn infer_binary_expression_type_info(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let text = source[node.byte_range()].trim();
+    find_top_level_text(text, "??")?;
+
+    let left = node
+        .child_by_field_name("left")
+        .or_else(|| node.named_child(0));
+    let right = node
+        .child_by_field_name("right")
+        .or_else(|| node.named_child(1));
+    let left_type = left
+        .and_then(|left| {
+            infer_expression_type_info(left, source, file_symbols, resolver, callable_resolver)
+        })
+        .and_then(|type_info| type_info_without_null(&type_info));
+    let right_type = right
+        .and_then(|right| {
+            infer_expression_type_info(right, source, file_symbols, resolver, callable_resolver)
+        })
+        .or_else(|| right.and_then(|right| infer_literal_expression_type_info(right, source)));
+
+    merge_optional_type_infos(left_type, right_type)
+}
+
+fn infer_literal_expression_type_info(node: Node, source: &str) -> Option<TypeInfo> {
+    let text = source[node.byte_range()].trim();
+    if text.starts_with(['\'', '"']) {
+        return Some(TypeInfo::Simple("string".to_string()));
+    }
+    if text.eq_ignore_ascii_case("true") {
+        return Some(TypeInfo::LiteralBool(true));
+    }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(TypeInfo::LiteralBool(false));
+    }
+    if text.eq_ignore_ascii_case("null") {
+        return Some(TypeInfo::LiteralNull);
+    }
+    if text.parse::<i64>().is_ok() {
+        return Some(TypeInfo::Simple("int".to_string()));
+    }
+    if text.parse::<f64>().is_ok() {
+        return Some(TypeInfo::Simple("float".to_string()));
+    }
+    None
+}
+
+fn type_info_from_type_text(type_text: &str) -> TypeInfo {
+    let type_text = type_text.trim();
+    if let Some(inner) = type_text.strip_prefix('?') {
+        return TypeInfo::Nullable(Box::new(type_info_from_type_text(inner)));
+    }
+
+    let union_parts = split_top_level_text(type_text, '|');
+    if union_parts.len() > 1 {
+        return merge_type_infos(
+            union_parts
+                .into_iter()
+                .filter(|part| !part.trim().is_empty())
+                .map(type_info_from_type_text)
+                .collect(),
+        );
+    }
+
+    let intersection_parts = split_top_level_text(type_text, '&');
+    if intersection_parts.len() > 1 {
+        return TypeInfo::Intersection(
+            intersection_parts
+                .into_iter()
+                .filter(|part| !part.trim().is_empty())
+                .map(type_info_from_type_text)
+                .collect(),
+        );
+    }
+
+    match type_text.to_ascii_lowercase().as_str() {
+        "null" => TypeInfo::LiteralNull,
+        "true" => TypeInfo::LiteralBool(true),
+        "false" => TypeInfo::LiteralBool(false),
+        _ => TypeInfo::Simple(type_text.to_string()),
+    }
+}
+
+fn type_info_without_null(type_info: &TypeInfo) -> Option<TypeInfo> {
+    match type_info {
+        TypeInfo::LiteralNull => None,
+        TypeInfo::Nullable(inner) => type_info_without_null(inner),
+        TypeInfo::Union(types) => {
+            let kept: Vec<TypeInfo> = types.iter().filter_map(type_info_without_null).collect();
+            (!kept.is_empty()).then(|| merge_type_infos(kept))
+        }
+        other => Some(other.clone()),
+    }
+}
+
+fn merge_optional_type_infos(left: Option<TypeInfo>, right: Option<TypeInfo>) -> Option<TypeInfo> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(merge_type_infos(vec![left, right])),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+fn merge_type_infos(types: Vec<TypeInfo>) -> TypeInfo {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for type_info in types {
+        match type_info {
+            TypeInfo::Union(inner) => {
+                for inner_type in inner {
+                    let key = inner_type.to_string();
+                    if seen.insert(key) {
+                        merged.push(inner_type);
+                    }
+                }
+            }
+            other => {
+                let key = other.to_string();
+                if seen.insert(key) {
+                    merged.push(other);
+                }
+            }
+        }
+    }
+
+    if merged.len() == 1 {
+        merged.pop().unwrap()
+    } else {
+        TypeInfo::Union(merged)
+    }
+}
+
 fn infer_expression_type_info(
     node: Node,
     source: &str,
@@ -2829,9 +3158,16 @@ fn infer_expression_type_info(
             None
         }
         "function_call_expression" => {
-            try_resolve_function_call_return_type(node, source, file_symbols, resolver)
-                .map(TypeInfo::Simple)
+            infer_function_call_type_info(node, source, file_symbols, resolver, callable_resolver)
         }
+        "cast_expression" => infer_cast_expression_type_info(node, source),
+        "binary_expression" => infer_binary_expression_type_info(
+            node,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        ),
         "member_access_expression" | "nullsafe_member_access_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
@@ -3339,6 +3675,57 @@ fn iterable_key_type_info(type_info: &TypeInfo) -> Option<TypeInfo> {
             if_type, else_type, ..
         } => iterable_key_type_info(if_type).or_else(|| iterable_key_type_info(else_type)),
         _ => None,
+    }
+}
+
+fn array_key_compatible_type_info(type_info: &TypeInfo) -> TypeInfo {
+    match type_info {
+        TypeInfo::LiteralString(_) => TypeInfo::Simple("string".to_string()),
+        TypeInfo::LiteralInt(_) => TypeInfo::Simple("int".to_string()),
+        TypeInfo::Nullable(inner) => array_key_compatible_type_info(inner),
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            let compatible: Vec<TypeInfo> = types
+                .iter()
+                .filter_map(|type_info| {
+                    let normalized = array_key_compatible_type_info(type_info);
+                    is_array_key_type_info(&normalized).then_some(normalized)
+                })
+                .collect();
+            if compatible.is_empty() {
+                TypeInfo::Simple("array-key".to_string())
+            } else {
+                merge_type_infos(compatible)
+            }
+        }
+        TypeInfo::Simple(name) => {
+            let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+            match lower.as_str() {
+                "string" | "non-empty-string" | "numeric-string" | "class-string" => {
+                    TypeInfo::Simple("string".to_string())
+                }
+                "int" | "integer" | "positive-int" | "negative-int" | "non-negative-int" => {
+                    TypeInfo::Simple("int".to_string())
+                }
+                "array-key" => TypeInfo::Simple("array-key".to_string()),
+                _ => TypeInfo::Simple("array-key".to_string()),
+            }
+        }
+        _ => TypeInfo::Simple("array-key".to_string()),
+    }
+}
+
+fn is_array_key_type_info(type_info: &TypeInfo) -> bool {
+    match type_info {
+        TypeInfo::Simple(name) => {
+            matches!(
+                name.trim_start_matches('\\').to_ascii_lowercase().as_str(),
+                "array-key" | "int" | "integer" | "string"
+            )
+        }
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            types.iter().all(is_array_key_type_info)
+        }
+        _ => false,
     }
 }
 
@@ -4661,6 +5048,31 @@ function run(): void {
         let result = parse_and_resolve(code, line, col).expect("foreach value should resolve");
         assert_eq!(result.fqn, "App\\Entity\\User::getName");
         assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_infer_foreach_value_from_array_keys_after_array_write() {
+        let code = r#"<?php
+function run(array $numbers): void {
+    $normalizedNumbers = [];
+    foreach ($numbers as $number) {
+        $normalizedNumber = preg_replace('/\D+/', '', is_scalar($number) ? (string)$number : '') ?? '';
+        if ('' !== $normalizedNumber) {
+            $normalizedNumbers[$normalizedNumber] = true;
+        }
+    }
+    $numbers = array_keys($normalizedNumbers);
+    foreach ($numbers as $phoneNumber) {
+        $phoneNumber;
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "$phoneNumber;");
+        let info =
+            parse_and_variable_hover_info(code, line, col + 2).expect("foreach value should infer");
+
+        assert_eq!(info.variable_name, "$phoneNumber");
+        assert_eq!(info.type_display.as_deref(), Some("string"));
     }
 
     #[test]

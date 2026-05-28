@@ -10654,8 +10654,10 @@ fn local_variable_inlay_type(
                 Some(&resolver),
                 Some(&callable_param_resolver),
             )?;
+            let allow_scalar =
+                enclosing_foreach_statement_for_variable(ctx.source, variable_node).is_some();
 
-            local_variable_type_from_hover_info(&info, ctx.file_symbols, false)
+            local_variable_type_from_hover_info(&info, ctx.file_symbols, allow_scalar)
         },
     )
 }
@@ -10702,7 +10704,7 @@ fn foreach_variable_inlay_type_from_index(
         &iterable_type.owner_fqn,
         &iterable_type.uri,
         &value_type,
-        false,
+        true,
     )
 }
 

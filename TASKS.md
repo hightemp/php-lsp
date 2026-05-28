@@ -2400,6 +2400,23 @@ type feedback as ordinary PHP variables and calls.
     bdpn-ui file confirmed the `: ReversePortingNumber` inlay hint, hover type,
     and clickable type location for `$portingNumber`.
 
+- [x] **BDPN-012** Infer `foreach` value variables after `array_keys()` normalization. *(done 2026-05-28)*
+  - Reproduction: `/home/apanov/Projects/bdpn-ui/app/src/Soap/Inbound/Handler/CompleteHandler.php`
+    inside `handleRegionChangeRequestComplete()`:
+    `$numbers = array_keys($normalizedNumbers); foreach ($numbers as $phoneNumber)`.
+  - Original gaps: `$phoneNumber` has no local variable inlay hint and no hover
+    type after `$numbers` is reassigned from `array_keys($normalizedNumbers)`.
+  - Expected: inference should understand `array_keys(array<string, true>)` as a
+    list of key values and expose `$phoneNumber` as `string` without
+    project-specific hardcode.
+  - Delivered: parser flow inference now tracks simple array writes
+    (`$array[$key] = $value`), models `array_keys()` / `array_values()` as list
+    transforms, understands casts and null-coalescing expressions, and allows
+    scalar inlay hints for typed `foreach` value variables.
+  - Validation: focused parser and e2e regressions plus an in-process LSP check
+    against the bdpn-ui file confirmed the `: string` inlay hint and
+    `string $phoneNumber` hover.
+
 ---
 
 ## Текущие задачи

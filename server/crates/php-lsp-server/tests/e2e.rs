@@ -4860,6 +4860,113 @@ function update(ReverseRequest $reverseRequest): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_foreach_value_inlay_and_hover_from_array_keys_after_array_write() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+function handleRegionChangeRequestComplete(array $numbers): void {
+    $normalizedNumbers = [];
+    foreach ($numbers as $number) {
+        $normalizedNumber = preg_replace('/\D+/', '', is_scalar($number) ? (string)$number : '') ?? '';
+        if ('' !== $normalizedNumber) {
+            $normalizedNumbers[$normalizedNumber] = true;
+        }
+    }
+    $numbers = array_keys($normalizedNumbers);
+
+    foreach ($numbers as $phone/*decl*/Number) {
+        strlen($phone/*usage*/Number);
+    }
+}
+"#;
+    let markers = ["/*decl*/", "/*usage*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (usage_line, usage_character) = marker_position("/*usage*/");
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/foreach-array-keys-normalized.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 20, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    let hints = inlay_result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+    assert!(
+        labels.iter().any(|label| label == ": string"),
+        "expected foreach value type hint from array_keys normalized array, got: {:?}",
+        labels
+    );
+
+    let hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, usage_line, usage_character))
+        .await
+        .unwrap();
+    let hover_result = extract_result(hover_response);
+    let hover = hover_markdown_value(&hover_result);
+    assert!(
+        hover.contains("string $phoneNumber"),
+        "expected foreach value hover from array_keys normalized array, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_callback_parameter_inference_from_indexed_signatures() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
