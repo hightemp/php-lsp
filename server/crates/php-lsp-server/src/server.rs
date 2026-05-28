@@ -10877,6 +10877,23 @@ fn server_member_call_expression_type_info(
     expression: tree_sitter::Node,
 ) -> Option<IndexedExpressionTypeInfo> {
     let expression = normalized_expression_node(expression);
+    let (receiver_fqn, symbol) = server_member_call_symbol(ctx, expression)?;
+
+    let return_type = symbol_effective_return_type(&symbol)?;
+    let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&receiver_fqn);
+    let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
+    Some(IndexedExpressionTypeInfo {
+        type_info,
+        owner_fqn: owner_fqn.to_string(),
+        uri: symbol.uri.clone(),
+    })
+}
+
+fn server_member_call_symbol(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<(String, Arc<php_lsp_types::SymbolInfo>)> {
+    let expression = normalized_expression_node(expression);
     if !matches!(
         expression.kind(),
         "member_call_expression" | "nullsafe_member_call_expression"
@@ -10896,18 +10913,49 @@ fn server_member_call_expression_type_info(
     )?;
     let method_fqn = format!("{receiver_fqn}::{method_name}");
     let symbol = ctx.index.resolve_fqn(&method_fqn)?;
-    if symbol.kind != php_lsp_types::PhpSymbolKind::Method {
-        return None;
+    (symbol.kind == php_lsp_types::PhpSymbolKind::Method).then_some((receiver_fqn, symbol))
+}
+
+fn server_member_symbol_at_position(
+    ctx: &InlayHintContext<'_>,
+    line: u32,
+    byte_col: u32,
+) -> Option<SymbolAtPosition> {
+    let point = tree_sitter::Point::new(line as usize, byte_col as usize);
+    let mut node = ctx
+        .tree
+        .root_node()
+        .descendant_for_point_range(point, point)?;
+    while !node.is_named() {
+        node = node.parent()?;
     }
 
-    let return_type = symbol_effective_return_type(&symbol)?;
-    let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&receiver_fqn);
-    let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
-    Some(IndexedExpressionTypeInfo {
-        type_info,
-        owner_fqn: owner_fqn.to_string(),
-        uri: symbol.uri.clone(),
-    })
+    let point_range = (line, byte_col, line, byte_col);
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "member_call_expression" | "nullsafe_member_call_expression"
+        ) {
+            let name_node = member_reference_name_node(candidate)?;
+            if byte_range_contains(node_range_node(name_node), point_range) {
+                let method_name = node_text(ctx.source, name_node).trim().to_string();
+                let (_, symbol) = server_member_call_symbol(ctx, candidate)?;
+                return Some(SymbolAtPosition {
+                    fqn: symbol.fqn.clone(),
+                    name: method_name,
+                    ref_kind: RefKind::MethodCall,
+                    object_expr: candidate
+                        .child_by_field_name("object")
+                        .map(|object| node_text(ctx.source, object).trim().to_string()),
+                    range: node_range_node(name_node),
+                });
+            }
+        }
+        current = candidate.parent();
+    }
+
+    None
 }
 
 fn server_expression_type_info(
@@ -21551,8 +21599,10 @@ impl LanguageServer for PhpLspBackend {
             let local_var_hover = variable_node_at_position
                 .and_then(|variable_node| local_variable_hover_data(&ctx, variable_node));
 
+            let inferred_member_symbol = server_member_symbol_at_position(&ctx, pos.line, byte_col);
+
             // Find symbol at cursor position (with resolver for chains)
-            let sym_at_pos = match symbol_at_position_with_request_cache(
+            let primary_sym_at_pos = symbol_at_position_with_request_cache(
                 &type_cache,
                 tree,
                 &source,
@@ -21562,21 +21612,33 @@ impl LanguageServer for PhpLspBackend {
                 "hover",
                 Some(&resolver),
                 Some(&callable_param_resolver),
-            ) {
+            );
+            let sym_at_pos = match primary_sym_at_pos {
+                Some(s)
+                    if matches!(s.ref_kind, RefKind::MethodCall)
+                        && self.index.resolve_fqn(&s.fqn).is_none() =>
+                {
+                    inferred_member_symbol.unwrap_or(s)
+                }
                 Some(s) => s,
                 None => {
-                    let Some(variable_node) = variable_node_at_position else {
-                        return Ok(None);
-                    };
-                    let Some(variable_name) = variable_text_for_node(&source, variable_node) else {
-                        return Ok(None);
-                    };
-                    SymbolAtPosition {
-                        fqn: variable_name.clone(),
-                        name: variable_name,
-                        ref_kind: RefKind::Variable,
-                        object_expr: None,
-                        range: node_range_node(variable_node),
+                    if let Some(sym) = inferred_member_symbol {
+                        sym
+                    } else {
+                        let Some(variable_node) = variable_node_at_position else {
+                            return Ok(None);
+                        };
+                        let Some(variable_name) = variable_text_for_node(&source, variable_node)
+                        else {
+                            return Ok(None);
+                        };
+                        SymbolAtPosition {
+                            fqn: variable_name.clone(),
+                            name: variable_name,
+                            ref_kind: RefKind::Variable,
+                            object_expr: None,
+                            range: node_range_node(variable_node),
+                        }
                     }
                 }
             };
@@ -22176,6 +22238,9 @@ impl LanguageServer for PhpLspBackend {
 
             let source = parser.source();
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+            let utf16_index = Utf16LineIndex::new(&source);
+            let type_cache =
+                RequestTypeCache::new(&uri_str, self.current_document_version(&uri_str));
 
             let file_symbols = self
                 .index
@@ -22198,7 +22263,18 @@ impl LanguageServer for PhpLspBackend {
                 .map(|d| range_byte_to_utf16(&source, d));
             let framework_string_key_context =
                 framework_string_key_context_at_position(&source, pos.line, byte_col);
-            let sym = symbol_at_position_with_resolvers(
+
+            let ctx = InlayHintContext {
+                tree,
+                source: &source,
+                file_symbols: &file_symbols,
+                index: &self.index,
+                type_cache: &type_cache,
+                utf16_index: &utf16_index,
+                requested_range: (0, 0, u32::MAX, u32::MAX),
+            };
+            let inferred_member_symbol = server_member_symbol_at_position(&ctx, pos.line, byte_col);
+            let primary_sym = symbol_at_position_with_resolvers(
                 tree,
                 &source,
                 pos.line,
@@ -22207,6 +22283,16 @@ impl LanguageServer for PhpLspBackend {
                 Some(&resolver),
                 Some(&callable_param_resolver),
             );
+            let sym = match primary_sym {
+                Some(s)
+                    if matches!(s.ref_kind, RefKind::MethodCall)
+                        && self.index.resolve_fqn(&s.fqn).is_none() =>
+                {
+                    inferred_member_symbol.or(Some(s))
+                }
+                Some(s) => Some(s),
+                None => inferred_member_symbol,
+            };
             let this_class_def = sym.as_ref().and_then(|sym| {
                 if sym.ref_kind == RefKind::Variable && sym.name == "$this" {
                     current_class_symbol_at_range(

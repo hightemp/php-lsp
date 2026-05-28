@@ -2596,6 +2596,30 @@ type feedback as ordinary PHP variables and calls.
     and real CLI JSON analyze against bdpn-ui `CompleteHandler.php` with zero
     diagnostics.
 
+- [x] **BDPN-021** Use enriched local variable receiver types for member hover/definition. *(done 2026-05-28)*
+  - Reproduction: `CompleteHandler.php` inside
+    `foreach ($portingRequest->getPortingNumbers() as $portingNumber)`, local
+    variable inference knows `$portingNumber` is a Doctrine ORM
+    `targetEntity` collection item, but hover on
+    `$portingNumber->getCurrentNumberStatus()` and
+    `$portingNumber->setCurrentNumberStatus(...)` is empty.
+  - Expected: method hover/goto-definition should resolve member calls from the
+    same enriched receiver inference used by inlay hints and local-variable
+    hovers, including generic Doctrine collection item inference, without
+    project-specific class or method names.
+  - Validation: neutral e2e fixture with a Doctrine collection getter and
+    child entity methods, plus bdpn-ui in-process check for both methods.
+  - Implemented: member hover/definition now has a server-side fallback that
+    resolves method symbols from enriched receiver type inference when
+    parser-level symbol resolution cannot bind the member call.
+  - Regression: Doctrine `targetEntity` collection e2e fixture now verifies
+    hover on methods called on the inferred foreach item, including scalar and
+    nullable entity return types.
+  - Validation: real LSP stdio check against bdpn-ui `CompleteHandler.php`
+    confirmed hovers for `getCurrentNumberStatus` and `setCurrentNumberStatus`;
+    `cargo test --all`, `cargo fmt --all --check`, and
+    `cargo clippy --all-targets -- -D warnings` passed.
+
 ---
 
 ## Текущие задачи

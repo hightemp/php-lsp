@@ -5559,12 +5559,18 @@ use App\Entity\Order;
 
 function update(Order $order): void {
     foreach ($order->getItems() as $it/*decl*/em) {
-        $sku = $it/*usage*/em->sku();
-        $st/*status*/atusName = $item->getStatus()?->name();
+        $sku = $it/*usage*/em->sk/*sku*/u();
+        $st/*status*/atusName = $item->get/*getStatus*/Status()?->name();
     }
 }
 "#;
-    let markers = ["/*decl*/", "/*usage*/", "/*status*/"];
+    let markers = [
+        "/*decl*/",
+        "/*usage*/",
+        "/*sku*/",
+        "/*status*/",
+        "/*getStatus*/",
+    ];
     let marker_position = |marker: &str| -> (u32, u32) {
         let marker_offset = code_with_markers
             .find(marker)
@@ -5579,7 +5585,9 @@ function update(Order $order): void {
         (line, character)
     };
     let (usage_line, usage_character) = marker_position("/*usage*/");
+    let (sku_line, sku_character) = marker_position("/*sku*/");
     let (status_line, status_character) = marker_position("/*status*/");
+    let (get_status_line, get_status_character) = marker_position("/*getStatus*/");
     let mut handler_code = code_with_markers.to_string();
     for marker in markers {
         handler_code = handler_code.replace(marker, "");
@@ -5649,12 +5657,48 @@ function update(Order $order): void {
         hover
     );
 
+    let sku_hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(4, &handler_uri, sku_line, sku_character))
+        .await
+        .unwrap();
+    let sku_hover_result = extract_result(sku_hover_response);
+    let sku_hover = hover_markdown_value(&sku_hover_result);
+    assert!(
+        sku_hover.contains("method App\\Entity\\OrderItem::sku") && sku_hover.contains(": string"),
+        "expected method hover from Doctrine targetEntity foreach receiver, got: {}",
+        sku_hover
+    );
+
+    let get_status_hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            5,
+            &handler_uri,
+            get_status_line,
+            get_status_character,
+        ))
+        .await
+        .unwrap();
+    let get_status_hover_result = extract_result(get_status_hover_response);
+    let get_status_hover = hover_markdown_value(&get_status_hover_result);
+    assert!(
+        get_status_hover.contains("method App\\Entity\\OrderItem::getStatus")
+            && get_status_hover.contains("?OrderStatus"),
+        "expected nullable method hover from Doctrine targetEntity foreach receiver, got: {}",
+        get_status_hover
+    );
+
     let status_hover_response = service
         .ready()
         .await
         .unwrap()
         .call(hover_request(
-            4,
+            6,
             &handler_uri,
             status_line,
             status_character.saturating_sub(2),
