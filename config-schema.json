@@ -80,7 +80,10 @@
           "type": "string",
           "enum": ["auto", "none", "custom", "pint", "php-cs-fixer", "phpcbf"]
         },
-        "command": { "type": "string" },
+        "command": {
+          "type": "string",
+          "description": "Executable formatter command. Ignored from project config unless phpLsp.allowProjectCommands is enabled in VS Code or allowProjectCommands is enabled in global config."
+        },
         "timeoutMs": {
           "type": "integer",
           "minimum": 1000
@@ -95,8 +98,14 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean" },
-        "command": { "type": "string" },
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable PHPStan diagnostics. Project config cannot enable this unless phpLsp.allowProjectCommands is enabled in VS Code or allowProjectCommands is enabled in global config."
+        },
+        "command": {
+          "type": "string",
+          "description": "Executable PHPStan command template. Ignored from project config unless phpLsp.allowProjectCommands is enabled in VS Code or allowProjectCommands is enabled in global config."
+        },
         "timeoutMs": {
           "type": "integer",
           "minimum": 1000
@@ -113,8 +122,14 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean" },
-        "command": { "type": "string" },
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable Psalm diagnostics. Project config cannot enable this unless phpLsp.allowProjectCommands is enabled in VS Code or allowProjectCommands is enabled in global config."
+        },
+        "command": {
+          "type": "string",
+          "description": "Executable Psalm command template. Ignored from project config unless phpLsp.allowProjectCommands is enabled in VS Code or allowProjectCommands is enabled in global config."
+        },
         "timeoutMs": {
           "type": "integer",
           "minimum": 1000

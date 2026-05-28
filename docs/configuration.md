@@ -25,6 +25,31 @@ The VS Code client watches `**/.php-lsp.toml`; changes are sent as
 `workspace/didChangeWatchedFiles` and the server reloads effective
 configuration without requiring a restart.
 
+## Command Trust
+
+Project `.php-lsp.toml` is treated as untrusted for executable settings by
+default. The server ignores project-provided analyzer and formatter commands
+unless command trust is enabled outside the project:
+
+- VS Code: `phpLsp.allowProjectCommands = true`
+- Global php-lsp config: `allowProjectCommands = true`
+
+The project file itself cannot opt in to command trust. Without trust, these
+project settings are ignored:
+
+- `[formatting] command`
+- executable `[formatting] provider` values such as `pint`, `php-cs-fixer`, and
+  `phpcbf`
+- `[phpstan] enabled = true`
+- `[phpstan] command`
+- `[psalm] enabled = true`
+- `[psalm] command`
+
+Safe project settings such as PHP version, diagnostics mode/severity,
+include/exclude paths, stubs, analyzer timeouts, and `formatting.provider =
+"none"` still apply. Put commands in VS Code settings or global php-lsp config
+for untrusted repositories.
+
 ## Create A Config
 
 ```bash
@@ -93,14 +118,16 @@ provider = "auto"
 timeoutMs = 30000
 
 [phpstan]
-enabled = true
-command = "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}"
+enabled = false
+# Project analyzer commands require phpLsp.allowProjectCommands or global
+# allowProjectCommands = true before they are executed.
+# command = "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}"
 timeoutMs = 30000
 memory_limit = "1G"
 
 [psalm]
 enabled = false
-command = "vendor/bin/psalm --output-format=json --no-progress {file}"
+# command = "vendor/bin/psalm --output-format=json --no-progress {file}"
 timeoutMs = 30000
 
 [analyzerCodeActions]
@@ -121,6 +148,7 @@ enabled = false
 | `[psalm]` | `enabled`, `command`, `timeoutMs` |
 | `[analyzerCodeActions]` | `enabled` |
 
+Executable keys in project config follow the command trust rules above.
 Relative include/exclude paths are interpreted relative to the effective
 workspace root. `phpstan.memory_limit` is added to the PHPStan command unless
 the command already contains `--memory-limit`; `{memory_limit}` can be used in a
@@ -131,8 +159,8 @@ custom command template for explicit placement.
 `[formatting] provider = "auto"` is the default. The formatter provider is
 resolved in this order:
 
-1. Explicit VS Code `phpLsp.formatting.*` settings or `.php-lsp.toml`
-   `[formatting]` values.
+1. Explicit VS Code `phpLsp.formatting.*` settings, global php-lsp config, or
+   trusted `.php-lsp.toml` `[formatting]` values.
 2. Composer `require-dev`/`require` auto-detection:
    `laravel/pint`, `friendsofphp/php-cs-fixer`, then
    `squizlabs/php_codesniffer`.

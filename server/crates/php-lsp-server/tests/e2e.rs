@@ -4180,6 +4180,152 @@ async fn test_project_config_controls_diagnostics_and_reloads_on_watch() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_untrusted_project_config_does_not_execute_phpstan_command() {
+    if cfg!(windows) {
+        return;
+    }
+
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-untrusted-project-command-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(&tmp_root).unwrap();
+    let marker_path = tmp_root.join("phpstan-ran");
+    let script_path = tmp_root.join("phpstan-command.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nprintf ran > {}\ncat <<'JSON'\n{{\"totals\":{{\"errors\":0,\"file_errors\":0}},\"files\":{{}}}}\nJSON\n",
+            marker_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        tmp_root.join(".php-lsp.toml"),
+        format!(
+            "[phpstan]\nenabled = true\ncommand = \"sh {} {{file}}\"\n",
+            script_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let file_path = tmp_root.join("Subject.php");
+    fs::write(&file_path, "<?php\nclass Subject {}\n").unwrap();
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let file_uri = format!("file://{}", file_path.to_string_lossy());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            &file_uri,
+            "<?php\nclass Subject {}\n",
+        ))
+        .await
+        .unwrap();
+
+    let _ = next_publish_diagnostics(&mut notifications, &file_uri, Duration::from_secs(1)).await;
+    assert!(
+        !marker_path.exists(),
+        "untrusted project PHPStan command should not execute"
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_trusted_project_config_can_execute_phpstan_command() {
+    if cfg!(windows) {
+        return;
+    }
+
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-trusted-project-command-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(&tmp_root).unwrap();
+    let marker_path = tmp_root.join("phpstan-ran");
+    let script_path = tmp_root.join("phpstan-command.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nprintf ran > {}\ncat <<'JSON'\n{{\"totals\":{{\"errors\":0,\"file_errors\":0}},\"files\":{{}}}}\nJSON\n",
+            marker_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        tmp_root.join(".php-lsp.toml"),
+        format!(
+            "[phpstan]\nenabled = true\ncommand = \"sh {} {{file}}\"\n",
+            script_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let file_path = tmp_root.join("Subject.php");
+    fs::write(&file_path, "<?php\nclass Subject {}\n").unwrap();
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let file_uri = format!("file://{}", file_path.to_string_lossy());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            Some(&root_uri),
+            Some(json!({ "allowProjectCommands": true })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            &file_uri,
+            "<?php\nclass Subject {}\n",
+        ))
+        .await
+        .unwrap();
+
+    let _ = next_publish_diagnostics(&mut notifications, &file_uri, Duration::from_secs(1)).await;
+    assert!(
+        marker_path.exists(),
+        "trusted project PHPStan command should execute"
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_member_access_from_parenthesized_new_expression() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

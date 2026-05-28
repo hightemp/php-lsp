@@ -258,6 +258,12 @@
           "scope": "resource",
           "description": "Per-category severity for php-lsp diagnostics. Use off to suppress a noisy category without disabling all diagnostics."
         },
+        "phpLsp.allowProjectCommands": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Allow executable analyzer and formatter settings from .php-lsp.toml. Keep disabled unless you trust the workspace."
+        },
         "phpLsp.formatting.provider": {
           "type": "string",
           "default": "auto",

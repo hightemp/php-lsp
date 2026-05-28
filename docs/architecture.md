@@ -57,6 +57,8 @@ Disk cache: workspace / stubs / vendor
    overrides, so `.php-lsp.toml` can define shared project defaults.
 4. The server loads effective configuration in this order: built-in defaults,
    global config, project `.php-lsp.toml`, then explicit client settings.
+   Executable analyzer and formatter settings from project config are ignored
+   unless command trust is enabled from VS Code or global config.
 5. The server stores the settings and advertises capabilities.
 6. After `initialized`, the server:
    - Discovers effective workspace roots, including Composer roots.

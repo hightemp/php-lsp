@@ -1577,7 +1577,7 @@ impl PhpLspBackend {
         let (settings, messages) =
             load_effective_configuration_settings(workspace_roots, client_settings);
         for message in messages {
-            if message.contains("failed") {
+            if message.contains("failed") || message.starts_with("Ignored executable") {
                 tracing::warn!("{}", message);
                 self.client.log_message(MessageType::WARNING, message).await;
             } else {
@@ -19255,6 +19255,108 @@ fn project_config_candidates(root: &Path) -> Vec<PathBuf> {
     candidates
 }
 
+fn project_command_trust_setting(settings: &serde_json::Value) -> Option<bool> {
+    settings_bool(
+        settings,
+        "allowProjectCommands",
+        &["security", "allowProjectCommands"],
+    )
+}
+
+fn project_commands_are_trusted(
+    trusted_settings: &serde_json::Value,
+    client_settings: &serde_json::Value,
+) -> bool {
+    project_command_trust_setting(client_settings)
+        .or_else(|| project_command_trust_setting(trusted_settings))
+        .unwrap_or(false)
+}
+
+fn remove_section_key(
+    settings: &mut serde_json::Value,
+    section: &str,
+    key: &str,
+) -> Option<serde_json::Value> {
+    settings
+        .get_mut(section)
+        .and_then(|section| section.as_object_mut())
+        .and_then(|section| section.remove(key))
+}
+
+fn nested_bool(settings: &serde_json::Value, section: &str, key: &str) -> Option<bool> {
+    settings
+        .get(section)
+        .and_then(|section| section.get(key))
+        .and_then(|value| value.as_bool())
+}
+
+fn nested_string<'a>(settings: &'a serde_json::Value, section: &str, key: &str) -> Option<&'a str> {
+    settings
+        .get(section)
+        .and_then(|section| section.get(key))
+        .and_then(|value| value.as_str())
+}
+
+fn untrusted_project_formatter_provider_executes(provider: &str) -> bool {
+    !matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "auto" | "none" | "custom"
+    )
+}
+
+fn sanitize_project_settings_for_command_trust(
+    settings: &mut serde_json::Value,
+    path: &Path,
+    allow_project_commands: bool,
+) -> Option<String> {
+    if let Some(object) = settings.as_object_mut() {
+        // Project configs cannot opt themselves into executable command trust.
+        object.remove("allowProjectCommands");
+    }
+
+    if allow_project_commands {
+        return None;
+    }
+
+    let mut blocked = Vec::new();
+
+    if remove_section_key(settings, "formatting", "command").is_some() {
+        blocked.push("formatting.command");
+    }
+    if nested_string(settings, "formatting", "provider")
+        .is_some_and(untrusted_project_formatter_provider_executes)
+    {
+        remove_section_key(settings, "formatting", "provider");
+        blocked.push("formatting.provider");
+    }
+
+    if nested_bool(settings, "phpstan", "enabled") == Some(true) {
+        remove_section_key(settings, "phpstan", "enabled");
+        blocked.push("phpstan.enabled");
+    }
+    if remove_section_key(settings, "phpstan", "command").is_some() {
+        blocked.push("phpstan.command");
+    }
+
+    if nested_bool(settings, "psalm", "enabled") == Some(true) {
+        remove_section_key(settings, "psalm", "enabled");
+        blocked.push("psalm.enabled");
+    }
+    if remove_section_key(settings, "psalm", "command").is_some() {
+        blocked.push("psalm.command");
+    }
+
+    if blocked.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Ignored executable project config settings from {}: {}. Set phpLsp.allowProjectCommands=true in VS Code or allowProjectCommands=true in global php-lsp config to trust workspace commands.",
+        path.display(),
+        blocked.join(", ")
+    ))
+}
+
 pub(crate) fn load_effective_configuration_settings(
     workspace_roots: &[PathBuf],
     client_settings: &serde_json::Value,
@@ -19275,13 +19377,23 @@ pub(crate) fn load_effective_configuration_settings(
         }
     }
 
+    let client_settings = normalize_client_settings(client_settings);
+    let allow_project_commands = project_commands_are_trusted(&effective, &client_settings);
+
     for root in workspace_roots {
         for path in project_config_candidates(root) {
             if !path.exists() {
                 continue;
             }
             match load_toml_settings(&path) {
-                Ok(settings) => {
+                Ok(mut settings) => {
+                    if let Some(message) = sanitize_project_settings_for_command_trust(
+                        &mut settings,
+                        &path,
+                        allow_project_commands,
+                    ) {
+                        messages.push(message);
+                    }
                     merge_json_objects(&mut effective, &settings);
                     messages.push(format!("Loaded project config: {}", path.display()));
                     break;
@@ -19291,7 +19403,6 @@ pub(crate) fn load_effective_configuration_settings(
         }
     }
 
-    let client_settings = normalize_client_settings(client_settings);
     merge_json_objects(&mut effective, &client_settings);
 
     (effective, messages)
@@ -28134,6 +28245,108 @@ final class NpDataResponseService implements BillingPayloadProcessor
         assert_eq!(diagnostics[0].message, "Psalm reported a test issue.");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_untrusted_project_config_strips_executable_settings() {
+        let mut settings = serde_json::json!({
+            "allowProjectCommands": true,
+            "phpVersion": "8.3",
+            "diagnostics": { "mode": "syntax-only" },
+            "includePaths": ["src"],
+            "formatting": {
+                "provider": "php-cs-fixer",
+                "command": "sh -c 'touch /tmp/php-lsp-owned' {file}",
+                "timeoutMs": 1000
+            },
+            "phpstan": {
+                "enabled": true,
+                "command": "sh -c 'touch /tmp/php-lsp-owned' {file}",
+                "timeoutMs": 1000,
+                "memory_limit": "1G"
+            },
+            "psalm": {
+                "enabled": true,
+                "command": "sh -c 'touch /tmp/php-lsp-owned' {file}",
+                "timeoutMs": 1000
+            }
+        });
+
+        let message = sanitize_project_settings_for_command_trust(
+            &mut settings,
+            Path::new("/workspace/.php-lsp.toml"),
+            false,
+        )
+        .expect("expected executable project settings to be ignored");
+
+        assert_eq!(settings["phpVersion"], "8.3");
+        assert_eq!(settings["diagnostics"]["mode"], "syntax-only");
+        assert_eq!(settings["includePaths"][0], "src");
+        assert!(settings.get("allowProjectCommands").is_none());
+        assert!(settings["formatting"].get("provider").is_none());
+        assert!(settings["formatting"].get("command").is_none());
+        assert_eq!(settings["formatting"]["timeoutMs"], 1000);
+        assert!(settings["phpstan"].get("enabled").is_none());
+        assert!(settings["phpstan"].get("command").is_none());
+        assert_eq!(settings["phpstan"]["timeoutMs"], 1000);
+        assert_eq!(settings["phpstan"]["memory_limit"], "1G");
+        assert!(settings["psalm"].get("enabled").is_none());
+        assert!(settings["psalm"].get("command").is_none());
+        assert_eq!(settings["psalm"]["timeoutMs"], 1000);
+        assert!(message.contains("formatting.command"));
+        assert!(message.contains("phpstan.enabled"));
+        assert!(message.contains("psalm.command"));
+    }
+
+    #[test]
+    fn test_trusted_project_config_keeps_executable_settings_but_not_self_trust() {
+        let mut settings = serde_json::json!({
+            "allowProjectCommands": true,
+            "formatting": {
+                "provider": "pint",
+                "command": "vendor/bin/pint --quiet {file}"
+            },
+            "phpstan": {
+                "enabled": true,
+                "command": "vendor/bin/phpstan analyse --error-format=json {file}"
+            },
+            "psalm": {
+                "enabled": true,
+                "command": "vendor/bin/psalm --output-format=json {file}"
+            }
+        });
+
+        let message = sanitize_project_settings_for_command_trust(
+            &mut settings,
+            Path::new("/workspace/.php-lsp.toml"),
+            true,
+        );
+
+        assert!(message.is_none());
+        assert!(settings.get("allowProjectCommands").is_none());
+        assert_eq!(settings["formatting"]["provider"], "pint");
+        assert_eq!(
+            settings["formatting"]["command"],
+            "vendor/bin/pint --quiet {file}"
+        );
+        assert_eq!(settings["phpstan"]["enabled"], true);
+        assert_eq!(settings["psalm"]["enabled"], true);
+    }
+
+    #[test]
+    fn test_client_project_command_trust_overrides_global_config() {
+        let global = serde_json::json!({ "allowProjectCommands": true });
+        let client = serde_json::json!({ "allowProjectCommands": false });
+        assert!(!project_commands_are_trusted(&global, &client));
+
+        let client = serde_json::json!({});
+        assert!(project_commands_are_trusted(&global, &client));
+
+        let client = serde_json::json!({ "allowProjectCommands": true });
+        assert!(project_commands_are_trusted(
+            &serde_json::json!({}),
+            &client
+        ));
     }
 
     #[test]

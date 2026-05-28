@@ -787,6 +787,7 @@ function buildInitializationOptions(config: ReturnType<typeof workspace.getConfi
   setIfConfigured(options, config, "excludePaths", "excludePaths", []);
   setIfConfigured(options, config, "stubs.extensions", "stubExtensions", []);
   setIfConfigured(options, config, "logLevel", "logLevel", "info");
+  setIfConfigured(options, config, "allowProjectCommands", "allowProjectCommands", false);
   setIfConfigured(options, config, "formatting.provider", "formattingProvider", "auto");
   setIfConfigured(options, config, "formatting.command", "formattingCommand", "");
   setIfConfigured(options, config, "formatting.timeoutMs", "formattingTimeoutMs", 30000);

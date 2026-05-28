@@ -33,6 +33,8 @@ extensions = []
 
 [formatting]
 provider = "auto"
+# Project formatter commands/providers that execute tools are ignored unless
+# trusted from VS Code or global config with allowProjectCommands = true.
 command = ""
 timeoutMs = 30000
 
@@ -134,6 +136,20 @@ pub fn normalize_client_settings(settings: &Value) -> Value {
 pub fn normalize_project_config_settings(raw: &Value) -> Value {
     let raw = raw.get("phpLsp").unwrap_or(raw);
     let mut settings = Map::new();
+
+    if let Some(allow_project_commands) = raw
+        .get("allowProjectCommands")
+        .or_else(|| {
+            raw.get("security")
+                .and_then(|security| security.get("allowProjectCommands"))
+        })
+        .and_then(Value::as_bool)
+    {
+        settings.insert(
+            "allowProjectCommands".to_string(),
+            Value::Bool(allow_project_commands),
+        );
+    }
 
     if let Some(version) = string_at(raw, &["php", "version"]) {
         settings.insert("phpVersion".to_string(), Value::String(version.to_string()));
@@ -340,11 +356,13 @@ mod tests {
                 "exclude": ["vendor"]
             },
             "stubs": { "path": "/tmp/stubs", "extensions": ["Core"] },
+            "security": { "allowProjectCommands": true },
             "formatting": { "provider": "custom", "command": "fmt {file}", "timeoutMs": 1000 },
             "phpstan": { "enabled": true, "memory_limit": "1G" }
         });
 
         let settings = normalize_project_config_settings(&raw);
+        assert_eq!(settings["allowProjectCommands"], true);
         assert_eq!(settings["phpVersion"], "8.3");
         assert_eq!(settings["diagnostics"]["mode"], "syntax-only");
         assert_eq!(

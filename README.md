@@ -230,6 +230,7 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
 | `phpLsp.diagnostics.mode` | `basic-semantic` | `off`, `syntax-only`, or `basic-semantic`. |
 | `phpLsp.diagnostics.severity` | Category warnings | Per-category severity for `unknownSymbols`, `unused`, `duplicateSymbols`, `members`, `typeCompatibility`, `overrideSignatures`, and `phpVersion`; values are `off`, `error`, `warning`, `information`, or `hint`. |
+| `phpLsp.allowProjectCommands` | `false` | Trust executable analyzer and formatter settings from `.php-lsp.toml`. Keep disabled for untrusted workspaces. |
 | `phpLsp.formatting.provider` | `auto` | `auto`, `none`, `pint`, `php-cs-fixer`, `phpcbf`, or `custom`. |
 | `phpLsp.formatting.command` | `""` | Custom formatter command; use `{file}` for the temporary PHP file. |
 | `phpLsp.formatting.timeoutMs` | `30000` | External formatter timeout per request. |
@@ -246,7 +247,10 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 Shared project defaults can also be stored in `.php-lsp.toml`. Use
 `php-lsp init-config` to create a default file without overwriting an existing
 one. Config precedence is built-in defaults, global config, project config, then
-explicit VS Code settings. See [Configuration](docs/configuration.md).
+explicit VS Code settings. Executable analyzer and formatter settings from
+project config are ignored unless `phpLsp.allowProjectCommands` is enabled in
+VS Code or `allowProjectCommands = true` is set in global php-lsp config. See
+[Configuration](docs/configuration.md).
 
 Example external diagnostics setup:
 
@@ -260,6 +264,11 @@ Example external diagnostics setup:
 }
 ```
 
+When the same analyzer settings are stored in project `.php-lsp.toml`, php-lsp
+requires explicit workspace-command trust before it executes them. Prefer VS
+Code user/workspace settings or global php-lsp config for commands in
+repositories you do not fully trust.
+
 Example external formatting setup:
 
 ```json
@@ -270,8 +279,8 @@ Example external formatting setup:
 
 Formatter resolution order:
 
-1. Explicit `phpLsp.formatting.*` settings or `[formatting]` values in
-   `.php-lsp.toml`.
+1. Explicit `phpLsp.formatting.*` settings, global php-lsp config, or trusted
+   `.php-lsp.toml` `[formatting]` values.
 2. Composer metadata auto-detection from `require-dev`/`require`: `laravel/pint`,
    `friendsofphp/php-cs-fixer`, then `squizlabs/php_codesniffer`.
 3. No formatting provider when no explicit provider or supported Composer tool is
@@ -401,6 +410,8 @@ The extension contributes these VS Code commands:
 
 - Enable the analyzer explicitly with `phpLsp.phpstan.enabled` or
   `phpLsp.psalm.enabled`.
+- If the analyzer is enabled only in `.php-lsp.toml`, also enable
+  `phpLsp.allowProjectCommands` after you trust the workspace.
 - Make sure the configured command works from the workspace root and prints JSON.
 - Keep `{file}` in the command template unless the tool should receive the file
   path appended at the end.
@@ -414,6 +425,9 @@ The extension contributes these VS Code commands:
 - Set `phpLsp.formatting.provider` explicitly to `pint`, `php-cs-fixer`,
   `phpcbf`, or `custom` to bypass auto-detection; set it to `none` to disable
   formatting.
+- If a formatter command or executable provider is configured only in
+  `.php-lsp.toml`, enable `phpLsp.allowProjectCommands` after you trust the
+  workspace.
 - For `custom`, configure `phpLsp.formatting.command` and include `{file}` where
   the temporary PHP file path should be inserted.
 - Ensure the formatter executable is available from the workspace root.

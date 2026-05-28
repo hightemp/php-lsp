@@ -2656,8 +2656,409 @@ type feedback as ordinary PHP variables and calls.
 
 ---
 
+## Milestone: Static Audit Production Hardening Follow-up (2026-05-28 -> 2026-06-11)
+
+**Goal:** close the remaining foundation risks found by the full static audit
+before making stronger production-ready claims. This milestone is about
+security, URI/range correctness, safe rename/reference behavior, cache
+robustness, and measurable regressions. Do not add project-specific hardcode
+while implementing these tasks.
+
+### Audit Triage
+
+- Confirmed high-risk gaps in current code:
+  - project `.php-lsp.toml` can configure executable analyzer/formatter shell
+    commands and is merged automatically;
+  - `path_to_uri()` / `uri_to_path()` still use raw `file://{path}` string
+    formatting/parsing in server and index cache code;
+  - unresolved member references still fall back to `::member`, and
+    `symbol_reference_matches()` allows those fallbacks for member
+    references/rename;
+  - completion still derives current class from the first class-like symbol in
+    the file;
+  - completion trigger characters do not include array-shape key triggers
+    (`[`, `'`, `"`);
+  - `use`-statement completion reuses short-name namespace completion instead
+    of inserting the full FQN;
+  - PHPDoc tag parsing still has some `strip_prefix("@param")` /
+    `strip_prefix("@return")` / `strip_prefix("@var")` paths;
+  - diagnostics still has blocking sync work and a dedicated thread followed by
+    synchronous `join()`;
+  - cache save uses plain `rename()` over an existing path, which is fragile on
+    Windows;
+  - rename validates only a small subset of invalid names for non-variable
+    symbols.
+- Partially mitigated and must be verified with targeted tests before large
+  rewrites:
+  - many incoming and outgoing LSP positions already use `Utf16LineIndex` or
+    `range_byte_to_utf16()`, but several direct `SymbolInfo` range conversions
+    remain and need a complete audit;
+  - phpstorm stubs are present in the current workspace, but packaging and CI
+    still need a guard that prevents publishing an empty or uninitialized stubs
+    bundle;
+  - PHPDoc parsing and type modeling were improved earlier, but exact tag
+    matching, multi-line type aliases/shapes, quoted shape keys, and virtual
+    method signatures still need explicit regression coverage;
+  - Twig/Blade diagnostics are intentionally conservative, but the current
+    behavior should be documented as best-effort and improved only through
+    source-map-safe diagnostics.
+
+### Critical Foundation Tasks
+
+- [x] **PHA-001** Add a trust gate for executable settings loaded from project config. *(done 2026-05-28)*
+  - Problem: `.php-lsp.toml` is loaded automatically from the workspace and can
+    enable `phpstan`, `psalm`, or external formatter commands that are executed
+    through a shell.
+  - Implementation:
+    - split safe project settings from executable settings:
+      `phpstan.command`, `psalm.command`, `formatting.command`, and any future
+      command template;
+    - add an explicit trust/consent setting, for example
+      `phpLsp.trustWorkspaceCommands` or a more precise
+      `phpLsp.allowProjectCommands`;
+    - default behavior: project-provided commands are ignored unless trusted,
+      while global/user settings and VS Code settings may still configure
+      commands intentionally;
+    - surface a clear warning in logs/status when executable project settings
+      were ignored;
+    - keep analyzer/formatter disabled rather than silently falling back to a
+      different untrusted command.
+  - Regression tests:
+    - project `.php-lsp.toml` with `phpstan.enabled=true` and malicious-looking
+      command must not execute by default;
+    - the same command is accepted only when the explicit trust setting is true;
+    - safe non-executable project settings such as PHP version, include/exclude,
+      diagnostics severity, and stubs still apply.
+  - Docs: update `docs/configuration.md`, README configuration section, and VS
+    Code setting metadata.
+  - Implemented: added `phpLsp.allowProjectCommands` as the explicit VS Code
+    trust gate and `allowProjectCommands = true` support for global php-lsp
+    config. Project `.php-lsp.toml` cannot opt itself into trust.
+  - Implemented: untrusted project config strips executable settings before
+    merge: formatter commands/executable providers, `phpstan.enabled=true`,
+    `phpstan.command`, `psalm.enabled=true`, and `psalm.command`; safe settings
+    still apply.
+  - Implemented: ignored executable project settings are logged as warnings and
+    documented in README, client README, configuration docs, architecture docs,
+    LSP feature docs, and config schema descriptions.
+  - Regression: unit tests cover sanitizer behavior, trusted behavior, and
+    client-vs-global trust precedence; e2e tests verify an untrusted project
+    PHPStan command is not executed and trusted config can execute it.
+  - Validation: `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `npm run lint`,
+    `npm run build`, and `git diff --check` passed.
+
+- [ ] **PHA-002** Replace ad-hoc file URI conversion with standards-compliant helpers.
+  - Problem: raw `format!("file://{}", path.display())` and
+    `strip_prefix("file://")` break spaces, `#`, `%`, Unicode edge cases,
+    Windows drive paths, and UNC paths.
+  - Implementation:
+    - introduce one shared URI helper API used by server, analyzer/fix code,
+      framework providers, and index cache serialization;
+    - use `url::Url::from_file_path()` and `Url::to_file_path()` or an
+      equivalent LSP-safe helper;
+    - return `Option`/`Result` where conversion can fail instead of producing
+      malformed URI strings;
+    - migrate cache URI persistence carefully so older cache entries do not
+      crash the server and can be invalidated/rebuilt;
+    - remove duplicate `path_to_uri()` implementations across crates.
+  - Regression tests:
+    - path with spaces;
+    - path containing `#` and `%`;
+    - non-ASCII path segment;
+    - Windows-like drive path behavior behind platform-appropriate tests;
+    - cache round-trip for encoded URIs.
+  - Acceptance: no production code path builds `file://` URI strings manually.
+
+- [ ] **PHA-003** Complete byte-range vs UTF-16 LSP position audit.
+  - Problem: parser/index symbols store byte columns, while LSP uses UTF-16
+    columns. Some paths already convert, but direct `SymbolInfo.range` and
+    `selection_range` conversions remain.
+  - Implementation:
+    - enumerate all outbound LSP responses that carry positions:
+      hover, definition, declaration, typeDefinition, implementation,
+      references, rename edits, documentSymbol, workspaceSymbol, codeLens,
+      callHierarchy, typeHierarchy, selectionRange, foldingRange,
+      semanticTokens, diagnostics, completion text edits, document links, and
+      template/source-map locations;
+    - convert every byte-backed range with `range_byte_to_utf16(source, range)`
+      or `Utf16LineIndex`;
+    - avoid converting `SymbolReference.range` twice, because parser references
+      are already UTF-16 today;
+    - introduce small wrapper types or helper names that make byte-vs-LSP range
+      ownership explicit enough to prevent regressions.
+  - Regression tests:
+    - PHP file with Cyrillic text before a class/method/property and exact
+      hover/definition/documentSymbol ranges;
+    - rename on a symbol after non-ASCII text edits only the intended UTF-16
+      range;
+    - workspaceSymbol/codeLens/callHierarchy/typeHierarchy locations after
+      non-ASCII prefixes.
+
+- [ ] **PHA-004** Make member references and rename safe for unresolved receivers.
+  - Problem: `$obj->foo()` and `$obj->bar` can be indexed as unresolved
+    `::foo` / `::$bar`. References may be useful as a fuzzy fallback, but
+    destructive rename must not edit every same-named member across unrelated
+    classes.
+  - Implementation:
+    - extend `SymbolReference` or add a side-channel to represent resolved
+      receiver type, unresolved receiver, and static class receiver separately;
+    - for rename, only include member references resolved to the exact owner
+      type or to a proven inheritance/interface relationship;
+    - keep unresolved `::member` references out of destructive edits;
+    - if exact references are unavailable, return a clear `invalid_params`
+      message instead of a broad workspace edit;
+    - keep non-destructive references/codeLens behavior conservative and label
+      unresolved fallback results if still exposed.
+  - Regression tests:
+    - two unrelated classes with same method name: renaming one method changes
+      only its declaration and exact calls;
+    - property rename does not touch same-named properties on unrelated
+      receivers;
+    - inherited/interface method references remain included when receiver type
+      is resolved.
+
+- [ ] **PHA-005** Add stubs integrity checks for development, CI, and packaging.
+  - Current status: `server/data/stubs` is populated in this workspace, so the
+    "only qodana.yaml" audit observation is not true for the current checkout.
+    The risk is still valid for fresh clones, CI, and VSIX packaging if the
+    submodule/bundled stubs are missing.
+  - Implementation:
+    - add a CI/package guard that fails when the stubs source or bundled client
+      stubs contain too few PHP stub files or miss core stubs;
+    - make `bundle-stubs.sh` fail loudly when the submodule is not initialized;
+    - make server startup logs distinguish "stubs disabled by config" from
+      "stubs path missing/uninitialized";
+    - add an e2e or unit test for built-in symbol availability from bundled
+      stubs.
+  - Acceptance: publishing a VSIX without usable built-in stubs is impossible.
+
+### Completion, Diagnostics, and Type Safety Tasks
+
+- [ ] **PHA-010** Make completion current-class context position-aware.
+  - Problem: completion provider uses the first class-like symbol in the file as
+    the current class. Multi-class files, anonymous classes, and nested contexts
+    can expose wrong private/protected members.
+  - Implementation:
+    - pass cursor position/range into the completion provider;
+    - reuse existing server-side `current_class_fqn_at_range(...)` logic or
+      move a shared equivalent into the parser/completion boundary;
+    - update member visibility filtering for `$this`, `self`, `static`, and
+      `parent` based on the class at cursor, not file order.
+  - Regression tests:
+    - two classes in one file with different private methods;
+    - trait and anonymous class contexts;
+    - `$this->` completion does not leak private members from another class.
+
+- [ ] **PHA-011** Fix completion UX gaps found by the audit.
+  - Scope:
+    - add completion trigger characters for array/object shape access:
+      `[`, `'`, and `"`;
+    - in `use` statements, insert full FQN text while keeping the short class
+      name as the label;
+    - support `@method static` virtual methods in static completion (`::`);
+    - honor `@property-read` and `@property-write` access mode for read/write
+      member completion contexts;
+    - keep quoted array-shape key normalization in one shared helper used by
+      parser, completion, and definition.
+  - Regression tests:
+    - `$row['|']` triggers shape key completion without manual invocation;
+    - `use Ven|` inserts `Vendor\Package\ClassName`;
+    - `Model::|` shows static PHPDoc virtual methods only when marked static;
+    - write-only virtual properties are not suggested for read access.
+
+- [ ] **PHA-012** Tighten diagnostics correctness before increasing coverage.
+  - Scope:
+    - deduplicate duplicate-symbol diagnostics when local and workspace checks
+      report the same declaration pair;
+    - decide and document policy for unqualified unknown functions, then add
+      diagnostics only when built-ins/imports/current namespace fallback cannot
+      resolve safely;
+    - make approximate type compatibility rules explicit in tests for generics,
+      array shapes, unions/intersections, `self/static/parent`, and literal
+      types;
+    - improve override signature compatibility incrementally with PHP variance
+      rules and regression tests.
+  - Acceptance: fewer false positives on real Composer projects before adding
+    broader unknown-function diagnostics.
+
+- [ ] **PHA-013** Finish PHPDoc parser hardening.
+  - Scope:
+    - replace remaining `strip_prefix("@param")`, `strip_prefix("@return")`,
+      and `strip_prefix("@var")` paths with exact tag matching so
+      `@param-out`, `@returnFoo`, and `@var-something` do not parse as the wrong
+      tag;
+    - verify and complete `@method` parameter parsing, including references,
+      optional/default markers, variadic parameters, and static methods;
+    - support multi-line `@phpstan-type` / `@psalm-type` array-shape aliases
+      well enough for common real-world shapes;
+    - normalize quoted shape keys once and preserve the display key separately
+      if needed.
+  - Regression tests:
+    - malformed/similar tags do not produce misleading type metadata;
+    - multi-line shape aliases resolve in hover, completion, and diagnostics;
+    - quoted shape keys complete and define without duplicated quotes.
+
+- [ ] **PHA-014** Strengthen rename validation by symbol kind.
+  - Problem: non-variable rename currently rejects only empty names, spaces, and
+    backslashes. It still allows invalid PHP identifiers such as `123`,
+    `foo-bar`, keywords, or `$bad` for class/method/function/constants.
+  - Implementation:
+    - add validators for class-like names, function/method names, constants,
+      enum cases, properties, and variables;
+    - apply validation in both `prepareRename` and `rename`;
+    - return specific error messages per symbol kind.
+  - Regression tests:
+    - invalid names are rejected for each symbol kind;
+    - valid PHP identifiers and property/variable `$` normalization keep
+      working.
+
+- [ ] **PHA-015** Make organize imports semantic instead of raw text based.
+  - Problem: `build_organize_imports_edit()` can keep unused imports because it
+    scans raw source text and sees aliases in comments, strings, or unrelated
+    text.
+  - Implementation:
+    - reuse AST/reference-based unused import information where possible;
+    - treat PHPDoc type references deliberately rather than by raw string scan;
+    - keep grouping/sorting behavior unchanged except for more accurate removal.
+  - Regression tests:
+    - alias only in a comment/string is removed;
+    - alias used in executable code is kept;
+    - alias used only in PHPDoc is kept or removed according to documented
+      policy.
+
+### Performance, Cache, and Async Tasks
+
+- [ ] **PHA-020** Move blocking diagnostics execution to `spawn_blocking` or a bounded worker pool.
+  - Problem: diagnostics are computed on a dedicated thread, but the async task
+    immediately waits with `join()`, blocking the executor worker.
+  - Implementation:
+    - replace the dedicated-thread join path with `tokio::task::spawn_blocking`
+      or a bounded diagnostics worker pool;
+    - keep cancellation/version ordering semantics from the current debounce
+      pipeline;
+    - add tracing spans for queue wait, compute time, and publish time.
+  - Regression/validation:
+    - e2e or integration test that hover/completion can respond while a heavy
+      diagnostics computation is running;
+    - benchmark before/after on a large file.
+
+- [ ] **PHA-021** Audit sync filesystem work in async request paths.
+  - Scope:
+    - composer discovery and vendor metadata reads;
+    - `collect_php_files()` and recursive scans;
+    - framework providers and Doctrine metadata helpers;
+    - Twig context PHP-file scans;
+    - formatter temp-file operations and CLI shared paths.
+  - Implementation:
+    - move unavoidable blocking FS work to `spawn_blocking` or background index
+      phases;
+    - add bounded caches where repeated request-time reads are currently used;
+    - preserve correctness for file watcher invalidation.
+  - Acceptance: common interactive LSP requests do not perform unbounded
+    recursive sync FS scans.
+
+- [ ] **PHA-022** Make diagnostics budget behavior configurable and visible.
+  - Problem: large files can silently skip member/type diagnostics after an
+    internal node limit. That protects latency but is surprising.
+  - Implementation:
+    - expose a documented setting for diagnostics member/type budget;
+    - optionally publish an informational diagnostic or status/log entry when a
+      file is partially analyzed due to budget;
+    - keep default latency-safe.
+  - Regression tests: verify skip behavior, configured higher budget, and
+    disabled/partial diagnostic message behavior.
+
+- [ ] **PHA-023** Harden disk cache and lazy vendor cache correctness.
+  - Scope:
+    - make `save_cache_atomic()` reliable on Windows by using replace/remove
+      strategy or a crate/API with replace semantics;
+    - persist lazy-indexed vendor files when appropriate, or document and test
+      why they are intentionally session-only;
+    - make `lazy_index_class()` return success only when the requested class
+      actually appears in the index after parsing;
+    - consider a content hash or stronger validation option for cache entries
+      where mtime+size is insufficient.
+  - Regression tests:
+    - cache save over existing file;
+    - PSR-4 path exists but contains a different class returns false;
+    - lazy vendor symbol survives restart if persistence is implemented.
+
+### Template Support Tasks
+
+- [ ] **PHA-030** Define safe template diagnostics instead of clearing all mapped diagnostics.
+  - Problem: template virtual PHP diagnostics are mapped and then cleared in
+    some paths. This suppresses HTML/Twig noise but also hides real expression
+    errors.
+  - Implementation:
+    - classify which diagnostics are safe to report for Blade/Twig expressions;
+    - preserve source-map-safe unknown variable/member/type diagnostics only
+      when the mapped range is exact and not inside plain HTML;
+    - keep noisy syntax diagnostics suppressed;
+    - document template diagnostics as best-effort until coverage is proven.
+  - Regression tests: valid Twig/Blade templates stay quiet, while a clear
+    PHP-expression error in a mapped expression is reported at the original
+    template range.
+
+- [ ] **PHA-031** Refresh Twig context types when controllers or render calls change.
+  - Problem: open Twig documents can keep stale `twig_variable_types` after PHP
+    controller/render context changes.
+  - Implementation:
+    - invalidate template context caches on relevant PHP file changes and
+      Composer/workspace reindex events;
+    - recompute context for open Twig documents and republish diagnostics,
+      hover, completion, and inlay data;
+    - keep recomputation bounded for large Symfony projects.
+  - Regression tests: edit a controller render context type and verify the open
+    Twig document sees the new variable type without restart.
+
+- [ ] **PHA-032** Treat complex Twig expressions as an explicit best-effort parser backlog.
+  - Scope:
+    - filters (`|`), tests (`is`), `in`, functions, macros, ternaries, null
+      coalescing, and complex attribute access;
+    - add fixture-driven coverage and skip unsupported expressions safely rather
+      than producing misleading diagnostics.
+  - Docs: keep README and `docs/lsp-features.md` honest about Twig support
+    limits.
+
+### Acceptance and Documentation
+
+- [ ] **PHA-040** Add regression suites for the audit's foundation failures.
+  - Required tests:
+    - executable project config security behavior;
+    - URI encoding/path round-trips;
+    - UTF-16 ranges after non-ASCII text;
+    - unsafe member rename with same-named methods/properties;
+    - completion current-class context;
+    - Windows-sensitive cache replacement behavior where possible;
+    - stubs integrity/package guard.
+  - Run before marking this milestone complete:
+    - `cargo test --all`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `npm run lint`;
+    - `npm run build`;
+    - real-project smoke checks on the existing local validation projects when
+      available.
+
+- [ ] **PHA-041** Update production documentation and risk register after fixes.
+  - Docs to update:
+    - `README.md`;
+    - `docs/configuration.md`;
+    - `docs/lsp-features.md`;
+    - `docs/production-risk-register.md`;
+    - `docs/production-baseline.md` if metrics or acceptance numbers change.
+  - Acceptance:
+    - security/trust behavior is clearly documented;
+    - URI/range/rename/cache risks are either closed or accurately listed as
+      known limitations;
+    - production-ready claims are backed by the audit regression suite.
+
+---
+
 ## Текущие задачи
 
+- [x] **T-2026-05-28** Analyze GPT-5.5 static production audit and add a follow-up hardening milestone. *(done 2026-05-28)*
 - [x] **T-2026-05-28** Пройти `/home/apanov/Projects/bdpn-ui` PHP+Twig и найти текущие ошибки/false positives `php-lsp` *(done 2026-05-28)*
   - Scope: run CLI diagnostics against the Symfony app PHP tree with project root `/home/apanov/Projects/bdpn-ui/app`.
   - Scope: inspect Twig coverage separately because CLI `analyze` currently targets PHP files, while Twig diagnostics are served through template documents in LSP mode.
