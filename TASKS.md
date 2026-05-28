@@ -2620,6 +2620,40 @@ type feedback as ordinary PHP variables and calls.
     `cargo test --all`, `cargo fmt --all --check`, and
     `cargo clippy --all-targets -- -D warnings` passed.
 
+- [x] **COMPOSER-001** Refresh Composer/vendor metadata after dependency install/update. *(done 2026-05-28)*
+  - Reproduction: open `/home/apanov/ForTesting/monica`, run `composer install`,
+    and existing `Unresolved use statement` diagnostics remain even after
+    `vendor/` and `vendor/composer/installed.json` appear.
+  - Expected: `composer.json`, `composer.lock`, and `vendor/composer/*`
+    metadata changes should invalidate in-memory Composer/vendor autoload
+    state, evict stale lazy-indexed vendor symbols, reload workspace Composer
+    roots when needed, and republish diagnostics for open files.
+  - Client scope: VS Code file watchers must include Composer metadata files,
+    not only PHP/Twig/config files.
+  - Server scope: `workspace/didChangeWatchedFiles` must treat Composer/vendor
+    metadata events as cache invalidation/reindex triggers rather than ignoring
+    them because they are not `.php` files.
+  - Regression: e2e should simulate creating vendor metadata after an unresolved
+    open file and verify the diagnostic disappears without restart/manual clear.
+  - Constraint: no project-specific paths, package names, or hardcoded Monica
+    symbols in production code.
+  - Implemented: VS Code synchronization now watches Composer project files and
+    vendor autoload metadata: `composer.json`, `composer.lock`,
+    `vendor/composer/installed.json`, and `vendor/composer/autoload_*.php`.
+  - Implemented: server-side `workspace/didChangeWatchedFiles` invalidates the
+    in-memory vendor autoload cache, evicts lazy-indexed vendor symbols, starts
+    workspace reindexing for `composer.json`, and republishes open diagnostics
+    for vendor metadata changes.
+  - Implemented: watched vendor PHP create/change storms are ignored unless the
+    vendor file was already indexed, so `composer install` does not eagerly
+    index the whole vendor tree.
+  - Regression: e2e creates vendor metadata after an unresolved open file and
+    verifies `Unresolved use statement` disappears without restart/manual cache
+    clear.
+  - Validation: targeted e2e, `cargo test --all`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `npm run lint`, and
+    `npm run build` passed.
+
 ---
 
 ## Текущие задачи

@@ -130,6 +130,17 @@ async fn expect_no_publish_diagnostics(
     }
 }
 
+fn published_diagnostic_messages(params: &serde_json::Value) -> Vec<String> {
+    params
+        .get("diagnostics")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|diagnostic| diagnostic.get("message").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
 async fn wait_for_indexing_phase(
     notifications: &mut UnboundedReceiver<Request>,
     phase: &str,
@@ -10861,6 +10872,130 @@ async fn test_hover_and_completion_respond_while_workspace_indexing_runs() {
         labels.iter().any(|label| label == "ping"),
         "completion should include open-file member during indexing, got: {:?}",
         labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_composer_vendor_metadata_watch_refreshes_unresolved_use_diagnostics() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-composer-watch-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src")).unwrap();
+    fs::write(
+        tmp_root.join("composer.json"),
+        r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+    )
+    .unwrap();
+
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(2)).await;
+
+    let app_path = tmp_root.join("src/App.php");
+    let app_uri = format!("file://{}", app_path.to_string_lossy());
+    let app_code = r#"<?php
+namespace App;
+
+use Vendor\Pkg\Service;
+
+final class Handler
+{
+    public function handle(Service $service): void {}
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&app_uri, app_code))
+        .await
+        .unwrap();
+
+    let unresolved =
+        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(1)).await;
+    let unresolved_messages = published_diagnostic_messages(&unresolved);
+    assert!(
+        unresolved_messages
+            .iter()
+            .any(|message| message.contains("Unresolved use statement: Vendor\\Pkg\\Service")),
+        "expected unresolved vendor use before composer install metadata exists, got: {:?}",
+        unresolved_messages
+    );
+
+    let composer_dir = tmp_root.join("vendor/composer");
+    let package_src = tmp_root.join("vendor/acme/pkg/src");
+    fs::create_dir_all(&composer_dir).unwrap();
+    fs::create_dir_all(&package_src).unwrap();
+    fs::write(
+        package_src.join("Service.php"),
+        "<?php\nnamespace Vendor\\Pkg;\nfinal class Service {}\n",
+    )
+    .unwrap();
+    let installed_json = composer_dir.join("installed.json");
+    fs::write(
+        &installed_json,
+        r#"{"packages":[{"name":"acme/pkg","install-path":"acme/pkg","autoload":{"psr-4":{"Vendor\\Pkg\\":"src/"}}}]}"#,
+    )
+    .unwrap();
+    let installed_uri = format!("file://{}", installed_json.to_string_lossy());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &installed_uri,
+            1,
+        )]))
+        .await
+        .unwrap();
+
+    let refreshed =
+        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(2)).await;
+    let refreshed_messages = published_diagnostic_messages(&refreshed);
+    assert!(
+        !refreshed_messages
+            .iter()
+            .any(|message| message.contains("Vendor\\Pkg\\Service")),
+        "composer vendor metadata change should clear unresolved vendor diagnostics, got: {:?}",
+        refreshed_messages
     );
 
     service

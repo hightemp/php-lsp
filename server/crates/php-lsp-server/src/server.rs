@@ -1836,6 +1836,52 @@ impl PhpLspBackend {
         }
     }
 
+    async fn current_workspace_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.workspace_roots.lock().await.clone();
+        if roots.is_empty() {
+            if let Some(root) = self.workspace_root.lock().await.clone() {
+                roots.push(root);
+            }
+        }
+        if roots.is_empty() {
+            roots.extend(
+                self.workspace_configs
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|config| config.root.clone()),
+            );
+        }
+        roots
+    }
+
+    async fn invalidate_composer_metadata(&self, path: &Path, reindex_workspace: bool) {
+        self.vendor_autoload_cache.lock().await.clear();
+        let evicted = self.vendor_file_lru.lock().await.clear();
+        for uri in evicted {
+            self.index.remove_file(&uri);
+        }
+
+        let roots = self.current_workspace_roots().await;
+        let removed_vendor_files = remove_indexed_vendor_symbols(&self.index, &roots);
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "php-lsp: Composer metadata changed at {}; cleared vendor metadata cache and {} indexed vendor file(s)",
+                    path.display(),
+                    removed_vendor_files
+                ),
+            )
+            .await;
+
+        if reindex_workspace {
+            self.reindex_workspaces().await;
+        } else {
+            self.republish_open_diagnostics().await;
+        }
+    }
+
     async fn workspace_root_for_uri(&self, uri_str: &str) -> Option<PathBuf> {
         let roots = self.workspace_roots.lock().await.clone();
         if let Some(path) = uri_to_path(uri_str) {
@@ -3093,6 +3139,12 @@ impl PhpLspBackend {
         }
 
         if let Some(path) = uri_to_path(&uri_str) {
+            let roots = self.current_workspace_roots().await;
+            if path_is_under_vendor_roots(&path, &roots)
+                && !self.index.file_symbols.contains_key(&uri_str)
+            {
+                return;
+            }
             if self.path_is_excluded_by_config(&path).await {
                 self.index.remove_file(&uri_str);
                 self.semantic_tokens_cache.lock().await.remove(&uri_str);
@@ -19255,6 +19307,43 @@ fn uri_is_project_config_file(uri: &Uri) -> bool {
         .is_some_and(|file_name| file_name == PROJECT_CONFIG_FILE_NAME)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerMetadataChange {
+    ProjectAutoload,
+    VendorAutoload,
+}
+
+fn composer_metadata_change_for_path(path: &Path) -> Option<ComposerMetadataChange> {
+    let file_name = path.file_name()?.to_str()?;
+    if file_name == "composer.json" {
+        return Some(ComposerMetadataChange::ProjectAutoload);
+    }
+    if file_name == "composer.lock" {
+        return Some(ComposerMetadataChange::VendorAutoload);
+    }
+
+    let parent = path.parent()?;
+    let parent_name = parent.file_name()?.to_str()?;
+    if parent_name != "composer" {
+        return None;
+    }
+    let grandparent_name = parent.parent()?.file_name()?.to_str()?;
+    if grandparent_name != "vendor" {
+        return None;
+    }
+
+    let is_vendor_metadata = file_name == "installed.json"
+        || file_name == "installed.php"
+        || (file_name.starts_with("autoload_") && file_name.ends_with(".php"));
+    is_vendor_metadata.then_some(ComposerMetadataChange::VendorAutoload)
+}
+
+fn uri_composer_metadata_change(uri: &Uri) -> Option<(PathBuf, ComposerMetadataChange)> {
+    let path = uri_to_path(uri.as_str())?;
+    let change = composer_metadata_change_for_path(&path)?;
+    Some((path, change))
+}
+
 pub(crate) fn discover_workspace_root_config(
     root: &Path,
     composer_enabled: bool,
@@ -21285,9 +21374,19 @@ impl LanguageServer for PhpLspBackend {
         tracing::debug!("didChangeWatchedFiles: {} change(s)", params.changes.len());
 
         let mut config_changed = false;
+        let mut composer_metadata_changed: Option<PathBuf> = None;
+        let mut composer_requires_workspace_reindex = false;
         for event in params.changes {
             if uri_is_project_config_file(&event.uri) {
                 config_changed = true;
+                continue;
+            }
+
+            if let Some((path, change)) = uri_composer_metadata_change(&event.uri) {
+                composer_metadata_changed = Some(path);
+                if change == ComposerMetadataChange::ProjectAutoload {
+                    composer_requires_workspace_reindex = true;
+                }
                 continue;
             }
 
@@ -21302,6 +21401,10 @@ impl LanguageServer for PhpLspBackend {
 
         if config_changed {
             self.reload_effective_configuration().await;
+        }
+        if let Some(path) = composer_metadata_changed {
+            self.invalidate_composer_metadata(&path, composer_requires_workspace_reindex)
+                .await;
         }
     }
 

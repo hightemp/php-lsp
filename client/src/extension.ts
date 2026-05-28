@@ -861,6 +861,10 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
       fileEvents: [
         workspace.createFileSystemWatcher("**/*.php"),
         workspace.createFileSystemWatcher("**/*.twig"),
+        workspace.createFileSystemWatcher("**/composer.json"),
+        workspace.createFileSystemWatcher("**/composer.lock"),
+        workspace.createFileSystemWatcher("**/vendor/composer/installed.json"),
+        workspace.createFileSystemWatcher("**/vendor/composer/autoload_*.php"),
         workspace.createFileSystemWatcher("**/.php-lsp.toml"),
       ],
     },
