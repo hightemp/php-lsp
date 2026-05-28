@@ -2,6 +2,19 @@
 
 use super::super::*;
 
+fn php_file_operation_registration_options() -> FileOperationRegistrationOptions {
+    FileOperationRegistrationOptions {
+        filters: vec![FileOperationFilter {
+            scheme: Some("file".to_string()),
+            pattern: FileOperationPattern {
+                glob: "**/*.php".to_string(),
+                matches: Some(FileOperationPatternKind::File),
+                options: None,
+            },
+        }],
+    }
+}
+
 impl PhpLspBackend {
     pub(crate) async fn lsp_initialize(
         &self,
@@ -133,7 +146,7 @@ impl PhpLspBackend {
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
                             work_done_progress_options: WorkDoneProgressOptions::default(),
-                            legend: semantic_tokens_legend(),
+                            legend: super::semantic_tokens::semantic_tokens_legend(),
                             range: Some(true),
                             full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                         },

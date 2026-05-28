@@ -3058,6 +3058,32 @@ while implementing these tasks.
 
 ## Текущие задачи
 
+- [x] **T-2026-05-28-server-split-step2** Continue reducing `php-lsp-server/src/server.rs` by moving remaining pure helper blocks into focused modules. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; do not change URI/range semantics, diagnostics, completion, or indexing behavior.
+  - Implementation target: move small self-contained helper groups out of `server.rs` before touching complex inference/diagnostics code.
+  - Candidate modules: request cache/cancellation helpers, shell/external command helpers, semantic-token delta helpers, workspace-symbol helpers, document-link/folding helpers, and other pure LSP utility blocks.
+  - Validation target: `cargo fmt --all --check`, focused `php-lsp-server` check/tests, clippy for `php-lsp-server`, and `git diff --check`.
+  - Implemented: moved semantic-token legend/range/delta helpers into `src/lsp/semantic_tokens.rs`.
+  - Implemented: moved document-link static include/require helpers into `src/lsp/document_links.rs` and kept the shared static-string helper available to code actions.
+  - Implemented: moved folding range helpers into `src/lsp/folding.rs`.
+  - Implemented: moved workspace-symbol candidate/ranking/range helpers into `src/lsp/document_symbols.rs`.
+  - Implemented: moved formatter auto-detect, external formatter, range-formatting, and on-type indentation helpers into `src/lsp/formatting.rs`.
+  - Implemented: moved PHPStan/Psalm JSON parsing and runner helpers into `src/lsp/diagnostics.rs`.
+  - Result: `server.rs` reduced from 18,123 lines at task start to 16,785 lines after this extraction.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo test -p php-lsp-server`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-e2e-definition-helper-scope** Make the vendor fixture helper reference explicit in `e2e_definition.rs` for IDE/rust-analyzer diagnostics. *(done 2026-05-28)*
+  - Scope: address the editor diagnostic `cannot find function vendor_resolve_fixture_root` without changing test behavior.
+  - Validation target: focused `e2e_definition` test target, rustfmt, clippy, and whitespace check.
+  - Implemented: changed vendor fixture helper calls in `e2e_definition.rs` to `support::vendor_resolve_fixture_root()`.
+  - Validation: `cargo fmt --all --check`, `cargo clippy -p php-lsp-server --test e2e_definition -- -D warnings`, `cargo test -p php-lsp-server --test e2e_definition`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-e2e-split-lint** Check and fix linter failures in split `php-lsp-server` e2e completion/definition tests. *(done 2026-05-28)*
+  - Scope: inspect `server/crates/php-lsp-server/tests/e2e_completion.rs` and `server/crates/php-lsp-server/tests/e2e_definition.rs`.
+  - Validation target: run focused formatting/lint/test commands for the affected integration test targets and keep the fix behavior-preserving.
+  - Result: no linter/test failure reproduced on the current tree; no code changes were needed.
+  - Validation: `cargo fmt --all --check`, `cargo clippy -p php-lsp-server --test e2e_completion --test e2e_definition -- -D warnings`, `cargo clippy --all-targets -- -D warnings`, and `cargo test -p php-lsp-server --test e2e_completion --test e2e_definition` passed.
+
 - [x] **T-2026-05-28-document-split-structure** Document the new split server/test structure and update agent guidance. *(done 2026-05-28)*
   - Scope: update existing English documentation only; do not create duplicate markdown files.
   - Implementation target: document the new `php-lsp-server/src/lsp`, `src/indexing`, `src/util`, and split e2e test layout.

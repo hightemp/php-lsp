@@ -1,6 +1,7 @@
 //! Index cache helpers.
 
 use super::super::*;
+use std::time::UNIX_EPOCH;
 
 pub(crate) fn workspace_index_cache_config(
     root: Option<&Path>,

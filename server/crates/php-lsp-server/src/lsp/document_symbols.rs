@@ -2,6 +2,301 @@
 
 use super::super::*;
 
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceSymbolCandidate {
+    pub(crate) score: i64,
+    pub(crate) symbol: php_lsp_types::SymbolInfo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceSymbolKindFilter {
+    Type,
+    Class,
+    Interface,
+    Trait,
+    Enum,
+    Function,
+    Method,
+    Property,
+    Constant,
+}
+
+pub(crate) fn workspace_symbol_candidates(
+    index: &WorkspaceIndex,
+    raw_query: &str,
+) -> Vec<WorkspaceSymbolCandidate> {
+    let (kind_filter, query) = parse_workspace_symbol_query(raw_query);
+    if query.is_empty() && kind_filter.is_none() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for file_symbols in index.file_symbols.iter() {
+        for symbol in &file_symbols.symbols {
+            if symbol.modifiers.is_builtin {
+                continue;
+            }
+            if !kind_filter.is_none_or(|filter| workspace_symbol_kind_matches(symbol.kind, filter))
+            {
+                continue;
+            }
+            let Some(score) = workspace_symbol_score(symbol, &query) else {
+                continue;
+            };
+            candidates.push(WorkspaceSymbolCandidate {
+                score,
+                symbol: symbol.clone(),
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                workspace_symbol_kind_rank(left.symbol.kind)
+                    .cmp(&workspace_symbol_kind_rank(right.symbol.kind))
+            })
+            .then_with(|| left.symbol.fqn.cmp(&right.symbol.fqn))
+    });
+    candidates
+}
+
+fn parse_workspace_symbol_query(raw_query: &str) -> (Option<WorkspaceSymbolKindFilter>, String) {
+    let query = raw_query.trim();
+    if let Some((prefix, rest)) = query.split_once(':') {
+        if let Some(filter) = parse_workspace_symbol_kind_filter(prefix) {
+            return (Some(filter), rest.trim().to_string());
+        }
+    }
+
+    if let Some((prefix, rest)) = query.split_once(char::is_whitespace) {
+        if let Some(filter) = parse_workspace_symbol_kind_filter(prefix) {
+            return (Some(filter), rest.trim().to_string());
+        }
+    }
+
+    (None, query.to_string())
+}
+
+fn parse_workspace_symbol_kind_filter(raw: &str) -> Option<WorkspaceSymbolKindFilter> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "type" | "types" => Some(WorkspaceSymbolKindFilter::Type),
+        "class" | "classes" => Some(WorkspaceSymbolKindFilter::Class),
+        "interface" | "interfaces" => Some(WorkspaceSymbolKindFilter::Interface),
+        "trait" | "traits" => Some(WorkspaceSymbolKindFilter::Trait),
+        "enum" | "enums" => Some(WorkspaceSymbolKindFilter::Enum),
+        "function" | "functions" | "fn" => Some(WorkspaceSymbolKindFilter::Function),
+        "method" | "methods" => Some(WorkspaceSymbolKindFilter::Method),
+        "property" | "properties" | "prop" | "props" => Some(WorkspaceSymbolKindFilter::Property),
+        "const" | "constant" | "constants" => Some(WorkspaceSymbolKindFilter::Constant),
+        _ => None,
+    }
+}
+
+fn workspace_symbol_kind_matches(
+    kind: php_lsp_types::PhpSymbolKind,
+    filter: WorkspaceSymbolKindFilter,
+) -> bool {
+    match filter {
+        WorkspaceSymbolKindFilter::Type => matches!(
+            kind,
+            php_lsp_types::PhpSymbolKind::Class
+                | php_lsp_types::PhpSymbolKind::Interface
+                | php_lsp_types::PhpSymbolKind::Trait
+                | php_lsp_types::PhpSymbolKind::Enum
+        ),
+        WorkspaceSymbolKindFilter::Class => kind == php_lsp_types::PhpSymbolKind::Class,
+        WorkspaceSymbolKindFilter::Interface => kind == php_lsp_types::PhpSymbolKind::Interface,
+        WorkspaceSymbolKindFilter::Trait => kind == php_lsp_types::PhpSymbolKind::Trait,
+        WorkspaceSymbolKindFilter::Enum => kind == php_lsp_types::PhpSymbolKind::Enum,
+        WorkspaceSymbolKindFilter::Function => kind == php_lsp_types::PhpSymbolKind::Function,
+        WorkspaceSymbolKindFilter::Method => kind == php_lsp_types::PhpSymbolKind::Method,
+        WorkspaceSymbolKindFilter::Property => kind == php_lsp_types::PhpSymbolKind::Property,
+        WorkspaceSymbolKindFilter::Constant => matches!(
+            kind,
+            php_lsp_types::PhpSymbolKind::ClassConstant
+                | php_lsp_types::PhpSymbolKind::GlobalConstant
+                | php_lsp_types::PhpSymbolKind::EnumCase
+        ),
+    }
+}
+
+fn workspace_symbol_score(symbol: &php_lsp_types::SymbolInfo, query: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(1_000 + workspace_symbol_kind_bonus(symbol.kind));
+    }
+
+    let mut best_score = fuzzy_text_score(&symbol.name, query);
+    if let Some(fqn_score) = fuzzy_text_score(&symbol.fqn, query) {
+        let qualified_bonus = if query.contains('\\') { 700 } else { 100 };
+        best_score = Some(
+            best_score
+                .unwrap_or(i64::MIN)
+                .max(fqn_score + qualified_bonus),
+        );
+    }
+    if let Some(container) = workspace_symbol_container_name(symbol) {
+        if container
+            .to_ascii_lowercase()
+            .contains(&query.to_ascii_lowercase())
+        {
+            best_score = Some(best_score.unwrap_or(i64::MIN).max(5_500));
+        }
+    }
+
+    Some(best_score? + workspace_symbol_kind_bonus(symbol.kind))
+}
+
+fn fuzzy_text_score(text: &str, query: &str) -> Option<i64> {
+    let text_lower = text.to_ascii_lowercase();
+    let query_lower = query.to_ascii_lowercase();
+    if query_lower.is_empty() {
+        return Some(1_000);
+    }
+    if text_lower == query_lower {
+        return Some(10_000);
+    }
+    if text_lower.starts_with(&query_lower) {
+        return Some(9_000 - text_lower.len().saturating_sub(query_lower.len()) as i64);
+    }
+    if let Some(index) = text_lower.find(&query_lower) {
+        return Some(7_000 - (index as i64 * 10));
+    }
+
+    fuzzy_abbreviation_score(&text_lower, &query_lower)
+}
+
+fn fuzzy_abbreviation_score(text: &str, query: &str) -> Option<i64> {
+    let mut score = 4_000i64;
+    let mut last_match_index: Option<usize> = None;
+    let mut search_from = 0usize;
+
+    for query_char in query.chars() {
+        let relative_index = text[search_from..].find(query_char)?;
+        let absolute_index = search_from + relative_index;
+        if let Some(last_match_index) = last_match_index {
+            let gap = absolute_index.saturating_sub(last_match_index + 1);
+            score -= gap as i64 * 8;
+        } else {
+            score -= absolute_index as i64 * 4;
+        }
+        if absolute_index == 0
+            || text[..absolute_index]
+                .chars()
+                .last()
+                .is_some_and(|ch| ch == '\\' || ch == '_' || ch == '-' || ch.is_whitespace())
+        {
+            score += 80;
+        }
+        last_match_index = Some(absolute_index);
+        search_from = absolute_index + query_char.len_utf8();
+    }
+
+    Some(score - text.len() as i64)
+}
+
+fn workspace_symbol_kind_bonus(kind: php_lsp_types::PhpSymbolKind) -> i64 {
+    match kind {
+        php_lsp_types::PhpSymbolKind::Class => 90,
+        php_lsp_types::PhpSymbolKind::Enum => 85,
+        php_lsp_types::PhpSymbolKind::Interface => 80,
+        php_lsp_types::PhpSymbolKind::Trait => 70,
+        php_lsp_types::PhpSymbolKind::Function => 60,
+        php_lsp_types::PhpSymbolKind::Method => 40,
+        php_lsp_types::PhpSymbolKind::Property => 30,
+        php_lsp_types::PhpSymbolKind::ClassConstant
+        | php_lsp_types::PhpSymbolKind::GlobalConstant
+        | php_lsp_types::PhpSymbolKind::EnumCase => 20,
+        php_lsp_types::PhpSymbolKind::Namespace => 10,
+    }
+}
+
+fn workspace_symbol_kind_rank(kind: php_lsp_types::PhpSymbolKind) -> u8 {
+    match kind {
+        php_lsp_types::PhpSymbolKind::Class => 0,
+        php_lsp_types::PhpSymbolKind::Enum => 1,
+        php_lsp_types::PhpSymbolKind::Interface => 2,
+        php_lsp_types::PhpSymbolKind::Trait => 3,
+        php_lsp_types::PhpSymbolKind::Function => 4,
+        php_lsp_types::PhpSymbolKind::Method => 5,
+        php_lsp_types::PhpSymbolKind::Property => 6,
+        php_lsp_types::PhpSymbolKind::ClassConstant
+        | php_lsp_types::PhpSymbolKind::GlobalConstant
+        | php_lsp_types::PhpSymbolKind::EnumCase => 7,
+        php_lsp_types::PhpSymbolKind::Namespace => 8,
+    }
+}
+
+fn workspace_symbol_container_name(symbol: &php_lsp_types::SymbolInfo) -> Option<String> {
+    symbol.parent_fqn.clone().or_else(|| {
+        let fqn = &symbol.fqn;
+        fqn.rfind('\\').map(|index| fqn[..index].to_string())
+    })
+}
+
+async fn workspace_symbol_source_for_uri(
+    uri_str: &str,
+    open_files: &DashMap<String, FileParser>,
+    source_cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(cached) = source_cache.get(uri_str) {
+        return cached.clone();
+    }
+
+    let source = { open_files.get(uri_str).map(|parser| parser.source()) };
+    let source = if source.is_some() {
+        source
+    } else if let Some(path) = uri_to_path(uri_str) {
+        read_file_to_string_blocking(path, "workspace/symbol source read")
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    source_cache.insert(uri_str.to_string(), source.clone());
+    source
+}
+
+async fn workspace_symbol_information(
+    symbol: &php_lsp_types::SymbolInfo,
+    open_files: &DashMap<String, FileParser>,
+    source_cache: &mut HashMap<String, Option<String>>,
+) -> Option<SymbolInformation> {
+    let uri: Uri = symbol.uri.parse().ok()?;
+    let source = workspace_symbol_source_for_uri(&symbol.uri, open_files, source_cache).await;
+    let range = workspace_symbol_lsp_range(source.as_deref(), symbol.range);
+
+    #[allow(deprecated)]
+    Some(SymbolInformation {
+        name: symbol.name.clone(),
+        kind: php_kind_to_lsp(symbol.kind),
+        tags: if symbol.modifiers.is_deprecated {
+            Some(vec![SymbolTag::DEPRECATED])
+        } else {
+            None
+        },
+        deprecated: None,
+        location: Location { uri, range },
+        container_name: workspace_symbol_container_name(symbol),
+    })
+}
+
+pub(crate) fn workspace_symbol_lsp_range(
+    source: Option<&str>,
+    range: (u32, u32, u32, u32),
+) -> Range {
+    let range = source
+        .map(|source| range_byte_to_utf16(source, range))
+        .unwrap_or(range);
+    Range {
+        start: Position::new(range.0, range.1),
+        end: Position::new(range.2, range.3),
+    }
+}
+
 impl PhpLspBackend {
     pub(crate) async fn lsp_selection_range(
         &self,

@@ -940,7 +940,7 @@ async fn test_goto_definition_vendor_inherited_method() {
         socket.collect::<Vec<_>>().await;
     });
 
-    let fixture_root = vendor_resolve_fixture_root();
+    let fixture_root = support::vendor_resolve_fixture_root();
     let root_uri = format!("file://{}", fixture_root.display());
 
     service
@@ -1018,7 +1018,7 @@ async fn test_goto_definition_vendor_method_via_typed_property() {
         socket.collect::<Vec<_>>().await;
     });
 
-    let fixture_root = vendor_resolve_fixture_root();
+    let fixture_root = support::vendor_resolve_fixture_root();
     let root_uri = format!("file://{}", fixture_root.display());
 
     service
@@ -1097,7 +1097,7 @@ async fn test_goto_definition_cross_file_inherited_property_method() {
         socket.collect::<Vec<_>>().await;
     });
 
-    let fixture_root = vendor_resolve_fixture_root();
+    let fixture_root = support::vendor_resolve_fixture_root();
     let root_uri = format!("file://{}", fixture_root.display());
 
     service
@@ -1183,7 +1183,7 @@ async fn test_goto_definition_cross_file_method_via_same_file_property() {
         socket.collect::<Vec<_>>().await;
     });
 
-    let fixture_root = vendor_resolve_fixture_root();
+    let fixture_root = support::vendor_resolve_fixture_root();
     let root_uri = format!("file://{}", fixture_root.display());
 
     service

@@ -1,6 +1,7 @@
 //! Code Action LSP handlers extracted from `server.rs`.
 
 use super::super::*;
+use super::document_links::is_static_string_literal_node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ImportKind {
