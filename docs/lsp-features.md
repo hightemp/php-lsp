@@ -10,6 +10,10 @@ the IDE intelligence milestone after PHPDoc/type inference, framework provider,
 Blade-like document, and Symfony/Twig document work. Performance evidence lives
 in `docs/production-baseline.md`.
 
+Implementation ownership for the major feature areas is documented in the
+Feature Ownership Map in `docs/architecture.md`; keep this file focused on
+client-visible LSP behavior and known limits.
+
 ## Status Legend
 
 | Status | Meaning |

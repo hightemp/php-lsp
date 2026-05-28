@@ -10,6 +10,10 @@
 #   make release    — bump versions from VERSION, commit, tag & push to GitHub
 #   make clean      — remove build artefacts
 #   make check      — run all lints and tests
+#   make check-server — run Rust fmt, clippy and tests
+#   make check-client — run VS Code client lint and build
+#   make test-server  — run php-lsp-server crate tests
+#   make test-e2e     — run LSP protocol e2e tests
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := package
@@ -41,7 +45,7 @@ BIN_NAME   := $(if $(findstring windows,$(HOST_TARGET)),php-lsp.exe,php-lsp)
 SERVER_BIN := $(BIN_DIR)/$(BIN_NAME)
 
 # ─── Phony targets ───────────────────────────────────────────────
-.PHONY: all package package-all install server server-all client stubs clean check test lint fmt release
+.PHONY: all package package-all install server server-all client stubs clean check check-server check-client cargo-check test test-parser test-index test-completion test-server test-e2e lint fmt release
 
 all: package
 
@@ -105,6 +109,18 @@ package-all: server-all $(CLIENT_DIR)/out/extension.js $(STUBS_DEST)
 # ─── Quality checks ─────────────────────────────────────────────
 check: lint test
 
+check-server:
+	cd $(SERVER_DIR) && cargo fmt --all --check
+	cd $(SERVER_DIR) && cargo clippy --all-targets -- -D warnings
+	cd $(SERVER_DIR) && cargo test --all
+
+check-client:
+	cd $(CLIENT_DIR) && npm run lint
+	cd $(CLIENT_DIR) && npm run build
+
+cargo-check:
+	cd $(SERVER_DIR) && cargo check --workspace
+
 lint:
 	cd $(SERVER_DIR) && cargo fmt --all --check
 	cd $(SERVER_DIR) && cargo clippy --all-targets -- -D warnings
@@ -115,6 +131,21 @@ fmt:
 
 test:
 	cd $(SERVER_DIR) && cargo test --all
+
+test-parser:
+	cd $(SERVER_DIR) && cargo test -p php-lsp-parser
+
+test-index:
+	cd $(SERVER_DIR) && cargo test -p php-lsp-index
+
+test-completion:
+	cd $(SERVER_DIR) && cargo test -p php-lsp-completion
+
+test-server:
+	cd $(SERVER_DIR) && cargo test -p php-lsp-server
+
+test-e2e:
+	cd $(SERVER_DIR) && cargo test -p php-lsp-server --test e2e
 
 # ─── Install into VS Code ────────────────────────────────────────
 VSIX := $(shell ls -t $(CLIENT_DIR)/*.vsix 2>/dev/null | head -1)

@@ -3058,6 +3058,17 @@ while implementing these tasks.
 
 ## Текущие задачи
 
+- [x] **T-2026-05-28-agent-onboarding** Improve agent-facing project guidance without duplicating existing docs. *(done 2026-05-28)*
+  - Scope: update existing `AGENTS.md`, architecture/feature documentation, and build shortcuts so future Codex/LLM work has a concise project map, invariants, recipes, and test-selection guidance.
+  - Constraint: do not create duplicate markdown files when an equivalent document already exists; extend existing files such as `AGENTS.md`, `docs/architecture.md`, `docs/lsp-features.md`, and `Makefile`.
+  - Scope: add short source-code comments only for fragile shared invariants that affect many LSP features.
+  - Implemented: expanded the existing root `AGENTS.md` with a crate map, architecture rules, test-selection guidance, "where to look" routes, and known pitfalls.
+  - Implemented: updated the existing `docs/architecture.md` with shared invariants, position/URI/symbol model rules, a feature ownership map, and public entry points instead of creating duplicate architecture/API docs.
+  - Implemented: kept `docs/lsp-features.md` focused on user-visible LSP behavior and linked it to the architecture feature ownership map.
+  - Implemented: extended the existing `Makefile` with focused server/client/check/e2e targets instead of adding a `justfile`.
+  - Implemented: added source comments for fragile shared type invariants in `php-lsp-types` and the server module position convention.
+  - Validation: `cargo fmt --all --check`, `make -n check-server`, `make -n check-client`, and `make -n test-e2e` passed.
+
 - [x] **T-2026-05-28** Analyze GPT-5.5 static production audit and add a follow-up hardening milestone. *(done 2026-05-28)*
 - [x] **T-2026-05-28** Пройти `/home/apanov/Projects/bdpn-ui` PHP+Twig и найти текущие ошибки/false positives `php-lsp` *(done 2026-05-28)*
   - Scope: run CLI diagnostics against the Symfony app PHP tree with project root `/home/apanov/Projects/bdpn-ui/app`.

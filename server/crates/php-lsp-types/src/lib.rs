@@ -61,6 +61,10 @@ pub struct SymbolModifiers {
 }
 
 /// Represents a PHP type.
+///
+/// `Display` output is user-visible in hover, completion details, inlay hints,
+/// code actions, and tests. Keep formatting stable unless all callers and
+/// regressions are updated deliberately.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TypeInfo {
     Simple(String),
@@ -322,6 +326,9 @@ pub struct PhpDocMethod {
 }
 
 /// Full information about a symbol in the index.
+///
+/// `range` and `selection_range` use tree-sitter byte columns, not LSP UTF-16
+/// columns. Convert them before returning locations/ranges to an LSP client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolInfo {
     /// Short name (e.g. "Foo", "bar", "BAZ")
@@ -332,9 +339,9 @@ pub struct SymbolInfo {
     pub kind: PhpSymbolKind,
     /// File URI
     pub uri: String,
-    /// Range in the file (start line, start col, end line, end col)
+    /// Byte-column range in the file (start line, start col, end line, end col).
     pub range: (u32, u32, u32, u32),
-    /// Selection range (the name part)
+    /// Byte-column selection range for the name part.
     pub selection_range: (u32, u32, u32, u32),
     /// Visibility
     pub visibility: Visibility,
@@ -369,7 +376,7 @@ pub struct UseStatement {
     pub fqn: String,
     pub alias: Option<String>,
     pub kind: UseKind,
-    /// Source range (start_line, start_col, end_line, end_col).
+    /// Source byte-column range (start line, start col, end line, end col).
     pub range: (u32, u32, u32, u32),
 }
 
@@ -394,6 +401,9 @@ pub struct FileSymbols {
 }
 
 /// A precomputed symbol occurrence used by references/rename/code lens.
+///
+/// Unlike `SymbolInfo` ranges, `range` is already an LSP UTF-16 range because
+/// references are emitted directly as LSP locations and workspace edits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolReference {
     pub target_fqn: String,

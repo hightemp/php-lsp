@@ -1,4 +1,14 @@
-//! LSP server implementation — LanguageServer trait.
+//! LSP server implementation and `LanguageServer` wiring.
+//!
+//! This module connects LSP request handlers to parser, index, completion,
+//! framework, template, analyzer, and formatter helpers. Keep feature-specific
+//! pure logic in helper functions/modules when possible.
+//!
+//! Position convention:
+//! - incoming LSP positions/ranges are UTF-16;
+//! - parser/tree-sitter symbol ranges are byte columns;
+//! - convert incoming positions to byte offsets before parser queries;
+//! - convert byte-backed ranges before returning them through LSP.
 
 use crate::config::{
     global_config_candidates, load_toml_settings, merge_json_objects, normalize_client_settings,

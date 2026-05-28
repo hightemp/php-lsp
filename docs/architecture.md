@@ -18,6 +18,49 @@ which paths affect latency.
 The VS Code extension launches `php-lsp` over stdio. Server logs go to stderr
 through `tracing`, so they do not corrupt JSON-RPC messages.
 
+## Shared Invariants
+
+These invariants are intentionally called out because many LSP features cross
+crate boundaries.
+
+### Position Model
+
+Tree-sitter and parser data use byte columns. LSP uses UTF-16 columns.
+
+| Data | Position unit |
+|---|---|
+| `SymbolInfo.range` | Tree-sitter byte columns. |
+| `SymbolInfo.selection_range` | Tree-sitter byte columns. |
+| `UseStatement.range` | Tree-sitter byte columns. |
+| Parser semantic diagnostic ranges | Tree-sitter byte columns unless converted at the server boundary. |
+| `SymbolReference.range` | LSP UTF-16 columns. |
+| LSP request and response ranges | UTF-16 columns. |
+
+Outbound LSP handlers must convert byte-backed ranges with
+`php_lsp_parser::utf16::range_byte_to_utf16` or `Utf16LineIndex`. Do not return
+`SymbolInfo.range` or `selection_range` directly as an LSP `Range`.
+
+### URI Model
+
+File URIs are an LSP/client boundary format, not an internal path format. New
+code should not build URIs with raw string formatting such as
+`format!("file://{}", path.display())`. URI conversion should go through a
+shared helper that percent-encodes paths, decodes client URIs, and handles
+platform-specific path forms.
+
+### Symbol Model
+
+Top-level classes, interfaces, traits, enums, functions, and constants are
+indexed in dedicated `WorkspaceIndex` maps. Members remain part of
+`FileSymbols.symbols` and are resolved through the owning type. Property
+`SymbolInfo.name` is stored without `$`, while property FQNs include `$` as in
+`Class::$prop`.
+
+`SymbolReference` entries are precomputed occurrences used by references,
+rename, and code lenses. Unresolved member references such as `::method` and
+`::$prop` may be useful for non-destructive discovery, but they are not precise
+enough for workspace rename edits without a resolved receiver type.
+
 ## Data Flow
 
 ```text
@@ -43,6 +86,22 @@ Composer maps + stubs + vendor cache
   v
 Disk cache: workspace / stubs / vendor
 ```
+
+## Feature Ownership Map
+
+| Feature area | LSP/server entry point | Parser/completion layer | Index/cache layer | Primary tests |
+|---|---|---|---|---|
+| Hover | `PhpLspBackend::hover` | `resolve.rs`, PHPDoc helpers | `workspace.rs` symbol lookup | `php-lsp-server/tests/e2e.rs` |
+| Definition/declaration/type definition | `goto_definition`, `goto_declaration`, `goto_type_definition` | `resolve.rs` | `workspace.rs`, lazy vendor lookup | e2e definition tests |
+| Completion | `completion`, `completion_resolve` | `php-lsp-completion/src/context.rs`, `provider.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + e2e |
+| Signature help | `signature_help` | call/member resolution helpers | `workspace.rs` signature lookup | e2e signature tests |
+| References/code lens | `references`, `code_lens`, `code_lens_resolve` | `references.rs` | `file_references` in `WorkspaceIndex` | e2e references/lens tests |
+| Rename | `prepare_rename`, `rename` | `references.rs`, local variable search | `file_references`, symbol lookup | e2e rename tests |
+| Diagnostics | open/change/save diagnostic paths | `diagnostics.rs`, `semantic.rs` | `workspace.rs` symbol resolution | parser unit tests + e2e |
+| Code actions/refactors | `code_action`, `code_action_resolve` | parser helpers, return type helpers | symbol/member lookup | server unit/e2e tests |
+| Inlay hints | `inlay_hint` | type inference and local variable scans | indexed signatures/types | e2e inlay hint tests |
+| Templates | template-aware LSP handlers | `template.rs` virtual PHP/source maps | Twig context scans | template e2e tests |
+| Stubs/vendor/cache | initialization, reindex, lazy index paths | symbol extraction | `stubs.rs`, `composer.rs`, `cache.rs` | index unit tests + e2e |
 
 ## Startup Flow
 
@@ -295,6 +354,25 @@ intelligence milestone. On the primary 10k-file Symfony workspace, warm
 open-file p95 for hover/completion/definition stayed under 7 ms, while heavy
 `references` and rename dry-run requests kept unrelated hover/completion below
 10 ms p95.
+
+## Public Entry Points
+
+LSP request/notification handlers live on `PhpLspBackend` in
+`server/crates/php-lsp-server/src/server.rs`. The most important entry points
+are:
+
+| Area | Entry points |
+|---|---|
+| Lifecycle | `initialize`, `initialized`, `shutdown`. |
+| Document sync | `did_open`, `did_change`, `did_save`, `did_close`. |
+| Workspace sync | `did_change_configuration`, `did_change_workspace_folders`, `did_change_watched_files`, file operation handlers. |
+| Navigation | `hover`, `goto_definition`, `goto_declaration`, `goto_type_definition`, `goto_implementation`. |
+| Symbols and hierarchy | `document_symbol`, `symbol`, call hierarchy handlers, type hierarchy handlers. |
+| Editing | `prepare_rename`, `rename`, `code_action`, `code_action_resolve`, formatting handlers, on-type formatting. |
+| Intelligence | `completion`, `completion_resolve`, `signature_help`, `inlay_hint`, semantic token handlers, folding and selection range handlers. |
+
+Non-LSP command-line entry points are `analyze::run_analyze_cli` and
+`fix::run_fix_cli`.
 
 ## Configuration Updates
 
