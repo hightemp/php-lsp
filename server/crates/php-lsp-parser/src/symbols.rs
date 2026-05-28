@@ -455,7 +455,10 @@ fn extract_class_like(
     let fqn = make_fqn(current_ns, &name);
 
     let modifiers = extract_modifiers(node, source);
-    let doc_comment = find_doc_comment(node, source);
+    let doc_comment_node = find_doc_comment_node(node, source);
+    let doc_comment = doc_comment_node
+        .as_ref()
+        .map(|doc_node| node_text(*doc_node, source).to_string());
     let templates = phpdoc_templates(doc_comment.as_deref());
     let template_bindings = phpdoc_template_bindings(doc_comment.as_deref(), result);
 
@@ -476,7 +479,7 @@ fn extract_class_like(
         selection_range: node_range(name_node),
         visibility: Visibility::Public,
         modifiers,
-        doc_comment,
+        doc_comment: doc_comment.clone(),
         signature: None,
         parent_fqn: None,
         extends: extends_fqns,
@@ -491,6 +494,107 @@ fn extract_class_like(
     if let Some(body) = body_node {
         extract_class_body(body, source, uri, result, &fqn, php_version);
     }
+
+    if let (Some(doc), Some(doc_node)) = (doc_comment.as_deref(), doc_comment_node) {
+        extract_phpdoc_virtual_methods(
+            doc,
+            uri,
+            result,
+            &fqn,
+            node_range(name_node),
+            doc_node.start_position(),
+        );
+    }
+}
+
+fn extract_phpdoc_virtual_methods(
+    doc_comment: &str,
+    uri: &str,
+    result: &mut FileSymbols,
+    parent_fqn: &str,
+    fallback_range: (u32, u32, u32, u32),
+    doc_start: tree_sitter::Point,
+) {
+    let phpdoc = crate::phpdoc::parse_phpdoc(doc_comment);
+    let template_names: HashSet<String> = phpdoc
+        .templates
+        .iter()
+        .map(|template| template.name.clone())
+        .collect();
+
+    for method in phpdoc.methods {
+        if result.symbols.iter().any(|symbol| {
+            symbol.kind == PhpSymbolKind::Method
+                && symbol.parent_fqn.as_deref() == Some(parent_fqn)
+                && symbol.name == method.name
+        }) {
+            continue;
+        }
+
+        let return_type = method.return_type.map(|type_info| {
+            resolve_template_type_info_in_file(type_info, result, &template_names)
+        });
+
+        let method_range = phpdoc_method_name_range(doc_comment, &method.name, doc_start)
+            .unwrap_or(fallback_range);
+
+        result.symbols.push(SymbolInfo {
+            name: method.name.clone(),
+            fqn: format!("{}::{}", parent_fqn, method.name),
+            kind: PhpSymbolKind::Method,
+            uri: uri.to_string(),
+            range: method_range,
+            selection_range: method_range,
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers {
+                is_static: method.is_static,
+                ..SymbolModifiers::default()
+            },
+            doc_comment: Some(doc_comment.to_string()),
+            signature: Some(Signature {
+                params: method.params,
+                return_type,
+            }),
+            parent_fqn: Some(parent_fqn.to_string()),
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
+        });
+    }
+}
+
+fn phpdoc_method_name_range(
+    doc_comment: &str,
+    method_name: &str,
+    doc_start: tree_sitter::Point,
+) -> Option<(u32, u32, u32, u32)> {
+    for (line_idx, raw_line) in doc_comment.lines().enumerate() {
+        if !raw_line.contains("@method") {
+            continue;
+        }
+
+        let mut search_from = 0usize;
+        while let Some(relative_pos) = raw_line[search_from..].find(method_name) {
+            let name_start = search_from + relative_pos;
+            let after_name = &raw_line[name_start + method_name.len()..];
+            if after_name.trim_start().starts_with('(') {
+                let line = doc_start.row as u32 + line_idx as u32;
+                let line_base_col = if line_idx == 0 {
+                    doc_start.column as u32
+                } else {
+                    0
+                };
+                let start_col = line_base_col + name_start as u32;
+                let end_col = start_col + method_name.len() as u32;
+                return Some((line, start_col, line, end_col));
+            }
+            search_from = name_start + method_name.len();
+        }
+    }
+
+    None
 }
 
 /// Extract members from a class/interface/trait/enum body.
@@ -1544,13 +1648,17 @@ fn has_child_kind(node: Node, kind: &str) -> bool {
 
 /// Find the doc comment (PHPDoc) immediately preceding a node.
 fn find_doc_comment(node: Node, source: &str) -> Option<String> {
+    find_doc_comment_node(node, source).map(|comment| node_text(comment, source).to_string())
+}
+
+fn find_doc_comment_node<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
     // Look for a comment node as a previous sibling
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {
         if p.kind() == "comment" {
             let text = node_text(p, source);
             if text.starts_with("/**") {
-                return Some(text.to_string());
+                return Some(p);
             }
             // Non-PHPDoc comment — stop looking
             return None;
@@ -2270,5 +2378,42 @@ class Holder {
             .as_ref()
             .and_then(|sig| sig.return_type.as_ref());
         assert!(matches!(native_type, Some(TypeInfo::Simple(name)) if name == "Account"));
+    }
+
+    #[test]
+    fn test_phpdoc_method_tags_emit_virtual_method_symbols() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App;
+
+/**
+ * @method void refresh()
+ * @method static User make()
+ */
+interface Helper {}
+"#,
+        );
+
+        let refresh = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Method && s.fqn == "App\\Helper::refresh")
+            .expect("@method refresh should be emitted as a method symbol");
+        assert_eq!(refresh.parent_fqn.as_deref(), Some("App\\Helper"));
+        assert!(!refresh.modifiers.is_static);
+        assert!(matches!(
+            refresh
+                .signature
+                .as_ref()
+                .and_then(|sig| sig.return_type.as_ref()),
+            Some(TypeInfo::Void)
+        ));
+
+        let make = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Method && s.fqn == "App\\Helper::make")
+            .expect("@method static make should be emitted as a method symbol");
+        assert!(make.modifiers.is_static);
     }
 }

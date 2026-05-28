@@ -99,6 +99,7 @@
             "filter",
             "hash",
             "session",
+            "soap",
             "Reflection",
             "random",
             "intl",

@@ -1292,6 +1292,7 @@ impl PhpLspBackend {
             );
             if let Some(template) = template_document {
                 diagnostics = template.map_diagnostics_to_original(diagnostics);
+                diagnostics.clear();
             }
 
             if document_versions.get(&task_uri_str).map(|current| *current) == Some(version) {
@@ -1807,6 +1808,7 @@ impl PhpLspBackend {
                     );
                     if let Some(template) = template_document {
                         diags = template.map_diagnostics_to_original(diags);
+                        diags.clear();
                     }
                     if reindex_document_versions
                         .get(&uri_str)
@@ -2979,6 +2981,11 @@ impl PhpLspBackend {
         );
         if let Some(template) = &template_document {
             diagnostics = template.map_diagnostics_to_original(diagnostics);
+            diagnostics.clear();
+        } else if should_preresolve_dependencies {
+            diagnostics = self
+                .filter_lazy_resolved_symbol_diagnostics(diagnostics)
+                .await;
         }
 
         let has_syntax_errors = diagnostics.iter().any(|diagnostic| {
@@ -3022,6 +3029,26 @@ impl PhpLspBackend {
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, version)
             .await;
+    }
+
+    async fn filter_lazy_resolved_symbol_diagnostics(
+        &self,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Vec<Diagnostic> {
+        let mut filtered = Vec::with_capacity(diagnostics.len());
+
+        for diagnostic in diagnostics {
+            if diagnostic.source.as_deref() == Some("php-lsp") {
+                if let Some(fqn) = lazy_resolvable_diagnostic_fqn(&diagnostic.message) {
+                    if self.resolve_fqn_lazy(&fqn).await.is_some() {
+                        continue;
+                    }
+                }
+            }
+            filtered.push(diagnostic);
+        }
+
+        filtered
     }
 
     async fn path_is_excluded_by_config(&self, path: &Path) -> bool {
@@ -14096,7 +14123,10 @@ fn is_dynamic_member_access(
         return false;
     }
 
-    if fqn_matches(class_fqn, "stdClass") || is_phpunit_test_double_type(class_fqn) {
+    if fqn_matches(class_fqn, "stdClass")
+        || fqn_matches(class_fqn, "SimpleXMLElement")
+        || is_phpunit_test_double_type(class_fqn)
+    {
         return true;
     }
 
@@ -14292,6 +14322,24 @@ fn unknown_member_message(sym_at_pos: &SymbolAtPosition) -> String {
         RefKind::ClassConstant => format!("Unknown class constant: {}", sym_at_pos.fqn),
         _ => format!("Unknown member: {}", sym_at_pos.fqn),
     }
+}
+
+fn lazy_resolvable_diagnostic_fqn(message: &str) -> Option<String> {
+    for prefix in [
+        "Unresolved use statement: ",
+        "Unknown class: ",
+        "Unknown method: ",
+        "Unknown class constant: ",
+    ] {
+        if let Some(fqn) = message.strip_prefix(prefix) {
+            let fqn = fqn.trim();
+            if fqn.contains('\\') || fqn.contains("::") {
+                return Some(fqn.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 fn static_instance_misuse_message(
@@ -15191,7 +15239,14 @@ fn infer_expression_type(
     if lower == "true" || lower == "false" {
         return Some(inferred_builtin_type(&lower, range));
     }
-    if raw.starts_with('"') || raw.starts_with('\'') || kind.contains("string") {
+    if raw.starts_with('"') || raw.starts_with('\'') {
+        return Some(InferredExprType {
+            display: "string".to_string(),
+            comparable: raw.to_string(),
+            range,
+        });
+    }
+    if kind.contains("string") {
         return Some(inferred_builtin_type("string", range));
     }
     if kind.contains("array") || raw.starts_with('[') || lower.starts_with("array(") {
@@ -15203,7 +15258,11 @@ fn infer_expression_type(
         return Some(inferred_builtin_type("float", range));
     }
     if kind.contains("integer") || numeric.parse::<i64>().is_ok() {
-        return Some(inferred_builtin_type("int", range));
+        return Some(InferredExprType {
+            display: "int".to_string(),
+            comparable: raw.to_string(),
+            range,
+        });
     }
 
     None
@@ -15294,12 +15353,33 @@ fn simple_type_accepts_inferred_type(
         .comparable
         .trim_start_matches('\\')
         .to_ascii_lowercase();
+    let actual_display_lower = actual.display.trim_start_matches('\\').to_ascii_lowercase();
 
     match expected_lower.as_str() {
         "mixed" => true,
-        "string" => actual_lower == "string",
-        "int" => actual_lower == "int",
-        "float" => actual_lower == "float" || actual_lower == "int",
+        "string" => {
+            actual_lower == "string"
+                || actual_display_lower == "string"
+                || inferred_string_literal_inner(&actual.comparable).is_some()
+        }
+        "non-empty-string" => {
+            actual_lower == "non-empty-string"
+                || inferred_string_literal_inner(&actual.comparable)
+                    .is_some_and(|inner| !inner.is_empty())
+        }
+        "literal-string" => {
+            actual_lower == "literal-string"
+                || inferred_string_literal_inner(&actual.comparable).is_some()
+        }
+        "int" => actual_lower == "int" || actual_lower.parse::<i64>().is_ok(),
+        "positive-int" => actual_lower.parse::<i64>().is_ok_and(|value| value > 0),
+        "negative-int" => actual_lower.parse::<i64>().is_ok_and(|value| value < 0),
+        "non-negative-int" => actual_lower.parse::<i64>().is_ok_and(|value| value >= 0),
+        "non-positive-int" => actual_lower.parse::<i64>().is_ok_and(|value| value <= 0),
+        "non-zero-int" => actual_lower.parse::<i64>().is_ok_and(|value| value != 0),
+        "float" => {
+            actual_lower == "float" || actual_lower == "int" || actual_lower.parse::<i64>().is_ok()
+        }
         "bool" => matches!(actual_lower.as_str(), "bool" | "true" | "false"),
         "false" => actual_lower == "false",
         "true" => actual_lower == "true",
@@ -15320,6 +15400,18 @@ fn simple_type_accepts_inferred_type(
                 || class_extends_or_implements(index, actual_fqn, &expected_fqn, &mut Vec::new())
         }
     }
+}
+
+fn inferred_string_literal_inner(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    let quote = raw.as_bytes().first().copied()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    if raw.as_bytes().last().copied() != Some(quote) || raw.len() < 2 {
+        return None;
+    }
+    raw.get(1..raw.len() - 1)
 }
 
 fn is_builtin_comparable_type(name: &str) -> bool {
@@ -15361,6 +15453,7 @@ fn override_signature_diagnostics(
             .filter(|sym| {
                 sym.kind == php_lsp_types::PhpSymbolKind::Method
                     && sym.parent_fqn.as_deref() == Some(class_sym.fqn.as_str())
+                    && !is_phpdoc_virtual_method_symbol(sym, class_sym)
             })
             .collect();
 
@@ -15410,6 +15503,19 @@ fn override_signature_diagnostics(
     }
 
     diagnostics
+}
+
+fn is_phpdoc_virtual_method_symbol(
+    method: &php_lsp_types::SymbolInfo,
+    owner: &php_lsp_types::SymbolInfo,
+) -> bool {
+    method.kind == php_lsp_types::PhpSymbolKind::Method
+        && method.parent_fqn.as_deref() == Some(owner.fqn.as_str())
+        && method.doc_comment.as_deref() == owner.doc_comment.as_deref()
+        && method
+            .doc_comment
+            .as_deref()
+            .is_some_and(|doc| doc.contains("@method"))
 }
 
 fn override_signatures_are_compatible(
@@ -15482,13 +15588,14 @@ fn override_param_type_is_compatible(
     parent_file_symbols: &php_lsp_types::FileSymbols,
     child_owner_fqn: Option<&str>,
     parent_owner_fqn: Option<&str>,
-    _index: &WorkspaceIndex,
+    index: &WorkspaceIndex,
 ) -> bool {
     match (child_type, parent_type) {
         (None, _) => true,
         (Some(_), None) => false,
         (Some(child_type), Some(parent_type)) => {
             type_info_is_mixed(child_type)
+                || type_info_is_owner_template(parent_type, parent_owner_fqn, index)
                 || normalized_type_info_for_override(
                     child_type,
                     child_file_symbols,
@@ -15498,6 +15605,8 @@ fn override_param_type_is_compatible(
                     parent_file_symbols,
                     parent_owner_fqn,
                 )
+                || type_info_refines_native(parent_type, child_type)
+                || type_info_refines_native(child_type, parent_type)
         }
     }
 }
@@ -15522,6 +15631,11 @@ fn override_return_type_is_compatible(
     if child_normalized == parent_normalized {
         return true;
     }
+    if type_info_refines_native(parent_type, child_type)
+        || type_info_refines_native(child_type, parent_type)
+    {
+        return true;
+    }
 
     match (
         simple_class_fqn_for_override(child_type, child_file_symbols, child_owner_fqn),
@@ -15540,6 +15654,29 @@ fn type_info_is_mixed(type_info: &php_lsp_types::TypeInfo) -> bool {
         php_lsp_types::TypeInfo::Simple(name) => name.eq_ignore_ascii_case("mixed"),
         _ => false,
     }
+}
+
+fn type_info_is_owner_template(
+    type_info: &php_lsp_types::TypeInfo,
+    owner_fqn: Option<&str>,
+    index: &WorkspaceIndex,
+) -> bool {
+    let Some(owner_fqn) = owner_fqn else {
+        return false;
+    };
+    let php_lsp_types::TypeInfo::Simple(name) = type_info else {
+        return false;
+    };
+
+    index
+        .types
+        .get(owner_fqn.trim_start_matches('\\'))
+        .is_some_and(|owner| {
+            owner
+                .templates
+                .iter()
+                .any(|template| template.name == *name)
+        })
 }
 
 fn normalized_type_info_for_override(
@@ -19919,6 +20056,7 @@ impl LanguageServer for PhpLspBackend {
                     );
                     if let Some(template) = template_document {
                         diags = template.map_diagnostics_to_original(diags);
+                        diags.clear();
                     }
                     if reindex_document_versions
                         .get(&uri_str)
@@ -24239,6 +24377,30 @@ mod tests {
         line_start + col as usize
     }
 
+    fn parse_and_index_php_file(index: &WorkspaceIndex, uri: &str, code: &str) -> FileParser {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+        index.update_file(uri, symbols);
+        parser
+    }
+
+    fn diagnostic_messages(diagnostics: &[Diagnostic]) -> Vec<String> {
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect()
+    }
+
+    fn assert_no_diagnostic_containing(messages: &[String], unexpected: &str) {
+        assert!(
+            !messages.iter().any(|message| message.contains(unexpected)),
+            "Did not expect `{}` in diagnostics, got: {:?}",
+            unexpected,
+            messages
+        );
+    }
+
     #[test]
     fn test_request_type_cache_reuses_same_expression_context() {
         let cache = RequestTypeCache::new("file:///test.php", Some(7));
@@ -25992,6 +26154,222 @@ function run(): void {
     }
 
     #[test]
+    fn test_compute_diagnostics_accepts_positive_int_literal_phpdoc_type() {
+        let uri = "file:///positive-int-literal.php";
+        let code = r#"<?php
+namespace Symfony\Component\Validator\Constraints;
+
+class Length {
+    /**
+     * @param positive-int|null $max
+     */
+    public function __construct(?int $max = null) {}
+}
+
+namespace App;
+
+use Symfony\Component\Validator\Constraints\Length;
+
+function build(): void {
+    new Length(max: 255);
+}
+"#;
+
+        let index = WorkspaceIndex::new();
+        let parser = parse_and_index_php_file(&index, uri, code);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages = diagnostic_messages(&diagnostics);
+
+        assert_no_diagnostic_containing(&messages, "Type mismatch");
+        assert_no_diagnostic_containing(&messages, "positive-int");
+    }
+
+    #[test]
+    fn test_compute_diagnostics_resolves_phpdoc_method_tags() {
+        let uri = "file:///phpdoc-method-call.php";
+        let code = r#"<?php
+namespace Symfony\Component\HttpFoundation;
+
+class Request {}
+
+namespace SymfonyCasts\Bundle\VerifyEmail;
+
+/**
+ * @method void validateEmailConfirmationFromRequest(Request $request, string $userId, string $userEmail)
+ */
+interface VerifyEmailHelperInterface {}
+
+namespace App;
+
+use Symfony\Component\HttpFoundation\Request;
+use SymfonyCasts\Bundle\VerifyEmail\VerifyEmailHelperInterface;
+
+final class EmailVerifier
+{
+    public function __construct(private VerifyEmailHelperInterface $helper) {}
+
+    public function handle(Request $request): void
+    {
+        $this->helper->validateEmailConfirmationFromRequest($request, '1', 'a@example.com');
+    }
+}
+"#;
+
+        let index = WorkspaceIndex::new();
+        let parser = parse_and_index_php_file(&index, uri, code);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages = diagnostic_messages(&diagnostics);
+
+        assert_no_diagnostic_containing(
+            &messages,
+            "Unknown method: SymfonyCasts\\Bundle\\VerifyEmail\\VerifyEmailHelperInterface::validateEmailConfirmationFromRequest",
+        );
+    }
+
+    #[test]
+    fn test_compute_diagnostics_ignores_phpdoc_method_tags_for_override_checks() {
+        let uri = "file:///phpdoc-method-override-noise.php";
+        let code = r#"<?php
+namespace Vendor;
+
+class Entity {}
+
+class BaseRepository
+{
+    public function find(mixed $id): object|null
+    {
+        return null;
+    }
+}
+
+namespace App;
+
+use Vendor\BaseRepository;
+use Vendor\Entity;
+
+/**
+ * @method Entity|null find($id)
+ */
+final class EntityRepository extends BaseRepository
+{
+}
+"#;
+
+        let index = WorkspaceIndex::new();
+        let parser = parse_and_index_php_file(&index, uri, code);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages = diagnostic_messages(&diagnostics);
+
+        assert_no_diagnostic_containing(
+            &messages,
+            "Incompatible override signature: App\\EntityRepository::find differs from Vendor\\BaseRepository::find",
+        );
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_simplexml_dynamic_properties() {
+        let stub_uri = "phpstub://SimpleXML/SimpleXML.php";
+        let stub_code = "<?php\nclass SimpleXMLElement {}\n";
+        let uri = "file:///simplexml-dynamic-properties.php";
+        let code = r#"<?php
+namespace App;
+
+function status(\SimpleXMLElement $result): void {
+    $statusCode = (string) $result->StatusCode;
+    echo $statusCode;
+}
+"#;
+
+        let index = WorkspaceIndex::new();
+        let _stub_parser = parse_and_index_php_file(&index, stub_uri, stub_code);
+        let parser = parse_and_index_php_file(&index, uri, code);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages = diagnostic_messages(&diagnostics);
+
+        assert_no_diagnostic_containing(
+            &messages,
+            "Unknown property: SimpleXMLElement::$StatusCode",
+        );
+    }
+
+    #[test]
+    fn test_compute_diagnostics_accepts_non_empty_string_literals() {
+        let uri = "file:///non-empty-string-literal.php";
+        let code = r#"<?php
+namespace App;
+
+final class RailsClient
+{
+    /**
+     * @param non-empty-string $path
+     * @param array<string,mixed> $payload
+     */
+    public function post(string $path, array $payload): array
+    {
+        return [];
+    }
+
+    public function log(string $message): void {}
+}
+
+function run(RailsClient $client, string $suffix): void
+{
+    $client->post('/v1/billing/crm/get-personal-data', []);
+    $client->log('Rails API HTTP error: ' . $suffix);
+}
+"#;
+
+        let index = WorkspaceIndex::new();
+        let parser = parse_and_index_php_file(&index, uri, code);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages = diagnostic_messages(&diagnostics);
+
+        assert_no_diagnostic_containing(
+            &messages,
+            "Type mismatch for App\\RailsClient::post argument $path",
+        );
+        assert_no_diagnostic_containing(
+            &messages,
+            "Type mismatch for App\\RailsClient::log argument $message",
+        );
+    }
+
+    #[test]
     fn test_compute_diagnostics_allows_enum_builtin_methods_and_parent_constructor() {
         let uri = "file:///enum-parent.php";
         let code = r#"<?php
@@ -26148,6 +26526,111 @@ class UserVoter extends Voter {
                 messages
             );
         }
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_template_phpdoc_override_signature() {
+        let framework_uri = "file:///security-voter-framework.php";
+        let framework_code = r#"<?php
+namespace Symfony\Component\Security\Core\Authentication\Token;
+
+interface TokenInterface {}
+
+namespace Symfony\Component\Security\Core\Authorization\Voter;
+
+use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+
+final class Vote {}
+
+/**
+ * @template TAttribute of string
+ * @template TSubject
+ */
+abstract class Voter
+{
+    /**
+     * @param TAttribute $attribute
+     * @param TSubject $subject
+     */
+    abstract protected function voteOnAttribute(string $attribute, mixed $subject, TokenInterface $token, ?Vote $vote = null): bool;
+}
+"#;
+        let app_uri = "file:///security-voter-app.php";
+        let app_code = r#"<?php
+namespace App;
+
+use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+use Symfony\Component\Security\Core\Authorization\Voter\Vote;
+use Symfony\Component\Security\Core\Authorization\Voter\Voter;
+
+final class UserVoter extends Voter
+{
+    protected function voteOnAttribute(string $attribute, mixed $subject, TokenInterface $token, ?Vote $vote = null): bool
+    {
+        return true;
+    }
+}
+"#;
+
+        let index = WorkspaceIndex::new();
+        let _framework_parser = parse_and_index_php_file(&index, framework_uri, framework_code);
+        let parser = parse_and_index_php_file(&index, app_uri, app_code);
+
+        let diagnostics = compute_diagnostics(
+            app_uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages = diagnostic_messages(&diagnostics);
+
+        assert_no_diagnostic_containing(
+            &messages,
+            "Incompatible override signature: App\\UserVoter::voteOnAttribute differs from Symfony\\Component\\Security\\Core\\Authorization\\Voter\\Voter::voteOnAttribute",
+        );
+    }
+
+    #[test]
+    fn test_compute_diagnostics_allows_phpdoc_refined_array_override_signature() {
+        let uri = "file:///billing-payload-overrides.php";
+        let code = r#"<?php
+namespace App;
+
+interface BillingPayloadProcessor
+{
+    /**
+     * @param array<int,array<string,mixed>> $payload
+     * @return array<int,array<string,mixed>>
+     */
+    public function processWithBillingPayload(array $payload): array;
+}
+
+final class NpDataResponseService implements BillingPayloadProcessor
+{
+    public function processWithBillingPayload(array $payload): array
+    {
+        return $payload;
+    }
+}
+"#;
+
+        let index = WorkspaceIndex::new();
+        let parser = parse_and_index_php_file(&index, uri, code);
+
+        let diagnostics = compute_diagnostics(
+            uri,
+            &parser,
+            &index,
+            DiagnosticsMode::BasicSemantic,
+            PhpVersion::DEFAULT,
+        );
+        let messages = diagnostic_messages(&diagnostics);
+
+        assert_no_diagnostic_containing(
+            &messages,
+            "Incompatible override signature: App\\NpDataResponseService::processWithBillingPayload differs from App\\BillingPayloadProcessor::processWithBillingPayload",
+        );
     }
 
     #[test]

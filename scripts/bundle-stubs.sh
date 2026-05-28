@@ -22,7 +22,7 @@ DEFAULT_EXTENSIONS=(
     Core SPL standard pcre date json
     mbstring ctype tokenizer dom SimpleXML
     PDO curl filter hash session
-    Reflection intl fileinfo openssl phar
+    soap Reflection intl fileinfo openssl phar
     random xml xmlreader xmlwriter zip zlib
     bcmath gd iconv mysqli sodium
 )

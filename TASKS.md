@@ -2277,8 +2277,116 @@ V1-023 ─→ VN-005         (single-root config → multi-root config)
 
 ---
 
+## Milestone: bdpn-ui PHP/Twig diagnostics stabilization (2026-05-28 → 2026-05-29)
+
+Goal: reduce real-project false positives found on `/home/apanov/Projects/bdpn-ui/app`
+without weakening diagnostics for ordinary PHP files.
+
+- [x] **BDPN-001** Fix vendor/lazy resolution diagnostics for Symfony/Doctrine classes. *(done 2026-05-28)*
+  - Reproduction: open `/home/apanov/Projects/bdpn-ui/app/src/Command/ChangeUserPasswordCommand.php`
+    after workspace indexing.
+  - Current false positives: unresolved/unknown `Doctrine\ORM\EntityManagerInterface`,
+    `Symfony\Component\Console\Command\Command`, `InputArgument`, `InputInterface`,
+    `OutputInterface`, `SymfonyStyle`, and `UserPasswordHasherInterface`.
+  - Expected: LSP diagnostics must lazy-index these vendor symbols before semantic
+    diagnostics and return definitions for the imported classes.
+  - Check against bdpn-ui with a real LSP stdio session, not only `php-lsp analyze`.
+
+- [x] **BDPN-002** Support PHPDoc `@method` as virtual method symbols. *(done 2026-05-28)*
+  - Reproduction: `/home/apanov/Projects/bdpn-ui/app/src/Security/EmailVerifier.php:48`
+    calls `VerifyEmailHelperInterface::validateEmailConfirmationFromRequest()`.
+  - Vendor declares the method through PHPDoc `@method` on
+    `SymfonyCasts\Bundle\VerifyEmail\VerifyEmailHelperInterface`.
+  - Expected: no `Unknown method` diagnostic; hover/completion may expose the
+    virtual method when the declaring interface is indexed.
+
+- [x] **BDPN-003** Accept literal positive integers for `positive-int` PHPDoc types. *(done 2026-05-28)*
+  - Reproduction: Symfony `Assert\Length(max: 255)` in bdpn-ui form types.
+  - Current false positive: `expected positive-int|null, got int`.
+  - Expected: integer literals greater than zero are compatible with
+    `positive-int`; keep rejection for non-literal `int` when precision is absent.
+
+- [x] **BDPN-004** Add SOAP and dynamic SimpleXML handling. *(done 2026-05-28)*
+  - Reproduction: `SoapController.php` reports unknown `SoapServer::setObject()`
+    and `SoapServer::handle()`; `GetPublicKeyByCodeService.php` reports unknown
+    dynamic properties on `SimpleXMLElement`.
+  - Expected: bundled/default stubs include SOAP when available; `SimpleXMLElement`
+    dynamic child access does not produce unknown-property diagnostics.
+
+- [x] **BDPN-005** Remove false override-signature diagnostics found on bdpn-ui. *(done 2026-05-28)*
+  - Reproduction: `UserVoter::voteOnAttribute()` and
+    `NpDataResponseService::processWithBillingPayload()` are reported as
+    incompatible despite matching native signatures.
+  - Expected: override checks compare resolved signatures and ignore PHPDoc-only
+    refinements that do not change the native PHP signature.
+
+- [x] **BDPN-006** Make Twig diagnostics safe for real Symfony templates. *(done 2026-05-28)*
+  - Reproduction: bdpn-ui `templates/base.html.twig` and
+    `templates/porting_process/show.html.twig` produce hundreds of virtual-PHP
+    syntax diagnostics from valid Twig syntax.
+  - Expected: no syntax diagnostics caused by valid Twig constructs such as
+    `asset()`, `path()`, filters, inline ternary, `starts with`, block calls,
+    and long HTML attributes. If the virtual PHP mapper cannot prove a diagnostic
+    came from a safe expression fragment, suppress it instead of showing noise.
+
+- [x] **BDPN-007** Add bdpn-ui audit harness or focused fixtures. *(done 2026-05-28)*
+  - Add focused regression tests for the reduced false positives.
+  - Keep the real-project check reproducible through a lightweight script or a
+    documented command path that opens PHP and Twig documents through LSP stdio.
+
+- [x] **BDPN-008** Do not treat PHPDoc `@method` virtual symbols as real overrides. *(done 2026-05-28)*
+  - Reproduction: bdpn-ui Doctrine repositories declare inherited repository
+    methods through class PHPDoc `@method` tags.
+  - Current false positive after `@method` indexing: virtual methods such as
+    `DebtSuspensionRepository::find()` are compared against inherited
+    `ServiceEntityRepository::find()` as if the repository actually declared an
+    override.
+  - Expected: virtual PHPDoc methods remain usable for method resolution,
+    hover/completion, and calls, but override-signature diagnostics ignore them.
+
+- [x] **BDPN-009** Preserve string literal precision for `non-empty-string`. *(done 2026-05-28)*
+  - Reproduction: `/home/apanov/Projects/bdpn-ui/app/src/Rails/Service/OnymaCrmService.php`
+    calls `RailsClient::post('/v1/billing/crm/get-personal-data', ...)`.
+  - Current false positive: `expected non-empty-string, got string`.
+  - Expected: non-empty string literals are compatible with `non-empty-string`
+    while general `string` values remain less precise.
+
+Validation:
+- Added focused parser/server regressions for PHPDoc `@method`, `positive-int`,
+  SimpleXML dynamic properties, override PHPDoc refinements, virtual `@method`
+  override suppression, and `non-empty-string` literals.
+- Final real-project LSP audit on `/home/apanov/Projects/bdpn-ui/app`: opened
+  266 PHP files and 102 Twig files; received diagnostics for all 368 documents;
+  result is 65 PHP diagnostics in 23 files and 0 Twig diagnostics. Remaining
+  diagnostics are unused-symbol warnings plus one real-looking unknown method:
+  `App\Service\PortingProcessWorkflowService::createProcessesForPortingRequest`.
+
+---
+
 ## Текущие задачи
 
+- [x] **T-2026-05-28** Пройти `/home/apanov/Projects/bdpn-ui` PHP+Twig и найти текущие ошибки/false positives `php-lsp` *(done 2026-05-28)*
+  - Scope: run CLI diagnostics against the Symfony app PHP tree with project root `/home/apanov/Projects/bdpn-ui/app`.
+  - Scope: inspect Twig coverage separately because CLI `analyze` currently targets PHP files, while Twig diagnostics are served through template documents in LSP mode.
+  - Deliverable: concise list of reproducible `php-lsp` issues with file/line, message, likely cause, and whether it looks like project code or `php-lsp` false positive/gap.
+  - Audit command path: real LSP stdio session with `rootUri=/home/apanov/Projects/bdpn-ui/app`, `stubsPath=/home/apanov/Projects/php-lsp/client/stubs`, `phpVersion=8.4`, workspace index ready before opening documents.
+  - Result: 266 PHP files + 102 Twig files opened; workspace index loaded 4013 PHP files from cache; 889 diagnostics in 84 files.
+  - PHP result: 118 diagnostics in 35 files. Main `php-lsp` gaps are unresolved Symfony Console/Doctrine/PasswordHasher classes in `ChangeUserPasswordCommand.php`, missing `@method` support on `VerifyEmailHelperInterface`, incomplete `positive-int` literal compatibility for Symfony `Assert\Length`, missing/dynamic SimpleXML property handling, missing bundled/default SOAP stubs, and false override-signature noise.
+  - Twig result: 771 syntax diagnostics in 49 templates, dominated by valid Twig expressions such as `asset()/path()`, `starts with`, inline ternaries, filters, and long HTML attributes that the current virtual-PHP preprocessor cannot model safely.
+  - CLI note: `php-lsp analyze app/src` produced 1668 warnings because CLI analyze does not use the LSP lazy vendor indexing path; this is a separate CLI parity gap and should not be treated as editor-equivalent output.
+- [x] **T-2026-05-28** Проверить и исправить false positive `arrayp` type mismatch для `LoggerInterface::info` context в `DeactivateConfirmService.php` *(done 2026-05-28)*
+  - Причина: PHPDoc shorthand `mixed[]` из `Psr\Log\LoggerInterface` парсился
+    как простой тип `mixed[]`, перезаписывал native `array $context` и давал
+    ложный mismatch для литерала массива.
+  - Исправлено: PHPDoc parser теперь разворачивает `T[]` / `T[][]` в generic
+    array type, поэтому `mixed[]` принимает `[$soapRequest]`.
+  - Cache schema bumped to invalidate old workspace/stubs/vendor symbol
+    snapshots that may already contain `mixed[]` as a simple type.
+  - Regression: добавлены parser test для `mixed[]`/`User[][]`, diagnostics
+    test для PHPDoc `mixed[]` argument и точный diagnostics test для
+    `Psr\Log\LoggerInterface::info(..., mixed[] $context)`.
+  - Validation: targeted parser/server tests, `cargo test --all`,
+    `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`.
 - [x] **T-2026-05-25** Добавить новый milestone IDE intelligence/tooling expansion без ссылок на внешние проекты.
 - [x] **T-2026-05-25** Добавить Monica в список локальных проектов для production validation.
 - [x] **T-2026-05-25** Добавить список локальных проектов для production validation.

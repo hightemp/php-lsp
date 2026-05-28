@@ -29,6 +29,7 @@ pub const DEFAULT_EXTENSIONS: &[&str] = &[
     "filter",
     "hash",
     "session",
+    "soap",
     "tokenizer",
     "ctype",
     "fileinfo",
