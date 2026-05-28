@@ -1663,7 +1663,12 @@ fn find_doc_comment_node<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
             // Non-PHPDoc comment — stop looking
             return None;
         }
-        // Skip whitespace/empty lines between comment and declaration
+        // Skip only structural/unnamed trivia between comment and declaration.
+        // A named sibling means another declaration or statement owns any
+        // earlier PHPDoc and this node is undocumented.
+        if p.is_named() {
+            return None;
+        }
         prev = p.prev_sibling();
     }
     None
@@ -1880,6 +1885,46 @@ mod tests {
         assert_eq!(
             syms.symbols[0].doc_comment.as_deref(),
             Some("/** This is Foo. */")
+        );
+    }
+
+    #[test]
+    fn test_method_does_not_inherit_previous_method_doc_comment() {
+        let syms = parse_and_extract(
+            r#"<?php
+class Foo {
+    /**
+     * @return array<string, int>
+     */
+    public function documented(): array { return []; }
+
+    public function plain(): Bar { return new Bar(); }
+}
+
+class Bar {}
+"#,
+        );
+
+        let documented = syms
+            .symbols
+            .iter()
+            .find(|symbol| symbol.fqn == "Foo::documented")
+            .unwrap();
+        assert!(documented.doc_comment.is_some());
+
+        let plain = syms
+            .symbols
+            .iter()
+            .find(|symbol| symbol.fqn == "Foo::plain")
+            .unwrap();
+        assert!(plain.doc_comment.is_none());
+        assert_eq!(
+            plain
+                .signature
+                .as_ref()
+                .and_then(|signature| signature.return_type.as_ref())
+                .map(ToString::to_string),
+            Some("Bar".to_string())
         );
     }
 

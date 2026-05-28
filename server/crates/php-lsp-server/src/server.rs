@@ -692,19 +692,19 @@ pub(crate) struct WorkspaceRootConfig {
 }
 
 const VENDOR_FILE_LRU_CAPACITY: usize = 512;
-const VENDOR_PRELOAD_ENTRYPOINT_LIMIT: usize = 16;
+pub(crate) const VENDOR_PRELOAD_ENTRYPOINT_LIMIT: usize = 16;
 const MAX_INDEXING_PARSE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
-struct VendorPsr4Mapping {
+pub(crate) struct VendorPsr4Mapping {
     prefix: String,
     directories: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct VendorAutoloadMap {
+pub(crate) struct VendorAutoloadMap {
     psr4: Vec<VendorPsr4Mapping>,
-    files: Vec<PathBuf>,
+    pub(crate) files: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -10620,16 +10620,6 @@ fn local_variable_inlay_type(
         "local-variable-inlay",
         format!("{variable_name}:{usage_start}"),
         || {
-            if let Some(type_hint) =
-                rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
-            {
-                return Some(type_hint);
-            }
-
-            if let Some(type_hint) = foreach_variable_inlay_type_from_index(ctx, variable_node) {
-                return Some(type_hint);
-            }
-
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 ctx.type_cache.cached_string(
                     (0, 0, 0, 0),
@@ -10645,7 +10635,7 @@ fn local_variable_inlay_type(
                     callable_ctx,
                 )
             };
-            let info = infer_variable_hover_info_at_node_with_resolvers(
+            let parser_info = infer_variable_hover_info_at_node_with_resolvers(
                 variable_node,
                 ctx.source,
                 ctx.file_symbols,
@@ -10653,11 +10643,31 @@ fn local_variable_inlay_type(
                 variable_name,
                 Some(&resolver),
                 Some(&callable_param_resolver),
-            )?;
+            );
             let allow_scalar =
                 enclosing_foreach_statement_for_variable(ctx.source, variable_node).is_some();
 
-            local_variable_type_from_hover_info(&info, ctx.file_symbols, allow_scalar)
+            if let Some(type_hint) = parser_info.as_ref().and_then(|info| {
+                info.phpdoc_comment.as_ref().and_then(|_| {
+                    local_variable_type_from_hover_info(info, ctx.file_symbols, allow_scalar)
+                })
+            }) {
+                return Some(type_hint);
+            }
+
+            if let Some(type_hint) =
+                rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
+            {
+                return Some(type_hint);
+            }
+
+            if let Some(type_hint) = foreach_variable_inlay_type_from_index(ctx, variable_node) {
+                return Some(type_hint);
+            }
+
+            parser_info.as_ref().and_then(|info| {
+                local_variable_type_from_hover_info(info, ctx.file_symbols, allow_scalar)
+            })
         },
     )
 }
@@ -10678,8 +10688,76 @@ fn local_variable_inlay_type_from_expression(
             local_variable_inlay_type_from_call_expression(ctx, expression)
         }
         "cast_expression" => local_variable_inlay_type_from_cast_expression(ctx, expression),
+        "conditional_expression" => {
+            local_variable_inlay_type_from_conditional_expression(ctx, expression)
+        }
         "variable_name" => local_variable_inlay_type_from_variable_expression(ctx, expression),
         _ => None,
+    }
+}
+
+fn local_variable_inlay_type_from_conditional_expression(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<LocalVariableInlayType> {
+    let type_info = conditional_expression_type_info(ctx.source, expression)?;
+    local_variable_inlay_type_from_type_info(ctx, "", "", &type_info, true)
+}
+
+fn conditional_expression_type_info(
+    source: &str,
+    expression: tree_sitter::Node,
+) -> Option<php_lsp_types::TypeInfo> {
+    let text = node_text(source, expression);
+    let question = find_top_level_conditional_question(text)?;
+    let colon = find_top_level_needle(text, question + 1, text.len(), ":")?;
+    let if_type = scalar_literal_type_info_from_text(&text[question + 1..colon])?;
+    let else_type = scalar_literal_type_info_from_text(&text[colon + 1..])?;
+    merge_conditional_branch_type_infos(if_type, else_type)
+}
+
+fn find_top_level_conditional_question(text: &str) -> Option<usize> {
+    split_top_level_text_scan(text, |idx, ch, nested| {
+        (ch == '?' && !nested && !text[idx..].starts_with("?->")).then_some(idx)
+    })
+}
+
+fn scalar_literal_type_info_from_text(text: &str) -> Option<php_lsp_types::TypeInfo> {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    if text.starts_with(['\'', '"']) {
+        return Some(php_lsp_types::TypeInfo::Simple("string".to_string()));
+    }
+    if lower == "true" || lower == "false" {
+        return Some(php_lsp_types::TypeInfo::Simple("bool".to_string()));
+    }
+    if lower == "null" {
+        return Some(php_lsp_types::TypeInfo::LiteralNull);
+    }
+
+    let numeric = lower.trim_start_matches(['+', '-']);
+    if numeric.parse::<i64>().is_ok() {
+        return Some(php_lsp_types::TypeInfo::Simple("int".to_string()));
+    }
+    if numeric.parse::<f64>().is_ok() && numeric.contains('.') {
+        return Some(php_lsp_types::TypeInfo::Simple("float".to_string()));
+    }
+
+    None
+}
+
+fn merge_conditional_branch_type_infos(
+    left: php_lsp_types::TypeInfo,
+    right: php_lsp_types::TypeInfo,
+) -> Option<php_lsp_types::TypeInfo> {
+    match (left, right) {
+        (php_lsp_types::TypeInfo::LiteralNull, php_lsp_types::TypeInfo::LiteralNull) => None,
+        (php_lsp_types::TypeInfo::LiteralNull, other)
+        | (other, php_lsp_types::TypeInfo::LiteralNull) => {
+            Some(php_lsp_types::TypeInfo::Nullable(Box::new(other)))
+        }
+        (left, right) if left == right => Some(left),
+        (left, right) => Some(php_lsp_types::TypeInfo::Union(vec![left, right])),
     }
 }
 
@@ -10753,15 +10831,21 @@ fn indexed_call_expression_type_info(
     ctx: &InlayHintContext<'_>,
     expression: tree_sitter::Node,
 ) -> Option<IndexedExpressionTypeInfo> {
+    if let Some(type_info) = doctrine_repository_call_type_info(ctx, expression) {
+        return Some(type_info);
+    }
+
     let name_node = call_target_name_node(expression)?;
-    let (sym_at_pos, symbol) = resolve_reference_symbol_at_node_cached(
+    let Some((sym_at_pos, symbol)) = resolve_reference_symbol_at_node_cached(
         ctx.tree,
         ctx.source,
         name_node,
         ctx.file_symbols,
         ctx.index,
         ctx.type_cache,
-    )?;
+    ) else {
+        return server_member_call_expression_type_info(ctx, expression);
+    };
     if !matches!(
         symbol.kind,
         php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
@@ -10777,12 +10861,466 @@ fn indexed_call_expression_type_info(
         .or_else(|| symbol.parent_fqn.clone())
         .unwrap_or_default();
     let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
+    let type_info =
+        doctrine_collection_getter_return_type_info(ctx, &symbol, &owner_fqn, &type_info)
+            .unwrap_or(type_info);
 
     Some(IndexedExpressionTypeInfo {
         type_info,
         owner_fqn,
         uri: symbol.uri.clone(),
     })
+}
+
+fn server_member_call_expression_type_info(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<IndexedExpressionTypeInfo> {
+    let expression = normalized_expression_node(expression);
+    if !matches!(
+        expression.kind(),
+        "member_call_expression" | "nullsafe_member_call_expression"
+    ) {
+        return None;
+    }
+
+    let object = expression.child_by_field_name("object")?;
+    let name = expression.child_by_field_name("name")?;
+    let method_name = node_text(ctx.source, name).trim();
+    let receiver_type = server_expression_type_info(ctx, object)?;
+    let receiver_fqn = type_info_fqn_from_index(
+        ctx.index,
+        &receiver_type.owner_fqn,
+        &receiver_type.uri,
+        &receiver_type.type_info,
+    )?;
+    let method_fqn = format!("{receiver_fqn}::{method_name}");
+    let symbol = ctx.index.resolve_fqn(&method_fqn)?;
+    if symbol.kind != php_lsp_types::PhpSymbolKind::Method {
+        return None;
+    }
+
+    let return_type = symbol_effective_return_type(&symbol)?;
+    let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&receiver_fqn);
+    let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
+    Some(IndexedExpressionTypeInfo {
+        type_info,
+        owner_fqn: owner_fqn.to_string(),
+        uri: symbol.uri.clone(),
+    })
+}
+
+fn server_expression_type_info(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<IndexedExpressionTypeInfo> {
+    let expression = normalized_expression_node(expression);
+    match expression.kind() {
+        "object_creation_expression" => {
+            let class_node = object_creation_class_node(expression)?;
+            let class_name = node_text(ctx.source, class_node).trim();
+            let fqn = resolve_class_name_pub(class_name, ctx.file_symbols)
+                .trim_start_matches('\\')
+                .to_string();
+            if fqn.is_empty() {
+                return None;
+            }
+            let uri = ctx
+                .index
+                .resolve_fqn(&fqn)
+                .map(|symbol| symbol.uri.clone())
+                .unwrap_or_default();
+            Some(IndexedExpressionTypeInfo {
+                type_info: php_lsp_types::TypeInfo::Simple(fqn.clone()),
+                owner_fqn: fqn,
+                uri,
+            })
+        }
+        "variable_name" => server_variable_type_info(ctx, expression),
+        "function_call_expression"
+        | "member_call_expression"
+        | "nullsafe_member_call_expression"
+        | "scoped_call_expression" => indexed_call_expression_type_info(ctx, expression),
+        _ => None,
+    }
+}
+
+fn server_variable_type_info(
+    ctx: &InlayHintContext<'_>,
+    variable_node: tree_sitter::Node,
+) -> Option<IndexedExpressionTypeInfo> {
+    if let Some(foreach_stmt) = enclosing_foreach_statement_for_variable(ctx.source, variable_node)
+    {
+        let iterable_node = foreach_iterable_node_for_inlay(foreach_stmt)?;
+        let iterable_type = indexed_expression_type_info(ctx, iterable_node)?;
+        let value_type = iterable_value_type_info(&iterable_type.type_info, None)?;
+        return Some(IndexedExpressionTypeInfo {
+            type_info: value_type,
+            owner_fqn: iterable_type.owner_fqn,
+            uri: iterable_type.uri,
+        });
+    }
+
+    call_site_variable_phpdoc_type(ctx, variable_node).map(|type_info| IndexedExpressionTypeInfo {
+        type_info,
+        owner_fqn: current_class_fqn(ctx.file_symbols).unwrap_or_default(),
+        uri: String::new(),
+    })
+}
+
+fn doctrine_repository_call_type_info(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<IndexedExpressionTypeInfo> {
+    let expression = normalized_expression_node(expression);
+    if !matches!(
+        expression.kind(),
+        "member_call_expression" | "nullsafe_member_call_expression"
+    ) {
+        return None;
+    }
+
+    let object = expression.child_by_field_name("object")?;
+    let name = expression.child_by_field_name("name")?;
+    let method_name = node_text(ctx.source, name).trim();
+    let entity_fqn = doctrine_get_repository_entity_fqn(ctx, object)?;
+
+    if let Some(repository_fqn) = doctrine_repository_class_for_entity(ctx, &entity_fqn) {
+        let method_fqn = format!("{repository_fqn}::{method_name}");
+        if let Some(symbol) = ctx.index.resolve_fqn(&method_fqn) {
+            if symbol.kind == php_lsp_types::PhpSymbolKind::Method {
+                let return_type = symbol_effective_return_type(&symbol)?;
+                let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&repository_fqn);
+                let type_info =
+                    resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
+                return Some(IndexedExpressionTypeInfo {
+                    type_info,
+                    owner_fqn: owner_fqn.to_string(),
+                    uri: symbol.uri.clone(),
+                });
+            }
+        }
+    }
+
+    let type_info = doctrine_standard_repository_method_return_type(method_name, &entity_fqn)?;
+    let uri = ctx
+        .index
+        .resolve_fqn(&entity_fqn)
+        .map(|symbol| symbol.uri.clone())
+        .unwrap_or_default();
+
+    Some(IndexedExpressionTypeInfo {
+        type_info,
+        owner_fqn: entity_fqn,
+        uri,
+    })
+}
+
+fn doctrine_get_repository_entity_fqn(
+    ctx: &InlayHintContext<'_>,
+    object: tree_sitter::Node,
+) -> Option<String> {
+    let object = normalized_expression_node(object);
+    if !matches!(
+        object.kind(),
+        "member_call_expression" | "nullsafe_member_call_expression"
+    ) {
+        return None;
+    }
+
+    let name = object.child_by_field_name("name")?;
+    if node_text(ctx.source, name).trim() != "getRepository" {
+        return None;
+    }
+
+    let first_arg = call_arguments(object, ctx.source).into_iter().next()?;
+    let raw = node_text(ctx.source, first_arg.value_node);
+    class_string_fqn_from_expression_text(raw, ctx.file_symbols, ctx.index)
+}
+
+fn doctrine_repository_class_for_entity(
+    ctx: &InlayHintContext<'_>,
+    entity_fqn: &str,
+) -> Option<String> {
+    let normalized_entity = entity_fqn.trim_start_matches('\\');
+    ctx.type_cache.cached_string(
+        (0, 0, 0, 0),
+        "doctrine-repository-class",
+        normalized_entity,
+        || {
+            doctrine_repository_class_from_template_binding(ctx.index, normalized_entity).or_else(
+                || {
+                    doctrine_repository_class_from_entity_attribute(
+                        ctx.index,
+                        ctx.file_symbols,
+                        normalized_entity,
+                    )
+                },
+            )
+        },
+    )
+}
+
+fn doctrine_repository_class_from_template_binding(
+    index: &WorkspaceIndex,
+    entity_fqn: &str,
+) -> Option<String> {
+    index.types.iter().find_map(|entry| {
+        let symbol = entry.value();
+        if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class) {
+            return None;
+        }
+
+        symbol.template_bindings.iter().find_map(|binding| {
+            if binding.kind != php_lsp_types::TemplateBindingKind::Extends
+                || !is_doctrine_repository_base(&binding.target)
+            {
+                return None;
+            }
+
+            let bound_entity = binding.args.first().and_then(type_info_simple_fqn)?;
+            fqn_eq(&bound_entity, entity_fqn).then(|| symbol.fqn.clone())
+        })
+    })
+}
+
+fn doctrine_repository_class_from_entity_attribute(
+    index: &WorkspaceIndex,
+    current_file_symbols: &php_lsp_types::FileSymbols,
+    entity_fqn: &str,
+) -> Option<String> {
+    let entity = index.resolve_fqn(entity_fqn)?;
+    let path = uri_to_path(&entity.uri)?;
+    let source = std::fs::read_to_string(path).ok()?;
+    let declaration_line = entity.range.0 as usize;
+    let start_line = declaration_line.saturating_sub(32);
+    let attribute_text = source
+        .lines()
+        .skip(start_line)
+        .take(declaration_line.saturating_sub(start_line) + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let repository_name = doctrine_repository_class_name_from_attribute_text(&attribute_text)?;
+
+    let entity_file_symbols = index.file_symbols.get(&entity.uri);
+    let file_symbols = entity_file_symbols
+        .as_ref()
+        .map(|symbols| symbols.value())
+        .unwrap_or(current_file_symbols);
+    let resolved = resolve_class_name_pub(&repository_name, file_symbols)
+        .trim_start_matches('\\')
+        .to_string();
+
+    (!resolved.is_empty() && index.resolve_fqn(&resolved).is_some()).then_some(resolved)
+}
+
+fn doctrine_repository_class_name_from_attribute_text(text: &str) -> Option<String> {
+    doctrine_class_name_argument_from_attribute_text(text, "repositoryClass")
+}
+
+fn doctrine_standard_repository_method_return_type(
+    method_name: &str,
+    entity_fqn: &str,
+) -> Option<php_lsp_types::TypeInfo> {
+    let entity = php_lsp_types::TypeInfo::Simple(entity_fqn.to_string());
+    if matches!(method_name, "find" | "findOneBy") || method_name.starts_with("findOneBy") {
+        return Some(php_lsp_types::TypeInfo::Nullable(Box::new(entity)));
+    }
+
+    if matches!(method_name, "findAll" | "findBy") || method_name.starts_with("findBy") {
+        return Some(php_lsp_types::TypeInfo::Generic {
+            base: "list".to_string(),
+            args: vec![entity],
+        });
+    }
+
+    if method_name == "count" || method_name.starts_with("countBy") {
+        return Some(php_lsp_types::TypeInfo::Simple("int".to_string()));
+    }
+
+    None
+}
+
+fn is_doctrine_repository_base(fqn: &str) -> bool {
+    matches!(
+        fqn.trim_start_matches('\\'),
+        "Doctrine\\ORM\\EntityRepository"
+            | "Doctrine\\Bundle\\DoctrineBundle\\Repository\\ServiceEntityRepository"
+            | "Doctrine\\Persistence\\ObjectRepository"
+    )
+}
+
+fn type_info_simple_fqn(type_info: &php_lsp_types::TypeInfo) -> Option<String> {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => Some(name.trim_start_matches('\\').to_string()),
+        php_lsp_types::TypeInfo::Nullable(inner) => type_info_simple_fqn(inner),
+        _ => None,
+    }
+}
+
+fn fqn_eq(left: &str, right: &str) -> bool {
+    left.trim_start_matches('\\') == right.trim_start_matches('\\')
+}
+
+fn doctrine_collection_getter_return_type_info(
+    ctx: &InlayHintContext<'_>,
+    method: &php_lsp_types::SymbolInfo,
+    owner_fqn: &str,
+    return_type: &php_lsp_types::TypeInfo,
+) -> Option<php_lsp_types::TypeInfo> {
+    let collection_base = collection_base_type_name(return_type)?;
+    let path = uri_to_path(&method.uri)?;
+    let source = std::fs::read_to_string(path).ok()?;
+    let property_name = returned_this_property_name_from_method_source(&source, method)
+        .or_else(|| property_name_from_getter(&method.name))?;
+    let target_fqn = doctrine_collection_target_entity_for_property(
+        ctx.index,
+        ctx.file_symbols,
+        &method.uri,
+        owner_fqn,
+        &property_name,
+        method.range.0 as usize,
+        &source,
+    )?;
+
+    Some(php_lsp_types::TypeInfo::Generic {
+        base: collection_base,
+        args: vec![
+            php_lsp_types::TypeInfo::Simple("int".to_string()),
+            php_lsp_types::TypeInfo::Simple(target_fqn),
+        ],
+    })
+}
+
+fn collection_base_type_name(type_info: &php_lsp_types::TypeInfo) -> Option<String> {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) if is_collection_type_name(name) => {
+            Some(name.clone())
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => collection_base_type_name(inner),
+        _ => None,
+    }
+}
+
+fn is_collection_type_name(name: &str) -> bool {
+    let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+    lower == "collection"
+        || lower.ends_with("\\collection")
+        || lower == "doctrine\\common\\collections\\collection"
+}
+
+fn returned_this_property_name_from_method_source(
+    source: &str,
+    method: &php_lsp_types::SymbolInfo,
+) -> Option<String> {
+    let start = method.range.0 as usize;
+    let end = method.range.2 as usize;
+    let method_source = source
+        .lines()
+        .skip(start)
+        .take(end.saturating_sub(start) + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let marker = "return $this->";
+    let after_marker = method_source
+        .find(marker)
+        .map(|idx| &method_source[idx + marker.len()..])?;
+    let end = after_marker
+        .char_indices()
+        .find_map(|(idx, ch)| (!(ch.is_ascii_alphanumeric() || ch == '_')).then_some(idx))
+        .unwrap_or(after_marker.len());
+    let property = after_marker[..end].trim();
+    (!property.is_empty()).then(|| property.to_string())
+}
+
+fn property_name_from_getter(method_name: &str) -> Option<String> {
+    let rest = method_name.strip_prefix("get")?;
+    let mut chars = rest.chars();
+    let first = chars.next()?;
+    let mut property = first.to_ascii_lowercase().to_string();
+    property.push_str(chars.as_str());
+    Some(property)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn doctrine_collection_target_entity_for_property(
+    index: &WorkspaceIndex,
+    current_file_symbols: &php_lsp_types::FileSymbols,
+    uri: &str,
+    owner_fqn: &str,
+    property_name: &str,
+    before_line: usize,
+    source: &str,
+) -> Option<String> {
+    let owner = index.resolve_fqn(owner_fqn)?;
+    if owner.uri != uri {
+        return None;
+    }
+
+    let property_pattern = format!("${property_name}");
+    let lines: Vec<&str> = source.lines().collect();
+    let search_end = before_line.min(lines.len().saturating_sub(1));
+    for line_index in 0..=search_end {
+        let line = lines[line_index];
+        if !line.contains(&property_pattern) || !line.contains("Collection") {
+            continue;
+        }
+
+        let start_line = line_index.saturating_sub(32);
+        let metadata = lines[start_line..=line_index].join("\n");
+        let Some(target_name) = doctrine_target_entity_class_name_from_attribute_text(&metadata)
+        else {
+            continue;
+        };
+
+        let owner_file_symbols = index.file_symbols.get(uri);
+        let file_symbols = owner_file_symbols
+            .as_ref()
+            .map(|symbols| symbols.value())
+            .unwrap_or(current_file_symbols);
+        let resolved = resolve_class_name_pub(&target_name, file_symbols)
+            .trim_start_matches('\\')
+            .to_string();
+        if !resolved.is_empty()
+            && (index.resolve_fqn(&resolved).is_some()
+                || file_symbols
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.fqn == resolved))
+        {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+fn doctrine_target_entity_class_name_from_attribute_text(text: &str) -> Option<String> {
+    doctrine_class_name_argument_from_attribute_text(text, "targetEntity")
+}
+
+fn doctrine_class_name_argument_from_attribute_text(text: &str, argument: &str) -> Option<String> {
+    let marker_start = text.find(argument)?;
+    let after_marker = &text[marker_start + argument.len()..];
+    let separator = after_marker
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, ':' | '=').then_some(idx))?;
+    let after_separator = after_marker[separator + 1..].trim_start();
+    let mut end = 0usize;
+    for (idx, ch) in after_separator.char_indices() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\\') {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    let class_name = after_separator[..end].trim().trim_start_matches('\\');
+    if class_name.is_empty() || !after_separator[end..].trim_start().starts_with("::class") {
+        return None;
+    }
+
+    Some(class_name.to_string())
 }
 
 fn local_variable_inlay_type_from_new_expression(
@@ -10808,31 +11346,8 @@ fn local_variable_inlay_type_from_call_expression(
     ctx: &InlayHintContext<'_>,
     expression: tree_sitter::Node,
 ) -> Option<LocalVariableInlayType> {
-    let name_node = call_target_name_node(expression)?;
-    let (sym_at_pos, symbol) = resolve_reference_symbol_at_node_cached(
-        ctx.tree,
-        ctx.source,
-        name_node,
-        ctx.file_symbols,
-        ctx.index,
-        ctx.type_cache,
-    )?;
-    if !matches!(
-        symbol.kind,
-        php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
-    ) {
-        return None;
-    }
-
-    let return_type = symbol_effective_return_type(&symbol)?;
-    let owner_fqn = sym_at_pos
-        .fqn
-        .rsplit_once("::")
-        .map(|(owner, _)| owner)
-        .or(symbol.parent_fqn.as_deref())
-        .unwrap_or_default();
-    let return_type = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
-    local_variable_inlay_type_from_type_info(ctx, owner_fqn, &symbol.uri, &return_type, true)
+    let info = indexed_call_expression_type_info(ctx, expression)?;
+    local_variable_inlay_type_from_type_info(ctx, &info.owner_fqn, &info.uri, &info.type_info, true)
 }
 
 fn completion_call_arguments_by_param(
@@ -11949,8 +12464,16 @@ fn local_variable_hover_data(
 ) -> Option<LocalVariableHoverData> {
     let variable_name = variable_text_for_node(ctx.source, variable_node)?;
     let usage_start = variable_node.start_byte();
-    let rhs_node =
-        assignment_rhs_for_variable_hover(variable_node, &variable_name, usage_start, ctx.source);
+    let current_rhs = current_assignment_rhs_for_variable(variable_node, ctx.source);
+    let parser_usage_start = current_rhs
+        .as_ref()
+        .map(|rhs| rhs.end_byte())
+        .unwrap_or(usage_start);
+    let rhs_node = current_rhs.or_else(|| {
+        let scope = local_variable_scope_node(variable_node);
+        latest_assignment_rhs_before_usage(scope, &variable_name, usage_start, ctx.source)
+            .map(|(_, rhs)| rhs)
+    });
 
     let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         ctx.type_cache.cached_string(
@@ -11967,13 +12490,19 @@ fn local_variable_hover_data(
         variable_node,
         ctx.source,
         ctx.file_symbols,
-        usage_start,
+        parser_usage_start,
         &variable_name,
         Some(&resolver),
         Some(&callable_param_resolver),
     );
-    let type_hint = rhs_node
-        .and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
+    let type_hint = parser_info
+        .as_ref()
+        .and_then(|info| {
+            info.phpdoc_comment
+                .as_ref()
+                .and_then(|_| local_variable_type_from_hover_info(info, ctx.file_symbols, true))
+        })
+        .or_else(|| rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs)))
         .or_else(|| foreach_variable_inlay_type_from_index(ctx, variable_node))
         .or_else(|| {
             parser_info
@@ -11991,21 +12520,6 @@ fn local_variable_hover_data(
         type_hint,
         phpdoc_comment,
     })
-}
-
-fn assignment_rhs_for_variable_hover<'tree>(
-    variable_node: tree_sitter::Node<'tree>,
-    variable_name: &str,
-    usage_start: usize,
-    source: &str,
-) -> Option<tree_sitter::Node<'tree>> {
-    if let Some(current_rhs) = current_assignment_rhs_for_variable(variable_node, source) {
-        return Some(current_rhs);
-    }
-
-    let scope = local_variable_scope_node(variable_node);
-    latest_assignment_rhs_before_usage(scope, variable_name, usage_start, source)
-        .map(|(_, rhs)| rhs)
 }
 
 fn current_assignment_rhs_for_variable<'tree>(
@@ -14603,7 +15117,7 @@ fn unknown_member_message(sym_at_pos: &SymbolAtPosition) -> String {
     }
 }
 
-fn lazy_resolvable_diagnostic_fqn(message: &str) -> Option<String> {
+pub(crate) fn lazy_resolvable_diagnostic_fqn(message: &str) -> Option<String> {
     for prefix in [
         "Unresolved use statement: ",
         "Unknown class: ",
@@ -18073,7 +18587,7 @@ fn resolve_config_path(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn path_is_excluded(path: &Path, root: &Path, exclude_paths: &[PathBuf]) -> bool {
+pub(crate) fn path_is_excluded(path: &Path, root: &Path, exclude_paths: &[PathBuf]) -> bool {
     if exclude_paths.is_empty() {
         return false;
     }
@@ -18885,7 +19399,7 @@ fn find_composer_json(root: &Path) -> Option<PathBuf> {
     }
 }
 
-fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutoloadMap> {
+pub(crate) fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutoloadMap> {
     let installed_json = vendor_dir.join("composer/installed.json");
     if !installed_json.exists() {
         return None;
@@ -18976,7 +19490,10 @@ fn vendor_package_dir(vendor_dir: &Path, install_path: &str) -> PathBuf {
     }
 }
 
-fn resolve_vendor_paths_from_map(fqn: &str, map: &VendorAutoloadMap) -> Option<Vec<PathBuf>> {
+pub(crate) fn resolve_vendor_paths_from_map(
+    fqn: &str,
+    map: &VendorAutoloadMap,
+) -> Option<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for mapping in &map.psr4 {
         let Some(relative) = fqn.strip_prefix(mapping.prefix.as_str()) else {
@@ -21017,6 +21534,23 @@ impl LanguageServer for PhpLspBackend {
                 resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
             };
 
+            let ctx = InlayHintContext {
+                tree,
+                source: &source,
+                file_symbols: &file_symbols,
+                index: &self.index,
+                type_cache: &type_cache,
+                utf16_index: &utf16_index,
+                requested_range: (0, 0, u32::MAX, u32::MAX),
+            };
+            let variable_node_at_position = variable_name_node_at_range(
+                tree,
+                &source,
+                (pos.line, byte_col, pos.line, byte_col),
+            );
+            let local_var_hover = variable_node_at_position
+                .and_then(|variable_node| local_variable_hover_data(&ctx, variable_node));
+
             // Find symbol at cursor position (with resolver for chains)
             let sym_at_pos = match symbol_at_position_with_request_cache(
                 &type_cache,
@@ -21030,22 +21564,21 @@ impl LanguageServer for PhpLspBackend {
                 Some(&callable_param_resolver),
             ) {
                 Some(s) => s,
-                None => return Ok(None),
-            };
-            let local_var_hover = if sym_at_pos.ref_kind == RefKind::Variable {
-                let ctx = InlayHintContext {
-                    tree,
-                    source: &source,
-                    file_symbols: &file_symbols,
-                    index: &self.index,
-                    type_cache: &type_cache,
-                    utf16_index: &utf16_index,
-                    requested_range: (0, 0, u32::MAX, u32::MAX),
-                };
-                variable_name_node_at_range(tree, &source, (pos.line, byte_col, pos.line, byte_col))
-                    .and_then(|variable_node| local_variable_hover_data(&ctx, variable_node))
-            } else {
-                None
+                None => {
+                    let Some(variable_node) = variable_node_at_position else {
+                        return Ok(None);
+                    };
+                    let Some(variable_name) = variable_text_for_node(&source, variable_node) else {
+                        return Ok(None);
+                    };
+                    SymbolAtPosition {
+                        fqn: variable_name.clone(),
+                        name: variable_name,
+                        ref_kind: RefKind::Variable,
+                        object_expr: None,
+                        range: node_range_node(variable_node),
+                    }
+                }
             };
 
             (sym_at_pos, local_var_hover, file_symbols, source)

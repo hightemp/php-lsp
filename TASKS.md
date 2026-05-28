@@ -2417,6 +2417,185 @@ type feedback as ordinary PHP variables and calls.
     against the bdpn-ui file confirmed the `: string` inlay hint and
     `string $phoneNumber` hover.
 
+- [x] **BDPN-013** Audit LSP behavior for `CompleteHandler.php`. *(done 2026-05-28)*
+  - Scope: independently inspect
+    `/home/apanov/Projects/bdpn-ui/app/src/Soap/Inbound/Handler/CompleteHandler.php`
+    for remaining php-lsp gaps after BDPN-011/BDPN-012.
+  - Checks: LSP diagnostics, local-variable inlay hints, hover/type links,
+    goto-definition coverage, and obvious false positives around repositories,
+    Doctrine collections, foreach values, scalar-normalization flow, and service
+    member calls.
+  - Findings:
+    - Line 18: CLI diagnostics report unresolved
+      `Symfony\Component\Routing\Generator\UrlGeneratorInterface` even though the
+      vendor file exists under `vendor/symfony/routing`.
+    - Lines 46 and 352: weak repository RHS inference overrides adjacent inline
+      `@var` annotations, so `$reverseRequest` shows `object|null` instead of
+      `ReverseRequest|null`, and `$numberStatusRepo` shows
+      `EntityRepository<NumberStatus>` instead of `NumberStatusRepository`.
+    - Line 53: `$regionChangeRequest` gets an inlay hint from inline `@var`, but
+      hover on the declaration is missing in the ternary assignment.
+    - Line 177: `$messageLog = $this->logRegionChangeComplete(...)` is inferred
+      as `array<string, int|string>` instead of `MessageLog`.
+    - Line 262: `$numberStatus` has no hover/inlay for direct chained
+      `getRepository(NumberStatus::class)->findByNameOrCreate(...)`.
+    - Lines 391 and 439: generic repository `findOneBy(...)` results are only
+      `object|null` instead of `RequestStatus|null` and `PortingProcess|null`.
+    - Lines 356 and 422: `$portingNumber` from
+      `PortingRequest::getPortingNumbers()` has no hover/inlay; follow-on
+      `$oldStatus` and `$statusName` are missing because the collection element
+      type is not known. The getter lacks PHPDoc generics, so this needs generic
+      Doctrine collection inference from ORM `targetEntity`/property metadata.
+    - Lines 464 and 479: `$context` has an array-shape inlay but no hover, and
+      `$transition` has no hover for the ternary string result.
+
+- [x] **BDPN-014** Prefer adjacent inline `@var` annotations over weak RHS inference. *(done 2026-05-28)*
+  - Reproduction: `CompleteHandler.php` line 46
+    `/** @var ReverseRequest|null $reverseRequest */` before
+    `$reverseRequest = $this->em->getRepository(...)->findOneBy(...)` still
+    hovers as `object|null`; line 352
+    `/** @var \App\Repository\NumberStatusRepository $numberStatusRepo */`
+    still hovers as `EntityRepository<NumberStatus>`.
+  - Expected: named inline `@var` immediately attached to an assignment should
+    win over generic/weak RHS inference for both inlay hints and hover.
+  - Validation: focused parser/server regression and bdpn-ui in-process LSP
+    check for `$reverseRequest` and `$numberStatusRepo`.
+  - Implemented: local-variable inlay and hover now prefer explicit adjacent
+    PHPDoc `@var` inference before falling back to RHS expression inference.
+  - Implemented: declaration hover on assignment variables resolves parser
+    context at the end of the current RHS, so same-statement PHPDoc is visible.
+  - Regression: e2e coverage verifies `@var User|null` and `@var
+    UserRepository` override weak `object|null` / `object` RHS inference for
+    both inlay hints and hover.
+  - Validation: targeted e2e regression, temporary in-process LSP check against
+    bdpn-ui `CompleteHandler.php` for `$reverseRequest` and
+    `$numberStatusRepo`.
+
+- [x] **BDPN-015** Provide hover on ternary-assignment declaration variables. *(done 2026-05-28)*
+  - Reproduction: `CompleteHandler.php` line 53
+    `$regionChangeRequest = RegionChangeRequest::PROCESS_TYPE === $processType
+    ? ... : null;` gets an inlay hint from inline `@var`, but hover on the
+    declaration variable is empty.
+  - Expected: declaration-hover should use the same assignment/inline-phpdoc
+    inference as inlay hints, including multi-line ternary RHS expressions.
+  - Validation: focused e2e hover regression and bdpn-ui in-process LSP check.
+  - Implemented: current-assignment hover uses the RHS end byte as the parser
+    usage boundary, so inline PHPDoc attached to multi-line assignments is
+    available on the declaration variable itself.
+  - Regression: e2e coverage verifies hover and inlay on a multi-line ternary
+    assignment annotated with `@var RegionChangeRequest|null`.
+  - Validation: targeted e2e regression and temporary in-process LSP check
+    against bdpn-ui `CompleteHandler.php` line 53.
+
+- [x] **BDPN-016** Resolve same-class/private method return types for local assignment inference. *(done 2026-05-28)*
+  - Reproduction: `CompleteHandler.php` line 177
+    `$messageLog = $this->logRegionChangeComplete(...)` is inferred as
+    `array<string, int|string>` instead of `MessageLog`.
+  - Expected: calls on `$this` should resolve methods declared in the same file
+    before falling back to unrelated candidate types; assignment inlay/hover
+    should show `MessageLog`.
+  - Validation: focused e2e regression plus bdpn-ui check for `$messageLog`.
+  - Root cause: a method without PHPDoc could inherit a previous method's
+    docblock because symbol extraction skipped over named siblings while
+    looking backward for an adjacent PHPDoc comment.
+  - Implemented: PHPDoc attachment now stops at named siblings, so only
+    structurally adjacent docblocks belong to the declaration.
+  - Implemented: cache schema version bumped to invalidate stale symbol
+    snapshots with incorrectly attached method PHPDoc.
+  - Regression: parser test covers a documented method followed by an
+    undocumented native-return method; e2e coverage verifies local variable
+    inlay/hover use the native same-class method return.
+  - Validation: parser regression, e2e regression, and temporary in-process LSP
+    check against bdpn-ui `CompleteHandler.php` line 177.
+
+- [x] **BDPN-017** Improve Doctrine repository generic return inference. *(done 2026-05-28)*
+  - Reproduction: `CompleteHandler.php` lines 262, 391, and 439:
+    chained `getRepository(Entity::class)->findByNameOrCreate(...)` has no
+    useful `$numberStatus` hover, while `findOneBy(...)` results show only
+    `object|null` instead of `RequestStatus|null` / `PortingProcess|null`.
+  - Expected: repository receiver generics created from `getRepository(Foo::class)`
+    should flow through chained calls and standard repository methods
+    (`find`, `findOneBy`) without hardcoding project classes.
+  - Validation: generic Doctrine repository e2e regressions and bdpn-ui checks.
+  - Implemented: local expression inference recognizes direct
+    `getRepository(Entity::class)->...` chains and resolves the entity from the
+    class-string argument.
+  - Implemented: custom repository classes are discovered from Doctrine
+    repository generic bindings such as `@extends ServiceEntityRepository<T>`
+    and, as a fallback, from ORM `repositoryClass: Foo::class` attributes.
+  - Implemented: standard Doctrine repository methods infer entity-aware
+    returns: `find`/`findOneBy*` as nullable entity, `findBy*`/`findAll` as
+    `list<Entity>`, and `count`/`countBy*` as `int`.
+  - Regression: e2e coverage verifies direct chained custom repository methods
+    and standard `findOneBy` calls no longer fall back to `object|null`.
+  - Validation: targeted Doctrine e2e regression and temporary in-process LSP
+    check against bdpn-ui `CompleteHandler.php` lines 262, 391, and 439.
+
+- [x] **BDPN-018** Infer Doctrine collection item types from ORM metadata. *(done 2026-05-28)*
+  - Reproduction: `CompleteHandler.php` lines 356 and 422:
+    `foreach ($portingRequest->getPortingNumbers() as $portingNumber)` has no
+    hover/inlay because `PortingRequest::getPortingNumbers()` lacks
+    `@return Collection<int, PortingNumber>`, even though the property has
+    `#[ORM\OneToMany(targetEntity: PortingNumber::class, ...)]`.
+  - Expected: collection-valued getters/properties should expose item types from
+    PHPDoc property generics when present and from ORM `targetEntity` metadata as
+    a fallback.
+  - Validation: generic ORM attribute fixture plus bdpn-ui checks for
+    `$portingNumber`, `$oldStatus`, and `$statusName`.
+  - Implemented: collection-returning getters with non-generic `Collection`
+    returns are enriched from returned `$this->property` metadata when the
+    property has Doctrine ORM `targetEntity: Entity::class`.
+  - Implemented: server-side member-chain fallback reuses enriched foreach
+    variable types, so follow-on chains like `$item->getStatus()?->name()` can
+    infer scalar hover/inlay results.
+  - Implemented: local-variable hover can fall back to local variable inference
+    even when the symbol resolver cannot produce a symbol at the cursor.
+  - Regression: neutral e2e fixture verifies Doctrine `targetEntity` collection
+    foreach item inlay/hover and follow-on member-chain hover without
+    project-specific class names.
+  - Validation: targeted Doctrine e2e regression and temporary in-process LSP
+    check against bdpn-ui `CompleteHandler.php` lines 356, 422, and 423.
+
+- [x] **BDPN-019** Add hover support for array-shape and ternary scalar assignment results. *(done 2026-05-28)*
+  - Reproduction: `CompleteHandler.php` line 464 `$context = [...]` has an
+    array-shape inlay but no hover; line 479 `$transition = condition ? 'a' :
+    'b'` has no hover.
+  - Expected: local-variable hover should reuse explicit inlay-capable type info
+    for array shapes and ternary scalar/string-literal unions.
+  - Validation: focused parser/e2e regressions and bdpn-ui checks.
+  - Implemented: local-variable hover now falls back to local variable inference
+    when symbol-at-position cannot resolve a local symbol.
+  - Implemented: local RHS inference handles scalar literal ternaries, including
+    string/bool/int/float/null branches, and merges nullable/simple branch
+    results for inlay and hover.
+  - Regression: e2e coverage verifies array-shape assignment hover/inlay and
+    scalar ternary assignment hover/inlay.
+  - Validation: targeted e2e regression and temporary in-process LSP check
+    against bdpn-ui `CompleteHandler.php` lines 464 and 479.
+
+- [x] **BDPN-020** Align CLI analyze vendor resolution with editor lazy vendor lookup. *(done 2026-05-28)*
+  - Reproduction: `php-lsp analyze CompleteHandler.php --project-root bdpn-ui/app`
+    reports unresolved `Symfony\Component\Routing\Generator\UrlGeneratorInterface`
+    even though `vendor/symfony/routing/Generator/UrlGeneratorInterface.php`
+    exists and editor lazy vendor indexing should be able to resolve it.
+  - Expected: CLI diagnostics should either load the same Composer/vendor
+    metadata path as LSP or explicitly perform lazy vendor resolution before
+    reporting unresolved external uses.
+  - Validation: CLI JSON regression using a temporary Composer/vendor fixture.
+  - Implemented: CLI `analyze` now pre-resolves class imports and aliased class
+    FQNs through the same generic Composer workspace map plus
+    `vendor/composer/installed.json` PSR-4 metadata path used by editor lazy
+    vendor lookup.
+  - Implemented: CLI `analyze` preloads Composer `autoload.files` vendor
+    entrypoints with the same bounded limit as the LSP path and filters
+    lazy-resolved unresolved-symbol diagnostics after indexing.
+  - Regression: neutral Composer/vendor fixture verifies a class imported from
+    installed vendor PSR-4 metadata produces zero CLI diagnostics.
+  - Validation: `cargo test -p php-lsp-server -- --nocapture`,
+    `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+    and real CLI JSON analyze against bdpn-ui `CompleteHandler.php` with zero
+    diagnostics.
+
 ---
 
 ## Текущие задачи

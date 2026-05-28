@@ -1,14 +1,17 @@
 use crate::server::{
     collect_php_files, compute_diagnostics_with_config, discover_workspace_root_config,
-    load_effective_configuration_settings, normalize_config_paths, path_to_uri,
+    lazy_resolvable_diagnostic_fqn, load_effective_configuration_settings, normalize_config_paths,
+    parse_vendor_autoload_map, path_is_excluded, path_to_uri, resolve_vendor_paths_from_map,
     workspace_index_directories, DiagnosticSeverityConfig, DiagnosticsMode, PhpVersion,
+    VendorAutoloadMap, VENDOR_PRELOAD_ENTRYPOINT_LIMIT,
 };
 use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::references::collect_symbol_references_in_file;
+use php_lsp_parser::semantic::collect_aliased_class_fqns;
 use php_lsp_parser::symbols::extract_file_symbols;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tower_lsp::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
@@ -139,6 +142,7 @@ struct AnalyzeRuntimeConfig {
     diagnostics_mode: DiagnosticsMode,
     diagnostic_severity: DiagnosticSeverityConfig,
     composer_enabled: bool,
+    index_vendor: bool,
     include_paths: Vec<PathBuf>,
     exclude_paths: Vec<PathBuf>,
 }
@@ -156,6 +160,14 @@ struct AnalyzeReport {
     target: PathBuf,
     files_analyzed: usize,
     diagnostics: Vec<AnalyzeDiagnostic>,
+}
+
+struct AnalyzeLazyIndexContext<'a> {
+    index: &'a WorkspaceIndex,
+    project_root: &'a Path,
+    namespace_map: Option<&'a php_lsp_index::composer::NamespaceMap>,
+    runtime_config: &'a AnalyzeRuntimeConfig,
+    vendor_map: Option<&'a VendorAutoloadMap>,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,15 +367,34 @@ fn run_analyze(args: &AnalyzeArgs) -> Result<AnalyzeReport, AnalyzeError> {
     all_files.sort();
 
     let index = WorkspaceIndex::new();
+    let vendor_autoload_map = runtime_config
+        .index_vendor
+        .then(|| parse_vendor_autoload_map(&project_root.join("vendor")))
+        .flatten();
+    if let Some(vendor_map) = vendor_autoload_map.as_ref() {
+        preload_analyze_vendor_entrypoints(&index, &project_root, &runtime_config, vendor_map);
+    }
+
     let mut parsed_by_path = HashMap::new();
     for path in all_files {
         let parsed = parse_analyze_file(&path)?;
-        let source = parsed.parser.source();
-        let tree = parsed.parser.tree().expect("parsed file has a tree");
-        let file_symbols = extract_file_symbols(tree, &source, &parsed.uri);
-        let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
-        index.update_file_with_references(&parsed.uri, file_symbols, references);
+        index_analyze_file(&index, &parsed);
         parsed_by_path.insert(path, parsed);
+    }
+
+    let lazy_index_context = AnalyzeLazyIndexContext {
+        index: &index,
+        project_root: &project_root,
+        namespace_map: workspace_config.namespace_map.as_ref(),
+        runtime_config: &runtime_config,
+        vendor_map: vendor_autoload_map.as_ref(),
+    };
+
+    for target_file in &target_files {
+        let parsed = parsed_by_path.get(target_file).ok_or_else(|| {
+            AnalyzeError::new(format!("Failed to parse {}", target_file.display()))
+        })?;
+        pre_resolve_analyze_file_dependencies(parsed, &lazy_index_context);
     }
 
     let mut diagnostics = Vec::new();
@@ -371,23 +402,25 @@ fn run_analyze(args: &AnalyzeArgs) -> Result<AnalyzeReport, AnalyzeError> {
         let parsed = parsed_by_path.get(target_file).ok_or_else(|| {
             AnalyzeError::new(format!("Failed to parse {}", target_file.display()))
         })?;
-        diagnostics.extend(
-            compute_diagnostics_with_config(
-                &parsed.uri,
-                &parsed.parser,
-                &index,
-                runtime_config.diagnostics_mode,
-                runtime_config.diagnostic_severity,
-                runtime_config.php_version,
-            )
-            .into_iter()
-            .filter(|diagnostic| args.severity.includes(diagnostic.severity))
-            .map(|diagnostic| AnalyzeDiagnostic {
-                path: parsed.path.clone(),
-                uri: parsed.uri.clone(),
-                diagnostic,
-            }),
+        let file_diagnostics = compute_diagnostics_with_config(
+            &parsed.uri,
+            &parsed.parser,
+            &index,
+            runtime_config.diagnostics_mode,
+            runtime_config.diagnostic_severity,
+            runtime_config.php_version,
         );
+        let file_diagnostics =
+            filter_analyze_lazy_resolved_symbol_diagnostics(file_diagnostics, &lazy_index_context);
+        diagnostics.extend(file_diagnostics.into_iter().filter_map(|diagnostic| {
+            args.severity
+                .includes(diagnostic.severity)
+                .then(|| AnalyzeDiagnostic {
+                    path: parsed.path.clone(),
+                    uri: parsed.uri.clone(),
+                    diagnostic,
+                })
+        }));
     }
 
     diagnostics.sort_by(|left, right| {
@@ -432,6 +465,7 @@ fn analyze_runtime_config(settings: &serde_json::Value) -> AnalyzeRuntimeConfig 
     .unwrap_or_default();
     let composer_enabled =
         settings_bool(settings, "composerEnabled", &["composer", "enabled"]).unwrap_or(true);
+    let index_vendor = settings_bool(settings, "indexVendor", &["indexVendor"]).unwrap_or(true);
     let include_paths = settings_string_array(settings, "includePaths", &["includePaths"])
         .map(normalize_config_paths)
         .unwrap_or_default();
@@ -444,6 +478,7 @@ fn analyze_runtime_config(settings: &serde_json::Value) -> AnalyzeRuntimeConfig 
         diagnostics_mode,
         diagnostic_severity,
         composer_enabled,
+        index_vendor,
         include_paths,
         exclude_paths,
     }
@@ -575,9 +610,200 @@ fn parse_analyze_file(path: &Path) -> Result<ParsedAnalyzeFile, AnalyzeError> {
     })
 }
 
+fn index_analyze_file(index: &WorkspaceIndex, parsed: &ParsedAnalyzeFile) {
+    let source = parsed.parser.source();
+    let Some(tree) = parsed.parser.tree() else {
+        return;
+    };
+    let file_symbols = extract_file_symbols(tree, &source, &parsed.uri);
+    let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
+    index.update_file_with_references(&parsed.uri, file_symbols, references);
+}
+
+fn parse_and_index_analyze_php_file(index: &WorkspaceIndex, file_path: &Path) -> bool {
+    if !file_path.is_file() || file_path.extension().and_then(|ext| ext.to_str()) != Some("php") {
+        return false;
+    }
+
+    let Ok(parsed) = parse_analyze_file(file_path) else {
+        return false;
+    };
+    index_analyze_file(index, &parsed);
+    true
+}
+
+fn preload_analyze_vendor_entrypoints(
+    index: &WorkspaceIndex,
+    project_root: &Path,
+    runtime_config: &AnalyzeRuntimeConfig,
+    vendor_map: &VendorAutoloadMap,
+) {
+    for file_path in vendor_map
+        .files
+        .iter()
+        .take(VENDOR_PRELOAD_ENTRYPOINT_LIMIT)
+    {
+        if path_is_excluded(file_path, project_root, &runtime_config.exclude_paths) {
+            continue;
+        }
+        parse_and_index_analyze_php_file(index, file_path);
+    }
+}
+
+fn pre_resolve_analyze_file_dependencies(
+    parsed: &ParsedAnalyzeFile,
+    context: &AnalyzeLazyIndexContext<'_>,
+) {
+    let Some(tree) = parsed.parser.tree() else {
+        return;
+    };
+    let source = parsed.parser.source();
+    let file_symbols = context
+        .index
+        .file_symbols
+        .get(&parsed.uri)
+        .map(|entry| entry.value().clone())
+        .unwrap_or_default();
+
+    let mut fqns = Vec::new();
+    for use_statement in &file_symbols.use_statements {
+        if use_statement.kind == php_lsp_types::UseKind::Class && use_statement.fqn.contains('\\') {
+            push_unique_string(&mut fqns, use_statement.fqn.clone());
+        }
+    }
+    for fqn in collect_aliased_class_fqns(tree, &source, &file_symbols) {
+        push_unique_string(&mut fqns, fqn);
+    }
+
+    for fqn in fqns {
+        analyze_index_class_dependencies(context, &fqn);
+    }
+}
+
+fn filter_analyze_lazy_resolved_symbol_diagnostics(
+    diagnostics: Vec<Diagnostic>,
+    context: &AnalyzeLazyIndexContext<'_>,
+) -> Vec<Diagnostic> {
+    let mut filtered = Vec::with_capacity(diagnostics.len());
+
+    for diagnostic in diagnostics {
+        if diagnostic.source.as_deref() == Some("php-lsp") {
+            if let Some(fqn) = lazy_resolvable_diagnostic_fqn(&diagnostic.message) {
+                analyze_index_class_dependencies(context, &fqn);
+                if context.index.resolve_fqn(&fqn).is_some() {
+                    continue;
+                }
+            }
+        }
+        filtered.push(diagnostic);
+    }
+
+    filtered
+}
+
+fn analyze_index_class_dependencies(
+    context: &AnalyzeLazyIndexContext<'_>,
+    class_or_member_fqn: &str,
+) {
+    let mut visited = HashSet::new();
+    analyze_index_class_dependencies_inner(context, class_or_member_fqn, &mut visited, 0);
+}
+
+fn analyze_index_class_dependencies_inner(
+    context: &AnalyzeLazyIndexContext<'_>,
+    class_or_member_fqn: &str,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 10;
+    if depth >= MAX_DEPTH {
+        return;
+    }
+
+    let class_fqn = analyze_lazy_class_fqn(class_or_member_fqn);
+    if class_fqn.is_empty() || !visited.insert(class_fqn.clone()) {
+        return;
+    }
+
+    analyze_index_class(context, &class_fqn);
+
+    let parent_fqns: Vec<String> = context
+        .index
+        .types
+        .get(&class_fqn)
+        .map(|symbol| {
+            symbol
+                .extends
+                .iter()
+                .chain(symbol.implements.iter())
+                .chain(symbol.traits.iter())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for parent_fqn in parent_fqns {
+        analyze_index_class_dependencies_inner(context, &parent_fqn, visited, depth + 1);
+    }
+}
+
+fn analyze_index_class(context: &AnalyzeLazyIndexContext<'_>, class_fqn: &str) -> bool {
+    if context.index.types.contains_key(class_fqn) {
+        return false;
+    }
+
+    let mut paths = context
+        .namespace_map
+        .map(|map| map.resolve_class_to_paths(class_fqn))
+        .unwrap_or_default();
+    if paths.is_empty() {
+        if let Some(vendor_map) = context.vendor_map {
+            if let Some(vendor_paths) = resolve_vendor_paths_from_map(class_fqn, vendor_map) {
+                paths.extend(vendor_paths);
+            }
+        }
+    }
+
+    for path in paths {
+        let abs = if path.is_absolute() {
+            path
+        } else {
+            context.project_root.join(path)
+        };
+        if path_is_excluded(
+            &abs,
+            context.project_root,
+            &context.runtime_config.exclude_paths,
+        ) {
+            continue;
+        }
+        if parse_and_index_analyze_php_file(context.index, &abs)
+            && context.index.types.contains_key(class_fqn)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn analyze_lazy_class_fqn(fqn: &str) -> String {
+    let fqn = fqn.trim().trim_start_matches('\\');
+    fqn.rsplit_once("::")
+        .map(|(class_fqn, _)| class_fqn)
+        .unwrap_or(fqn)
+        .to_string()
+}
+
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
+    }
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
     }
 }
 
@@ -839,6 +1065,74 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(clean_root);
         let _ = std::fs::remove_dir_all(broken_root);
+    }
+
+    #[test]
+    fn analyze_resolves_vendor_psr4_symbols_from_composer_installed_metadata() {
+        let root = temp_dir("vendor-psr4");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/acme/library/src")).unwrap();
+
+        std::fs::write(
+            root.join("composer.json"),
+            r#"{
+                "autoload": {
+                    "psr-4": {
+                        "App\\": "src/"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/composer/installed.json"),
+            serde_json::json!({
+                "packages": [
+                    {
+                        "name": "acme/library",
+                        "install-path": "../acme/library",
+                        "autoload": {
+                            "psr-4": {
+                                "Vendor\\Package\\": "src/"
+                            }
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/acme/library/src/ExternalThing.php"),
+            "<?php\nnamespace Vendor\\Package;\nclass ExternalThing {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Service.php"),
+            "<?php\nnamespace App;\nuse Vendor\\Package\\ExternalThing;\nfinal class Service { public function build(): ExternalThing { return new ExternalThing(); } }\n",
+        )
+        .unwrap();
+
+        let result = run_analyze_cli(vec![
+            "src/Service.php".to_string(),
+            "--project-root".to_string(),
+            root.display().to_string(),
+            "--severity".to_string(),
+            "all".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ]);
+
+        assert_eq!(
+            result.exit_code, 0,
+            "stdout: {}\nstderr: {}",
+            result.stdout, result.stderr
+        );
+        let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(value["summary"]["diagnostics"], 0, "{}", result.stdout);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn temp_dir(label: &str) -> PathBuf {
