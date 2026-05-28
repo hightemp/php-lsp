@@ -1,8 +1,8 @@
 # Production Baseline
 
-Latest acceptance refresh: 2026-05-25
+Latest acceptance refresh: 2026-05-28
 Current project version: `0.6.0`
-Latest checked revision: `a9692c0` + working tree validation updates
+Latest checked revision: `a7308f3` + working tree acceptance updates
 
 ## Initial Baseline
 
@@ -69,6 +69,96 @@ Rust acceptance test breakdown:
 | `php-lsp-server` unit tests | 45 |
 | `php-lsp-server` e2e tests | 57 |
 | `php-lsp-types` | 2 |
+
+## IE-045 Intelligence Milestone Acceptance Refresh
+
+Date: 2026-05-28
+Scope: final acceptance after the IDE intelligence milestone through
+`IE-044A`, including PHPDoc/type inference, framework providers, Blade-like
+documents, and Symfony/Twig documents.
+Git revision: `a7308f3` + working tree acceptance updates
+Package version: `0.6.0`
+
+Validation commands:
+
+| Command | Result |
+|---------|--------|
+| `cargo fmt --all --check` | pass |
+| `cargo test --all` | pass, 386 non-doc tests |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `npm run lint` | pass |
+| `npm run build` | pass |
+| `go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/ci.yml .github/workflows/release.yml` | pass |
+| `bash -n scripts/build-server.sh scripts/bundle-stubs.sh scripts/profile-workspace.sh scripts/benchmark-lsp-latency.sh scripts/smoke-vsix.sh` | pass |
+| `git diff --check` | pass |
+| Documentation Cyrillic text check for `README.md`, `docs/`, and `client/README.md` | pass |
+
+Rust acceptance test breakdown:
+
+| Target | Tests |
+|--------|-------|
+| `php-lsp-completion` | 27 |
+| `php-lsp-index` | 34 |
+| `php-lsp-parser` | 169 |
+| `php-lsp-server` unit tests | 76 |
+| `php-lsp-server` e2e tests | 78 |
+| `php-lsp-types` | 2 |
+
+Package input refresh:
+
+| Command | Result |
+|---------|--------|
+| `./scripts/build-server.sh` | pass, `client/bin/linux-x64/php-lsp` size 9.3M |
+| `./scripts/bundle-stubs.sh` | pass, 31 bundled stub extensions, 3.5M |
+| `npx @vscode/vsce package --no-dependencies -o ../target/php-lsp-profile/ht-php-lsp-ie045.vsix` | pass, 99 files, 4.73 MB |
+| `PHP_LSP_VSIX_PLATFORMS=linux-x64 scripts/smoke-vsix.sh target/php-lsp-profile/ht-php-lsp-ie045.vsix` | pass, package and CLI smoke |
+
+Large workspace profile on the primary `large-symfony` acceptance workspace:
+
+| Scenario | JSON | Cache loaded | Cache missing | Indexed files | Symbols | Stub files | Stubs load | Ready time | Peak RSS |
+|----------|------|--------------|---------------|---------------|---------|------------|------------|------------|----------|
+| `ie045-large-symfony-cold` | `target/php-lsp-profile/ie045-large-symfony-cold.json` | 0 | 10575 | 10575 | 72683 | 86 | 321.96 ms | 7419.09 ms | 751,562,752 bytes |
+| `ie045-large-symfony-warm` | `target/php-lsp-profile/ie045-large-symfony-warm.json` | 10575 | 0 | 10575 | 72683 | 86 | 25.72 ms | 3436.05 ms | 643,149,824 bytes |
+
+Result: the primary large workspace still meets the warm-start target `<5s`
+from disk cache after the intelligence milestone.
+
+Large workspace latency:
+
+| State | Hover p95 / p99 | Completion p95 / p99 | Definition p95 / p99 | References p95 / p99 | Rename dry-run p95 / p99 |
+|-------|-----------------|----------------------|----------------------|----------------------|--------------------------|
+| `open` | 3.727 ms / 4.820 ms | 6.720 ms / 10.216 ms | 3.302 ms / 3.918 ms | 76.147 ms / 76.658 ms | 74.853 ms / 98.153 ms |
+| `unopened` | 0.263 ms / 0.263 ms | 0.223 ms / 0.254 ms | 0.190 ms / 0.214 ms | 0.181 ms / 0.301 ms | 0.236 ms / 0.290 ms |
+
+Output: `target/php-lsp-profile/ie045-large-symfony-latency.json`
+
+Result: warm p95 for common interactive requests (`hover`, `completion`,
+`definition`) remains below the `<50ms` target on the primary large workspace.
+
+Large workspace heavy-request responsiveness:
+
+| Heavy request | Hover p95 / p99 while outstanding | Completion p95 / p99 while outstanding | Heavy request p95 / p99 | Cancelled | Cancel p95 / p99 |
+|---------------|-----------------------------------|----------------------------------------|--------------------------|-----------|------------------|
+| `references` | 6.536 ms / 6.789 ms | 9.060 ms / 11.225 ms | 85.743 ms / 91.312 ms | 20/20 | 2.441 ms / 2.742 ms |
+| `renameDryRun` | 7.105 ms / 7.607 ms | 9.250 ms / 9.549 ms | 86.113 ms / 86.152 ms | 20/20 | 2.256 ms / 2.891 ms |
+
+Output:
+`target/php-lsp-profile/ie045-large-symfony-heavy-responsiveness.json`
+
+Result: heavy `references` and rename dry-run requests did not block unrelated
+hover/completion requests in the benchmark, and both request types cancelled
+consistently.
+
+Fixture audit for the current type/framework/template feature corpus:
+
+| Scenario | Output | PHP files | Diagnostics | Missing diagnostics | Request errors | Definition probes | Expected definition misses | Completion probes | Completion label misses |
+|----------|--------|-----------|-------------|---------------------|----------------|-------------------|----------------------------|-------------------|-------------------------|
+| `ie045-lsp-cases-audit` | `target/php-lsp-profile/ie045-lsp-cases-audit.json` | 20 | 35 | 0 | 0 | 63 | 0 | 65 | 20 |
+
+Result: the audit passed with no request/stderr failures, no missing diagnostic
+payloads, and no expected non-null definition misses. Completion label misses
+are reported for review but are not a failure condition for this broad corpus
+audit.
 
 ## Build Artifacts
 

@@ -2111,7 +2111,7 @@ PR-052 ─→ PR-053
     `cargo clippy --all-targets -- -D warnings`, `npm run lint`,
     `npm run build`, `git diff --check`.
 
-- [ ] **IE-045** Final acceptance for intelligence milestone
+- [x] **IE-045** Final acceptance for intelligence milestone *(done 2026-05-28)*
   - Run full validation:
     - `cd server && cargo fmt --all --check`
     - `cd server && cargo test --all`
@@ -2128,6 +2128,35 @@ PR-052 ─→ PR-053
     - `docs/performance.md`
     - `docs/production-baseline.md` if metrics changed.
   - Update risk register with any remaining partial/accepted limitations.
+  - Validation passed: `cargo fmt --all --check`, `cargo test --all`
+    (386 non-doc tests), `cargo clippy --all-targets -- -D warnings`,
+    `npm run lint`, `npm run build`, `actionlint`, shell syntax checks,
+    documentation Cyrillic check, and `git diff --check`.
+  - Large workspace profile refreshed on the primary Symfony acceptance
+    workspace:
+    `target/php-lsp-profile/ie045-large-symfony-cold.json` and
+    `target/php-lsp-profile/ie045-large-symfony-warm.json`.
+    Warm cache result: 10575 files loaded from cache, 72683 symbols, ready in
+    3436.05 ms, peak RSS 643,149,824 bytes.
+  - Large workspace latency refreshed:
+    `target/php-lsp-profile/ie045-large-symfony-latency.json`.
+    Warm open-file p95: hover 3.727 ms, completion 6.720 ms, definition
+    3.302 ms; references and rename dry-run remain accepted heavy operations.
+  - Heavy-request responsiveness refreshed:
+    `target/php-lsp-profile/ie045-large-symfony-heavy-responsiveness.json`.
+    Hover/completion stayed below 10 ms p95 while `references` or rename
+    dry-run was outstanding; both heavy requests cancelled 20/20.
+  - Fixture audit added for the current type/framework/template corpus:
+    `target/php-lsp-profile/ie045-lsp-cases-audit.json`, 20 PHP files,
+    35 diagnostics, no request errors, no missing diagnostics, no expected
+    non-null definition misses.
+  - Package smoke passed:
+    `target/php-lsp-profile/ht-php-lsp-ie045.vsix`, host `linux-x64` package
+    and CLI smoke.
+  - Documentation updated in English: `README.md`, `docs/lsp-features.md`,
+    `docs/architecture.md`, `docs/performance.md`,
+    `docs/production-baseline.md`, and
+    `docs/production-risk-register.md`.
 
 ### IDE Intelligence Dependencies
 

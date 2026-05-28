@@ -288,6 +288,12 @@ unopened files from disk through blocking/background IO. The current production
 target is to keep common open-file requests responsive while heavier operations
 are measured on large projects.
 
+The latest acceptance refresh was captured on 2026-05-28 after the IDE
+intelligence milestone. On the primary 10k-file Symfony workspace, warm
+open-file p95 for hover/completion/definition stayed under 7 ms, while heavy
+`references` and rename dry-run requests kept unrelated hover/completion below
+10 ms p95.
+
 ## Configuration Updates
 
 `workspace/didChangeConfiguration` and watched `.php-lsp.toml` changes are

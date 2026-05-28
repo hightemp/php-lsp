@@ -16,12 +16,32 @@ Current tracked artifacts:
 - Small fixture indexing/profile runs.
 - LSP latency smoke runs.
 - Disk cache smoke runs.
+- Large workspace cold/warm profile, latency, and heavy-request responsiveness
+  runs.
+- Broad fixture audits for type, framework, and template intelligence.
+- Packaged VSIX smoke checks.
 
 The risk register in `docs/production-risk-register.md` explains which numbers
 are still production blockers.
 
 Latest large-workspace validation numbers are recorded in
 `docs/production-baseline.md` under "Production Validation Large Workspace Run".
+The latest intelligence milestone refresh is recorded there under
+"IE-045 Intelligence Milestone Acceptance Refresh".
+
+## Latest Acceptance Snapshot
+
+The latest acceptance refresh was captured on 2026-05-28 against the primary
+10k-file Symfony workspace.
+
+| Area | Artifact | Result |
+|---|---|---|
+| Cold profile | `target/php-lsp-profile/ie045-large-symfony-cold.json` | 10575 indexed files, 72683 symbols, ready in 7419.09 ms, peak RSS 751,562,752 bytes. |
+| Warm profile | `target/php-lsp-profile/ie045-large-symfony-warm.json` | 10575 files loaded from cache, ready in 3436.05 ms, peak RSS 643,149,824 bytes. |
+| Latency | `target/php-lsp-profile/ie045-large-symfony-latency.json` | Warm open-file p95: hover 3.727 ms, completion 6.720 ms, definition 3.302 ms. |
+| Heavy responsiveness | `target/php-lsp-profile/ie045-large-symfony-heavy-responsiveness.json` | Hover/completion stayed under 10 ms p95 while references or rename dry-run was outstanding; both heavy requests cancelled 20/20. |
+| Fixture audit | `target/php-lsp-profile/ie045-lsp-cases-audit.json` | Passed with 20 PHP files, 35 expected diagnostics, no request errors, and no expected non-null definition misses. |
+| VSIX smoke | `target/php-lsp-profile/ht-php-lsp-ie045.vsix` | Passed package smoke and host CLI smoke for `linux-x64`. |
 
 ## Key Metrics
 

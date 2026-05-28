@@ -166,8 +166,9 @@ phpstorm-stubs support.
 
 ## Known Limitations
 
-- Production validation has measured a primary 10k-file Symfony workspace and
-  two additional Laravel-like workspaces. Remaining GA work is tracked in
+- Production validation was refreshed on 2026-05-28 after the IDE intelligence
+  milestone. It measures a primary 10k-file Symfony workspace and two
+  additional Laravel-like workspaces. Remaining GA work is tracked in
   `docs/production-risk-register.md` and `docs/production-baseline.md`.
 - Workspace, stub, and lazy vendor file symbols are cached in separate disk
   namespaces; Composer vendor metadata is cached in memory with an LRU for

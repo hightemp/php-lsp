@@ -1,7 +1,7 @@
 # Production Risk Register
 
 Date: 2026-05-22
-Last updated: 2026-05-25
+Last updated: 2026-05-28
 Scope: production-readiness milestone, weeks 1-6.
 
 This document tracks known production gaps after the baseline/profiling setup.
@@ -12,16 +12,16 @@ The format is intentionally operational: every risk is tied to an owner task in
 
 | ID | Area | Severity | Owner task | Status |
 |----|------|----------|------------|--------|
-| R-001 | Disk cache maturity | High | `PR-010`, `PR-011`, `PV-002` | Mitigated |
-| R-002 | `references`/`rename`/`codeLens` scale | High | `PR-022`, `PR-021`, `PV-003`, `PV-004`, `PV-011` | Accepted limitation |
-| R-003 | Parallel indexing acceptance | High | `PR-013`, `PR-023`, `PV-002` | Mitigated |
-| R-004 | Sync file IO in async/hot paths | High | `PR-023`, `PV-003`, `PV-004` | Mitigated |
-| R-005 | Request cancellation coverage for heavy operations | High | `PR-021`, `PR-050`, `PV-004` | Mitigated |
+| R-001 | Disk cache maturity | High | `PR-010`, `PR-011`, `PV-002`, `IE-045` | Mitigated |
+| R-002 | `references`/`rename`/`codeLens` scale | High | `PR-022`, `PR-021`, `PV-003`, `PV-004`, `PV-011`, `IE-045` | Accepted limitation |
+| R-003 | Parallel indexing acceptance | High | `PR-013`, `PR-023`, `PV-002`, `IE-045` | Mitigated |
+| R-004 | Sync file IO in async/hot paths | High | `PR-023`, `PV-003`, `PV-004`, `IE-045` | Mitigated |
+| R-005 | Request cancellation coverage for heavy operations | High | `PR-021`, `PR-050`, `PV-004`, `IE-045` | Mitigated |
 | R-006 | `didChange` debounce/version ordering | High | `PR-020`, `PR-050` | Mitigated |
 | R-007 | Version-aware stubs | Medium | `PR-030`, `PR-011` | Mitigated |
 | R-008 | Lazy vendor indexing scale validation | Medium | `PR-012`, `PR-011`, `PV-014` | Partially mitigated |
-| R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041`, `IE-030`, `IE-031`, `PV-012` | Accepted limitation |
-| R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052` | Mitigated |
+| R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041`, `IE-030`, `IE-031`, `PV-012`, `IE-045` | Accepted limitation |
+| R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052`, `IE-045` | Mitigated |
 
 ## Risks
 
@@ -39,6 +39,9 @@ Current evidence:
   3423.19 ms warm, meeting the `<5s` large-workspace warm-start target.
 - `PV-002` also showed stubs cache load dropping from 313.73 ms cold to 33.79
   ms warm.
+- `IE-045` repeated the same primary large workspace profile after the
+  intelligence milestone: 10575 workspace files loaded from disk cache, ready
+  time 3436.05 ms warm, and stubs cache load 25.72 ms warm.
 
 Impact:
 
@@ -55,7 +58,7 @@ Mitigation:
 
 Exit signal:
 
-- `PV-002` warm `large-symfony` run reaches `phase=ready` in `3423.19 ms`.
+- `IE-045` warm `large-symfony` run reaches `phase=ready` in `3436.05 ms`.
 - Cache invalidates changed files without full rebuild; keep this covered by
   cache tests and reindex dogfood.
 
@@ -72,11 +75,18 @@ Current evidence:
   73.529 ms / 73.619 ms.
 - In the same run, common warm open-file requests stayed below target:
   hover p95 3.562 ms, completion p95 6.556 ms, definition p95 2.855 ms.
+- `IE-045` repeated the latency baseline after the intelligence milestone:
+  warm open-file `references` p95/p99 76.147 ms / 76.658 ms, rename dry-run
+  p95/p99 74.853 ms / 98.153 ms, hover p95 3.727 ms, completion p95 6.720 ms,
+  and definition p95 3.302 ms.
 - `PV-004` heavy-responsiveness benchmark on `large-symfony` shows
   hover/completion p95 staying under 6.4 ms while `references` or rename dry-run
   is outstanding.
 - `PV-004` normal heavy request p95: `references` 76.329 ms, rename dry-run
   82.806 ms.
+- `IE-045` heavy-responsiveness run kept hover/completion below 9.3 ms p95
+  while heavy requests were outstanding. Heavy request p95 was 85.743 ms for
+  `references` and 86.113 ms for rename dry-run.
 
 Impact:
 
@@ -97,6 +107,8 @@ Exit signal:
 
 - `PV-003`/`PV-004` measured warm `references`/rename dry-run and concurrent
   hover/completion responsiveness on `large-symfony`.
+- `IE-045` refreshed those measurements after type/framework/template
+  intelligence work.
 - `PV-011`/`PV-014` dogfood should keep `codeLens` on the watch list; this is
   an accepted limitation rather than a GA blocker unless dogfood finds visible UI stalls.
 
@@ -112,6 +124,9 @@ Current evidence:
   730,419,200 bytes.
 - `PV-002` warm cache run loaded the same workspace with peak RSS 625,729,536
   bytes and ready time 3423.19 ms.
+- `IE-045` cold run indexed the same 10575 files / 72683 symbols with
+  `filesPerSec=1492.38`, `symbolsPerSec=10257.27`, and peak RSS 751,562,752
+  bytes. The warm run stayed under the `<5s` target at 3436.05 ms.
 
 Impact:
 
@@ -129,6 +144,8 @@ Exit signal:
 
 - `PV-002` measured `1503.84` files/sec and `10336.04` symbols/sec on
   `large-symfony` cold indexing with bounded parallel parsing.
+- `IE-045` repeated the acceptance run after the intelligence milestone and
+  stayed within the same performance envelope.
 - Progress reporting remains correct enough for the acceptance/profile harness.
 
 ### R-004: Sync file IO in async/hot paths
@@ -141,6 +158,8 @@ Current evidence:
 - `PV-003` did not show common request latency symptoms from disk IO on the
   primary large workspace: warm open-file hover/completion/definition p95 stayed
   under 7 ms.
+- `IE-045` repeated the common warm open-file request check with hover p95
+  3.727 ms, completion p95 6.720 ms, and definition p95 3.302 ms.
 
 Impact:
 
@@ -156,6 +175,8 @@ Exit signal:
 
 - `PV-003` and `PV-004` show hover/completion staying under the common
   interactive target during large-workspace warm and heavy-request scenarios.
+- `IE-045` refreshed this evidence after Blade/Twig and framework-provider
+  work.
 - Slow file reads are observable and timeout-safe.
 
 ### R-005: Request cancellation coverage for heavy operations
@@ -168,6 +189,9 @@ Current evidence:
 - `references` and `rename` have cooperative yield points and e2e coverage for `$/cancelRequest`.
 - `PV-004` large-workspace cancellation check cancelled `references` 20/20 and
   rename dry-run 20/20; cancel p95 stayed near 2 ms for both request types.
+- `IE-045` repeated cancellation after the intelligence milestone:
+  `references` cancelled 20/20 with p95 2.441 ms and rename dry-run cancelled
+  20/20 with p95 2.256 ms.
 
 Impact:
 
@@ -185,6 +209,7 @@ Exit signal:
 
 - `PV-004` cancelled `references` and rename dry-run 20/20 with cancel p95 near
   2 ms.
+- `IE-045` refreshed the cancellation result after the intelligence milestone.
 - New hover/completion requests remain responsive while obsolete work is cancelled or yields.
 
 ### R-006: `didChange` debounce/version ordering
@@ -248,6 +273,9 @@ Current evidence:
   `large-monica` produced no LSP request/stderr failures, but the top unknown
   symbol diagnostics are dominated by missing external vendor metadata in these
   local checkouts.
+- `IE-045` did not change the installed-vendor evidence; the primary large
+  Symfony checkout used for acceptance still lacks installed Composer vendor
+  metadata.
 
 Impact:
 
@@ -295,6 +323,9 @@ Current evidence:
   document support through virtual PHP and source maps, including mapped
   hover/completion/definition/diagnostics/semantic tokens for supported
   template expressions and static Twig template path lookup.
+- `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request
+  errors, no missing diagnostic payloads, and no expected non-null definition
+  misses across the current type/framework/template corpus.
 
 Impact:
 
@@ -320,6 +351,8 @@ Exit signal:
 
 - Fixture-driven PHPDoc e2e tests cover hover/completion/definition/diagnostics behavior.
 - Framework-heavy regression corpus shows reduced false positives without project-specific hardcode.
+- `IE-045` broad fixture audit covers the current milestone corpus and records
+  any non-blocking completion-label misses for review.
 - Future work should be driven by real-project misses rather than broad parser rewrites.
 
 ### R-010: LSP polish/capability mismatch risk
@@ -329,6 +362,8 @@ Current evidence:
 - `PR-043` added `textDocument/semanticTokens/range`, improved `workspace/symbol`, and stopped advertising `willRenameFiles` until meaningful path-refactor edits exist.
 - `PR-051` aligned release packaging with documented platforms and added VSIX smoke checks.
 - `PR-052` added `docs/lsp-features.md` with supported/partial/unsupported behavior.
+- `IE-045` refreshed README, feature, architecture, performance, baseline, and
+  risk documentation after the intelligence milestone acceptance run.
 
 Impact:
 

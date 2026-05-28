@@ -5,6 +5,11 @@ means the server implements the LSP method, but the behavior is intentionally
 limited, performance-sensitive on large workspaces, or delegated to external
 tools.
 
+Latest acceptance refresh: 2026-05-28 (`IE-045`). The feature matrix reflects
+the IDE intelligence milestone after PHPDoc/type inference, framework provider,
+Blade-like document, and Symfony/Twig document work. Performance evidence lives
+in `docs/production-baseline.md`.
+
 ## Status Legend
 
 | Status | Meaning |
