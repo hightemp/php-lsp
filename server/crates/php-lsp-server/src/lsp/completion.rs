@@ -217,7 +217,12 @@ impl PhpLspBackend {
                     array_expr,
                     key_prefix,
                 } => self.shape_key_completion_items(&inference_ctx, array_expr, key_prefix),
-                _ => provide_completions(&context, &self.index, &file_symbols),
+                _ => provide_completions_at_range(
+                    &context,
+                    &self.index,
+                    &file_symbols,
+                    (pos.line, byte_col, pos.line, byte_col),
+                ),
             }
         };
         if let Some(ref framework_string_key_context) = framework_string_key_context {
@@ -698,7 +703,6 @@ impl PhpLspBackend {
 
                 if object_expr == "$this" {
                     current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
-                        .or_else(|| current_class_fqn(file_symbols))
                 } else if object_expr.starts_with('$') {
                     self.infer_completion_variable_type(
                         tree,
@@ -782,8 +786,7 @@ impl PhpLspBackend {
                 let mut parts = normalized.split("->");
                 let base_expr = parts.next()?.trim();
                 let mut class_fqn = if base_expr == "$this" {
-                    current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
-                        .or_else(|| current_class_fqn(file_symbols))?
+                    current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))?
                 } else if base_expr.starts_with('$') {
                     self.infer_completion_variable_type(
                         tree,

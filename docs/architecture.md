@@ -174,6 +174,22 @@ Disk cache: workspace / stubs / vendor
 | Templates | `template.rs` plus template-aware LSP handlers | virtual PHP/source maps | Twig context scans | `tests/e2e_templates.rs` |
 | Stubs/vendor/cache | `src/indexing/*` and lazy index paths | symbol extraction | `php-lsp-index::{stubs,composer,cache}` | index unit tests + `tests/e2e_indexing.rs` |
 
+## Completion Context
+
+The LSP completion path calls `provide_completions_at_range(...)` with the
+cursor byte-column range. The completion provider uses that range to find the
+class-like symbol containing the cursor before filtering member visibility for
+`$this`, `self`, `static`, and `parent`. This keeps private and protected
+members tied to the actual class, trait, enum, or anonymous class at the cursor
+instead of the first class-like symbol in file order.
+
+When ranges are nested, the innermost containing class-like symbol wins. This is
+important for anonymous classes declared inside methods or other class bodies:
+completion inside the anonymous class must not leak private members from the
+outer class. The older `provide_completions(...)` helper remains available for
+non-position-aware callers and tests, but server-side LSP requests should use
+the positional API.
+
 ## Startup Flow
 
 1. VS Code activates on PHP files or a workspace containing `composer.json`.

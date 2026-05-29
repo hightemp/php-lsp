@@ -2915,7 +2915,15 @@ while implementing these tasks.
 
 ### Completion, Diagnostics, and Type Safety Tasks
 
-- [ ] **PHA-010** Make completion current-class context position-aware.
+- [x] **PHA-010** Make completion current-class context position-aware. *(done 2026-05-29)*
+  - Completed: completion now passes the cursor byte-range into the provider,
+    uses the class-like symbol at that range for `$this`, `self`, `static`, and
+    `parent` visibility, and picks the innermost class-like context for nested
+    anonymous classes. Validation: `cargo test -p php-lsp-completion`,
+    `cargo test -p php-lsp-server --tests`, `cargo fmt --all --check`,
+    `cargo clippy --all-targets -- -D warnings`, `git diff --check`.
+  - Docs follow-up: `docs/architecture.md` documents positional completion
+    context and innermost class-like visibility filtering. *(done 2026-05-29)*
   - Problem: completion provider uses the first class-like symbol in the file as
     the current class. Multi-class files, anonymous classes, and nested contexts
     can expose wrong private/protected members.

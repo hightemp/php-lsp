@@ -126,6 +126,37 @@ pub fn provide_completions(
     index: &WorkspaceIndex,
     file_symbols: &FileSymbols,
 ) -> Vec<CompletionItem> {
+    let current_class_fqn = find_current_class_fqn(file_symbols);
+    provide_completions_with_current_class(
+        context,
+        index,
+        file_symbols,
+        current_class_fqn.as_deref(),
+    )
+}
+
+/// Provide completion items at a byte-column cursor range.
+pub fn provide_completions_at_range(
+    context: &CompletionContext,
+    index: &WorkspaceIndex,
+    file_symbols: &FileSymbols,
+    cursor_range: (u32, u32, u32, u32),
+) -> Vec<CompletionItem> {
+    let current_class_fqn = find_current_class_fqn_at_range(file_symbols, cursor_range);
+    provide_completions_with_current_class(
+        context,
+        index,
+        file_symbols,
+        current_class_fqn.as_deref(),
+    )
+}
+
+fn provide_completions_with_current_class(
+    context: &CompletionContext,
+    index: &WorkspaceIndex,
+    file_symbols: &FileSymbols,
+    current_class_fqn: Option<&str>,
+) -> Vec<CompletionItem> {
     match context {
         CompletionContext::MemberAccess {
             object_expr,
@@ -136,13 +167,19 @@ pub fn provide_completions(
             member_prefix,
             class_fqn.as_deref(),
             index,
-            file_symbols,
+            current_class_fqn,
         ),
         CompletionContext::StaticAccess {
             class_fqn,
             class_expr,
             member_prefix,
-        } => provide_static_completions(class_fqn, class_expr, member_prefix, index, file_symbols),
+        } => provide_static_completions(
+            class_fqn,
+            class_expr,
+            member_prefix,
+            index,
+            current_class_fqn,
+        ),
         CompletionContext::ArrayKey { .. } => vec![],
         CompletionContext::Variable { prefix } => {
             provide_variable_completions(prefix, file_symbols)
@@ -160,7 +197,7 @@ fn provide_member_completions(
     member_prefix: &str,
     inferred_class_fqn: Option<&str>,
     index: &WorkspaceIndex,
-    file_symbols: &FileSymbols,
+    current_class_fqn: Option<&str>,
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
@@ -169,8 +206,7 @@ fn provide_member_completions(
     let class_fqn = if let Some(fqn) = inferred_class_fqn {
         Some(fqn.to_string())
     } else if object_expr == "$this" {
-        // Find the class we're inside
-        find_current_class_fqn(file_symbols)
+        current_class_fqn.map(str::to_string)
     } else {
         // Best-effort: look for variable type hints or assignments
         // For now, just try to find any type annotation
@@ -184,7 +220,7 @@ fn provide_member_completions(
             if member.modifiers.is_static {
                 continue;
             }
-            if !member_is_visible(&member, object_expr == "$this", file_symbols) {
+            if !member_is_visible(&member, object_expr == "$this", current_class_fqn) {
                 continue;
             }
 
@@ -349,7 +385,7 @@ fn provide_static_completions(
     class_expr: &str,
     member_prefix: &str,
     index: &WorkspaceIndex,
-    file_symbols: &FileSymbols,
+    current_class_fqn: Option<&str>,
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
@@ -376,7 +412,7 @@ fn provide_static_completions(
         if !member_is_visible(
             &member,
             matches!(class_expr, "self" | "static" | "parent"),
-            file_symbols,
+            current_class_fqn,
         ) {
             continue;
         }
@@ -676,14 +712,20 @@ fn symbol_sort_rank(kind: PhpSymbolKind) -> &'static str {
 fn member_is_visible(
     member: &SymbolInfo,
     accessing_from_self: bool,
-    file_symbols: &FileSymbols,
+    current_class_fqn: Option<&str>,
 ) -> bool {
     match member.visibility {
         Visibility::Public => true,
-        Visibility::Protected => accessing_from_self,
+        Visibility::Protected => accessing_from_self && current_class_fqn.is_some(),
         Visibility::Private => {
             accessing_from_self
-                && member.parent_fqn.as_deref() == find_current_class_fqn(file_symbols).as_deref()
+                && member
+                    .parent_fqn
+                    .as_deref()
+                    .zip(current_class_fqn)
+                    .is_some_and(|(declaring_class, current_class)| {
+                        fqn_matches(declaring_class, current_class)
+                    })
         }
     }
 }
@@ -731,6 +773,43 @@ fn find_current_class_fqn(file_symbols: &FileSymbols) -> Option<String> {
     None
 }
 
+fn find_current_class_fqn_at_range(
+    file_symbols: &FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<String> {
+    current_class_symbol_at_range(file_symbols, range).map(|sym| sym.fqn.clone())
+}
+
+fn current_class_symbol_at_range(
+    file_symbols: &FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&SymbolInfo> {
+    let mut current: Option<&SymbolInfo> = None;
+    for sym in file_symbols.symbols.iter().filter(|sym| {
+        matches!(
+            sym.kind,
+            PhpSymbolKind::Class
+                | PhpSymbolKind::Interface
+                | PhpSymbolKind::Trait
+                | PhpSymbolKind::Enum
+        ) && byte_range_contains(sym.range, range)
+    }) {
+        if current.is_none_or(|candidate| byte_range_contains(candidate.range, sym.range)) {
+            current = Some(sym);
+        }
+    }
+    current
+}
+
+fn byte_range_contains(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {
+    (inner.0 > outer.0 || (inner.0 == outer.0 && inner.1 >= outer.1))
+        && (inner.2 < outer.2 || (inner.2 == outer.2 && inner.3 <= outer.3))
+}
+
+fn fqn_matches(left: &str, right: &str) -> bool {
+    left.trim_start_matches('\\') == right.trim_start_matches('\\')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +851,11 @@ mod tests {
             templates: vec![],
             template_bindings: vec![],
         }
+    }
+
+    fn with_range(mut symbol: SymbolInfo, range: (u32, u32, u32, u32)) -> SymbolInfo {
+        symbol.range = range;
+        symbol
     }
 
     #[test]
@@ -1367,5 +1451,292 @@ mod tests {
             "`parent::` should complete inherited instance methods"
         );
         assert!(labels.contains(&"create"));
+    }
+
+    #[test]
+    fn test_member_completion_uses_cursor_class_for_two_classes() {
+        let base = with_range(
+            make_symbol(
+                "Base",
+                "App\\Base",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (0, 0, 6, 1),
+        );
+        let base_secret = make_symbol(
+            "baseSecret",
+            "App\\Base::baseSecret",
+            PhpSymbolKind::Method,
+            Some("App\\Base"),
+            Visibility::Private,
+            false,
+        );
+        let mut child = with_range(
+            make_symbol(
+                "Child",
+                "App\\Child",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (8, 0, 14, 1),
+        );
+        child.extends = vec!["App\\Base".to_string()];
+        let child_secret = make_symbol(
+            "childSecret",
+            "App\\Child::childSecret",
+            PhpSymbolKind::Method,
+            Some("App\\Child"),
+            Visibility::Private,
+            false,
+        );
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![base, base_secret, child, child_secret],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::MemberAccess {
+            object_expr: "$this".to_string(),
+            member_prefix: String::new(),
+            class_fqn: Some("App\\Child".to_string()),
+        };
+        let items = provide_completions_at_range(&ctx, &index, &file_symbols, (10, 12, 10, 12));
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert!(
+            labels.contains(&"childSecret"),
+            "$this-> should include private members from the cursor class"
+        );
+        assert!(
+            !labels.contains(&"baseSecret"),
+            "$this-> should not expose private members from another class"
+        );
+    }
+
+    #[test]
+    fn test_member_completion_uses_cursor_trait_context() {
+        let other = with_range(
+            make_symbol(
+                "Other",
+                "App\\Other",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (0, 0, 4, 1),
+        );
+        let feature = with_range(
+            make_symbol(
+                "Feature",
+                "App\\Feature",
+                PhpSymbolKind::Trait,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (6, 0, 12, 1),
+        );
+        let trait_secret = make_symbol(
+            "traitSecret",
+            "App\\Feature::traitSecret",
+            PhpSymbolKind::Method,
+            Some("App\\Feature"),
+            Visibility::Private,
+            false,
+        );
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![other, feature, trait_secret],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::MemberAccess {
+            object_expr: "$this".to_string(),
+            member_prefix: String::new(),
+            class_fqn: Some("App\\Feature".to_string()),
+        };
+        let items = provide_completions_at_range(&ctx, &index, &file_symbols, (8, 12, 8, 12));
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert!(
+            labels.contains(&"traitSecret"),
+            "$this-> should use the trait at the cursor for private visibility"
+        );
+    }
+
+    #[test]
+    fn test_member_completion_uses_innermost_anonymous_class_context() {
+        let outer = with_range(
+            make_symbol(
+                "Outer",
+                "App\\Outer",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (0, 0, 24, 1),
+        );
+        let outer_secret = make_symbol(
+            "outerSecret",
+            "App\\Outer::outerSecret",
+            PhpSymbolKind::Method,
+            Some("App\\Outer"),
+            Visibility::Private,
+            false,
+        );
+        let anonymous_fqn = "App\\Outer@anonymous:8";
+        let mut anonymous = with_range(
+            make_symbol(
+                "anonymous",
+                anonymous_fqn,
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (8, 8, 16, 9),
+        );
+        anonymous.extends = vec!["App\\Outer".to_string()];
+        let anonymous_secret = make_symbol(
+            "anonymousSecret",
+            "App\\Outer@anonymous:8::anonymousSecret",
+            PhpSymbolKind::Method,
+            Some(anonymous_fqn),
+            Visibility::Private,
+            false,
+        );
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![outer, outer_secret, anonymous, anonymous_secret],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::MemberAccess {
+            object_expr: "$this".to_string(),
+            member_prefix: String::new(),
+            class_fqn: Some(anonymous_fqn.to_string()),
+        };
+        let items = provide_completions_at_range(&ctx, &index, &file_symbols, (12, 16, 12, 16));
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert!(
+            labels.contains(&"anonymousSecret"),
+            "anonymous class private members should be visible inside that class"
+        );
+        assert!(
+            !labels.contains(&"outerSecret"),
+            "outer class private members should not leak into an anonymous class"
+        );
+    }
+
+    #[test]
+    fn test_static_completion_uses_cursor_class_for_self_static_and_parent() {
+        let base = with_range(
+            make_symbol(
+                "Base",
+                "App\\Base",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (0, 0, 6, 1),
+        );
+        let base_private = make_symbol(
+            "basePrivate",
+            "App\\Base::basePrivate",
+            PhpSymbolKind::Method,
+            Some("App\\Base"),
+            Visibility::Private,
+            true,
+        );
+        let base_protected = make_symbol(
+            "baseProtected",
+            "App\\Base::baseProtected",
+            PhpSymbolKind::Method,
+            Some("App\\Base"),
+            Visibility::Protected,
+            false,
+        );
+        let mut child = with_range(
+            make_symbol(
+                "Child",
+                "App\\Child",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (8, 0, 14, 1),
+        );
+        child.extends = vec!["App\\Base".to_string()];
+        let child_private = make_symbol(
+            "childPrivate",
+            "App\\Child::childPrivate",
+            PhpSymbolKind::Method,
+            Some("App\\Child"),
+            Visibility::Private,
+            true,
+        );
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![base, base_private, base_protected, child, child_private],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        for class_expr in ["self", "static"] {
+            let ctx = CompletionContext::StaticAccess {
+                class_expr: class_expr.to_string(),
+                member_prefix: String::new(),
+                class_fqn: "App\\Child".to_string(),
+            };
+            let items = provide_completions_at_range(&ctx, &index, &file_symbols, (10, 12, 10, 12));
+            let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+            assert!(
+                labels.contains(&"childPrivate"),
+                "{class_expr}:: should include private members from the cursor class"
+            );
+            assert!(
+                !labels.contains(&"basePrivate"),
+                "{class_expr}:: should not expose private members from another class"
+            );
+        }
+
+        let ctx = CompletionContext::StaticAccess {
+            class_expr: "parent".to_string(),
+            member_prefix: String::new(),
+            class_fqn: "App\\Base".to_string(),
+        };
+        let items = provide_completions_at_range(&ctx, &index, &file_symbols, (10, 12, 10, 12));
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert!(
+            labels.contains(&"baseProtected"),
+            "parent:: should include protected parent instance methods"
+        );
+        assert!(
+            !labels.contains(&"basePrivate"),
+            "parent:: should not expose private parent members"
+        );
     }
 }

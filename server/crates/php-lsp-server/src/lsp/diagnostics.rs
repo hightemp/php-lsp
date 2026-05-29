@@ -1707,7 +1707,8 @@ pub(in crate::server) fn current_class_symbol_at_range(
     file_symbols: &php_lsp_types::FileSymbols,
     range: (u32, u32, u32, u32),
 ) -> Option<&php_lsp_types::SymbolInfo> {
-    file_symbols.symbols.iter().find(|sym| {
+    let mut current = None;
+    for sym in file_symbols.symbols.iter().filter(|sym| {
         matches!(
             sym.kind,
             php_lsp_types::PhpSymbolKind::Class
@@ -1715,7 +1716,14 @@ pub(in crate::server) fn current_class_symbol_at_range(
                 | php_lsp_types::PhpSymbolKind::Trait
                 | php_lsp_types::PhpSymbolKind::Enum
         ) && byte_range_contains(sym.range, range)
-    })
+    }) {
+        if current.is_none_or(|candidate: &php_lsp_types::SymbolInfo| {
+            byte_range_contains(candidate.range, sym.range)
+        }) {
+            current = Some(sym);
+        }
+    }
+    current
 }
 
 pub(in crate::server) fn class_can_access_protected_member(

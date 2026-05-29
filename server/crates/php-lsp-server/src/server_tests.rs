@@ -1,4 +1,6 @@
-use super::lsp::diagnostics::{parse_phpstan_json_diagnostics, parse_psalm_json_diagnostics};
+use super::lsp::diagnostics::{
+    current_class_fqn_at_range, parse_phpstan_json_diagnostics, parse_psalm_json_diagnostics,
+};
 use super::lsp::document_symbols::{workspace_symbol_candidates, workspace_symbol_lsp_range};
 use super::*;
 use php_lsp_types::*;
@@ -53,6 +55,40 @@ fn parse_and_index_php_file(index: &WorkspaceIndex, uri: &str, code: &str) -> Fi
     let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
     index.update_file(uri, symbols);
     parser
+}
+
+#[test]
+fn test_current_class_fqn_at_range_uses_innermost_class_like() {
+    let file_symbols = FileSymbols {
+        namespace: Some("App".to_string()),
+        use_statements: vec![],
+        symbols: vec![
+            make_symbol(
+                "Outer",
+                "App\\Outer",
+                PhpSymbolKind::Class,
+                (0, 0, 24, 1),
+                None,
+            ),
+            make_symbol(
+                "anonymous",
+                "App\\Outer@anonymous:8",
+                PhpSymbolKind::Class,
+                (8, 8, 16, 9),
+                None,
+            ),
+        ],
+        ..Default::default()
+    };
+
+    assert_eq!(
+        current_class_fqn_at_range(&file_symbols, (12, 16, 12, 16)).as_deref(),
+        Some("App\\Outer@anonymous:8")
+    );
+    assert_eq!(
+        current_class_fqn_at_range(&file_symbols, (20, 8, 20, 8)).as_deref(),
+        Some("App\\Outer")
+    );
 }
 
 fn diagnostic_messages(diagnostics: &[Diagnostic]) -> Vec<String> {
