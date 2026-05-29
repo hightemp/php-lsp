@@ -185,6 +185,22 @@ async fn test_initialize_and_shutdown() {
             == Some(true),
         "expected documentRangeFormattingProvider capability"
     );
+    let completion_triggers = result
+        .get("capabilities")
+        .and_then(|c| c.get("completionProvider"))
+        .and_then(|provider| provider.get("triggerCharacters"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        ["[", "'", "\""].iter().all(|expected| {
+            completion_triggers
+                .iter()
+                .any(|trigger| trigger.as_str() == Some(*expected))
+        }),
+        "expected shape completion triggers '[', '\\'', and '\"', got: {}",
+        result
+    );
     let on_type_provider = result
         .get("capabilities")
         .and_then(|c| c.get("documentOnTypeFormattingProvider"))

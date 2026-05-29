@@ -1,6 +1,7 @@
 //! Shared hover/completion/definition helpers extracted from `server.rs`.
 
 use super::super::*;
+use php_lsp_types::normalize_shape_key_text;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum PhpDocVirtualMemberKind {
@@ -723,6 +724,7 @@ pub(in crate::server) fn shape_completion_items_from_type_info(
     type_info: &php_lsp_types::TypeInfo,
     kind: ShapeCompletionKind,
     prefix: &str,
+    quote: Option<char>,
 ) -> Vec<lsp_types::CompletionItem> {
     let mut shape_items = Vec::new();
     let mut seen = HashSet::new();
@@ -754,6 +756,11 @@ pub(in crate::server) fn shape_completion_items_from_type_info(
                     }
                 }
             };
+            let insert_text = match (kind, quote) {
+                (ShapeCompletionKind::ArrayKey, None) => Some(format!("'{key}'")),
+                _ => Some(key.clone()),
+            };
+
             Some(lsp_types::CompletionItem {
                 label: key.clone(),
                 kind: Some(match kind {
@@ -767,7 +774,7 @@ pub(in crate::server) fn shape_completion_items_from_type_info(
                     key.to_ascii_lowercase()
                 )),
                 filter_text: Some(key.clone()),
-                insert_text: Some(key),
+                insert_text,
                 commit_characters: Some(match kind {
                     ShapeCompletionKind::ArrayKey => vec!["'".to_string(), "\"".to_string()],
                     ShapeCompletionKind::ObjectProperty => {
@@ -843,13 +850,6 @@ pub(in crate::server) fn completion_prefix_rank_for_text(label: &str, prefix: &s
     } else {
         2
     }
-}
-
-pub(in crate::server) fn normalize_shape_key_text(key: &str) -> String {
-    key.trim()
-        .trim_end_matches('?')
-        .trim_matches(|ch| ch == '\'' || ch == '"')
-        .to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

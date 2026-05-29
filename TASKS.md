@@ -2938,7 +2938,8 @@ while implementing these tasks.
     - trait and anonymous class contexts;
     - `$this->` completion does not leak private members from another class.
 
-- [ ] **PHA-011** Fix completion UX gaps found by the audit.
+- [x] **PHA-011** Fix completion UX gaps found by the audit. *(done 2026-05-29)*
+  - Status: completed 2026-05-29.
   - Scope:
     - add completion trigger characters for array/object shape access:
       `[`, `'`, and `"`;
@@ -2954,6 +2955,25 @@ while implementing these tasks.
     - `use Ven|` inserts `Vendor\Package\ClassName`;
     - `Model::|` shows static PHPDoc virtual methods only when marked static;
     - write-only virtual properties are not suggested for read access.
+  - Implementation:
+    - completion capabilities now advertise `[`, `'`, and `"` shape triggers;
+    - array-shape completion supports both `$row[` and `$row['...']` contexts,
+      inserting quoted keys only when the user has not already typed quotes;
+    - `use` statement completion keeps the short class label and sends the full
+      FQN as `insertText`;
+    - static completion includes only static PHPDoc `@method` virtual methods;
+    - member completion tracks read/write access and filters PHPDoc
+      `@property-read` / `@property-write` virtual properties accordingly;
+    - quoted/optional shape-key normalization is shared via
+      `php_lsp_types::normalize_shape_key_text(...)`.
+  - Validation:
+    - `cargo test -p php-lsp-completion`;
+    - `cargo test -p php-lsp-parser array_shape`;
+    - `cargo test -p php-lsp-server --test e2e_initialize --test e2e_completion`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `git diff --check`.
 
 - [ ] **PHA-012** Tighten diagnostics correctness before increasing coverage.
   - Scope:

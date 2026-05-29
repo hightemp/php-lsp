@@ -6,9 +6,9 @@
 //! and @phpstan-import-type/@psalm-import-type.
 
 use php_lsp_types::{
-    ArrayShapeItem, PhpDoc, PhpDocMethod, PhpDocParam, PhpDocProperty, PhpDocPropertyAccess,
-    PhpDocTypeAlias, PhpDocTypeAliasImport, TemplateBinding, TemplateBindingKind, TemplateParam,
-    TemplateVariance, TypeInfo,
+    normalize_shape_key_text, ArrayShapeItem, PhpDoc, PhpDocMethod, PhpDocParam, PhpDocProperty,
+    PhpDocPropertyAccess, PhpDocTypeAlias, PhpDocTypeAliasImport, TemplateBinding,
+    TemplateBindingKind, TemplateParam, TemplateVariance, TypeInfo,
 };
 
 /// Parse a PHPDoc comment string into structured data.
@@ -878,12 +878,9 @@ fn parse_shape_type(s: &str) -> Option<TypeInfo> {
 fn parse_array_shape_item(s: &str) -> ArrayShapeItem {
     let s = s.trim();
     if let Some(colon) = find_top_level_char(s, ':') {
-        let mut key = s[..colon].trim().to_string();
-        let optional = key.ends_with('?');
-        if optional {
-            key.pop();
-            key = key.trim_end().to_string();
-        }
+        let raw_key = s[..colon].trim();
+        let optional = raw_key.trim_end().ends_with('?');
+        let key = normalize_shape_key_text(raw_key);
         ArrayShapeItem {
             key: (!key.is_empty()).then_some(key),
             optional,
@@ -1543,7 +1540,7 @@ mod tests {
     #[test]
     fn test_parse_array_shape_and_literal_types() {
         let doc = parse_phpdoc(
-            "/**\n * @return array{status: 'ok', count?: 1, active: true, ratio: 1.5}\n */",
+            "/**\n * @return array{'status': 'ok', \"count\"?: 1, active: true, ratio: 1.5}\n */",
         );
         let Some(TypeInfo::ArrayShape(items)) = doc.return_type else {
             panic!("expected array shape");

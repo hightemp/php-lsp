@@ -188,6 +188,15 @@ impl std::fmt::Display for ArrayShapeItem {
     }
 }
 
+/// Normalize a PHPDoc or source array/object-shape key for lookup/comparison.
+pub fn normalize_shape_key_text(key: &str) -> String {
+    key.trim()
+        .trim_end_matches('?')
+        .trim()
+        .trim_matches(|ch| ch == '\'' || ch == '"')
+        .to_string()
+}
+
 /// Parameter information for a function/method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParamInfo {

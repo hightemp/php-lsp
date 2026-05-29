@@ -157,6 +157,7 @@ impl PhpLspBackend {
                 object_expr,
                 class_fqn,
                 member_prefix,
+                access_mode,
             } => php_lsp_completion::context::CompletionContext::MemberAccess {
                 class_fqn: class_fqn.or_else(|| {
                     self.infer_completion_object_type(
@@ -172,6 +173,7 @@ impl PhpLspBackend {
                 }),
                 object_expr,
                 member_prefix,
+                access_mode,
             },
             other => other,
         };
@@ -216,7 +218,10 @@ impl PhpLspBackend {
                 php_lsp_completion::context::CompletionContext::ArrayKey {
                     array_expr,
                     key_prefix,
-                } => self.shape_key_completion_items(&inference_ctx, array_expr, key_prefix),
+                    quote,
+                } => {
+                    self.shape_key_completion_items(&inference_ctx, array_expr, key_prefix, *quote)
+                }
                 _ => provide_completions_at_range(
                     &context,
                     &self.index,
@@ -249,6 +254,7 @@ impl PhpLspBackend {
             object_expr,
             member_prefix,
             class_fqn,
+            ..
         } = &context
         {
             self.add_object_shape_completion_items(
@@ -920,12 +926,18 @@ impl PhpLspBackend {
         ctx: &CompletionInferenceContext<'_>,
         array_expr: &str,
         key_prefix: &str,
+        quote: Option<char>,
     ) -> Vec<lsp_types::CompletionItem> {
         let Some(type_info) = self.infer_completion_type_info(ctx, array_expr) else {
             return Vec::new();
         };
 
-        shape_completion_items_from_type_info(&type_info, ShapeCompletionKind::ArrayKey, key_prefix)
+        shape_completion_items_from_type_info(
+            &type_info,
+            ShapeCompletionKind::ArrayKey,
+            key_prefix,
+            quote,
+        )
     }
 
     pub(in crate::server) fn add_object_shape_completion_items(
@@ -944,6 +956,7 @@ impl PhpLspBackend {
             &type_info,
             ShapeCompletionKind::ObjectProperty,
             member_prefix,
+            None,
         ) {
             if seen.insert(item.label.clone()) {
                 items.push(item);

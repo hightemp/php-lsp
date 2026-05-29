@@ -114,6 +114,9 @@ impl PhpLspBackend {
                         ">".to_string(),
                         ":".to_string(),
                         "\\".to_string(),
+                        "[".to_string(),
+                        "'".to_string(),
+                        "\"".to_string(),
                     ]),
                     resolve_provider: Some(true),
                     ..Default::default()

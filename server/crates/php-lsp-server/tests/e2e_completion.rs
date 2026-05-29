@@ -374,6 +374,7 @@ function run(): void {
     $shape = (object)[];
 
     $row['/*array*/'];
+    $row[/*bracket*/];
     $row['meta']['/*nested*/'];
     $users['/*list*/'];
     $shape->/*object*/;
@@ -385,6 +386,7 @@ function run(): void {
 "#;
     let markers = [
         "/*array*/",
+        "/*bracket*/",
         "/*nested*/",
         "/*list*/",
         "/*object*/",
@@ -438,6 +440,28 @@ function run(): void {
         "array shape completion should include foo/bar, got: {:?}; result: {}",
         array_labels,
         array_result
+    );
+
+    let (bracket_line, bracket_character) = marker_position("/*bracket*/");
+    let bracket_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(21, uri, bracket_line, bracket_character))
+        .await
+        .unwrap();
+    let bracket_result = extract_result(bracket_completion);
+    let bracket_items = completion_items_from_result(&bracket_result);
+    let bracket_foo = bracket_items
+        .iter()
+        .find(|item| item.get("label").and_then(|label| label.as_str()) == Some("foo"))
+        .unwrap_or_else(|| panic!("expected foo after open bracket, got: {bracket_items:?}"));
+    assert_eq!(
+        bracket_foo
+            .get("insertText")
+            .and_then(|value| value.as_str()),
+        Some("'foo'"),
+        "completion after '[' should insert a quoted array-shape key"
     );
 
     let (nested_line, nested_character) = marker_position("/*nested*/");
@@ -563,7 +587,7 @@ function run(): void {
     let literal_definition_result = extract_result(literal_definition);
     assert_eq!(
         literal_definition_result["range"]["start"]["line"].as_u64(),
-        Some(20),
+        Some(21),
         "literal shape key definition should point to array key declaration, got: {}",
         literal_definition_result
     );
@@ -1197,6 +1221,36 @@ class Demo {
         "auto-import should be inserted after namespace declaration"
     );
 
+    let use_uri = "file:///test/UseCompletion.php";
+    let use_code = "<?php\nnamespace App;\nuse Ven;\nclass Demo {}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(use_uri, use_code))
+        .await
+        .unwrap();
+    let use_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(21, use_uri, 2, 7))
+        .await
+        .unwrap();
+    let use_result = extract_result(use_resp);
+    let use_items = completion_items_from_result(&use_result);
+    let use_service_item = use_items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("Service"))
+        .unwrap_or_else(|| panic!("expected Service use completion, got: {use_items:?}"));
+    assert_eq!(
+        use_service_item
+            .get("insertText")
+            .and_then(|value| value.as_str()),
+        Some("Vendor\\Service"),
+        "use statement completion should insert the full FQN"
+    );
+
     let snippet_uri = "file:///test/CompletionSnippet.php";
     let snippet_code = "<?php\ncla";
     service
@@ -1608,13 +1662,74 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         completion_result
     );
     assert!(
-        items.iter().any(|item| {
+        !items
+            .iter()
+            .any(|item| item.get("label").and_then(|value| value.as_str()) == Some("dirty")),
+        "read completion should not include @property-write, got: {}",
+        completion_result
+    );
+
+    let write_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(41, &usage_uri, 13, 14))
+        .await
+        .unwrap();
+    let write_completion_result = extract_result(write_completion);
+    let write_items = completion_items_from_result(&write_completion_result);
+    assert!(
+        write_items.iter().any(|item| {
             item.get("label").and_then(|value| value.as_str()) == Some("dirty")
                 && item.get("detail").and_then(|value| value.as_str())
                     == Some("@property-write bool")
         }),
-        "completion should include @property-write detail, got: {}",
-        completion_result
+        "write completion should include @property-write detail, got: {}",
+        write_completion_result
+    );
+    assert!(
+        !write_items
+            .iter()
+            .any(|item| item.get("label").and_then(|value| value.as_str()) == Some("version")),
+        "write completion should not include @property-read, got: {}",
+        write_completion_result
+    );
+
+    let static_usage_uri = "file:///test/PhpDocStaticVirtualMembers.php";
+    let static_usage_content =
+        "<?php\nnamespace App\\PhpDoc;\nfunction makeSupported(): void\n{\n    SupportedTags::\n}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            static_usage_uri,
+            static_usage_content,
+        ))
+        .await
+        .unwrap();
+    let static_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(42, static_usage_uri, 4, 19))
+        .await
+        .unwrap();
+    let static_completion_result = extract_result(static_completion);
+    let static_items = completion_items_from_result(&static_completion_result);
+    assert!(
+        static_items
+            .iter()
+            .any(|item| item.get("label").and_then(|value| value.as_str()) == Some("make")),
+        "static completion should include static @method, got: {}",
+        static_completion_result
+    );
+    assert!(
+        !static_items
+            .iter()
+            .any(|item| item.get("label").and_then(|value| value.as_str()) == Some("findById")),
+        "static completion should not include instance @method, got: {}",
+        static_completion_result
     );
 
     let resolved_label = service

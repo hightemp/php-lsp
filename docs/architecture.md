@@ -183,12 +183,24 @@ class-like symbol containing the cursor before filtering member visibility for
 members tied to the actual class, trait, enum, or anonymous class at the cursor
 instead of the first class-like symbol in file order.
 
+Member-access completion contexts also carry a read/write mode inferred from
+the text after the cursor. PHPDoc virtual properties use that mode to honor
+`@property-read` and `@property-write`: read contexts hide write-only virtual
+properties, and assignment contexts hide read-only virtual properties.
+
 When ranges are nested, the innermost containing class-like symbol wins. This is
 important for anonymous classes declared inside methods or other class bodies:
 completion inside the anonymous class must not leak private members from the
 outer class. The older `provide_completions(...)` helper remains available for
 non-position-aware callers and tests, but server-side LSP requests should use
 the positional API.
+
+Array-shape key completion can trigger either after `[` or inside quoted string
+keys. Completion after `[` inserts a quoted key, while completion inside an
+existing quote inserts only the key text. Parser PHPDoc shapes, completion
+items, and shape-key definition lookups all normalize quoted/optional shape keys
+through `php_lsp_types::normalize_shape_key_text(...)` so lookup and display do
+not diverge.
 
 ## Startup Flow
 

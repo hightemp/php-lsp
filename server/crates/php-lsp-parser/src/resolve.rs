@@ -5,7 +5,9 @@
 //! and use statements.
 
 use crate::phpdoc::parse_phpdoc;
-use php_lsp_types::{FileSymbols, Signature, SymbolInfo, TypeInfo, UseKind};
+use php_lsp_types::{
+    normalize_shape_key_text, FileSymbols, Signature, SymbolInfo, TypeInfo, UseKind,
+};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Point, Tree};
@@ -3812,7 +3814,7 @@ fn array_shape_value_type<'a>(
 }
 
 fn normalize_array_access_key(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_matches(|ch| ch == '\'' || ch == '"');
+    let trimmed = normalize_shape_key_text(raw);
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
@@ -5220,7 +5222,7 @@ namespace App;
 use App\Entity\User;
 
 function run(): void {
-    /** @var array{user: User} $row */
+    /** @var array{'user': User} $row */
     $row = [];
     $row['user']->getName();
 }

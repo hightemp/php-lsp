@@ -3,7 +3,7 @@
 //! Given a completion context and the workspace index, provides relevant
 //! completion items.
 
-use crate::context::CompletionContext;
+use crate::context::{CompletionContext, MemberAccessMode};
 use lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat};
 use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::phpdoc::parse_phpdoc;
@@ -162,12 +162,14 @@ fn provide_completions_with_current_class(
             object_expr,
             class_fqn,
             member_prefix,
+            access_mode,
         } => provide_member_completions(
             object_expr,
             member_prefix,
             class_fqn.as_deref(),
             index,
             current_class_fqn,
+            *access_mode,
         ),
         CompletionContext::StaticAccess {
             class_fqn,
@@ -185,7 +187,9 @@ fn provide_completions_with_current_class(
             provide_variable_completions(prefix, file_symbols)
         }
         CompletionContext::Namespace { prefix } => provide_namespace_completions(prefix, index),
-        CompletionContext::UseStatement { prefix } => provide_namespace_completions(prefix, index),
+        CompletionContext::UseStatement { prefix } => {
+            provide_use_statement_completions(prefix, index)
+        }
         CompletionContext::Free { prefix } => provide_free_completions(prefix, index),
         CompletionContext::None => vec![],
     }
@@ -198,6 +202,7 @@ fn provide_member_completions(
     inferred_class_fqn: Option<&str>,
     index: &WorkspaceIndex,
     current_class_fqn: Option<&str>,
+    access_mode: MemberAccessMode,
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
@@ -238,6 +243,7 @@ fn provide_member_completions(
             index,
             &mut items,
             &mut seen_labels,
+            access_mode,
         );
     }
 
@@ -251,6 +257,7 @@ fn add_phpdoc_virtual_member_completions(
     index: &WorkspaceIndex,
     items: &mut Vec<CompletionItem>,
     seen_labels: &mut HashSet<String>,
+    access_mode: MemberAccessMode,
 ) {
     for owner in index.get_type_hierarchy_symbols(class_fqn) {
         let Some(ref doc_comment) = owner.doc_comment else {
@@ -270,6 +277,9 @@ fn add_phpdoc_virtual_member_completions(
         }
 
         for property in &phpdoc.properties {
+            if !phpdoc_property_matches_access(property.access, access_mode) {
+                continue;
+            }
             if !seen_labels.insert(property.name.clone()) {
                 continue;
             }
@@ -279,6 +289,42 @@ fn add_phpdoc_virtual_member_completions(
                 member_prefix,
             ));
         }
+    }
+}
+
+fn add_phpdoc_static_virtual_method_completions(
+    class_fqn: &str,
+    member_prefix: &str,
+    index: &WorkspaceIndex,
+    items: &mut Vec<CompletionItem>,
+    seen_labels: &mut HashSet<String>,
+) {
+    for owner in index.get_type_hierarchy_symbols(class_fqn) {
+        let Some(ref doc_comment) = owner.doc_comment else {
+            continue;
+        };
+        let phpdoc = parse_phpdoc(doc_comment);
+
+        for method in &phpdoc.methods {
+            if !method.is_static || !seen_labels.insert(method.name.clone()) {
+                continue;
+            }
+            items.push(phpdoc_method_completion_item(
+                &owner.fqn,
+                method,
+                member_prefix,
+            ));
+        }
+    }
+}
+
+fn phpdoc_property_matches_access(
+    property_access: PhpDocPropertyAccess,
+    completion_access: MemberAccessMode,
+) -> bool {
+    match completion_access {
+        MemberAccessMode::Read => property_access.is_readable(),
+        MemberAccessMode::Write => property_access.is_writable(),
     }
 }
 
@@ -422,6 +468,14 @@ fn provide_static_completions(
             Some(member_prefix),
         ));
     }
+    let mut seen_labels: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
+    add_phpdoc_static_virtual_method_completions(
+        &fqn,
+        member_prefix,
+        index,
+        &mut items,
+        &mut seen_labels,
+    );
 
     // Also add class constants and enum cases
     sort_completion_items(&mut items);
@@ -499,6 +553,18 @@ fn provide_variable_completions(prefix: &str, file_symbols: &FileSymbols) -> Vec
 
 /// Provide namespace/class completions.
 fn provide_namespace_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<CompletionItem> {
+    provide_namespace_completions_with_options(prefix, index, false)
+}
+
+fn provide_use_statement_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<CompletionItem> {
+    provide_namespace_completions_with_options(prefix, index, true)
+}
+
+fn provide_namespace_completions_with_options(
+    prefix: &str,
+    index: &WorkspaceIndex,
+    insert_fqn: bool,
+) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
     // Search for types matching the prefix
@@ -509,7 +575,7 @@ fn provide_namespace_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Co
         if sym.fqn.to_lowercase().contains(&prefix_lower)
             || sym.name.to_lowercase().starts_with(&prefix_lower)
         {
-            items.push(CompletionItem {
+            let mut item = CompletionItem {
                 label: sym.name.clone(),
                 kind: Some(symbol_kind_to_completion_kind(sym.kind)),
                 detail: Some(sym.fqn.clone()),
@@ -517,7 +583,11 @@ fn provide_namespace_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Co
                 filter_text: Some(format!("{} {}", sym.name, sym.fqn)),
                 data: Some(serde_json::Value::String(sym.fqn.clone())),
                 ..Default::default()
-            });
+            };
+            if insert_fqn {
+                item.insert_text = Some(sym.fqn.clone());
+            }
+            items.push(item);
         }
     }
 
@@ -925,6 +995,40 @@ mod tests {
     }
 
     #[test]
+    fn test_use_statement_completion_inserts_full_fqn() {
+        let mut class = make_symbol(
+            "ClassName",
+            "Vendor\\Package\\ClassName",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        );
+        class.uri = "file:///vendor/ClassName.php".to_string();
+        let symbols = FileSymbols {
+            symbols: vec![class],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///vendor/ClassName.php", symbols);
+
+        let ctx = CompletionContext::UseStatement {
+            prefix: "Ven".to_string(),
+        };
+        let items = provide_completions(&ctx, &index, &FileSymbols::default());
+        let item = items
+            .iter()
+            .find(|item| item.label == "ClassName")
+            .expect("use completion should keep short class label");
+
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("Vendor\\Package\\ClassName")
+        );
+        assert_eq!(item.detail.as_deref(), Some("Vendor\\Package\\ClassName"));
+    }
+
+    #[test]
     fn test_free_completion_ranks_prefix_matches_before_contains_matches() {
         let mut symbols = Vec::new();
         for idx in 0..120 {
@@ -1072,6 +1176,7 @@ mod tests {
             object_expr: "$baz2".to_string(),
             member_prefix: String::new(),
             class_fqn: Some("App\\Test\\Baz".to_string()),
+            access_mode: MemberAccessMode::Read,
         };
         let items = provide_completions(&ctx, &index, &file_symbols);
 
@@ -1129,6 +1234,7 @@ mod tests {
             object_expr: "$service".to_string(),
             member_prefix: String::new(),
             class_fqn: Some("App\\Service".to_string()),
+            access_mode: MemberAccessMode::Read,
         };
         let items = provide_completions(&ctx, &index, &file_symbols);
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
@@ -1196,6 +1302,7 @@ mod tests {
             object_expr: "$client".to_string(),
             member_prefix: "reques".to_string(),
             class_fqn: Some("App\\Client".to_string()),
+            access_mode: MemberAccessMode::Read,
         };
         let items = provide_completions(&ctx, &index, &file_symbols);
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
@@ -1246,6 +1353,7 @@ mod tests {
             object_expr: "$service".to_string(),
             member_prefix: String::new(),
             class_fqn: Some("App\\Service".to_string()),
+            access_mode: MemberAccessMode::Read,
         };
         let items = provide_completions(&ctx, &index, &file_symbols);
 
@@ -1269,6 +1377,58 @@ mod tests {
             .expect("virtual method completion");
         assert_eq!(owner.kind, Some(CompletionItemKind::METHOD));
         assert_eq!(owner.detail.as_deref(), Some("(): User"));
+    }
+
+    #[test]
+    fn test_member_completion_filters_phpdoc_properties_by_access_mode() {
+        let mut service = make_symbol(
+            "Service",
+            "App\\Service",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        );
+        service.doc_comment = Some(
+            "/**\n * @property-read int $version\n * @property-write bool $dirty\n * @property string $label\n */"
+                .to_string(),
+        );
+        let file_symbols = FileSymbols {
+            symbols: vec![service],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let read_ctx = CompletionContext::MemberAccess {
+            object_expr: "$service".to_string(),
+            member_prefix: String::new(),
+            class_fqn: Some("App\\Service".to_string()),
+            access_mode: MemberAccessMode::Read,
+        };
+        let read_items = provide_completions(&read_ctx, &index, &file_symbols);
+        let read_labels: Vec<&str> = read_items.iter().map(|item| item.label.as_str()).collect();
+        assert!(read_labels.contains(&"version"));
+        assert!(read_labels.contains(&"label"));
+        assert!(
+            !read_labels.contains(&"dirty"),
+            "write-only virtual properties should be hidden in read completion"
+        );
+
+        let write_ctx = CompletionContext::MemberAccess {
+            object_expr: "$service".to_string(),
+            member_prefix: String::new(),
+            class_fqn: Some("App\\Service".to_string()),
+            access_mode: MemberAccessMode::Write,
+        };
+        let write_items = provide_completions(&write_ctx, &index, &file_symbols);
+        let write_labels: Vec<&str> = write_items.iter().map(|item| item.label.as_str()).collect();
+        assert!(write_labels.contains(&"dirty"));
+        assert!(write_labels.contains(&"label"));
+        assert!(
+            !write_labels.contains(&"version"),
+            "read-only virtual properties should be hidden in write completion"
+        );
     }
 
     #[test]
@@ -1304,6 +1464,7 @@ mod tests {
             object_expr: "$service".to_string(),
             member_prefix: String::new(),
             class_fqn: Some("App\\Service".to_string()),
+            access_mode: MemberAccessMode::Read,
         };
         let items = provide_completions(&ctx, &index, &file_symbols);
 
@@ -1367,6 +1528,40 @@ mod tests {
         assert!(
             !labels.contains(&"run"),
             "instance method should be hidden on `::`"
+        );
+    }
+
+    #[test]
+    fn test_static_completion_includes_static_phpdoc_virtual_methods() {
+        let mut service = make_symbol(
+            "Service",
+            "App\\Service",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        );
+        service.doc_comment =
+            Some("/**\n * @method User owner()\n * @method static self make()\n */".to_string());
+        let file_symbols = FileSymbols {
+            symbols: vec![service],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::StaticAccess {
+            class_expr: "Service".to_string(),
+            member_prefix: String::new(),
+            class_fqn: "App\\Service".to_string(),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert!(labels.contains(&"make"));
+        assert!(
+            !labels.contains(&"owner"),
+            "instance @method should not appear in static completion"
         );
     }
 
@@ -1507,6 +1702,7 @@ mod tests {
             object_expr: "$this".to_string(),
             member_prefix: String::new(),
             class_fqn: Some("App\\Child".to_string()),
+            access_mode: MemberAccessMode::Read,
         };
         let items = provide_completions_at_range(&ctx, &index, &file_symbols, (10, 12, 10, 12));
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
@@ -1566,6 +1762,7 @@ mod tests {
             object_expr: "$this".to_string(),
             member_prefix: String::new(),
             class_fqn: Some("App\\Feature".to_string()),
+            access_mode: MemberAccessMode::Read,
         };
         let items = provide_completions_at_range(&ctx, &index, &file_symbols, (8, 12, 8, 12));
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
@@ -1631,6 +1828,7 @@ mod tests {
             object_expr: "$this".to_string(),
             member_prefix: String::new(),
             class_fqn: Some(anonymous_fqn.to_string()),
+            access_mode: MemberAccessMode::Read,
         };
         let items = provide_completions_at_range(&ctx, &index, &file_symbols, (12, 16, 12, 16));
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();

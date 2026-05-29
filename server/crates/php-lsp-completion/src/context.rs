@@ -6,6 +6,12 @@
 use php_lsp_types::FileSymbols;
 use tree_sitter::{Node, Point, Tree};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberAccessMode {
+    Read,
+    Write,
+}
+
 /// The context in which completion was triggered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionContext {
@@ -17,6 +23,8 @@ pub enum CompletionContext {
         member_prefix: String,
         /// Optional inferred FQN of object class (filled later by server).
         class_fqn: Option<String>,
+        /// Whether the member access is used for reading or writing.
+        access_mode: MemberAccessMode,
     },
 
     /// After `::`: static member access (static methods, properties, constants).
@@ -35,6 +43,8 @@ pub enum CompletionContext {
         array_expr: String,
         /// The key prefix already typed inside the quote.
         key_prefix: String,
+        /// The current quote if completion is inside quotes, or None after `[`.
+        quote: Option<char>,
     },
 
     /// After `$`: variable name completion.
@@ -90,10 +100,12 @@ pub fn detect_context(
         .sum::<usize>();
     let cursor_offset = line_start + character as usize;
     let line_text = source.lines().nth(line as usize).unwrap_or("");
-    let text_before = &line_text[..std::cmp::min(character as usize, line_text.len())];
+    let cursor_col = std::cmp::min(character as usize, line_text.len());
+    let text_before = &line_text[..cursor_col];
+    let text_after = &line_text[cursor_col..];
 
     // Check for `->` member access
-    if let Some(ctx) = check_member_access(text_before, &node, source) {
+    if let Some(ctx) = check_member_access(text_before, text_after, &node, source) {
         return ctx;
     }
 
@@ -140,7 +152,12 @@ pub fn detect_context(
 }
 
 /// Check for `->` member access pattern.
-fn check_member_access(text_before: &str, node: &Node, source: &str) -> Option<CompletionContext> {
+fn check_member_access(
+    text_before: &str,
+    text_after: &str,
+    node: &Node,
+    source: &str,
+) -> Option<CompletionContext> {
     let trimmed = text_before.trim_end();
 
     // Check if text ends with `->`  or `->partial`
@@ -165,6 +182,7 @@ fn check_member_access(text_before: &str, node: &Node, source: &str) -> Option<C
                 object_expr,
                 member_prefix: after_arrow.to_string(),
                 class_fqn: None,
+                access_mode: member_access_mode_after_cursor(text_after),
             });
         }
     }
@@ -172,36 +190,88 @@ fn check_member_access(text_before: &str, node: &Node, source: &str) -> Option<C
     None
 }
 
+fn member_access_mode_after_cursor(text_after: &str) -> MemberAccessMode {
+    let mut rest = text_after;
+    loop {
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if ch.is_alphanumeric() || ch == '_' {
+            rest = &rest[ch.len_utf8()..];
+        } else {
+            break;
+        }
+    }
+
+    if starts_assignment_operator(rest.trim_start()) {
+        MemberAccessMode::Write
+    } else {
+        MemberAccessMode::Read
+    }
+}
+
+fn starts_assignment_operator(text: &str) -> bool {
+    if text.starts_with("===") || text.starts_with("==") || text.starts_with("=>") {
+        return false;
+    }
+    text.starts_with('=')
+        || [
+            "+=", "-=", "*=", "/=", "%=", ".=", "??=", "&=", "|=", "^=", "<<=", ">>=",
+        ]
+        .iter()
+        .any(|operator| text.starts_with(operator))
+}
+
 /// Check for `$row['...` array key completion.
 fn check_array_key_access(text_before: &str) -> Option<CompletionContext> {
     let trimmed = text_before.trim_end();
-    let quote_pos = trimmed.rfind(['\'', '"'])?;
-    let quote = trimmed.as_bytes().get(quote_pos).copied()? as char;
-    let before_quote = &trimmed[..quote_pos];
-    let bracket_pos = before_quote.rfind('[')?;
-    if !before_quote[bracket_pos + 1..].trim().is_empty() {
-        return None;
-    }
-    let key_prefix = &trimmed[quote_pos + quote.len_utf8()..];
-    if key_prefix.contains(quote) || key_prefix.contains(']') {
-        return None;
-    }
-    if !key_prefix
-        .chars()
-        .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == '\\')
-    {
-        return None;
+    let bracket_pos = trimmed.rfind('[')?;
+
+    if let Some(quote_pos) = trimmed.rfind(['\'', '"']).filter(|pos| *pos > bracket_pos) {
+        let quote = trimmed.as_bytes().get(quote_pos).copied()? as char;
+        let before_quote = &trimmed[..quote_pos];
+        if !before_quote[bracket_pos + 1..].trim().is_empty() {
+            return None;
+        }
+        let key_prefix = &trimmed[quote_pos + quote.len_utf8()..];
+        if key_prefix.contains(quote) || key_prefix.contains(']') {
+            return None;
+        }
+        if !is_array_key_prefix(key_prefix) {
+            return None;
+        }
+
+        let array_expr = extract_object_expr(trimmed[..bracket_pos].trim_end());
+        if array_expr.is_empty() {
+            return None;
+        }
+
+        return Some(CompletionContext::ArrayKey {
+            array_expr,
+            key_prefix: key_prefix.to_string(),
+            quote: Some(quote),
+        });
     }
 
+    let key_prefix = trimmed[bracket_pos + 1..].trim_start();
+    if key_prefix.contains(']') || !is_array_key_prefix(key_prefix) {
+        return None;
+    }
     let array_expr = extract_object_expr(trimmed[..bracket_pos].trim_end());
     if array_expr.is_empty() {
         return None;
     }
-
     Some(CompletionContext::ArrayKey {
         array_expr,
         key_prefix: key_prefix.to_string(),
+        quote: None,
     })
+}
+
+fn is_array_key_prefix(prefix: &str) -> bool {
+    prefix
+        .chars()
+        .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == '\\')
 }
 
 /// Check for `::` static access pattern.
@@ -291,20 +361,34 @@ fn check_namespace_access(text_before: &str) -> Option<CompletionContext> {
 }
 
 /// Check if cursor is inside a use statement.
-fn check_use_context(node: &Node, _text_before: &str, source: &str) -> Option<CompletionContext> {
+fn check_use_context(node: &Node, text_before: &str, source: &str) -> Option<CompletionContext> {
     let mut current = Some(*node);
     while let Some(n) = current {
         if n.kind() == "namespace_use_declaration" || n.kind() == "namespace_use_clause" {
-            // Get the text of the current node as prefix
-            let text = &source[n.byte_range()];
-            let prefix = text.trim_start_matches("use").trim();
-            return Some(CompletionContext::UseStatement {
-                prefix: prefix.to_string(),
-            });
+            let node_text = &source[n.byte_range()];
+            let prefix_source = if text_before.trim_start().starts_with("use") {
+                text_before
+            } else {
+                node_text
+            };
+            let prefix = use_statement_prefix(prefix_source);
+            return Some(CompletionContext::UseStatement { prefix });
         }
         current = n.parent();
     }
     None
+}
+
+fn use_statement_prefix(text: &str) -> String {
+    let mut prefix = text.trim_start();
+    prefix = prefix.strip_prefix("use").unwrap_or(prefix).trim_start();
+    for keyword in ["function", "const"] {
+        if let Some(rest) = prefix.strip_prefix(keyword) {
+            prefix = rest.trim_start();
+            break;
+        }
+    }
+    prefix.trim_end_matches(';').trim().to_string()
 }
 
 /// Extract the object expression from text before `->`.
@@ -463,10 +547,31 @@ mod tests {
             CompletionContext::MemberAccess {
                 object_expr,
                 member_prefix,
+                access_mode,
                 ..
             } => {
                 assert_eq!(object_expr, "$obj");
                 assert_eq!(member_prefix, "meth");
+                assert_eq!(access_mode, MemberAccessMode::Read);
+            }
+            other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_context_detects_write_assignment() {
+        let code = "<?php\n$subject->dirty = false;";
+        let ctx = detect(code, 1, 10);
+        match ctx {
+            CompletionContext::MemberAccess {
+                object_expr,
+                member_prefix,
+                access_mode,
+                ..
+            } => {
+                assert_eq!(object_expr, "$subject");
+                assert_eq!(member_prefix, "");
+                assert_eq!(access_mode, MemberAccessMode::Write);
             }
             other => panic!("Expected MemberAccess, got {:?}", other),
         }
@@ -531,9 +636,11 @@ mod tests {
             CompletionContext::ArrayKey {
                 array_expr,
                 key_prefix,
+                quote,
             } => {
                 assert_eq!(array_expr, "$row");
                 assert_eq!(key_prefix, "fo");
+                assert_eq!(quote, Some('\''));
             }
             other => panic!("Expected ArrayKey, got {:?}", other),
         }
@@ -547,9 +654,29 @@ mod tests {
             CompletionContext::ArrayKey {
                 array_expr,
                 key_prefix,
+                quote,
             } => {
                 assert_eq!(array_expr, "$row['meta']");
                 assert_eq!(key_prefix, "");
+                assert_eq!(quote, Some('\''));
+            }
+            other => panic!("Expected ArrayKey, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_array_key_context_after_open_bracket() {
+        let code = "<?php\n$row[";
+        let ctx = detect(code, 1, 5);
+        match ctx {
+            CompletionContext::ArrayKey {
+                array_expr,
+                key_prefix,
+                quote,
+            } => {
+                assert_eq!(array_expr, "$row");
+                assert_eq!(key_prefix, "");
+                assert_eq!(quote, None);
             }
             other => panic!("Expected ArrayKey, got {:?}", other),
         }
@@ -679,6 +806,18 @@ mod tests {
                 assert_eq!(prefix, "use");
             }
             other => panic!("Expected Variable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_use_statement_context_uses_text_before_cursor() {
+        let code = "<?php\nnamespace App;\nuse Ven;\n";
+        let ctx = detect(code, 2, 7);
+        match ctx {
+            CompletionContext::UseStatement { prefix } => {
+                assert_eq!(prefix, "Ven");
+            }
+            other => panic!("Expected UseStatement, got {:?}", other),
         }
     }
 
