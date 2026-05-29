@@ -361,6 +361,10 @@ impl PhpLspBackend {
         self.open_files.insert(uri_str, parser);
 
         self.publish_diagnostics(&uri).await;
+        if uri_is_php_file(&uri) {
+            self.refresh_open_twig_contexts_and_republish_diagnostics()
+                .await;
+        }
     }
 
     pub(crate) async fn lsp_did_change(&self, params: DidChangeTextDocumentParams) {
@@ -426,13 +430,20 @@ impl PhpLspBackend {
             }
         }
 
+        let refresh_twig_contexts = uri_is_php_file(&uri);
         self.schedule_fast_diagnostics(uri, version).await;
+        if refresh_twig_contexts {
+            self.refresh_open_twig_contexts_and_republish_diagnostics()
+                .await;
+        }
     }
 
     pub(crate) async fn lsp_did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         let uri_str = uri.as_str().to_string();
         tracing::debug!("didClose: {}", uri_str);
+        let refresh_twig_contexts =
+            uri_is_php_file(&uri) && !self.template_documents.contains_key(&uri_str);
         self.open_files.remove(&uri_str);
         self.template_documents.remove(&uri_str);
         self.document_versions.remove(&uri_str);
@@ -442,14 +453,26 @@ impl PhpLspBackend {
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
         // Clear diagnostics for closed file
         self.client.publish_diagnostics(uri, vec![], None).await;
+        if refresh_twig_contexts {
+            self.refresh_open_twig_contexts_and_republish_diagnostics()
+                .await;
+        }
     }
 
     pub(crate) async fn lsp_did_save(&self, params: DidSaveTextDocumentParams) {
         tracing::debug!("didSave: {}", params.text_document.uri.as_str());
+        let refresh_twig_contexts = uri_is_php_file(&params.text_document.uri)
+            && !self
+                .template_documents
+                .contains_key(params.text_document.uri.as_str());
         self.invalidate_request_fs_caches().await;
         self.cancel_debounced_diagnostics(params.text_document.uri.as_str())
             .await;
         self.publish_diagnostics(&params.text_document.uri).await;
+        if refresh_twig_contexts {
+            self.refresh_open_twig_contexts_and_republish_diagnostics()
+                .await;
+        }
     }
 }
 

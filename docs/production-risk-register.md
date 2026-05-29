@@ -362,6 +362,9 @@ Mitigation:
   source ranges are exact and the diagnostic belongs to a conservative
   expression allowlist; generated virtual PHP, syntax noise, template
   functions, incomplete/magic properties, and uncertain ranges are suppressed.
+- `PHA-031`: open Twig documents refresh inferred render-context types after
+  relevant PHP controller/render edits and workspace reindex completion, with a
+  bounded open-template refresh limit.
 
 Exit signal:
 

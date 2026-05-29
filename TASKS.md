@@ -3347,7 +3347,28 @@ while implementing these tasks.
     PHP-expression error in a mapped expression is reported at the original
     template range.
 
-- [ ] **PHA-031** Refresh Twig context types when controllers or render calls change.
+- [x] **PHA-031** Refresh Twig context types when controllers or render calls change.
+  - Completed 2026-05-29:
+    - extracted shared Twig context recomputation over open PHP buffers plus the
+      bounded disk-backed render-context cache;
+    - open Twig documents now refresh their context prelude, virtual PHP parser,
+      semantic-token cache, and diagnostics after relevant PHP open/change/save,
+      close, watched-file, rename/delete, Composer, and workspace reindex events;
+    - refresh is bounded to open Twig documents with an explicit per-event limit;
+    - added an e2e regression where editing a controller render context changes
+      Twig completion from `User::getName()` to `Admin::getRole()` without a
+      restart;
+    - README, architecture docs, LSP feature docs, and production risk register
+      document the refresh behavior.
+  - Validation:
+    - `cargo test -p php-lsp-server --test e2e_templates test_twig_context_types_refresh_after_controller_render_context_change -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`;
+    - `cargo test -p php-lsp-server template::tests -- --nocapture`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo test --all`;
+    - `git diff --check`.
   - Problem: open Twig documents can keep stale `twig_variable_types` after PHP
     controller/render context changes.
   - Implementation:

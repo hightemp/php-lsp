@@ -577,6 +577,230 @@ final class DashboardController
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_context_types_refresh_after_controller_render_context_change() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-context-refresh-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/dashboard")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let user_path = tmp_root.join("src/Entity/User.php");
+    let admin_path = tmp_root.join("src/Entity/Admin.php");
+    let controller_path = tmp_root.join("src/Controller/DashboardController.php");
+    let twig_path = tmp_root.join("templates/dashboard/show.html.twig");
+    let user_uri = file_uri(&user_path);
+    let admin_uri = file_uri(&admin_path);
+    let controller_uri = file_uri(&controller_path);
+    let twig_uri = file_uri(&twig_path);
+
+    let user_php = r#"<?php
+namespace App\Entity;
+
+class User
+{
+    public function getName(): string { return ''; }
+}
+"#;
+    let admin_php = r#"<?php
+namespace App\Entity;
+
+class Admin
+{
+    public function getRole(): string { return ''; }
+}
+"#;
+    let controller_php = |class_name: &str| {
+        format!(
+            r#"<?php
+namespace App\Controller;
+
+use App\Entity\Admin;
+use App\Entity\User;
+
+final class DashboardController
+{{
+    public function show(): void
+    {{
+        $this->render('dashboard/show.html.twig', [
+            'user' => new {class_name}(),
+        ]);
+    }}
+}}
+"#
+        )
+    };
+    let completion_marker = "/*complete*/";
+    let twig_with_marker = format!("{{{{ user.get{} }}}}\n", completion_marker);
+    let completion_offset = twig_with_marker
+        .find(completion_marker)
+        .expect("test Twig should contain completion marker");
+    let completion_prefix = &twig_with_marker[..completion_offset];
+    let completion_line = completion_prefix
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u32;
+    let completion_line_start = completion_prefix
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let completion_character = (completion_prefix.len() - completion_line_start) as u32;
+    let twig = twig_with_marker.replace(completion_marker, "");
+    let initial_controller_php = controller_php("User");
+    let changed_controller_php = controller_php("Admin");
+
+    fs::write(&user_path, user_php).unwrap();
+    fs::write(&admin_path, admin_php).unwrap();
+    fs::write(&controller_path, &initial_controller_php).unwrap();
+    fs::write(&twig_path, &twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&user_uri, user_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&admin_uri, admin_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            &controller_uri,
+            &initial_controller_php,
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &twig_uri, "twig", &twig,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "initial Twig context should stay quiet, got: {}",
+        diagnostics
+    );
+
+    let initial_completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            2,
+            &twig_uri,
+            completion_line,
+            completion_character,
+        ))
+        .await
+        .unwrap();
+    let initial_completion = extract_result(initial_completion_resp);
+    let initial_labels: Vec<String> = completion_items_from_result(&initial_completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        initial_labels.iter().any(|label| label == "getName"),
+        "expected initial User context completion to include getName, got: {:?}",
+        initial_labels
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(
+            &controller_uri,
+            2,
+            &changed_controller_php,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "refreshed Twig context should stay quiet, got: {}",
+        diagnostics
+    );
+
+    let refreshed_completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            3,
+            &twig_uri,
+            completion_line,
+            completion_character,
+        ))
+        .await
+        .unwrap();
+    let refreshed_completion = extract_result(refreshed_completion_resp);
+    let refreshed_labels: Vec<String> = completion_items_from_result(&refreshed_completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        refreshed_labels.iter().any(|label| label == "getRole"),
+        "expected refreshed Admin context completion to include getRole, got: {:?}",
+        refreshed_labels
+    );
+    assert!(
+        !refreshed_labels.iter().any(|label| label == "getName"),
+        "stale User completion should not survive controller context change, got: {:?}",
+        refreshed_labels
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_member_access_after_class_string_template_factory() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

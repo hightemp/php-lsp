@@ -106,6 +106,8 @@ impl PhpLspBackend {
         let index = self.index.clone();
         let open_files = self.open_files.clone();
         let template_documents = self.template_documents.clone();
+        let twig_context_disk_cache = self.twig_context_disk_cache.clone();
+        let semantic_tokens_cache = self.semantic_tokens_cache.clone();
         let reindex_document_versions = self.document_versions.clone();
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
@@ -187,6 +189,20 @@ impl PhpLspBackend {
             }
 
             // Re-publish diagnostics for all open files now that the index is populated.
+            if indexing_token.is_cancelled() {
+                return;
+            }
+            let workspace_roots: Vec<PathBuf> =
+                configs.iter().map(|config| config.root.clone()).collect();
+            refresh_open_twig_contexts_for_state(
+                &open_files,
+                &template_documents,
+                &reindex_index,
+                &workspace_roots,
+                &twig_context_disk_cache,
+                &semantic_tokens_cache,
+            )
+            .await;
             if indexing_token.is_cancelled() {
                 return;
             }
@@ -1869,6 +1885,7 @@ impl PhpLspBackend {
         if !uri_is_php_file(uri) {
             return;
         }
+        let refresh_twig_contexts = !is_blade_template_uri(&uri_str);
         if is_blade_template_uri(&uri_str) {
             self.index.remove_file(&uri_str);
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
@@ -1907,6 +1924,10 @@ impl PhpLspBackend {
                 .update_file_with_references(&uri_str, file_symbols, references);
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
             self.publish_diagnostics(uri).await;
+            if refresh_twig_contexts {
+                self.refresh_open_twig_contexts_and_republish_diagnostics()
+                    .await;
+            }
             return;
         }
 
@@ -1946,6 +1967,10 @@ impl PhpLspBackend {
         }
 
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
+        if refresh_twig_contexts {
+            self.refresh_open_twig_contexts_and_republish_diagnostics()
+                .await;
+        }
     }
 
     /// Remove one PHP file from all server-side caches/indexes.
@@ -1967,6 +1992,10 @@ impl PhpLspBackend {
         self.client
             .publish_diagnostics(uri.clone(), vec![], None)
             .await;
+        if !is_blade_template_uri(&uri_str) {
+            self.refresh_open_twig_contexts_and_republish_diagnostics()
+                .await;
+        }
     }
 
     pub(in crate::server) async fn rename_php_file(&self, old_uri: &Uri, new_uri: &Uri) {
@@ -2005,6 +2034,10 @@ impl PhpLspBackend {
         }
 
         if !new_is_php {
+            if old_is_php && !is_blade_template_uri(&old_uri_str) {
+                self.refresh_open_twig_contexts_and_republish_diagnostics()
+                    .await;
+            }
             return;
         }
 

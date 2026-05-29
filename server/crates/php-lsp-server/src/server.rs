@@ -1228,7 +1228,7 @@ pub struct PhpLspBackend {
     /// External formatter configuration.
     formatting_config: Mutex<FormattingConfig>,
     /// Last semantic token snapshots used for full/delta requests.
-    semantic_tokens_cache: Mutex<SemanticTokensCache>,
+    semantic_tokens_cache: Arc<Mutex<SemanticTokensCache>>,
     /// Bounded cache for static framework string-key scans.
     framework_string_key_cache: Arc<Mutex<FrameworkStringKeyCache>>,
     /// Bounded cache for disk-backed Twig render-context scans.
@@ -1273,7 +1273,7 @@ impl PhpLspBackend {
             log_level: Mutex::new("info".to_string()),
             work_done_progress_supported: Mutex::new(false),
             formatting_config: Mutex::new(FormattingConfig::default()),
-            semantic_tokens_cache: Mutex::new(SemanticTokensCache::default()),
+            semantic_tokens_cache: Arc::new(Mutex::new(SemanticTokensCache::default())),
             framework_string_key_cache: Arc::new(Mutex::new(FrameworkStringKeyCache::default())),
             twig_context_disk_cache: Arc::new(Mutex::new(TwigContextDiskCache::default())),
             vendor_autoload_cache: Arc::new(Mutex::new(VendorAutoloadCache::default())),
@@ -1883,6 +1883,8 @@ impl PhpLspBackend {
         let index = self.index.clone();
         let open_files = self.open_files.clone();
         let template_documents = self.template_documents.clone();
+        let twig_context_disk_cache = self.twig_context_disk_cache.clone();
+        let semantic_tokens_cache = self.semantic_tokens_cache.clone();
         let reindex_document_versions = self.document_versions.clone();
         let reindex_index = self.index.clone();
         let reindex_client = self.client.clone();
@@ -1969,6 +1971,20 @@ impl PhpLspBackend {
                 }
             }
 
+            if indexing_token.is_cancelled() {
+                return;
+            }
+            let workspace_roots: Vec<PathBuf> =
+                configs.iter().map(|config| config.root.clone()).collect();
+            refresh_open_twig_contexts_for_state(
+                &open_files,
+                &template_documents,
+                &reindex_index,
+                &workspace_roots,
+                &twig_context_disk_cache,
+                &semantic_tokens_cache,
+            )
+            .await;
             if indexing_token.is_cancelled() {
                 return;
             }
@@ -2075,6 +2091,7 @@ impl PhpLspBackend {
         if reindex_workspace {
             self.reindex_workspaces().await;
         } else {
+            self.refresh_open_twig_contexts().await;
             self.republish_open_diagnostics().await;
         }
     }

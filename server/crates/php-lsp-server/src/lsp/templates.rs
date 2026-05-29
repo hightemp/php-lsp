@@ -4,6 +4,9 @@ use crate::util::uri::path_to_uri;
 
 use super::super::*;
 
+const TWIG_CONTEXT_PHP_FILE_SCAN_LIMIT: usize = 2048;
+const OPEN_TWIG_CONTEXT_REFRESH_LIMIT: usize = 64;
+
 pub(in crate::server) fn template_kind_for_document(
     uri_str: &str,
     language_id: &str,
@@ -29,6 +32,23 @@ pub(in crate::server) fn twig_template_name_for_uri(uri_str: &str, root: &Path) 
         .and_then(|file| file.to_str())
         .filter(|file| file.ends_with(".twig"))
         .map(str::to_string)
+}
+
+fn workspace_root_for_template_context_uri(
+    uri_str: &str,
+    workspace_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(path) = uri_to_path(uri_str) {
+        if let Some(root) = workspace_roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+        {
+            return Some(root.clone());
+        }
+    }
+
+    workspace_roots.first().cloned()
 }
 
 pub(in crate::server) fn twig_template_path_for_key(root: &Path, key: &str) -> Option<PathBuf> {
@@ -470,6 +490,194 @@ pub(in crate::server) fn map_location_for_template(
     location
 }
 
+async fn cached_twig_context_file_variables_for_state(
+    root: &Path,
+    template_name: &str,
+    twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
+) -> Vec<TwigContextFileVariables> {
+    let key = TwigContextDiskCacheKey {
+        root: root.to_path_buf(),
+        template_name: template_name.to_string(),
+    };
+    if let Some(files) = twig_context_disk_cache.lock().await.get(&key) {
+        return files;
+    }
+
+    let root = root.to_path_buf();
+    let template_name = template_name.to_string();
+    let path_label = format!("{} ({})", root.display(), template_name);
+    let files = match run_file_io_blocking("twig context scan", path_label, move || {
+        let mut result = Vec::new();
+        for path in collect_twig_context_php_files(&root, TWIG_CONTEXT_PHP_FILE_SCAN_LIMIT) {
+            let Ok(source_uri) = path_to_uri(&path) else {
+                continue;
+            };
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut parser = FileParser::new();
+            parser.parse_full(&source);
+            let file_symbols = parser
+                .tree()
+                .map(|tree| extract_file_symbols(tree, &source, &source_uri))
+                .unwrap_or_default();
+            let mut variables = HashMap::new();
+            collect_twig_render_context_types(
+                &template_name,
+                &source,
+                &file_symbols,
+                &mut variables,
+            );
+            if variables.is_empty() {
+                continue;
+            }
+            let mut variables: Vec<_> = variables
+                .into_iter()
+                .map(|(name, type_text)| TemplateVariableType { name, type_text })
+                .collect();
+            variables.sort_by(|left, right| left.name.cmp(&right.name));
+            result.push(TwigContextFileVariables {
+                uri: source_uri,
+                variables,
+            });
+        }
+        result
+    })
+    .await
+    {
+        Ok(files) => files,
+        Err(message) => {
+            tracing::warn!("{}", message);
+            Vec::new()
+        }
+    };
+
+    twig_context_disk_cache
+        .lock()
+        .await
+        .insert(key, files.clone());
+    files
+}
+
+async fn twig_variable_types_for_template_state(
+    uri_str: &str,
+    open_files: &Arc<DashMap<String, FileParser>>,
+    index: &WorkspaceIndex,
+    workspace_roots: &[PathBuf],
+    twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
+) -> Vec<TemplateVariableType> {
+    let Some(root) = workspace_root_for_template_context_uri(uri_str, workspace_roots) else {
+        return Vec::new();
+    };
+    let Some(template_name) = twig_template_name_for_uri(uri_str, &root) else {
+        return Vec::new();
+    };
+
+    let mut variables = HashMap::<String, String>::new();
+    let mut open_php_uris = HashSet::<String>::new();
+
+    for entry in open_files.iter() {
+        let source_uri = entry.key();
+        if source_uri == uri_str
+            || !source_uri.ends_with(".php")
+            || is_blade_template_uri(source_uri.as_str())
+        {
+            continue;
+        }
+        open_php_uris.insert(source_uri.to_string());
+        let source = entry.value().source();
+        let file_symbols = index
+            .file_symbols
+            .get(source_uri.as_str())
+            .map(|symbols| symbols.value().clone())
+            .or_else(|| {
+                entry
+                    .value()
+                    .tree()
+                    .map(|tree| extract_file_symbols(tree, &source, source_uri.as_str()))
+            })
+            .unwrap_or_default();
+        collect_twig_render_context_types(&template_name, &source, &file_symbols, &mut variables);
+    }
+
+    for file in
+        cached_twig_context_file_variables_for_state(&root, &template_name, twig_context_disk_cache)
+            .await
+    {
+        if open_php_uris.contains(&file.uri) {
+            continue;
+        }
+        for variable in file.variables {
+            variables.insert(variable.name, variable.type_text);
+        }
+    }
+
+    let mut result: Vec<_> = variables
+        .into_iter()
+        .map(|(name, type_text)| TemplateVariableType { name, type_text })
+        .collect();
+    result.sort_by(|left, right| left.name.cmp(&right.name));
+    result
+}
+
+pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
+    open_files: &Arc<DashMap<String, FileParser>>,
+    template_documents: &Arc<DashMap<String, TemplateDocument>>,
+    index: &WorkspaceIndex,
+    workspace_roots: &[PathBuf],
+    twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
+    semantic_tokens_cache: &Arc<Mutex<SemanticTokensCache>>,
+) -> Vec<String> {
+    let mut candidates: Vec<_> = template_documents
+        .iter()
+        .filter_map(|entry| {
+            (entry.value().kind() == TemplateKind::Twig).then(|| entry.key().clone())
+        })
+        .collect();
+    candidates.sort();
+
+    if candidates.len() > OPEN_TWIG_CONTEXT_REFRESH_LIMIT {
+        tracing::warn!(
+            "Skipping {} open Twig context refresh(es) over limit {}",
+            candidates.len() - OPEN_TWIG_CONTEXT_REFRESH_LIMIT,
+            OPEN_TWIG_CONTEXT_REFRESH_LIMIT
+        );
+        candidates.truncate(OPEN_TWIG_CONTEXT_REFRESH_LIMIT);
+    }
+
+    let mut refreshed = Vec::new();
+    for uri_str in candidates {
+        let Some(template) = template_documents
+            .get(&uri_str)
+            .map(|document| document.value().clone())
+        else {
+            continue;
+        };
+        if template.kind() != TemplateKind::Twig {
+            continue;
+        }
+
+        let variable_types = twig_variable_types_for_template_state(
+            &uri_str,
+            open_files,
+            index,
+            workspace_roots,
+            twig_context_disk_cache,
+        )
+        .await;
+        let refreshed_template = template.with_twig_variable_types(&variable_types);
+        let mut parser = FileParser::new();
+        parser.parse_full(refreshed_template.virtual_source());
+        template_documents.insert(uri_str.clone(), refreshed_template);
+        open_files.insert(uri_str.clone(), parser);
+        index.remove_file(&uri_str);
+        semantic_tokens_cache.lock().await.remove(&uri_str);
+        refreshed.push(uri_str);
+    }
+
+    refreshed
+}
+
 impl PhpLspBackend {
     pub(in crate::server) fn template_document(&self, uri_str: &str) -> Option<TemplateDocument> {
         self.template_documents
@@ -495,134 +703,41 @@ impl PhpLspBackend {
         parser
     }
 
-    async fn cached_twig_context_file_variables(
-        &self,
-        root: &Path,
-        template_name: &str,
-    ) -> Vec<TwigContextFileVariables> {
-        let key = TwigContextDiskCacheKey {
-            root: root.to_path_buf(),
-            template_name: template_name.to_string(),
-        };
-        if let Some(files) = self.twig_context_disk_cache.lock().await.get(&key) {
-            return files;
-        }
-
-        let root = root.to_path_buf();
-        let template_name = template_name.to_string();
-        let path_label = format!("{} ({})", root.display(), template_name);
-        let files = match run_file_io_blocking("twig context scan", path_label, move || {
-            let mut result = Vec::new();
-            for path in collect_twig_context_php_files(&root, 2048) {
-                let Ok(source_uri) = path_to_uri(&path) else {
-                    continue;
-                };
-                let Ok(source) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let mut parser = FileParser::new();
-                parser.parse_full(&source);
-                let file_symbols = parser
-                    .tree()
-                    .map(|tree| extract_file_symbols(tree, &source, &source_uri))
-                    .unwrap_or_default();
-                let mut variables = HashMap::new();
-                collect_twig_render_context_types(
-                    &template_name,
-                    &source,
-                    &file_symbols,
-                    &mut variables,
-                );
-                if variables.is_empty() {
-                    continue;
-                }
-                let mut variables: Vec<_> = variables
-                    .into_iter()
-                    .map(|(name, type_text)| TemplateVariableType { name, type_text })
-                    .collect();
-                variables.sort_by(|left, right| left.name.cmp(&right.name));
-                result.push(TwigContextFileVariables {
-                    uri: source_uri,
-                    variables,
-                });
-            }
-            result
-        })
-        .await
-        {
-            Ok(files) => files,
-            Err(message) => {
-                tracing::warn!("{}", message);
-                Vec::new()
-            }
-        };
-
-        self.twig_context_disk_cache
-            .lock()
-            .await
-            .insert(key, files.clone());
-        files
-    }
-
     pub(in crate::server) async fn twig_variable_types_for_template(
         &self,
         uri_str: &str,
     ) -> Vec<TemplateVariableType> {
-        let Some(root) = self.workspace_root_for_uri(uri_str).await else {
-            return Vec::new();
-        };
-        let Some(template_name) = twig_template_name_for_uri(uri_str, &root) else {
-            return Vec::new();
-        };
+        let roots = self.current_workspace_roots().await;
+        twig_variable_types_for_template_state(
+            uri_str,
+            &self.open_files,
+            &self.index,
+            &roots,
+            &self.twig_context_disk_cache,
+        )
+        .await
+    }
 
-        let mut variables = HashMap::<String, String>::new();
-        let mut open_php_uris = HashSet::<String>::new();
+    pub(in crate::server) async fn refresh_open_twig_contexts(&self) -> Vec<String> {
+        let roots = self.current_workspace_roots().await;
+        refresh_open_twig_contexts_for_state(
+            &self.open_files,
+            &self.template_documents,
+            &self.index,
+            &roots,
+            &self.twig_context_disk_cache,
+            &self.semantic_tokens_cache,
+        )
+        .await
+    }
 
-        for entry in self.open_files.iter() {
-            let source_uri = entry.key();
-            if source_uri == uri_str || !source_uri.ends_with(".php") {
-                continue;
-            }
-            open_php_uris.insert(source_uri.to_string());
-            let source = entry.value().source();
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(source_uri.as_str())
-                .map(|symbols| symbols.value().clone())
-                .or_else(|| {
-                    entry
-                        .value()
-                        .tree()
-                        .map(|tree| extract_file_symbols(tree, &source, source_uri.as_str()))
-                })
-                .unwrap_or_default();
-            collect_twig_render_context_types(
-                &template_name,
-                &source,
-                &file_symbols,
-                &mut variables,
-            );
-        }
-
-        for file in self
-            .cached_twig_context_file_variables(&root, &template_name)
-            .await
-        {
-            if open_php_uris.contains(&file.uri) {
-                continue;
-            }
-            for variable in file.variables {
-                variables.insert(variable.name, variable.type_text);
+    pub(in crate::server) async fn refresh_open_twig_contexts_and_republish_diagnostics(&self) {
+        let refreshed_uris = self.refresh_open_twig_contexts().await;
+        for uri_str in refreshed_uris {
+            if let Ok(uri) = uri_str.parse::<Uri>() {
+                self.publish_diagnostics(&uri).await;
             }
         }
-
-        let mut result: Vec<_> = variables
-            .into_iter()
-            .map(|(name, type_text)| TemplateVariableType { name, type_text })
-            .collect();
-        result.sort_by(|left, right| left.name.cmp(&right.name));
-        result
     }
 
     pub(in crate::server) async fn twig_template_location(

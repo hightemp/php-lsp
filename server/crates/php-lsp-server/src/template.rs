@@ -30,12 +30,23 @@ pub(crate) struct TemplateDocument {
 }
 
 impl TemplateDocument {
+    pub(crate) fn kind(&self) -> TemplateKind {
+        self.kind
+    }
+
     pub(crate) fn original_source(&self) -> &str {
         &self.original_source
     }
 
     pub(crate) fn virtual_source(&self) -> &str {
         &self.virtual_source
+    }
+
+    pub(crate) fn with_twig_variable_types(&self, variable_types: &[TemplateVariableType]) -> Self {
+        match self.kind {
+            TemplateKind::Blade => self.clone(),
+            TemplateKind::Twig => preprocess_twig_template(&self.original_source, variable_types),
+        }
     }
 
     pub(crate) fn map_original_position_to_virtual(&self, position: Position) -> Option<Position> {
