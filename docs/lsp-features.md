@@ -72,8 +72,8 @@ client-visible LSP behavior and known limits.
 
 | LSP feature | Status | Notes |
 |---|---|---|
-| `textDocument/rename` | Partial | Supports classes, functions, methods, properties, constants, and same-scope local variables. Built-ins and PHPDoc virtual members are not renamed. Workspace rename can still be expensive on large workspaces. |
-| `textDocument/prepareRename` | Supported | Rejects unsupported or built-in targets before rename. |
+| `textDocument/rename` | Partial | Supports classes, functions, methods, properties, constants, enum cases, and same-scope local variables. New names are validated by symbol kind; variables and properties still accept optional `$` input and normalize edits correctly. Built-ins and PHPDoc virtual members are not renamed. Workspace rename can still be expensive on large workspaces. |
+| `textDocument/prepareRename` | Supported | Rejects unsupported, built-in, virtual, or unsafe unresolved member targets before rename. |
 | `textDocument/codeAction` quick fix | Supported | Adds imports for unresolved classes/functions when candidates exist, removes one unused import, bulk-removes unused imports through organize imports, applies diagnostic replacement metadata, and supports opt-in PHPStan/Psalm local fixes for ignore comments, missing `@throws`, iterable PHPDoc value types, and prefixed class-name replacements. |
 | `textDocument/codeAction` implement missing methods | Supported | Generates concrete stubs for missing interface, abstract parent, and abstract trait methods. Preserves method PHPDoc, analyzer-specific contract tags, safe method attributes, visibility, static, params, defaults, and native-safe return types. Edits are resolved lazily and stale document versions resolve to a no-op edit. |
 | `textDocument/codeAction` generate members | Supported | Generates constructors and property getters/setters from indexed property symbols. Handles readonly/static properties, bool getter naming, nullable/default values, refined property PHPDoc types, analyzer-specific `@phpstan-var`/`@psalm-var` tags, and native-safe signatures. |

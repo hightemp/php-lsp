@@ -656,6 +656,134 @@ function run(string $name): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_rename_rejects_invalid_new_names_by_symbol_kind() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class RenameClass {
+    public const LIMIT = 1;
+    public string $prop = '';
+
+    public function run(string $arg): void {
+        $local = $arg;
+        echo self::LIMIT;
+        echo $this->prop;
+    }
+}
+
+interface RenameInterface {}
+trait RenameTrait {}
+enum RenameEnum {
+    case Ready;
+}
+
+function rename_function(): void {}
+const GLOBAL_LIMIT = 1;
+
+rename_function();
+echo GLOBAL_LIMIT;
+RenameEnum::Ready;
+"#;
+    let uri = "file:///test/RenameValidation.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let cases = [
+        ("RenameClass", 1, "123", "Invalid class name"),
+        ("RenameInterface", 1, "$Contract", "Invalid interface name"),
+        ("RenameTrait", 1, "trait", "Invalid trait name"),
+        (
+            "enum RenameEnum",
+            "enum ".len() as u32 + 1,
+            "enum-name",
+            "Invalid enum name",
+        ),
+        ("rename_function();", 1, "return", "Invalid function name"),
+        ("run(string", 1, "$run", "Invalid method name"),
+        (
+            "$this->prop",
+            "$this->".len() as u32 + 1,
+            "prop-name",
+            "Invalid property name",
+        ),
+        (
+            "self::LIMIT",
+            "self::".len() as u32 + 1,
+            "MAX-VALUE",
+            "Invalid constant name",
+        ),
+        (
+            "echo GLOBAL_LIMIT",
+            "echo ".len() as u32 + 1,
+            "$GLOBAL",
+            "Invalid constant name",
+        ),
+        (
+            "::Ready",
+            "::".len() as u32 + 1,
+            "123",
+            "Invalid enum case name",
+        ),
+        ("$local =", 1, "$1local", "Invalid variable name"),
+    ];
+
+    for (idx, (needle, offset, new_name, expected_error)) in cases.iter().enumerate() {
+        let (line, col) = line_col(code, needle);
+        let resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(rename_request(
+                2 + idx as i64,
+                uri,
+                line,
+                col + offset,
+                new_name,
+            ))
+            .await
+            .unwrap();
+        let err = extract_error_message(resp).unwrap_or_default();
+        assert!(
+            err.contains(expected_error),
+            "rename of {needle:?} to {new_name:?} should fail with {expected_error:?}, got: {err}"
+        );
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_cancel_request_cancels_references_request() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

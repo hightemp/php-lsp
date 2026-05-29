@@ -3060,7 +3060,8 @@ while implementing these tasks.
     - `cargo test --all`;
     - `git diff --check`.
 
-- [ ] **PHA-014** Strengthen rename validation by symbol kind.
+- [x] **PHA-014** Strengthen rename validation by symbol kind. *(done 2026-05-29)*
+  - Status: completed 2026-05-29.
   - Problem: non-variable rename currently rejects only empty names, spaces, and
     backslashes. It still allows invalid PHP identifiers such as `123`,
     `foo-bar`, keywords, or `$bad` for class/method/function/constants.
@@ -3073,6 +3074,26 @@ while implementing these tasks.
     - invalid names are rejected for each symbol kind;
     - valid PHP identifiers and property/variable `$` normalization keep
       working.
+  - Implementation:
+    - `rename` now validates the requested `newName` after resolving the target
+      symbol kind, with separate messages for classes, interfaces, traits,
+      enums, functions, methods, properties, constants, enum cases, and
+      variables;
+    - `prepareRename` now uses the same supported-kind gate before returning a
+      range;
+    - property and variable renames still accept either `name` or `$name` input
+      and normalize edits according to whether the target range includes `$`.
+  - Docs: `docs/lsp-features.md` documents kind-aware rename validation and
+    supported enum-case rename behavior.
+  - Validation:
+    - `cargo fmt --all --check`;
+    - `cargo test -p php-lsp-server rename::tests -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_references test_rename_rejects_invalid_new_names_by_symbol_kind -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_references -- --nocapture`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`;
+    - `git diff --check`.
 
 - [ ] **PHA-015** Make organize imports semantic instead of raw text based.
   - Problem: `build_organize_imports_edit()` can keep unused imports because it
