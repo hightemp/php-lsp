@@ -1867,9 +1867,9 @@ pub(in crate::server) fn node_inside_anonymous_class_body(
 
 #[derive(Debug, Clone)]
 pub(in crate::server) struct InferredExprType {
-    display: String,
-    comparable: String,
-    range: (u32, u32, u32, u32),
+    pub(in crate::server) display: String,
+    pub(in crate::server) comparable: String,
+    pub(in crate::server) range: (u32, u32, u32, u32),
 }
 
 pub(in crate::server) fn type_compatibility_diagnostics(
@@ -2937,8 +2937,36 @@ pub(in crate::server) fn override_param_type_is_compatible(
                     parent_owner_fqn,
                 )
                 || type_info_refines_native(parent_type, child_type)
-                || type_info_refines_native(child_type, parent_type)
+                || override_param_class_type_is_contravariant(
+                    child_type,
+                    parent_type,
+                    child_file_symbols,
+                    parent_file_symbols,
+                    child_owner_fqn,
+                    parent_owner_fqn,
+                    index,
+                )
         }
+    }
+}
+
+pub(in crate::server) fn override_param_class_type_is_contravariant(
+    child_type: &php_lsp_types::TypeInfo,
+    parent_type: &php_lsp_types::TypeInfo,
+    child_file_symbols: &php_lsp_types::FileSymbols,
+    parent_file_symbols: &php_lsp_types::FileSymbols,
+    child_owner_fqn: Option<&str>,
+    parent_owner_fqn: Option<&str>,
+    index: &WorkspaceIndex,
+) -> bool {
+    match (
+        simple_class_fqn_for_override(child_type, child_file_symbols, child_owner_fqn),
+        simple_class_fqn_for_override(parent_type, parent_file_symbols, parent_owner_fqn),
+    ) {
+        (Some(child_fqn), Some(parent_fqn)) => {
+            class_extends_or_implements(index, &parent_fqn, &child_fqn, &mut Vec::new())
+        }
+        _ => false,
     }
 }
 
@@ -3309,12 +3337,12 @@ pub(in crate::server) fn workspace_duplicate_symbol_diagnostics(
         }
 
         let has_duplicate = index.file_symbols.iter().any(|entry| {
+            if entry.key().as_str() == uri_str {
+                return false;
+            }
+
             entry.value().symbols.iter().any(|other| {
-                other.kind == sym.kind
-                    && other.fqn == sym.fqn
-                    && !other.modifiers.is_builtin
-                    && (entry.key().as_str() != uri_str
-                        || other.selection_range != sym.selection_range)
+                other.kind == sym.kind && other.fqn == sym.fqn && !other.modifiers.is_builtin
             })
         });
 

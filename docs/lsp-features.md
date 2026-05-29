@@ -93,7 +93,7 @@ client-visible LSP behavior and known limits.
 | LSP feature | Status | Notes |
 |---|---|---|
 | Diagnostics: syntax | Supported | Tree-sitter syntax errors. |
-| Diagnostics: built-in semantic | Supported | Unknown symbols, unused code, duplicate symbols, member access, type compatibility, override signatures, PHP-version checks. Without Composer/vendor metadata, external framework symbols can be reported as unknown; highly dynamic framework members such as some Eloquent relation APIs remain best-effort. |
+| Diagnostics: built-in semantic | Supported | Unknown symbols, unused code, duplicate symbols, member access, type compatibility, override signatures, PHP-version checks. Unqualified function calls follow current-namespace then global/built-in fallback before reporting unknown functions. Type compatibility and override variance checks are conservative approximations rather than full PHPStan/Psalm parity. Without Composer/vendor metadata, external framework symbols can be reported as unknown; highly dynamic framework members such as some Eloquent relation APIs remain best-effort. |
 | Diagnostics: PHPStan | Partial | Optional external command, timeout-bound, JSON output required. |
 | Diagnostics: Psalm | Partial | Optional external command, timeout-bound, JSON output required. |
 | `textDocument/hover` | Supported | Symbols, signatures, types, PHPDoc, variables, deprecation, PHPDoc virtual members, expanded indexed PHPDoc type aliases, call-site `class-string<T>` / conditional return inference, closure callback parameter inference from `callable(...)` signatures, and mapped Blade/Twig expression hovers where virtual PHP can resolve the symbol. |

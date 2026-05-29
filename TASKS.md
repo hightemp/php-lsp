@@ -2975,7 +2975,8 @@ while implementing these tasks.
     - `cargo clippy --all-targets -- -D warnings`;
     - `git diff --check`.
 
-- [ ] **PHA-012** Tighten diagnostics correctness before increasing coverage.
+- [x] **PHA-012** Tighten diagnostics correctness before increasing coverage. *(done 2026-05-29)*
+  - Status: completed 2026-05-29.
   - Scope:
     - deduplicate duplicate-symbol diagnostics when local and workspace checks
       report the same declaration pair;
@@ -2989,6 +2990,32 @@ while implementing these tasks.
       rules and regression tests.
   - Acceptance: fewer false positives on real Composer projects before adding
     broader unknown-function diagnostics.
+  - Implementation:
+    - same-file duplicate declarations are reported only by parser semantic
+      diagnostics; workspace duplicate diagnostics now cover cross-file
+      duplicates only;
+    - unqualified function diagnostics use explicit `use function`, current
+      namespace, and global/built-in fallback resolution before reporting an
+      unknown function;
+    - type-compatibility approximation rules for generics, shapes,
+      unions/intersections, relative types, and literals are locked with unit
+      coverage;
+    - override signature checks now allow class-typed parameter widening and
+      continue to reject narrowed parameters / widened returns.
+  - Docs: `docs/architecture.md` documents duplicate/function/type/override
+    diagnostic policy; `docs/lsp-features.md` documents the client-visible
+    diagnostics limits.
+  - Validation:
+    - `cargo test -p php-lsp-parser semantic`;
+    - `cargo test -p php-lsp-server test_compute_diagnostics -- --nocapture`;
+    - `cargo test -p php-lsp-server test_type_compatibility_approximation_rules_are_explicit -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_diagnostics`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo test -p php-lsp-parser`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`;
+    - `git diff --check`.
 
 - [ ] **PHA-013** Finish PHPDoc parser hardening.
   - Scope:

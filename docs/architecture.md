@@ -426,6 +426,27 @@ duplicate symbols, member access problems, type compatibility, override
 signatures, and PHP-version checks. Per-category severity is controlled by
 `phpLsp.diagnostics.severity`.
 
+Duplicate-symbol diagnostics are split by scope: parser semantic diagnostics
+report duplicate declarations inside the current file, while workspace
+diagnostics report only cross-file duplicates from the index. This avoids
+publishing the same declaration pair twice when the current file is already in
+the workspace index.
+
+Unknown function diagnostics use PHP's namespace fallback order. Explicitly
+qualified calls and `use function` aliases must resolve to the indexed symbol
+they name. Unqualified calls are checked against the current namespace first and
+then the global function table, which is where bundled PHP stubs expose built-in
+functions. A diagnostic is emitted only when those fallbacks do not resolve.
+
+Type compatibility diagnostics are intentionally approximate. They compare
+known literal/scalar values, class names, arrays, array/object shapes,
+class-string/callable types, and unions where enough local information is
+available; intersections and relative `self`/`static`/`parent` types are treated
+optimistically to avoid false positives without whole-program type flow.
+Override diagnostics apply incremental PHP variance rules: parameters may widen
+class types, returns may narrow class types, and PHPDoc/native refinements are
+handled conservatively rather than as a full PHPStan/Psalm type lattice.
+
 There are two publishing paths:
 
 - Fast diagnostics after `didChange`: debounced, in-process, version-checked,

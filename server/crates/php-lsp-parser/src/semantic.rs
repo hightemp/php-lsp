@@ -349,21 +349,9 @@ fn check_function_call<F>(
         if nk == "name" || nk == "qualified_name" || nk == "namespace_name" {
             let name = &source[name_node.byte_range()];
 
-            // Skip PHP built-in functions by checking if name is simple and common
-            // We only check namespaced function calls or functions that aren't in the index
             let fqn = resolve_function_name(name, file_symbols);
 
-            // Resolve function symbol for argument count checks.
-            // For simple names, try namespace-qualified fallback as well.
-            let mut resolved: Option<(String, Arc<SymbolInfo>)> =
-                resolver(&fqn).map(|sym| (fqn.clone(), sym));
-
-            if resolved.is_none() && !fqn.contains('\\') {
-                if let Some(ref ns) = file_symbols.namespace {
-                    let ns_fqn = format!("{}\\{}", ns, fqn);
-                    resolved = resolver(&ns_fqn).map(|sym| (ns_fqn, sym));
-                }
-            }
+            let resolved = resolve_function_call_target(name, &fqn, file_symbols, resolver);
 
             if let Some((resolved_fqn, func_sym)) = resolved {
                 if let Some(ref sig) = func_sym.signature {
@@ -405,17 +393,86 @@ fn check_function_call<F>(
                 }
             }
 
-            // Don't flag simple function names — too many PHP built-ins
-            // Only flag namespaced function calls that can't be resolved
-            if fqn.contains('\\') && resolver(&fqn).is_none() {
+            if let Some(unknown_fqn) =
+                unknown_function_diagnostic_fqn(name, &fqn, file_symbols, resolver)
+            {
                 diagnostics.push(SemanticDiagnostic {
                     range: node_range(&name_node),
-                    message: format!("Unknown function: {}", fqn),
+                    message: format!("Unknown function: {}", unknown_fqn),
                     kind: SemanticDiagnosticKind::UnknownFunction,
                 });
             }
         }
     }
+}
+
+fn resolve_function_call_target<F>(
+    name: &str,
+    resolved_name: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+) -> Option<(String, Arc<SymbolInfo>)>
+where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
+    if is_unqualified_name(name) {
+        if resolved_name != name {
+            return resolve_function_symbol(resolver, resolved_name)
+                .map(|sym| (resolved_name.to_string(), sym));
+        }
+
+        if let Some(ref ns) = file_symbols.namespace {
+            let namespaced = format!("{}\\{}", ns, name);
+            if let Some(sym) = resolve_function_symbol(resolver, &namespaced) {
+                return Some((namespaced, sym));
+            }
+        }
+
+        return resolve_function_symbol(resolver, name).map(|sym| (name.to_string(), sym));
+    }
+
+    resolve_function_symbol(resolver, resolved_name).map(|sym| (resolved_name.to_string(), sym))
+}
+
+fn unknown_function_diagnostic_fqn<F>(
+    name: &str,
+    resolved_name: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+) -> Option<String>
+where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
+    if resolve_function_call_target(name, resolved_name, file_symbols, resolver).is_some() {
+        return None;
+    }
+
+    if is_unqualified_name(name) {
+        if resolved_name != name {
+            return Some(resolved_name.to_string());
+        }
+
+        return Some(
+            file_symbols
+                .namespace
+                .as_ref()
+                .map(|ns| format!("{}\\{}", ns, name))
+                .unwrap_or_else(|| name.to_string()),
+        );
+    }
+
+    Some(resolved_name.to_string())
+}
+
+fn resolve_function_symbol<F>(resolver: &F, fqn: &str) -> Option<Arc<SymbolInfo>>
+where
+    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+{
+    resolver(fqn)
+}
+
+fn is_unqualified_name(name: &str) -> bool {
+    !name.starts_with('\\') && !name.contains('\\')
 }
 
 /// Whether we should check a class name against the index.
@@ -1674,6 +1731,77 @@ App\Utils\helper();
         assert!(
             !unknown_funcs.is_empty(),
             "Expected unknown function diagnostic for namespaced call"
+        );
+    }
+
+    #[test]
+    fn test_unknown_unqualified_function_after_namespace_and_global_fallbacks() {
+        let code = r#"<?php
+namespace App;
+
+missing_helper();
+"#;
+        let diags = parse_and_check(code, |_fqn| None);
+
+        let unknown_funcs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::UnknownFunction)
+            .collect();
+
+        assert_eq!(
+            unknown_funcs.len(),
+            1,
+            "Expected one unknown function diagnostic, got: {:?}",
+            unknown_funcs
+        );
+        assert!(unknown_funcs[0]
+            .message
+            .contains("Unknown function: App\\missing_helper"));
+    }
+
+    #[test]
+    fn test_unqualified_function_uses_current_namespace_or_global_fallback() {
+        let code = r#"<?php
+namespace App;
+
+helper();
+strlen("hello");
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "App\\helper" || fqn == "strlen" {
+                Some(dummy_symbol())
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.kind == SemanticDiagnosticKind::UnknownFunction),
+            "Expected namespace/global function fallback to avoid unknown diagnostics, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_imported_function_reports_import_fqn_when_missing() {
+        let code = r#"<?php
+namespace App;
+
+use function Vendor\helper;
+
+helper();
+"#;
+        let diags = parse_and_check(code, |_fqn| None);
+
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnknownFunction
+                    && d.message.contains("Unknown function: Vendor\\helper")
+            }),
+            "Expected imported function FQN diagnostic, got: {:?}",
+            diags
         );
     }
 

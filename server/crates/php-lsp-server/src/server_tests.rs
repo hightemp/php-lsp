@@ -1,5 +1,6 @@
 use super::lsp::diagnostics::{
     current_class_fqn_at_range, parse_phpstan_json_diagnostics, parse_psalm_json_diagnostics,
+    type_info_accepts_inferred_type, InferredExprType,
 };
 use super::lsp::document_symbols::{workspace_symbol_candidates, workspace_symbol_lsp_range};
 use super::*;
@@ -105,6 +106,14 @@ fn assert_no_diagnostic_containing(messages: &[String], unexpected: &str) {
         unexpected,
         messages
     );
+}
+
+fn inferred_expr(display: &str, comparable: &str) -> InferredExprType {
+    InferredExprType {
+        display: display.to_string(),
+        comparable: comparable.to_string(),
+        range: (0, 0, 0, 1),
+    }
 }
 
 #[test]
@@ -868,6 +877,140 @@ fn test_compute_diagnostics_reports_duplicate_workspace_symbols() {
         "Expected duplicate workspace symbol diagnostic, got: {:?}",
         diagnostics
     );
+}
+
+#[test]
+fn test_compute_diagnostics_deduplicates_same_file_duplicate_symbols() {
+    let uri = "file:///same-file-duplicates.php";
+    let code = "<?php\nnamespace App;\nclass Duplicate {}\nclass Duplicate {}\n";
+
+    let index = WorkspaceIndex::new();
+    let parser = parse_and_index_php_file(&index, uri, code);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let duplicates: Vec<_> = diagnostics
+        .iter()
+        .filter(|diag| diag.message == "Duplicate symbol: App\\Duplicate")
+        .collect();
+
+    assert_eq!(
+        duplicates.len(),
+        2,
+        "Expected one diagnostic per duplicate declaration, got: {:?}",
+        diagnostics
+    );
+}
+
+#[test]
+fn test_type_compatibility_approximation_rules_are_explicit() {
+    let file_symbols = FileSymbols::default();
+    let index = WorkspaceIndex::new();
+
+    let generic_array = TypeInfo::Generic {
+        base: "array".to_string(),
+        args: vec![
+            TypeInfo::Simple("int".to_string()),
+            TypeInfo::Simple("string".to_string()),
+        ],
+    };
+    assert!(type_info_accepts_inferred_type(
+        &generic_array,
+        &inferred_expr("array", "array"),
+        &file_symbols,
+        &index
+    ));
+    assert!(!type_info_accepts_inferred_type(
+        &generic_array,
+        &inferred_expr("string", "string"),
+        &file_symbols,
+        &index
+    ));
+
+    let shape = TypeInfo::ArrayShape(vec![ArrayShapeItem {
+        key: Some("id".to_string()),
+        optional: false,
+        value: TypeInfo::Simple("int".to_string()),
+    }]);
+    assert!(type_info_accepts_inferred_type(
+        &shape,
+        &inferred_expr("array", "array"),
+        &file_symbols,
+        &index
+    ));
+
+    let union = TypeInfo::Union(vec![
+        TypeInfo::Simple("string".to_string()),
+        TypeInfo::Simple("int".to_string()),
+    ]);
+    assert!(type_info_accepts_inferred_type(
+        &union,
+        &inferred_expr("string", "'ok'"),
+        &file_symbols,
+        &index
+    ));
+    assert!(!type_info_accepts_inferred_type(
+        &union,
+        &inferred_expr("bool", "false"),
+        &file_symbols,
+        &index
+    ));
+
+    let intersection = TypeInfo::Intersection(vec![
+        TypeInfo::Simple("App\\A".to_string()),
+        TypeInfo::Simple("App\\B".to_string()),
+    ]);
+    assert!(type_info_accepts_inferred_type(
+        &intersection,
+        &inferred_expr("App\\A", "App\\A"),
+        &file_symbols,
+        &index
+    ));
+
+    for relative_type in [TypeInfo::Self_, TypeInfo::Static_, TypeInfo::Parent_] {
+        assert!(type_info_accepts_inferred_type(
+            &relative_type,
+            &inferred_expr("App\\Child", "App\\Child"),
+            &file_symbols,
+            &index
+        ));
+    }
+
+    assert!(type_info_accepts_inferred_type(
+        &TypeInfo::LiteralString("'ok'".to_string()),
+        &inferred_expr("string", "'ok'"),
+        &file_symbols,
+        &index
+    ));
+    assert!(type_info_accepts_inferred_type(
+        &TypeInfo::LiteralInt("1".to_string()),
+        &inferred_expr("int", "1"),
+        &file_symbols,
+        &index
+    ));
+    assert!(type_info_accepts_inferred_type(
+        &TypeInfo::LiteralBool(true),
+        &inferred_expr("true", "true"),
+        &file_symbols,
+        &index
+    ));
+    assert!(type_info_accepts_inferred_type(
+        &TypeInfo::LiteralNull,
+        &inferred_expr("null", "null"),
+        &file_symbols,
+        &index
+    ));
+    assert!(!type_info_accepts_inferred_type(
+        &TypeInfo::LiteralInt("2".to_string()),
+        &inferred_expr("int", "1"),
+        &file_symbols,
+        &index
+    ));
 }
 
 #[test]
@@ -1881,6 +2024,79 @@ function nullableUnion(): string|null {
             messages
         );
     }
+}
+
+#[test]
+fn test_compute_diagnostics_applies_class_variance_to_override_signatures() {
+    let uri = "file:///override-variance.php";
+    let code = r#"<?php
+namespace App;
+
+class Animal {}
+class Dog extends Animal {}
+class ServiceDog extends Dog {}
+
+class Base {
+    public function adopt(Dog $dog): Animal {
+        return $dog;
+    }
+}
+
+class GoodChild extends Base {
+    public function adopt(Animal $dog): Dog {
+        return new Dog();
+    }
+}
+
+class BadParamChild extends Base {
+    public function adopt(ServiceDog $dog): Animal {
+        return $dog;
+    }
+}
+
+class ReturnBase {
+    public function make(): Dog {
+        return new Dog();
+    }
+}
+
+class BadReturnChild extends ReturnBase {
+    public function make(): Animal {
+        return new Animal();
+    }
+}
+"#;
+
+    let index = WorkspaceIndex::new();
+    let parser = parse_and_index_php_file(&index, uri, code);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    assert_no_diagnostic_containing(
+        &messages,
+        "Incompatible override signature: App\\GoodChild::adopt",
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message == "Incompatible override signature: App\\BadParamChild::adopt differs from App\\Base::adopt"
+        }),
+        "Expected narrowed parameter override diagnostic, got: {:?}",
+        messages
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message == "Incompatible override signature: App\\BadReturnChild::make differs from App\\ReturnBase::make"
+        }),
+        "Expected widened return override diagnostic, got: {:?}",
+        messages
+    );
 }
 
 #[test]
