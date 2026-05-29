@@ -2578,6 +2578,99 @@ class Demo {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_code_action_organize_imports_uses_semantic_references_and_phpdoc_types() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+use Vendor\CommentOnly as CommentAlias;
+use Vendor\DocTextOnly;
+use Vendor\DocType as DocAlias;
+use Vendor\Runtime;
+use Vendor\StringOnly as StringAlias;
+use function Vendor\runtime_func;
+use const Vendor\RUNTIME_CONST;
+
+class Demo {
+    /**
+     * @param DocAlias $value
+     * @param string $label DocTextOnly appears only in prose.
+     */
+    public function run(Runtime $runtime, $value, string $label): void {
+        // CommentAlias appears only in a comment.
+        $text = "StringAlias appears only in a string";
+        runtime_func();
+        echo RUNTIME_CONST;
+    }
+}
+"#;
+    let uri = "file:///test/OrganizeImportsSemantic.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(organize_imports_request(2, uri))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let actions = result.as_array().expect("code actions array");
+    let organize_action = actions
+        .iter()
+        .find(|action| action.get("title").and_then(|v| v.as_str()) == Some("Organize imports"))
+        .unwrap_or_else(|| panic!("expected Organize imports action, got: {}", result));
+
+    let new_text = organize_action["edit"]["changes"][uri][0]["newText"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(
+        new_text,
+        "use Vendor\\DocType as DocAlias;\nuse Vendor\\Runtime;\n\nuse function Vendor\\runtime_func;\n\nuse const Vendor\\RUNTIME_CONST;\n"
+    );
+    assert!(
+        !new_text.contains("CommentOnly")
+            && !new_text.contains("DocTextOnly")
+            && !new_text.contains("StringOnly"),
+        "imports used only in comments, strings, or PHPDoc prose should be removed, got: {}",
+        new_text
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_action_unused_import_quickfixes() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

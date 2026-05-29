@@ -358,91 +358,230 @@ pub(crate) fn find_organizable_use_block(
     Some((start_line, end_line))
 }
 
-pub(crate) fn source_without_line_range(source: &str, start_line: u32, end_line: u32) -> String {
-    let mut result = String::with_capacity(source.len());
-    for (line_idx, line) in source.split_inclusive('\n').enumerate() {
-        if (start_line as usize..end_line as usize).contains(&line_idx) {
-            result.push('\n');
-        } else {
-            result.push_str(line);
-        }
-    }
-    result
-}
-
-pub(crate) fn is_php_identifier_char(ch: char) -> bool {
-    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() || !ch.is_ascii()
-}
-
-pub(crate) fn has_identifier_boundaries(source: &str, start: usize, end: usize) -> bool {
-    let before_ok = source[..start]
-        .chars()
-        .next_back()
-        .map(|ch| !is_php_identifier_char(ch))
-        .unwrap_or(true);
-    let after_ok = source[end..]
-        .chars()
-        .next()
-        .map(|ch| !is_php_identifier_char(ch))
-        .unwrap_or(true);
-    before_ok && after_ok
-}
-
-pub(crate) fn contains_php_identifier(source: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-
-    let mut offset = 0usize;
-    while let Some(relative) = source[offset..].find(name) {
-        let start = offset + relative;
-        let end = start + name.len();
-        if has_identifier_boundaries(source, start, end) {
-            return true;
-        }
-        offset = end;
-    }
-
-    false
-}
-
-pub(crate) fn contains_php_function_call(source: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-
-    let mut offset = 0usize;
-    while let Some(relative) = source[offset..].find(name) {
-        let start = offset + relative;
-        let end = start + name.len();
-        if has_identifier_boundaries(source, start, end) {
-            let after_name = source[end..].trim_start();
-            if after_name.starts_with('(') {
-                return true;
-            }
-        }
-        offset = end;
-    }
-
-    false
-}
-
-pub(crate) fn import_is_used(source_without_imports: &str, import: &OrganizableImport) -> bool {
-    let alias = import
+pub(crate) fn import_alias(import: &OrganizableImport) -> &str {
+    import
         .alias
         .as_deref()
-        .unwrap_or_else(|| short_name(&import.fqn));
+        .unwrap_or_else(|| short_name(&import.fqn))
+}
+
+pub(crate) fn import_is_used(
+    import: &OrganizableImport,
+    file_symbols: &php_lsp_types::FileSymbols,
+    references: &[php_lsp_types::SymbolReference],
+) -> bool {
+    import_is_used_by_references(import, references)
+        || import_is_used_by_phpdoc_types(import, file_symbols)
+}
+
+fn import_is_used_by_references(
+    import: &OrganizableImport,
+    references: &[php_lsp_types::SymbolReference],
+) -> bool {
+    references
+        .iter()
+        .any(|reference| reference_matches_import(reference, import))
+}
+
+fn reference_matches_import(
+    reference: &php_lsp_types::SymbolReference,
+    import: &OrganizableImport,
+) -> bool {
+    let target_fqn = reference.target_fqn.trim_start_matches('\\');
+    let import_fqn = import.fqn.trim_start_matches('\\');
 
     match import.kind {
-        ImportKind::Class => contains_php_identifier(source_without_imports, alias),
-        ImportKind::Function => contains_php_function_call(source_without_imports, alias),
-        ImportKind::Constant => contains_php_identifier(source_without_imports, alias),
+        ImportKind::Class => {
+            matches!(
+                reference.target_kind,
+                php_lsp_types::PhpSymbolKind::Class
+                    | php_lsp_types::PhpSymbolKind::Interface
+                    | php_lsp_types::PhpSymbolKind::Trait
+                    | php_lsp_types::PhpSymbolKind::Enum
+            ) && fqn_matches_import_or_prefix(target_fqn, import_fqn)
+        }
+        ImportKind::Function => {
+            reference.target_kind == php_lsp_types::PhpSymbolKind::Function
+                && target_fqn == import_fqn
+        }
+        ImportKind::Constant => {
+            reference.target_kind == php_lsp_types::PhpSymbolKind::GlobalConstant
+                && target_fqn == import_fqn
+        }
     }
+}
+
+fn fqn_matches_import_or_prefix(target_fqn: &str, import_fqn: &str) -> bool {
+    target_fqn == import_fqn
+        || target_fqn
+            .strip_prefix(import_fqn)
+            .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+fn import_is_used_by_phpdoc_types(
+    import: &OrganizableImport,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> bool {
+    if import.kind != ImportKind::Class {
+        return false;
+    }
+
+    file_symbols
+        .symbols
+        .iter()
+        .filter_map(|symbol| symbol.doc_comment.as_deref())
+        .map(parse_phpdoc)
+        .any(|phpdoc| phpdoc_uses_import(&phpdoc, import))
+        || file_symbols
+            .type_aliases
+            .iter()
+            .any(|alias| type_info_uses_import(&alias.type_info, import))
+        || file_symbols
+            .type_alias_imports
+            .iter()
+            .any(|alias_import| phpdoc_name_uses_import(&alias_import.source_type, import))
+}
+
+fn phpdoc_uses_import(phpdoc: &php_lsp_types::PhpDoc, import: &OrganizableImport) -> bool {
+    phpdoc
+        .params
+        .iter()
+        .filter_map(|param| param.type_info.as_ref())
+        .any(|type_info| type_info_uses_import(type_info, import))
+        || phpdoc
+            .return_type
+            .as_ref()
+            .is_some_and(|type_info| type_info_uses_import(type_info, import))
+        || phpdoc
+            .var_type
+            .as_ref()
+            .is_some_and(|type_info| type_info_uses_import(type_info, import))
+        || phpdoc
+            .throws
+            .iter()
+            .any(|type_info| type_info_uses_import(type_info, import))
+        || phpdoc.properties.iter().any(|property| {
+            property
+                .type_info
+                .as_ref()
+                .is_some_and(|type_info| type_info_uses_import(type_info, import))
+        })
+        || phpdoc.methods.iter().any(|method| {
+            method
+                .return_type
+                .as_ref()
+                .is_some_and(|type_info| type_info_uses_import(type_info, import))
+                || method
+                    .params
+                    .iter()
+                    .filter_map(|param| param.type_info.as_ref())
+                    .any(|type_info| type_info_uses_import(type_info, import))
+        })
+        || phpdoc.templates.iter().any(|template| {
+            template
+                .bound
+                .as_ref()
+                .is_some_and(|type_info| type_info_uses_import(type_info, import))
+        })
+        || phpdoc.template_bindings.iter().any(|binding| {
+            phpdoc_name_uses_import(&binding.target, import)
+                || binding
+                    .args
+                    .iter()
+                    .any(|type_info| type_info_uses_import(type_info, import))
+        })
+        || phpdoc
+            .type_aliases
+            .iter()
+            .any(|alias| type_info_uses_import(&alias.type_info, import))
+        || phpdoc
+            .type_alias_imports
+            .iter()
+            .any(|alias_import| phpdoc_name_uses_import(&alias_import.source_type, import))
+}
+
+fn type_info_uses_import(type_info: &php_lsp_types::TypeInfo, import: &OrganizableImport) -> bool {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => phpdoc_name_uses_import(name, import),
+        php_lsp_types::TypeInfo::Generic { base, args } => {
+            phpdoc_name_uses_import(base, import)
+                || args
+                    .iter()
+                    .any(|type_info| type_info_uses_import(type_info, import))
+        }
+        php_lsp_types::TypeInfo::ArrayShape(items)
+        | php_lsp_types::TypeInfo::ObjectShape(items) => items
+            .iter()
+            .any(|item| type_info_uses_import(&item.value, import)),
+        php_lsp_types::TypeInfo::Callable {
+            params,
+            return_type,
+        } => {
+            params
+                .iter()
+                .any(|type_info| type_info_uses_import(type_info, import))
+                || return_type
+                    .as_deref()
+                    .is_some_and(|type_info| type_info_uses_import(type_info, import))
+        }
+        php_lsp_types::TypeInfo::ClassString(inner) => inner
+            .as_deref()
+            .is_some_and(|type_info| type_info_uses_import(type_info, import)),
+        php_lsp_types::TypeInfo::Conditional {
+            target,
+            if_type,
+            else_type,
+            ..
+        } => {
+            type_info_uses_import(target, import)
+                || type_info_uses_import(if_type, import)
+                || type_info_uses_import(else_type, import)
+        }
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            types
+                .iter()
+                .any(|type_info| type_info_uses_import(type_info, import))
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => type_info_uses_import(inner, import),
+        php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull
+        | php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed
+        | php_lsp_types::TypeInfo::Self_
+        | php_lsp_types::TypeInfo::Static_
+        | php_lsp_types::TypeInfo::Parent_ => false,
+    }
+}
+
+fn phpdoc_name_uses_import(name: &str, import: &OrganizableImport) -> bool {
+    let name = name.trim().trim_start_matches('\\');
+    if name.is_empty() {
+        return false;
+    }
+
+    let import_fqn = import.fqn.trim_start_matches('\\');
+    if fqn_matches_import_or_prefix(name, import_fqn) {
+        return true;
+    }
+
+    first_name_segment(name) == import_alias(import)
+}
+
+fn first_name_segment(name: &str) -> &str {
+    name.trim_start_matches('\\')
+        .split('\\')
+        .next()
+        .unwrap_or(name)
 }
 
 pub(crate) fn build_organize_imports_edit(
     uri: Uri,
     source: &str,
+    tree: &tree_sitter::Tree,
     file_symbols: &php_lsp_types::FileSymbols,
 ) -> Option<WorkspaceEdit> {
     if file_symbols.use_statements.is_empty() {
@@ -450,7 +589,7 @@ pub(crate) fn build_organize_imports_edit(
     }
 
     let (start_line, end_line) = find_organizable_use_block(source, file_symbols)?;
-    let source_without_imports = source_without_line_range(source, start_line, end_line);
+    let references = collect_symbol_references_in_file(tree, source, file_symbols);
 
     let mut imports: Vec<OrganizableImport> = file_symbols
         .use_statements
@@ -460,7 +599,7 @@ pub(crate) fn build_organize_imports_edit(
             alias: use_stmt.alias.clone(),
             kind: import_kind_from_use_kind(use_stmt.kind),
         })
-        .filter(|import| import_is_used(&source_without_imports, import))
+        .filter(|import| import_is_used(import, file_symbols, &references))
         .collect();
 
     imports.sort_by(|a, b| {
@@ -5129,9 +5268,7 @@ pub(crate) fn build_remove_unused_import_action(
 }
 
 pub(crate) fn build_remove_all_unused_imports_action(
-    uri: Uri,
-    source: &str,
-    file_symbols: &php_lsp_types::FileSymbols,
+    organize_imports_edit: Option<&WorkspaceEdit>,
     diagnostics: &[Diagnostic],
 ) -> Option<CodeActionOrCommand> {
     let unused_diagnostics = diagnostics
@@ -5147,7 +5284,7 @@ pub(crate) fn build_remove_all_unused_imports_action(
         title: "Remove all unused imports".to_string(),
         kind: Some(CodeActionKind::QUICKFIX),
         diagnostics: Some(unused_diagnostics),
-        edit: Some(build_organize_imports_edit(uri, source, file_symbols)?),
+        edit: Some(organize_imports_edit.cloned()?),
         command: None,
         is_preferred: Some(false),
         disabled: None,
@@ -5614,6 +5751,7 @@ impl PhpLspBackend {
         let (
             source,
             file_symbols,
+            organize_imports_edit,
             add_return_type_actions,
             generate_member_actions,
             refactor_extract_actions,
@@ -5635,6 +5773,11 @@ impl PhpLspBackend {
                 .get(&uri_str)
                 .map(|entry| entry.value().clone())
                 .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
+            let organize_imports_edit = if wants_organize_imports || wants_quickfix {
+                build_organize_imports_edit(uri.clone(), &source, tree, &file_symbols)
+            } else {
+                None
+            };
             let add_return_type_actions = if wants_add_return_type {
                 let range = lsp_range_to_byte_range(&source, params.range);
                 find_missing_return_type_candidates(tree, &source, range)
@@ -5788,6 +5931,7 @@ impl PhpLspBackend {
             (
                 source,
                 file_symbols,
+                organize_imports_edit,
                 add_return_type_actions,
                 generate_member_actions,
                 refactor_extract_actions,
@@ -5804,7 +5948,7 @@ impl PhpLspBackend {
         actions.extend(implement_missing_methods_actions);
 
         if wants_organize_imports {
-            if let Some(edit) = build_organize_imports_edit(uri.clone(), &source, &file_symbols) {
+            if let Some(edit) = organize_imports_edit.clone() {
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                     title: "Organize imports".to_string(),
                     kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
@@ -5966,9 +6110,7 @@ impl PhpLspBackend {
         }
 
         if let Some(action) = build_remove_all_unused_imports_action(
-            uri.clone(),
-            &source,
-            &file_symbols,
+            organize_imports_edit.as_ref(),
             &all_quickfix_diagnostics,
         ) {
             actions.push(action);

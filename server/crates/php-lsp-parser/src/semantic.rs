@@ -3,7 +3,7 @@
 //! Walks the CST and checks class/function/use references
 //! against a resolver function (typically backed by the workspace index).
 
-use php_lsp_types::{FileSymbols, SymbolInfo, UseKind};
+use php_lsp_types::{FileSymbols, PhpDoc, SymbolInfo, TypeInfo, UseKind};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Tree;
@@ -617,9 +617,10 @@ fn check_unused_imports(
             continue;
         }
 
-        if !import_name_is_used(root, source, imported_name, use_stmt.range)
-            && !import_name_is_used_in_phpdoc(source, imported_name)
-        {
+        let is_used_in_phpdoc =
+            use_stmt.kind == UseKind::Class && import_name_is_used_in_phpdoc(source, imported_name);
+
+        if !import_name_is_used(root, source, imported_name, use_stmt.range) && !is_used_in_phpdoc {
             diagnostics.push(SemanticDiagnostic {
                 range: use_stmt.range,
                 message: format!("Unused import: {}", use_stmt.fqn),
@@ -664,7 +665,8 @@ fn import_name_is_used_in_phpdoc(source: &str, imported_name: &str) -> bool {
             break;
         };
         let end = start + relative_end + 2;
-        if contains_identifier(&source[start..end], imported_name) {
+        let phpdoc = crate::phpdoc::parse_phpdoc(&source[start..end]);
+        if phpdoc_uses_imported_name(&phpdoc, imported_name) {
             return true;
         }
         offset = end;
@@ -672,25 +674,119 @@ fn import_name_is_used_in_phpdoc(source: &str, imported_name: &str) -> bool {
     false
 }
 
-fn contains_identifier(source: &str, name: &str) -> bool {
-    let mut offset = 0usize;
-    while let Some(relative) = source[offset..].find(name) {
-        let start = offset + relative;
-        let end = start + name.len();
-        let before_ok = source[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|ch| !is_identifier_char(ch));
-        let after_ok = source[end..]
-            .chars()
-            .next()
-            .is_none_or(|ch| !is_identifier_char(ch));
-        if before_ok && after_ok {
-            return true;
+fn phpdoc_uses_imported_name(phpdoc: &PhpDoc, imported_name: &str) -> bool {
+    phpdoc
+        .params
+        .iter()
+        .filter_map(|param| param.type_info.as_ref())
+        .any(|type_info| type_info_uses_imported_name(type_info, imported_name))
+        || phpdoc
+            .return_type
+            .as_ref()
+            .is_some_and(|type_info| type_info_uses_imported_name(type_info, imported_name))
+        || phpdoc
+            .var_type
+            .as_ref()
+            .is_some_and(|type_info| type_info_uses_imported_name(type_info, imported_name))
+        || phpdoc
+            .throws
+            .iter()
+            .any(|type_info| type_info_uses_imported_name(type_info, imported_name))
+        || phpdoc.properties.iter().any(|property| {
+            property
+                .type_info
+                .as_ref()
+                .is_some_and(|type_info| type_info_uses_imported_name(type_info, imported_name))
+        })
+        || phpdoc.methods.iter().any(|method| {
+            method
+                .return_type
+                .as_ref()
+                .is_some_and(|type_info| type_info_uses_imported_name(type_info, imported_name))
+                || method
+                    .params
+                    .iter()
+                    .filter_map(|param| param.type_info.as_ref())
+                    .any(|type_info| type_info_uses_imported_name(type_info, imported_name))
+        })
+        || phpdoc.templates.iter().any(|template| {
+            template
+                .bound
+                .as_ref()
+                .is_some_and(|type_info| type_info_uses_imported_name(type_info, imported_name))
+        })
+        || phpdoc.template_bindings.iter().any(|binding| {
+            type_name_uses_imported_name(&binding.target, imported_name)
+                || binding
+                    .args
+                    .iter()
+                    .any(|type_info| type_info_uses_imported_name(type_info, imported_name))
+        })
+        || phpdoc
+            .type_aliases
+            .iter()
+            .any(|alias| type_info_uses_imported_name(&alias.type_info, imported_name))
+        || phpdoc.type_alias_imports.iter().any(|alias_import| {
+            type_name_uses_imported_name(&alias_import.source_type, imported_name)
+        })
+}
+
+fn type_info_uses_imported_name(type_info: &TypeInfo, imported_name: &str) -> bool {
+    match type_info {
+        TypeInfo::Simple(name) => type_name_uses_imported_name(name, imported_name),
+        TypeInfo::Generic { base, args } => {
+            type_name_uses_imported_name(base, imported_name)
+                || args
+                    .iter()
+                    .any(|type_info| type_info_uses_imported_name(type_info, imported_name))
         }
-        offset = end;
+        TypeInfo::ArrayShape(items) | TypeInfo::ObjectShape(items) => items
+            .iter()
+            .any(|item| type_info_uses_imported_name(&item.value, imported_name)),
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => {
+            params
+                .iter()
+                .any(|type_info| type_info_uses_imported_name(type_info, imported_name))
+                || return_type
+                    .as_deref()
+                    .is_some_and(|type_info| type_info_uses_imported_name(type_info, imported_name))
+        }
+        TypeInfo::ClassString(inner) => inner
+            .as_deref()
+            .is_some_and(|type_info| type_info_uses_imported_name(type_info, imported_name)),
+        TypeInfo::Conditional {
+            target,
+            if_type,
+            else_type,
+            ..
+        } => {
+            type_info_uses_imported_name(target, imported_name)
+                || type_info_uses_imported_name(if_type, imported_name)
+                || type_info_uses_imported_name(else_type, imported_name)
+        }
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
+            .iter()
+            .any(|type_info| type_info_uses_imported_name(type_info, imported_name)),
+        TypeInfo::Nullable(inner) => type_info_uses_imported_name(inner, imported_name),
+        TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed
+        | TypeInfo::Self_
+        | TypeInfo::Static_
+        | TypeInfo::Parent_ => false,
     }
-    false
+}
+
+fn type_name_uses_imported_name(name: &str, imported_name: &str) -> bool {
+    first_name_segment(name) == imported_name
 }
 
 fn first_name_segment(name: &str) -> &str {
@@ -2116,6 +2212,60 @@ class Generator {
                     && d.message.contains("Random\\RandomException")
             }),
             "PHPDoc type references should count as import usage, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_phpdoc_prose_does_not_count_import_as_used() {
+        let code = r#"<?php
+namespace App;
+
+use Vendor\DocTextOnly;
+
+class Generator {
+    /**
+     * @param string $value DocTextOnly appears only in prose.
+     */
+    public function run(string $value): void {
+    }
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedImport
+                    && d.message.contains("Vendor\\DocTextOnly")
+            }),
+            "PHPDoc prose should not count as import usage, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_phpdoc_type_does_not_count_function_import_as_used() {
+        let code = r#"<?php
+namespace App;
+
+use function Vendor\DocType;
+
+class Generator {
+    /**
+     * @param DocType $value
+     */
+    public function run($value): void {
+    }
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedImport
+                    && d.message.contains("Vendor\\DocType")
+            }),
+            "PHPDoc class-like types should not count as function import usage, got: {:?}",
             diags
         );
     }

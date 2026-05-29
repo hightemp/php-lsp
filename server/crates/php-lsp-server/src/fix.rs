@@ -445,6 +445,7 @@ fn collect_file_fixes(
         .parse::<Uri>()
         .map_err(|err| FixError::new(format!("Invalid URI {}: {err}", parsed.uri)))?;
     let source = parsed.parser.source();
+    let tree = parsed.parser.tree().expect("parsed file has a tree");
     let mut actions = Vec::new();
 
     if rules.contains(&FixRule::OrganizeImports) {
@@ -452,6 +453,7 @@ fn collect_file_fixes(
             uri.clone(),
             &parsed.uri,
             &source,
+            tree,
             &parsed.file_symbols,
             FixRule::OrganizeImports,
             "Organize imports",
@@ -465,6 +467,7 @@ fn collect_file_fixes(
                 uri.clone(),
                 &parsed.uri,
                 &source,
+                tree,
                 &parsed.file_symbols,
                 FixRule::UnusedImports,
                 "Remove unused imports",
@@ -477,7 +480,7 @@ fn collect_file_fixes(
     if rules.contains(&FixRule::AddReturnType) {
         actions.extend(add_return_type_actions(
             &source,
-            parsed.parser.tree().expect("parsed file has a tree"),
+            tree,
             runtime_config.php_version,
         ));
     }
@@ -506,11 +509,12 @@ fn organize_imports_action(
     uri: Uri,
     uri_str: &str,
     source: &str,
+    tree: &tree_sitter::Tree,
     file_symbols: &php_lsp_types::FileSymbols,
     rule: FixRule,
     title: &str,
 ) -> Result<Option<FixAction>, FixError> {
-    let Some(workspace_edit) = build_organize_imports_edit(uri, source, file_symbols) else {
+    let Some(workspace_edit) = build_organize_imports_edit(uri, source, tree, file_symbols) else {
         return Ok(None);
     };
     let edits = workspace_edit_to_fix_edits(uri_str, source, workspace_edit)?;

@@ -3095,11 +3095,12 @@ while implementing these tasks.
     - `cargo test --all`;
     - `git diff --check`.
 
-- [ ] **PHA-015** Make organize imports semantic instead of raw text based.
+- [x] **PHA-015** Make organize imports semantic instead of raw text based. *(done 2026-05-29)*
+  - Status: completed 2026-05-29.
   - Problem: `build_organize_imports_edit()` can keep unused imports because it
     scans raw source text and sees aliases in comments, strings, or unrelated
     text.
-  - Implementation:
+  - Planned implementation:
     - reuse AST/reference-based unused import information where possible;
     - treat PHPDoc type references deliberately rather than by raw string scan;
     - keep grouping/sorting behavior unchanged except for more accurate removal.
@@ -3108,6 +3109,25 @@ while implementing these tasks.
     - alias used in executable code is kept;
     - alias used only in PHPDoc is kept or removed according to documented
       policy.
+  - Completed implementation:
+    - `source.organizeImports` and fix CLI organize-imports now filter imports
+      from collected symbol references instead of raw text searches;
+    - class imports referenced only from parsed PHPDoc type positions are kept,
+      while comments, strings, summaries, and PHPDoc prose no longer count;
+    - global constant references now resolve `use const` aliases for semantic
+      organize-imports decisions;
+    - unused-import diagnostics use the same parsed PHPDoc type policy.
+  - Docs: `docs/lsp-features.md` documents the semantic organize-imports and
+    PHPDoc policy.
+  - Validation:
+    - `cargo fmt --all --check`;
+    - `cargo test -p php-lsp-parser references::tests -- --nocapture`;
+    - `cargo test -p php-lsp-parser semantic::tests -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_code_actions -- --nocapture`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`;
+    - `git diff --check`.
 
 ### Performance, Cache, and Async Tasks
 

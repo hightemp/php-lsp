@@ -543,7 +543,7 @@ fn push_constant_reference_if_plain_name(
     }
     push_symbol_reference(
         references,
-        resolve_name_to_fqn(text, file_symbols),
+        resolve_constant_name_to_fqn(text, file_symbols),
         PhpSymbolKind::GlobalConstant,
         reference_range(source, node),
         false,
@@ -932,6 +932,38 @@ fn resolve_function_name_to_fqn(name: &str, file_symbols: &FileSymbols) -> Strin
     }
 }
 
+/// Resolve a global constant name to FQN.
+fn resolve_constant_name_to_fqn(name: &str, file_symbols: &FileSymbols) -> String {
+    if name.starts_with('\\') {
+        return name.trim_start_matches('\\').to_string();
+    }
+
+    for use_stmt in &file_symbols.use_statements {
+        if use_stmt.kind != UseKind::Constant {
+            continue;
+        }
+
+        let alias = use_stmt
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+
+        if alias == name {
+            return use_stmt.fqn.clone();
+        }
+    }
+
+    if name.contains('\\') {
+        return name.to_string();
+    }
+
+    if let Some(ref ns) = file_symbols.namespace {
+        format!("{}\\{}", ns, name)
+    } else {
+        name.to_string()
+    }
+}
+
 /// Find all references to a class member (method, property, class constant, enum case).
 fn find_member_references(
     root: Node,
@@ -1182,7 +1214,7 @@ fn walk_for_constant_refs(
         {
             let text = &source[node.byte_range()];
             // Try resolving as constant
-            let resolved = resolve_name_to_fqn(text, file_symbols);
+            let resolved = resolve_constant_name_to_fqn(text, file_symbols);
             if resolved == target_fqn {
                 let start = node.start_position();
                 let end = node.end_position();
@@ -1450,6 +1482,24 @@ echo RenameTarget::STATE_ACTIVE;
         );
         // declaration + 2 usages
         assert_eq!(refs.len(), 3, "Should find declaration + 2 constant usages");
+    }
+
+    #[test]
+    fn test_collect_symbol_references_resolves_imported_global_constants() {
+        let code = r#"<?php
+namespace App;
+
+use const Vendor\FLAGS\ENABLED as IS_ENABLED;
+
+echo IS_ENABLED;
+"#;
+        let refs = collect_refs(code);
+
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == "Vendor\\FLAGS\\ENABLED"
+                && reference.target_kind == PhpSymbolKind::GlobalConstant
+                && !reference.is_declaration
+        }));
     }
 
     #[test]
