@@ -90,6 +90,11 @@ fn find_code_lens_for_fqn<'a>(
         .find(|lens| lens["data"]["fqn"].as_str() == Some(fqn))
 }
 
+fn location_starts_with(location: &serde_json::Value, expected: (u32, u32)) -> bool {
+    location["range"]["start"]["line"].as_u64() == Some(expected.0 as u64)
+        && location["range"]["start"]["character"].as_u64() == Some(expected.1 as u64)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_lsp_ranges_are_utf16_after_non_ascii_prefixes() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
@@ -115,14 +120,23 @@ async fn test_lsp_ranges_are_utf16_after_non_ascii_prefixes() {
     let code = r#"<?php
 namespace App;
 
+/* контракт */ interface Contract {
+    /* контрактный метод */ public function makeTarget(): Target;
+}
+
 /* класс */ class Target {
     /* свойство */ public int $value = 0;
 
     /* метод */ public function callMe(): void {}
 }
 
+/* реализация */ class TargetImpl implements Contract {
+    /* метод */ public function makeTarget(): Target { return new Target(); }
+}
+
 /* переменная */ $usage = new Target();
 /* вызов */ $usage->callMe();
+/* тип */ $made = (new TargetImpl())->makeTarget();
 "#;
     let uri = "file:///test/utf16-ranges.php";
 
@@ -136,12 +150,15 @@ namespace App;
 
     let class_keyword = utf16_position_at(code, "class Target");
     let class_name = utf16_position_after(code, "class ");
+    let contract_method_name = utf16_position_at(code, "makeTarget(): Target;");
+    let impl_method_name = utf16_position_at(code, "makeTarget(): Target {");
     let method_keyword = utf16_position_at(code, "public function callMe");
-    let method_name = utf16_position_after(code, "function ");
+    let method_name = utf16_position_at(code, "callMe(): void");
     let property_keyword = utf16_position_at(code, "public int $value");
     let property_name = utf16_position_at(code, "$value");
     let usage_class_name = utf16_position_after(code, "new ");
     let usage_method_name = utf16_position_at(code, "callMe();");
+    let type_definition_call = utf16_position_at(code, "makeTarget();");
     let usage_variable = utf16_position_at(code, "$usage =");
     let usage_variable_call = utf16_position_at(code, "$usage->");
 
@@ -160,6 +177,93 @@ namespace App;
             .unwrap(),
     );
     assert_lsp_range_start(&definition_result, class_name, "definition");
+
+    let declaration_result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(declaration_request(
+                10,
+                uri,
+                usage_class_name.0,
+                usage_class_name.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_lsp_range_start(&declaration_result, class_name, "declaration");
+
+    let type_definition_result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(type_definition_request(
+                11,
+                uri,
+                type_definition_call.0,
+                type_definition_call.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_lsp_range_start(&type_definition_result, class_name, "typeDefinition");
+
+    let implementation_result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(implementation_request(
+                12,
+                uri,
+                contract_method_name.0,
+                contract_method_name.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let implementations = implementation_result
+        .as_array()
+        .expect("implementation should return an array");
+    assert!(
+        implementations
+            .iter()
+            .any(|location| location_starts_with(location, impl_method_name)),
+        "implementation should point to TargetImpl::makeTarget UTF-16 range, got: {implementation_result}"
+    );
+
+    let references_result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(references_request(
+                13,
+                uri,
+                class_name.0,
+                class_name.1,
+                true,
+            ))
+            .await
+            .unwrap(),
+    );
+    let references = references_result
+        .as_array()
+        .expect("references should return an array");
+    assert!(
+        references
+            .iter()
+            .any(|location| location_starts_with(location, class_name)),
+        "references should include declaration UTF-16 range, got: {references_result}"
+    );
+    assert!(
+        references
+            .iter()
+            .any(|location| location_starts_with(location, usage_class_name)),
+        "references should include usage UTF-16 range, got: {references_result}"
+    );
 
     let hover_result = extract_result(
         service
@@ -330,6 +434,169 @@ namespace App;
         edit_starts.contains(&usage_variable_call),
         "rename should edit usage UTF-16 range, got: {rename_result}"
     );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_completion_text_edit_range_survives_non_ascii_context() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_uri = "file:///test/VendorService.php";
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+class Service {}
+"#;
+    let app_uri = "file:///test/CompletionUtf16Edit.php";
+    let app_code = r#"<?php
+namespace App;
+
+class Demo {
+    public function run(): void {
+        /* префикс */ Ser
+    }
+}
+"#;
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(app_uri, app_code))
+        .await
+        .unwrap();
+
+    let completion_position = utf16_position_after(app_code, "Ser");
+    let completion_result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(
+                2,
+                app_uri,
+                completion_position.0,
+                completion_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let completion_items = completion_items_from_result(&completion_result);
+    let service_item = completion_items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("Service"))
+        .unwrap_or_else(|| panic!("expected Service completion, got: {completion_items:?}"));
+    let edits = service_item["additionalTextEdits"]
+        .as_array()
+        .expect("Service completion should include auto-import edit");
+    assert_eq!(
+        edits[0]["newText"].as_str(),
+        Some("use Vendor\\Service;\n"),
+        "completion text edit should import Vendor\\Service, got: {service_item}"
+    );
+    assert_lsp_range_start(&edits[0], (2, 0), "completion additionalTextEdit");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_template_source_map_ranges_are_utf16_after_non_ascii_prefix() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let php_uri = "file:///test/BladeUser.php";
+    let blade_uri = "file:///test/show.blade.php";
+    let php_code = "<?php\nclass User {}\n";
+    let blade = "Привет {{ User::class }}\n";
+    let user_position = utf16_position_at(blade, "User::class");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(php_uri, php_code))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            blade_uri, "blade", blade,
+        ))
+        .await
+        .unwrap();
+
+    let hover_result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                2,
+                blade_uri,
+                user_position.0,
+                user_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_lsp_range_start(&hover_result, user_position, "Blade hover source-map range");
 
     service
         .ready()

@@ -2848,6 +2848,13 @@ while implementing these tasks.
     `cargo test -p php-lsp-server --test e2e_ranges`,
     `cargo test -p php-lsp-server --tests`, `cargo test --all`,
     `cargo clippy --all-targets -- -D warnings`, and `git diff --check`.
+  - Follow-up completed 2026-05-29: extended UTF-16 regression matrix for
+    declaration, typeDefinition, implementation, references, completion text
+    edits, and template/source-map locations. Validation:
+    `cargo test -p php-lsp-server --test e2e_ranges`,
+    `cargo test -p php-lsp-server --tests`, `cargo fmt --all --check`,
+    `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and
+    `git diff --check`.
 
 - [ ] **PHA-004** Make member references and rename safe for unresolved receivers.
   - Problem: `$obj->foo()` and `$obj->bar` can be indexed as unresolved
