@@ -495,6 +495,75 @@ impl PhpLspBackend {
         parser
     }
 
+    async fn cached_twig_context_file_variables(
+        &self,
+        root: &Path,
+        template_name: &str,
+    ) -> Vec<TwigContextFileVariables> {
+        let key = TwigContextDiskCacheKey {
+            root: root.to_path_buf(),
+            template_name: template_name.to_string(),
+        };
+        if let Some(files) = self.twig_context_disk_cache.lock().await.get(&key) {
+            return files;
+        }
+
+        let root = root.to_path_buf();
+        let template_name = template_name.to_string();
+        let path_label = format!("{} ({})", root.display(), template_name);
+        let files = match run_file_io_blocking("twig context scan", path_label, move || {
+            let mut result = Vec::new();
+            for path in collect_twig_context_php_files(&root, 2048) {
+                let Ok(source_uri) = path_to_uri(&path) else {
+                    continue;
+                };
+                let Ok(source) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let mut parser = FileParser::new();
+                parser.parse_full(&source);
+                let file_symbols = parser
+                    .tree()
+                    .map(|tree| extract_file_symbols(tree, &source, &source_uri))
+                    .unwrap_or_default();
+                let mut variables = HashMap::new();
+                collect_twig_render_context_types(
+                    &template_name,
+                    &source,
+                    &file_symbols,
+                    &mut variables,
+                );
+                if variables.is_empty() {
+                    continue;
+                }
+                let mut variables: Vec<_> = variables
+                    .into_iter()
+                    .map(|(name, type_text)| TemplateVariableType { name, type_text })
+                    .collect();
+                variables.sort_by(|left, right| left.name.cmp(&right.name));
+                result.push(TwigContextFileVariables {
+                    uri: source_uri,
+                    variables,
+                });
+            }
+            result
+        })
+        .await
+        {
+            Ok(files) => files,
+            Err(message) => {
+                tracing::warn!("{}", message);
+                Vec::new()
+            }
+        };
+
+        self.twig_context_disk_cache
+            .lock()
+            .await
+            .insert(key, files.clone());
+        files
+    }
+
     pub(in crate::server) async fn twig_variable_types_for_template(
         &self,
         uri_str: &str,
@@ -507,12 +576,14 @@ impl PhpLspBackend {
         };
 
         let mut variables = HashMap::<String, String>::new();
+        let mut open_php_uris = HashSet::<String>::new();
 
         for entry in self.open_files.iter() {
             let source_uri = entry.key();
             if source_uri == uri_str || !source_uri.ends_with(".php") {
                 continue;
             }
+            open_php_uris.insert(source_uri.to_string());
             let source = entry.value().source();
             let file_symbols = self
                 .index
@@ -534,28 +605,16 @@ impl PhpLspBackend {
             );
         }
 
-        for path in collect_twig_context_php_files(&root, 2048) {
-            let Ok(source_uri) = path_to_uri(&path) else {
-                continue;
-            };
-            if self.open_files.contains_key(&source_uri) {
+        for file in self
+            .cached_twig_context_file_variables(&root, &template_name)
+            .await
+        {
+            if open_php_uris.contains(&file.uri) {
                 continue;
             }
-            let Ok(source) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let mut parser = FileParser::new();
-            parser.parse_full(&source);
-            let file_symbols = parser
-                .tree()
-                .map(|tree| extract_file_symbols(tree, &source, &source_uri))
-                .unwrap_or_default();
-            collect_twig_render_context_types(
-                &template_name,
-                &source,
-                &file_symbols,
-                &mut variables,
-            );
+            for variable in file.variables {
+                variables.insert(variable.name, variable.type_text);
+            }
         }
 
         let mut result: Vec<_> = variables

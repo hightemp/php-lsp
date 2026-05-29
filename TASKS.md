@@ -3172,7 +3172,8 @@ while implementing these tasks.
     - `cargo test --all`;
     - `git diff --check`.
 
-- [ ] **PHA-021** Audit sync filesystem work in async request paths.
+- [x] **PHA-021** Audit sync filesystem work in async request paths. *(done 2026-05-29)*
+  - Status: completed 2026-05-29.
   - Scope:
     - composer discovery and vendor metadata reads;
     - `collect_php_files()` and recursive scans;
@@ -3186,6 +3187,47 @@ while implementing these tasks.
     - preserve correctness for file watcher invalidation.
   - Acceptance: common interactive LSP requests do not perform unbounded
     recursive sync FS scans.
+  - Completed implementation:
+    - Composer/config discovery used by LSP initialization/reindex now runs via
+      blocking wrappers; CLI analyze/fix keep the synchronous helpers.
+    - Workspace PHP file discovery during indexing runs through a blocking
+      wrapper instead of scanning recursively on the async executor.
+    - Framework string-key completion/definition uses a bounded per-root/domain
+      cache; cache misses run static scans on the blocking pool.
+    - Twig render-context inference uses a bounded disk-scan cache for closed
+      PHP files and overlays open PHP files from memory on every request.
+    - Formatter auto-detection and formatter temp-file create/write/read/remove
+      operations run through blocking helpers around the async external command.
+    - Inlay hint inference now runs on the blocking pool, covering Doctrine
+      source-inspection fallbacks without holding async executor workers.
+    - Request FS caches are invalidated on watcher events, file operations,
+      saved files, configuration changes, and Composer metadata refreshes.
+  - Regression tests:
+    - bounded cache LRU eviction tests for framework string keys and Twig
+      context scans;
+    - current-thread runtime responsiveness test for the shared blocking FS
+      helper;
+    - request FS cache invalidation test that clears both framework string-key
+      and Twig context caches;
+    - existing e2e coverage for framework string-key completion/definition,
+      Twig context behavior, formatting, and Doctrine inlay hints.
+  - Follow-up completed 2026-05-29: strengthened async responsiveness and cache
+    invalidation regression coverage.
+  - Docs: `docs/architecture.md` documents the blocking/cached request FS model.
+  - Validation:
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test -p php-lsp-server cache_evicts_lru_entries -- --nocapture`;
+    - `cargo test -p php-lsp-server test_file_io_blocking_yields_current_thread_runtime -- --nocapture`;
+    - `cargo test -p php-lsp-server test_request_fs_cache_invalidation_clears_framework_and_twig_caches -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_completion test_framework_string_key_completion_and_definition -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_formatting -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_hover test_foreach_value_inlay_and_hover_from_doctrine_collection_target_entity -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_indexing test_doctrine_get_repository_chain_infers_custom_and_standard_returns -- --nocapture`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo test --all`;
+    - `git diff --check`.
 
 - [ ] **PHA-022** Make diagnostics budget behavior configurable and visible.
   - Problem: large files can silently skip member/type diagnostics after an

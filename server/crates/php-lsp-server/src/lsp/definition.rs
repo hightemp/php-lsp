@@ -742,32 +742,58 @@ impl PhpLspBackend {
         })
     }
 
-    pub(in crate::server) fn framework_string_key_items(
+    async fn cached_framework_string_keys(
+        &self,
+        workspace_root: &Path,
+        domain: &str,
+    ) -> Vec<crate::framework::FrameworkStringKey> {
+        let key = FrameworkStringKeyCacheKey {
+            root: workspace_root.to_path_buf(),
+            domain: domain.to_string(),
+        };
+        if let Some(keys) = self.framework_string_key_cache.lock().await.get(&key) {
+            return keys;
+        }
+
+        let root = workspace_root.to_path_buf();
+        let domain = domain.to_string();
+        let path_label = format!("{} ({})", root.display(), domain);
+        let keys = match run_file_io_blocking("framework string-key scan", path_label, move || {
+            crate::framework::framework_string_keys_for_workspace(&root, &domain)
+        })
+        .await
+        {
+            Ok(keys) => keys,
+            Err(message) => {
+                tracing::warn!("{}", message);
+                Vec::new()
+            }
+        };
+
+        self.framework_string_key_cache
+            .lock()
+            .await
+            .insert(key, keys.clone());
+        keys
+    }
+
+    pub(in crate::server) async fn framework_string_key_items(
         &self,
         workspace_root: Option<&Path>,
-        namespace_map: Option<&NamespaceMap>,
-        uri_str: &str,
-        file_symbols: &php_lsp_types::FileSymbols,
-        source: &str,
+        _namespace_map: Option<&NamespaceMap>,
+        _uri_str: &str,
+        _file_symbols: &php_lsp_types::FileSymbols,
+        _source: &str,
         context: &FrameworkStringKeyAtPosition,
     ) -> Vec<lsp_types::CompletionItem> {
         let Some(workspace_root) = workspace_root else {
             return Vec::new();
         };
-        let framework_ctx = crate::framework::FrameworkProviderContext::new(&self.index)
-            .with_workspace(Some(workspace_root), namespace_map)
-            .with_source_uri(Some(uri_str))
-            .with_file(Some(file_symbols), Some(source))
-            .with_relevant_files(&[]);
-        let registry = crate::framework::default_framework_provider_registry();
-        let query = crate::framework::FrameworkStringKeyQuery {
-            domain: context.domain.to_string(),
-            prefix: context.prefix.clone(),
-        };
 
-        registry
-            .string_keys(&framework_ctx, &query)
+        self.cached_framework_string_keys(workspace_root, context.domain)
+            .await
             .into_iter()
+            .filter(|key| key.key.starts_with(&context.prefix))
             .map(|key| framework_string_key_completion_item(&key, &context.prefix))
             .collect()
     }
@@ -775,30 +801,17 @@ impl PhpLspBackend {
     pub(in crate::server) async fn framework_string_key_location(
         &self,
         uri_str: &str,
-        file_symbols: &php_lsp_types::FileSymbols,
-        source: &str,
+        _file_symbols: &php_lsp_types::FileSymbols,
+        _source: &str,
         context: &FrameworkStringKeyAtPosition,
     ) -> Option<Location> {
         let workspace_root = self.workspace_root_for_uri(uri_str).await?;
-        let namespace_map = self.namespace_map.lock().await.clone();
-        let source_range = {
-            let framework_ctx = crate::framework::FrameworkProviderContext::new(&self.index)
-                .with_workspace(Some(workspace_root.as_path()), namespace_map.as_ref())
-                .with_source_uri(Some(uri_str))
-                .with_file(Some(file_symbols), Some(source))
-                .with_relevant_files(&[]);
-            let registry = crate::framework::default_framework_provider_registry();
-            let query = crate::framework::FrameworkStringKeyQuery {
-                domain: context.domain.to_string(),
-                prefix: context.key.clone(),
-            };
-
-            registry
-                .string_keys(&framework_ctx, &query)
-                .into_iter()
-                .find(|key| key.key == context.key)
-                .and_then(|key| framework_string_key_source_byte_range(&key))
-        };
+        let source_range = self
+            .cached_framework_string_keys(&workspace_root, context.domain)
+            .await
+            .into_iter()
+            .find(|key| key.key == context.key)
+            .and_then(|key| framework_string_key_source_byte_range(&key));
         let (uri, range) = source_range?;
         let source = self
             .source_for_uri(&uri, "framework string key source read")

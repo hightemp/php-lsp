@@ -372,6 +372,14 @@ async fn send_indexing_status(client: &Client, params: serde_json::Value) {
         .await;
 }
 
+async fn clear_request_fs_caches(
+    framework_string_key_cache: &Arc<Mutex<FrameworkStringKeyCache>>,
+    twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
+) {
+    framework_string_key_cache.lock().await.clear();
+    twig_context_disk_cache.lock().await.clear();
+}
+
 fn elapsed_ms(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -446,6 +454,7 @@ impl FormattingConfig {
         }
     }
 
+    #[cfg(test)]
     fn resolve_for_workspace(&self, workspace_root: Option<&Path>) -> Self {
         if self.provider != "auto" {
             return self.clone();
@@ -455,6 +464,27 @@ impl FormattingConfig {
             return self.clone();
         };
         let Some(tool) = lsp::formatting::detect_project_formatter_tool(workspace_root) else {
+            return self.clone();
+        };
+
+        Self {
+            provider: tool.provider().to_string(),
+            command: Some(tool.command_template().to_string()),
+            timeout_ms: self.timeout_ms,
+        }
+    }
+
+    async fn resolve_for_workspace_blocking(&self, workspace_root: Option<&Path>) -> Self {
+        if self.provider != "auto" {
+            return self.clone();
+        }
+
+        let Some(workspace_root) = workspace_root.map(Path::to_path_buf) else {
+            return self.clone();
+        };
+        let Some(tool) =
+            lsp::formatting::detect_project_formatter_tool_blocking(workspace_root).await
+        else {
             return self.clone();
         };
 
@@ -722,6 +752,143 @@ struct SemanticTokensCache {
     by_uri: HashMap<String, SemanticTokensSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FrameworkStringKeyCacheKey {
+    root: PathBuf,
+    domain: String,
+}
+
+#[derive(Debug)]
+struct FrameworkStringKeyCache {
+    capacity: usize,
+    entries: HashMap<FrameworkStringKeyCacheKey, Vec<crate::framework::FrameworkStringKey>>,
+    order: VecDeque<FrameworkStringKeyCacheKey>,
+}
+
+impl Default for FrameworkStringKeyCache {
+    fn default() -> Self {
+        Self {
+            capacity: FRAMEWORK_STRING_KEY_CACHE_CAPACITY,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl FrameworkStringKeyCache {
+    fn get(
+        &mut self,
+        key: &FrameworkStringKeyCacheKey,
+    ) -> Option<Vec<crate::framework::FrameworkStringKey>> {
+        let value = self.entries.get(key).cloned()?;
+        self.touch(key.clone());
+        Some(value)
+    }
+
+    fn insert(
+        &mut self,
+        key: FrameworkStringKeyCacheKey,
+        value: Vec<crate::framework::FrameworkStringKey>,
+    ) {
+        self.entries.insert(key.clone(), value);
+        self.touch(key);
+        self.evict_over_capacity();
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn touch(&mut self, key: FrameworkStringKeyCacheKey) {
+        if let Some(position) = self.order.iter().position(|existing| existing == &key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key);
+    }
+
+    fn evict_over_capacity(&mut self) {
+        while self.order.len() > self.capacity {
+            if let Some(key) = self.order.pop_front() {
+                self.entries.remove(&key);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TwigContextDiskCacheKey {
+    root: PathBuf,
+    template_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TwigContextFileVariables {
+    uri: String,
+    variables: Vec<TemplateVariableType>,
+}
+
+#[derive(Debug)]
+struct TwigContextDiskCache {
+    capacity: usize,
+    entries: HashMap<TwigContextDiskCacheKey, Vec<TwigContextFileVariables>>,
+    order: VecDeque<TwigContextDiskCacheKey>,
+}
+
+impl Default for TwigContextDiskCache {
+    fn default() -> Self {
+        Self {
+            capacity: TWIG_CONTEXT_DISK_CACHE_CAPACITY,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl TwigContextDiskCache {
+    fn get(&mut self, key: &TwigContextDiskCacheKey) -> Option<Vec<TwigContextFileVariables>> {
+        let value = self.entries.get(key).cloned()?;
+        self.touch(key.clone());
+        Some(value)
+    }
+
+    fn insert(&mut self, key: TwigContextDiskCacheKey, value: Vec<TwigContextFileVariables>) {
+        self.entries.insert(key.clone(), value);
+        self.touch(key);
+        self.evict_over_capacity();
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn touch(&mut self, key: TwigContextDiskCacheKey) {
+        if let Some(position) = self.order.iter().position(|existing| existing == &key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key);
+    }
+
+    fn evict_over_capacity(&mut self) {
+        while self.order.len() > self.capacity {
+            if let Some(key) = self.order.pop_front() {
+                self.entries.remove(&key);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceRootConfig {
     pub(crate) root: PathBuf,
@@ -729,6 +896,8 @@ pub(crate) struct WorkspaceRootConfig {
 }
 
 const VENDOR_FILE_LRU_CAPACITY: usize = 512;
+const FRAMEWORK_STRING_KEY_CACHE_CAPACITY: usize = 32;
+const TWIG_CONTEXT_DISK_CACHE_CAPACITY: usize = 64;
 pub(crate) const VENDOR_PRELOAD_ENTRYPOINT_LIMIT: usize = 16;
 const MAX_INDEXING_PARSE_CONCURRENCY: usize = 8;
 
@@ -979,6 +1148,10 @@ pub struct PhpLspBackend {
     formatting_config: Mutex<FormattingConfig>,
     /// Last semantic token snapshots used for full/delta requests.
     semantic_tokens_cache: Mutex<SemanticTokensCache>,
+    /// Bounded cache for static framework string-key scans.
+    framework_string_key_cache: Arc<Mutex<FrameworkStringKeyCache>>,
+    /// Bounded cache for disk-backed Twig render-context scans.
+    twig_context_disk_cache: Arc<Mutex<TwigContextDiskCache>>,
     /// Parsed Composer vendor metadata keyed by vendor directory.
     vendor_autoload_cache: Arc<Mutex<VendorAutoloadCache>>,
     /// Bounded set of lazy-indexed vendor files currently kept in the symbol index.
@@ -1019,6 +1192,8 @@ impl PhpLspBackend {
             work_done_progress_supported: Mutex::new(false),
             formatting_config: Mutex::new(FormattingConfig::default()),
             semantic_tokens_cache: Mutex::new(SemanticTokensCache::default()),
+            framework_string_key_cache: Arc::new(Mutex::new(FrameworkStringKeyCache::default())),
+            twig_context_disk_cache: Arc::new(Mutex::new(TwigContextDiskCache::default())),
             vendor_autoload_cache: Arc::new(Mutex::new(VendorAutoloadCache::default())),
             vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
         }
@@ -1051,6 +1226,14 @@ impl PhpLspBackend {
 
         self.document_versions.insert(uri_str.to_string(), incoming);
         true
+    }
+
+    async fn invalidate_request_fs_caches(&self) {
+        clear_request_fs_caches(
+            &self.framework_string_key_cache,
+            &self.twig_context_disk_cache,
+        )
+        .await;
     }
 
     async fn cancel_debounced_diagnostics(&self, uri_str: &str) {
@@ -1459,8 +1642,11 @@ impl PhpLspBackend {
         client_settings: &serde_json::Value,
         workspace_roots: &[PathBuf],
     ) -> AppliedConfiguration {
-        let (settings, messages) =
-            load_effective_configuration_settings(workspace_roots, client_settings);
+        let (settings, messages) = load_effective_configuration_settings_blocking(
+            workspace_roots.to_vec(),
+            client_settings.clone(),
+        )
+        .await;
         for message in messages {
             if message.contains("failed") || message.starts_with("Ignored executable") {
                 tracing::warn!("{}", message);
@@ -1553,12 +1739,12 @@ impl PhpLspBackend {
         }
 
         let composer_enabled = *self.composer_enabled.lock().await;
-        let configs = dedup_workspace_configs(
-            roots
-                .iter()
-                .map(|root| discover_workspace_root_config(root, composer_enabled))
-                .collect(),
-        );
+        let configs = discover_workspace_root_configs_blocking(
+            roots,
+            composer_enabled,
+            "workspace reindex discovery",
+        )
+        .await;
         let effective_roots: Vec<PathBuf> =
             configs.iter().map(|config| config.root.clone()).collect();
 
@@ -1756,6 +1942,7 @@ impl PhpLspBackend {
     }
 
     async fn invalidate_composer_metadata(&self, path: &Path, reindex_workspace: bool) {
+        self.invalidate_request_fs_caches().await;
         self.vendor_autoload_cache.lock().await.clear();
         let evicted = self.vendor_file_lru.lock().await.clear();
         for uri in evicted {

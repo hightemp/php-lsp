@@ -114,6 +114,28 @@ async fn test_diagnostics_blocking_compute_yields_current_thread_runtime() {
     assert!(handle.await.unwrap().is_empty());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn test_file_io_blocking_yields_current_thread_runtime() {
+    let started = Instant::now();
+    let handle = tokio::spawn(run_file_io_blocking(
+        "synthetic file IO",
+        "/tmp/php-lsp-slow-io.php".to_string(),
+        || {
+            std::thread::sleep(Duration::from_millis(400));
+            7usize
+        },
+    ));
+
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "file IO helper should not block the async runtime"
+    );
+    assert_eq!(handle.await.unwrap().unwrap(), 7);
+}
+
 fn diagnostic_messages(diagnostics: &[Diagnostic]) -> Vec<String> {
     diagnostics
         .iter()
@@ -2715,6 +2737,134 @@ fn test_formatting_provider_none_disables_stale_command() {
         custom.command_template().as_deref(),
         Some("vendor/bin/fmt {file}")
     );
+}
+
+#[test]
+fn test_framework_string_key_cache_evicts_lru_entries() {
+    fn key(root: &str, domain: &str) -> FrameworkStringKeyCacheKey {
+        FrameworkStringKeyCacheKey {
+            root: PathBuf::from(root),
+            domain: domain.to_string(),
+        }
+    }
+
+    fn value(name: &str) -> crate::framework::FrameworkStringKey {
+        crate::framework::FrameworkStringKey {
+            key: name.to_string(),
+            detail: None,
+            provider_ids: Vec::new(),
+            sources: Vec::new(),
+        }
+    }
+
+    let mut cache = FrameworkStringKeyCache {
+        capacity: 2,
+        ..Default::default()
+    };
+    let first = key("/workspace-a", "config");
+    let second = key("/workspace-b", "route");
+    let third = key("/workspace-c", "view");
+
+    cache.insert(first.clone(), vec![value("app.name")]);
+    cache.insert(second.clone(), vec![value("home")]);
+    assert!(cache.get(&first).is_some());
+    cache.insert(third.clone(), vec![value("users.show")]);
+
+    assert!(cache.get(&second).is_none());
+    assert!(cache.get(&first).is_some());
+    assert!(cache.get(&third).is_some());
+}
+
+#[test]
+fn test_twig_context_disk_cache_evicts_lru_entries() {
+    fn key(root: &str, template_name: &str) -> TwigContextDiskCacheKey {
+        TwigContextDiskCacheKey {
+            root: PathBuf::from(root),
+            template_name: template_name.to_string(),
+        }
+    }
+
+    fn value(uri: &str, name: &str, type_text: &str) -> TwigContextFileVariables {
+        TwigContextFileVariables {
+            uri: uri.to_string(),
+            variables: vec![TemplateVariableType {
+                name: name.to_string(),
+                type_text: type_text.to_string(),
+            }],
+        }
+    }
+
+    let mut cache = TwigContextDiskCache {
+        capacity: 2,
+        ..Default::default()
+    };
+    let first = key("/workspace", "one.html.twig");
+    let second = key("/workspace", "two.html.twig");
+    let third = key("/workspace", "three.html.twig");
+
+    cache.insert(
+        first.clone(),
+        vec![value("file:///one.php", "user", "User")],
+    );
+    cache.insert(
+        second.clone(),
+        vec![value("file:///two.php", "team", "Team")],
+    );
+    assert!(cache.get(&first).is_some());
+    cache.insert(
+        third.clone(),
+        vec![value("file:///three.php", "post", "Post")],
+    );
+
+    assert!(cache.get(&second).is_none());
+    assert!(cache.get(&first).is_some());
+    assert!(cache.get(&third).is_some());
+}
+
+#[tokio::test]
+async fn test_request_fs_cache_invalidation_clears_framework_and_twig_caches() {
+    let framework_cache = Arc::new(Mutex::new(FrameworkStringKeyCache {
+        capacity: 4,
+        ..Default::default()
+    }));
+    framework_cache.lock().await.insert(
+        FrameworkStringKeyCacheKey {
+            root: PathBuf::from("/workspace"),
+            domain: "config".to_string(),
+        },
+        vec![crate::framework::FrameworkStringKey {
+            key: "app.name".to_string(),
+            detail: None,
+            provider_ids: Vec::new(),
+            sources: Vec::new(),
+        }],
+    );
+
+    let twig_cache = Arc::new(Mutex::new(TwigContextDiskCache {
+        capacity: 4,
+        ..Default::default()
+    }));
+    twig_cache.lock().await.insert(
+        TwigContextDiskCacheKey {
+            root: PathBuf::from("/workspace"),
+            template_name: "users/show.html.twig".to_string(),
+        },
+        vec![TwigContextFileVariables {
+            uri: "file:///workspace/src/Controller/UserController.php".to_string(),
+            variables: vec![TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        }],
+    );
+
+    assert_eq!(framework_cache.lock().await.len(), 1);
+    assert_eq!(twig_cache.lock().await.len(), 1);
+
+    clear_request_fs_caches(&framework_cache, &twig_cache).await;
+
+    assert_eq!(framework_cache.lock().await.len(), 0);
+    assert_eq!(twig_cache.lock().await.len(), 0);
 }
 
 #[test]

@@ -104,6 +104,7 @@ impl PhpLspBackend {
                         template.original_source(),
                         &context,
                     )
+                    .await
                     .into_iter()
                     .map(framework_string_key_completion_item_to_ls)
                     .collect();
@@ -147,6 +148,20 @@ impl PhpLspBackend {
                 )
             } else {
                 (None, None)
+            };
+        let framework_string_key_items =
+            if let Some(ref framework_string_key_context) = framework_string_key_context {
+                self.framework_string_key_items(
+                    framework_workspace_root.as_deref(),
+                    framework_namespace_map.as_ref(),
+                    &uri_str,
+                    &file_symbols,
+                    &source,
+                    framework_string_key_context,
+                )
+                .await
+            } else {
+                Vec::new()
             };
         let type_cache = RequestTypeCache::new(&uri_str, self.current_document_version(&uri_str));
 
@@ -230,15 +245,8 @@ impl PhpLspBackend {
                 ),
             }
         };
-        if let Some(ref framework_string_key_context) = framework_string_key_context {
-            lsp_items.extend(self.framework_string_key_items(
-                framework_workspace_root.as_deref(),
-                framework_namespace_map.as_ref(),
-                &uri_str,
-                &file_symbols,
-                &source,
-                framework_string_key_context,
-            ));
+        if framework_string_key_context.is_some() {
+            lsp_items.extend(framework_string_key_items);
         }
         if let php_lsp_completion::context::CompletionContext::Variable { prefix } = &context {
             add_local_variable_completion_items(

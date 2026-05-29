@@ -77,6 +77,18 @@ pub(crate) fn detect_project_formatter_tool(
     None
 }
 
+pub(crate) async fn detect_project_formatter_tool_blocking(
+    workspace_root: PathBuf,
+) -> Option<DetectedFormatterTool> {
+    let path_label = workspace_root.display().to_string();
+    run_file_io_blocking("formatter auto-detect", path_label, move || {
+        detect_project_formatter_tool(&workspace_root)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 fn composer_declares_package(value: &serde_json::Value, package: &str) -> bool {
     ["require-dev", "require"].iter().any(|section| {
         value
@@ -94,6 +106,47 @@ fn temp_format_dir() -> PathBuf {
     std::env::temp_dir().join(format!("php-lsp-format-{}-{}", std::process::id(), nanos))
 }
 
+async fn write_formatter_temp_file_blocking(
+    temp_dir: PathBuf,
+    file_path: PathBuf,
+    source: String,
+) -> std::result::Result<(), String> {
+    let path_label = file_path.display().to_string();
+    match run_file_io_blocking("formatter temp write", path_label, move || {
+        if let Err(err) = std::fs::create_dir_all(&temp_dir) {
+            return Err(format!("failed to create formatter temp dir: {}", err));
+        }
+        if let Err(err) = std::fs::write(&file_path, &source) {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(format!("failed to write formatter temp file: {}", err));
+        }
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(message) => Err(message),
+    }
+}
+
+async fn read_and_cleanup_formatter_temp_file_blocking(
+    temp_dir: PathBuf,
+    file_path: PathBuf,
+) -> std::result::Result<String, String> {
+    let path_label = file_path.display().to_string();
+    match run_file_io_blocking("formatter temp read", path_label, move || {
+        let formatted = std::fs::read_to_string(&file_path)
+            .map_err(|err| format!("failed to read formatter temp file: {}", err));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        formatted
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(message) => Err(message),
+    }
+}
+
 async fn run_external_formatter(
     source: String,
     config: FormattingConfig,
@@ -106,10 +159,7 @@ async fn run_external_formatter(
 
     let temp_dir = temp_format_dir();
     let file_path = temp_dir.join("input.php");
-    std::fs::create_dir_all(&temp_dir)
-        .map_err(|err| format!("failed to create formatter temp dir: {}", err))?;
-    std::fs::write(&file_path, &source)
-        .map_err(|err| format!("failed to write formatter temp file: {}", err))?;
+    write_formatter_temp_file_blocking(temp_dir.clone(), file_path.clone(), source.clone()).await?;
 
     let command = build_formatter_shell_command(&template, &file_path);
     let output = run_shell_command_with_timeout(
@@ -121,9 +171,7 @@ async fn run_external_formatter(
     )
     .await
     .map_err(|err| format!("failed to run formatter command: {}", err));
-    let formatted = std::fs::read_to_string(&file_path)
-        .map_err(|err| format!("failed to read formatter temp file: {}", err));
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    let formatted = read_and_cleanup_formatter_temp_file_blocking(temp_dir, file_path).await;
 
     let output = output?;
     let formatted = formatted?;
@@ -258,12 +306,10 @@ impl PhpLspBackend {
         };
 
         let workspace_root = self.workspace_root_for_uri(&uri_str).await;
-        let config = self
-            .formatting_config
-            .lock()
-            .await
-            .clone()
-            .resolve_for_workspace(workspace_root.as_deref());
+        let config = self.formatting_config.lock().await.clone();
+        let config = config
+            .resolve_for_workspace_blocking(workspace_root.as_deref())
+            .await;
         if config.command_template().is_none() {
             return Ok(None);
         }
@@ -321,12 +367,10 @@ impl PhpLspBackend {
         }
 
         let workspace_root = self.workspace_root_for_uri(&uri_str).await;
-        let config = self
-            .formatting_config
-            .lock()
-            .await
-            .clone()
-            .resolve_for_workspace(workspace_root.as_deref());
+        let config = self.formatting_config.lock().await.clone();
+        let config = config
+            .resolve_for_workspace_blocking(workspace_root.as_deref())
+            .await;
         if config.command_template().is_none() {
             return Ok(None);
         }

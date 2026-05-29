@@ -520,6 +520,23 @@ pub(crate) fn default_framework_provider_registry() -> FrameworkProviderRegistry
     ])
 }
 
+pub(crate) fn framework_string_keys_for_workspace(
+    root: &Path,
+    domain: &str,
+) -> Vec<FrameworkStringKey> {
+    let index = WorkspaceIndex::new();
+    let ctx = FrameworkProviderContext::new(&index)
+        .with_workspace(Some(root), None)
+        .with_relevant_files(&[]);
+    let registry = default_framework_provider_registry();
+    let query = FrameworkStringKeyQuery {
+        domain: domain.to_string(),
+        prefix: String::new(),
+    };
+
+    registry.string_keys(&ctx, &query)
+}
+
 struct DoctrineRepositoryProvider;
 
 impl VirtualMemberProvider for DoctrineRepositoryProvider {

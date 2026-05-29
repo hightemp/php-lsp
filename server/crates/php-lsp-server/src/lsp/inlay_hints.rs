@@ -10,13 +10,13 @@ impl PhpLspBackend {
         let uri_str = params.text_document.uri.as_str().to_string();
         let php_version = *self.php_version.lock().await;
 
-        let mut hints = {
+        let (tree, source, file_symbols, document_version) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(parser) => parser,
                 None => return Ok(None),
             };
             let tree = match parser.tree() {
-                Some(tree) => tree,
+                Some(tree) => tree.clone(),
                 None => return Ok(None),
             };
             let source = parser.source();
@@ -25,19 +25,40 @@ impl PhpLspBackend {
                 .file_symbols
                 .get(&uri_str)
                 .map(|entry| entry.value().clone())
-                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
+                .unwrap_or_else(|| extract_file_symbols(&tree, &source, &uri_str));
 
-            inlay_hints(
-                &uri_str,
-                self.current_document_version(&uri_str),
+            (
                 tree,
-                &source,
-                &file_symbols,
-                &self.index,
-                params.range,
-                php_version,
+                source,
+                file_symbols,
+                self.current_document_version(&uri_str),
             )
         };
+
+        let index = self.index.clone();
+        let requested_range = params.range;
+        let compute_uri = uri_str.clone();
+        let mut hints =
+            match run_file_io_blocking("inlayHint compute", uri_str.clone(), move || {
+                inlay_hints(
+                    &compute_uri,
+                    document_version,
+                    &tree,
+                    &source,
+                    &file_symbols,
+                    &index,
+                    requested_range,
+                    php_version,
+                )
+            })
+            .await
+            {
+                Ok(hints) => hints,
+                Err(message) => {
+                    tracing::warn!("{}", message);
+                    Vec::new()
+                }
+            };
 
         self.hydrate_inlay_hint_label_locations(&mut hints).await;
 

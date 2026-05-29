@@ -37,12 +37,12 @@ impl PhpLspBackend {
         }
 
         let composer_enabled = *self.composer_enabled.lock().await;
-        let configs = dedup_workspace_configs(
-            roots
-                .iter()
-                .map(|root| discover_workspace_root_config(root, composer_enabled))
-                .collect(),
-        );
+        let configs = discover_workspace_root_configs_blocking(
+            roots,
+            composer_enabled,
+            "workspace discovery",
+        )
+        .await;
         let effective_roots: Vec<PathBuf> =
             configs.iter().map(|config| config.root.clone()).collect();
 
@@ -298,12 +298,12 @@ impl PhpLspBackend {
         }
 
         let composer_enabled = *self.composer_enabled.lock().await;
-        let added_configs = dedup_workspace_configs(
-            added_roots
-                .iter()
-                .map(|root| discover_workspace_root_config(root, composer_enabled))
-                .collect(),
-        );
+        let added_configs = discover_workspace_root_configs_blocking(
+            added_roots,
+            composer_enabled,
+            "workspace folder discovery",
+        )
+        .await;
 
         let first_root = {
             let mut roots = self.workspace_roots.lock().await;
@@ -412,6 +412,10 @@ impl PhpLspBackend {
     pub(crate) async fn lsp_did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         tracing::debug!("didChangeWatchedFiles: {} change(s)", params.changes.len());
 
+        if !params.changes.is_empty() {
+            self.invalidate_request_fs_caches().await;
+        }
+
         let roots = self.current_workspace_roots().await;
         let mut config_changed = false;
         let mut composer_metadata_changed: Option<PathBuf> = None;
@@ -454,6 +458,7 @@ impl PhpLspBackend {
     pub(crate) async fn lsp_did_change_configuration(&self, params: DidChangeConfigurationParams) {
         tracing::debug!("didChangeConfiguration");
 
+        self.invalidate_request_fs_caches().await;
         *self.client_settings.lock().await = params.settings.clone();
         self.reload_effective_configuration().await;
     }
@@ -467,6 +472,10 @@ impl PhpLspBackend {
 
     pub(crate) async fn lsp_did_create_files(&self, params: CreateFilesParams) {
         tracing::debug!("didCreateFiles: {} file(s)", params.files.len());
+
+        if !params.files.is_empty() {
+            self.invalidate_request_fs_caches().await;
+        }
 
         for file in params.files {
             if let Ok(uri) = file.uri.parse::<Uri>() {
@@ -484,6 +493,10 @@ impl PhpLspBackend {
 
     pub(crate) async fn lsp_did_rename_files(&self, params: RenameFilesParams) {
         tracing::debug!("didRenameFiles: {} file(s)", params.files.len());
+
+        if !params.files.is_empty() {
+            self.invalidate_request_fs_caches().await;
+        }
 
         for file in params.files {
             let old_uri = file.old_uri.parse::<Uri>();
@@ -503,6 +516,10 @@ impl PhpLspBackend {
 
     pub(crate) async fn lsp_did_delete_files(&self, params: DeleteFilesParams) {
         tracing::debug!("didDeleteFiles: {} file(s)", params.files.len());
+
+        if !params.files.is_empty() {
+            self.invalidate_request_fs_caches().await;
+        }
 
         for file in params.files {
             if let Ok(uri) = file.uri.parse::<Uri>() {
@@ -595,6 +612,18 @@ pub(crate) fn collect_php_files(
         }
     }
     files
+}
+
+pub(in crate::server) async fn collect_php_files_blocking(
+    directories: Vec<PathBuf>,
+    root: PathBuf,
+    exclude_paths: Vec<PathBuf>,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let path_label = root.display().to_string();
+    run_file_io_blocking("workspace PHP file discovery", path_label, move || {
+        collect_php_files(&directories, &root, &exclude_paths)
+    })
+    .await
 }
 
 /// Recursively collect .php files from a directory.
@@ -856,6 +885,25 @@ pub(crate) fn load_effective_configuration_settings(
     (effective, messages)
 }
 
+pub(in crate::server) async fn load_effective_configuration_settings_blocking(
+    workspace_roots: Vec<PathBuf>,
+    client_settings: serde_json::Value,
+) -> (serde_json::Value, Vec<String>) {
+    let fallback_client_settings = client_settings.clone();
+    let path_label = format!("{} workspace root(s)", workspace_roots.len());
+    match run_file_io_blocking("configuration load", path_label, move || {
+        load_effective_configuration_settings(&workspace_roots, &client_settings)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(message) => (
+            normalize_client_settings(&fallback_client_settings),
+            vec![message],
+        ),
+    }
+}
+
 pub(in crate::server) fn uri_is_project_config_file(uri: &Uri) -> bool {
     uri_to_path(uri.as_str())
         .and_then(|path| {
@@ -965,6 +1013,39 @@ pub(crate) fn discover_workspace_root_config(
     WorkspaceRootConfig {
         root: root.to_path_buf(),
         namespace_map: None,
+    }
+}
+
+pub(in crate::server) async fn discover_workspace_root_configs_blocking(
+    roots: Vec<PathBuf>,
+    composer_enabled: bool,
+    label: &'static str,
+) -> Vec<WorkspaceRootConfig> {
+    let fallback_roots = roots.clone();
+    let path_label = format!("{} workspace root(s)", roots.len());
+    match run_file_io_blocking(label, path_label, move || {
+        dedup_workspace_configs(
+            roots
+                .iter()
+                .map(|root| discover_workspace_root_config(root, composer_enabled))
+                .collect(),
+        )
+    })
+    .await
+    {
+        Ok(configs) => configs,
+        Err(message) => {
+            tracing::warn!("{}", message);
+            dedup_workspace_configs(
+                fallback_roots
+                    .into_iter()
+                    .map(|root| WorkspaceRootConfig {
+                        root,
+                        namespace_map: None,
+                    })
+                    .collect(),
+            )
+        }
     }
 }
 
@@ -1490,7 +1571,12 @@ pub(in crate::server) async fn index_workspace(
 
     // Collect PHP files
     let source_dirs = workspace_index_directories(root, namespace_map, &options.include_paths);
-    let php_files = collect_php_files(&source_dirs, root, &options.exclude_paths);
+    let php_files = collect_php_files_blocking(
+        source_dirs,
+        root.to_path_buf(),
+        options.exclude_paths.clone(),
+    )
+    .await?;
     if cancellation.is_cancelled() {
         tracing::debug!(
             "Workspace indexing cancelled after discovery: {}",

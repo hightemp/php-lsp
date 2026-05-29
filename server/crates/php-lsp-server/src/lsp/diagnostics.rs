@@ -446,6 +446,7 @@ impl PhpLspBackend {
 
     pub(crate) async fn lsp_did_save(&self, params: DidSaveTextDocumentParams) {
         tracing::debug!("didSave: {}", params.text_document.uri.as_str());
+        self.invalidate_request_fs_caches().await;
         self.cancel_debounced_diagnostics(params.text_document.uri.as_str())
             .await;
         self.publish_diagnostics(&params.text_document.uri).await;
