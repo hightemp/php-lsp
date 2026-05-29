@@ -270,3 +270,50 @@ impl PhpLspBackend {
         }
     }
 }
+
+pub(in crate::server) fn normalize_variable_new_name(new_name: &str) -> Option<String> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let raw = trimmed.strip_prefix('$').unwrap_or(trimmed);
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut chars = raw.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return None;
+    }
+
+    Some(format!("${}", raw))
+}
+
+pub(in crate::server) fn normalize_property_new_name(new_name: &str) -> Option<String> {
+    let var = normalize_variable_new_name(new_name)?;
+    Some(var.trim_start_matches('$').to_string())
+}
+
+pub(in crate::server) fn is_renameable_variable(var_name: &str) -> bool {
+    !matches!(
+        var_name,
+        "$this"
+            | "$GLOBALS"
+            | "$_SERVER"
+            | "$_GET"
+            | "$_POST"
+            | "$_FILES"
+            | "$_COOKIE"
+            | "$_SESSION"
+            | "$_REQUEST"
+            | "$_ENV"
+            | "$http_response_header"
+            | "$argc"
+            | "$argv"
+    )
+}

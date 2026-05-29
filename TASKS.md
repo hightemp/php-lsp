@@ -3058,6 +3058,92 @@ while implementing these tasks.
 
 ## Текущие задачи
 
+- [x] **T-2026-05-29-agents-update** Update `AGENTS.md` after the `server.rs` split. *(done 2026-05-29)*
+  - Scope: documentation-only update; keep repository guidance aligned with the current `php-lsp-server` module layout and test-selection routes.
+  - Validation target: `git diff --check`.
+  - Implemented: updated `php-lsp-server` layout notes, test-selection guidance, and Where To Look routes for the split `lsp/*`, `indexing/*`, and `server_tests.rs` files.
+  - Validation: `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step13** Move feature-specific `PhpLspBackend` method groups out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; preserve method names/call sites and only widen to `pub(in crate::server)` where sibling modules need access.
+  - Implementation target: move template document helpers to `src/lsp/templates.rs`, completion inference helpers to `src/lsp/completion.rs`, lazy vendor/index resolution helpers to `src/indexing/vendor.rs`, analyzer/diagnostic publishing helpers to `src/lsp/diagnostics.rs`, and PHP file reindex/remove/rename helpers to `src/indexing/workspace.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, relevant focused e2e tests, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved template document helpers into `src/lsp/templates.rs`, completion member/type inference helpers into `src/lsp/completion.rs`, lazy vendor/index resolution helpers into `src/indexing/vendor.rs`, analyzer/diagnostic publishing helpers into `src/lsp/diagnostics.rs`, definition import lookup into `src/lsp/definition.rs`, and PHP file reindex/remove/rename helpers into `src/indexing/workspace.rs`.
+  - Result: `server.rs` reduced from 3,572 lines to 2,043 lines in this step, satisfying the <=5,000 line target.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_templates --test e2e_completion --test e2e_definition --test e2e_diagnostics --test e2e_indexing`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step12** Move remaining LSP helper tail out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep rename/reference behavior, signature help labels, template definition mapping, external analyzer/formatter command behavior, LSP conversion behavior, and completion auto-import edits unchanged.
+  - Implementation target: move rename/reference/document-symbol helpers into owning LSP modules, external command helpers into `src/lsp/external_command.rs`, shared LSP conversion helpers into `src/lsp/conversions.rs`, and completion auto-import helpers into `src/lsp/completion_helpers.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused references/completion/definition/formatting tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved rename helpers into `src/lsp/rename.rs`, document-highlight/reference helpers into `src/lsp/references.rs`, selection/linked-editing helpers into `src/lsp/document_symbols.rs`, signature-help and completion auto-import helpers into `src/lsp/completion_helpers.rs`, template definition mapping into `src/lsp/templates.rs`, external command helpers into `src/lsp/external_command.rs`, and LSP conversion helpers into `src/lsp/conversions.rs`.
+  - Result: `server.rs` reduced from 4,191 lines to 3,572 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_references --test e2e_completion --test e2e_definition --test e2e_formatting`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step11** Move workspace indexing execution helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep PHP file parsing/index updates, cache load/save behavior, vendor preload behavior, progress notifications, cancellation, and diagnostics republish behavior unchanged.
+  - Implementation target: move workspace parse/index helpers, cached vendor file load/save helpers, vendor preload entrypoint helper, and `index_workspace` into `src/indexing/workspace.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused indexing/vendor tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved workspace file parse/index helpers, cached vendor file load/save helpers, vendor preload entrypoint helper, and `index_workspace` into `src/indexing/workspace.rs`.
+  - Result: `server.rs` reduced from 4,774 lines to 4,191 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_indexing`, `cargo test -p php-lsp-server vendor`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step10** Move the remaining unit test block out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving test-file extraction only; keep test names, assertions, fixtures, and helper behavior unchanged.
+  - Implementation target: move the trailing `server.rs` unit test module body into `src/server_tests.rs` and leave `server.rs` with only a small `#[cfg(test)] mod tests` declaration.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved the trailing `server.rs` unit test module body into `src/server_tests.rs` and left `server.rs` with a small `#[cfg(test)]` module declaration.
+  - Result: `server.rs` reduced from 7,712 lines to 4,774 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step9** Move vendor autoload helper leftovers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep Composer installed.json parsing, vendor PSR-4 resolution, lazy vendor indexing, cache-source behavior, and indexing response behavior unchanged.
+  - Implementation target: move vendor autoload parsing/resolution helpers into `src/indexing/vendor.rs` and keep CLI-facing vendor APIs re-exported from `server`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused vendor/indexing tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved vendor autoload parsing, vendor package path resolution, cached vendor autoload lookup, and test-only vendor path resolution into `src/indexing/vendor.rs`.
+  - Result: `server.rs` reduced from 7,855 lines to 7,712 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server vendor`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step8** Move workspace/config helper leftovers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep configuration merge/trust behavior, workspace root discovery, include/exclude path semantics, watched-file metadata handling, and indexing behavior unchanged.
+  - Implementation target: move path exclusion, PHP file collection, workspace root/config discovery, project command trust sanitization, Composer metadata change detection, and indexed-root removal helpers into `src/indexing/workspace.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused indexing/initialize/config tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved path exclusion/PHP file collection, workspace root/config discovery, project command trust sanitization, Composer metadata change detection, and indexed-root removal helpers into `src/indexing/workspace.rs`.
+  - Result: `server.rs` reduced from 8,419 lines to 7,855 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_initialize --test e2e_indexing`, `cargo test -p php-lsp-server path_is_excluded`, `cargo test -p php-lsp-server collect_php_files`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step7** Move template/Twig context helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep Blade/Twig preprocessing, virtual-document mapping, diagnostics suppression, hover/completion/definition behavior, and URI/range semantics unchanged.
+  - Implementation target: move template document kind detection, Twig template path/name helpers, and Twig render-context inference helpers into `src/lsp/templates.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused template e2e tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: added `src/lsp/templates.rs` and moved template document kind detection, Twig path/name helpers, and Twig render-context type inference helpers into it.
+  - Result: `server.rs` reduced from 8,807 lines to 8,419 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_templates`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step6** Move virtual-member and shape completion helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep hover markdown, completion item data, definition ranges, URI/range semantics, and LSP response shapes unchanged.
+  - Implementation target: move PHPDoc/framework virtual-member helpers, framework string-key helpers, shape completion/definition helpers, and completion type-resolution helpers into a focused `src/lsp/completion_helpers.rs` module.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused hover/completion/definition tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: added `src/lsp/completion_helpers.rs` and moved PHPDoc/framework virtual-member helpers, framework string-key helpers, shape completion/definition helpers, local-variable completion helpers, and completion type-resolution helpers into it.
+  - Result: `server.rs` reduced from 10,537 lines to 8,807 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_completion --test e2e_hover --test e2e_definition`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step5** Move diagnostics core helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep URI/range semantics, diagnostic messages/codes/severity, indexing behavior, and LSP response shapes unchanged.
+  - Implementation target: move `compute_*diagnostics`, semantic/member/type/override/PHP-version/duplicate-symbol diagnostics helpers, and supporting diagnostic inference structs into `src/lsp/diagnostics.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused diagnostics tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved core diagnostic computation, semantic diagnostic mapping/category helpers, member/type/override/PHP-version diagnostics, duplicate-symbol checks, and supporting diagnostic inference structs into `src/lsp/diagnostics.rs`.
+  - Result: `server.rs` reduced from 13,327 lines to 10,537 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server compute_diagnostics_`, `cargo test -p php-lsp-server --test e2e_diagnostics`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step4** Move inlay/local-variable inference helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep URI/range semantics, diagnostics, completion, indexing, hover, and inlay behavior unchanged.
+  - Implementation target: move the cohesive inlay hint, local-variable type display, local-variable hover, and shared call-site type helper block into `src/lsp/inlay_hints.rs` so `server.rs` stops owning feature-specific inference/display code.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused inlay/hover/completion diagnostics tests where practical, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved the inlay hint generation, local-variable type inference/display, local-variable hover support, and shared call-site type inference helpers into `src/lsp/inlay_hints.rs`.
+  - Result: `server.rs` reduced from 16,300 lines to 13,327 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server inlay --tests`, `cargo test -p php-lsp-server hover --tests`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
 - [x] **T-2026-05-28-server-split-step3** Move hierarchy/reference helper logic out of `server.rs`. *(done 2026-05-28)*
   - Scope: behavior-preserving extraction only; keep LSP response shapes, ranges, indexing, diagnostics, and inference behavior unchanged.
   - Implementation target: move call/type hierarchy and implementation helper functions into `src/lsp/hierarchy.rs`.

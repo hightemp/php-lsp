@@ -287,3 +287,134 @@ impl PhpLspBackend {
         }
     }
 }
+
+pub(in crate::server) fn line_byte_col_to_byte(
+    source: &str,
+    line: u32,
+    byte_col: u32,
+) -> Option<usize> {
+    let mut offset = 0usize;
+
+    for (current_line, l) in source.split_inclusive('\n').enumerate() {
+        if current_line as u32 == line {
+            let col = byte_col as usize;
+            return (col <= l.len()).then_some(offset + col);
+        }
+        offset += l.len();
+    }
+
+    None
+}
+
+pub(in crate::server) fn starts_with_assignment_operator(text: &str) -> bool {
+    matches!(
+        text.as_bytes(),
+        [b'=', rest @ ..] if !matches!(rest.first(), Some(b'=' | b'>'))
+    ) || text.starts_with("+=")
+        || text.starts_with("-=")
+        || text.starts_with("*=")
+        || text.starts_with("/=")
+        || text.starts_with("%=")
+        || text.starts_with(".=")
+        || text.starts_with("&=")
+        || text.starts_with("|=")
+        || text.starts_with("^=")
+        || text.starts_with("??=")
+        || text.starts_with("<<=")
+        || text.starts_with(">>=")
+}
+
+pub(in crate::server) fn is_declaration_like_write(
+    before_trimmed: &str,
+    after_trimmed: &str,
+) -> bool {
+    let segment = before_trimmed
+        .rsplit([';', '{', '}'])
+        .next()
+        .unwrap_or(before_trimmed)
+        .trim_start();
+    let declaration_tail = after_trimmed.starts_with([',', ')', ';', '=']);
+
+    declaration_tail
+        && (segment.contains("function ")
+            || segment.starts_with("public ")
+            || segment.starts_with("protected ")
+            || segment.starts_with("private ")
+            || segment.starts_with("readonly ")
+            || segment.starts_with("static ")
+            || segment.starts_with("var "))
+}
+
+pub(in crate::server) fn is_write_reference(source: &str, range: (u32, u32, u32, u32)) -> bool {
+    let Some(start) = line_byte_col_to_byte(source, range.0, range.1) else {
+        return false;
+    };
+    let Some(end) = line_byte_col_to_byte(source, range.2, range.3) else {
+        return false;
+    };
+    if start > end || end > source.len() {
+        return false;
+    }
+
+    let line_start = source[..start].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let line_end = source[end..]
+        .find('\n')
+        .map(|idx| end + idx)
+        .unwrap_or(source.len());
+    let before_trimmed = source[line_start..start].trim_end();
+    let after_trimmed = source[end..line_end].trim_start();
+
+    starts_with_assignment_operator(after_trimmed)
+        || after_trimmed.starts_with("++")
+        || after_trimmed.starts_with("--")
+        || before_trimmed.ends_with("++")
+        || before_trimmed.ends_with("--")
+        || is_declaration_like_write(before_trimmed, after_trimmed)
+}
+
+pub(in crate::server) fn document_highlight_kind(
+    source: &str,
+    range: (u32, u32, u32, u32),
+    read_write_capable: bool,
+) -> DocumentHighlightKind {
+    if !read_write_capable {
+        return DocumentHighlightKind::TEXT;
+    }
+
+    if is_write_reference(source, range) {
+        DocumentHighlightKind::WRITE
+    } else {
+        DocumentHighlightKind::READ
+    }
+}
+
+pub(in crate::server) fn document_highlight_from_range(
+    source: &str,
+    range: (u32, u32, u32, u32),
+    read_write_capable: bool,
+) -> DocumentHighlight {
+    let rng = range_byte_to_utf16(source, range);
+    DocumentHighlight {
+        range: Range {
+            start: Position::new(rng.0, rng.1),
+            end: Position::new(rng.2, rng.3),
+        },
+        kind: Some(document_highlight_kind(source, range, read_write_capable)),
+    }
+}
+
+pub(in crate::server) fn php_symbol_kind_for_ref_kind(
+    ref_kind: RefKind,
+) -> Option<php_lsp_types::PhpSymbolKind> {
+    match ref_kind {
+        RefKind::ClassName | RefKind::Constructor => Some(php_lsp_types::PhpSymbolKind::Class),
+        RefKind::FunctionCall => Some(php_lsp_types::PhpSymbolKind::Function),
+        RefKind::MethodCall => Some(php_lsp_types::PhpSymbolKind::Method),
+        RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {
+            Some(php_lsp_types::PhpSymbolKind::Property)
+        }
+        RefKind::ClassConstant => Some(php_lsp_types::PhpSymbolKind::ClassConstant),
+        RefKind::GlobalConstant => Some(php_lsp_types::PhpSymbolKind::GlobalConstant),
+        RefKind::Variable | RefKind::NamespaceName | RefKind::Unknown => None,
+    }
+}

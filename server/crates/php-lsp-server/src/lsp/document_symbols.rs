@@ -585,3 +585,93 @@ impl PhpLspBackend {
         Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
     }
 }
+
+pub(in crate::server) fn selection_range_from_byte_ranges(
+    source: &str,
+    byte_ranges: Vec<(u32, u32, u32, u32)>,
+) -> Option<SelectionRange> {
+    let mut parent = None;
+
+    for byte_range in byte_ranges.into_iter().rev() {
+        let range = range_byte_to_utf16(source, byte_range);
+        parent = Some(Box::new(SelectionRange {
+            range: Range {
+                start: Position::new(range.0, range.1),
+                end: Position::new(range.2, range.3),
+            },
+            parent,
+        }));
+    }
+
+    parent.map(|selection_range| *selection_range)
+}
+
+pub(in crate::server) fn node_byte_range(node: tree_sitter::Node) -> (u32, u32, u32, u32) {
+    let start = node.start_position();
+    let end = node.end_position();
+    (
+        start.row as u32,
+        start.column as u32,
+        end.row as u32,
+        end.column as u32,
+    )
+}
+
+pub(in crate::server) fn node_text<'a>(source: &'a str, node: tree_sitter::Node) -> &'a str {
+    source.get(node.byte_range()).unwrap_or("")
+}
+
+pub(in crate::server) fn enclosing_linked_edit_construct(
+    mut node: tree_sitter::Node,
+) -> Option<tree_sitter::Node> {
+    loop {
+        if matches!(
+            node.kind(),
+            "namespace_definition"
+                | "namespace_use_declaration"
+                | "namespace_use_clause"
+                | "namespace_use_group"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+pub(in crate::server) fn collect_matching_name_ranges(
+    node: tree_sitter::Node,
+    source: &str,
+    target: &str,
+    ranges: &mut Vec<(u32, u32, u32, u32)>,
+) {
+    if node.kind() == "name" && node_text(source, node) == target {
+        ranges.push(node_byte_range(node));
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_matching_name_ranges(child, source, target, ranges);
+    }
+}
+
+pub(in crate::server) fn linked_editing_ranges_for_namespace_or_use(
+    source: &str,
+    node: tree_sitter::Node,
+) -> Option<Vec<(u32, u32, u32, u32)>> {
+    if node.kind() != "name" {
+        return None;
+    }
+
+    let target = node_text(source, node);
+    if target.is_empty() {
+        return None;
+    }
+
+    let construct = enclosing_linked_edit_construct(node)?;
+    let mut ranges = Vec::new();
+    collect_matching_name_ranges(construct, source, target, &mut ranges);
+    ranges.sort_unstable();
+    ranges.dedup();
+
+    (ranges.len() >= 2).then_some(ranges)
+}

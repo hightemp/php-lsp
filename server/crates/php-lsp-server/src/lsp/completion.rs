@@ -524,3 +524,427 @@ impl PhpLspBackend {
         Ok(item)
     }
 }
+
+impl PhpLspBackend {
+    pub(in crate::server) fn resolve_member_type(
+        &self,
+        class_fqn: &str,
+        member_name: &str,
+    ) -> Option<String> {
+        resolve_member_type_from_index(&self.index, class_fqn, member_name)
+    }
+
+    pub(in crate::server) fn resolve_completion_member_type(
+        &self,
+        class_fqn: &str,
+        member_name: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        source_uri: Option<&str>,
+        source: Option<&str>,
+    ) -> Option<String> {
+        self.resolve_member_type(class_fqn, member_name)
+            .or_else(|| {
+                let member_fqn = format!("{}::{}", class_fqn, member_name);
+                let bare_name = member_name.strip_prefix('$').unwrap_or(member_name);
+                file_symbols.symbols.iter().find_map(|sym| {
+                    if sym.fqn == member_fqn
+                        || (sym.parent_fqn.as_deref() == Some(class_fqn)
+                            && (sym.name == member_name || sym.name == bare_name))
+                    {
+                        symbol_return_type_fqn(&self.index, class_fqn, sym)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .or_else(|| {
+                framework_virtual_member_type_fqn(
+                    &self.index,
+                    class_fqn,
+                    member_name,
+                    source_uri,
+                    Some(file_symbols),
+                    source,
+                )
+            })
+    }
+
+    pub(in crate::server) fn resolve_completion_member_type_cached(
+        &self,
+        class_fqn: &str,
+        member_name: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        source_uri: Option<&str>,
+        source: Option<&str>,
+        type_cache: &RequestTypeCache,
+    ) -> Option<String> {
+        type_cache.cached_string(
+            (0, 0, 0, 0),
+            "completion-member-type",
+            format!("{class_fqn}::{member_name}"),
+            || {
+                self.resolve_completion_member_type(
+                    class_fqn,
+                    member_name,
+                    file_symbols,
+                    source_uri,
+                    source,
+                )
+            },
+        )
+    }
+
+    pub(in crate::server) fn resolve_completion_member_call_type(
+        &self,
+        class_fqn: &str,
+        member_name: &str,
+        member_text: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        type_cache: &RequestTypeCache,
+    ) -> Option<String> {
+        type_cache.cached_string(
+            (0, 0, 0, 0),
+            "completion-member-call-type",
+            format!("{class_fqn}::{member_name}:{member_text}"),
+            || {
+                let symbol = self
+                    .index
+                    .resolve_member(&format!("{}::{}", class_fqn, member_name))
+                    .or_else(|| {
+                        let member_fqn = format!("{}::{}", class_fqn, member_name);
+                        file_symbols.symbols.iter().find_map(|sym| {
+                            (sym.fqn == member_fqn
+                                || (sym.parent_fqn.as_deref() == Some(class_fqn)
+                                    && sym.name == member_name))
+                                .then(|| Arc::new(sym.clone()))
+                        })
+                    })?;
+                let signature = symbol.signature.as_ref()?;
+                let return_type = signature.return_type.as_ref()?;
+                let arguments = completion_call_arguments_by_param(
+                    member_text,
+                    signature,
+                    file_symbols,
+                    &self.index,
+                );
+                let template_names: HashSet<String> = symbol
+                    .templates
+                    .iter()
+                    .map(|template| template.name.clone())
+                    .collect();
+                let substitutions =
+                    call_site_template_substitutions(&arguments, signature, &template_names);
+                let resolved = resolve_call_site_type_info(
+                    return_type,
+                    &arguments,
+                    &template_names,
+                    &substitutions,
+                );
+                type_info_fqn_from_index(&self.index, class_fqn, &symbol.uri, &resolved)
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::server) fn infer_completion_object_type(
+        &self,
+        object_expr: &str,
+        tree: &tree_sitter::Tree,
+        source_uri: &str,
+        source: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        line: u32,
+        byte_col: u32,
+        type_cache: &RequestTypeCache,
+    ) -> Option<String> {
+        type_cache.cached_string(
+            (line, byte_col, line, byte_col),
+            "completion-object-type",
+            object_expr,
+            || {
+                let object_expr = object_expr.trim();
+                if let Some(class_fqn) = infer_new_expression_type(object_expr, file_symbols) {
+                    return Some(class_fqn);
+                }
+                if let Some(class_fqn) = infer_static_call_expression_type(
+                    object_expr,
+                    file_symbols,
+                    |class_fqn, method_name| {
+                        self.resolve_completion_member_type_cached(
+                            class_fqn,
+                            method_name,
+                            file_symbols,
+                            Some(source_uri),
+                            Some(source),
+                            type_cache,
+                        )
+                    },
+                ) {
+                    return Some(class_fqn);
+                }
+
+                if object_expr.contains("->") || object_expr.contains("?->") {
+                    return self.infer_completion_member_chain_type(
+                        object_expr,
+                        tree,
+                        source_uri,
+                        source,
+                        file_symbols,
+                        line,
+                        byte_col,
+                        type_cache,
+                    );
+                }
+
+                if object_expr == "$this" {
+                    current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
+                        .or_else(|| current_class_fqn(file_symbols))
+                } else if object_expr.starts_with('$') {
+                    self.infer_completion_variable_type(
+                        tree,
+                        source_uri,
+                        source,
+                        file_symbols,
+                        line,
+                        byte_col,
+                        object_expr,
+                        type_cache,
+                    )
+                } else {
+                    None
+                }
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::server) fn infer_completion_variable_type(
+        &self,
+        tree: &tree_sitter::Tree,
+        source_uri: &str,
+        source: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        line: u32,
+        byte_col: u32,
+        var_name: &str,
+        type_cache: &RequestTypeCache,
+    ) -> Option<String> {
+        type_cache.cached_string(
+            (line, byte_col, line, byte_col),
+            "completion-variable-type",
+            var_name,
+            || {
+                let resolve_member_type = |class_fqn: &str, member_name: &str| {
+                    self.resolve_completion_member_type_cached(
+                        class_fqn,
+                        member_name,
+                        file_symbols,
+                        Some(source_uri),
+                        Some(source),
+                        type_cache,
+                    )
+                };
+                let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+                    resolve_callable_parameter_type_from_index(&self.index, file_symbols, ctx)
+                };
+                infer_variable_type_at_position_with_resolvers(
+                    tree,
+                    source,
+                    file_symbols,
+                    line,
+                    byte_col,
+                    var_name,
+                    Some(&resolve_member_type),
+                    Some(&callable_param_resolver),
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::server) fn infer_completion_member_chain_type(
+        &self,
+        object_expr: &str,
+        tree: &tree_sitter::Tree,
+        source_uri: &str,
+        source: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        line: u32,
+        byte_col: u32,
+        type_cache: &RequestTypeCache,
+    ) -> Option<String> {
+        type_cache.cached_string(
+            (line, byte_col, line, byte_col),
+            "completion-member-chain-type",
+            object_expr,
+            || {
+                let normalized = object_expr.replace("?->", "->");
+                let mut parts = normalized.split("->");
+                let base_expr = parts.next()?.trim();
+                let mut class_fqn = if base_expr == "$this" {
+                    current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
+                        .or_else(|| current_class_fqn(file_symbols))?
+                } else if base_expr.starts_with('$') {
+                    self.infer_completion_variable_type(
+                        tree,
+                        source_uri,
+                        source,
+                        file_symbols,
+                        line,
+                        byte_col,
+                        base_expr,
+                        type_cache,
+                    )?
+                } else {
+                    infer_new_expression_type(base_expr, file_symbols).or_else(|| {
+                        infer_static_call_expression_type(
+                            base_expr,
+                            file_symbols,
+                            |class_fqn, method_name| {
+                                self.resolve_completion_member_type_cached(
+                                    class_fqn,
+                                    method_name,
+                                    file_symbols,
+                                    Some(source_uri),
+                                    Some(source),
+                                    type_cache,
+                                )
+                            },
+                        )
+                    })?
+                };
+
+                for raw_member in parts {
+                    let member = raw_member.trim();
+                    if member.is_empty() {
+                        return None;
+                    }
+
+                    let is_method_call = member.contains('(');
+                    let member_name = member
+                        .split('(')
+                        .next()
+                        .unwrap_or(member)
+                        .trim()
+                        .trim_start_matches('$');
+                    if member_name.is_empty() {
+                        return None;
+                    }
+
+                    let lookup_name = if is_method_call {
+                        member_name.to_string()
+                    } else {
+                        format!("${}", member_name)
+                    };
+                    class_fqn = if is_method_call {
+                        self.resolve_completion_member_call_type(
+                            &class_fqn,
+                            &lookup_name,
+                            member,
+                            file_symbols,
+                            type_cache,
+                        )
+                        .or_else(|| {
+                            self.resolve_completion_member_type_cached(
+                                &class_fqn,
+                                &lookup_name,
+                                file_symbols,
+                                Some(source_uri),
+                                Some(source),
+                                type_cache,
+                            )
+                        })?
+                    } else {
+                        self.resolve_completion_member_type_cached(
+                            &class_fqn,
+                            &lookup_name,
+                            file_symbols,
+                            Some(source_uri),
+                            Some(source),
+                            type_cache,
+                        )?
+                    };
+                }
+
+                Some(class_fqn)
+            },
+        )
+    }
+
+    pub(in crate::server) fn infer_completion_type_info(
+        &self,
+        ctx: &CompletionInferenceContext<'_>,
+        expr: &str,
+    ) -> Option<php_lsp_types::TypeInfo> {
+        ctx.type_cache.cached_type_info(
+            (ctx.line, ctx.byte_col, ctx.line, ctx.byte_col),
+            "completion-type-info",
+            expr,
+            || {
+                let resolve_member_type = |class_fqn: &str, member_name: &str| {
+                    self.resolve_completion_member_type_cached(
+                        class_fqn,
+                        member_name,
+                        ctx.file_symbols,
+                        Some(ctx.source_uri),
+                        Some(ctx.source),
+                        ctx.type_cache,
+                    )
+                };
+                let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
+                    resolve_callable_parameter_type_from_index(
+                        &self.index,
+                        ctx.file_symbols,
+                        callable_ctx,
+                    )
+                };
+                infer_variable_type_info_at_position_with_resolvers(
+                    ctx.tree,
+                    ctx.source,
+                    ctx.file_symbols,
+                    ctx.line,
+                    ctx.byte_col,
+                    expr,
+                    Some(&resolve_member_type),
+                    Some(&callable_param_resolver),
+                )
+            },
+        )
+    }
+
+    pub(in crate::server) fn shape_key_completion_items(
+        &self,
+        ctx: &CompletionInferenceContext<'_>,
+        array_expr: &str,
+        key_prefix: &str,
+    ) -> Vec<lsp_types::CompletionItem> {
+        let Some(type_info) = self.infer_completion_type_info(ctx, array_expr) else {
+            return Vec::new();
+        };
+
+        shape_completion_items_from_type_info(&type_info, ShapeCompletionKind::ArrayKey, key_prefix)
+    }
+
+    pub(in crate::server) fn add_object_shape_completion_items(
+        &self,
+        items: &mut Vec<lsp_types::CompletionItem>,
+        ctx: &CompletionInferenceContext<'_>,
+        object_expr: &str,
+        member_prefix: &str,
+    ) {
+        let Some(type_info) = self.infer_completion_type_info(ctx, object_expr) else {
+            return;
+        };
+
+        let mut seen: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
+        for item in shape_completion_items_from_type_info(
+            &type_info,
+            ShapeCompletionKind::ObjectProperty,
+            member_prefix,
+        ) {
+            if seen.insert(item.label.clone()) {
+                items.push(item);
+            }
+        }
+    }
+}

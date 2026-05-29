@@ -25,25 +25,27 @@
 - `server/crates/php-lsp-server`
   - LSP server orchestration, CLI analyze/fix, configuration, framework heuristics, and template support.
   - Common entry files: `src/server.rs`, `src/config.rs`, `src/analyze.rs`, `src/fix.rs`, `src/framework.rs`, `src/template.rs`.
-  - LSP request bodies live in `src/lsp/`; `src/server.rs` owns `PhpLspBackend`, shared helper state, and `LanguageServer` trait wiring.
+  - LSP request bodies and feature helpers live in `src/lsp/`; `src/server.rs` owns `PhpLspBackend`, shared state/config orchestration, and `LanguageServer` trait wiring.
   - Workspace/file-operation handlers and server-side cache/stub/vendor helpers live in `src/indexing/`.
   - Shared server utilities live in `src/util/`.
 
 ## `php-lsp-server` Layout
 
 - `src/server.rs`
-  - Defines `PhpLspBackend`, shared request caches, runtime configuration state, common inference/diagnostic helpers, and `LanguageServer` delegation.
-  - Keep new LSP feature request bodies out of this file unless they are only trait wiring.
+  - Defines `PhpLspBackend`, shared request caches, runtime configuration state, small cross-feature orchestration helpers, and `LanguageServer` delegation.
+  - Keep new LSP feature request bodies and large helper blocks out of this file unless they are only trait wiring or shared backend state.
 - `src/lsp/lifecycle.rs`
   - `initialize` and `shutdown` behavior.
 - `src/lsp/diagnostics.rs`
-  - `didOpen`, `didChange`, `didSave`, `didClose` notification handlers.
+  - `didOpen`, `didChange`, `didSave`, `didClose` notification handlers, diagnostic computation, analyzer publishing, and lazy diagnostic filtering.
 - `src/lsp/completion.rs`
-  - `textDocument/completion`, `completionItem/resolve`, and `textDocument/signatureHelp`.
+  - `textDocument/completion`, `completionItem/resolve`, `textDocument/signatureHelp`, and backend completion type/member inference methods.
+- `src/lsp/completion_helpers.rs`
+  - PHPDoc/framework virtual members, framework string-key helpers, shape completion/definition helpers, local-variable completion helpers, signature-help assembly, and auto-import edit helpers.
 - `src/lsp/hover.rs`
-  - `textDocument/hover`, including local-variable and virtual-member markdown assembly.
+  - `textDocument/hover` request assembly; local-variable type display helpers live in `inlay_hints.rs`, and PHPDoc/framework virtual-member helpers live in `completion_helpers.rs`.
 - `src/lsp/definition.rs`
-  - Definition, declaration, type definition, and implementation requests.
+  - Definition, declaration, type definition, implementation requests, and import/source-location lookup helpers.
 - `src/lsp/references.rs`
   - Document highlight, references, and reference-count code lens requests.
 - `src/lsp/rename.rs`
@@ -53,25 +55,31 @@
 - `src/lsp/formatting.rs`
   - Document/range/on-type formatting request handling.
 - `src/lsp/inlay_hints.rs`
-  - `textDocument/inlayHint` request handling.
+  - `textDocument/inlayHint` request handling, local-variable type inference/display, local-variable hover data, call-site type resolution, and related type markdown.
 - `src/lsp/semantic_tokens.rs`
   - Full, delta, and range semantic token request handling.
 - `src/lsp/hierarchy.rs`
   - Call hierarchy and type hierarchy requests.
 - `src/lsp/document_symbols.rs`
-  - Document symbols, workspace symbols, selection range, and linked editing range.
+  - Document symbols, workspace symbols, selection range, linked editing range, and AST selection helper logic.
 - `src/lsp/folding.rs`
   - Folding range requests.
 - `src/lsp/document_links.rs`
   - Static include/require document links.
+- `src/lsp/templates.rs`
+  - Template document lookup, virtual PHP position mapping helpers, Twig/Blade context helpers, and template-aware definition mapping.
+- `src/lsp/external_command.rs`
+  - Shared external analyzer/formatter command execution helpers, timeouts, cancellation, and JSON output parsing support.
+- `src/lsp/conversions.rs`
+  - Shared conversions between server `lsp_types` values and `tower_lsp::ls_types` values.
 - `src/indexing/workspace.rs`
-  - `initialized`, workspace folders, watched files, configuration changes, and file-operation handlers.
+  - `initialized`, workspace folders, watched files, configuration changes, file-operation handlers, workspace config/exclusion helpers, PHP file collection, workspace parse/index execution, and indexed-root cleanup.
 - `src/indexing/cache.rs`
   - Server-side index cache config/hash helpers.
 - `src/indexing/stubs.rs`
   - Server-side stub loading and stub cache-source helpers.
 - `src/indexing/vendor.rs`
-  - Vendor autoload metadata cache and lazy vendor file LRU helpers.
+  - Vendor autoload metadata cache, lazy vendor file LRU helpers, vendor path resolution, and lazy FQN/class/member indexing helpers.
 - `src/util/uri.rs`
   - Shared path/URI helpers. Current behavior intentionally preserves legacy URI semantics until `PHA-002`.
 - `src/util/lsp_text.rs`
@@ -149,7 +157,7 @@
 - Workspace index/cache/stubs behavior: `cd server && cargo test -p php-lsp-index`.
 - All split LSP e2e tests: `cd server && cargo test -p php-lsp-server --tests`.
 - Focused LSP e2e tests: `cd server && cargo test -p php-lsp-server --test e2e_completion <test_name>` or the relevant `e2e_*` target.
-- Server helper/config behavior: `cd server && cargo test -p php-lsp-server <test_name>`.
+- Server helper/config behavior: `cd server && cargo test -p php-lsp-server <test_name>`; extracted `server.rs` unit tests live in `server/crates/php-lsp-server/src/server_tests.rs`.
 - Client behavior: `cd client && npm run lint && npm run build`.
 
 ## Where To Look
@@ -157,11 +165,14 @@
   - `server/crates/php-lsp-completion/src/context.rs`
   - `server/crates/php-lsp-completion/src/provider.rs`
   - `server/crates/php-lsp-server/src/lsp/completion.rs`
+  - `server/crates/php-lsp-server/src/lsp/completion_helpers.rs`
   - `server/crates/php-lsp-server/tests/e2e_completion.rs`
 - Hover, definition, declaration, and type definition bugs:
   - `server/crates/php-lsp-parser/src/resolve.rs`
   - `server/crates/php-lsp-server/src/lsp/hover.rs`
   - `server/crates/php-lsp-server/src/lsp/definition.rs`
+  - `server/crates/php-lsp-server/src/lsp/completion_helpers.rs`
+  - `server/crates/php-lsp-server/src/lsp/inlay_hints.rs` for local-variable hover/type display.
   - `server/crates/php-lsp-server/tests/e2e_hover.rs`
   - `server/crates/php-lsp-server/tests/e2e_definition.rs`
 - Rename and references bugs:
@@ -174,21 +185,21 @@
   - `server/crates/php-lsp-parser/src/diagnostics.rs`
   - `server/crates/php-lsp-parser/src/semantic.rs`
   - `server/crates/php-lsp-server/src/lsp/diagnostics.rs`
-  - `server/crates/php-lsp-server/src/server.rs`, search for `compute_diagnostics` only for shared diagnostic helpers.
   - `server/crates/php-lsp-server/tests/e2e_diagnostics.rs`
 - Code action/refactor bugs:
   - `server/crates/php-lsp-server/src/lsp/code_action.rs`
   - `server/crates/php-lsp-server/tests/e2e_code_actions.rs`
 - Inlay hint bugs:
   - `server/crates/php-lsp-server/src/lsp/inlay_hints.rs`
-  - `server/crates/php-lsp-server/src/server.rs`, search for `LocalVariableInlayType` or shared type-inference helpers.
   - `server/crates/php-lsp-server/tests/e2e_hover.rs`
 - Formatting bugs:
   - `server/crates/php-lsp-server/src/lsp/formatting.rs`
+  - `server/crates/php-lsp-server/src/lsp/external_command.rs`
   - `server/crates/php-lsp-server/tests/e2e_formatting.rs`
 - Semantic token / symbol / folding / document link bugs:
   - `server/crates/php-lsp-server/src/lsp/semantic_tokens.rs`
   - `server/crates/php-lsp-server/src/lsp/document_symbols.rs`
+  - `server/crates/php-lsp-server/src/lsp/conversions.rs`
   - `server/crates/php-lsp-server/src/lsp/folding.rs`
   - `server/crates/php-lsp-server/src/lsp/document_links.rs`
   - `server/crates/php-lsp-server/tests/e2e_symbols.rs`
@@ -211,6 +222,7 @@
   - `server/crates/php-lsp-server/tests/e2e_indexing.rs`
 - Blade/Twig bugs:
   - `server/crates/php-lsp-server/src/template.rs`
+  - `server/crates/php-lsp-server/src/lsp/templates.rs`
   - `server/crates/php-lsp-server/src/lsp/hover.rs`, `completion.rs`, `definition.rs`, and `semantic_tokens.rs` for template-aware LSP behavior.
   - `server/crates/php-lsp-server/tests/e2e_templates.rs`
 

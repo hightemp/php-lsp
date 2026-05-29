@@ -586,3 +586,234 @@ impl PhpLspBackend {
         }))
     }
 }
+
+impl PhpLspBackend {
+    pub(in crate::server) fn import_declaration_at_position(
+        &self,
+        uri: &Uri,
+        pos: Position,
+    ) -> Option<GotoDefinitionResponse> {
+        let uri_str = uri.as_str().to_string();
+        let parser = self.open_files.get(&uri_str)?;
+        let tree = parser.tree()?;
+        let source = parser.source();
+        let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
+        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+        let sym = symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols)?;
+        let use_stmt = imported_use_statement_for_symbol(&file_symbols, &sym)?;
+        let range = range_byte_to_utf16(&source, use_stmt.range);
+
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range: Range {
+                start: Position::new(range.0, range.1),
+                end: Position::new(range.2, range.3),
+            },
+        }))
+    }
+
+    pub(in crate::server) fn file_symbols_for_uri(
+        &self,
+        uri_str: &str,
+    ) -> Option<php_lsp_types::FileSymbols> {
+        if let Some(file_symbols) = self.index.file_symbols.get(uri_str) {
+            return Some(file_symbols.value().clone());
+        }
+
+        let parser = self.open_files.get(uri_str)?;
+        let tree = parser.tree()?;
+        let source = parser.source();
+        Some(extract_file_symbols(tree, &source, uri_str))
+    }
+
+    pub(in crate::server) async fn source_for_uri(
+        &self,
+        uri_str: &str,
+        label: &'static str,
+    ) -> Option<String> {
+        if let Some(parser) = self.open_files.get(uri_str) {
+            return Some(parser.source());
+        }
+
+        let path = uri_to_path(uri_str)?;
+        read_file_to_string_blocking(path, label).await.ok()
+    }
+
+    pub(in crate::server) async fn phpdoc_virtual_member_location(
+        &self,
+        member: &PhpDocVirtualMember,
+    ) -> Option<Location> {
+        let source = self
+            .source_for_uri(&member.owner.uri, "phpdoc virtual member source read")
+            .await?;
+        let doc_comment = member.owner.doc_comment.as_ref()?;
+        let doc_start = source.find(doc_comment)?;
+        let range = phpdoc_virtual_member_range(&source, doc_comment, doc_start, member)?;
+        let utf16_range = range_byte_to_utf16(&source, range);
+        Some(Location {
+            uri: member.owner.uri.parse::<Uri>().ok()?,
+            range: Range {
+                start: Position::new(utf16_range.0, utf16_range.1),
+                end: Position::new(utf16_range.2, utf16_range.3),
+            },
+        })
+    }
+
+    pub(in crate::server) async fn framework_virtual_member_location(
+        &self,
+        member: &crate::framework::VirtualMember,
+    ) -> Option<Location> {
+        let (uri, range) = member.sources.iter().find_map(|source| match source {
+            crate::framework::VirtualMemberSource::SourceRange { uri, range } => {
+                Some((uri.clone(), *range))
+            }
+            crate::framework::VirtualMemberSource::Synthetic { .. } => None,
+        })?;
+        let source = self
+            .source_for_uri(&uri, "framework virtual member source read")
+            .await?;
+        let utf16_range = range_byte_to_utf16(&source, range);
+        Some(Location {
+            uri: uri.parse::<Uri>().ok()?,
+            range: Range {
+                start: Position::new(utf16_range.0, utf16_range.1),
+                end: Position::new(utf16_range.2, utf16_range.3),
+            },
+        })
+    }
+
+    pub(in crate::server) fn framework_string_key_items(
+        &self,
+        workspace_root: Option<&Path>,
+        namespace_map: Option<&NamespaceMap>,
+        uri_str: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        source: &str,
+        context: &FrameworkStringKeyAtPosition,
+    ) -> Vec<lsp_types::CompletionItem> {
+        let Some(workspace_root) = workspace_root else {
+            return Vec::new();
+        };
+        let framework_ctx = crate::framework::FrameworkProviderContext::new(&self.index)
+            .with_workspace(Some(workspace_root), namespace_map)
+            .with_source_uri(Some(uri_str))
+            .with_file(Some(file_symbols), Some(source))
+            .with_relevant_files(&[]);
+        let registry = crate::framework::default_framework_provider_registry();
+        let query = crate::framework::FrameworkStringKeyQuery {
+            domain: context.domain.to_string(),
+            prefix: context.prefix.clone(),
+        };
+
+        registry
+            .string_keys(&framework_ctx, &query)
+            .into_iter()
+            .map(|key| framework_string_key_completion_item(&key, &context.prefix))
+            .collect()
+    }
+
+    pub(in crate::server) async fn framework_string_key_location(
+        &self,
+        uri_str: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        source: &str,
+        context: &FrameworkStringKeyAtPosition,
+    ) -> Option<Location> {
+        let workspace_root = self.workspace_root_for_uri(uri_str).await?;
+        let namespace_map = self.namespace_map.lock().await.clone();
+        let framework_ctx = crate::framework::FrameworkProviderContext::new(&self.index)
+            .with_workspace(Some(workspace_root.as_path()), namespace_map.as_ref())
+            .with_source_uri(Some(uri_str))
+            .with_file(Some(file_symbols), Some(source))
+            .with_relevant_files(&[]);
+        let registry = crate::framework::default_framework_provider_registry();
+        let query = crate::framework::FrameworkStringKeyQuery {
+            domain: context.domain.to_string(),
+            prefix: context.key.clone(),
+        };
+
+        registry
+            .string_keys(&framework_ctx, &query)
+            .into_iter()
+            .find(|key| key.key == context.key)
+            .and_then(|key| framework_string_key_source_location(&key))
+    }
+
+    pub(in crate::server) fn type_definition_fqn_for_symbol(
+        &self,
+        symbol: &php_lsp_types::SymbolInfo,
+        fallback_file_symbols: &php_lsp_types::FileSymbols,
+    ) -> Option<String> {
+        if matches!(
+            symbol.kind,
+            php_lsp_types::PhpSymbolKind::Class
+                | php_lsp_types::PhpSymbolKind::Interface
+                | php_lsp_types::PhpSymbolKind::Trait
+                | php_lsp_types::PhpSymbolKind::Enum
+        ) {
+            return Some(symbol.fqn.clone());
+        }
+
+        let return_type = symbol.signature.as_ref()?.return_type.as_ref()?;
+        let declaring_file_symbols = self
+            .file_symbols_for_uri(&symbol.uri)
+            .unwrap_or_else(|| fallback_file_symbols.clone());
+
+        first_type_definition_fqn(
+            return_type,
+            &declaring_file_symbols,
+            symbol.parent_fqn.as_deref(),
+        )
+    }
+
+    pub(in crate::server) async fn location_for_type_fqn(&self, fqn: &str) -> Option<Location> {
+        if is_builtin_type_name(fqn) {
+            return None;
+        }
+
+        let symbol = self
+            .resolve_fqn_lazy_with_fallback(fqn, RefKind::ClassName)
+            .await?;
+        let uri = symbol.uri.parse::<Uri>().ok()?;
+        Some(Location {
+            uri,
+            range: Range {
+                start: Position::new(symbol.selection_range.0, symbol.selection_range.1),
+                end: Position::new(symbol.selection_range.2, symbol.selection_range.3),
+            },
+        })
+    }
+
+    pub(in crate::server) fn reference_locations_for_symbol(
+        &self,
+        target_fqn: &str,
+        target_kind: php_lsp_types::PhpSymbolKind,
+        include_declaration: bool,
+    ) -> Vec<Location> {
+        let mut locations = Vec::new();
+        let indexed_references: Vec<_> = self
+            .index
+            .file_references
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for file_uri in indexed_references {
+            for reference in
+                self.references_for_file(&file_uri, target_fqn, target_kind, include_declaration)
+            {
+                if let Ok(uri) = file_uri.parse::<Uri>() {
+                    locations.push(Location {
+                        uri,
+                        range: Range {
+                            start: Position::new(reference.range.0, reference.range.1),
+                            end: Position::new(reference.range.2, reference.range.3),
+                        },
+                    });
+                }
+            }
+        }
+
+        locations
+    }
+}
