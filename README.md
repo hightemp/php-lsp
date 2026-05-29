@@ -230,6 +230,8 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
 | `phpLsp.diagnostics.mode` | `basic-semantic` | `off`, `syntax-only`, or `basic-semantic`. |
 | `phpLsp.diagnostics.severity` | Category warnings | Per-category severity for `unknownSymbols`, `unused`, `duplicateSymbols`, `members`, `typeCompatibility`, `overrideSignatures`, and `phpVersion`; values are `off`, `error`, `warning`, `information`, or `hint`. |
+| `phpLsp.diagnostics.memberTypeNodeBudget` | `64` | Relevant AST-node budget for expensive member/type diagnostics per file. Set `0` to disable the cap. |
+| `phpLsp.diagnostics.partialAnalysisDiagnostic` | `true` | Publish an informational diagnostic when member/type diagnostics are skipped by the budget. |
 | `phpLsp.allowProjectCommands` | `false` | Trust executable analyzer and formatter settings from `.php-lsp.toml`. Keep disabled for untrusted workspaces. |
 | `phpLsp.formatting.provider` | `auto` | `auto`, `none`, `pint`, `php-cs-fixer`, `phpcbf`, or `custom`. |
 | `phpLsp.formatting.command` | `""` | Custom formatter command; use `{file}` for the temporary PHP file. |
@@ -395,6 +397,9 @@ The extension contributes these VS Code commands:
 - Set `"phpLsp.diagnostics.mode": "syntax-only"` to keep only parser syntax
   diagnostics.
 - Set `"phpLsp.diagnostics.mode": "off"` to disable built-in diagnostics.
+- If a large file reports partial analysis, raise
+  `"phpLsp.diagnostics.memberTypeNodeBudget"` or set it to `0` to run
+  member/type diagnostics without that cap.
 - Prefer per-category severity controls when only one category is noisy:
 
 ```json

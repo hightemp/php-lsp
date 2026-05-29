@@ -461,9 +461,7 @@ pub(in crate::server) async fn compute_open_file_diagnostics(
     uri_str: &str,
     open_files: &DashMap<String, FileParser>,
     index: &Arc<WorkspaceIndex>,
-    diagnostics_mode: DiagnosticsMode,
-    diagnostic_severity: DiagnosticSeverityConfig,
-    php_version: PhpVersion,
+    diagnostics_config: DiagnosticsRuntimeConfig,
     document_version: Option<i32>,
 ) -> Vec<Diagnostic> {
     let Some(source) = open_files.get(uri_str).map(|parser| parser.source()) else {
@@ -474,9 +472,7 @@ pub(in crate::server) async fn compute_open_file_diagnostics(
         uri_str.to_string(),
         source,
         index.clone(),
-        diagnostics_mode,
-        diagnostic_severity,
-        php_version,
+        diagnostics_config,
         document_version,
     )
     .await
@@ -486,9 +482,7 @@ pub(in crate::server) async fn compute_source_diagnostics_blocking(
     uri_str: String,
     source: String,
     index: Arc<WorkspaceIndex>,
-    diagnostics_mode: DiagnosticsMode,
-    diagnostic_severity: DiagnosticSeverityConfig,
-    php_version: PhpVersion,
+    diagnostics_config: DiagnosticsRuntimeConfig,
     document_version: Option<i32>,
 ) -> Vec<Diagnostic> {
     run_diagnostics_blocking(uri_str.clone(), document_version, move || {
@@ -498,9 +492,7 @@ pub(in crate::server) async fn compute_source_diagnostics_blocking(
             &uri_str,
             &parser,
             &index,
-            diagnostics_mode,
-            diagnostic_severity,
-            php_version,
+            diagnostics_config,
             document_version,
         )
     })
@@ -705,16 +697,20 @@ pub(in crate::server) fn compute_diagnostics(
     diagnostics_mode: DiagnosticsMode,
     php_version: PhpVersion,
 ) -> Vec<Diagnostic> {
-    compute_diagnostics_with_config(
+    compute_diagnostics_with_runtime_config(
         uri_str,
         parser,
         index,
-        diagnostics_mode,
-        DiagnosticSeverityConfig::default(),
-        php_version,
+        DiagnosticsRuntimeConfig {
+            mode: diagnostics_mode,
+            php_version,
+            ..DiagnosticsRuntimeConfig::default()
+        },
+        None,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn compute_diagnostics_with_config(
     uri_str: &str,
     parser: &FileParser,
@@ -723,14 +719,33 @@ pub(crate) fn compute_diagnostics_with_config(
     diagnostic_severity: DiagnosticSeverityConfig,
     php_version: PhpVersion,
 ) -> Vec<Diagnostic> {
+    compute_diagnostics_with_runtime_config(
+        uri_str,
+        parser,
+        index,
+        DiagnosticsRuntimeConfig {
+            mode: diagnostics_mode,
+            severity: diagnostic_severity,
+            php_version,
+            ..DiagnosticsRuntimeConfig::default()
+        },
+        None,
+    )
+}
+
+pub(crate) fn compute_diagnostics_with_runtime_config(
+    uri_str: &str,
+    parser: &FileParser,
+    index: &WorkspaceIndex,
+    diagnostics_config: DiagnosticsRuntimeConfig,
+    document_version: Option<i32>,
+) -> Vec<Diagnostic> {
     compute_diagnostics_with_config_for_version(
         uri_str,
         parser,
         index,
-        diagnostics_mode,
-        diagnostic_severity,
-        php_version,
-        None,
+        diagnostics_config,
+        document_version,
     )
 }
 
@@ -738,15 +753,15 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
     uri_str: &str,
     parser: &FileParser,
     index: &WorkspaceIndex,
-    diagnostics_mode: DiagnosticsMode,
-    diagnostic_severity: DiagnosticSeverityConfig,
-    php_version: PhpVersion,
+    diagnostics_config: DiagnosticsRuntimeConfig,
     document_version: Option<i32>,
 ) -> Vec<Diagnostic> {
     let diagnostics_started = Instant::now();
-    if diagnostics_mode == DiagnosticsMode::Off {
+    if diagnostics_config.mode == DiagnosticsMode::Off {
         return vec![];
     }
+    let diagnostic_severity = diagnostics_config.severity;
+    let php_version = diagnostics_config.php_version;
 
     let tree = match parser.tree() {
         Some(t) => t,
@@ -784,7 +799,7 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
         return diagnostics;
     }
 
-    if diagnostics_mode == DiagnosticsMode::SyntaxOnly {
+    if diagnostics_config.mode == DiagnosticsMode::SyntaxOnly {
         return diagnostics;
     }
 
@@ -801,20 +816,34 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
     warn_if_slow_diagnostic_phase(uri_str, "semantic", semantic_started);
 
     for sd in sem_diags {
-        if let Some(diagnostic) = semantic_diagnostic_to_lsp(sd, &utf16_index, diagnostic_severity)
+        if let Some(diagnostic) =
+            semantic_diagnostic_to_lsp(sd, &utf16_index, diagnostics_config.severity)
         {
             diagnostics.push(diagnostic);
         }
     }
 
-    let skip_member_and_type_diagnostics =
-        count_member_type_diagnostic_nodes(tree.root_node()) > MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT;
+    let member_type_budget_exceeded = member_type_diagnostic_budget_exceeded(
+        tree.root_node(),
+        diagnostics_config.budget.member_type_node_budget,
+    );
+    let skip_member_and_type_diagnostics = member_type_budget_exceeded.is_some();
 
     diagnostics.extend(apply_diagnostic_category(
         workspace_duplicate_symbol_diagnostics(uri_str, &file_symbols, index, &utf16_index),
         DiagnosticCategory::DuplicateSymbols,
         diagnostic_severity,
     ));
+    if let Some(limit) = member_type_budget_exceeded {
+        tracing::info!(
+            uri = %uri_str,
+            member_type_node_budget = limit,
+            "Skipping member/type diagnostics because the file exceeded the configured diagnostics budget"
+        );
+        if diagnostics_config.budget.partial_analysis_diagnostic {
+            diagnostics.push(partial_analysis_budget_diagnostic(limit));
+        }
+    }
     if diagnostic_severity
         .severity(DiagnosticCategory::Members)
         .is_some()
@@ -872,7 +901,34 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
     diagnostics
 }
 
-pub(in crate::server) fn count_member_type_diagnostic_nodes(node: tree_sitter::Node) -> usize {
+fn member_type_diagnostic_budget_exceeded(
+    node: tree_sitter::Node,
+    budget: Option<usize>,
+) -> Option<usize> {
+    let budget = budget?;
+    (count_member_type_diagnostic_nodes_with_budget(node, Some(budget)) > budget).then_some(budget)
+}
+
+fn partial_analysis_budget_diagnostic(limit: usize) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 0),
+        },
+        severity: Some(DiagnosticSeverity::INFORMATION),
+        source: Some("php-lsp".to_string()),
+        code: Some(NumberOrString::String("partial-analysis".to_string())),
+        message: format!(
+            "php-lsp skipped member and type diagnostics because this file exceeded the diagnostics budget of {limit} relevant syntax nodes. Set phpLsp.diagnostics.memberTypeNodeBudget higher or to 0 to analyze the whole file."
+        ),
+        ..Default::default()
+    }
+}
+
+fn count_member_type_diagnostic_nodes_with_budget(
+    node: tree_sitter::Node,
+    budget: Option<usize>,
+) -> usize {
     let mut count = usize::from(matches!(
         node.kind(),
         "member_access_expression"
@@ -888,8 +944,8 @@ pub(in crate::server) fn count_member_type_diagnostic_nodes(node: tree_sitter::N
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        count += count_member_type_diagnostic_nodes(child);
-        if count > MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT {
+        count += count_member_type_diagnostic_nodes_with_budget(child, budget);
+        if budget.is_some_and(|budget| count > budget) {
             break;
         }
     }
@@ -3609,19 +3665,28 @@ impl PhpLspBackend {
         }
 
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
+        let diagnostic_budget = *self.diagnostic_budget.lock().await;
         let php_version = *self.php_version.lock().await;
+        let diagnostics_config = DiagnosticsRuntimeConfig {
+            mode: diagnostics_mode,
+            severity: diagnostic_severity,
+            budget: diagnostic_budget,
+            php_version,
+        };
         let effective_diagnostics_mode = if template_document.is_some() {
             DiagnosticsMode::SyntaxOnly
         } else {
             diagnostics_mode
         };
+        let diagnostics_config = DiagnosticsRuntimeConfig {
+            mode: effective_diagnostics_mode,
+            ..diagnostics_config
+        };
         let mut diagnostics = compute_open_file_diagnostics(
             &uri_str,
             &self.open_files,
             &self.index,
-            effective_diagnostics_mode,
-            diagnostic_severity,
-            php_version,
+            diagnostics_config,
             version,
         )
         .await;

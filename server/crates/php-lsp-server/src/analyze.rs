@@ -1,9 +1,10 @@
 use crate::server::{
-    collect_php_files, compute_diagnostics_with_config, discover_workspace_root_config,
+    collect_php_files, compute_diagnostics_with_runtime_config,
+    diagnostic_budget_config_from_settings, discover_workspace_root_config,
     lazy_resolvable_diagnostic_fqn, load_effective_configuration_settings, normalize_config_paths,
     parse_vendor_autoload_map, path_is_excluded, resolve_vendor_paths_from_map,
-    workspace_index_directories, DiagnosticSeverityConfig, DiagnosticsMode, PhpVersion,
-    VendorAutoloadMap, VENDOR_PRELOAD_ENTRYPOINT_LIMIT,
+    workspace_index_directories, DiagnosticBudgetConfig, DiagnosticSeverityConfig, DiagnosticsMode,
+    DiagnosticsRuntimeConfig, PhpVersion, VendorAutoloadMap, VENDOR_PRELOAD_ENTRYPOINT_LIMIT,
 };
 use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -142,6 +143,7 @@ struct AnalyzeRuntimeConfig {
     php_version: PhpVersion,
     diagnostics_mode: DiagnosticsMode,
     diagnostic_severity: DiagnosticSeverityConfig,
+    diagnostic_budget: DiagnosticBudgetConfig,
     composer_enabled: bool,
     index_vendor: bool,
     include_paths: Vec<PathBuf>,
@@ -403,13 +405,17 @@ fn run_analyze(args: &AnalyzeArgs) -> Result<AnalyzeReport, AnalyzeError> {
         let parsed = parsed_by_path.get(target_file).ok_or_else(|| {
             AnalyzeError::new(format!("Failed to parse {}", target_file.display()))
         })?;
-        let file_diagnostics = compute_diagnostics_with_config(
+        let file_diagnostics = compute_diagnostics_with_runtime_config(
             &parsed.uri,
             &parsed.parser,
             &index,
-            runtime_config.diagnostics_mode,
-            runtime_config.diagnostic_severity,
-            runtime_config.php_version,
+            DiagnosticsRuntimeConfig {
+                mode: runtime_config.diagnostics_mode,
+                severity: runtime_config.diagnostic_severity,
+                budget: runtime_config.diagnostic_budget,
+                php_version: runtime_config.php_version,
+            },
+            None,
         );
         let file_diagnostics =
             filter_analyze_lazy_resolved_symbol_diagnostics(file_diagnostics, &lazy_index_context);
@@ -464,6 +470,7 @@ fn analyze_runtime_config(settings: &serde_json::Value) -> AnalyzeRuntimeConfig 
     )
     .and_then(DiagnosticSeverityConfig::parse)
     .unwrap_or_default();
+    let diagnostic_budget = diagnostic_budget_config_from_settings(settings);
     let composer_enabled =
         settings_bool(settings, "composerEnabled", &["composer", "enabled"]).unwrap_or(true);
     let index_vendor = settings_bool(settings, "indexVendor", &["indexVendor"]).unwrap_or(true);
@@ -478,6 +485,7 @@ fn analyze_runtime_config(settings: &serde_json::Value) -> AnalyzeRuntimeConfig 
         php_version,
         diagnostics_mode,
         diagnostic_severity,
+        diagnostic_budget,
         composer_enabled,
         index_vendor,
         include_paths,

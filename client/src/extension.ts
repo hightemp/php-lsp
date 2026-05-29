@@ -846,6 +846,20 @@ function buildInitializationOptions(config: ReturnType<typeof workspace.getConfi
   setIfConfigured(options, config, "phpVersion", "phpVersion", "8.2");
   setIfConfigured(options, config, "diagnostics.mode", "diagnosticsMode", "basic-semantic");
   setIfConfigured(options, config, "diagnostics.severity", "diagnosticsSeverity", {});
+  setIfConfigured(
+    options,
+    config,
+    "diagnostics.memberTypeNodeBudget",
+    "diagnosticsMemberTypeNodeBudget",
+    64,
+  );
+  setIfConfigured(
+    options,
+    config,
+    "diagnostics.partialAnalysisDiagnostic",
+    "diagnosticsPartialAnalysisDiagnostic",
+    true,
+  );
   setIfConfigured(options, config, "composer.enabled", "composerEnabled", true);
   setIfConfigured(options, config, "indexVendor", "indexVendor", true);
   setIfConfigured(options, config, "includePaths", "includePaths", []);

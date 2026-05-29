@@ -258,6 +258,19 @@
           "scope": "resource",
           "description": "Per-category severity for php-lsp diagnostics. Use off to suppress a noisy category without disabling all diagnostics."
         },
+        "phpLsp.diagnostics.memberTypeNodeBudget": {
+          "type": "number",
+          "default": 64,
+          "minimum": 0,
+          "scope": "resource",
+          "description": "Maximum relevant AST nodes to inspect before skipping expensive member and type-compatibility diagnostics for a file. Set to 0 to disable this budget cap."
+        },
+        "phpLsp.diagnostics.partialAnalysisDiagnostic": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Publish an informational diagnostic when php-lsp skips member and type-compatibility diagnostics because the file exceeded the diagnostics budget."
+        },
         "phpLsp.allowProjectCommands": {
           "type": "boolean",
           "default": false,

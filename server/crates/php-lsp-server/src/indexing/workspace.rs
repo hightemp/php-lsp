@@ -111,6 +111,13 @@ impl PhpLspBackend {
         let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
+        let diagnostic_budget = *self.diagnostic_budget.lock().await;
+        let diagnostics_config = DiagnosticsRuntimeConfig {
+            mode: diagnostics_mode,
+            severity: diagnostic_severity,
+            budget: diagnostic_budget,
+            php_version,
+        };
         let index_vendor = *self.index_vendor.lock().await;
         let vendor_autoload_cache = self.vendor_autoload_cache.clone();
         let vendor_file_lru = self.vendor_file_lru.clone();
@@ -198,13 +205,15 @@ impl PhpLspBackend {
                     } else {
                         diagnostics_mode
                     };
+                    let diagnostics_config = DiagnosticsRuntimeConfig {
+                        mode: effective_diagnostics_mode,
+                        ..diagnostics_config
+                    };
                     let mut diags = compute_open_file_diagnostics(
                         &uri_str,
                         &open_files,
                         &reindex_index,
-                        effective_diagnostics_mode,
-                        diagnostic_severity,
-                        php_version,
+                        diagnostics_config,
                         version,
                     )
                     .await;

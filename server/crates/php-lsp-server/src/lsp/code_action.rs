@@ -5973,13 +5973,17 @@ impl PhpLspBackend {
             };
             let diagnostics_mode = *self.diagnostics_mode.lock().await;
             let diagnostic_severity = *self.diagnostic_severity.lock().await;
+            let diagnostic_budget = *self.diagnostic_budget.lock().await;
             compute_diagnostics_with_config_for_version(
                 &uri_str,
                 &parser,
                 &self.index,
-                diagnostics_mode,
-                diagnostic_severity,
-                php_version,
+                DiagnosticsRuntimeConfig {
+                    mode: diagnostics_mode,
+                    severity: diagnostic_severity,
+                    budget: diagnostic_budget,
+                    php_version,
+                },
                 self.current_document_version(&uri_str),
             )
             .into_iter()

@@ -1651,8 +1651,7 @@ final class Factory
     }
 }
 
-#[test]
-fn test_compute_diagnostics_skips_member_type_checks_above_node_budget() {
+fn compute_member_heavy_diagnostics(diagnostic_budget: DiagnosticBudgetConfig) -> Vec<Diagnostic> {
     let uri = "file:///large-member-heavy.php";
     let mut code = String::from(
         r#"<?php
@@ -1664,7 +1663,7 @@ function configure(Service $service): void
 {
 "#,
     );
-    for index in 0..=MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT {
+    for index in 0..=DEFAULT_MEMBER_TYPE_DIAGNOSTIC_NODE_BUDGET {
         code.push_str(&format!("    $service->missing{}();\n", index));
     }
     code.push_str("}\n");
@@ -1676,13 +1675,22 @@ function configure(Service $service): void
     let symbols = extract_file_symbols(parser.tree().unwrap(), &code, uri);
     index.update_file(uri, symbols);
 
-    let diagnostics = compute_diagnostics(
+    compute_diagnostics_with_runtime_config(
         uri,
         &parser,
         &index,
-        DiagnosticsMode::BasicSemantic,
-        PhpVersion::DEFAULT,
-    );
+        DiagnosticsRuntimeConfig {
+            mode: DiagnosticsMode::BasicSemantic,
+            budget: diagnostic_budget,
+            ..DiagnosticsRuntimeConfig::default()
+        },
+        None,
+    )
+}
+
+#[test]
+fn test_compute_diagnostics_skips_member_type_checks_above_default_node_budget() {
+    let diagnostics = compute_member_heavy_diagnostics(DiagnosticBudgetConfig::default());
     let messages: Vec<_> = diagnostics
         .iter()
         .map(|diagnostic| diagnostic.message.as_str())
@@ -1695,6 +1703,129 @@ function configure(Service $service): void
         "Member diagnostics should be skipped above budget, got: {:?}",
         messages
     );
+    assert!(
+        messages.iter().any(|message| message.contains(
+            "php-lsp skipped member and type diagnostics because this file exceeded the diagnostics budget of 64 relevant syntax nodes"
+        )),
+        "Expected a partial-analysis diagnostic, got: {:?}",
+        messages
+    );
+    let partial = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("php-lsp skipped member and type diagnostics because this file exceeded")
+        })
+        .expect("expected partial-analysis diagnostic");
+    assert_eq!(partial.severity, Some(DiagnosticSeverity::INFORMATION));
+    assert_eq!(
+        partial.code,
+        Some(NumberOrString::String("partial-analysis".to_string()))
+    );
+}
+
+#[test]
+fn test_compute_diagnostics_runs_member_type_checks_with_higher_node_budget() {
+    let diagnostic_budget = DiagnosticBudgetConfig {
+        member_type_node_budget: Some(10_000),
+        ..DiagnosticBudgetConfig::default()
+    };
+    let diagnostics = compute_member_heavy_diagnostics(diagnostic_budget);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Unknown method: App\\Service::missing")),
+        "Member diagnostics should run with higher budget, got: {:?}",
+        messages
+    );
+    assert!(
+        !messages.iter().any(|message| message
+            .contains("php-lsp skipped member and type diagnostics because this file exceeded")),
+        "Partial-analysis diagnostic should not be emitted when budget is not exceeded, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn test_compute_diagnostics_can_disable_member_type_node_budget() {
+    let diagnostic_budget = DiagnosticBudgetConfig {
+        member_type_node_budget: None,
+        ..DiagnosticBudgetConfig::default()
+    };
+    let diagnostics = compute_member_heavy_diagnostics(diagnostic_budget);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Unknown method: App\\Service::missing")),
+        "Member diagnostics should run when the budget cap is disabled, got: {:?}",
+        messages
+    );
+    assert!(
+        !messages.iter().any(|message| message
+            .contains("php-lsp skipped member and type diagnostics because this file exceeded")),
+        "Partial-analysis diagnostic should not be emitted when budget cap is disabled, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn test_compute_diagnostics_can_hide_partial_analysis_budget_message() {
+    let diagnostic_budget = DiagnosticBudgetConfig {
+        partial_analysis_diagnostic: false,
+        ..DiagnosticBudgetConfig::default()
+    };
+    let diagnostics = compute_member_heavy_diagnostics(diagnostic_budget);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Unknown method: App\\Service::missing")),
+        "Member diagnostics should still be skipped above budget, got: {:?}",
+        messages
+    );
+    assert!(
+        !messages.iter().any(|message| message
+            .contains("php-lsp skipped member and type diagnostics because this file exceeded")),
+        "Partial-analysis diagnostic should be hidden by config, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn test_diagnostic_budget_config_parses_nested_settings_and_zero_budget() {
+    let config = diagnostic_budget_config_from_settings(&serde_json::json!({
+        "diagnostics": {
+            "memberTypeNodeBudget": 256,
+            "partialAnalysisDiagnostic": false
+        }
+    }));
+    assert_eq!(config.member_type_node_budget, Some(256));
+    assert!(!config.partial_analysis_diagnostic);
+
+    let disabled = diagnostic_budget_config_from_settings(&serde_json::json!({
+        "phpLsp": {
+            "diagnostics": {
+                "memberTypeNodeBudget": 0
+            }
+        }
+    }));
+    assert_eq!(disabled.member_type_node_budget, None);
+    assert!(disabled.partial_analysis_diagnostic);
 }
 
 #[test]

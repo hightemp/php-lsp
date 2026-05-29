@@ -437,6 +437,15 @@ duplicate symbols, member access problems, type compatibility, override
 signatures, and PHP-version checks. Per-category severity is controlled by
 `phpLsp.diagnostics.severity`.
 
+Member access and type-compatibility diagnostics share a latency budget because
+they can resolve many call sites and inferred types in large files. The default
+`phpLsp.diagnostics.memberTypeNodeBudget` is `64` relevant syntax nodes. When a
+file exceeds that budget, php-lsp skips those two expensive categories, logs the
+partial analysis, and by default publishes an informational `partial-analysis`
+diagnostic at the start of the file. Set the budget higher for large files or to
+`0` to disable the cap; set `phpLsp.diagnostics.partialAnalysisDiagnostic` to
+`false` to keep the log but hide the informational diagnostic.
+
 Duplicate-symbol diagnostics are split by scope: parser semantic diagnostics
 report duplicate declarations inside the current file, while workspace
 diagnostics report only cross-file duplicates from the index. This avoids
@@ -539,7 +548,7 @@ applied at runtime:
 | Changed setting group | Server action |
 |---|---|
 | PHP version | Reload stubs and republish diagnostics. |
-| Diagnostics mode/severity | Republish open diagnostics. |
+| Diagnostics mode/severity/budget | Republish open diagnostics. |
 | Composer enabled | Recompute workspace roots and reindex. |
 | Include/exclude paths | Reindex. |
 | Stub extensions/path | Reload stubs and republish diagnostics. |

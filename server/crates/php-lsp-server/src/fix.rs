@@ -1,8 +1,9 @@
 use crate::server::{
-    build_organize_imports_edit, collect_php_files, compute_diagnostics_with_config,
-    discover_workspace_root_config, is_unused_import_diagnostic,
-    load_effective_configuration_settings, normalize_config_paths, return_type_hint,
-    workspace_index_directories, DiagnosticSeverityConfig, DiagnosticsMode, PhpVersion,
+    build_organize_imports_edit, collect_php_files, compute_diagnostics_with_runtime_config,
+    diagnostic_budget_config_from_settings, discover_workspace_root_config,
+    is_unused_import_diagnostic, load_effective_configuration_settings, normalize_config_paths,
+    return_type_hint, workspace_index_directories, DiagnosticBudgetConfig,
+    DiagnosticSeverityConfig, DiagnosticsMode, DiagnosticsRuntimeConfig, PhpVersion,
 };
 use crate::util::lsp_text::{lsp_position_to_byte, text_at_lsp_range};
 use crate::util::uri::path_to_uri;
@@ -125,6 +126,7 @@ struct FixRuntimeConfig {
     php_version: PhpVersion,
     diagnostics_mode: DiagnosticsMode,
     diagnostic_severity: DiagnosticSeverityConfig,
+    diagnostic_budget: DiagnosticBudgetConfig,
     composer_enabled: bool,
     include_paths: Vec<PathBuf>,
     exclude_paths: Vec<PathBuf>,
@@ -564,13 +566,17 @@ fn compute_file_diagnostics(
     index: &WorkspaceIndex,
     runtime_config: &FixRuntimeConfig,
 ) -> Vec<Diagnostic> {
-    compute_diagnostics_with_config(
+    compute_diagnostics_with_runtime_config(
         &parsed.uri,
         &parsed.parser,
         index,
-        runtime_config.diagnostics_mode,
-        runtime_config.diagnostic_severity,
-        runtime_config.php_version,
+        DiagnosticsRuntimeConfig {
+            mode: runtime_config.diagnostics_mode,
+            severity: runtime_config.diagnostic_severity,
+            budget: runtime_config.diagnostic_budget,
+            php_version: runtime_config.php_version,
+        },
+        None,
     )
 }
 
@@ -654,6 +660,7 @@ fn fix_runtime_config(settings: &serde_json::Value) -> FixRuntimeConfig {
     )
     .and_then(DiagnosticSeverityConfig::parse)
     .unwrap_or_default();
+    let diagnostic_budget = diagnostic_budget_config_from_settings(settings);
     let composer_enabled =
         settings_bool(settings, "composerEnabled", &["composer", "enabled"]).unwrap_or(true);
     let include_paths = settings_string_array(settings, "includePaths", &["includePaths"])
@@ -667,6 +674,7 @@ fn fix_runtime_config(settings: &serde_json::Value) -> FixRuntimeConfig {
         php_version,
         diagnostics_mode,
         diagnostic_severity,
+        diagnostic_budget,
         composer_enabled,
         include_paths,
         exclude_paths,

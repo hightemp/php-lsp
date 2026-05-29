@@ -86,9 +86,11 @@ pub(crate) use indexing::workspace::{
 pub(crate) use lsp::code_action::*;
 use lsp::completion_helpers::*;
 use lsp::conversions::*;
+#[cfg(test)]
+pub(crate) use lsp::diagnostics::compute_diagnostics_with_config;
 use lsp::diagnostics::*;
 pub(crate) use lsp::diagnostics::{
-    compute_diagnostics_with_config, lazy_resolvable_diagnostic_fqn,
+    compute_diagnostics_with_runtime_config, lazy_resolvable_diagnostic_fqn,
 };
 use lsp::document_symbols::*;
 use lsp::external_command::*;
@@ -254,7 +256,9 @@ struct CompletionInferenceContext<'a> {
     line: u32,
     byte_col: u32,
 }
-const MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT: usize = 64;
+
+const DEFAULT_MEMBER_TYPE_DIAGNOSTIC_NODE_BUDGET: usize = 64;
+const DEFAULT_PARTIAL_ANALYSIS_DIAGNOSTIC: bool = true;
 
 fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {
     current.is_none_or(|current| incoming > current)
@@ -725,6 +729,40 @@ impl DiagnosticSeverityConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiagnosticBudgetConfig {
+    pub(crate) member_type_node_budget: Option<usize>,
+    pub(crate) partial_analysis_diagnostic: bool,
+}
+
+impl Default for DiagnosticBudgetConfig {
+    fn default() -> Self {
+        Self {
+            member_type_node_budget: Some(DEFAULT_MEMBER_TYPE_DIAGNOSTIC_NODE_BUDGET),
+            partial_analysis_diagnostic: DEFAULT_PARTIAL_ANALYSIS_DIAGNOSTIC,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiagnosticsRuntimeConfig {
+    pub(crate) mode: DiagnosticsMode,
+    pub(crate) severity: DiagnosticSeverityConfig,
+    pub(crate) budget: DiagnosticBudgetConfig,
+    pub(crate) php_version: PhpVersion,
+}
+
+impl Default for DiagnosticsRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            mode: DiagnosticsMode::default(),
+            severity: DiagnosticSeverityConfig::default(),
+            budget: DiagnosticBudgetConfig::default(),
+            php_version: PhpVersion::DEFAULT,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct AppliedConfiguration {
     diagnostics_changed: bool,
@@ -1081,6 +1119,47 @@ fn settings_u64_aliases(
     None
 }
 
+fn diagnostic_member_type_node_budget_setting(settings: &serde_json::Value) -> Option<u64> {
+    settings_u64_aliases(
+        settings,
+        "diagnosticsMemberTypeNodeBudget",
+        &[
+            &["diagnostics", "memberTypeNodeBudget"],
+            &["diagnostics", "memberTypeBudget"],
+        ],
+    )
+}
+
+fn diagnostic_member_type_node_budget_from_u64(raw_budget: u64) -> Option<Option<usize>> {
+    if raw_budget == 0 {
+        return Some(None);
+    }
+    usize::try_from(raw_budget).ok().map(Some)
+}
+
+pub(crate) fn diagnostic_budget_config_from_settings(
+    settings: &serde_json::Value,
+) -> DiagnosticBudgetConfig {
+    let settings = php_lsp_settings(settings);
+    let mut config = DiagnosticBudgetConfig::default();
+
+    if let Some(raw_budget) = diagnostic_member_type_node_budget_setting(settings) {
+        if let Some(parsed) = diagnostic_member_type_node_budget_from_u64(raw_budget) {
+            config.member_type_node_budget = parsed;
+        }
+    }
+
+    if let Some(enabled) = settings_bool(
+        settings,
+        "diagnosticsPartialAnalysisDiagnostic",
+        &["diagnostics", "partialAnalysisDiagnostic"],
+    ) {
+        config.partial_analysis_diagnostic = enabled;
+    }
+
+    config
+}
+
 /// Main LSP backend holding all state.
 pub struct PhpLspBackend {
     /// Client handle for sending notifications to VS Code.
@@ -1121,6 +1200,8 @@ pub struct PhpLspBackend {
     diagnostics_mode: Mutex<DiagnosticsMode>,
     /// Per-category severity controls for php-lsp diagnostics.
     diagnostic_severity: Mutex<DiagnosticSeverityConfig>,
+    /// Latency budget controls for expensive in-process diagnostics.
+    diagnostic_budget: Mutex<DiagnosticBudgetConfig>,
     /// PHPStan subprocess diagnostics configuration.
     phpstan_config: Mutex<PhpStanConfig>,
     /// Psalm subprocess diagnostics configuration.
@@ -1180,6 +1261,7 @@ impl PhpLspBackend {
             php_version: Mutex::new(PhpVersion::DEFAULT),
             diagnostics_mode: Mutex::new(DiagnosticsMode::default()),
             diagnostic_severity: Mutex::new(DiagnosticSeverityConfig::default()),
+            diagnostic_budget: Mutex::new(DiagnosticBudgetConfig::default()),
             phpstan_config: Mutex::new(PhpStanConfig::default()),
             psalm_config: Mutex::new(PsalmConfig::default()),
             analyzer_code_actions: Mutex::new(AnalyzerCodeActionConfig::default()),
@@ -1317,7 +1399,14 @@ impl PhpLspBackend {
         let index = self.index.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
+        let diagnostic_budget = *self.diagnostic_budget.lock().await;
         let php_version = *self.php_version.lock().await;
+        let diagnostics_config = DiagnosticsRuntimeConfig {
+            mode: diagnostics_mode,
+            severity: diagnostic_severity,
+            budget: diagnostic_budget,
+            php_version,
+        };
         let debounce = Duration::from_millis(DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS);
         let task_uri_str = uri_str.clone();
 
@@ -1336,13 +1425,15 @@ impl PhpLspBackend {
             } else {
                 diagnostics_mode
             };
+            let diagnostics_config = DiagnosticsRuntimeConfig {
+                mode: effective_diagnostics_mode,
+                ..diagnostics_config
+            };
             let mut diagnostics = compute_open_file_diagnostics(
                 &task_uri_str,
                 &open_files,
                 &index,
-                effective_diagnostics_mode,
-                diagnostic_severity,
-                php_version,
+                diagnostics_config,
                 Some(version),
             )
             .await;
@@ -1427,6 +1518,36 @@ impl PhpLspBackend {
                 }
             } else {
                 tracing::warn!("Ignoring invalid diagnostics severity settings: {raw_severity}");
+            }
+        }
+
+        let raw_member_type_node_budget = diagnostic_member_type_node_budget_setting(settings);
+        let partial_analysis_diagnostic = settings_bool(
+            settings,
+            "diagnosticsPartialAnalysisDiagnostic",
+            &["diagnostics", "partialAnalysisDiagnostic"],
+        );
+        if raw_member_type_node_budget.is_some() || partial_analysis_diagnostic.is_some() {
+            let current = *self.diagnostic_budget.lock().await;
+            let mut next = current;
+
+            if let Some(raw_budget) = raw_member_type_node_budget {
+                if let Some(parsed) = diagnostic_member_type_node_budget_from_u64(raw_budget) {
+                    next.member_type_node_budget = parsed;
+                } else {
+                    tracing::warn!(
+                        "Ignoring diagnostics member/type node budget that exceeds this platform: {raw_budget}"
+                    );
+                }
+            }
+
+            if let Some(enabled) = partial_analysis_diagnostic {
+                next.partial_analysis_diagnostic = enabled;
+            }
+
+            if next != current {
+                *self.diagnostic_budget.lock().await = next;
+                applied.diagnostics_changed = true;
             }
         }
 
@@ -1777,7 +1898,14 @@ impl PhpLspBackend {
         let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
+        let diagnostic_budget = *self.diagnostic_budget.lock().await;
         let php_version = *self.php_version.lock().await;
+        let diagnostics_config = DiagnosticsRuntimeConfig {
+            mode: diagnostics_mode,
+            severity: diagnostic_severity,
+            budget: diagnostic_budget,
+            php_version,
+        };
         let index_vendor = *self.index_vendor.lock().await;
         let vendor_autoload_cache = self.vendor_autoload_cache.clone();
         let vendor_file_lru = self.vendor_file_lru.clone();
@@ -1869,13 +1997,15 @@ impl PhpLspBackend {
                     } else {
                         diagnostics_mode
                     };
+                    let diagnostics_config = DiagnosticsRuntimeConfig {
+                        mode: effective_diagnostics_mode,
+                        ..diagnostics_config
+                    };
                     let mut diags = compute_open_file_diagnostics(
                         &uri_str,
                         &open_files,
                         &reindex_index,
-                        effective_diagnostics_mode,
-                        diagnostic_severity,
-                        php_version,
+                        diagnostics_config,
                         version,
                     )
                     .await;

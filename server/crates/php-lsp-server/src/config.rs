@@ -11,6 +11,10 @@ version = "8.2"
 
 [diagnostics]
 mode = "basic-semantic"
+# Maximum relevant AST nodes before member/type diagnostics are skipped.
+# Set to 0 to disable the budget cap for this project.
+memberTypeNodeBudget = 64
+partialAnalysisDiagnostic = true
 
 [diagnostics.severity]
 unknownSymbols = "warning"
@@ -160,6 +164,22 @@ pub fn normalize_project_config_settings(raw: &Value) -> Value {
         let mut diagnostics_settings = Map::new();
         if let Some(mode) = diagnostics.get("mode").and_then(Value::as_str) {
             diagnostics_settings.insert("mode".to_string(), Value::String(mode.to_string()));
+        }
+        if let Some(budget) = diagnostics
+            .get("memberTypeNodeBudget")
+            .or_else(|| diagnostics.get("memberTypeBudget"))
+            .and_then(Value::as_u64)
+        {
+            diagnostics_settings.insert("memberTypeNodeBudget".to_string(), Value::from(budget));
+        }
+        if let Some(enabled) = diagnostics
+            .get("partialAnalysisDiagnostic")
+            .and_then(Value::as_bool)
+        {
+            diagnostics_settings.insert(
+                "partialAnalysisDiagnostic".to_string(),
+                Value::Bool(enabled),
+            );
         }
 
         let mut severity = Map::new();
@@ -347,6 +367,8 @@ mod tests {
             "php": { "version": "8.3" },
             "diagnostics": {
                 "mode": "syntax-only",
+                "memberTypeNodeBudget": 128,
+                "partialAnalysisDiagnostic": false,
                 "unknown_symbols": "off",
                 "severity": { "members": "error" }
             },
@@ -366,6 +388,8 @@ mod tests {
         assert_eq!(settings["allowProjectCommands"], true);
         assert_eq!(settings["phpVersion"], "8.3");
         assert_eq!(settings["diagnostics"]["mode"], "syntax-only");
+        assert_eq!(settings["diagnostics"]["memberTypeNodeBudget"], 128);
+        assert_eq!(settings["diagnostics"]["partialAnalysisDiagnostic"], false);
         assert_eq!(
             settings["diagnostics"]["severity"]["unknown_symbols"],
             "off"

@@ -3229,7 +3229,7 @@ while implementing these tasks.
     - `cargo test --all`;
     - `git diff --check`.
 
-- [ ] **PHA-022** Make diagnostics budget behavior configurable and visible.
+- [x] **PHA-022** Make diagnostics budget behavior configurable and visible. *(done 2026-05-29)*
   - Problem: large files can silently skip member/type diagnostics after an
     internal node limit. That protects latency but is surprising.
   - Implementation:
@@ -3239,6 +3239,30 @@ while implementing these tasks.
     - keep default latency-safe.
   - Regression tests: verify skip behavior, configured higher budget, and
     disabled/partial diagnostic message behavior.
+  - Completed 2026-05-29:
+    - added `phpLsp.diagnostics.memberTypeNodeBudget` with default `64`; `0`
+      disables the budget cap;
+    - added `phpLsp.diagnostics.partialAnalysisDiagnostic` with default `true`;
+    - budget skips now log partial analysis and publish an informational
+      `partial-analysis` diagnostic at the start of the file when enabled;
+    - the budget config is used by fast diagnostics, full diagnostics, reindex
+      republish, quick-fix fallback diagnostics, `analyze`, and `fix`;
+    - `.php-lsp.toml`, VS Code settings, initialization options, README, and
+      architecture docs document the behavior.
+  - Validation:
+    - `cargo fmt --all --check`;
+    - `cargo clippy -p php-lsp-server --all-targets -- -D warnings`;
+    - `cargo test -p php-lsp-server test_compute_diagnostics_skips_member_type_checks_above_default_node_budget -- --nocapture`;
+    - `cargo test -p php-lsp-server test_compute_diagnostics_runs_member_type_checks_with_higher_node_budget -- --nocapture`;
+    - `cargo test -p php-lsp-server test_compute_diagnostics_can_disable_member_type_node_budget -- --nocapture`;
+    - `cargo test -p php-lsp-server test_compute_diagnostics_can_hide_partial_analysis_budget_message -- --nocapture`;
+    - `cargo test -p php-lsp-server test_diagnostic_budget_config_parses_nested_settings_and_zero_budget -- --nocapture`;
+    - `cargo test -p php-lsp-server normalizes_project_config_sections_to_runtime_settings -- --nocapture`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo test --all`;
+    - `npm run lint`;
+    - `npm run build`;
+    - `git diff --check`.
 
 - [ ] **PHA-023** Harden disk cache and lazy vendor cache correctness.
   - Follow-up completed 2026-05-29: fixed stale diagnostics after `composer
