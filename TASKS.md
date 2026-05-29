@@ -3131,7 +3131,8 @@ while implementing these tasks.
 
 ### Performance, Cache, and Async Tasks
 
-- [ ] **PHA-020** Move blocking diagnostics execution to `spawn_blocking` or a bounded worker pool.
+- [x] **PHA-020** Move blocking diagnostics execution to `spawn_blocking` or a bounded worker pool. *(done 2026-05-29)*
+  - Status: completed 2026-05-29.
   - Problem: diagnostics are computed on a dedicated thread, but the async task
     immediately waits with `join()`, blocking the executor worker.
   - Implementation:
@@ -3144,6 +3145,32 @@ while implementing these tasks.
     - e2e or integration test that hover/completion can respond while a heavy
       diagnostics computation is running;
     - benchmark before/after on a large file.
+  - Completed implementation:
+    - open-file diagnostics are now computed through `tokio::task::spawn_blocking`
+      instead of a dedicated thread followed by an async-task-local `join()`;
+    - didChange debounce, save/open publish, and post-indexing re-publish paths
+      await the blocking task without holding parser/index map guards across
+      `.await`;
+    - existing stale-version checks still gate publication after diagnostics
+      complete;
+    - queue wait, compute, and publish phases now have tracing spans with
+      duration fields.
+  - Regression tests:
+    - `test_diagnostics_blocking_compute_yields_current_thread_runtime` covers
+      current-thread runtime responsiveness while a synthetic heavy diagnostics
+      compute runs;
+    - existing didChange debounce/stale-version e2e tests cover ordering.
+  - Docs: `docs/architecture.md` documents the diagnostics `spawn_blocking`
+    pipeline and tracing spans.
+  - Validation:
+    - `cargo fmt --all --check`;
+    - `cargo test -p php-lsp-server test_diagnostics_blocking_compute_yields_current_thread_runtime -- --nocapture`;
+    - `cargo test -p php-lsp-server test_did_change_debounces_diagnostics_and_ignores_stale_versions -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_diagnostics -- --nocapture`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`;
+    - `git diff --check`.
 
 - [ ] **PHA-021** Audit sync filesystem work in async request paths.
   - Scope:

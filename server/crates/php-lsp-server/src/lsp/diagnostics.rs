@@ -1,6 +1,7 @@
 //! Diagnostics LSP handlers extracted from `server.rs`.
 
 use super::super::*;
+use tracing::Instrument;
 
 fn build_analyzer_shell_command(template: &str, file_path: &Path) -> String {
     let escaped_file = shell_escape(&file_path.to_string_lossy());
@@ -454,8 +455,8 @@ impl PhpLspBackend {
 /// Compute diagnostics for a file (syntax + semantic).
 ///
 /// Extracted as a free function so it can be called both from
-/// `publish_diagnostics` and from the post-indexing re-check in `initialized`.
-pub(in crate::server) fn compute_open_file_diagnostics(
+/// `publish_diagnostics` and from post-indexing re-checks.
+pub(in crate::server) async fn compute_open_file_diagnostics(
     uri_str: &str,
     open_files: &DashMap<String, FileParser>,
     index: &Arc<WorkspaceIndex>,
@@ -464,22 +465,23 @@ pub(in crate::server) fn compute_open_file_diagnostics(
     php_version: PhpVersion,
     document_version: Option<i32>,
 ) -> Vec<Diagnostic> {
-    if let Some(parser) = open_files.get(uri_str) {
-        compute_source_diagnostics_on_dedicated_stack(
-            uri_str.to_string(),
-            parser.source(),
-            index.clone(),
-            diagnostics_mode,
-            diagnostic_severity,
-            php_version,
-            document_version,
-        )
-    } else {
-        vec![]
-    }
+    let Some(source) = open_files.get(uri_str).map(|parser| parser.source()) else {
+        return vec![];
+    };
+
+    compute_source_diagnostics_blocking(
+        uri_str.to_string(),
+        source,
+        index.clone(),
+        diagnostics_mode,
+        diagnostic_severity,
+        php_version,
+        document_version,
+    )
+    .await
 }
 
-pub(in crate::server) fn compute_source_diagnostics_on_dedicated_stack(
+pub(in crate::server) async fn compute_source_diagnostics_blocking(
     uri_str: String,
     source: String,
     index: Arc<WorkspaceIndex>,
@@ -488,34 +490,67 @@ pub(in crate::server) fn compute_source_diagnostics_on_dedicated_stack(
     php_version: PhpVersion,
     document_version: Option<i32>,
 ) -> Vec<Diagnostic> {
-    let thread_name = format!("php-lsp-diagnostics:{uri_str}");
-    let handle = match std::thread::Builder::new()
-        .name(thread_name)
-        .stack_size(DIAGNOSTIC_THREAD_STACK_SIZE)
-        .spawn(move || {
-            let mut parser = FileParser::new();
-            parser.parse_full(&source);
-            compute_diagnostics_with_config_for_version(
-                &uri_str,
-                &parser,
-                &index,
-                diagnostics_mode,
-                diagnostic_severity,
-                php_version,
-                document_version,
-            )
-        }) {
-        Ok(handle) => handle,
-        Err(err) => {
-            tracing::warn!("Failed to spawn diagnostics worker: {}", err);
-            return vec![];
-        }
-    };
+    run_diagnostics_blocking(uri_str.clone(), document_version, move || {
+        let mut parser = FileParser::new();
+        parser.parse_full(&source);
+        compute_diagnostics_with_config_for_version(
+            &uri_str,
+            &parser,
+            &index,
+            diagnostics_mode,
+            diagnostic_severity,
+            php_version,
+            document_version,
+        )
+    })
+    .await
+}
 
-    match handle.join() {
+pub(in crate::server) async fn run_diagnostics_blocking<F>(
+    uri_str: String,
+    document_version: Option<i32>,
+    compute: F,
+) -> Vec<Diagnostic>
+where
+    F: FnOnce() -> Vec<Diagnostic> + Send + 'static,
+{
+    let queued_at = Instant::now();
+    let task_uri = uri_str.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let queue_wait = queued_at.elapsed();
+        let queue_span = tracing::debug_span!(
+            "diagnostics.queue_wait",
+            uri = %uri_str,
+            version = ?document_version,
+            duration_ms = queue_wait.as_millis() as u64,
+        );
+        {
+            let _entered = queue_span.enter();
+            tracing::debug!("diagnostics compute dequeued");
+        }
+
+        let compute_started = Instant::now();
+        let compute_span = tracing::debug_span!(
+            "diagnostics.compute",
+            uri = %uri_str,
+            version = ?document_version,
+            duration_ms = tracing::field::Empty,
+        );
+        let _entered = compute_span.enter();
+
+        let diagnostics = compute();
+        compute_span.record("duration_ms", compute_started.elapsed().as_millis() as u64);
+        diagnostics
+    });
+
+    match task.await {
         Ok(diagnostics) => diagnostics,
-        Err(_) => {
-            tracing::warn!("Diagnostics worker panicked");
+        Err(err) => {
+            tracing::warn!(
+                uri = %task_uri,
+                version = ?document_version,
+                "Diagnostics blocking task failed: {err}"
+            );
             vec![]
         }
     }
@@ -3553,17 +3588,22 @@ impl PhpLspBackend {
         // e.g. `use Symfony\...\Constraints as Assert;` → `new Assert\NotBlank`
         // → need to lazily index `Symfony\...\Constraints\NotBlank`.
         if should_preresolve_dependencies {
-            if let Some(parser) = self.open_files.get(&uri_str) {
+            let alias_fqns = if let Some(parser) = self.open_files.get(&uri_str) {
                 if let Some(tree) = parser.tree() {
                     let source = parser.source();
-                    if let Some(fs) = self.index.file_symbols.get(&uri_str) {
-                        let alias_fqns = collect_aliased_class_fqns(tree, &source, &fs);
-                        drop(fs);
-                        for fqn in alias_fqns {
-                            self.lazy_index_class_dependencies(&fqn).await;
-                        }
-                    }
+                    self.index
+                        .file_symbols
+                        .get(&uri_str)
+                        .map(|fs| collect_aliased_class_fqns(tree, &source, &fs))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
                 }
+            } else {
+                Vec::new()
+            };
+            for fqn in alias_fqns {
+                self.lazy_index_class_dependencies(&fqn).await;
             }
         }
 
@@ -3582,7 +3622,8 @@ impl PhpLspBackend {
             diagnostic_severity,
             php_version,
             version,
-        );
+        )
+        .await;
         if let Some(template) = &template_document {
             diagnostics = template.map_diagnostics_to_original(diagnostics);
             diagnostics.clear();
@@ -3630,9 +3671,21 @@ impl PhpLspBackend {
             return;
         }
 
-        self.client
-            .publish_diagnostics(uri.clone(), diagnostics, version)
-            .await;
+        let publish_started = Instant::now();
+        let publish_span = tracing::debug_span!(
+            "diagnostics.publish",
+            uri = %uri_str,
+            version = ?version,
+            duration_ms = tracing::field::Empty,
+        );
+        async {
+            self.client
+                .publish_diagnostics(uri.clone(), diagnostics, version)
+                .await;
+        }
+        .instrument(publish_span.clone())
+        .await;
+        publish_span.record("duration_ms", publish_started.elapsed().as_millis() as u64);
     }
 
     pub(in crate::server) async fn filter_lazy_resolved_symbol_diagnostics(

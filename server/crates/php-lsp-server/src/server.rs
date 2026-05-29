@@ -68,6 +68,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp::ls_types::*;
 use tower_lsp::{Client, LanguageServer};
+use tracing::Instrument;
 
 #[path = "indexing/mod.rs"]
 mod indexing;
@@ -254,7 +255,6 @@ struct CompletionInferenceContext<'a> {
     byte_col: u32,
 }
 const MEMBER_TYPE_DIAGNOSTIC_NODE_LIMIT: usize = 64;
-const DIAGNOSTIC_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {
     current.is_none_or(|current| incoming > current)
@@ -1161,16 +1161,29 @@ impl PhpLspBackend {
                 diagnostic_severity,
                 php_version,
                 Some(version),
-            );
+            )
+            .await;
             if let Some(template) = template_document {
                 diagnostics = template.map_diagnostics_to_original(diagnostics);
                 diagnostics.clear();
             }
 
             if document_versions.get(&task_uri_str).map(|current| *current) == Some(version) {
-                client
-                    .publish_diagnostics(uri, diagnostics, Some(version))
-                    .await;
+                let publish_started = Instant::now();
+                let publish_span = tracing::debug_span!(
+                    "diagnostics.publish",
+                    uri = %task_uri_str,
+                    version = ?Some(version),
+                    duration_ms = tracing::field::Empty,
+                );
+                async {
+                    client
+                        .publish_diagnostics(uri, diagnostics, Some(version))
+                        .await;
+                }
+                .instrument(publish_span.clone())
+                .await;
+                publish_span.record("duration_ms", publish_started.elapsed().as_millis() as u64);
             }
         });
 
@@ -1655,8 +1668,9 @@ impl PhpLspBackend {
             if indexing_token.is_cancelled() {
                 return;
             }
-            for entry in open_files.iter() {
-                let uri_str = entry.key().clone();
+            let open_file_uris: Vec<String> =
+                open_files.iter().map(|entry| entry.key().clone()).collect();
+            for uri_str in open_file_uris {
                 if let Ok(uri) = uri_str.parse::<Uri>() {
                     let version = reindex_document_versions
                         .get(&uri_str)
@@ -1669,15 +1683,16 @@ impl PhpLspBackend {
                     } else {
                         diagnostics_mode
                     };
-                    let mut diags = compute_diagnostics_with_config_for_version(
+                    let mut diags = compute_open_file_diagnostics(
                         &uri_str,
-                        &entry,
+                        &open_files,
                         &reindex_index,
                         effective_diagnostics_mode,
                         diagnostic_severity,
                         php_version,
                         version,
-                    );
+                    )
+                    .await;
                     if let Some(template) = template_document {
                         diags = template.map_diagnostics_to_original(diags);
                         diags.clear();
@@ -1687,9 +1702,22 @@ impl PhpLspBackend {
                         .map(|current| *current)
                         == version
                     {
-                        reindex_client
-                            .publish_diagnostics(uri, diags, version)
-                            .await;
+                        let publish_started = Instant::now();
+                        let publish_span = tracing::debug_span!(
+                            "diagnostics.publish",
+                            uri = %uri_str,
+                            version = ?version,
+                            duration_ms = tracing::field::Empty,
+                        );
+                        async {
+                            reindex_client
+                                .publish_diagnostics(uri, diags, version)
+                                .await;
+                        }
+                        .instrument(publish_span.clone())
+                        .await;
+                        publish_span
+                            .record("duration_ms", publish_started.elapsed().as_millis() as u64);
                     }
                 }
             }

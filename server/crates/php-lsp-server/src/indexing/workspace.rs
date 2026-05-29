@@ -3,6 +3,7 @@
 use crate::util::uri::path_to_uri;
 
 use super::super::*;
+use tracing::Instrument;
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_initialized(&self, _params: InitializedParams) {
@@ -182,8 +183,9 @@ impl PhpLspBackend {
             if indexing_token.is_cancelled() {
                 return;
             }
-            for entry in open_files.iter() {
-                let uri_str = entry.key().clone();
+            let open_file_uris: Vec<String> =
+                open_files.iter().map(|entry| entry.key().clone()).collect();
+            for uri_str in open_file_uris {
                 if let Ok(uri) = uri_str.parse::<Uri>() {
                     let version = reindex_document_versions
                         .get(&uri_str)
@@ -196,15 +198,16 @@ impl PhpLspBackend {
                     } else {
                         diagnostics_mode
                     };
-                    let mut diags = compute_diagnostics_with_config_for_version(
+                    let mut diags = compute_open_file_diagnostics(
                         &uri_str,
-                        &entry,
+                        &open_files,
                         &reindex_index,
                         effective_diagnostics_mode,
                         diagnostic_severity,
                         php_version,
                         version,
-                    );
+                    )
+                    .await;
                     if let Some(template) = template_document {
                         diags = template.map_diagnostics_to_original(diags);
                         diags.clear();
@@ -214,9 +217,22 @@ impl PhpLspBackend {
                         .map(|current| *current)
                         == version
                     {
-                        reindex_client
-                            .publish_diagnostics(uri, diags, version)
-                            .await;
+                        let publish_started = Instant::now();
+                        let publish_span = tracing::debug_span!(
+                            "diagnostics.publish",
+                            uri = %uri_str,
+                            version = ?version,
+                            duration_ms = tracing::field::Empty,
+                        );
+                        async {
+                            reindex_client
+                                .publish_diagnostics(uri, diags, version)
+                                .await;
+                        }
+                        .instrument(publish_span.clone())
+                        .await;
+                        publish_span
+                            .record("duration_ms", publish_started.elapsed().as_millis() as u64);
                     }
                 }
             }

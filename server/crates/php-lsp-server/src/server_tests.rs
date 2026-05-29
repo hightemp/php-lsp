@@ -1,12 +1,12 @@
 use super::lsp::diagnostics::{
     current_class_fqn_at_range, parse_phpstan_json_diagnostics, parse_psalm_json_diagnostics,
-    type_info_accepts_inferred_type, InferredExprType,
+    run_diagnostics_blocking, type_info_accepts_inferred_type, InferredExprType,
 };
 use super::lsp::document_symbols::{workspace_symbol_candidates, workspace_symbol_lsp_range};
 use super::*;
 use php_lsp_types::*;
 use std::cell::Cell;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn make_symbol(
     name: &str,
@@ -90,6 +90,28 @@ fn test_current_class_fqn_at_range_uses_innermost_class_like() {
         current_class_fqn_at_range(&file_symbols, (20, 8, 20, 8)).as_deref(),
         Some("App\\Outer")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_diagnostics_blocking_compute_yields_current_thread_runtime() {
+    let started = Instant::now();
+    let handle = tokio::spawn(run_diagnostics_blocking(
+        "file:///test/SlowDiagnostics.php".to_string(),
+        Some(1),
+        || {
+            std::thread::sleep(Duration::from_millis(400));
+            Vec::new()
+        },
+    ));
+
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "diagnostics compute should not block the async runtime"
+    );
+    assert!(handle.await.unwrap().is_empty());
 }
 
 fn diagnostic_messages(diagnostics: &[Diagnostic]) -> Vec<String> {

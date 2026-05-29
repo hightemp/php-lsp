@@ -458,9 +458,15 @@ handled conservatively rather than as a full PHPStan/Psalm type lattice.
 There are two publishing paths:
 
 - Fast diagnostics after `didChange`: debounced, in-process, version-checked,
-  and intended for editor feedback.
+  computed on Tokio's blocking pool, and intended for editor feedback.
 - Full diagnostics after open/save/reconfiguration: in-process diagnostics plus
   enabled PHPStan/Psalm external analyzer output.
+
+In-process diagnostic parsing and semantic checks are queued through
+`spawn_blocking` before publication, so expensive diagnostics do not occupy an
+async executor worker. The pipeline records tracing spans for queue wait,
+compute, and publish phases, then checks the document version before sending the
+result to the client.
 
 External analyzer runs are per document. A newer document event cancels the
 previous analyzer run for that URI. Analyzer commands are timeout-bound and
