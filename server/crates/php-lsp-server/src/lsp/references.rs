@@ -195,10 +195,7 @@ impl PhpLspBackend {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     locations.push(Location {
                         uri,
-                        range: Range {
-                            start: Position::new(r.range.0, r.range.1),
-                            end: Position::new(r.range.2, r.range.3),
-                        },
+                        range: range_from_lsp_tuple(r.range),
                     });
                 }
             }

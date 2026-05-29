@@ -464,7 +464,7 @@ fn test_workspace_symbol_candidates_rank_filters_and_members() {
 #[test]
 fn test_workspace_symbol_lsp_range_converts_byte_columns_to_utf16() {
     let source = "<?php\n$привет = 1; class Demo {}\n";
-    let range = workspace_symbol_lsp_range(Some(source), (1, 19, 1, 24));
+    let range = workspace_symbol_lsp_range(source, (1, 19, 1, 24));
 
     assert_eq!(range.start, Position::new(1, 13));
     assert_eq!(range.end, Position::new(1, 18));

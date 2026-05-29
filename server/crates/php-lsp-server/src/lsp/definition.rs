@@ -1,7 +1,7 @@
 //! Definition LSP handlers extracted from `server.rs`.
 
 use super::super::*;
-use super::hierarchy::{implementation_locations_for_method, implementation_locations_for_type};
+use super::hierarchy::{implementation_symbols_for_method, implementation_symbols_for_type};
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_goto_declaration(
@@ -257,18 +257,40 @@ impl PhpLspBackend {
             return Ok(None);
         };
 
-        let locations = match target.kind {
+        let implementation_symbols = match target.kind {
             php_lsp_types::PhpSymbolKind::Class
             | php_lsp_types::PhpSymbolKind::Interface
             | php_lsp_types::PhpSymbolKind::Trait
             | php_lsp_types::PhpSymbolKind::Enum => {
-                implementation_locations_for_type(&self.index, &target)
+                implementation_symbols_for_type(&self.index, &target)
             }
             php_lsp_types::PhpSymbolKind::Method => {
-                implementation_locations_for_method(&self.index, &target)
+                implementation_symbols_for_method(&self.index, &target)
             }
             _ => Vec::new(),
         };
+
+        let mut locations = Vec::new();
+        for symbol in implementation_symbols {
+            if let Some(location) = self
+                .location_for_symbol_selection(&symbol, "gotoImplementation source read")
+                .await
+            {
+                locations.push(location);
+            }
+        }
+        locations.sort_by(|left, right| {
+            (
+                left.uri.as_str(),
+                left.range.start.line,
+                left.range.start.character,
+            )
+                .cmp(&(
+                    right.uri.as_str(),
+                    right.range.start.line,
+                    right.range.start.character,
+                ))
+        });
 
         if locations.is_empty() {
             Ok(None)
@@ -393,7 +415,12 @@ impl PhpLspBackend {
                         &file_symbols,
                         (pos.line, byte_col, pos.line, byte_col),
                     )
-                    .map(|class_sym| (class_sym.uri.clone(), class_sym.selection_range))
+                    .map(|class_sym| {
+                        (
+                            class_sym.uri.clone(),
+                            range_byte_to_utf16(&source, class_sym.selection_range),
+                        )
+                    })
                 } else {
                     None
                 }
@@ -510,19 +537,9 @@ impl PhpLspBackend {
         };
 
         let result = if let Some(sym) = symbol_info {
-            // Convert URI string to lsp_types::Uri
-            if let Ok(target_uri) = sym.uri.parse::<Uri>() {
-                let range = Range {
-                    start: Position::new(sym.selection_range.0, sym.selection_range.1),
-                    end: Position::new(sym.selection_range.2, sym.selection_range.3),
-                };
-                Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: target_uri,
-                    range,
-                }))
-            } else {
-                None
-            }
+            self.location_for_symbol_selection(&sym, "gotoDefinition source read")
+                .await
+                .map(GotoDefinitionResponse::Scalar)
         } else if let Some(virtual_member) =
             phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)
         {
@@ -631,12 +648,55 @@ impl PhpLspBackend {
         uri_str: &str,
         label: &'static str,
     ) -> Option<String> {
+        if uri_str.starts_with("phpstub://") {
+            return self.stub_source_for_uri(uri_str, label).await;
+        }
+
         if let Some(parser) = self.open_files.get(uri_str) {
             return Some(parser.source());
         }
 
         let path = uri_to_path(uri_str)?;
         read_file_to_string_blocking(path, label).await.ok()
+    }
+
+    async fn stub_source_for_uri(&self, uri_str: &str, label: &'static str) -> Option<String> {
+        let rest = uri_str.strip_prefix("phpstub://")?;
+        let (extension, file_name) = rest.split_once('/')?;
+        if extension.is_empty() || file_name.is_empty() || file_name.contains('/') {
+            return None;
+        }
+
+        let client_stubs_path = self.stubs_path.lock().await.clone();
+        let root = self
+            .workspace_root
+            .lock()
+            .await
+            .clone()
+            .or_else(|| std::env::current_dir().ok())?;
+
+        for stubs_path in candidate_stubs_paths(&root, client_stubs_path.clone()) {
+            let path = stubs_path.join(extension).join(file_name);
+            if path.is_file() {
+                if let Ok(source) = read_file_to_string_blocking(path, label).await {
+                    return Some(source);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub(in crate::server) async fn location_for_symbol_selection(
+        &self,
+        symbol: &php_lsp_types::SymbolInfo,
+        label: &'static str,
+    ) -> Option<Location> {
+        let source = self.source_for_uri(&symbol.uri, label).await?;
+        Some(Location {
+            uri: symbol.uri.parse::<Uri>().ok()?,
+            range: range_from_byte_range(&source, symbol.selection_range),
+        })
     }
 
     pub(in crate::server) async fn phpdoc_virtual_member_location(
@@ -721,22 +781,32 @@ impl PhpLspBackend {
     ) -> Option<Location> {
         let workspace_root = self.workspace_root_for_uri(uri_str).await?;
         let namespace_map = self.namespace_map.lock().await.clone();
-        let framework_ctx = crate::framework::FrameworkProviderContext::new(&self.index)
-            .with_workspace(Some(workspace_root.as_path()), namespace_map.as_ref())
-            .with_source_uri(Some(uri_str))
-            .with_file(Some(file_symbols), Some(source))
-            .with_relevant_files(&[]);
-        let registry = crate::framework::default_framework_provider_registry();
-        let query = crate::framework::FrameworkStringKeyQuery {
-            domain: context.domain.to_string(),
-            prefix: context.key.clone(),
-        };
+        let source_range = {
+            let framework_ctx = crate::framework::FrameworkProviderContext::new(&self.index)
+                .with_workspace(Some(workspace_root.as_path()), namespace_map.as_ref())
+                .with_source_uri(Some(uri_str))
+                .with_file(Some(file_symbols), Some(source))
+                .with_relevant_files(&[]);
+            let registry = crate::framework::default_framework_provider_registry();
+            let query = crate::framework::FrameworkStringKeyQuery {
+                domain: context.domain.to_string(),
+                prefix: context.key.clone(),
+            };
 
-        registry
-            .string_keys(&framework_ctx, &query)
-            .into_iter()
-            .find(|key| key.key == context.key)
-            .and_then(|key| framework_string_key_source_location(&key))
+            registry
+                .string_keys(&framework_ctx, &query)
+                .into_iter()
+                .find(|key| key.key == context.key)
+                .and_then(|key| framework_string_key_source_byte_range(&key))
+        };
+        let (uri, range) = source_range?;
+        let source = self
+            .source_for_uri(&uri, "framework string key source read")
+            .await?;
+        Some(Location {
+            uri: uri.parse::<Uri>().ok()?,
+            range: range_from_byte_range(&source, range),
+        })
     }
 
     pub(in crate::server) fn type_definition_fqn_for_symbol(
@@ -774,14 +844,8 @@ impl PhpLspBackend {
         let symbol = self
             .resolve_fqn_lazy_with_fallback(fqn, RefKind::ClassName)
             .await?;
-        let uri = symbol.uri.parse::<Uri>().ok()?;
-        Some(Location {
-            uri,
-            range: Range {
-                start: Position::new(symbol.selection_range.0, symbol.selection_range.1),
-                end: Position::new(symbol.selection_range.2, symbol.selection_range.3),
-            },
-        })
+        self.location_for_symbol_selection(&symbol, "type definition source read")
+            .await
     }
 
     pub(in crate::server) fn reference_locations_for_symbol(
@@ -805,10 +869,7 @@ impl PhpLspBackend {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     locations.push(Location {
                         uri,
-                        range: Range {
-                            start: Position::new(reference.range.0, reference.range.1),
-                            end: Position::new(reference.range.2, reference.range.3),
-                        },
+                        range: range_from_lsp_tuple(reference.range),
                     });
                 }
             }

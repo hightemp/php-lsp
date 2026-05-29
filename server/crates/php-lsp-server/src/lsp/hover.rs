@@ -168,6 +168,7 @@ impl PhpLspBackend {
             None
         };
 
+        let hover_range = range_from_byte_range(&source, sym_at_pos.range);
         let result = if let Some(sym) = symbol_info {
             // Build hover content
             let mut content = String::new();
@@ -281,53 +282,36 @@ impl PhpLspBackend {
                 }
             }
 
-            let range = Range {
-                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
-                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
-            };
-
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: content,
                 }),
-                range: Some(range),
+                range: Some(hover_range),
             })
         } else if let Some(virtual_member) = virtual_member {
-            let range = Range {
-                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
-                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
-            };
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: phpdoc_virtual_member_markdown(&virtual_member),
                 }),
-                range: Some(range),
+                range: Some(hover_range),
             })
         } else if let Some(virtual_member) = framework_virtual_member {
-            let range = Range {
-                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
-                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
-            };
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: framework_virtual_member_markdown(&virtual_member),
                 }),
-                range: Some(range),
+                range: Some(hover_range),
             })
         } else if let Some(content) = magic_property_hover {
-            let range = Range {
-                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
-                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
-            };
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: content,
                 }),
-                range: Some(range),
+                range: Some(hover_range),
             })
         } else if let Some(var_info) = local_var_hover {
             let mut content = String::new();
@@ -362,16 +346,12 @@ impl PhpLspBackend {
                 }
             }
 
-            let range = Range {
-                start: Position::new(sym_at_pos.range.0, sym_at_pos.range.1),
-                end: Position::new(sym_at_pos.range.2, sym_at_pos.range.3),
-            };
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: content,
                 }),
-                range: Some(range),
+                range: Some(hover_range),
             })
         } else {
             None

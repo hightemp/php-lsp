@@ -477,15 +477,14 @@ impl PhpLspBackend {
             );
 
             if let Some(sym) = self.resolve_fqn_lazy(&fallback_fqn).await {
-                if let Ok(target_uri) = sym.uri.parse::<Uri>() {
-                    let range = Range {
-                        start: Position::new(sym.selection_range.0, sym.selection_range.1),
-                        end: Position::new(sym.selection_range.2, sym.selection_range.3),
-                    };
-                    return Some(GotoDefinitionResponse::Scalar(Location {
-                        uri: target_uri,
-                        range,
-                    }));
+                if let Some(location) = self
+                    .location_for_symbol_selection(
+                        &sym,
+                        "property assignment fallback target source read",
+                    )
+                    .await
+                {
+                    return Some(GotoDefinitionResponse::Scalar(location));
                 }
             }
         }

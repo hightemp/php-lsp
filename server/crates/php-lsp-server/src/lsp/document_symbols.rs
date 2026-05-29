@@ -266,8 +266,8 @@ async fn workspace_symbol_information(
     source_cache: &mut HashMap<String, Option<String>>,
 ) -> Option<SymbolInformation> {
     let uri: Uri = symbol.uri.parse().ok()?;
-    let source = workspace_symbol_source_for_uri(&symbol.uri, open_files, source_cache).await;
-    let range = workspace_symbol_lsp_range(source.as_deref(), symbol.range);
+    let source = workspace_symbol_source_for_uri(&symbol.uri, open_files, source_cache).await?;
+    let range = workspace_symbol_lsp_range(&source, symbol.range);
 
     #[allow(deprecated)]
     Some(SymbolInformation {
@@ -284,17 +284,8 @@ async fn workspace_symbol_information(
     })
 }
 
-pub(crate) fn workspace_symbol_lsp_range(
-    source: Option<&str>,
-    range: (u32, u32, u32, u32),
-) -> Range {
-    let range = source
-        .map(|source| range_byte_to_utf16(source, range))
-        .unwrap_or(range);
-    Range {
-        start: Position::new(range.0, range.1),
-        end: Position::new(range.2, range.3),
-    }
+pub(crate) fn workspace_symbol_lsp_range(source: &str, range: (u32, u32, u32, u32)) -> Range {
+    range_from_byte_range(source, range)
 }
 
 impl PhpLspBackend {
@@ -424,14 +415,26 @@ impl PhpLspBackend {
         let uri_str = params.text_document.uri.as_str().to_string();
 
         // Try open files first, then fall back to index
-        let file_symbols = if let Some(parser) = self.open_files.get(&uri_str) {
+        let (file_symbols, source) = if let Some(parser) = self.open_files.get(&uri_str) {
             if let Some(tree) = parser.tree() {
-                extract_file_symbols(tree, &parser.source(), &uri_str)
+                let source = parser.source();
+                (extract_file_symbols(tree, &source, &uri_str), source)
             } else {
                 return Ok(None);
             }
-        } else if let Some(fs) = self.index.file_symbols.get(&uri_str) {
-            fs.value().clone()
+        } else if let Some(file_symbols) = self
+            .index
+            .file_symbols
+            .get(&uri_str)
+            .map(|entry| entry.value().clone())
+        {
+            let Some(source) = self
+                .source_for_uri(&uri_str, "documentSymbol source read")
+                .await
+            else {
+                return Ok(None);
+            };
+            (file_symbols, source)
         } else {
             return Ok(None);
         };
@@ -468,12 +471,8 @@ impl PhpLspBackend {
         }
 
         // Helper to convert SymbolInfo range to LSP Range
-        let to_range = |r: (u32, u32, u32, u32)| -> Range {
-            Range {
-                start: Position::new(r.0, r.1),
-                end: Position::new(r.2, r.3),
-            }
-        };
+        let to_range =
+            |range: (u32, u32, u32, u32)| -> Range { range_from_byte_range(&source, range) };
 
         // Build DocumentSymbol for a symbol with its children
         #[allow(deprecated)] // DocumentSymbol.deprecated field

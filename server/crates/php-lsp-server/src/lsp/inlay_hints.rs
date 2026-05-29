@@ -10,7 +10,7 @@ impl PhpLspBackend {
         let uri_str = params.text_document.uri.as_str().to_string();
         let php_version = *self.php_version.lock().await;
 
-        let hints = {
+        let mut hints = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(parser) => parser,
                 None => return Ok(None),
@@ -39,10 +39,31 @@ impl PhpLspBackend {
             )
         };
 
+        self.hydrate_inlay_hint_label_locations(&mut hints).await;
+
         if hints.is_empty() {
             Ok(None)
         } else {
             Ok(Some(hints))
+        }
+    }
+
+    async fn hydrate_inlay_hint_label_locations(&self, hints: &mut [InlayHint]) {
+        for hint in hints {
+            let InlayHintLabel::LabelParts(parts) = &mut hint.label else {
+                continue;
+            };
+            for part in parts {
+                if part.location.is_some() {
+                    continue;
+                }
+                let Some(InlayHintLabelPartTooltip::String(fqn)) = part.tooltip.as_ref() else {
+                    continue;
+                };
+                if let Some(location) = self.location_for_type_fqn(fqn).await {
+                    part.location = Some(location);
+                }
+            }
         }
     }
 }
@@ -2692,11 +2713,19 @@ pub(in crate::server) fn local_variable_inlay_label(
     ctx: &InlayHintContext<'_>,
     type_hint: &LocalVariableInlayType,
 ) -> InlayHintLabel {
-    if let Some(location) = type_hint
-        .target_fqn
-        .as_deref()
-        .and_then(|fqn| location_for_inlay_type_fqn(ctx.index, fqn))
-    {
+    if let Some(target_fqn) = type_hint.target_fqn.as_deref().filter(|fqn| {
+        ctx.index
+            .resolve_fqn(fqn.trim_start_matches('\\'))
+            .is_some_and(|symbol| {
+                matches!(
+                    symbol.kind,
+                    php_lsp_types::PhpSymbolKind::Class
+                        | php_lsp_types::PhpSymbolKind::Interface
+                        | php_lsp_types::PhpSymbolKind::Trait
+                        | php_lsp_types::PhpSymbolKind::Enum
+                )
+            })
+    }) {
         let mut parts = vec![InlayHintLabelPart {
             value: ": ".to_string(),
             ..Default::default()
@@ -2713,11 +2742,8 @@ pub(in crate::server) fn local_variable_inlay_label(
 
         parts.push(InlayHintLabelPart {
             value: clickable_value,
-            tooltip: type_hint
-                .target_fqn
-                .as_ref()
-                .map(|fqn| InlayHintLabelPartTooltip::String(fqn.clone())),
-            location: Some(location),
+            tooltip: Some(InlayHintLabelPartTooltip::String(target_fqn.to_string())),
+            location: None,
             command: None,
         });
 
@@ -2822,26 +2848,6 @@ pub(in crate::server) fn markdown_code_span(text: &str) -> String {
     } else {
         format!("`{}`", text)
     }
-}
-
-pub(in crate::server) fn location_for_inlay_type_fqn(
-    index: &WorkspaceIndex,
-    fqn: &str,
-) -> Option<Location> {
-    let symbol = index.resolve_fqn(fqn.trim_start_matches('\\'))?;
-    if !matches!(
-        symbol.kind,
-        php_lsp_types::PhpSymbolKind::Class
-            | php_lsp_types::PhpSymbolKind::Interface
-            | php_lsp_types::PhpSymbolKind::Trait
-            | php_lsp_types::PhpSymbolKind::Enum
-    ) {
-        return None;
-    }
-    Some(Location::new(
-        symbol.uri.parse::<Uri>().ok()?,
-        range_from_tuple(symbol.selection_range),
-    ))
 }
 
 pub(in crate::server) fn shorten_inlay_type_display(

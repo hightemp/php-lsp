@@ -425,22 +425,16 @@ pub(in crate::server) fn framework_string_key_completion_item_to_ls(
     }
 }
 
-pub(in crate::server) fn framework_string_key_source_location(
+pub(in crate::server) fn framework_string_key_source_byte_range(
     key: &crate::framework::FrameworkStringKey,
-) -> Option<Location> {
+) -> Option<(String, (u32, u32, u32, u32))> {
     let (uri, range) = key.sources.iter().find_map(|source| match source {
         crate::framework::VirtualMemberSource::SourceRange { uri, range } => {
             Some((uri.clone(), *range))
         }
         crate::framework::VirtualMemberSource::Synthetic { .. } => None,
     })?;
-    Some(Location {
-        uri: uri.parse::<Uri>().ok()?,
-        range: Range {
-            start: Position::new(range.0, range.1),
-            end: Position::new(range.2, range.3),
-        },
-    })
+    Some((uri, range))
 }
 
 pub(in crate::server) fn framework_string_key_context_at_position(

@@ -2805,7 +2805,9 @@ while implementing these tasks.
     existing extension-host processes still need a VS Code window reload to
     load the updated JavaScript.
 
-- [ ] **PHA-003** Complete byte-range vs UTF-16 LSP position audit.
+- [x] **PHA-003** Complete byte-range vs UTF-16 LSP position audit. *(done 2026-05-29)*
+  - Status: completed 2026-05-29; outbound LSP range paths audited and covered
+    with focused UTF-16 regression tests.
   - Problem: parser/index symbols store byte columns, while LSP uses UTF-16
     columns. Some paths already convert, but direct `SymbolInfo.range` and
     `selection_range` conversions remain.
@@ -2829,6 +2831,23 @@ while implementing these tasks.
       range;
     - workspaceSymbol/codeLens/callHierarchy/typeHierarchy locations after
       non-ASCII prefixes.
+  - Completed changes:
+    - converted remaining direct byte-backed `SymbolInfo.range` and
+      `selection_range` emissions in hover, definition/typeDefinition,
+      implementation, documentSymbol, workspaceSymbol, codeLens-adjacent
+      symbol locations, callHierarchy, typeHierarchy, framework string-key
+      locations, and inlay-hint label locations;
+    - kept `SymbolReference.range` as an explicit LSP tuple path via
+      `range_from_lsp_tuple` to avoid double conversion;
+    - added `phpstub://` source lookup so built-in definition locations can
+      still be UTF-16 converted without dropping navigation results;
+    - added `e2e_ranges.rs` coverage for Cyrillic prefixes across definition,
+      hover, documentSymbol, workspaceSymbol, codeLens, callHierarchy,
+      typeHierarchy, and rename edits.
+  - Validation: `cargo fmt --all --check`,
+    `cargo test -p php-lsp-server --test e2e_ranges`,
+    `cargo test -p php-lsp-server --tests`, `cargo test --all`,
+    `cargo clippy --all-targets -- -D warnings`, and `git diff --check`.
 
 - [ ] **PHA-004** Make member references and rename safe for unresolved receivers.
   - Problem: `$obj->foo()` and `$obj->bar` can be indexed as unresolved
@@ -3092,6 +3111,11 @@ while implementing these tasks.
 ---
 
 ## Текущие задачи
+
+- [x] **T-2026-05-29-serena-rust-search-smoke** Test Serena search on Rust code. *(done 2026-05-29)*
+  - Scope: tool smoke test only; use Serena to inspect/search Rust symbols and report whether it works.
+  - Validation target: successful Serena symbol/pattern query output.
+  - Result: Serena `get_symbols_overview`, `find_symbol`, `find_referencing_symbols`, `search_for_pattern`, and file diagnostics worked on Rust files.
 
 - [x] **T-2026-05-29-agents-update** Update `AGENTS.md` after the `server.rs` split. *(done 2026-05-29)*
   - Scope: documentation-only update; keep repository guidance aligned with the current `php-lsp-server` module layout and test-selection routes.

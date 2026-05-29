@@ -162,10 +162,7 @@ impl PhpLspBackend {
                     let edits: Vec<TextEdit> = refs
                         .into_iter()
                         .map(|r| TextEdit {
-                            range: Range {
-                                start: Position::new(r.range.0, r.range.1),
-                                end: Position::new(r.range.2, r.range.3),
-                            },
+                            range: range_from_lsp_tuple(r.range),
                             new_text: if target_kind == php_lsp_types::PhpSymbolKind::Property
                                 && r.starts_with_dollar
                             {

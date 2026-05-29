@@ -19,7 +19,9 @@ use crate::template::{
     is_twig_template_uri, preprocess_blade_template, preprocess_twig_template, TemplateDocument,
     TemplateKind, TemplateVariableType,
 };
-use crate::util::lsp_text::{lsp_position_to_byte, range_from_tuple, text_at_lsp_range};
+use crate::util::lsp_text::{
+    lsp_position_to_byte, range_from_byte_range, range_from_lsp_tuple, text_at_lsp_range,
+};
 use crate::util::uri::uri_to_path;
 use dashmap::DashMap;
 use php_lsp_completion::context::detect_context;
