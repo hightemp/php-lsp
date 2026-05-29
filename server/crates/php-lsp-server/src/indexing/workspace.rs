@@ -396,6 +396,7 @@ impl PhpLspBackend {
     pub(crate) async fn lsp_did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         tracing::debug!("didChangeWatchedFiles: {} change(s)", params.changes.len());
 
+        let roots = self.current_workspace_roots().await;
         let mut config_changed = false;
         let mut composer_metadata_changed: Option<PathBuf> = None;
         let mut composer_requires_workspace_reindex = false;
@@ -406,6 +407,9 @@ impl PhpLspBackend {
             }
 
             if let Some((path, change)) = uri_composer_metadata_change(&event.uri) {
+                if should_ignore_vendor_package_composer_metadata_change(&path, &roots) {
+                    continue;
+                }
                 composer_metadata_changed = Some(path);
                 if change == ComposerMetadataChange::ProjectAutoload {
                     composer_requires_workspace_reindex = true;
@@ -877,6 +881,19 @@ pub(in crate::server) fn composer_metadata_change_for_path(
         || file_name == "installed.php"
         || (file_name.starts_with("autoload_") && file_name.ends_with(".php"));
     is_vendor_metadata.then_some(ComposerMetadataChange::VendorAutoload)
+}
+
+pub(in crate::server) fn should_ignore_vendor_package_composer_metadata_change(
+    path: &Path,
+    roots: &[PathBuf],
+) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if file_name != "composer.json" && file_name != "composer.lock" {
+        return false;
+    }
+    path_is_under_vendor_roots(path, roots)
 }
 
 pub(in crate::server) fn uri_composer_metadata_change(

@@ -721,6 +721,70 @@ fn test_vendor_autoload_map_parses_psr4_and_files() {
 }
 
 #[test]
+fn test_watched_composer_metadata_change_ignores_vendor_package_composer_files() {
+    let roots = vec![PathBuf::from("/workspace")];
+    let package_composer = PathBuf::from("/workspace/vendor/acme/package/composer.json");
+    let temp_package_composer =
+        PathBuf::from("/workspace/vendor/composer/75f4db74/package/composer.json");
+    let package_lock = PathBuf::from("/workspace/vendor/acme/package/composer.lock");
+    let installed_json = PathBuf::from("/workspace/vendor/composer/installed.json");
+    let autoload_static = PathBuf::from("/workspace/vendor/composer/autoload_static.php");
+
+    assert_eq!(
+        composer_metadata_change_for_path(&PathBuf::from("/workspace/composer.json")),
+        Some(ComposerMetadataChange::ProjectAutoload)
+    );
+    assert_eq!(
+        composer_metadata_change_for_path(&PathBuf::from("/workspace/composer.lock")),
+        Some(ComposerMetadataChange::VendorAutoload)
+    );
+    assert_eq!(
+        composer_metadata_change_for_path(&package_composer),
+        Some(ComposerMetadataChange::ProjectAutoload)
+    );
+    assert_eq!(
+        composer_metadata_change_for_path(&temp_package_composer),
+        Some(ComposerMetadataChange::ProjectAutoload)
+    );
+    assert_eq!(
+        composer_metadata_change_for_path(&package_lock),
+        Some(ComposerMetadataChange::VendorAutoload)
+    );
+    assert_eq!(
+        composer_metadata_change_for_path(&installed_json),
+        Some(ComposerMetadataChange::VendorAutoload)
+    );
+    assert_eq!(
+        composer_metadata_change_for_path(&autoload_static),
+        Some(ComposerMetadataChange::VendorAutoload)
+    );
+    assert!(should_ignore_vendor_package_composer_metadata_change(
+        &package_composer,
+        &roots
+    ));
+    assert!(should_ignore_vendor_package_composer_metadata_change(
+        &temp_package_composer,
+        &roots
+    ));
+    assert!(should_ignore_vendor_package_composer_metadata_change(
+        &package_lock,
+        &roots
+    ));
+    assert!(!should_ignore_vendor_package_composer_metadata_change(
+        &installed_json,
+        &roots
+    ));
+    assert!(!should_ignore_vendor_package_composer_metadata_change(
+        &autoload_static,
+        &roots
+    ));
+    assert!(!should_ignore_vendor_package_composer_metadata_change(
+        &PathBuf::from("/vendor/workspace/composer.json"),
+        &[PathBuf::from("/vendor/workspace")]
+    ));
+}
+
+#[test]
 fn test_compute_diagnostics_reports_duplicate_workspace_symbols() {
     let uri1 = "file:///one.php";
     let uri2 = "file:///two.php";

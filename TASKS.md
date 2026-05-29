@@ -3031,6 +3031,14 @@ while implementing these tasks.
     disabled/partial diagnostic message behavior.
 
 - [ ] **PHA-023** Harden disk cache and lazy vendor cache correctness.
+  - Follow-up completed 2026-05-29: fixed stale diagnostics after `composer
+    install` in Monica by ignoring package `composer.json`/`composer.lock`
+    events inside `vendor`, keeping real `vendor/composer/*` metadata refreshes,
+    and watching `vendor/composer/installed.php` from the VS Code client.
+    Validation: targeted Composer metadata unit/e2e tests,
+    `cargo test -p php-lsp-server --tests`, `cargo fmt --all --check`,
+    `cargo clippy -p php-lsp-server --all-targets -- -D warnings`,
+    Monica `DeleteMultipleVCard.php` CLI analyze, and `git diff --check`.
   - Scope:
     - make `save_cache_atomic()` reliable on Windows by using replace/remove
       strategy or a crate/API with replace semantics;

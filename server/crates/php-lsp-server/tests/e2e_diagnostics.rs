@@ -78,6 +78,26 @@ final class Handler
     );
 
     let composer_dir = tmp_root.join("vendor/composer");
+    let package_composer_json = composer_dir.join("75f4db74/acme-pkg/composer.json");
+    fs::create_dir_all(package_composer_json.parent().unwrap()).unwrap();
+    fs::write(
+        &package_composer_json,
+        r#"{"name":"acme/pkg","autoload":{"psr-4":{"Vendor\\Pkg\\":"src/"}}}"#,
+    )
+    .unwrap();
+    let package_composer_uri = format!("file://{}", package_composer_json.to_string_lossy());
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &package_composer_uri,
+            1,
+        )]))
+        .await
+        .unwrap();
+    expect_no_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(1)).await;
+
     let package_src = tmp_root.join("vendor/acme/pkg/src");
     fs::create_dir_all(&composer_dir).unwrap();
     fs::create_dir_all(&package_src).unwrap();
