@@ -18,6 +18,9 @@ import {
   ThemeColor,
 } from "vscode";
 import {
+  CloseAction,
+  ErrorAction,
+  ErrorHandler,
   LanguageClient,
   LanguageClientOptions,
   ServerOptions,
@@ -31,6 +34,8 @@ let outputChannel: OutputChannel | undefined;
 let lastBinaryResolutionError: string | undefined;
 let lastStartError: string | undefined;
 let lifecycleQueue: Promise<void> = Promise.resolve();
+let lifecycleOperationDepth = 0;
+const stoppingClients = new WeakSet<LanguageClient>();
 
 const STOP_TIMEOUT_MS = 5000;
 
@@ -487,12 +492,15 @@ function enqueueLifecycleOperation(reason: string, operation: () => Promise<void
     .catch(() => undefined)
     .then(async () => {
       lifecycleLog(`Lifecycle begin: ${reason}`);
+      lifecycleOperationDepth += 1;
       try {
         await operation();
         lifecycleLog(`Lifecycle complete: ${reason}`);
       } catch (error: unknown) {
         lifecycleLog(`Lifecycle failed: ${reason}: ${errorMessage(error)}`);
         throw error;
+      } finally {
+        lifecycleOperationDepth = Math.max(0, lifecycleOperationDepth - 1);
       }
     });
 
@@ -505,8 +513,16 @@ function managedServerProcess(languageClient: LanguageClient): ChildProcess | un
   return (languageClient as unknown as { _serverProcess?: ChildProcess })._serverProcess;
 }
 
+function childProcessIsRunning(childProcess: ChildProcess | undefined): childProcess is ChildProcess {
+  return !!childProcess
+    && childProcess.pid !== undefined
+    && !childProcess.killed
+    && childProcess.exitCode === null
+    && childProcess.signalCode === null;
+}
+
 async function terminateManagedServerProcess(processToTerminate: ChildProcess | undefined, reason: string): Promise<void> {
-  if (!processToTerminate || processToTerminate.pid === undefined || processToTerminate.killed) {
+  if (!childProcessIsRunning(processToTerminate)) {
     lifecycleLog(`Fallback process termination skipped: reason=${reason}; process handle unavailable`);
     return;
   }
@@ -526,6 +542,55 @@ async function terminateManagedServerProcess(processToTerminate: ChildProcess | 
       resolve();
     });
   });
+}
+
+function isBrokenPipeError(error: Error): boolean {
+  const message = error.message.toLowerCase();
+  return message.includes("epipe")
+    || message.includes("broken pipe")
+    || message.includes("stream was destroyed")
+    || message.includes("write after end");
+}
+
+function createClientErrorHandler(clientProvider: () => LanguageClient | undefined): ErrorHandler {
+  return {
+    error(error: Error, _message, count): { action: ErrorAction; handled: boolean } {
+      const languageClient = clientProvider();
+      const staleOrStopping = !languageClient
+        || client !== languageClient
+        || stoppingClients.has(languageClient)
+        || lifecycleOperationDepth > 0;
+
+      if (isBrokenPipeError(error) && staleOrStopping) {
+        lifecycleLog(
+          `Suppressed stale language-client pipe error during lifecycle transition: ${error.message}; count=${count ?? 0}`,
+        );
+        return { action: ErrorAction.Shutdown, handled: true };
+      }
+
+      lifecycleLog(`Language-client connection error: ${error.message}; count=${count ?? 0}`);
+      return { action: ErrorAction.Shutdown, handled: false };
+    },
+    closed(): { action: CloseAction; handled: boolean } {
+      const languageClient = clientProvider();
+      const staleOrStopping = !languageClient
+        || client !== languageClient
+        || stoppingClients.has(languageClient)
+        || lifecycleOperationDepth > 0;
+
+      if (staleOrStopping) {
+        lifecycleLog("Suppressed stale language-client close during lifecycle transition");
+        return { action: CloseAction.DoNotRestart, handled: true };
+      }
+
+      lifecycleLog("Language-client connection closed unexpectedly");
+      statusController?.update({
+        phase: "error",
+        message: "Language server connection closed",
+      });
+      return { action: CloseAction.DoNotRestart, handled: false };
+    },
+  };
 }
 
 function getServerEnvironment(logLevel: string): NodeJS.ProcessEnv {
@@ -829,6 +894,7 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
   const stubsPath = getStubsPath(context);
   const logLevel = config.get<string>("logLevel", "info");
   const serverEnvironment = getServerEnvironment(logLevel);
+  let languageClient: LanguageClient | undefined;
 
   const serverOptions: ServerOptions = {
     run: {
@@ -870,14 +936,16 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
       ],
     },
     initializationOptions: buildInitializationOptions(config, stubsPath),
+    errorHandler: createClientErrorHandler(() => languageClient),
   };
 
-  return new LanguageClient(
+  languageClient = new LanguageClient(
     "phpLsp",
     "PHP Language Server",
     serverOptions,
     clientOptions,
   );
+  return languageClient;
 }
 
 async function notifyServerConfigurationChanged(context: ExtensionContext): Promise<void> {
@@ -904,15 +972,28 @@ async function stopLanguageClient(reason: string): Promise<void> {
   }
 
   const processToTerminate = managedServerProcess(currentClient);
+  stoppingClients.add(currentClient);
   lifecycleLog(`Stopping language server: reason=${reason}; timeoutMs=${STOP_TIMEOUT_MS}`);
   try {
     await currentClient.stop(STOP_TIMEOUT_MS);
+    if (childProcessIsRunning(processToTerminate)) {
+      lifecycleLog(
+        `Language server process still running after stop: reason=${reason}; pid=${processToTerminate?.pid}`,
+      );
+      await terminateManagedServerProcess(processToTerminate, reason);
+    }
     lifecycleLog(`Stopped language server: reason=${reason}`);
   } catch (error: unknown) {
     lifecycleLog(
       `Stop failed or timed out: reason=${reason}; error=${errorMessage(error)}; managed process termination requested when available`,
     );
     await terminateManagedServerProcess(processToTerminate, reason);
+  } finally {
+    try {
+      await currentClient.dispose(STOP_TIMEOUT_MS);
+    } catch (error: unknown) {
+      lifecycleLog(`Client dispose failed after stop: reason=${reason}; error=${errorMessage(error)}`);
+    }
   }
 }
 
