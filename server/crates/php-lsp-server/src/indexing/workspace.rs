@@ -1,5 +1,7 @@
 //! Workspace LSP handlers extracted from `server.rs`.
 
+use crate::util::uri::path_to_uri;
+
 use super::super::*;
 
 impl PhpLspBackend {
@@ -1097,6 +1099,13 @@ pub(in crate::server) fn parse_and_index_php_file(
     index: &WorkspaceIndex,
     file_path: &Path,
 ) -> bool {
+    let uri = match path_to_uri(file_path) {
+        Ok(uri) => uri,
+        Err(err) => {
+            tracing::warn!("{}", err);
+            return false;
+        }
+    };
     let Ok(source) = read_php_source_lossy(file_path) else {
         return false;
     };
@@ -1106,7 +1115,6 @@ pub(in crate::server) fn parse_and_index_php_file(
         return false;
     };
 
-    let uri = path_to_uri(file_path);
     let file_symbols = extract_file_symbols(tree, &source, &uri);
     let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
     index.update_file_with_references(&uri, file_symbols, references);
@@ -1116,7 +1124,19 @@ pub(in crate::server) fn parse_and_index_php_file(
 pub(in crate::server) fn parse_workspace_file_for_index(
     file_path: PathBuf,
 ) -> WorkspaceParseResult {
-    let uri = path_to_uri(&file_path);
+    let uri = match path_to_uri(&file_path) {
+        Ok(uri) => uri,
+        Err(err) => {
+            return WorkspaceParseResult {
+                path: file_path,
+                uri: String::new(),
+                file_symbols: None,
+                references: Vec::new(),
+                symbol_count: 0,
+                error: Some(err.to_string()),
+            };
+        }
+    };
     let source = match read_php_source_lossy(&file_path) {
         Ok(source) => source,
         Err(err) => {
@@ -1193,7 +1213,13 @@ pub(in crate::server) fn load_cached_vendor_file(
     file_path: &Path,
     config: &IndexCacheConfig,
 ) -> bool {
-    let source = CacheSourceFile::workspace(root, file_path);
+    let source = match CacheSourceFile::workspace(root, file_path) {
+        Ok(source) => source,
+        Err(err) => {
+            tracing::debug!("{}", err);
+            return false;
+        }
+    };
     let cache_path = cache::cache_file_path_for_namespace(root, CacheNamespace::Vendor);
     let report = cache::load_valid_cached_sources(
         index,
@@ -1241,7 +1267,13 @@ pub(in crate::server) async fn touch_vendor_file_lru(
     vendor_file_lru: &Arc<Mutex<VendorFileLru>>,
     file_path: &Path,
 ) {
-    let uri = path_to_uri(file_path);
+    let uri = match path_to_uri(file_path) {
+        Ok(uri) => uri,
+        Err(err) => {
+            tracing::debug!("{}", err);
+            return;
+        }
+    };
     let evicted = vendor_file_lru.lock().await.touch(uri);
     for uri in evicted {
         index.remove_file(&uri);
@@ -1294,8 +1326,11 @@ pub(in crate::server) fn indexed_vendor_cache_sources(
         .iter()
         .filter_map(|entry| {
             let path = uri_to_path(entry.key())?;
-            (path.starts_with(&vendor_dir) && path.is_file())
-                .then(|| CacheSourceFile::workspace(root, &path))
+            if path.starts_with(&vendor_dir) && path.is_file() {
+                CacheSourceFile::workspace(root, &path).ok()
+            } else {
+                None
+            }
         })
         .collect();
     sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));

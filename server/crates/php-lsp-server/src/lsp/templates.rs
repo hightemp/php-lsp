@@ -1,5 +1,7 @@
 //! Template-aware LSP helpers extracted from `server.rs`.
 
+use crate::util::uri::path_to_uri;
+
 use super::super::*;
 
 pub(in crate::server) fn template_kind_for_document(
@@ -533,7 +535,9 @@ impl PhpLspBackend {
         }
 
         for path in collect_twig_context_php_files(&root, 2048) {
-            let source_uri = path_to_uri(&path);
+            let Ok(source_uri) = path_to_uri(&path) else {
+                continue;
+            };
             if self.open_files.contains_key(&source_uri) {
                 continue;
             }
@@ -569,8 +573,9 @@ impl PhpLspBackend {
     ) -> Option<Location> {
         let root = self.workspace_root_for_uri(uri_str).await?;
         let path = twig_template_path_for_key(&root, key)?;
+        let uri = path_to_uri(&path).ok()?.parse::<Uri>().ok()?;
         Some(Location {
-            uri: path_to_uri(&path).parse::<Uri>().ok()?,
+            uri,
             range: Range {
                 start: Position::new(0, 0),
                 end: Position::new(0, 0),

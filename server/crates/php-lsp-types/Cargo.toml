@@ -9,3 +9,4 @@ description = "Shared types for php-lsp"
 [dependencies]
 serde = { workspace = true }
 lsp-types = { workspace = true }
+url = { workspace = true }

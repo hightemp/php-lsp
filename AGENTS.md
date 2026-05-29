@@ -81,7 +81,7 @@
 - `src/indexing/vendor.rs`
   - Vendor autoload metadata cache, lazy vendor file LRU helpers, vendor path resolution, and lazy FQN/class/member indexing helpers.
 - `src/util/uri.rs`
-  - Shared path/URI helpers. Current behavior intentionally preserves legacy URI semantics until `PHA-002`.
+  - Re-exports shared path/URI helpers from `php-lsp-types`; use these instead of raw `file://` string formatting.
 - `src/util/lsp_text.rs`
   - UTF-16 LSP position/range to source byte-offset helpers.
 

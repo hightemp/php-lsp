@@ -606,7 +606,7 @@ fn parse_analyze_file(path: &Path) -> Result<ParsedAnalyzeFile, AnalyzeError> {
     }
     Ok(ParsedAnalyzeFile {
         path: path.to_path_buf(),
-        uri: path_to_uri(path),
+        uri: path_to_uri(path).map_err(|err| AnalyzeError::new(err.to_string()))?,
         parser,
     })
 }

@@ -4,6 +4,7 @@
 //! workspace/index context and must not bootstrap applications, open databases,
 //! or execute user code.
 
+use crate::util::uri::path_to_uri;
 use php_lsp_index::composer::NamespaceMap;
 use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::phpdoc::parse_phpdoc;
@@ -1965,7 +1966,9 @@ fn collect_laravel_config_keys(
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let uri = path_to_file_uri(&path);
+        let Some(uri) = path_to_file_uri(&path) else {
+            continue;
+        };
         for parsed in parse_php_array_key_paths(&source) {
             let key = format!("{}.{}", stem, parsed.key);
             if key.starts_with(prefix) {
@@ -1993,7 +1996,9 @@ fn collect_laravel_route_keys(
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let uri = path_to_file_uri(&path);
+        let Some(uri) = path_to_file_uri(&path) else {
+            continue;
+        };
         for parsed in parse_named_call_string_args(&source, "name") {
             if parsed.key.starts_with(prefix) {
                 keys.push(framework_string_key(
@@ -2034,7 +2039,9 @@ fn collect_laravel_translation_keys(
             let Ok(source) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let uri = path_to_file_uri(&path);
+            let Some(uri) = path_to_file_uri(&path) else {
+                continue;
+            };
             for parsed in parse_php_array_key_paths(&source) {
                 let key = format!("{}.{}", file_key, parsed.key);
                 if key.starts_with(prefix) {
@@ -2066,12 +2073,15 @@ fn collect_laravel_view_keys(
         let Some(key) = view_key_from_relative_path(relative) else {
             continue;
         };
+        let Some(uri) = path_to_file_uri(&path) else {
+            continue;
+        };
         if key.starts_with(prefix) {
             keys.push(framework_string_key(
                 provider_id,
                 key,
                 "Laravel view template",
-                path_to_file_uri(&path),
+                uri,
                 (0, 0, 0, 0),
             ));
         }
@@ -2093,12 +2103,15 @@ fn collect_symfony_twig_template_keys(
         let Some(key) = twig_template_key_from_relative_path(relative) else {
             continue;
         };
+        let Some(uri) = path_to_file_uri(&path) else {
+            continue;
+        };
         if key.starts_with(prefix) {
             keys.push(framework_string_key(
                 provider_id,
                 key,
                 "Symfony Twig template",
-                path_to_file_uri(&path),
+                uri,
                 (0, 0, 0, 0),
             ));
         }
@@ -2350,8 +2363,8 @@ fn line_col_for_offset(source: &str, target: usize) -> (u32, u32) {
     (line, target.saturating_sub(line_start) as u32)
 }
 
-fn path_to_file_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+fn path_to_file_uri(path: &Path) -> Option<String> {
+    path_to_uri(path).ok()
 }
 
 fn normalize_fqn(fqn: &str) -> String {

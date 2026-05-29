@@ -20,7 +20,7 @@ use crate::template::{
     TemplateKind, TemplateVariableType,
 };
 use crate::util::lsp_text::{lsp_position_to_byte, range_from_tuple, text_at_lsp_range};
-use crate::util::uri::{path_to_uri, uri_to_path};
+use crate::util::uri::uri_to_path;
 use dashmap::DashMap;
 use php_lsp_completion::context::detect_context;
 use php_lsp_completion::provider::provide_completions;

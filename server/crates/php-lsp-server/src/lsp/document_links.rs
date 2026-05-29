@@ -1,6 +1,7 @@
 //! Document Links LSP handlers extracted from `server.rs`.
 
 use crate::util::lsp_text::range_from_byte_range;
+use crate::util::uri::path_to_uri;
 
 use super::super::*;
 use std::path::{Path, PathBuf};
@@ -217,7 +218,10 @@ fn collect_document_links(
             if let Some(target_path) =
                 document_link_target_path(source, expression, file_path, file_dir)
             {
-                if let Ok(target) = path_to_uri(&target_path).parse::<Uri>() {
+                if let Some(target) = path_to_uri(&target_path)
+                    .ok()
+                    .and_then(|uri| uri.parse::<Uri>().ok())
+                {
                     links.push(DocumentLink {
                         range: range_from_byte_range(source, node_byte_range(expression)),
                         target: Some(target),

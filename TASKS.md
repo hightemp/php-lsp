@@ -2748,7 +2748,7 @@ while implementing these tasks.
     `cargo clippy --all-targets -- -D warnings`, `npm run lint`,
     `npm run build`, and `git diff --check` passed.
 
-- [ ] **PHA-002** Replace ad-hoc file URI conversion with standards-compliant helpers.
+- [x] **PHA-002** Replace ad-hoc file URI conversion with standards-compliant helpers.
   - Problem: raw `format!("file://{}", path.display())` and
     `strip_prefix("file://")` break spaces, `#`, `%`, Unicode edge cases,
     Windows drive paths, and UNC paths.
@@ -2769,6 +2769,41 @@ while implementing these tasks.
     - Windows-like drive path behavior behind platform-appropriate tests;
     - cache round-trip for encoded URIs.
   - Acceptance: no production code path builds `file://` URI strings manually.
+  - Implemented: added shared `php_lsp_types::uri` helpers using `url::Url`
+    for percent-encoded file URI generation and decoding, with `Result`/`Option`
+    failure paths instead of malformed URI strings.
+  - Implemented: migrated server, CLI analyze/fix, framework providers,
+    document links, Twig template lookup, vendor LRU/cache sources, and index
+    cache source creation to the shared helper API.
+  - Implemented: bumped index cache schema to invalidate older URI persistence;
+    cache loading also treats legacy raw file URIs for encoded paths as stale.
+  - Regression: tests cover spaces, `#`, `%`, non-ASCII path segments, relative
+    path absolutization, non-file URI rejection, encoded cache round-trip, and
+    legacy raw URI cache invalidation.
+  - Validation: `cargo fmt --all --check`, `cargo test -p php-lsp-types uri`,
+    `cargo test -p php-lsp-index cache`, `cargo test -p php-lsp-server --lib uri`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, and
+    `git diff --check` passed.
+  - Follow-up: checked reported navigation regression on
+    `/home/apanov/Projects/bdpn-ui/app/src/Soap/Inbound/Handler/CompleteHandler.php`.
+    Current source binary and installed bundled binary both answered
+    definition/declaration/typeDefinition/implementation/references/highlight/hover
+    requests in milliseconds for the reported positions. Investigation found
+    stale VS Code `php-lsp` processes from deleted extension temp paths, so the
+    observed hang is likely a stale language-client/server process rather than
+    the URI helper change.
+  - Follow-up: fixed VS Code client lifecycle handling for restart/shutdown
+    races that can surface as `write EPIPE` / `stream was destroyed` popups
+    after restart. The client now marks stopping clients, suppresses stale
+    broken-pipe errors during lifecycle transitions, disposes the old
+    language client, and terminates a still-running managed server process
+    after a timed-out stop.
+  - Follow-up validation: `npm run lint`, `npm run build`, and
+    `git diff --check` passed after the client lifecycle fix.
+  - Local runtime note: the rebuilt client bundle was copied to the installed
+    VS Code extension under `~/.vscode/extensions/hightemp.ht-php-lsp-0.6.0`;
+    existing extension-host processes still need a VS Code window reload to
+    load the updated JavaScript.
 
 - [ ] **PHA-003** Complete byte-range vs UTF-16 LSP position audit.
   - Problem: parser/index symbols store byte columns, while LSP uses UTF-16

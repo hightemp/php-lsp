@@ -19,6 +19,7 @@ repository = "https://github.com/TODO/php-lsp"
 # LSP
 tower-lsp = { package = "tower-lsp-server", version = "0.23" }
 lsp-types = "0.97"
+url = "2"
 
 # Async
 tokio = { version = "1", features = ["full"] }

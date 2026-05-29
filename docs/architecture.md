@@ -116,8 +116,8 @@ Outbound LSP handlers must convert byte-backed ranges with
 File URIs are an LSP/client boundary format, not an internal path format. New
 code should not build URIs with raw string formatting such as
 `format!("file://{}", path.display())`. URI conversion should go through a
-shared helper that percent-encodes paths, decodes client URIs, and handles
-platform-specific path forms.
+shared helper (`php_lsp_types::uri`) that percent-encodes paths, decodes client
+URIs, and handles platform-specific path forms.
 
 ### Symbol Model
 

@@ -1,6 +1,7 @@
 //! Disk cache for workspace index snapshots.
 
 use crate::workspace::WorkspaceIndex;
+use php_lsp_types::uri::{path_to_uri, FileUriError};
 use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo, SymbolReference};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 13;
+pub const CACHE_SCHEMA_VERSION: u32 = 14;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -95,12 +96,12 @@ impl CacheSourceFile {
         }
     }
 
-    pub fn workspace(root: &Path, path: &Path) -> Self {
-        Self {
+    pub fn workspace(root: &Path, path: &Path) -> Result<Self, FileUriError> {
+        Ok(Self {
             path: path.to_path_buf(),
-            uri: path_to_uri(path),
+            uri: path_to_uri(path)?,
             relative_path: relative_cache_path(root, path),
-        }
+        })
     }
 }
 
@@ -216,11 +217,21 @@ pub fn load_valid_cached_files(
     current_files: &[PathBuf],
     config: &IndexCacheConfig,
 ) -> CacheLoadReport {
-    let sources: Vec<CacheSourceFile> = current_files
-        .iter()
-        .map(|path| CacheSourceFile::workspace(workspace_root, path))
-        .collect();
-    load_valid_cached_sources(index, cache_path, workspace_root, &sources, config)
+    let (sources, uri_failures) = workspace_cache_sources(workspace_root, current_files);
+    let mut report = load_valid_cached_sources(index, cache_path, workspace_root, &sources, config);
+    if !uri_failures.is_empty() {
+        if report.miss_reason.is_none() {
+            report.miss_reason = Some(format!(
+                "failed to convert {} path(s) to file URIs",
+                uri_failures.len()
+            ));
+        }
+        report.missing_files = report.missing_files.saturating_add(uri_failures.len());
+        report.parse_files.extend(uri_failures);
+        report.parse_files.sort();
+        report.parse_files.dedup();
+    }
+    report
 }
 
 pub fn load_valid_cached_sources(
@@ -335,10 +346,7 @@ pub fn build_cache_from_index(
     current_files: &[PathBuf],
     config: &IndexCacheConfig,
 ) -> IndexCache {
-    let sources: Vec<CacheSourceFile> = current_files
-        .iter()
-        .map(|path| CacheSourceFile::workspace(workspace_root, path))
-        .collect();
+    let (sources, _) = workspace_cache_sources(workspace_root, current_files);
     build_cache_from_sources(index, workspace_root, &sources, config)
 }
 
@@ -506,8 +514,16 @@ fn normalized_path_string(path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn path_to_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+fn workspace_cache_sources(root: &Path, paths: &[PathBuf]) -> (Vec<CacheSourceFile>, Vec<PathBuf>) {
+    let mut sources = Vec::new();
+    let mut uri_failures = Vec::new();
+    for path in paths {
+        match CacheSourceFile::workspace(root, path) {
+            Ok(source) => sources.push(source),
+            Err(_) => uri_failures.push(path.clone()),
+        }
+    }
+    (sources, uri_failures)
 }
 
 fn unix_ms(time: SystemTime) -> u64 {
@@ -575,7 +591,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         let file = src.join("Foo.php");
         fs::write(&file, "<?php class Foo {}").unwrap();
-        let uri = path_to_uri(&file);
+        let uri = path_to_uri(&file).unwrap();
 
         let index = WorkspaceIndex::new();
         index.update_file(
@@ -616,7 +632,7 @@ mod tests {
         let root = unique_temp_dir("references");
         let file = root.join("Foo.php");
         fs::write(&file, "<?php class Foo {}").unwrap();
-        let uri = path_to_uri(&file);
+        let uri = path_to_uri(&file).unwrap();
         let references = vec![SymbolReference {
             target_fqn: "App\\Foo".to_string(),
             target_kind: PhpSymbolKind::Class,
@@ -670,7 +686,7 @@ mod tests {
         let root = unique_temp_dir("changed");
         let file = root.join("Foo.php");
         fs::write(&file, "<?php class Foo {}").unwrap();
-        let uri = path_to_uri(&file);
+        let uri = path_to_uri(&file).unwrap();
 
         let index = WorkspaceIndex::new();
         index.update_file(
@@ -725,7 +741,7 @@ mod tests {
         let file = root.join("src").join("Foo.php");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, "<?php class Foo {}").unwrap();
-        let uri = path_to_uri(&file);
+        let uri = path_to_uri(&file).unwrap();
         let cache_path = root.join("cache").join(CACHE_FILE_NAME);
         let config = test_config();
 
@@ -778,5 +794,107 @@ mod tests {
         assert!(workspace.ends_with(Path::new("workspace").join(CACHE_FILE_NAME)));
         assert!(stubs.ends_with(Path::new("stubs").join(CACHE_FILE_NAME)));
         assert!(vendor.ends_with(Path::new("vendor").join(CACHE_FILE_NAME)));
+    }
+
+    #[test]
+    fn cache_roundtrip_preserves_encoded_file_uris() {
+        let root = unique_temp_dir("encoded-uri");
+        let src = root.join("src #1%");
+        fs::create_dir_all(&src).unwrap();
+        let file = src.join("Привет File.php");
+        fs::write(&file, "<?php class Foo {}").unwrap();
+        let uri = path_to_uri(&file).unwrap();
+
+        assert!(uri.contains("src%20%231%25"));
+        assert!(uri.contains("%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82%20File.php"));
+
+        let index = WorkspaceIndex::new();
+        index.update_file(
+            &uri,
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![make_symbol(&uri)],
+                ..Default::default()
+            },
+        );
+
+        let config = test_config();
+        let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+        assert_eq!(cache.files[0].uri, uri);
+
+        let cache_path = root.join("index.bin");
+        save_cache_atomic(&cache_path, &cache).unwrap();
+
+        let loaded = WorkspaceIndex::new();
+        let report = load_valid_cached_files(
+            &loaded,
+            &cache_path,
+            &root,
+            std::slice::from_ref(&file),
+            &config,
+        );
+        assert_eq!(report.loaded_files, 1);
+        assert!(report.parse_files.is_empty());
+        assert!(loaded.file_symbols.contains_key(&uri));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_invalidates_legacy_raw_file_uri_for_encoded_path() {
+        let root = unique_temp_dir("legacy-uri");
+        let src = root.join("src #1%");
+        fs::create_dir_all(&src).unwrap();
+        let file = src.join("Foo File.php");
+        fs::write(&file, "<?php class Foo {}").unwrap();
+        let legacy_uri = format!("file://{}", file.display());
+        let encoded_uri = path_to_uri(&file).unwrap();
+        assert_ne!(legacy_uri, encoded_uri);
+
+        let metadata = file_metadata(&file).unwrap();
+        let cache = IndexCache {
+            schema_version: CACHE_SCHEMA_VERSION,
+            namespace: CacheNamespace::Workspace.as_str().to_string(),
+            php_lsp_version: test_config().php_lsp_version,
+            workspace_root: normalized_path_string(&root),
+            config_hash: test_config().config_hash(),
+            stubs_hash: test_config().stubs_hash,
+            created_at_unix_ms: 0,
+            files: vec![CachedFile {
+                uri: legacy_uri.clone(),
+                relative_path: relative_cache_path(&root, &file),
+                metadata,
+                file_symbols: FileSymbols {
+                    namespace: Some("App".to_string()),
+                    use_statements: vec![],
+                    symbols: vec![make_symbol(&legacy_uri)],
+                    ..Default::default()
+                },
+                references: Vec::new(),
+            }],
+            top_level: CachedTopLevelSymbols::default(),
+        };
+
+        let cache_path = root.join("index.bin");
+        save_cache_atomic(&cache_path, &cache).unwrap();
+
+        let loaded = WorkspaceIndex::new();
+        let config = test_config();
+        let report = load_valid_cached_files(
+            &loaded,
+            &cache_path,
+            &root,
+            std::slice::from_ref(&file),
+            &config,
+        );
+
+        assert_eq!(report.loaded_files, 0);
+        assert_eq!(report.stale_files, 1);
+        assert_eq!(report.parse_files, vec![file.clone()]);
+        assert!(loaded.file_symbols.get(&legacy_uri).is_none());
+        assert!(loaded.file_symbols.get(&encoded_uri).is_none());
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

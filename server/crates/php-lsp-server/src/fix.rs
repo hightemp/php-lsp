@@ -788,7 +788,7 @@ fn parse_fix_file(path: &Path) -> Result<ParsedFixFile, FixError> {
             path.display()
         ))
     })?;
-    let uri = path_to_uri(path);
+    let uri = path_to_uri(path).map_err(|err| FixError::new(err.to_string()))?;
     let file_symbols = extract_file_symbols(tree, &source, &uri);
     Ok(ParsedFixFile {
         path: path.to_path_buf(),

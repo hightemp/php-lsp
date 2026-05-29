@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod uri;
+
 /// Kind of a PHP symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PhpSymbolKind {
