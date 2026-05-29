@@ -3673,15 +3673,6 @@ impl PhpLspBackend {
             budget: diagnostic_budget,
             php_version,
         };
-        let effective_diagnostics_mode = if template_document.is_some() {
-            DiagnosticsMode::SyntaxOnly
-        } else {
-            diagnostics_mode
-        };
-        let diagnostics_config = DiagnosticsRuntimeConfig {
-            mode: effective_diagnostics_mode,
-            ..diagnostics_config
-        };
         let mut diagnostics = compute_open_file_diagnostics(
             &uri_str,
             &self.open_files,
@@ -3691,8 +3682,7 @@ impl PhpLspBackend {
         )
         .await;
         if let Some(template) = &template_document {
-            diagnostics = template.map_diagnostics_to_original(diagnostics);
-            diagnostics.clear();
+            diagnostics = template.map_safe_diagnostics_to_original(diagnostics);
         } else if should_preresolve_dependencies {
             diagnostics = self
                 .filter_lazy_resolved_symbol_diagnostics(diagnostics)

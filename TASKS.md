@@ -3312,7 +3312,28 @@ while implementing these tasks.
 
 ### Template Support Tasks
 
-- [ ] **PHA-030** Define safe template diagnostics instead of clearing all mapped diagnostics.
+- [x] **PHA-030** Define safe template diagnostics instead of clearing all mapped diagnostics.
+  - Completed 2026-05-29:
+    - replaced blanket clearing of mapped template diagnostics with
+      `map_safe_diagnostics_to_original()`;
+    - template diagnostics now run through the configured diagnostics mode and
+      publish only exact source-mapped expression diagnostics from a
+      conservative allowlist;
+    - syntax diagnostics, generated virtual PHP, partially mapped ranges,
+      template functions, Blade view-variable context, and incomplete/magic
+      properties remain suppressed;
+    - Twig copied expression tokens now contribute source-map segments so exact
+      type diagnostics can map back to numeric/operator expression ranges;
+    - README, architecture docs, LSP feature docs, and production risk register
+      document template diagnostics as best-effort.
+  - Validation:
+    - `cargo test -p php-lsp-server template::tests -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo test --all`;
+    - `git diff --check`.
   - Problem: template virtual PHP diagnostics are mapped and then cleared in
     some paths. This suppresses HTML/Twig noise but also hides real expression
     errors.

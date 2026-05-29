@@ -1420,15 +1420,6 @@ impl PhpLspBackend {
             let template_document = template_documents
                 .get(&task_uri_str)
                 .map(|template| template.value().clone());
-            let effective_diagnostics_mode = if template_document.is_some() {
-                DiagnosticsMode::SyntaxOnly
-            } else {
-                diagnostics_mode
-            };
-            let diagnostics_config = DiagnosticsRuntimeConfig {
-                mode: effective_diagnostics_mode,
-                ..diagnostics_config
-            };
             let mut diagnostics = compute_open_file_diagnostics(
                 &task_uri_str,
                 &open_files,
@@ -1438,8 +1429,7 @@ impl PhpLspBackend {
             )
             .await;
             if let Some(template) = template_document {
-                diagnostics = template.map_diagnostics_to_original(diagnostics);
-                diagnostics.clear();
+                diagnostics = template.map_safe_diagnostics_to_original(diagnostics);
             }
 
             if document_versions.get(&task_uri_str).map(|current| *current) == Some(version) {
@@ -1992,15 +1982,6 @@ impl PhpLspBackend {
                     let template_document = template_documents
                         .get(&uri_str)
                         .map(|template| template.value().clone());
-                    let effective_diagnostics_mode = if template_document.is_some() {
-                        DiagnosticsMode::SyntaxOnly
-                    } else {
-                        diagnostics_mode
-                    };
-                    let diagnostics_config = DiagnosticsRuntimeConfig {
-                        mode: effective_diagnostics_mode,
-                        ..diagnostics_config
-                    };
                     let mut diags = compute_open_file_diagnostics(
                         &uri_str,
                         &open_files,
@@ -2010,8 +1991,7 @@ impl PhpLspBackend {
                     )
                     .await;
                     if let Some(template) = template_document {
-                        diags = template.map_diagnostics_to_original(diags);
-                        diags.clear();
+                        diags = template.map_safe_diagnostics_to_original(diags);
                     }
                     if reindex_document_versions
                         .get(&uri_str)

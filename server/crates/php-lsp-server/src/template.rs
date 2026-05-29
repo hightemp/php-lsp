@@ -1,5 +1,5 @@
 use php_lsp_parser::utf16::{utf16_col_to_byte, Utf16LineIndex};
-use tower_lsp::ls_types::{Position, Range, SemanticToken};
+use tower_lsp::ls_types::{Diagnostic, NumberOrString, Position, Range, SemanticToken};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TemplateKind {
@@ -60,17 +60,56 @@ impl TemplateDocument {
         ))
     }
 
-    pub(crate) fn map_diagnostics_to_original(
+    pub(crate) fn map_safe_diagnostics_to_original(
         &self,
-        diagnostics: Vec<tower_lsp::ls_types::Diagnostic>,
-    ) -> Vec<tower_lsp::ls_types::Diagnostic> {
+        diagnostics: Vec<Diagnostic>,
+    ) -> Vec<Diagnostic> {
         diagnostics
             .into_iter()
             .filter_map(|mut diagnostic| {
-                diagnostic.range = self.map_virtual_range_to_original(diagnostic.range)?;
+                if !self.is_safe_template_diagnostic(&diagnostic) {
+                    return None;
+                }
+                diagnostic.range = self.map_virtual_range_to_original_exact(diagnostic.range)?;
                 Some(diagnostic)
             })
             .collect()
+    }
+
+    fn map_virtual_range_to_original_exact(&self, range: Range) -> Option<Range> {
+        let virtual_start = byte_offset_for_position(&self.virtual_source, range.start)?;
+        let virtual_end = byte_offset_for_position(&self.virtual_source, range.end)?;
+        let (original_start, original_end) = self
+            .source_map
+            .virtual_range_to_original_exact(virtual_start, virtual_end)?;
+        Some(range_for_byte_offsets(
+            &self.original_source,
+            original_start,
+            original_end,
+        ))
+    }
+
+    fn is_safe_template_diagnostic(&self, diagnostic: &Diagnostic) -> bool {
+        if diagnostic.source.as_deref() != Some("php-lsp") {
+            return false;
+        }
+
+        let message = diagnostic.message.as_str();
+        match diagnostic_code_str(diagnostic) {
+            Some("php-lsp.undefinedVariable") => self.kind == TemplateKind::Twig,
+            Some("php-lsp.unknownClass")
+            | Some("php-lsp.argumentCountMismatch")
+            | Some("php-lsp.typeCompatibility") => true,
+            Some("php-lsp.members") => is_unknown_member_diagnostic_message(message),
+            Some("php-lsp.unknownSymbols") => {
+                is_unknown_symbol_diagnostic_message(message, self.kind)
+            }
+            _ => {
+                is_unknown_member_diagnostic_message(message)
+                    || is_type_compatibility_diagnostic_message(message)
+                    || is_unknown_symbol_diagnostic_message(message, self.kind)
+            }
+        }
     }
 
     pub(crate) fn map_semantic_tokens_to_original(
@@ -242,6 +281,49 @@ impl TemplateSourceMap {
 
         Some((original_start?, original_end?))
     }
+
+    fn virtual_range_to_original_exact(
+        &self,
+        virtual_start: usize,
+        virtual_end: usize,
+    ) -> Option<(usize, usize)> {
+        if virtual_end < virtual_start {
+            return None;
+        }
+
+        if virtual_start == virtual_end {
+            let segment = self
+                .segments
+                .iter()
+                .find(|segment| segment.contains_virtual_offset(virtual_start))?;
+            let original = segment.map_virtual_to_original(virtual_start);
+            return Some((original, original));
+        }
+
+        let mut cursor = virtual_start;
+        let mut original_start: Option<usize> = None;
+        let mut original_end: Option<usize> = None;
+
+        while cursor < virtual_end {
+            let segment = self
+                .segments
+                .iter()
+                .find(|segment| segment.contains_virtual_offset(cursor))?;
+            let covered_end = virtual_end.min(segment.virtual_end);
+            if covered_end <= cursor {
+                return None;
+            }
+
+            let mapped_start = segment.map_virtual_to_original(cursor);
+            let mapped_end = segment.map_virtual_to_original(covered_end);
+            original_start =
+                Some(original_start.map_or(mapped_start, |current| current.min(mapped_start)));
+            original_end = Some(original_end.map_or(mapped_end, |current| current.max(mapped_end)));
+            cursor = covered_end;
+        }
+
+        Some((original_start?, original_end?))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -253,6 +335,10 @@ struct SourceMapSegment {
 }
 
 impl SourceMapSegment {
+    fn contains_virtual_offset(self, offset: usize) -> bool {
+        self.virtual_start <= offset && offset < self.virtual_end
+    }
+
     fn map_original_to_virtual(self, offset: usize) -> usize {
         map_offset_between_ranges(
             offset,
@@ -295,6 +381,30 @@ fn map_offset_between_ranges(
     }
 
     target_start + offset.saturating_sub(source_start) * target_len / source_len
+}
+
+fn diagnostic_code_str(diagnostic: &Diagnostic) -> Option<&str> {
+    match diagnostic.code.as_ref()? {
+        NumberOrString::String(code) => Some(code.as_str()),
+        NumberOrString::Number(_) => None,
+    }
+}
+
+fn is_unknown_symbol_diagnostic_message(message: &str, kind: TemplateKind) -> bool {
+    message.starts_with("Unknown class: ")
+        || (kind == TemplateKind::Twig && message.starts_with("Undefined variable: "))
+}
+
+fn is_unknown_member_diagnostic_message(message: &str) -> bool {
+    message.starts_with("Unknown method: ")
+        || message.starts_with("Unknown class constant: ")
+        || message.starts_with("Unknown member: ")
+}
+
+fn is_type_compatibility_diagnostic_message(message: &str) -> bool {
+    message.starts_with("Type mismatch for ")
+        || message.starts_with("Return type mismatch in ")
+        || message.starts_with("Property assignment type mismatch for ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -799,7 +909,14 @@ fn convert_twig_expression_to_php(
             continue;
         }
 
+        let virtual_start = converted.len();
         converted.push(ch);
+        segments.push(TwigExpressionSegment {
+            original_start: offset,
+            original_end: offset + ch.len_utf8(),
+            virtual_start,
+            virtual_end: converted.len(),
+        });
         offset += ch.len_utf8();
         if !ch.is_whitespace() {
             after_member_access = false;
@@ -1495,5 +1612,130 @@ mod tests {
         assert!(doc
             .map_virtual_range_to_original(generated_prelude)
             .is_none());
+    }
+
+    #[test]
+    fn safe_template_diagnostics_map_exact_unknown_members_and_suppress_syntax() {
+        let source = "<div>{{ (new User())->missing() }}</div>";
+        let doc = preprocess_blade_template(source);
+        let original_start = source.find("missing").expect("missing member in fixture");
+        let original_end = original_start + "missing".len();
+        let virtual_start = doc
+            .source_map
+            .original_to_virtual(original_start)
+            .expect("member start should map");
+        let virtual_end = doc
+            .source_map
+            .original_to_virtual(original_end)
+            .expect("member end should map");
+        let virtual_range =
+            range_for_byte_offsets(doc.virtual_source(), virtual_start, virtual_end);
+
+        let unknown_member = Diagnostic {
+            range: virtual_range,
+            source: Some("php-lsp".to_string()),
+            code: Some(NumberOrString::String("php-lsp.members".to_string())),
+            message: "Unknown method: User::missing".to_string(),
+            ..Default::default()
+        };
+        let mapped = doc.map_safe_diagnostics_to_original(vec![unknown_member]);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(
+            mapped[0].range,
+            range_for_byte_offsets(source, original_start, original_end)
+        );
+
+        let syntax = Diagnostic {
+            range: virtual_range,
+            source: Some("php-lsp".to_string()),
+            message: "Syntax error".to_string(),
+            ..Default::default()
+        };
+        assert!(doc
+            .map_safe_diagnostics_to_original(vec![syntax])
+            .is_empty());
+    }
+
+    #[test]
+    fn safe_template_diagnostics_require_full_source_map_coverage() {
+        let doc = preprocess_blade_template("{{ $user }}");
+        let generated_prefix = Range::new(Position::new(0, 0), Position::new(0, 5));
+        let diagnostic = Diagnostic {
+            range: generated_prefix,
+            source: Some("php-lsp".to_string()),
+            code: Some(NumberOrString::String("php-lsp.members".to_string())),
+            message: "Unknown property: User::$name".to_string(),
+            ..Default::default()
+        };
+
+        assert!(doc
+            .map_safe_diagnostics_to_original(vec![diagnostic])
+            .is_empty());
+    }
+
+    #[test]
+    fn safe_template_diagnostics_suppress_unknown_properties() {
+        let source = "{{ (new User())->missing }}";
+        let doc = preprocess_blade_template(source);
+        let original_start = source.find("missing").expect("property in fixture");
+        let original_end = original_start + "missing".len();
+        let virtual_start = doc
+            .source_map
+            .original_to_virtual(original_start)
+            .expect("property start should map");
+        let virtual_end = doc
+            .source_map
+            .original_to_virtual(original_end)
+            .expect("property end should map");
+        let diagnostic = Diagnostic {
+            range: range_for_byte_offsets(doc.virtual_source(), virtual_start, virtual_end),
+            source: Some("php-lsp".to_string()),
+            code: Some(NumberOrString::String("php-lsp.members".to_string())),
+            message: "Unknown property: User::$missing".to_string(),
+            ..Default::default()
+        };
+
+        assert!(doc
+            .map_safe_diagnostics_to_original(vec![diagnostic])
+            .is_empty());
+    }
+
+    #[test]
+    fn twig_copied_expression_tokens_map_for_type_diagnostics() {
+        let source = "{{ user.setAge(123) }}";
+        let doc = preprocess_twig_template(
+            source,
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+        let original_start = source.find("123").expect("numeric literal in fixture");
+        let original_end = original_start + "123".len();
+        let virtual_start = doc
+            .source_map
+            .original_to_virtual(original_start)
+            .expect("literal start should map");
+        let virtual_end = doc
+            .source_map
+            .original_to_virtual(original_end)
+            .expect("literal end should map");
+        let diagnostic = Diagnostic {
+            range: range_for_byte_offsets(doc.virtual_source(), virtual_start, virtual_end),
+            source: Some("php-lsp".to_string()),
+            code: Some(NumberOrString::String(
+                "php-lsp.typeCompatibility".to_string(),
+            )),
+            message: "Type mismatch for App\\Entity\\User::setAge argument $age: expected string, got int"
+                .to_string(),
+            ..Default::default()
+        };
+
+        let mapped = doc.map_safe_diagnostics_to_original(vec![diagnostic]);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(
+            mapped[0].range,
+            range_for_byte_offsets(source, original_start, original_end)
+        );
     }
 }

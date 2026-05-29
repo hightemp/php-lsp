@@ -358,8 +358,10 @@ Mitigation:
   for PHPDoc and literal array shapes.
 - `PV-012`: added regression coverage for `self`/`static` parameter type
   resolution before member diagnostics.
-- `IE-044` / `IE-044A`: template diagnostics are mapped only when source ranges
-  are precise; generated or uncertain virtual-PHP ranges are suppressed.
+- `IE-044` / `IE-044A` / `PHA-030`: template diagnostics are mapped only when
+  source ranges are exact and the diagnostic belongs to a conservative
+  expression allowlist; generated virtual PHP, syntax noise, template
+  functions, incomplete/magic properties, and uncertain ranges are suppressed.
 
 Exit signal:
 

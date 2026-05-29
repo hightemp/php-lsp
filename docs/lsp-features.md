@@ -111,8 +111,8 @@ client-visible LSP behavior and known limits.
 
 | Area | Status | Notes |
 |---|---|---|
-| Blade-like `.blade.php` documents | Partial | VS Code language contribution plus virtual PHP/source-map support for escaped/raw echo blocks and common `@if`, `@foreach`, `@isset`, and `@empty` control directives. Diagnostics are syntax-only on mapped virtual PHP to avoid noisy view-variable reports. |
-| Symfony/Twig `.twig` and `.html.twig` documents | Partial | Separate Twig language target with virtual PHP/source-map support for `{{ expr }}`, `{% if %}`, `{% for item in items %}`, `{% set name = expr %}`, comments, common block/include/extends/import semantic tokens, and static include/extends/embed path completion and definition. |
+| Blade-like `.blade.php` documents | Partial | VS Code language contribution plus virtual PHP/source-map support for escaped/raw echo blocks and common `@if`, `@foreach`, `@isset`, and `@empty` control directives. Diagnostics are best-effort: exact source-mapped method/class/type expression errors can be reported, while syntax noise, generated PHP, view-variable context, template functions, and magic/incomplete properties stay suppressed. |
+| Symfony/Twig `.twig` and `.html.twig` documents | Partial | Separate Twig language target with virtual PHP/source-map support for `{{ expr }}`, `{% if %}`, `{% for item in items %}`, `{% set name = expr %}`, comments, common block/include/extends/import semantic tokens, static include/extends/embed path completion and definition, and best-effort exact-mapped expression diagnostics. |
 | Twig context variables | Partial | Statically inferred from simple PHP `render('template.html.twig', ['name' => expr])` call sites. `new Class()` and simple arrays of new objects seed PHPDoc variables in virtual PHP. The server does not boot Symfony or execute Twig extensions. |
 
 ## Explicit Non-Goals For Current Milestone

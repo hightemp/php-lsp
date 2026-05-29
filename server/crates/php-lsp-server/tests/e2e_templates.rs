@@ -164,7 +164,8 @@ async fn test_blade_template_virtual_php_hover_completion_diagnostics_and_tokens
     assert_eq!(
         diagnostics["diagnostics"].as_array().map(Vec::len),
         Some(0),
-        "plain HTML around Blade expressions should not produce whole-file diagnostics"
+        "plain HTML around Blade expressions should not produce whole-file diagnostics, got: {}",
+        diagnostics
     );
 
     let hover_resp = service
@@ -226,6 +227,97 @@ async fn test_blade_template_virtual_php_hover_completion_diagnostics_and_tokens
         }),
         "expected @foreach keyword semantic token mapped to original template, got: {:?}",
         tokens
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_blade_template_reports_safe_mapped_expression_diagnostics() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-blade-template-diagnostics-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("app")).unwrap();
+    fs::create_dir_all(tmp_root.join("resources/views")).unwrap();
+
+    let php_path = tmp_root.join("app/User.php");
+    let blade_path = tmp_root.join("resources/views/show.blade.php");
+    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let php_uri = format!("file://{}", php_path.to_string_lossy());
+    let blade_uri = format!("file://{}", blade_path.to_string_lossy());
+    let php_code = "<?php\nclass User { public function getName(): string { return ''; } }\n";
+    let blade = "<div>{{ (new User())->missing() }}</div>\n";
+
+    fs::write(&php_path, php_code).unwrap();
+    fs::write(&blade_path, blade).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&php_uri, php_code))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &blade_uri, "blade", blade,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &blade_uri, Duration::from_secs(1)).await;
+    let diagnostic_items = diagnostics["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert!(
+        diagnostic_items.iter().any(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("Unknown method: "))
+                && diagnostic["range"]["start"]["line"].as_u64() == Some(0)
+                && diagnostic["range"]["start"]["character"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0
+        }),
+        "expected mapped Blade expression diagnostic, got: {}",
+        diagnostics
+    );
+    assert!(
+        diagnostic_items.iter().all(|diagnostic| {
+            let message = diagnostic["message"].as_str().unwrap_or_default();
+            message != "Syntax error" && !message.starts_with("Missing ")
+        }),
+        "template syntax noise should stay suppressed, got: {}",
+        diagnostics
     );
 
     let _ = fs::remove_dir_all(&tmp_root);
@@ -355,7 +447,8 @@ final class DashboardController
     assert_eq!(
         diagnostics["diagnostics"].as_array().map(Vec::len),
         Some(0),
-        "Twig HTML/control blocks should not produce noisy diagnostics"
+        "Twig HTML/control blocks should not produce noisy diagnostics, got: {}",
+        diagnostics
     );
 
     let hover_resp = service

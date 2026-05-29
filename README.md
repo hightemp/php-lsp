@@ -203,10 +203,12 @@ phpstorm-stubs support.
   reported as unknown; dynamic framework APIs such as some Eloquent relation
   members are best-effort.
 - Template support is conservative. Blade-like and Twig documents are not full
-  template-engine implementations; diagnostics are syntax-only on mapped virtual
-  PHP, Twig filters/functions/tests are treated as mixed unless statically
-  modeled, and Twig context variables are inferred only from static
-  `render(..., [...])` call sites and simple context expressions.
+  template-engine implementations; diagnostics are best-effort and published
+  only for a small allowlist of exact source-mapped expression errors; syntax
+  noise, generated virtual PHP, incomplete/magic properties, and uncertain
+  ranges stay suppressed. Twig filters/functions/tests are treated as mixed
+  unless statically modeled, and Twig context variables are inferred only from
+  static `render(..., [...])` call sites and simple context expressions.
 - Diagnostics are optimized for editor feedback: file changes publish fast
   in-process diagnostics, while full diagnostics and optional external analyzer
   runs are used on open/save and reconfiguration.

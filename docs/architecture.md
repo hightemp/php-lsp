@@ -305,8 +305,12 @@ When an open document is recognized as a template, the server stores a
 - A source map converts template positions to virtual PHP positions for hover,
   completion, definition, diagnostics, and semantic tokens, then maps returned
   ranges back to the template.
-- Template diagnostics are syntax-only on mapped virtual PHP. Unmapped generated
-  PHP ranges are suppressed instead of reporting whole-template errors.
+- Template diagnostics run through a conservative allowlist after virtual PHP
+  analysis. Only exact source-mapped expression diagnostics such as undefined
+  Twig variables, unknown methods/class constants, unknown classes, and type
+  compatibility errors are published. Syntax noise, generated virtual PHP
+  ranges, template functions, incomplete/magic properties, and any partially
+  mapped ranges are suppressed instead of reporting whole-template errors.
 
 Blade support covers escaped/raw echo blocks and common `@if`, `@foreach`,
 `@isset`, and `@empty` directives. Twig support is a separate language path for
