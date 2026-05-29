@@ -29,8 +29,14 @@ jobs:
         with:
           workspaces: server
 
+      - name: Check source stubs
+        run: ../scripts/check-stubs.sh --kind source data/stubs
+
       - name: Bundle stubs
         run: ../scripts/bundle-stubs.sh
+
+      - name: Check bundled stubs
+        run: ../scripts/check-stubs.sh --kind bundled ../client/stubs
 
       - name: Check formatting
         run: cargo fmt --all --check

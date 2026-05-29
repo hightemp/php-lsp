@@ -118,7 +118,7 @@
             "sodium"
           ],
           "scope": "resource",
-          "description": "PHP extensions to load stubs for"
+          "description": "PHP extensions to load stubs for. Leave unconfigured to use bundled defaults; set to an empty array to disable stubs."
         },
         "phpLsp.composer.enabled": {
           "type": "boolean",

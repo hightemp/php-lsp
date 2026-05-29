@@ -65,6 +65,19 @@ require_one_of "README" "extension/README.md" "extension/readme.md"
 require_one_of "LICENSE" "extension/LICENSE" "extension/LICENSE.txt" "extension/license.txt"
 require_entry "extension/stubs/PhpStormStubsMap.php"
 require_entry "extension/stubs/Core/Core.php"
+require_entry "extension/stubs/SPL/SPL.php"
+require_entry "extension/stubs/standard/basic.php"
+require_entry "extension/stubs/standard/standard_0.php"
+require_entry "extension/stubs/Reflection/Reflection.php"
+require_entry "extension/stubs/SimpleXML/SimpleXML.php"
+require_entry "extension/stubs/soap/soap.php"
+
+MIN_STUB_PHP_FILES="${PHP_LSP_VSIX_MIN_STUB_PHP_FILES:-80}"
+STUB_PHP_FILES=$(grep -E '^extension/stubs/.+\.php$' "$CONTENTS" | wc -l | tr -d '[:space:]')
+if (( STUB_PHP_FILES < MIN_STUB_PHP_FILES )); then
+    echo "ERROR: VSIX contains too few bundled PHP stub files: $STUB_PHP_FILES < $MIN_STUB_PHP_FILES" >&2
+    exit 1
+fi
 
 read -r -a PLATFORMS <<< "${PHP_LSP_VSIX_PLATFORMS:-linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64}"
 for platform in "${PLATFORMS[@]}"; do

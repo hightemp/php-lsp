@@ -1,7 +1,7 @@
 # Production Risk Register
 
 Date: 2026-05-22
-Last updated: 2026-05-28
+Last updated: 2026-05-29
 Scope: production-readiness milestone, weeks 1-6.
 
 This document tracks known production gaps after the baseline/profiling setup.
@@ -18,7 +18,7 @@ The format is intentionally operational: every risk is tied to an owner task in
 | R-004 | Sync file IO in async/hot paths | High | `PR-023`, `PV-003`, `PV-004`, `IE-045` | Mitigated |
 | R-005 | Request cancellation coverage for heavy operations | High | `PR-021`, `PR-050`, `PV-004`, `IE-045` | Mitigated |
 | R-006 | `didChange` debounce/version ordering | High | `PR-020`, `PR-050` | Mitigated |
-| R-007 | Version-aware stubs | Medium | `PR-030`, `PR-011` | Mitigated |
+| R-007 | Version-aware stubs and package integrity | Medium | `PR-030`, `PR-011`, `PHA-005` | Mitigated |
 | R-008 | Lazy vendor indexing scale validation | Medium | `PR-012`, `PR-011`, `PV-014` | Partially mitigated |
 | R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041`, `IE-030`, `IE-031`, `PV-012`, `IE-045` | Accepted limitation |
 | R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052`, `IE-045` | Mitigated |
@@ -236,7 +236,7 @@ Exit signal:
 - Latest-version diagnostics only after a burst; covered by e2e tests.
 - No stale diagnostics overwrite newer diagnostics.
 
-### R-007: Version-aware stubs
+### R-007: Version-aware stubs and package integrity
 
 Current evidence:
 
@@ -244,20 +244,31 @@ Current evidence:
 - `PR-011` stores stubs in a dedicated `stubs` cache namespace and reloads changed/missing stub files by mtime/size/config hash.
 - `PR-030` parses phpstorm-stubs version-gating attributes and filters symbols/signatures by `phpLsp.phpVersion`.
 - Changing PHP version reloads stubs and republishes diagnostics without restart.
+- `PHA-005` added source/bundled stubs integrity guards for development, CI,
+  release packaging, and packaged VSIX smoke tests.
+- Server startup now logs intentional stubs disablement separately from missing
+  or uninitialized stubs paths.
 
 Impact:
 
 - First startup may still parse configured stubs; repeated startup/reload can load unchanged stub files from cache.
 - Remaining risk is incomplete coverage if phpstorm-stubs adds new version-gating metadata forms not yet parsed.
+- Publishing a VSIX without usable core stubs is guarded by CI/release checks,
+  but package smoke should remain a required release gate.
 
 Mitigation:
 
 - `PR-030`: implemented version-aware symbol and parameter filtering.
 - `PR-011`: implemented separate stubs cache keyed by php-lsp version, PHP version, extension list and stubs hash.
+- `PHA-005`: added `scripts/check-stubs.sh`, `make check-stubs`,
+  `bundle-stubs.sh` hard failures, workflow guards, VSIX smoke checks for core
+  stub files/minimum count, and bundled-stubs symbol availability coverage.
 
 Exit signal:
 
 - Changing PHP version updates built-in completion/definition/diagnostics without restart; covered by e2e.
+- Source and bundled stubs integrity checks pass in CI and release workflow;
+  packaged VSIX smoke fails when required core stubs are absent.
 - Stub load time is near-zero from cache after first run.
 
 ### R-008: Lazy vendor indexing scale validation
@@ -361,6 +372,8 @@ Current evidence:
 
 - `PR-043` added `textDocument/semanticTokens/range`, improved `workspace/symbol`, and stopped advertising `willRenameFiles` until meaningful path-refactor edits exist.
 - `PR-051` aligned release packaging with documented platforms and added VSIX smoke checks.
+- `PHA-005` tightened VSIX smoke so it verifies required bundled stubs and a
+  minimum PHP stub-file count before publishing.
 - `PR-052` added `docs/lsp-features.md` with supported/partial/unsupported behavior.
 - `IE-045` refreshed README, feature, architecture, performance, baseline, and
   risk documentation after the intelligence milestone acceptance run.
@@ -373,6 +386,8 @@ Mitigation:
 
 - `PR-043`: closed capability mismatches in semantic tokens, workspace symbols, and file rename advertising.
 - `PR-051`: smoke test packaged VSIX and release workflow.
+- `PHA-005`: stubs integrity gates for source tree, bundled client stubs, and
+  packaged VSIX.
 - `PR-052`: published architecture, feature matrix and troubleshooting docs.
 
 Exit signal:

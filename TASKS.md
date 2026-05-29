@@ -2884,7 +2884,21 @@ while implementing these tasks.
     - inherited/interface method references remain included when receiver type
       is resolved.
 
-- [ ] **PHA-005** Add stubs integrity checks for development, CI, and packaging.
+- [x] **PHA-005** Add stubs integrity checks for development, CI, and packaging.
+  - Started 2026-05-29: adding guards for source/bundled stubs integrity,
+    bundle-script failure modes, startup logging, and stub availability tests.
+  - Completed 2026-05-29: added reusable source/bundled stubs integrity
+    checks, made `bundle-stubs.sh` fail on missing or incomplete stubs, wired
+    CI/release/package smoke guards, made server startup distinguish disabled
+    stubs from missing/uninitialized paths, and added bundled-stubs symbol
+    availability coverage. Validation: `make check-stubs`, `scripts/bundle-stubs.sh`,
+    `cargo test --all`, `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+    `npm run lint`, `npm run build`, `PHP_LSP_VSIX_PLATFORMS=linux-x64 scripts/smoke-vsix.sh client/ht-php-lsp-0.6.0.vsix`,
+    `git diff --check`.
+  - Docs follow-up completed 2026-05-29: updated README/configuration,
+    architecture, performance smoke docs, and production risk notes for the
+    new stubs integrity guards. Validation: `bash -n scripts/check-stubs.sh scripts/bundle-stubs.sh scripts/smoke-vsix.sh`,
+    `git diff --check`.
   - Current status: `server/data/stubs` is populated in this workspace, so the
     "only qodana.yaml" audit observation is not true for the current checkout.
     The risk is still valid for fresh clones, CI, and VSIX packaging if the

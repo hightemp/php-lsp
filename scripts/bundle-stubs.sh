@@ -12,9 +12,9 @@ STUBS_SRC="$REPO_ROOT/server/data/stubs"
 STUBS_DEST="$REPO_ROOT/client/stubs"
 
 if [[ ! -d "$STUBS_SRC" ]]; then
-    echo "WARNING: phpstorm-stubs not found at $STUBS_SRC"
-    echo "Run: git submodule update --init --recursive"
-    exit 0
+    echo "ERROR: phpstorm-stubs not found at $STUBS_SRC" >&2
+    echo "Run: git submodule update --init --recursive" >&2
+    exit 1
 fi
 
 # Default extensions to bundle (matches package.json defaults)
@@ -28,6 +28,8 @@ DEFAULT_EXTENSIONS=(
 )
 
 echo "=== Bundling phpstorm-stubs ==="
+
+"$REPO_ROOT/scripts/check-stubs.sh" --kind source "$STUBS_SRC"
 
 rm -rf "$STUBS_DEST"
 mkdir -p "$STUBS_DEST"
@@ -49,6 +51,8 @@ for f in PhpStormStubsMap.php; do
         cp "$STUBS_SRC/$f" "$STUBS_DEST/"
     fi
 done
+
+"$REPO_ROOT/scripts/check-stubs.sh" --kind bundled "$STUBS_DEST"
 
 STUBS_SIZE=$(du -sh "$STUBS_DEST" | cut -f1)
 echo "=== Bundled $COUNT extensions ($STUBS_SIZE) ==="

@@ -192,7 +192,8 @@ Disk cache: workspace / stubs / vendor
 5. The server stores the settings and advertises capabilities.
 6. After `initialized`, the server:
    - Discovers effective workspace roots, including Composer roots.
-   - Loads configured phpstorm-stubs.
+   - Loads configured phpstorm-stubs, after rejecting missing or incomplete
+     candidate stubs paths.
    - Starts background workspace indexing.
    - Preloads Composer `autoload.files` entrypoints when lazy vendor indexing is
      enabled.
@@ -359,12 +360,18 @@ Parse concurrency is CPU-aware and capped to avoid unbounded memory growth.
 Stubs:
 
 - The client passes `stubsPath` for the bundled stubs directory.
-- The server loads configured extension directories from phpstorm-stubs.
+- The server loads configured extension directories from phpstorm-stubs. If the
+  extension list is explicitly empty, stubs are treated as disabled by config.
+- Missing, non-directory, or uninitialized stubs paths are skipped and logged
+  separately from intentional stubs disablement.
 - Stub symbols are marked as built-in.
 - Stub cache is keyed by PHP version, extension list, php-lsp version, and stub
   metadata.
 - Changing PHP version or stub extension configuration reloads stubs and
   republishes open-file diagnostics.
+- Development, CI, and release packaging validate source and bundled stubs with
+  `scripts/check-stubs.sh`; VSIX smoke also checks required core stubs and a
+  minimum PHP stub-file count.
 
 Vendor:
 

@@ -28,7 +28,8 @@ include = []
 exclude = []
 
 [stubs]
-extensions = []
+# Omit `extensions` to use bundled defaults. Set `extensions = []` to disable stubs.
+# extensions = ["Core", "standard", "SPL"]
 # path = "/absolute/path/to/phpstorm-stubs"
 
 [formatting]

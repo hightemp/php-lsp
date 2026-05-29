@@ -186,6 +186,15 @@ mod tests {
         stubs_path.join("Core/Core.php").is_file()
     }
 
+    fn bundled_stubs_are_required() -> bool {
+        std::env::var_os("CI").is_some()
+            || std::env::var_os("PHP_LSP_REQUIRE_BUNDLED_STUBS").is_some()
+    }
+
+    fn bundled_stubs_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../client/stubs")
+    }
+
     #[test]
     fn test_load_stubs_with_real_data() {
         // This test uses actual phpstorm-stubs if available
@@ -243,5 +252,53 @@ mod tests {
             "Should have loaded files from multiple extensions, got {}",
             loaded
         );
+    }
+
+    #[test]
+    fn test_bundled_stubs_expose_core_builtin_symbols() {
+        let stubs_path = bundled_stubs_path();
+        if !stubs_are_available(&stubs_path) {
+            let message = format!(
+                "bundled stubs not initialized at {}; run scripts/bundle-stubs.sh",
+                stubs_path.display()
+            );
+            if bundled_stubs_are_required() {
+                panic!("{message}");
+            }
+            eprintln!("Skipping bundled stubs test: {message}");
+            return;
+        }
+
+        let index = WorkspaceIndex::new();
+        let loaded = load_stubs(
+            &index,
+            &stubs_path,
+            &["Core", "standard", "SPL", "SimpleXML", "soap"],
+        );
+
+        assert!(
+            loaded >= 20,
+            "bundled stubs should load core/default files, got {loaded}"
+        );
+
+        for fqn in ["stdClass", "Exception", "ArrayObject", "SimpleXMLElement"] {
+            let symbol = index
+                .resolve_fqn(fqn)
+                .unwrap_or_else(|| panic!("missing bundled built-in type: {fqn}"));
+            assert!(
+                symbol.modifiers.is_builtin,
+                "bundled symbol should be marked built-in: {fqn}"
+            );
+        }
+
+        for fqn in ["array_map", "strlen"] {
+            let symbol = index
+                .resolve_fqn(fqn)
+                .unwrap_or_else(|| panic!("missing bundled built-in function: {fqn}"));
+            assert!(
+                symbol.modifiers.is_builtin,
+                "bundled function should be marked built-in: {fqn}"
+            );
+        }
     }
 }

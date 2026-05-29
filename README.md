@@ -225,7 +225,7 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.serverPath` | `""` | Custom server binary path. Empty uses the bundled binary, then falls back to `php-lsp` from `PATH` if the bundled binary is missing. |
 | `phpLsp.includePaths` | `[]` | Additional relative or absolute directories/files to include in workspace indexing. |
 | `phpLsp.excludePaths` | `[]` | Relative or absolute directories/files to exclude from workspace indexing. |
-| `phpLsp.stubs.extensions` | Common extensions | PHP stub extension set to index from the bundled stubs. |
+| `phpLsp.stubs.extensions` | Common extensions | PHP stub extension set to index from the bundled stubs. Leave unset for defaults; set `[]` to disable stubs. |
 | `phpLsp.composer.enabled` | `true` | Enable `composer.json` autoload indexing. |
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
 | `phpLsp.diagnostics.mode` | `basic-semantic` | `off`, `syntax-only`, or `basic-semantic`. |
@@ -453,7 +453,8 @@ The extension contributes these VS Code commands:
 ```bash
 make            # build server + client + stubs → .vsix
 make install    # build + install extension into VS Code
-make check      # run Rust/TypeScript checks
+make check       # run stubs, Rust, and TypeScript checks
+make check-stubs # verify source and bundled phpstorm-stubs integrity
 ```
 
 `make` uses the host Rust target detected from `rustc -vV`, builds a release
@@ -471,7 +472,8 @@ Available targets:
 | `make package-all` | Universal `.vsix` with all configured platform binaries |
 | `make client` | `npm ci` + build extension JS |
 | `make stubs` | Init submodule + bundle phpstorm-stubs |
-| `make check` | Lint + test (Rust & TypeScript) |
+| `make check-stubs` | Verify source and bundled phpstorm-stubs have enough PHP files and required core stubs |
+| `make check` | Stubs integrity, lint, and tests |
 | `make test` | Run Rust tests |
 | `make lint` | `cargo fmt --check`, `clippy`, `tsc --noEmit` |
 | `make fmt` | Auto-format Rust code |
@@ -479,6 +481,8 @@ Available targets:
 | `make clean` | Remove all build artefacts |
 
 Stubs submodule (`server/data/stubs`) is pulled automatically on first build if not initialized.
+`scripts/bundle-stubs.sh`, `make check-stubs`, CI, and release packaging fail
+if source or bundled stubs are missing, too small, or lack required core files.
 
 `make server-all` and `make package-all` use `scripts/build-server.sh --all`
 for these VS Code platform directories:
@@ -527,6 +531,9 @@ npm run build
 
 # 2. Bundle phpstorm-stubs → client/stubs/
 ./scripts/bundle-stubs.sh
+
+# Optional: verify source and bundled stubs before packaging
+make check-stubs
 
 # 3. Package VSIX
 cd client

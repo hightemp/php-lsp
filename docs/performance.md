@@ -143,7 +143,8 @@ Universal release package smoke is covered by the release workflow and
 - `extension/package.json`
 - Bundled `extension/out/extension.js`
 - README and license files.
-- Bundled stubs.
+- Bundled stubs, including required core files and a minimum PHP stub-file
+  count.
 - Platform binaries.
 - Extension module exports and an activation/deactivation load check.
 
@@ -215,6 +216,8 @@ For workflow/release changes:
 
 ```bash
 go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/ci.yml .github/workflows/release.yml
-bash -n scripts/build-server.sh scripts/bundle-stubs.sh scripts/profile-workspace.sh scripts/benchmark-lsp-latency.sh scripts/smoke-vsix.sh
+bash -n scripts/build-server.sh scripts/bundle-stubs.sh scripts/check-stubs.sh scripts/profile-workspace.sh scripts/benchmark-lsp-latency.sh scripts/smoke-vsix.sh
+scripts/check-stubs.sh --kind source server/data/stubs
+scripts/check-stubs.sh --kind bundled client/stubs
 git diff --check
 ```

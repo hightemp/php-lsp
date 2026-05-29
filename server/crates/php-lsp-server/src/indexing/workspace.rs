@@ -121,7 +121,7 @@ impl PhpLspBackend {
             php_version,
             &include_paths,
             &exclude_paths,
-            &stub_extensions,
+            stub_extensions.as_deref(),
             client_stubs_path.as_deref(),
         );
         let indexing_options = WorkspaceIndexingOptions {
@@ -331,7 +331,7 @@ impl PhpLspBackend {
             php_version,
             &include_paths,
             &exclude_paths,
-            &stub_extensions,
+            stub_extensions.as_deref(),
             client_stubs_path.as_deref(),
         );
         let indexing_options = WorkspaceIndexingOptions {

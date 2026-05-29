@@ -109,6 +109,9 @@ jobs:
         with:
           node-version: 20
 
+      - name: Check source stubs
+        run: bash scripts/check-stubs.sh --kind source server/data/stubs
+
       # Download all platform binaries into bin/<platform>/
       - name: Download linux-x64 binary
         uses: actions/download-artifact@v4
@@ -158,6 +161,9 @@ jobs:
 
       - name: Bundle phpstorm-stubs
         run: bash scripts/bundle-stubs.sh
+
+      - name: Check bundled stubs
+        run: bash scripts/check-stubs.sh --kind bundled client/stubs
 
       - name: Install client dependencies
         working-directory: client

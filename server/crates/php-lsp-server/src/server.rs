@@ -967,7 +967,10 @@ pub struct PhpLspBackend {
     /// Files/directories excluded from workspace indexing.
     exclude_paths: Mutex<Vec<PathBuf>>,
     /// Configured phpstorm-stubs extension directory names.
-    stub_extensions: Mutex<Vec<String>>,
+    ///
+    /// `None` means use defaults. `Some([])` means stubs were explicitly disabled
+    /// by setting an empty extensions list.
+    stub_extensions: Mutex<Option<Vec<String>>>,
     /// Configured server log level label.
     log_level: Mutex<String>,
     /// Whether the client advertised window/workDoneProgress support.
@@ -1011,7 +1014,7 @@ impl PhpLspBackend {
             index_vendor: Mutex::new(true),
             include_paths: Mutex::new(Vec::new()),
             exclude_paths: Mutex::new(Vec::new()),
-            stub_extensions: Mutex::new(Vec::new()),
+            stub_extensions: Mutex::new(None),
             log_level: Mutex::new("info".to_string()),
             work_done_progress_supported: Mutex::new(false),
             formatting_config: Mutex::new(FormattingConfig::default()),
@@ -1282,12 +1285,12 @@ impl PhpLspBackend {
             }
         }
 
-        if let Some(extensions) =
-            settings_string_array(settings, "stubExtensions", &["stubs", "extensions"])
+        let next_stub_extensions =
+            settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
         {
             let mut stub_extensions = self.stub_extensions.lock().await;
-            if *stub_extensions != extensions {
-                *stub_extensions = extensions;
+            if *stub_extensions != next_stub_extensions {
+                *stub_extensions = next_stub_extensions;
                 applied.stubs_changed = true;
             }
         }
@@ -1589,7 +1592,7 @@ impl PhpLspBackend {
             php_version,
             &include_paths,
             &exclude_paths,
-            &stub_extensions,
+            stub_extensions.as_deref(),
             client_stubs_path.as_deref(),
         );
         let indexing_options = WorkspaceIndexingOptions {

@@ -45,7 +45,7 @@ BIN_NAME   := $(if $(findstring windows,$(HOST_TARGET)),php-lsp.exe,php-lsp)
 SERVER_BIN := $(BIN_DIR)/$(BIN_NAME)
 
 # ─── Phony targets ───────────────────────────────────────────────
-.PHONY: all package package-all install server server-all client stubs clean check check-server check-client cargo-check test test-parser test-index test-completion test-server test-e2e lint fmt release
+.PHONY: all package package-all install server server-all client stubs check-stubs clean check check-server check-client cargo-check test test-parser test-index test-completion test-server test-e2e lint fmt release
 
 all: package
 
@@ -57,6 +57,10 @@ $(STUBS_DEST): $(STUBS_SRC)/.git
 	$(ROOT_DIR)/scripts/bundle-stubs.sh
 
 stubs: $(STUBS_DEST)
+
+check-stubs:
+	$(ROOT_DIR)/scripts/check-stubs.sh --kind source $(STUBS_SRC)
+	$(ROOT_DIR)/scripts/check-stubs.sh --kind bundled $(STUBS_DEST)
 
 # ─── Server (Rust) ──────────────────────────────────────────────
 RUST_SOURCES := $(shell find $(SERVER_DIR)/crates -name '*.rs' 2>/dev/null)
@@ -107,7 +111,7 @@ package-all: server-all $(CLIENT_DIR)/out/extension.js $(STUBS_DEST)
 	@ls -lh $(CLIENT_DIR)/*.vsix 2>/dev/null
 
 # ─── Quality checks ─────────────────────────────────────────────
-check: lint test
+check: check-stubs lint test
 
 check-server:
 	cd $(SERVER_DIR) && cargo fmt --all --check

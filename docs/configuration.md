@@ -148,6 +148,23 @@ enabled = false
 | `[psalm]` | `enabled`, `command`, `timeoutMs` |
 | `[analyzerCodeActions]` | `enabled` |
 
+## Stubs
+
+The VS Code extension passes the bundled `client/stubs` directory to the
+server automatically. A project or global config can override the source path
+with `[stubs].path`.
+
+`[stubs].extensions` has three distinct states:
+
+- Omitted: use the bundled default extension set.
+- Non-empty array: load only the listed phpstorm-stubs extension directories.
+- Empty array: disable stubs intentionally.
+
+Startup logs distinguish an intentional empty extension list from missing or
+uninitialized stubs paths. Development, CI, and release packaging use
+`scripts/check-stubs.sh`/`make check-stubs` to fail when source or bundled stubs
+are too small or missing required core files.
+
 Executable keys in project config follow the command trust rules above.
 Relative include/exclude paths are interpreted relative to the effective
 workspace root. `phpstan.memory_limit` is added to the PHPStan command unless

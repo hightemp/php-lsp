@@ -603,11 +603,12 @@ fn test_document_version_ordering_accepts_only_newer_versions() {
 fn test_cache_configs_use_separate_namespaces() {
     let root = Path::new("/tmp/project");
     let workspace_config =
-        workspace_index_cache_config(Some(root), PhpVersion::DEFAULT, &[], &[], &[], None);
+        workspace_index_cache_config(Some(root), PhpVersion::DEFAULT, &[], &[], None, None);
+    let stub_extensions = ["Core".to_string()];
     let stubs_config = stubs_index_cache_config(
         Path::new("/tmp/project/stubs"),
         PhpVersion::DEFAULT,
-        &["Core".to_string()],
+        Some(&stub_extensions),
     );
     let vendor_config = vendor_index_cache_config(root, PhpVersion::DEFAULT, &[]);
 
@@ -616,6 +617,20 @@ fn test_cache_configs_use_separate_namespaces() {
     assert_eq!(vendor_config.namespace, CacheNamespace::Vendor);
     assert_ne!(workspace_config.config_hash(), stubs_config.config_hash());
     assert_ne!(workspace_config.config_hash(), vendor_config.config_hash());
+}
+
+#[test]
+fn test_effective_stub_extensions_distinguishes_defaults_from_explicit_empty() {
+    assert!(effective_stub_extensions(None).contains(&"Core".to_string()));
+
+    let disabled: Vec<String> = Vec::new();
+    assert!(effective_stub_extensions(Some(&disabled)).is_empty());
+
+    let custom = ["Core".to_string()];
+    assert_eq!(
+        effective_stub_extensions(Some(&custom)),
+        vec!["Core".to_string()]
+    );
 }
 
 #[test]
