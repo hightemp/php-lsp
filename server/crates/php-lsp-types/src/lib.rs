@@ -177,6 +177,7 @@ pub struct ArrayShapeItem {
 impl std::fmt::Display for ArrayShapeItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(ref key) = self.key {
+            let key = display_shape_key_text(key);
             if self.optional {
                 write!(f, "{}?: {}", key, self.value)
             } else {
@@ -186,6 +187,33 @@ impl std::fmt::Display for ArrayShapeItem {
             write!(f, "{}", self.value)
         }
     }
+}
+
+fn display_shape_key_text(key: &str) -> String {
+    if shape_key_can_display_unquoted(key) {
+        return key.to_string();
+    }
+
+    let escaped = key.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
+}
+
+fn shape_key_can_display_unquoted(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+
+    let digits = key.strip_prefix('-').unwrap_or(key);
+    if !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 /// Normalize a PHPDoc or source array/object-shape key for lookup/comparison.

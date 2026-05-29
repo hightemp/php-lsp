@@ -17,6 +17,7 @@ pub(in crate::server) struct PhpDocVirtualMember {
     pub(in crate::server) type_info: Option<php_lsp_types::TypeInfo>,
     pub(in crate::server) access: Option<php_lsp_types::PhpDocPropertyAccess>,
     pub(in crate::server) return_type: Option<php_lsp_types::TypeInfo>,
+    pub(in crate::server) params: Vec<php_lsp_types::ParamInfo>,
     pub(in crate::server) description: Option<String>,
     pub(in crate::server) is_static: bool,
 }
@@ -69,6 +70,7 @@ pub(in crate::server) fn phpdoc_virtual_member(
                         type_info: property.type_info,
                         access: Some(property.access),
                         return_type: None,
+                        params: Vec::new(),
                         description: property.description,
                         is_static: false,
                     });
@@ -87,6 +89,7 @@ pub(in crate::server) fn phpdoc_virtual_member(
                         type_info: None,
                         access: None,
                         return_type: method.return_type,
+                        params: method.params,
                         description: method.description,
                         is_static: method.is_static,
                     });
@@ -238,7 +241,9 @@ pub(in crate::server) fn phpdoc_virtual_member_markdown(member: &PhpDocVirtualMe
                 content.push(' ');
             }
             content.push_str(&member.name);
-            content.push_str("()");
+            content.push('(');
+            content.push_str(&format_phpdoc_params(&member.params));
+            content.push(')');
         }
     }
     content.push_str("\n```\n");
@@ -248,6 +253,35 @@ pub(in crate::server) fn phpdoc_virtual_member_markdown(member: &PhpDocVirtualMe
         content.push('\n');
     }
     content
+}
+
+fn format_phpdoc_params(params: &[php_lsp_types::ParamInfo]) -> String {
+    params
+        .iter()
+        .map(format_phpdoc_param)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_phpdoc_param(param: &php_lsp_types::ParamInfo) -> String {
+    let mut out = String::new();
+    if let Some(ref type_info) = param.type_info {
+        out.push_str(&type_info.to_string());
+        out.push(' ');
+    }
+    if param.is_by_ref {
+        out.push('&');
+    }
+    if param.is_variadic {
+        out.push_str("...");
+    }
+    out.push('$');
+    out.push_str(&param.name);
+    if let Some(ref default) = param.default_value {
+        out.push_str(" = ");
+        out.push_str(default);
+    }
+    out
 }
 
 pub(in crate::server) fn framework_virtual_member_detail(
@@ -634,8 +668,9 @@ pub(in crate::server) fn phpdoc_extra_markdown_sections(
                     .as_ref()
                     .map(|description| format!(" - {}", description))
                     .unwrap_or_default();
+                let params = format_phpdoc_params(&method.params);
                 format!(
-                    "- `@method {static_part}{return_type}{}()`{description}",
+                    "- `@method {static_part}{return_type}{}({params})`{description}",
                     method.name
                 )
             })

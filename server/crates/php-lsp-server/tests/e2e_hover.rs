@@ -527,6 +527,87 @@ function update(string $npId, Request $request, bool $donor): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_expands_multiline_phpdoc_shape_alias_for_local_var() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+function run(): void {
+    /** @var RowAlias $row */
+    $ro/*row*/w = [];
+}
+
+/**
+ * @phpstan-type RowAlias array{
+ *   'alias-key': string,
+ *   nested: array{
+ *     leaf: int,
+ *   },
+ * }
+ */
+"#;
+    let marker_offset = code_with_markers
+        .find("/*row*/")
+        .expect("test code should contain row marker");
+    let prefix = code_with_markers[..marker_offset].to_string();
+    let row_line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let row_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let row_character = (prefix.len() - row_start) as u32;
+    let code = code_with_markers.replace("/*row*/", "");
+    let uri = "file:///test/multiline-shape-alias-hover.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, row_line, row_character))
+        .await
+        .unwrap();
+    let hover_result = extract_result(hover);
+    let hover_text = hover_markdown_value(&hover_result);
+    assert!(
+        hover_text.contains("array{'alias-key': string")
+            && hover_text.contains("nested: array{leaf: int}")
+            && hover_text.contains("$row"),
+        "expected multiline type alias to expand in hover, got: {}",
+        hover_text
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_hover_local_variable_method_return_types_and_links() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

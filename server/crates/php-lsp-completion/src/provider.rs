@@ -406,14 +406,18 @@ fn phpdoc_method_detail(method: &PhpDocMethod) -> String {
                 value.push_str(&type_info.to_string());
                 value.push(' ');
             }
-            if param.is_variadic {
-                value.push_str("...");
-            }
             if param.is_by_ref {
                 value.push('&');
             }
+            if param.is_variadic {
+                value.push_str("...");
+            }
             value.push('$');
             value.push_str(&param.name);
+            if let Some(ref default) = param.default_value {
+                value.push_str(" = ");
+                value.push_str(default);
+            }
             value
         })
         .collect();

@@ -1242,7 +1242,7 @@ fn phpdoc_tagged_var_name(doc_comment: &str) -> Option<String> {
         if line.starts_with("*/") || line.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("@var") {
+        if let Some(rest) = crate::phpdoc::strip_exact_tag(line, "@var") {
             for token in rest.split_whitespace() {
                 if let Some(name) = phpdoc_var_token(token) {
                     return Some(name);
@@ -2432,7 +2432,7 @@ class Holder {
 namespace App;
 
 /**
- * @method void refresh()
+ * @method void refresh(string &$token, int ...$ids, [bool $force])
  * @method static User make()
  */
 interface Helper {}
@@ -2453,6 +2453,22 @@ interface Helper {}
                 .and_then(|sig| sig.return_type.as_ref()),
             Some(TypeInfo::Void)
         ));
+        let refresh_params = &refresh.signature.as_ref().unwrap().params;
+        assert_eq!(refresh_params.len(), 3);
+        assert_eq!(refresh_params[0].name, "token");
+        assert!(refresh_params[0].is_by_ref);
+        assert_eq!(
+            refresh_params[0].type_info,
+            Some(TypeInfo::Simple("string".to_string()))
+        );
+        assert_eq!(refresh_params[1].name, "ids");
+        assert!(refresh_params[1].is_variadic);
+        assert_eq!(
+            refresh_params[1].type_info,
+            Some(TypeInfo::Simple("int".to_string()))
+        );
+        assert_eq!(refresh_params[2].name, "force");
+        assert_eq!(refresh_params[2].default_value.as_deref(), Some("null"));
 
         let make = syms
             .symbols

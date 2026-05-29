@@ -3017,7 +3017,8 @@ while implementing these tasks.
     - `cargo test --all`;
     - `git diff --check`.
 
-- [ ] **PHA-013** Finish PHPDoc parser hardening.
+- [x] **PHA-013** Finish PHPDoc parser hardening. *(done 2026-05-29)*
+  - Status: completed 2026-05-29.
   - Scope:
     - replace remaining `strip_prefix("@param")`, `strip_prefix("@return")`,
       and `strip_prefix("@var")` paths with exact tag matching so
@@ -3033,6 +3034,31 @@ while implementing these tasks.
     - malformed/similar tags do not produce misleading type metadata;
     - multi-line shape aliases resolve in hover, completion, and diagnostics;
     - quoted shape keys complete and define without duplicated quotes.
+  - Implementation:
+    - PHPDoc parser now folds continuation lines into logical tags and uses
+      exact tag matching for `@param`, `@return`, `@var`, `@method`,
+      `@property*`, `@throws`, and `@deprecated`;
+    - `@method` tags now keep parsed params, by-reference markers, variadics,
+      optional/default markers, static marker, and trailing descriptions;
+    - array/object-shape parsing accepts common multi-line aliases with
+      trailing commas, and local file-level aliases are expanded for `@var`
+      hover/completion inference;
+    - quoted shape keys are normalized for lookup and rendered with valid
+      quoting when display requires it.
+  - Docs: `docs/architecture.md` documents exact PHPDoc tag matching and
+    multi-line alias policy; `docs/lsp-features.md` documents local shape alias
+    hover/completion and parsed `@method` params in completion resolve.
+  - Validation:
+    - `cargo test -p php-lsp-parser`;
+    - `cargo test -p php-lsp-completion`;
+    - `cargo test -p php-lsp-server --test e2e_completion test_shape_aware_completion_and_definition -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_hover test_hover_expands_multiline_phpdoc_shape_alias_for_local_var -- --nocapture`;
+    - `cargo test -p php-lsp-server test_compute_diagnostics_expands_multiline_phpdoc_shape_alias_for_arguments -- --nocapture`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`;
+    - `git diff --check`.
 
 - [ ] **PHA-014** Strengthen rename validation by symbol kind.
   - Problem: non-variable rename currently rejects only empty names, spaces, and

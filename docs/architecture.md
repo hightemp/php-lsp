@@ -202,6 +202,14 @@ items, and shape-key definition lookups all normalize quoted/optional shape keys
 through `php_lsp_types::normalize_shape_key_text(...)` so lookup and display do
 not diverge.
 
+PHPDoc tag parsing treats tag names as exact tokens: analyzer-specific tags such
+as `@param-out`, malformed `@returnFoo`, and vendor-specific `@var-*` tags do
+not fall through to the base `@param`, `@return`, or `@var` parser. PHPStan and
+Psalm type aliases may span multiple PHPDoc lines for common `array{...}` /
+`object{...}` shapes; file-level aliases are expanded for local `@var` shape
+hover and completion best-effort, while indexed signatures continue to expand
+aliases through `WorkspaceIndex`.
+
 ## Startup Flow
 
 1. VS Code activates on PHP files or a workspace containing `composer.json`.

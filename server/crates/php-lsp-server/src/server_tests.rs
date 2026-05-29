@@ -304,6 +304,7 @@ fn test_phpdoc_virtual_member_range_points_to_tag_name() {
         type_info: Some(TypeInfo::Simple("string".to_string())),
         access: Some(PhpDocPropertyAccess::ReadOnly),
         return_type: None,
+        params: Vec::new(),
         description: Some("Service slug".to_string()),
         is_static: false,
     };
@@ -1860,6 +1861,57 @@ function run(string $soapRequest): void {
             .iter()
             .any(|message| message.contains("Type mismatch")),
         "PHPDoc T[] should accept array literals, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn test_compute_diagnostics_expands_multiline_phpdoc_shape_alias_for_arguments() {
+    let uri = "file:///phpdoc-multiline-shape-alias.php";
+    let code = r#"<?php
+namespace App;
+
+/**
+ * @param RowShape $row
+ */
+function acceptsRow(array $row): void {}
+
+function run(): void {
+    acceptsRow(['id' => 1, 'name' => 'Ada']);
+}
+
+/**
+ * @phpstan-type RowShape array{
+ *   id: int,
+ *   name?: string,
+ * }
+ */
+"#;
+
+    let mut parser = FileParser::new();
+    parser.parse_full(code);
+
+    let index = WorkspaceIndex::new();
+    let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+    index.update_file(uri, symbols);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Type mismatch for App\\acceptsRow")),
+        "multi-line shape alias should be expanded before argument diagnostics, got: {:?}",
         messages
     );
 }

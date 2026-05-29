@@ -366,7 +366,7 @@ class User {
 }
 
 function run(): void {
-    /** @var array{foo: User, bar?: int, meta: array{city: string}} $row */
+    /** @var array{foo: User, bar?: int, 'quoted-key': string, meta: array{city: string}} $row */
     $row = [];
     /** @var list<User> $users */
     $users = [];
@@ -382,7 +382,21 @@ function run(): void {
     $literal = ['literal' => 1, 'nested' => ['leaf' => true]];
     $literal['/*literal*/'];
     $literal['nested']['leaf/*literaldef*/'];
+    $row['/*quoted*/'];
+    $row['quoted-key/*quoteddef*/'];
+    /** @var RowAlias $aliasRow */
+    $aliasRow = [];
+    $aliasRow['/*alias*/'];
 }
+
+/**
+ * @phpstan-type RowAlias array{
+ *   'alias-key': User,
+ *   nested: array{
+ *     leaf: string,
+ *   },
+ * }
+ */
 "#;
     let markers = [
         "/*array*/",
@@ -393,6 +407,9 @@ function run(): void {
         "/*phpdocdef*/",
         "/*literal*/",
         "/*literaldef*/",
+        "/*quoted*/",
+        "/*quoteddef*/",
+        "/*alias*/",
     ];
     let marker_position = |marker: &str| -> (u32, u32) {
         let marker_offset = code_with_markers
@@ -590,6 +607,73 @@ function run(): void {
         Some(21),
         "literal shape key definition should point to array key declaration, got: {}",
         literal_definition_result
+    );
+
+    let (quoted_line, quoted_character) = marker_position("/*quoted*/");
+    let quoted_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(9, uri, quoted_line, quoted_character))
+        .await
+        .unwrap();
+    let quoted_result = extract_result(quoted_completion);
+    let quoted_items = completion_items_from_result(&quoted_result);
+    let quoted_item = quoted_items
+        .iter()
+        .find(|item| item.get("label").and_then(|label| label.as_str()) == Some("quoted-key"))
+        .unwrap_or_else(|| {
+            panic!("expected quoted-key completion inside quotes, got: {quoted_items:?}")
+        });
+    assert_eq!(
+        quoted_item
+            .get("insertText")
+            .and_then(|value| value.as_str()),
+        Some("quoted-key"),
+        "completion inside existing quotes should not duplicate quotes"
+    );
+
+    let (quoted_def_line, quoted_def_character) = marker_position("/*quoteddef*/");
+    let quoted_definition = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            10,
+            uri,
+            quoted_def_line,
+            quoted_def_character,
+        ))
+        .await
+        .unwrap();
+    let quoted_definition_result = extract_result(quoted_definition);
+    assert_eq!(
+        quoted_definition_result["range"]["start"]["line"].as_u64(),
+        Some(8),
+        "quoted PHPDoc shape key definition should point to the quoted key, got: {}",
+        quoted_definition_result
+    );
+
+    let (alias_line, alias_character) = marker_position("/*alias*/");
+    let alias_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(11, uri, alias_line, alias_character))
+        .await
+        .unwrap();
+    let alias_result = extract_result(alias_completion);
+    let alias_labels: Vec<String> = completion_items_from_result(&alias_result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        alias_labels.contains(&"alias-key".to_string())
+            && alias_labels.contains(&"nested".to_string()),
+        "multi-line file-level shape alias should expand for completion, got: {:?}; result: {}",
+        alias_labels,
+        alias_result
     );
 
     service
@@ -1611,7 +1695,7 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
     assert!(
         class_hover_text.contains("Class-level PHPDoc")
             && class_hover_text.contains("@property-read int $version")
-            && class_hover_text.contains("@method User findById()"),
+            && class_hover_text.contains("@method User findById(int $id)"),
         "class hover should include PHPDoc summary and virtual members, got: {}",
         class_hover_text
     );
@@ -1758,7 +1842,7 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
     let resolved_method_result = extract_result(resolved_method);
     let resolved_method_doc = documentation_markdown_value(&resolved_method_result);
     assert!(
-        resolved_method_doc.contains("@method User findById()"),
+        resolved_method_doc.contains("@method User findById(int $id)"),
         "completionItem/resolve should document virtual method, got: {}",
         resolved_method_result
     );

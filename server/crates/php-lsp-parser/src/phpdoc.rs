@@ -6,8 +6,8 @@
 //! and @phpstan-import-type/@psalm-import-type.
 
 use php_lsp_types::{
-    normalize_shape_key_text, ArrayShapeItem, PhpDoc, PhpDocMethod, PhpDocParam, PhpDocProperty,
-    PhpDocPropertyAccess, PhpDocTypeAlias, PhpDocTypeAliasImport, TemplateBinding,
+    normalize_shape_key_text, ArrayShapeItem, ParamInfo, PhpDoc, PhpDocMethod, PhpDocParam,
+    PhpDocProperty, PhpDocPropertyAccess, PhpDocTypeAlias, PhpDocTypeAliasImport, TemplateBinding,
     TemplateBindingKind, TemplateParam, TemplateVariance, TypeInfo,
 };
 
@@ -23,10 +23,15 @@ pub fn parse_phpdoc(comment: &str) -> PhpDoc {
     let mut summary_lines: Vec<String> = Vec::new();
     let mut in_summary = true;
 
+    let mut pending_tag: Option<String> = None;
+
     for line in &lines {
         let trimmed = line.trim();
 
         if trimmed.is_empty() {
+            if let Some(tag) = pending_tag.take() {
+                parse_tag(&tag, &mut doc);
+            }
             if in_summary && !summary_lines.is_empty() {
                 in_summary = false;
             }
@@ -34,11 +39,21 @@ pub fn parse_phpdoc(comment: &str) -> PhpDoc {
         }
 
         if trimmed.starts_with('@') {
+            if let Some(tag) = pending_tag.take() {
+                parse_tag(&tag, &mut doc);
+            }
             in_summary = false;
-            parse_tag(trimmed, &mut doc);
+            pending_tag = Some(trimmed.to_string());
+        } else if let Some(tag) = pending_tag.as_mut() {
+            tag.push(' ');
+            tag.push_str(trimmed);
         } else if in_summary {
             summary_lines.push(trimmed.to_string());
         }
+    }
+
+    if let Some(tag) = pending_tag.take() {
+        parse_tag(&tag, &mut doc);
     }
 
     if !summary_lines.is_empty() {
@@ -66,9 +81,7 @@ fn strip_comment_markers(comment: &str) -> Vec<String> {
         if stripped.ends_with("*/") {
             stripped = stripped[..stripped.len() - 2].trim_end();
         }
-        if !stripped.is_empty() {
-            lines.push(stripped.to_string());
-        }
+        lines.push(stripped.to_string());
     }
     lines
 }
@@ -82,39 +95,39 @@ fn parse_tag(line: &str, doc: &mut PhpDoc) {
         parse_type_alias_tag(rest, doc);
     } else if let Some(rest) = type_alias_import_tag(line) {
         parse_type_alias_import_tag(rest, doc);
-    } else if let Some(rest) = line.strip_prefix("@param") {
+    } else if let Some(rest) = strip_exact_tag(line, "@param") {
         parse_param_tag(rest.trim(), doc);
-    } else if let Some(rest) = line.strip_prefix("@return") {
+    } else if let Some(rest) = strip_exact_tag(line, "@return") {
         let rest = rest.trim();
         if let Some((type_str, _)) = split_type_prefix(rest) {
             doc.return_type = Some(parse_type_string(type_str));
         }
-    } else if let Some(rest) = line.strip_prefix("@var") {
+    } else if let Some(rest) = strip_exact_tag(line, "@var") {
         parse_var_tag(rest.trim(), doc);
-    } else if let Some(rest) = line.strip_prefix("@throws") {
+    } else if let Some(rest) = strip_exact_tag(line, "@throws") {
         let rest = rest.trim();
         if let Some((type_str, _)) = split_type_prefix(rest) {
             doc.throws.push(parse_type_string(type_str));
         }
-    } else if let Some(rest) = line.strip_prefix("@deprecated") {
+    } else if let Some(rest) = strip_exact_tag(line, "@deprecated") {
         let rest = rest.trim();
         doc.deprecated = Some(if rest.is_empty() {
             "Deprecated".to_string()
         } else {
             rest.to_string()
         });
-    } else if let Some(rest) = line.strip_prefix("@property-read") {
+    } else if let Some(rest) = strip_exact_tag(line, "@property-read") {
         parse_property_tag(rest.trim(), doc, PhpDocPropertyAccess::ReadOnly);
-    } else if let Some(rest) = line.strip_prefix("@property-write") {
+    } else if let Some(rest) = strip_exact_tag(line, "@property-write") {
         parse_property_tag(rest.trim(), doc, PhpDocPropertyAccess::WriteOnly);
-    } else if let Some(rest) = line.strip_prefix("@property") {
+    } else if let Some(rest) = strip_exact_tag(line, "@property") {
         parse_property_tag(rest.trim(), doc, PhpDocPropertyAccess::ReadWrite);
-    } else if let Some(rest) = line.strip_prefix("@method") {
+    } else if let Some(rest) = strip_exact_tag(line, "@method") {
         parse_method_tag(rest.trim(), doc);
     }
 }
 
-fn strip_exact_tag<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+pub(crate) fn strip_exact_tag<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
     let rest = line.strip_prefix(tag)?;
     if rest.is_empty() || rest.starts_with(char::is_whitespace) {
         Some(rest.trim())
@@ -393,9 +406,12 @@ fn parse_property_tag(rest: &str, doc: &mut PhpDoc, access: PhpDocPropertyAccess
 fn parse_method_tag(rest: &str, doc: &mut PhpDoc) {
     let rest = rest.trim();
 
-    // Check for static
-    let (is_static, rest) = if let Some(r) = rest.strip_prefix("static") {
-        (true, r.trim_start())
+    let (is_static, rest) = if let Some((word, remaining)) = split_first_word(rest) {
+        if word == "static" {
+            (true, remaining.trim_start())
+        } else {
+            (false, rest)
+        }
     } else {
         (false, rest)
     };
@@ -411,13 +427,72 @@ fn parse_method_tag(rest: &str, doc: &mut PhpDoc) {
         return;
     };
 
+    let Some(close_paren) = find_matching_paren(rest, paren_pos) else {
+        return;
+    };
+    let params_body = &rest[paren_pos + 1..close_paren];
+    let params = parse_method_params(params_body);
+    let description = rest[close_paren + 1..].trim();
+
     doc.methods.push(PhpDocMethod {
         name,
         return_type,
-        params: vec![], // Simplified — not parsing method params in PHPDoc
+        params,
         is_static,
-        description: None,
+        description: (!description.is_empty()).then(|| description.to_string()),
     });
+}
+
+fn parse_method_params(params_body: &str) -> Vec<ParamInfo> {
+    split_top_level_allow_trailing(params_body, ',')
+        .into_iter()
+        .filter_map(parse_method_param)
+        .collect()
+}
+
+fn parse_method_param(param: &str) -> Option<ParamInfo> {
+    let mut param = param.trim();
+    let bracket_optional = if let Some(inner) = strip_enclosing_brackets(param) {
+        param = inner.trim();
+        true
+    } else {
+        false
+    };
+    if param.is_empty() {
+        return None;
+    }
+
+    let (param_without_default, default_value) =
+        if let Some(equal) = find_top_level_char(param, '=') {
+            let default = param[equal + 1..].trim();
+            (
+                param[..equal].trim(),
+                Some(if default.is_empty() {
+                    "null".to_string()
+                } else {
+                    default.to_string()
+                }),
+            )
+        } else {
+            (param, bracket_optional.then(|| "null".to_string()))
+        };
+
+    let (name_start, name_end) = find_phpdoc_variable_token(param_without_default)?;
+    let type_part = param_without_default[..name_start].trim();
+    let name_str = &param_without_default[name_start..name_end];
+    let name = strip_param_prefix(name_str).to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(ParamInfo {
+        name,
+        type_info: (!type_part.is_empty()).then(|| parse_type_string(type_part)),
+        default_value,
+        is_variadic: name_str.contains("..."),
+        is_by_ref: name_str.contains('&'),
+        is_promoted: false,
+    })
 }
 
 fn split_type_prefix(rest: &str) -> Option<(&str, Option<String>)> {
@@ -861,8 +936,7 @@ fn parse_shape_type(s: &str) -> Option<TypeInfo> {
         return None;
     };
 
-    let items = split_top_level(body, ',')
-        .unwrap_or_else(|| vec![body.trim()])
+    let items = split_top_level_allow_trailing(body, ',')
         .into_iter()
         .filter(|part| !part.trim().is_empty())
         .map(parse_array_shape_item)
@@ -1050,6 +1124,64 @@ fn split_top_level(s: &str, delimiter: char) -> Option<Vec<&str>> {
     Some(parts)
 }
 
+fn split_top_level_allow_trailing(s: &str, delimiter: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in s.char_indices() {
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        let nested = paren_depth > 0 || angle_depth > 0 || bracket_depth > 0 || brace_depth > 0;
+        if ch == delimiter && !nested {
+            let part = s[start..idx].trim();
+            if !part.is_empty() {
+                parts.push(part);
+            }
+            start = idx + ch.len_utf8();
+            continue;
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    let part = s[start..].trim();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+
+    parts
+}
+
 fn find_top_level_char(s: &str, needle: char) -> Option<usize> {
     find_top_level_char_from(s, needle, 0)
 }
@@ -1179,6 +1311,50 @@ fn strip_enclosing_parentheses(s: &str) -> Option<&str> {
         match ch {
             '(' => depth += 1,
             ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if idx + ch.len_utf8() == s.len() {
+                        return Some(s[1..idx].trim());
+                    }
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn strip_enclosing_brackets(s: &str) -> Option<&str> {
+    if !s.starts_with('[') || !s.ends_with(']') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in s.char_indices() {
+        if let Some(quote_ch) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote_ch {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        match ch {
+            '[' => depth += 1,
+            ']' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     if idx + ch.len_utf8() == s.len() {
@@ -1391,6 +1567,67 @@ mod tests {
         assert!(!doc.methods[0].is_static);
         assert_eq!(doc.methods[1].name, "create");
         assert!(doc.methods[1].is_static);
+    }
+
+    #[test]
+    fn test_similar_tags_do_not_parse_as_base_tags() {
+        let doc = parse_phpdoc(
+            "/**\n * @param-out string $name\n * @returnFoo int\n * @var-something User $user\n * @methodFoo string bad()\n */",
+        );
+
+        assert!(doc.params.is_empty());
+        assert!(doc.return_type.is_none());
+        assert!(doc.var_type.is_none());
+        assert!(doc.methods.is_empty());
+    }
+
+    #[test]
+    fn test_parse_method_params_flags_defaults_and_description() {
+        let doc = parse_phpdoc(
+            "/**\n * @method static Foo create(string &$name, ?int ...$ids, [bool $active], array<string, int> $map = []) Build it\n */",
+        );
+
+        assert_eq!(doc.methods.len(), 1);
+        let method = &doc.methods[0];
+        assert_eq!(method.name, "create");
+        assert!(method.is_static);
+        assert_eq!(
+            method.return_type,
+            Some(TypeInfo::Simple("Foo".to_string()))
+        );
+        assert_eq!(method.description.as_deref(), Some("Build it"));
+        assert_eq!(method.params.len(), 4);
+
+        assert_eq!(method.params[0].name, "name");
+        assert!(method.params[0].is_by_ref);
+        assert!(!method.params[0].is_variadic);
+        assert_eq!(
+            method.params[0].type_info,
+            Some(TypeInfo::Simple("string".to_string()))
+        );
+
+        assert_eq!(method.params[1].name, "ids");
+        assert!(method.params[1].is_variadic);
+        assert_eq!(
+            method.params[1].type_info,
+            Some(TypeInfo::Nullable(Box::new(TypeInfo::Simple(
+                "int".to_string()
+            ))))
+        );
+
+        assert_eq!(method.params[2].name, "active");
+        assert_eq!(method.params[2].default_value.as_deref(), Some("null"));
+        assert_eq!(
+            method.params[2].type_info,
+            Some(TypeInfo::Simple("bool".to_string()))
+        );
+
+        assert_eq!(method.params[3].name, "map");
+        assert_eq!(method.params[3].default_value.as_deref(), Some("[]"));
+        assert_eq!(
+            method.params[3].type_info.as_ref().map(ToString::to_string),
+            Some("array<string, int>".to_string())
+        );
     }
 
     #[test]
@@ -1634,6 +1871,33 @@ mod tests {
                 base: "list".to_string(),
                 args: vec![TypeInfo::Simple("int".to_string())],
             }
+        );
+    }
+
+    #[test]
+    fn test_parse_multiline_type_alias_shape() {
+        let doc = parse_phpdoc(
+            "/**\n * @phpstan-type UserShape array{\n *   'user-id': int,\n *   \"name\"?: string,\n *   meta: array{\n *     city: string,\n *   },\n * }\n */",
+        );
+
+        assert_eq!(doc.type_aliases.len(), 1);
+        assert_eq!(doc.type_aliases[0].name, "UserShape");
+        let TypeInfo::ArrayShape(items) = &doc.type_aliases[0].type_info else {
+            panic!("expected array shape alias");
+        };
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].key.as_deref(), Some("user-id"));
+        assert_eq!(items[0].value, TypeInfo::Simple("int".to_string()));
+        assert_eq!(items[1].key.as_deref(), Some("name"));
+        assert!(items[1].optional);
+        let TypeInfo::ArrayShape(meta_items) = &items[2].value else {
+            panic!("expected nested array shape");
+        };
+        assert_eq!(meta_items.len(), 1);
+        assert_eq!(meta_items[0].key.as_deref(), Some("city"));
+        assert_eq!(
+            doc.type_aliases[0].type_info.to_string(),
+            "array{'user-id': int, name?: string, meta: array{city: string}}"
         );
     }
 

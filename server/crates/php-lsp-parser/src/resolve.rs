@@ -4,7 +4,7 @@
 //! position and resolves it to an identifier name, considering namespace context
 //! and use statements.
 
-use crate::phpdoc::parse_phpdoc;
+use crate::phpdoc::{parse_phpdoc, strip_exact_tag};
 use php_lsp_types::{
     normalize_shape_key_text, FileSymbols, Signature, SymbolInfo, TypeInfo, UseKind,
 };
@@ -2007,6 +2007,7 @@ fn extract_preceding_phpdoc_var_inference(
     let comment = find_preceding_phpdoc_comment(stmt, source)?;
     let phpdoc = parse_phpdoc(comment);
     let type_info = phpdoc.var_type?;
+    let type_info = expand_file_type_aliases(&type_info, file_symbols, &mut Vec::new());
     let tagged_var = parse_tagged_var_name(comment);
 
     if let Some(name) = tagged_var {
@@ -2025,6 +2026,133 @@ fn extract_preceding_phpdoc_var_inference(
         phpdoc_comment: Some(comment.to_string()),
         type_info: Some(type_info),
     })
+}
+
+fn expand_file_type_aliases(
+    type_info: &TypeInfo,
+    file_symbols: &FileSymbols,
+    visited: &mut Vec<String>,
+) -> TypeInfo {
+    match type_info {
+        TypeInfo::Simple(name) => file_type_alias_for_name(name, file_symbols, visited)
+            .unwrap_or_else(|| TypeInfo::Simple(name.clone())),
+        TypeInfo::Generic { base, args } => {
+            let base_type = file_type_alias_for_name(base, file_symbols, visited)
+                .unwrap_or_else(|| TypeInfo::Simple(base.clone()));
+            let args = args
+                .iter()
+                .map(|arg| expand_file_type_aliases(arg, file_symbols, visited))
+                .collect();
+            match base_type {
+                TypeInfo::Simple(base) => TypeInfo::Generic { base, args },
+                TypeInfo::Generic {
+                    base,
+                    args: mut base_args,
+                } => {
+                    base_args.extend(args);
+                    TypeInfo::Generic {
+                        base,
+                        args: base_args,
+                    }
+                }
+                other => other,
+            }
+        }
+        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: expand_file_type_aliases(&item.value, file_symbols, visited),
+                })
+                .collect(),
+        ),
+        TypeInfo::ObjectShape(items) => TypeInfo::ObjectShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: expand_file_type_aliases(&item.value, file_symbols, visited),
+                })
+                .collect(),
+        ),
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => TypeInfo::Callable {
+            params: params
+                .iter()
+                .map(|param| expand_file_type_aliases(param, file_symbols, visited))
+                .collect(),
+            return_type: return_type.as_ref().map(|return_type| {
+                Box::new(expand_file_type_aliases(return_type, file_symbols, visited))
+            }),
+        },
+        TypeInfo::ClassString(Some(inner)) => TypeInfo::ClassString(Some(Box::new(
+            expand_file_type_aliases(inner, file_symbols, visited),
+        ))),
+        TypeInfo::ClassString(None) => TypeInfo::ClassString(None),
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => TypeInfo::Conditional {
+            subject: subject.clone(),
+            target: Box::new(expand_file_type_aliases(target, file_symbols, visited)),
+            if_type: Box::new(expand_file_type_aliases(if_type, file_symbols, visited)),
+            else_type: Box::new(expand_file_type_aliases(else_type, file_symbols, visited)),
+        },
+        TypeInfo::Union(types) => TypeInfo::Union(
+            types
+                .iter()
+                .map(|type_info| expand_file_type_aliases(type_info, file_symbols, visited))
+                .collect(),
+        ),
+        TypeInfo::Intersection(types) => TypeInfo::Intersection(
+            types
+                .iter()
+                .map(|type_info| expand_file_type_aliases(type_info, file_symbols, visited))
+                .collect(),
+        ),
+        TypeInfo::Nullable(inner) => TypeInfo::Nullable(Box::new(expand_file_type_aliases(
+            inner,
+            file_symbols,
+            visited,
+        ))),
+        TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed
+        | TypeInfo::Self_
+        | TypeInfo::Static_
+        | TypeInfo::Parent_ => type_info.clone(),
+    }
+}
+
+fn file_type_alias_for_name(
+    name: &str,
+    file_symbols: &FileSymbols,
+    visited: &mut Vec<String>,
+) -> Option<TypeInfo> {
+    if visited.iter().any(|visited_name| visited_name == name) {
+        return None;
+    }
+    let alias = file_symbols
+        .type_aliases
+        .iter()
+        .find(|alias| alias.name == name)?;
+
+    visited.push(name.to_string());
+    let expanded = expand_file_type_aliases(&alias.type_info, file_symbols, visited);
+    visited.pop();
+    Some(expanded)
 }
 
 fn infer_variable_in_scope(
@@ -2703,7 +2831,7 @@ fn parse_tagged_var_name(comment: &str) -> Option<String> {
         if line.starts_with("*/") || line.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("@var") {
+        if let Some(rest) = strip_exact_tag(line, "@var") {
             for token in rest.split_whitespace() {
                 if let Some(name) = normalize_doc_var_token(token) {
                     return Some(name);
@@ -5295,6 +5423,42 @@ function run(): void {
         assert_eq!(items[0].key.as_deref(), Some("city"));
         assert_eq!(items[1].key.as_deref(), Some("zip"));
         assert!(items[1].optional);
+    }
+
+    #[test]
+    fn test_infer_array_shape_from_multiline_file_type_alias() {
+        let code = r#"<?php
+namespace App;
+
+/**
+ * @phpstan-type RowShape array{
+ *   'user-id': int,
+ *   meta: array{
+ *     city: string,
+ *   },
+ * }
+ */
+use App\Entity\User;
+
+function run(): void {
+    /** @var RowShape $row */
+    $row = [];
+    $row['meta']['
+}
+"#;
+        let (line, col) = find_line_col(code, "$row['meta']['");
+        let inferred = parse_and_infer_var_type_info_at(
+            code,
+            line,
+            col + "$row['meta']".len() as u32,
+            "$row['meta']",
+        )
+        .expect("type alias array shape should be expanded for local inference");
+        let TypeInfo::ArrayShape(items) = inferred else {
+            panic!("expected nested alias array shape");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key.as_deref(), Some("city"));
     }
 
     #[test]
