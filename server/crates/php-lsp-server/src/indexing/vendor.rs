@@ -245,10 +245,11 @@ impl PhpLspBackend {
     }
 
     /// Lazy-index a single class FQN by finding its file via PSR-4/vendor mappings.
-    /// Returns true if a new file was indexed.
+    /// Returns true only when the requested class is present in the index after loading.
     pub(in crate::server) async fn lazy_index_class(&self, class_fqn: &str) -> bool {
+        let requested_class_fqn = class_fqn.trim_start_matches('\\');
         // Skip if already in the index
-        if self.index.types.contains_key(class_fqn) {
+        if self.index.types.contains_key(requested_class_fqn) {
             return false;
         }
 
@@ -271,7 +272,7 @@ impl PhpLspBackend {
             let mut all_paths = config
                 .namespace_map
                 .as_ref()
-                .map(|ns_map| ns_map.resolve_class_to_paths(class_fqn))
+                .map(|ns_map| ns_map.resolve_class_to_paths(requested_class_fqn))
                 .unwrap_or_default();
 
             let vendor_dir = config.root.join("vendor");
@@ -280,7 +281,7 @@ impl PhpLspBackend {
                     cached_vendor_autoload_map(&self.vendor_autoload_cache, &vendor_dir).await
                 {
                     if let Some(vendor_paths) =
-                        resolve_vendor_paths_from_map(class_fqn, &vendor_map)
+                        resolve_vendor_paths_from_map(requested_class_fqn, &vendor_map)
                     {
                         all_paths.extend(vendor_paths);
                     }
@@ -312,7 +313,15 @@ impl PhpLspBackend {
                     {
                         self.touch_vendor_file_lru(&abs).await;
                         tracing::debug!("Lazy-indexed vendor file from cache: {}", abs.display());
-                        return true;
+                        if self.index.types.contains_key(requested_class_fqn) {
+                            return true;
+                        }
+                        tracing::debug!(
+                            "Lazy vendor cache file {} did not contain requested class {}",
+                            abs.display(),
+                            requested_class_fqn
+                        );
+                        continue;
                     }
                 }
 
@@ -327,7 +336,24 @@ impl PhpLspBackend {
                         self.touch_vendor_file_lru(&abs).await;
                     }
                     tracing::debug!("Lazy-indexed file: {}", abs.display());
-                    return true;
+                    if self.index.types.contains_key(requested_class_fqn) {
+                        if is_vendor_file {
+                            if let Some(cache_config) = vendor_cache_config {
+                                save_vendor_index_cache_blocking(
+                                    self.index.clone(),
+                                    config.root.clone(),
+                                    cache_config,
+                                )
+                                .await;
+                            }
+                        }
+                        return true;
+                    }
+                    tracing::debug!(
+                        "Lazy-indexed file {} did not contain requested class {}",
+                        abs.display(),
+                        requested_class_fqn
+                    );
                 }
             }
         }

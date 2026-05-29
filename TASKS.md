@@ -3264,7 +3264,7 @@ while implementing these tasks.
     - `npm run build`;
     - `git diff --check`.
 
-- [ ] **PHA-023** Harden disk cache and lazy vendor cache correctness.
+- [x] **PHA-023** Harden disk cache and lazy vendor cache correctness. *(done 2026-05-29)*
   - Follow-up completed 2026-05-29: fixed stale diagnostics after `composer
     install` in Monica by ignoring package `composer.json`/`composer.lock`
     events inside `vendor`, keeping real `vendor/composer/*` metadata refreshes,
@@ -3273,6 +3273,29 @@ while implementing these tasks.
     `cargo test -p php-lsp-server --tests`, `cargo fmt --all --check`,
     `cargo clippy -p php-lsp-server --all-targets -- -D warnings`,
     Monica `DeleteMultipleVCard.php` CLI analyze, and `git diff --check`.
+  - Completed 2026-05-29:
+    - `save_cache_atomic()` now writes a unique synced temp file and replaces
+      existing cache snapshots with a Windows-safe remove/retry fallback;
+    - cache schema bumped to 16 and cached file validation now includes a
+      content hash in addition to mtime, size, encoded URI, namespace, and
+      config hashes;
+    - `lazy_index_class()` returns `true` only when the requested class is
+      actually present in the index after cache load or parse;
+    - successful lazy vendor class hits immediately save the `vendor` cache
+      namespace, so matching vendor files can be restored after restart;
+    - README, architecture, performance, baseline, and risk-register docs
+      describe the updated cache model.
+  - Validation:
+    - `cargo test -p php-lsp-index cache_save_over_existing_file_replaces_previous_snapshot -- --nocapture`;
+    - `cargo test -p php-lsp-index file_metadata_hash_distinguishes_same_size_content -- --nocapture`;
+    - `cargo test -p php-lsp-server test_lazy_index_class_returns_false_when_psr4_file_contains_different_class -- --nocapture`;
+    - `cargo test -p php-lsp-server test_lazy_indexed_vendor_symbol_survives_restart_cache_load -- --nocapture`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test -p php-lsp-index`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo test --all`;
+    - `git diff --check`.
   - Scope:
     - make `save_cache_atomic()` reliable on Windows by using replace/remove
       strategy or a crate/API with replace semantics;

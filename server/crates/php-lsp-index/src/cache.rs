@@ -6,13 +6,16 @@ use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo, SymbolReference};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 15;
+pub const CACHE_SCHEMA_VERSION: u32 = 16;
 pub const CACHE_FILE_NAME: &str = "index.bin";
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+const HASH_SEPARATOR_BYTE: u8 = 0xff;
 static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +113,7 @@ pub struct CachedFileMetadata {
     pub modified_secs: u64,
     pub modified_nanos: u32,
     pub size: u64,
+    pub content_hash: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -205,9 +209,43 @@ pub fn save_cache_atomic(path: &Path, cache: &IndexCache) -> Result<(), CacheErr
         counter
     ));
     let bytes = bincode::serialize(cache)?;
-    fs::write(&tmp_path, bytes)?;
-    fs::rename(tmp_path, path)?;
+    write_cache_temp_file(&tmp_path, &bytes)?;
+    replace_cache_file(&tmp_path, path)?;
     Ok(())
+}
+
+fn write_cache_temp_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn replace_cache_file(tmp_path: &Path, path: &Path) -> io::Result<()> {
+    match fs::rename(tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(remove_error) if remove_error.kind() == io::ErrorKind::NotFound => {}
+                Err(remove_error) => {
+                    let _ = fs::remove_file(tmp_path);
+                    return Err(io::Error::new(
+                        remove_error.kind(),
+                        format!(
+                            "failed to replace existing cache after rename failed ({rename_error}): {remove_error}"
+                        ),
+                    ));
+                }
+            }
+
+            if let Err(retry_error) = fs::rename(tmp_path, path) {
+                let _ = fs::remove_file(tmp_path);
+                return Err(retry_error);
+            }
+            Ok(())
+        }
+    }
 }
 
 pub fn load_valid_cached_files(
@@ -400,19 +438,29 @@ pub fn build_cache_from_sources(
 }
 
 pub fn stable_hash_strings<'a>(parts: impl IntoIterator<Item = &'a str>) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = FNV_OFFSET_BASIS;
     for part in parts {
         for byte in part.as_bytes() {
             hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
+            hash = hash.wrapping_mul(FNV_PRIME);
         }
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= u64::from(HASH_SEPARATOR_BYTE);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+pub fn stable_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
 }
 
 pub fn file_metadata(path: &Path) -> io::Result<CachedFileMetadata> {
+    let bytes = fs::read(path)?;
     let metadata = fs::metadata(path)?;
     let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
     let duration = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -420,6 +468,7 @@ pub fn file_metadata(path: &Path) -> io::Result<CachedFileMetadata> {
         modified_secs: duration.as_secs(),
         modified_nanos: duration.subsec_nanos(),
         size: metadata.len(),
+        content_hash: stable_hash_bytes(&bytes),
     })
 }
 
@@ -775,6 +824,70 @@ mod tests {
 
         let loaded = load_cache(&cache_path).unwrap();
         assert_eq!(loaded.files.len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_save_over_existing_file_replaces_previous_snapshot() {
+        let root = unique_temp_dir("replace-existing");
+        let file = root.join("src").join("Foo.php");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "<?php class Foo {}").unwrap();
+        let uri = path_to_uri(&file).unwrap();
+        let cache_path = root.join("cache").join(CACHE_FILE_NAME);
+        let config = test_config();
+
+        let first_index = WorkspaceIndex::new();
+        first_index.update_file(
+            &uri,
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![make_symbol(&uri)],
+                ..Default::default()
+            },
+        );
+        let first_cache =
+            build_cache_from_index(&first_index, &root, std::slice::from_ref(&file), &config);
+        save_cache_atomic(&cache_path, &first_cache).unwrap();
+
+        let second_index = WorkspaceIndex::new();
+        let mut bar_symbol = make_symbol(&uri);
+        bar_symbol.name = "Bar".to_string();
+        bar_symbol.fqn = "App\\Bar".to_string();
+        second_index.update_file(
+            &uri,
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![bar_symbol],
+                ..Default::default()
+            },
+        );
+        let second_cache =
+            build_cache_from_index(&second_index, &root, std::slice::from_ref(&file), &config);
+        save_cache_atomic(&cache_path, &second_cache).unwrap();
+
+        let loaded = load_cache(&cache_path).unwrap();
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(loaded.top_level.types[0].fqn, "App\\Bar");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_metadata_hash_distinguishes_same_size_content() {
+        let root = unique_temp_dir("content-hash");
+        let file = root.join("Foo.php");
+        fs::write(&file, "<?php class Foo {}").unwrap();
+        let first = file_metadata(&file).unwrap();
+
+        fs::write(&file, "<?php class Bar {}").unwrap();
+        let second = file_metadata(&file).unwrap();
+
+        assert_eq!(first.size, second.size);
+        assert_ne!(first.content_hash, second.content_hash);
 
         fs::remove_dir_all(root).unwrap();
     }

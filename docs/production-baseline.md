@@ -249,7 +249,7 @@ Second run result:
 |----------|------------|--------------------|---------------|---------|------------|
 | `small-cache-smoke-pr011` | `target/php-lsp-profile/cache-smoke-pr011/php-lsp/0da0d009104fa203/workspace/index.bin` | 4 | 4 | 14 | 26.71 ms |
 
-This validates the `PR-010` workspace cache path and mtime/size-valid file-symbol loading on a small fixture. After `PR-011`, workspace/stubs/vendor snapshots live under separate namespace directories below the same workspace hash; this smoke run created `workspace/index.bin` and `stubs/index.bin`, with second-run stubs load at 23.23 ms. Large-project acceptance is still tracked by the milestone exit criteria and should be measured with the same command against 5k-10k PHP files.
+This validates the `PR-010` workspace cache path and file-fingerprint-valid file-symbol loading on a small fixture. After `PR-011`, workspace/stubs/vendor snapshots live under separate namespace directories below the same workspace hash; this smoke run created `workspace/index.bin` and `stubs/index.bin`, with second-run stubs load at 23.23 ms. Large-project acceptance is still tracked by the milestone exit criteria and should be measured with the same command against 5k-10k PHP files.
 
 ## Production Validation Large Workspace Run
 

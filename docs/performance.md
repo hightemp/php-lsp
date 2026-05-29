@@ -173,7 +173,7 @@ Common causes of cache misses:
 - Changed include/exclude paths.
 - Changed stub extension list or stub files.
 - Composer metadata changes.
-- File mtime/size changes.
+- File mtime, size, or content-hash changes.
 - Different resolved workspace or Composer root.
 
 ## Large Project Acceptance Targets

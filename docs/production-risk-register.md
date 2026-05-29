@@ -32,7 +32,7 @@ Current evidence:
 - `PR-010` added a schema-versioned workspace disk cache for file symbols/top-level snapshots.
 - `PR-011` split cache files into `workspace`, `stubs`, and `vendor` namespace directories.
 - Cache path: `~/.cache/php-lsp/{workspace-hash}/{namespace}/index.bin`.
-- Cache invalidates by file mtime/size, php-lsp version, PHP version, include/exclude paths, stub extension set and stubs hash.
+- Cache invalidates by file mtime, size, content hash, php-lsp version, PHP version, include/exclude paths, stub extension set and stubs hash.
 - Fixture smoke run shows cached workspace file symbols loading on second start.
 - `PV-002` large workspace run on `large-symfony` loaded 10575 workspace files
   from disk cache on warm start; ready time improved from 7349.48 ms cold to
@@ -53,8 +53,9 @@ Impact:
 
 Mitigation:
 
-- `PR-010`: implemented workspace index disk cache with mtime/size/config/stubs hash invalidation.
+- `PR-010`: implemented workspace index disk cache with file fingerprint/config/stubs hash invalidation.
 - `PR-011`: implemented separate cache namespaces for workspace/stubs/vendor and preserved stub/vendor symbols across workspace reindex.
+- `PHA-023`: hardened cache replacement over existing snapshots and added content-hash validation.
 
 Exit signal:
 
@@ -241,7 +242,7 @@ Exit signal:
 Current evidence:
 
 - `load_configured_stubs()` reads bundled phpstorm-stubs and loads configured extensions into the main index.
-- `PR-011` stores stubs in a dedicated `stubs` cache namespace and reloads changed/missing stub files by mtime/size/config hash.
+- `PR-011` stores stubs in a dedicated `stubs` cache namespace and reloads changed/missing stub files by file fingerprint/config hash.
 - `PR-030` parses phpstorm-stubs version-gating attributes and filters symbols/signatures by `phpLsp.phpVersion`.
 - Changing PHP version reloads stubs and republishes diagnostics without restart.
 - `PHA-005` added source/bundled stubs integrity guards for development, CI,
@@ -280,6 +281,7 @@ Current evidence:
 - `PR-012` caches parsed Composer installed/autoload metadata in memory until the Composer metadata fingerprint changes.
 - `PR-012` bounds lazy vendor symbols with a 512-file LRU and restores evicted file symbols from the `vendor` disk cache when needed.
 - `PR-012` preloads up to 16 Composer `autoload.files` entrypoints after workspace ready.
+- `PHA-023` persists successfully verified lazy vendor class files immediately and rejects PSR-4 candidate files that do not actually define the requested class.
 - `PV-012` diagnostics samples on `large-symfony`, `large-laravel-crm`, and
   `large-monica` produced no LSP request/stderr failures, but the top unknown
   symbol diagnostics are dominated by missing external vendor metadata in these
@@ -297,6 +299,7 @@ Mitigation:
 
 - `PR-012`: implemented Composer installed/autoload metadata cache, vendor file symbol LRU and nonblocking `autoload.files` preload.
 - `PR-012`: keep vendor file symbols in the dedicated `vendor` disk cache so LRU evictions do not force reparsing unchanged files.
+- `PHA-023`: lazy vendor class hits save the dedicated vendor cache and survive restart cache loads when file fingerprints still match.
 
 Exit signal:
 

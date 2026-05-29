@@ -6,6 +6,7 @@ use super::lsp::document_symbols::{workspace_symbol_candidates, workspace_symbol
 use super::*;
 use php_lsp_types::*;
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn make_symbol(
@@ -56,6 +57,21 @@ fn parse_and_index_php_file(index: &WorkspaceIndex, uri: &str, code: &str) -> Fi
     let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
     index.update_file(uri, symbols);
     parser
+}
+
+fn unique_server_temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "php-lsp-server-test-{}-{}-{}",
+        name,
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 #[test]
@@ -823,6 +839,84 @@ fn test_vendor_autoload_map_parses_psr4_and_files() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_lazy_index_class_returns_false_when_psr4_file_contains_different_class() {
+    let root = unique_server_temp_dir("lazy-wrong-class");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("Foo.php"),
+        "<?php\nnamespace App;\nclass Different {}\n",
+    )
+    .unwrap();
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.workspace_configs.lock().await = vec![WorkspaceRootConfig {
+        root: root.clone(),
+        namespace_map: Some(NamespaceMap {
+            psr4: vec![("App\\".to_string(), vec![src])],
+            ..Default::default()
+        }),
+    }];
+
+    assert!(!backend.lazy_index_class("App\\Foo").await);
+    assert!(backend.index.resolve_fqn("App\\Foo").is_none());
+    assert!(backend.index.resolve_fqn("App\\Different").is_some());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_lazy_indexed_vendor_symbol_survives_restart_cache_load() {
+    let root = unique_server_temp_dir("lazy-vendor-cache");
+    let vendor_src = root.join("vendor/acme/package/src");
+    std::fs::create_dir_all(&vendor_src).unwrap();
+    let vendor_file = vendor_src.join("Foo.php");
+    std::fs::write(
+        &vendor_file,
+        "<?php\nnamespace Vendor\\Package;\nclass Foo {}\n",
+    )
+    .unwrap();
+
+    let cache_path = cache::cache_file_path_for_namespace(&root, CacheNamespace::Vendor);
+    let _ = std::fs::remove_file(&cache_path);
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.workspace_configs.lock().await = vec![WorkspaceRootConfig {
+        root: root.clone(),
+        namespace_map: Some(NamespaceMap {
+            psr4: vec![("Vendor\\Package\\".to_string(), vec![vendor_src])],
+            ..Default::default()
+        }),
+    }];
+
+    assert!(backend.lazy_index_class("Vendor\\Package\\Foo").await);
+    assert!(
+        cache_path.is_file(),
+        "expected vendor cache at {:?}",
+        cache_path
+    );
+
+    let restarted_index = WorkspaceIndex::new();
+    let cache_config = vendor_index_cache_config(&root, PhpVersion::DEFAULT, &[]);
+    assert!(load_cached_vendor_file(
+        &restarted_index,
+        &root,
+        &vendor_file,
+        &cache_config
+    ));
+    assert!(restarted_index
+        .resolve_fqn("Vendor\\Package\\Foo")
+        .is_some());
+
+    if let Some(cache_dir) = cache_path.parent() {
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

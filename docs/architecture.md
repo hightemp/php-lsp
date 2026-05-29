@@ -158,6 +158,14 @@ Composer maps + stubs + vendor cache
 Disk cache: workspace / stubs / vendor
 ```
 
+Disk cache snapshots are schema- and namespace-scoped. Each cached file is
+validated by encoded URI, mtime, size, and content hash before its symbols and
+references are restored. Cache saves write a unique temporary file and replace
+the existing snapshot so repeated saves to the same path also work on Windows.
+Lazy vendor indexing persists a parsed vendor file only after the requested
+class is actually present in the index, and later sessions can reload that file
+from the `vendor` cache namespace.
+
 ## Feature Ownership Map
 
 | Feature area | LSP/server entry point | Parser/completion layer | Index/cache layer | Primary tests |

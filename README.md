@@ -171,9 +171,11 @@ phpstorm-stubs support.
   additional Laravel-like workspaces. Remaining GA work is tracked in
   `docs/production-risk-register.md` and `docs/production-baseline.md`.
 - Workspace, stub, and lazy vendor file symbols are cached in separate disk
-  namespaces; Composer vendor metadata is cached in memory with an LRU for
-  lazy vendor symbols. The primary large-workspace warm cache target is met;
-  installed-vendor first-hit behavior remains a watch item.
+  namespaces with mtime, size, and content-hash validation. Lazy vendor files
+  are persisted after the requested class is verified in the index; Composer
+  vendor metadata is cached in memory with an LRU for lazy vendor symbols. The
+  primary large-workspace warm cache target is met; installed-vendor first-hit
+  behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses use indexed
   per-file references, but still iterate workspace reference sets and can be
   expensive on very large repositories.
