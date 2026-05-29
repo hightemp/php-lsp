@@ -3,8 +3,14 @@
 //! Given a target FQN and the file's CST + symbols, returns all locations
 //! in the file that reference the target.
 
+use crate::resolve::{
+    resolve_scope_class_name_pub, symbol_at_position_with_resolvers, CallableParamTypeResolver,
+    MemberTypeResolver, RefKind,
+};
 use crate::utf16::range_byte_to_utf16;
-use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolReference, UseKind};
+use php_lsp_types::{
+    FileSymbols, PhpSymbolKind, SymbolReference, SymbolReferenceReceiver, UseKind,
+};
 use tree_sitter::{Node, Point, Tree};
 
 /// A location within a file where a reference was found.
@@ -153,6 +159,18 @@ pub fn collect_symbol_references_in_file(
     source: &str,
     file_symbols: &FileSymbols,
 ) -> Vec<SymbolReference> {
+    collect_symbol_references_in_file_with_resolvers(tree, source, file_symbols, None, None)
+}
+
+/// Collect non-local symbol occurrences, using optional resolvers for receiver
+/// type inference when indexing member references.
+pub fn collect_symbol_references_in_file_with_resolvers(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Vec<SymbolReference> {
     let mut references = Vec::new();
 
     for symbol in &file_symbols.symbols {
@@ -165,15 +183,25 @@ pub fn collect_symbol_references_in_file(
             range: range_byte_to_utf16(source, symbol.selection_range),
             is_declaration: true,
             starts_with_dollar: symbol.kind == PhpSymbolKind::Property,
+            receiver: SymbolReferenceReceiver::None,
         });
     }
 
-    collect_symbol_references_walk(tree.root_node(), source, file_symbols, &mut references);
+    collect_symbol_references_walk(
+        tree,
+        tree.root_node(),
+        source,
+        file_symbols,
+        &mut references,
+        resolver,
+        callable_resolver,
+    );
     references.sort_by(|left, right| {
         left.target_fqn
             .cmp(&right.target_fqn)
             .then_with(|| left.range.cmp(&right.range))
             .then_with(|| left.is_declaration.cmp(&right.is_declaration))
+            .then_with(|| left.receiver.cmp(&right.receiver))
     });
     references.dedup_by(|left, right| {
         left.target_fqn == right.target_fqn
@@ -181,15 +209,19 @@ pub fn collect_symbol_references_in_file(
             && left.range == right.range
             && left.is_declaration == right.is_declaration
             && left.starts_with_dollar == right.starts_with_dollar
+            && left.receiver == right.receiver
     });
     references
 }
 
 fn collect_symbol_references_walk(
+    tree: &Tree,
     node: Node,
     source: &str,
     file_symbols: &FileSymbols,
     references: &mut Vec<SymbolReference>,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) {
     match node.kind() {
         "object_creation_expression" => {
@@ -215,6 +247,9 @@ fn collect_symbol_references_walk(
                         reference_range(source, name_node),
                         false,
                         false,
+                        SymbolReferenceReceiver::StaticClass {
+                            class_fqn: scope_fqn,
+                        },
                     );
                 } else {
                     push_symbol_reference(
@@ -224,6 +259,7 @@ fn collect_symbol_references_walk(
                         reference_range(source, name_node),
                         false,
                         false,
+                        SymbolReferenceReceiver::Unresolved,
                     );
                 }
             }
@@ -253,6 +289,9 @@ fn collect_symbol_references_walk(
                         reference_range(source, name_node),
                         false,
                         raw_name.starts_with('$'),
+                        SymbolReferenceReceiver::StaticClass {
+                            class_fqn: scope_fqn,
+                        },
                     );
                 } else {
                     push_symbol_reference(
@@ -262,33 +301,61 @@ fn collect_symbol_references_walk(
                         reference_range(source, name_node),
                         false,
                         raw_name.starts_with('$'),
+                        SymbolReferenceReceiver::Unresolved,
                     );
                 }
             }
         }
-        "member_access_expression" => {
+        "member_access_expression" | "nullsafe_member_access_expression" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let text = &source[name_node.byte_range()];
+                let (target_fqn, receiver) = resolved_instance_member_reference(
+                    tree,
+                    source,
+                    file_symbols,
+                    name_node,
+                    PhpSymbolKind::Property,
+                    resolver,
+                    callable_resolver,
+                )
+                .unwrap_or_else(|| {
+                    (
+                        format!("::${}", text.trim_start_matches('$')),
+                        SymbolReferenceReceiver::Unresolved,
+                    )
+                });
                 push_symbol_reference(
                     references,
-                    format!("::${}", text.trim_start_matches('$')),
+                    target_fqn,
                     PhpSymbolKind::Property,
                     reference_range(source, name_node),
                     false,
                     false,
+                    receiver,
                 );
             }
         }
-        "member_call_expression" => {
+        "member_call_expression" | "nullsafe_member_call_expression" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let text = &source[name_node.byte_range()];
+                let (target_fqn, receiver) = resolved_instance_member_reference(
+                    tree,
+                    source,
+                    file_symbols,
+                    name_node,
+                    PhpSymbolKind::Method,
+                    resolver,
+                    callable_resolver,
+                )
+                .unwrap_or_else(|| (format!("::{}", text), SymbolReferenceReceiver::Unresolved));
                 push_symbol_reference(
                     references,
-                    format!("::{}", text),
+                    target_fqn,
                     PhpSymbolKind::Method,
                     reference_range(source, name_node),
                     false,
                     false,
+                    receiver,
                 );
             }
         }
@@ -297,12 +364,21 @@ fn collect_symbol_references_walk(
             {
                 push_class_reference(scope_node, source, file_symbols, references);
                 let text = &source[name_node.byte_range()];
-                let scope_text = &source[scope_node.byte_range()];
-                let scope_fqn = resolve_name_to_fqn(scope_text, file_symbols);
-                let target = if matches!(scope_text, "self" | "static" | "parent") {
-                    format!("::{}", text)
+                let scope_fqn = scoped_member_reference_class_from_scope(
+                    scope_node,
+                    node,
+                    source,
+                    file_symbols,
+                );
+                let (target, receiver) = if let Some(scope_fqn) = scope_fqn {
+                    (
+                        format!("{}::{}", scope_fqn, text),
+                        SymbolReferenceReceiver::StaticClass {
+                            class_fqn: scope_fqn,
+                        },
+                    )
                 } else {
-                    format!("{}::{}", scope_fqn, text)
+                    (format!("::{}", text), SymbolReferenceReceiver::Unresolved)
                 };
                 push_symbol_reference(
                     references,
@@ -311,6 +387,7 @@ fn collect_symbol_references_walk(
                     reference_range(source, name_node),
                     false,
                     false,
+                    receiver,
                 );
             }
         }
@@ -324,6 +401,7 @@ fn collect_symbol_references_walk(
                     reference_range(source, func_node),
                     false,
                     false,
+                    SymbolReferenceReceiver::None,
                 );
             }
         }
@@ -374,7 +452,15 @@ fn collect_symbol_references_walk(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_symbol_references_walk(child, source, file_symbols, references);
+        collect_symbol_references_walk(
+            tree,
+            child,
+            source,
+            file_symbols,
+            references,
+            resolver,
+            callable_resolver,
+        );
     }
 }
 
@@ -396,6 +482,7 @@ fn push_class_reference(
         reference_range(source, node),
         false,
         false,
+        SymbolReferenceReceiver::None,
     );
 }
 
@@ -405,11 +492,21 @@ fn scoped_member_reference_class(
     file_symbols: &FileSymbols,
 ) -> Option<String> {
     let scope_node = node.child_by_field_name("scope")?;
+    scoped_member_reference_class_from_scope(scope_node, node, source, file_symbols)
+}
+
+fn scoped_member_reference_class_from_scope(
+    scope_node: Node,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
     let scope_text = &source[scope_node.byte_range()];
-    if matches!(scope_text, "self" | "static" | "parent") {
+    let resolved = resolve_scope_class_name_pub(scope_text, context_node, source, file_symbols);
+    if is_builtin_or_relative_class_name(&resolved) {
         return None;
     }
-    Some(resolve_name_to_fqn(scope_text, file_symbols))
+    Some(resolved)
 }
 
 fn push_constant_reference_if_plain_name(
@@ -451,6 +548,7 @@ fn push_constant_reference_if_plain_name(
         reference_range(source, node),
         false,
         false,
+        SymbolReferenceReceiver::None,
     );
 }
 
@@ -478,6 +576,56 @@ fn is_builtin_or_relative_class_name(name: &str) -> bool {
     )
 }
 
+fn resolved_instance_member_reference(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    name_node: Node,
+    target_kind: PhpSymbolKind,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<(String, SymbolReferenceReceiver)> {
+    let start = name_node.start_position();
+    let symbol = symbol_at_position_with_resolvers(
+        tree,
+        source,
+        start.row as u32,
+        start.column as u32,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )?;
+    if !ref_kind_matches_symbol_kind(symbol.ref_kind, target_kind) {
+        return None;
+    }
+
+    let receiver_fqn = symbol
+        .fqn
+        .rsplit_once("::")
+        .map(|(receiver, _)| receiver.to_string())?;
+    if is_builtin_or_relative_class_name(&receiver_fqn) {
+        return None;
+    }
+
+    Some((
+        symbol.fqn,
+        SymbolReferenceReceiver::ResolvedType {
+            type_fqn: receiver_fqn,
+        },
+    ))
+}
+
+fn ref_kind_matches_symbol_kind(ref_kind: RefKind, target_kind: PhpSymbolKind) -> bool {
+    matches!(
+        (ref_kind, target_kind),
+        (RefKind::MethodCall, PhpSymbolKind::Method)
+            | (RefKind::PropertyAccess, PhpSymbolKind::Property)
+            | (RefKind::StaticPropertyAccess, PhpSymbolKind::Property)
+            | (RefKind::ClassConstant, PhpSymbolKind::ClassConstant)
+            | (RefKind::ClassConstant, PhpSymbolKind::EnumCase)
+    )
+}
+
 fn push_symbol_reference(
     references: &mut Vec<SymbolReference>,
     target_fqn: String,
@@ -485,6 +633,7 @@ fn push_symbol_reference(
     range: (u32, u32, u32, u32),
     is_declaration: bool,
     starts_with_dollar: bool,
+    receiver: SymbolReferenceReceiver,
 ) {
     references.push(SymbolReference {
         target_fqn,
@@ -492,6 +641,7 @@ fn push_symbol_reference(
         range,
         is_declaration,
         starts_with_dollar,
+        receiver,
     });
 }
 
@@ -1350,15 +1500,19 @@ $service = new Service();
                 && !reference.is_declaration
         }));
         assert!(refs.iter().any(|reference| {
-            reference.target_fqn == "::STATE"
+            reference.target_fqn == "App\\Service::STATE"
                 && reference.target_kind == PhpSymbolKind::ClassConstant
                 && !reference.is_declaration
         }));
         assert!(refs.iter().any(|reference| {
-            reference.target_fqn == "::$name"
+            reference.target_fqn == "App\\Service::$name"
                 && reference.target_kind == PhpSymbolKind::Property
                 && !reference.is_declaration
                 && !reference.starts_with_dollar
+                && reference.receiver
+                    == SymbolReferenceReceiver::ResolvedType {
+                        type_fqn: "App\\Service".to_string(),
+                    }
         }));
         assert!(refs.iter().any(|reference| {
             reference.target_fqn == "App\\FLAG"

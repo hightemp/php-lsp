@@ -117,7 +117,22 @@ impl PhpLspBackend {
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
             let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
-            match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
+            let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+                self.resolve_member_type(class_fqn, member_name)
+            };
+            let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+            };
+
+            match symbol_at_position_with_resolvers(
+                tree,
+                &source,
+                pos.line,
+                byte_col,
+                &file_symbols,
+                Some(&resolver),
+                Some(&callable_param_resolver),
+            ) {
                 Some(sym) => {
                     if sym.ref_kind == RefKind::Variable {
                         let refs = find_variable_references_at_position(

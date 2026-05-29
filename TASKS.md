@@ -2856,7 +2856,12 @@ while implementing these tasks.
     `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and
     `git diff --check`.
 
-- [ ] **PHA-004** Make member references and rename safe for unresolved receivers.
+- [x] **PHA-004** Make member references and rename safe for unresolved receivers.
+  - Completed 2026-05-29: `SymbolReference` now records member receiver
+    resolution state; workspace references/rename use only exact or proven
+    related receivers, and unresolved member rename returns `invalid_params`
+    instead of broad edits. Validation: `cargo test --all`,
+    `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`.
   - Problem: `$obj->foo()` and `$obj->bar` can be indexed as unresolved
     `::foo` / `::$bar`. References may be useful as a fuzzy fallback, but
     destructive rename must not edit every same-named member across unrelated

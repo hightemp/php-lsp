@@ -402,6 +402,30 @@ pub struct FileSymbols {
     pub type_alias_imports: Vec<PhpDocTypeAliasImport>,
 }
 
+/// Receiver information for a precomputed member occurrence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SymbolReferenceReceiver {
+    /// Non-member occurrence, including declarations.
+    #[default]
+    None,
+    /// Instance receiver with a resolved static type (`$obj->member`).
+    ResolvedType { type_fqn: String },
+    /// Static/class receiver with a resolved class (`ClassName::member`).
+    StaticClass { class_fqn: String },
+    /// Member occurrence whose receiver could not be resolved safely.
+    Unresolved,
+}
+
+impl SymbolReferenceReceiver {
+    pub fn receiver_fqn(&self) -> Option<&str> {
+        match self {
+            Self::ResolvedType { type_fqn } => Some(type_fqn),
+            Self::StaticClass { class_fqn } => Some(class_fqn),
+            Self::None | Self::Unresolved => None,
+        }
+    }
+}
+
 /// A precomputed symbol occurrence used by references/rename/code lens.
 ///
 /// Unlike `SymbolInfo` ranges, `range` is already an LSP UTF-16 range because
@@ -415,6 +439,9 @@ pub struct SymbolReference {
     pub is_declaration: bool,
     /// True when the edited text itself starts with `$` (`$prop`, `Class::$prop`).
     pub starts_with_dollar: bool,
+    /// Receiver resolution state for member references.
+    #[serde(default)]
+    pub receiver: SymbolReferenceReceiver,
 }
 
 #[cfg(test)]

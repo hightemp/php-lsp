@@ -1,6 +1,40 @@
 mod support;
 
+use std::collections::BTreeSet;
 use support::*;
+
+fn line_col(code: &str, needle: &str) -> (u32, u32) {
+    for (line, text) in code.lines().enumerate() {
+        if let Some(col) = text.find(needle) {
+            return (line as u32, col as u32);
+        }
+    }
+    panic!("needle not found: {needle}");
+}
+
+fn workspace_edit_start_lines(result: &serde_json::Value, uri: &str) -> BTreeSet<u64> {
+    result
+        .get("changes")
+        .and_then(|changes| changes.get(uri))
+        .and_then(|edits| edits.as_array())
+        .unwrap_or_else(|| panic!("workspace edit should contain edits for {uri}: {result}"))
+        .iter()
+        .map(|edit| edit["range"]["start"]["line"].as_u64().unwrap_or(u64::MAX))
+        .collect()
+}
+
+fn location_start_lines(result: &serde_json::Value) -> BTreeSet<u64> {
+    result
+        .as_array()
+        .unwrap_or_else(|| panic!("references result should be an array: {result}"))
+        .iter()
+        .map(|location| {
+            location["range"]["start"]["line"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+        })
+        .collect()
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_document_highlight_variables_and_properties() {
@@ -759,6 +793,379 @@ async fn test_cancel_request_cancels_rename_request() {
     assert_eq!(
         extract_error_code(rename_response.unwrap()),
         Some(ErrorCode::RequestCancelled.code())
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_member_rename_uses_resolved_receivers_only() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Alpha {
+    public function touch(): void {}
+    public function run(): void {
+        $this->touch();
+    }
+}
+
+class Beta {
+    public function touch(): void {}
+    public function run(): void {
+        $this->touch();
+    }
+}
+
+function run(Alpha $alpha, Beta $beta): void {
+    $alpha->touch();
+    $beta->touch();
+}
+"#;
+    let uri = "file:///test/ResolvedMemberRename.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (rename_line, rename_col) = line_col(code, "touch(): void {}");
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(
+            2,
+            uri,
+            rename_line,
+            rename_col + 1,
+            "renamedTouch",
+        ))
+        .await
+        .unwrap();
+    let result = extract_result(rename);
+    let edit_lines = workspace_edit_start_lines(&result, uri);
+
+    let expected_lines = BTreeSet::from([
+        line_col(code, "touch(): void {}").0 as u64,
+        line_col(code, "$this->touch();").0 as u64,
+        line_col(code, "$alpha->touch();").0 as u64,
+    ]);
+    assert_eq!(
+        edit_lines, expected_lines,
+        "method rename should not touch unrelated Beta::touch references: {result}"
+    );
+    for edit in result["changes"][uri].as_array().unwrap() {
+        assert_eq!(edit["newText"].as_str(), Some("renamedTouch"));
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_property_rename_uses_resolved_receivers_only() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Alpha {
+    public string $name = '';
+    public function run(): void {
+        echo $this->name;
+    }
+}
+
+class Beta {
+    public string $name = '';
+    public function run(): void {
+        echo $this->name;
+    }
+}
+
+function run(Alpha $alpha, Beta $beta): void {
+    echo $alpha->name;
+    echo $beta->name;
+}
+"#;
+    let uri = "file:///test/ResolvedPropertyRename.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (rename_line, rename_col) = line_col(code, "$alpha->name");
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(
+            2,
+            uri,
+            rename_line,
+            rename_col + "$alpha->".len() as u32,
+            "label",
+        ))
+        .await
+        .unwrap();
+    let result = extract_result(rename);
+    let edit_lines = workspace_edit_start_lines(&result, uri);
+
+    let expected_lines = BTreeSet::from([
+        line_col(code, "$name = '';").0 as u64,
+        line_col(code, "$this->name;").0 as u64,
+        line_col(code, "$alpha->name;").0 as u64,
+    ]);
+    assert_eq!(
+        edit_lines, expected_lines,
+        "property rename should not touch unrelated Beta::$name references: {result}"
+    );
+
+    let edits = result["changes"][uri].as_array().unwrap();
+    assert!(edits
+        .iter()
+        .any(|edit| edit["newText"].as_str() == Some("$label")));
+    assert_eq!(
+        edits
+            .iter()
+            .filter(|edit| edit["newText"].as_str() == Some("label"))
+            .count(),
+        2
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_references_include_resolved_inheritance_and_interface_receivers() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+interface Contract {
+    public function handle(): void;
+}
+
+class Base {
+    public function handle(): void {}
+}
+
+class Child extends Base {}
+
+class Impl implements Contract {
+    public function handle(): void { echo 'impl'; }
+}
+
+function run(Child $child, Contract $contract, Impl $impl): void {
+    $child->handle();
+    $contract->handle();
+    $impl->handle();
+}
+"#;
+    let uri = "file:///test/ResolvedInheritanceReferences.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (base_line, base_col) = line_col(code, "handle(): void {}");
+    let base_refs = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(2, uri, base_line, base_col + 1, true))
+        .await
+        .unwrap();
+    let base_result = extract_result(base_refs);
+    let base_lines = location_start_lines(&base_result);
+    let expected_base_lines = BTreeSet::from([
+        base_line as u64,
+        line_col(code, "$child->handle();").0 as u64,
+    ]);
+    assert_eq!(
+        base_lines, expected_base_lines,
+        "base method references should include resolved child receiver only: {base_result}"
+    );
+
+    let (contract_line, contract_col) = line_col(code, "handle(): void;");
+    let contract_refs = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(
+            3,
+            uri,
+            contract_line,
+            contract_col + 1,
+            true,
+        ))
+        .await
+        .unwrap();
+    let contract_result = extract_result(contract_refs);
+    let contract_lines = location_start_lines(&contract_result);
+    let expected_contract_lines = BTreeSet::from([
+        contract_line as u64,
+        line_col(code, "handle(): void { echo 'impl'; }").0 as u64,
+        line_col(code, "$contract->handle();").0 as u64,
+        line_col(code, "$impl->handle();").0 as u64,
+    ]);
+    assert_eq!(
+        contract_lines, expected_contract_lines,
+        "interface references should include resolved interface and implementer receivers: {contract_result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_member_rename_rejects_unresolved_receiver() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+function run($obj): void {
+    $obj->touch();
+}
+"#;
+    let uri = "file:///test/UnresolvedMemberRename.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (line, col) = line_col(code, "touch();");
+    let prepare = service
+        .ready()
+        .await
+        .unwrap()
+        .call(prepare_rename_request(2, uri, line, col + 1))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(prepare).is_null(),
+        "prepareRename should reject unresolved member receivers"
+    );
+
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(3, uri, line, col + 1, "renamedTouch"))
+        .await
+        .unwrap();
+    let err = extract_error_message(rename).unwrap_or_default();
+    assert!(
+        err.contains("Cannot safely rename member without a resolved receiver type"),
+        "rename should return a safe unresolved receiver error, got: {err}"
     );
 
     service

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 14;
+pub const CACHE_SCHEMA_VERSION: u32 = 15;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -639,6 +639,7 @@ mod tests {
             range: (3, 12, 3, 15),
             is_declaration: false,
             starts_with_dollar: false,
+            receiver: Default::default(),
         }];
 
         let index = WorkspaceIndex::new();

@@ -32,7 +32,21 @@ impl PhpLspBackend {
         let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
-        let sym = match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
+        let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+            self.resolve_member_type(class_fqn, member_name)
+        };
+        let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+            resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+        };
+        let sym = match symbol_at_position_with_resolvers(
+            tree,
+            &source,
+            pos.line,
+            byte_col,
+            &file_symbols,
+            Some(&resolver),
+            Some(&callable_param_resolver),
+        ) {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -126,6 +140,12 @@ impl PhpLspBackend {
             }
         };
 
+        if is_member_rename_kind(target_kind) && !target_fqn.contains("::") {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "Cannot safely rename member without a resolved receiver type",
+            ));
+        }
+
         let property_new_name = if target_kind == php_lsp_types::PhpSymbolKind::Property {
             Some(normalize_property_new_name(new_name).ok_or_else(|| {
                 tower_lsp::jsonrpc::Error::invalid_params("Invalid property name")
@@ -182,7 +202,11 @@ impl PhpLspBackend {
             }
         }
 
-        if changes.is_empty() {
+        if changes.is_empty() && is_member_rename_kind(target_kind) {
+            Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "Cannot safely rename member because no exact references were found",
+            ))
+        } else if changes.is_empty() {
             Ok(None)
         } else {
             Ok(Some(WorkspaceEdit {
@@ -212,7 +236,22 @@ impl PhpLspBackend {
         let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
-        match symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols) {
+        let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+            self.resolve_member_type(class_fqn, member_name)
+        };
+        let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
+            resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+        };
+
+        match symbol_at_position_with_resolvers(
+            tree,
+            &source,
+            pos.line,
+            byte_col,
+            &file_symbols,
+            Some(&resolver),
+            Some(&callable_param_resolver),
+        ) {
             Some(sym) => {
                 // Variable rename support is local-scope only.
                 if sym.ref_kind == RefKind::Variable {
@@ -227,6 +266,9 @@ impl PhpLspBackend {
                     return Ok(Some(PrepareRenameResponse::Range(range)));
                 }
                 if sym.ref_kind == RefKind::Unknown || sym.ref_kind == RefKind::NamespaceName {
+                    return Ok(None);
+                }
+                if is_member_ref_kind(sym.ref_kind) && !sym.fqn.contains("::") {
                     return Ok(None);
                 }
 
@@ -312,5 +354,25 @@ pub(in crate::server) fn is_renameable_variable(var_name: &str) -> bool {
             | "$http_response_header"
             | "$argc"
             | "$argv"
+    )
+}
+
+fn is_member_rename_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
+    matches!(
+        kind,
+        php_lsp_types::PhpSymbolKind::Method
+            | php_lsp_types::PhpSymbolKind::Property
+            | php_lsp_types::PhpSymbolKind::ClassConstant
+            | php_lsp_types::PhpSymbolKind::EnumCase
+    )
+}
+
+fn is_member_ref_kind(kind: RefKind) -> bool {
+    matches!(
+        kind,
+        RefKind::MethodCall
+            | RefKind::PropertyAccess
+            | RefKind::StaticPropertyAccess
+            | RefKind::ClassConstant
     )
 }

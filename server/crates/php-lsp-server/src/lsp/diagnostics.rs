@@ -534,6 +534,7 @@ pub(in crate::server) fn current_parser_symbol_references(
 }
 
 pub(in crate::server) fn symbol_reference_matches(
+    index: &WorkspaceIndex,
     reference: &php_lsp_types::SymbolReference,
     target_fqn: &str,
     target_kind: php_lsp_types::PhpSymbolKind,
@@ -549,20 +550,94 @@ pub(in crate::server) fn symbol_reference_matches(
         return true;
     }
 
-    if reference.is_declaration || !reference_kind_matches(reference.target_kind, target_kind) {
+    if !reference_kind_matches(reference.target_kind, target_kind) {
         return false;
     }
 
-    let Some(member_name) = target_fqn.rsplit_once("::").map(|(_, member)| member) else {
+    if reference.is_declaration {
+        member_declaration_matches_related_owner(index, reference, target_fqn, target_kind)
+    } else {
+        member_reference_matches_related_receiver(index, reference, target_fqn, target_kind)
+    }
+}
+
+fn member_declaration_matches_related_owner(
+    index: &WorkspaceIndex,
+    reference: &php_lsp_types::SymbolReference,
+    target_fqn: &str,
+    target_kind: php_lsp_types::PhpSymbolKind,
+) -> bool {
+    if !is_member_symbol_kind(target_kind) {
+        return false;
+    }
+
+    let Some((target_owner, target_member)) = target_fqn.rsplit_once("::") else {
         return false;
     };
+    let Some((reference_owner, reference_member)) = reference.target_fqn.rsplit_once("::") else {
+        return false;
+    };
+    member_names_match(reference_member, target_member, target_kind)
+        && related_member_owner_matches(index, reference_owner, target_owner)
+}
+
+fn member_reference_matches_related_receiver(
+    index: &WorkspaceIndex,
+    reference: &php_lsp_types::SymbolReference,
+    target_fqn: &str,
+    target_kind: php_lsp_types::PhpSymbolKind,
+) -> bool {
+    if !is_member_symbol_kind(target_kind) {
+        return false;
+    }
+
+    let Some((target_owner, target_member)) = target_fqn.rsplit_once("::") else {
+        return false;
+    };
+    let Some((_, reference_member)) = reference.target_fqn.rsplit_once("::") else {
+        return false;
+    };
+    if !member_names_match(reference_member, target_member, target_kind) {
+        return false;
+    }
+
+    let Some(receiver_fqn) = reference.receiver.receiver_fqn() else {
+        return false;
+    };
+
+    related_member_owner_matches(index, receiver_fqn, target_owner)
+}
+
+fn related_member_owner_matches(
+    index: &WorkspaceIndex,
+    reference_owner: &str,
+    target_owner: &str,
+) -> bool {
+    fqn_matches(reference_owner, target_owner)
+        || class_extends_or_implements(index, reference_owner, target_owner, &mut Vec::new())
+        || class_or_ancestor_uses_trait(index, reference_owner, target_owner, &mut Vec::new())
+}
+
+fn member_names_match(
+    reference_member: &str,
+    target_member: &str,
+    target_kind: php_lsp_types::PhpSymbolKind,
+) -> bool {
+    if target_kind == php_lsp_types::PhpSymbolKind::Property {
+        return reference_member.trim_start_matches('$') == target_member.trim_start_matches('$');
+    }
+
+    reference_member == target_member
+}
+
+fn is_member_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
     matches!(
-        target_kind,
+        kind,
         php_lsp_types::PhpSymbolKind::Method
             | php_lsp_types::PhpSymbolKind::Property
             | php_lsp_types::PhpSymbolKind::ClassConstant
             | php_lsp_types::PhpSymbolKind::EnumCase
-    ) && reference.target_fqn == format!("::{}", member_name)
+    )
 }
 
 pub(in crate::server) fn reference_kind_matches(
@@ -3399,7 +3474,13 @@ impl PhpLspBackend {
                 .unwrap_or_default()
         };
         refs.retain(|reference| {
-            symbol_reference_matches(reference, target_fqn, target_kind, include_declaration)
+            symbol_reference_matches(
+                &self.index,
+                reference,
+                target_fqn,
+                target_kind,
+                include_declaration,
+            )
         });
         refs
     }
