@@ -4285,13 +4285,17 @@ fn find_variable_definition_before(
             }
         }
         "foreach_statement" => {
-            for field in ["key", "value"] {
-                if let Some(var_node) = node.child_by_field_name(field) {
-                    if normalize_var_name(&source[var_node.byte_range()]) == var_name {
-                        let start = var_node.start_byte();
-                        if start < usage_start {
-                            *best = Some((start, node_range(var_node)));
-                        }
+            for var_node in [
+                foreach_key_variable_node(node, source),
+                foreach_value_variable_node(node, source),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if normalize_var_name(&source[var_node.byte_range()]) == var_name {
+                    let start = var_node.start_byte();
+                    if start <= usage_start {
+                        *best = Some((start, node_range(var_node)));
                     }
                 }
             }
@@ -4342,10 +4346,14 @@ fn collect_variable_declarations_before(
             }
         }
         "foreach_statement" => {
-            for field in ["key", "value"] {
-                if let Some(var_node) = node.child_by_field_name(field) {
-                    collect_variable_node(var_node, usage_start, source, vars);
-                }
+            for var_node in [
+                foreach_key_variable_node(node, source),
+                foreach_value_variable_node(node, source),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                collect_variable_node(var_node, usage_start, source, vars);
             }
         }
         "catch_clause" => {
@@ -5586,6 +5594,39 @@ class Holder {
             parse_and_find_var_def(code, 2, 10).expect("parameter definition should be found");
         // points to parameter line
         assert_eq!(def.0, 1);
+    }
+
+    #[test]
+    fn test_find_variable_definition_foreach_value_usage() {
+        let code = r#"<?php
+function demo(array $items): void {
+    foreach ($items as $item) {
+        echo $item;
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "echo $item");
+        let def = parse_and_find_var_def(code, line, col + "echo ".len() as u32 + 2)
+            .expect("foreach value variable definition should be found");
+        let (def_line, def_col) = find_line_col(code, "$item) {");
+        assert_eq!(def.0, def_line);
+        assert_eq!(def.1, def_col);
+    }
+
+    #[test]
+    fn test_find_variable_definition_foreach_value_declaration_points_to_itself() {
+        let code = r#"<?php
+function demo(array $items): void {
+    foreach ($items as $item) {
+        echo $item;
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "$item) {");
+        let def = parse_and_find_var_def(code, line, col + 2)
+            .expect("foreach value declaration should be its own definition");
+        assert_eq!(def.0, line);
+        assert_eq!(def.1, col);
     }
 
     #[test]

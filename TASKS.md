@@ -4297,3 +4297,8 @@ change.
   - Найти, почему member diagnostics не доходят до `RefKind::MethodCall`
   - Добавить regression test без project-specific hardcode
   - Запустить релевантные Rust-тесты
+- [x] **T-2026-06-01-foreach-variable-definition** Исправить go-to-definition для `$portingNumber` и других `foreach` value-переменных. *(done 2026-06-01)*
+  - Воспроизвести проблему на `CompleteHandler.php`
+  - Найти пробел в local variable definition lookup для `foreach`
+  - Добавить regression test без project-specific hardcode
+  - Запустить релевантные Rust-тесты

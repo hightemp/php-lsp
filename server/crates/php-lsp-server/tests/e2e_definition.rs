@@ -564,6 +564,83 @@ function useIt(Contract $contract, Base $base): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_goto_definition_foreach_value_variable() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+function demo(array $items): void {
+    foreach ($items as $item) {
+        echo $item;
+    }
+}
+"#;
+    let uri = "file:///test/GotoForeachVariable.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (def_line, def_character) = utf16_position_at(code, "$item) {");
+    let (usage_line, usage_character) = utf16_position_at(code, "$item;");
+
+    for (id, line, character, label) in [
+        (2, usage_line, usage_character + 2, "foreach value usage"),
+        (3, def_line, def_character + 2, "foreach value declaration"),
+    ] {
+        let resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(id, uri, line, character))
+            .await
+            .unwrap();
+        let result = extract_result(resp);
+        assert_eq!(
+            result.get("uri").and_then(|value| value.as_str()),
+            Some(uri),
+            "definition for {} should point to the current file, got: {}",
+            label,
+            result
+        );
+        assert_eq!(
+            result["range"]["start"]["line"].as_u64(),
+            Some(def_line as u64),
+            "definition for {} should point to foreach value line, got: {}",
+            label,
+            result
+        );
+        assert_eq!(
+            result["range"]["start"]["character"].as_u64(),
+            Some(def_character as u64),
+            "definition for {} should point at foreach value variable, got: {}",
+            label,
+            result
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_goto_definition_variables_and_constants() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
