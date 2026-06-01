@@ -4,6 +4,7 @@
 //! position and resolves it to an identifier name, considering namespace context
 //! and use statements.
 
+use crate::cst::{argument_index, argument_name, is_by_ref_output_argument_variable};
 use crate::phpdoc::{parse_phpdoc, strip_exact_tag};
 use php_lsp_types::{
     normalize_shape_key_text, FileSymbols, Signature, SymbolInfo, TypeInfo, UseKind,
@@ -4370,102 +4371,6 @@ fn collect_variable_node(
         return;
     }
     vars.push((node.start_byte(), normalize_var_name(text)));
-}
-
-fn is_by_ref_output_argument_variable(node: Node, source: &str) -> bool {
-    let Some(argument) = ancestor_before_scope(node, "argument") else {
-        return false;
-    };
-    let Some(arguments) = argument
-        .parent()
-        .filter(|parent| parent.kind() == "arguments")
-    else {
-        return false;
-    };
-    let Some(call) = arguments
-        .parent()
-        .filter(|parent| parent.kind() == "function_call_expression")
-    else {
-        return false;
-    };
-    let Some(function_node) = call
-        .child_by_field_name("function")
-        .or_else(|| call.named_child(0))
-    else {
-        return false;
-    };
-
-    let function_name = source[function_node.byte_range()]
-        .trim()
-        .trim_start_matches('\\')
-        .rsplit('\\')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if !matches!(function_name.as_str(), "preg_match" | "preg_match_all") {
-        return false;
-    }
-
-    argument_name(argument, source).is_some_and(|name| name == "matches")
-        || argument_index(arguments, argument).is_some_and(|index| index == 2)
-}
-
-fn ancestor_before_scope<'tree>(node: Node<'tree>, ancestor_kind: &str) -> Option<Node<'tree>> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == ancestor_kind {
-            return Some(parent);
-        }
-        if matches!(
-            parent.kind(),
-            "method_declaration"
-                | "function_definition"
-                | "anonymous_function"
-                | "anonymous_function_creation_expression"
-                | "program"
-        ) {
-            return None;
-        }
-        current = parent.parent();
-    }
-    None
-}
-
-fn argument_index(arguments: Node, argument: Node) -> Option<usize> {
-    let mut cursor = arguments.walk();
-    let index = arguments
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() == "argument")
-        .position(|child| child.id() == argument.id());
-    index
-}
-
-fn argument_name(argument: Node, source: &str) -> Option<String> {
-    if let Some(name_node) = argument.child_by_field_name("name") {
-        return Some(normalize_argument_name(&source[name_node.byte_range()]));
-    }
-
-    let text = &source[argument.byte_range()];
-    let colon_index = text.find(':')?;
-    let value_start = argument
-        .child_by_field_name("value")
-        .or_else(|| {
-            let mut cursor = argument.walk();
-            argument.named_children(&mut cursor).last()
-        })
-        .map(|value| value.start_byte().saturating_sub(argument.start_byte()))
-        .unwrap_or(text.len());
-
-    (colon_index < value_start).then(|| normalize_argument_name(&text[..colon_index]))
-}
-
-fn normalize_argument_name(name: &str) -> String {
-    name.trim()
-        .trim_start_matches('$')
-        .trim_end_matches(':')
-        .trim()
-        .to_string()
 }
 
 fn normalize_var_name(text: &str) -> String {

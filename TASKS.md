@@ -3770,7 +3770,7 @@ change.
 
 ### Maintainability, completion polish, and packaging guards
 
-- [ ] **PHB-011** Reduce duplicated parser helper logic where it affects behavior.
+- [x] **PHB-011** Reduce duplicated parser helper logic where it affects behavior. *(done 2026-06-01)*
   - Audit finding: helpers such as by-ref argument detection, argument naming,
     variable normalization, parenthesis/type-expression parsing, and node range
     conversion exist in multiple parser/server modules.
