@@ -423,6 +423,13 @@ Each cache file stores schema version, namespace, php-lsp version, workspace
 root, config hash, stubs/vendor hash, file metadata, file symbols, references,
 and top-level symbol snapshots.
 
+Because the cache uses `bincode`, the snapshot format is not self-describing.
+Any change to `IndexCache`, nested cached structs, or serialized
+`php-lsp-types` fields must bump `CACHE_SCHEMA_VERSION` in
+`php-lsp-index/src/cache.rs`. The index crate keeps a representative serialized
+fixture hash/length test so CI catches schema-shape changes before old
+`index.bin` files are accidentally treated as current.
+
 Cache invalidation checks:
 
 - Cache schema version.

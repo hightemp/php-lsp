@@ -3836,7 +3836,7 @@ change.
     - future contributors can identify the correct cache/stubs module from the
       docs without reading both implementations.
 
-- [ ] **PHB-015** Enforce cache schema-version bump discipline.
+- [x] **PHB-015** Enforce cache schema-version bump discipline. *(done 2026-06-01)*
   - Audit finding: `bincode` cache deserialization is not self-describing, so
     serialized struct changes require a strict `CACHE_SCHEMA_VERSION` bump.
   - Affected code:

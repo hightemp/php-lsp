@@ -16,6 +16,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Serialized `IndexCache` schema version.
+///
+/// `bincode` is not self-describing. Bump this whenever `IndexCache`,
+/// `CachedFile`, `CachedFileMetadata`, `CachedTopLevelSymbols`, or nested
+/// serialized `php-lsp-types` fields change in a way that can affect persisted
+/// bytes. The cache schema fixture test below guards the representative binary
+/// shape so CI fails until this version and its fingerprint are updated
+/// together.
 pub const CACHE_SCHEMA_VERSION: u32 = 17;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -627,8 +635,16 @@ fn unix_ms(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use php_lsp_types::{SymbolModifiers, Visibility};
+    use php_lsp_types::{
+        ArrayShapeItem, ParamInfo, PhpDocTypeAlias, PhpDocTypeAliasImport, Signature,
+        SymbolModifiers, SymbolReferenceReceiver, TemplateBinding, TemplateBindingKind,
+        TemplateParam, TemplateVariance, TypeInfo, UseKind, UseStatement, Visibility,
+    };
     use std::io::Write;
+
+    const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 17;
+    const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3187;
+    const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x7bff_b1ed_2030_e33c;
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -662,6 +678,175 @@ mod tests {
         }
     }
 
+    fn cache_schema_symbol(uri: &str, name: &str, kind: PhpSymbolKind) -> SymbolInfo {
+        SymbolInfo {
+            name: name.to_string(),
+            fqn: format!("App\\{name}"),
+            kind,
+            uri: uri.to_string(),
+            range: (1, 2, 3, 4),
+            selection_range: (1, 12, 1, 12 + name.len() as u32),
+            visibility: Visibility::Protected,
+            modifiers: SymbolModifiers {
+                is_static: true,
+                is_abstract: false,
+                is_final: true,
+                is_readonly: false,
+                is_deprecated: true,
+                is_builtin: false,
+            },
+            doc_comment: Some("/** @template T of object */".to_string()),
+            signature: Some(Signature {
+                params: vec![ParamInfo {
+                    name: "items".to_string(),
+                    type_info: Some(TypeInfo::Generic {
+                        base: "array".to_string(),
+                        args: vec![TypeInfo::ArrayShape(vec![ArrayShapeItem {
+                            key: Some("id".to_string()),
+                            optional: false,
+                            value: TypeInfo::LiteralInt("42".to_string()),
+                        }])],
+                    }),
+                    default_value: Some("[]".to_string()),
+                    is_variadic: false,
+                    is_by_ref: true,
+                    is_promoted: false,
+                }],
+                return_type: Some(TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple(
+                    "App\\Foo".to_string(),
+                ))))),
+            }),
+            parent_fqn: Some("App\\Base".to_string()),
+            extends: vec!["App\\Base".to_string()],
+            implements: vec!["App\\Contract".to_string()],
+            traits: vec!["App\\SharedTrait".to_string()],
+            templates: vec![TemplateParam {
+                name: "T".to_string(),
+                bound: Some(TypeInfo::Simple("object".to_string())),
+                variance: TemplateVariance::Covariant,
+            }],
+            template_bindings: vec![TemplateBinding {
+                kind: TemplateBindingKind::Extends,
+                target: "App\\Base".to_string(),
+                args: vec![TypeInfo::Static_],
+            }],
+        }
+    }
+
+    fn cache_schema_fixture() -> IndexCache {
+        let uri = "file:///tmp/php-lsp-cache-schema/src/Foo.php";
+        let class_symbol = cache_schema_symbol(uri, "Foo", PhpSymbolKind::Class);
+        let function_symbol = cache_schema_symbol(uri, "helper", PhpSymbolKind::Function);
+        let constant_symbol =
+            cache_schema_symbol(uri, "APP_VERSION", PhpSymbolKind::GlobalConstant);
+
+        IndexCache {
+            schema_version: CACHE_SCHEMA_VERSION,
+            namespace: CacheNamespace::Workspace.as_str().to_string(),
+            php_lsp_version: "0.6.0".to_string(),
+            workspace_root: "/tmp/php-lsp-cache-schema".to_string(),
+            config_hash: 0x0123_4567_89ab_cdef,
+            stubs_hash: 0xfedc_ba98_7654_3210,
+            created_at_unix_ms: 1_765_000_000_123,
+            files: vec![CachedFile {
+                uri: uri.to_string(),
+                relative_path: "src/Foo.php".to_string(),
+                metadata: CachedFileMetadata {
+                    modified_secs: 1_765_000_000,
+                    modified_nanos: 123_456_789,
+                    modified_status: ModifiedTimeStatus::Available,
+                    size: 321,
+                    content_hash: 0x1020_3040_5060_7080,
+                },
+                file_symbols: FileSymbols {
+                    namespace: Some("App".to_string()),
+                    use_statements: vec![
+                        UseStatement {
+                            fqn: "Vendor\\Package\\Thing".to_string(),
+                            alias: Some("ThingAlias".to_string()),
+                            kind: UseKind::Class,
+                            range: (0, 5, 0, 32),
+                        },
+                        UseStatement {
+                            fqn: "Vendor\\Package\\helper".to_string(),
+                            alias: None,
+                            kind: UseKind::Function,
+                            range: (1, 5, 1, 40),
+                        },
+                        UseStatement {
+                            fqn: "Vendor\\Package\\APP_CONST".to_string(),
+                            alias: Some("APP_CONST_ALIAS".to_string()),
+                            kind: UseKind::Constant,
+                            range: (2, 5, 2, 44),
+                        },
+                    ],
+                    symbols: vec![class_symbol.clone(), function_symbol.clone()],
+                    type_aliases: vec![PhpDocTypeAlias {
+                        name: "Payload".to_string(),
+                        type_info: TypeInfo::Union(vec![
+                            TypeInfo::ObjectShape(vec![ArrayShapeItem {
+                                key: Some("name".to_string()),
+                                optional: true,
+                                value: TypeInfo::Nullable(Box::new(TypeInfo::LiteralString(
+                                    "demo".to_string(),
+                                ))),
+                            }]),
+                            TypeInfo::LiteralNull,
+                        ]),
+                    }],
+                    type_alias_imports: vec![PhpDocTypeAliasImport {
+                        name: "ExternalPayload".to_string(),
+                        source_alias: "Payload".to_string(),
+                        source_type: "Vendor\\Package\\Thing".to_string(),
+                    }],
+                },
+                references: vec![
+                    SymbolReference {
+                        target_fqn: "App\\Foo".to_string(),
+                        target_kind: PhpSymbolKind::Class,
+                        range: (5, 4, 5, 7),
+                        is_declaration: true,
+                        starts_with_dollar: false,
+                        receiver: SymbolReferenceReceiver::None,
+                    },
+                    SymbolReference {
+                        target_fqn: "App\\Foo::bar".to_string(),
+                        target_kind: PhpSymbolKind::Method,
+                        range: (8, 10, 8, 13),
+                        is_declaration: false,
+                        starts_with_dollar: false,
+                        receiver: SymbolReferenceReceiver::ResolvedType {
+                            type_fqn: "App\\Foo".to_string(),
+                        },
+                    },
+                    SymbolReference {
+                        target_fqn: "App\\Foo::$name".to_string(),
+                        target_kind: PhpSymbolKind::Property,
+                        range: (9, 15, 9, 20),
+                        is_declaration: false,
+                        starts_with_dollar: true,
+                        receiver: SymbolReferenceReceiver::StaticClass {
+                            class_fqn: "App\\Foo".to_string(),
+                        },
+                    },
+                    SymbolReference {
+                        target_fqn: "App\\Foo::missing".to_string(),
+                        target_kind: PhpSymbolKind::Method,
+                        range: (10, 15, 10, 22),
+                        is_declaration: false,
+                        starts_with_dollar: false,
+                        receiver: SymbolReferenceReceiver::Unresolved,
+                    },
+                ],
+            }],
+            top_level: CachedTopLevelSymbols {
+                types: vec![class_symbol],
+                functions: vec![function_symbol],
+                constants: vec![constant_symbol],
+            },
+        }
+    }
+
     fn test_config() -> IndexCacheConfig {
         IndexCacheConfig {
             namespace: CacheNamespace::Workspace,
@@ -672,6 +857,30 @@ mod tests {
             stub_extensions: vec!["Core".to_string()],
             stubs_hash: 42,
         }
+    }
+
+    #[test]
+    fn cache_schema_fixture_matches_version_guard() {
+        let cache = cache_schema_fixture();
+        assert_eq!(cache.schema_version, CACHE_SCHEMA_VERSION);
+        assert_eq!(
+            CACHE_SCHEMA_VERSION, CACHE_SCHEMA_FIXTURE_VERSION,
+            "CACHE_SCHEMA_VERSION changed; update CACHE_SCHEMA_FIXTURE_* constants together"
+        );
+
+        let bytes = bincode::serialize(&cache).unwrap();
+        assert_eq!(
+            bytes.len(),
+            CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN,
+            "serialized cache fixture size changed; bump CACHE_SCHEMA_VERSION and update \
+             CACHE_SCHEMA_FIXTURE_* constants together"
+        );
+        assert_eq!(
+            stable_hash_bytes(&bytes),
+            CACHE_SCHEMA_FIXTURE_HASH,
+            "serialized cache fixture hash changed; bump CACHE_SCHEMA_VERSION and update \
+             CACHE_SCHEMA_FIXTURE_* constants together"
+        );
     }
 
     #[test]
@@ -713,6 +922,88 @@ mod tests {
         assert_eq!(report.loaded_files, 1);
         assert!(report.parse_files.is_empty());
         assert!(loaded.resolve_fqn("App\\Foo").is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_invalidates_stale_schema_version() {
+        let root = unique_temp_dir("stale-schema");
+        let file = root.join("Foo.php");
+        fs::write(&file, "<?php class Foo {}").unwrap();
+        let uri = path_to_uri(&file).unwrap();
+
+        let index = WorkspaceIndex::new();
+        index.update_file(
+            &uri,
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![make_symbol(&uri)],
+                ..Default::default()
+            },
+        );
+
+        let config = test_config();
+        let mut cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+        cache.schema_version = CACHE_SCHEMA_VERSION - 1;
+        let cache_path = root.join("index.bin");
+        save_cache_atomic(&cache_path, &cache).unwrap();
+
+        let loaded = WorkspaceIndex::new();
+        let report = load_valid_cached_files(
+            &loaded,
+            &cache_path,
+            &root,
+            std::slice::from_ref(&file),
+            &config,
+        );
+
+        assert_eq!(report.loaded_files, 0);
+        assert_eq!(report.missing_files, 1);
+        assert_eq!(report.parse_files, vec![file.clone()]);
+        assert!(
+            report
+                .miss_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("schema version mismatch")),
+            "unexpected miss reason: {:?}",
+            report.miss_reason
+        );
+        assert!(loaded.resolve_fqn("App\\Foo").is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_bincode_cache_is_a_cache_miss() {
+        let root = unique_temp_dir("malformed-bincode");
+        let file = root.join("Foo.php");
+        fs::write(&file, "<?php class Foo {}").unwrap();
+        let cache_path = root.join("index.bin");
+        fs::write(&cache_path, [0xff]).unwrap();
+
+        let loaded = WorkspaceIndex::new();
+        let config = test_config();
+        let report = load_valid_cached_files(
+            &loaded,
+            &cache_path,
+            &root,
+            std::slice::from_ref(&file),
+            &config,
+        );
+
+        assert_eq!(report.loaded_files, 0);
+        assert_eq!(report.missing_files, 1);
+        assert_eq!(report.parse_files, vec![file.clone()]);
+        assert!(
+            report
+                .miss_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("failed to load cache:")),
+            "unexpected miss reason: {:?}",
+            report.miss_reason
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
