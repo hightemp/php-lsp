@@ -3671,7 +3671,7 @@ change.
     - `static::make()->` member completion;
     - `parent::make()->` member completion in a child class.
 
-- [ ] **PHB-005** Make nullsafe member-access trimming precise.
+- [x] **PHB-005** Make nullsafe member-access trimming precise. *(done 2026-06-01)*
   - Audit finding: `trim_end_matches('?')` removes all trailing question marks
     before `->`, not just the single nullsafe marker.
   - Affected code:
@@ -3686,7 +3686,7 @@ change.
     - ternary or coalesce expression before a member access is not distorted by
       broad trailing-`?` trimming.
 
-- [ ] **PHB-006** Include `target_kind` in reference dedup sort keys.
+- [ ] **PHB-006** Include `target_kind` in reference dedup sort keys. *(in progress 2026-06-01)*
   - Audit finding: `collect_symbol_references_in_file` sorts references without
     every field used by `dedup_by`, so equivalent duplicate records may not be
     adjacent.

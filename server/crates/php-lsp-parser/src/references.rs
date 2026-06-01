@@ -196,22 +196,53 @@ pub fn collect_symbol_references_in_file_with_resolvers(
         resolver,
         callable_resolver,
     );
+    sort_and_dedup_symbol_references(&mut references);
+    references
+}
+
+fn sort_and_dedup_symbol_references(references: &mut Vec<SymbolReference>) {
     references.sort_by(|left, right| {
         left.target_fqn
             .cmp(&right.target_fqn)
+            .then_with(|| {
+                symbol_reference_kind_rank(left.target_kind)
+                    .cmp(&symbol_reference_kind_rank(right.target_kind))
+            })
             .then_with(|| left.range.cmp(&right.range))
             .then_with(|| left.is_declaration.cmp(&right.is_declaration))
+            .then_with(|| left.starts_with_dollar.cmp(&right.starts_with_dollar))
             .then_with(|| left.receiver.cmp(&right.receiver))
     });
-    references.dedup_by(|left, right| {
+    references.dedup_by(symbol_references_equal_for_dedup);
+}
+
+fn symbol_references_equal_for_dedup(left: &mut SymbolReference, right: &mut SymbolReference) -> bool {
+    symbol_references_have_same_dedup_key(left, right)
+}
+
+fn symbol_references_have_same_dedup_key(left: &SymbolReference, right: &SymbolReference) -> bool {
         left.target_fqn == right.target_fqn
             && left.target_kind == right.target_kind
             && left.range == right.range
             && left.is_declaration == right.is_declaration
             && left.starts_with_dollar == right.starts_with_dollar
             && left.receiver == right.receiver
-    });
-    references
+}
+
+fn symbol_reference_kind_rank(kind: PhpSymbolKind) -> u8 {
+    match kind {
+        PhpSymbolKind::Class => 0,
+        PhpSymbolKind::Interface => 1,
+        PhpSymbolKind::Trait => 2,
+        PhpSymbolKind::Enum => 3,
+        PhpSymbolKind::Function => 4,
+        PhpSymbolKind::Method => 5,
+        PhpSymbolKind::Property => 6,
+        PhpSymbolKind::ClassConstant => 7,
+        PhpSymbolKind::GlobalConstant => 8,
+        PhpSymbolKind::EnumCase => 9,
+        PhpSymbolKind::Namespace => 10,
+    }
 }
 
 fn collect_symbol_references_walk(
@@ -1348,6 +1379,22 @@ mod tests {
         collect_symbol_references_in_file(tree, code, &file_symbols)
     }
 
+    fn synthetic_symbol_reference(
+        target_kind: PhpSymbolKind,
+        starts_with_dollar: bool,
+    ) -> SymbolReference {
+        SymbolReference {
+            target_fqn: "App\\Target::member".to_string(),
+            target_kind,
+            range: (4, 8, 4, 14),
+            is_declaration: false,
+            starts_with_dollar,
+            receiver: SymbolReferenceReceiver::ResolvedType {
+                type_fqn: "App\\Target".to_string(),
+            },
+        }
+    }
+
     fn find_var_refs_at(
         code: &str,
         line: u32,
@@ -1482,6 +1529,42 @@ echo RenameTarget::STATE_ACTIVE;
         );
         // declaration + 2 usages
         assert_eq!(refs.len(), 3, "Should find declaration + 2 constant usages");
+    }
+
+    #[test]
+    fn test_symbol_reference_sort_key_matches_dedup_key() {
+        let duplicate_method = synthetic_symbol_reference(PhpSymbolKind::Method, false);
+        let distinct_property_same_range =
+            synthetic_symbol_reference(PhpSymbolKind::Property, false);
+        let distinct_method_with_dollar =
+            synthetic_symbol_reference(PhpSymbolKind::Method, true);
+        let mut refs = vec![
+            duplicate_method.clone(),
+            distinct_property_same_range,
+            duplicate_method,
+            distinct_method_with_dollar,
+        ];
+
+        sort_and_dedup_symbol_references(&mut refs);
+
+        assert_eq!(
+            refs.len(),
+            3,
+            "same-kind duplicates should collapse, but different kind/dollar state must survive"
+        );
+        assert_eq!(
+            refs.iter()
+                .filter(|reference| reference.target_kind == PhpSymbolKind::Method
+                    && !reference.starts_with_dollar)
+                .count(),
+            1
+        );
+        assert!(refs.iter().any(|reference| {
+            reference.target_kind == PhpSymbolKind::Property && !reference.starts_with_dollar
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_kind == PhpSymbolKind::Method && reference.starts_with_dollar
+        }));
     }
 
     #[test]

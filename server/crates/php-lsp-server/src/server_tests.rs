@@ -1315,6 +1315,45 @@ class Demo {
 }
 
 #[test]
+fn test_compute_diagnostics_allows_nullsafe_member_access() {
+    let uri = "file:///nullsafe-members.php";
+    let code = r#"<?php
+namespace App;
+
+class Session {
+    public string $id;
+    public function get(string $key): string { return ''; }
+}
+
+class Demo {
+    public function run(?Session $session): void {
+        $session?->get('token');
+        echo $session?->id;
+    }
+}
+"#;
+
+    let mut parser = FileParser::new();
+    parser.parse_full(code);
+
+    let index = WorkspaceIndex::new();
+    let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+    index.update_file(uri, symbols);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    assert_no_diagnostic_containing(&messages, "Unknown method: App\\Session::get");
+    assert_no_diagnostic_containing(&messages, "Unknown property: App\\Session::$id");
+}
+
+#[test]
 fn test_compute_diagnostics_skips_members_on_unindexed_imported_types() {
     let uri = "file:///external-client.php";
     let code = r#"<?php

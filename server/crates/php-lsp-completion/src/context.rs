@@ -212,10 +212,7 @@ fn check_member_access(
         let after_arrow = &trimmed[arrow_pos + 2..];
         // Ensure after arrow is a valid identifier prefix or empty
         if after_arrow.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            let before_arrow = trimmed[..arrow_pos]
-                .trim_end()
-                .trim_end_matches('?')
-                .trim_end();
+            let before_arrow = receiver_text_before_member_arrow(&trimmed[..arrow_pos]);
 
             // Walk up to find the object
             let object_expr = if !before_arrow.is_empty() {
@@ -235,6 +232,14 @@ fn check_member_access(
     }
 
     None
+}
+
+fn receiver_text_before_member_arrow(text: &str) -> &str {
+    let before_arrow = text.trim_end();
+    before_arrow
+        .strip_suffix('?')
+        .unwrap_or(before_arrow)
+        .trim_end()
 }
 
 fn member_access_mode_after_cursor(text_after: &str) -> MemberAccessMode {
@@ -634,6 +639,37 @@ mod tests {
             }
             other => panic!("Expected MemberAccess, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_member_access_context_trims_single_nullsafe_marker() {
+        let code = "<?php\n$session?->get";
+        let ctx = detect_at_byte_col(code, 1, 14);
+        match ctx {
+            CompletionContext::MemberAccess {
+                object_expr,
+                member_prefix,
+                ..
+            } => {
+                assert_eq!(object_expr, "$session");
+                assert_eq!(member_prefix, "get");
+            }
+            other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_receiver_text_strips_only_one_question_mark() {
+        assert_eq!(receiver_text_before_member_arrow("$session?"), "$session");
+        assert_eq!(receiver_text_before_member_arrow("$session??"), "$session?");
+        assert_eq!(
+            receiver_text_before_member_arrow("$items[$i ?? 0]?"),
+            "$items[$i ?? 0]"
+        );
+        assert_eq!(
+            receiver_text_before_member_arrow("$flag ? $left : $right"),
+            "$flag ? $left : $right"
+        );
     }
 
     #[test]

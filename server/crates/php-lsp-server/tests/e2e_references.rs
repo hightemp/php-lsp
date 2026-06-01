@@ -357,6 +357,104 @@ async fn test_workspace_references_use_indexed_closed_files() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_references_do_not_return_duplicate_locations() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Target {}
+
+function run(): void {
+    new Target();
+    new Target();
+}
+"#;
+    let uri = "file:///test/DedupReferences.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (line, col) = line_col(code, "class Target");
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(
+            2,
+            uri,
+            line,
+            col + "class ".len() as u32 + 1,
+            true,
+        ))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let locations = result
+        .as_array()
+        .unwrap_or_else(|| panic!("references result should be an array: {result}"));
+    let unique_locations: BTreeSet<_> = locations
+        .iter()
+        .map(|location| {
+            (
+                location["uri"].as_str().unwrap_or_default().to_string(),
+                location["range"]["start"]["line"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX),
+                location["range"]["start"]["character"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX),
+                location["range"]["end"]["line"].as_u64().unwrap_or(u64::MAX),
+                location["range"]["end"]["character"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        locations.len(),
+        unique_locations.len(),
+        "references response should not contain duplicate locations: {result}"
+    );
+    assert_eq!(
+        location_start_lines(&result),
+        BTreeSet::from([3, 6, 7]),
+        "references should include declaration and both usages exactly once: {result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_rename() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
