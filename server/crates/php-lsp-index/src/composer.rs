@@ -39,8 +39,7 @@ impl NamespaceMap {
 
         for (prefix, dirs) in &self.psr0 {
             if let Some(relative) = fqn.strip_prefix(prefix.as_str()) {
-                // PSR-0: underscores in class name map to directory separators
-                let relative_path = relative.replace(['\\', '_'], "/") + ".php";
+                let relative_path = psr0_relative_path(relative);
                 for dir in dirs {
                     results.push(dir.join(&relative_path));
                 }
@@ -67,6 +66,22 @@ impl NamespaceMap {
             dirs.push(p.as_path());
         }
         dirs
+    }
+}
+
+fn psr0_relative_path(relative: &str) -> String {
+    // PSR-0 gives underscores special meaning only in the unqualified class name.
+    let (namespace, class_name) = relative
+        .rsplit_once('\\')
+        .map_or(("", relative), |(namespace, class_name)| {
+            (namespace, class_name)
+        });
+    let class_path = class_name.replace('_', "/");
+
+    if namespace.is_empty() {
+        format!("{class_path}.php")
+    } else {
+        format!("{}/{}.php", namespace.replace('\\', "/"), class_path)
     }
 }
 
@@ -236,6 +251,54 @@ mod tests {
         assert_eq!(
             paths[0],
             PathBuf::from("/project/src/Service/UserService.php")
+        );
+    }
+
+    #[test]
+    fn test_resolve_class_psr0_keeps_namespace_underscores() {
+        let json = r#"{
+            "autoload": {
+                "psr-0": {
+                    "App\\": "src/"
+                }
+            }
+        }"#;
+        let map = parse_composer_json_str(json, Path::new("/project")).unwrap();
+        let paths = map.resolve_class_to_paths("App\\Foo_Bar\\Baz");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], PathBuf::from("/project/src/Foo_Bar/Baz.php"));
+    }
+
+    #[test]
+    fn test_resolve_class_psr0_maps_only_class_name_underscores() {
+        let json = r#"{
+            "autoload": {
+                "psr-0": {
+                    "App\\": "src/"
+                }
+            }
+        }"#;
+        let map = parse_composer_json_str(json, Path::new("/project")).unwrap();
+        let paths = map.resolve_class_to_paths("App\\Foo\\Legacy_Class");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], PathBuf::from("/project/src/Foo/Legacy/Class.php"));
+    }
+
+    #[test]
+    fn test_resolve_class_psr0_global_pear_style_class() {
+        let json = r#"{
+            "autoload": {
+                "psr-0": {
+                    "": "legacy/"
+                }
+            }
+        }"#;
+        let map = parse_composer_json_str(json, Path::new("/project")).unwrap();
+        let paths = map.resolve_class_to_paths("Legacy_Class_Name");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/project/legacy/Legacy/Class/Name.php")
         );
     }
 

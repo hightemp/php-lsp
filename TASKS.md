@@ -3869,7 +3869,7 @@ change.
     - rejected malformed literal forms;
     - no regression for existing literal type compatibility tests.
 
-- [ ] **PHB-017** Fix PSR-0 underscore path mapping.
+- [x] **PHB-017** Fix PSR-0 underscore path mapping. *(done 2026-06-01)*
   - Audit finding: PSR-0 resolution replaces underscores across the whole
     relative namespace path, but PSR-0 maps underscores only in the class-name
     segment.
