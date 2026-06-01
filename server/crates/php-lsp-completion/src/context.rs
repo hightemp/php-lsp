@@ -75,15 +75,27 @@ pub enum CompletionContext {
     None,
 }
 
-/// Determine the completion context at a position.
-pub fn detect_context(
+/// Determine the completion context at a tree-sitter byte-column position.
+///
+/// LSP callers must convert `Position.character` from UTF-16 to a byte column
+/// before calling this function. The byte column is clamped to a valid UTF-8
+/// boundary on the requested source line before any string slicing.
+pub fn detect_context_at_byte_col(
     tree: &Tree,
     source: &str,
     line: u32,
-    character: u32,
+    byte_col: u32,
     file_symbols: &FileSymbols,
 ) -> CompletionContext {
-    let point = Point::new(line as usize, character as usize);
+    let (line_start, line_end) = match line_byte_bounds_without_newline(source, line) {
+        Some(bounds) => bounds,
+        None => return CompletionContext::None,
+    };
+    let cursor_offset =
+        clamp_line_byte_col_to_char_boundary(source, line_start, line_end, byte_col);
+    let cursor_col = cursor_offset - line_start;
+
+    let point = Point::new(line as usize, cursor_col);
     let root = tree.root_node();
 
     // Find the node at position
@@ -93,14 +105,7 @@ pub fn detect_context(
     };
 
     // Get the text before cursor on the current line
-    let line_start = source
-        .lines()
-        .take(line as usize)
-        .map(|l| l.len() + 1)
-        .sum::<usize>();
-    let cursor_offset = line_start + character as usize;
-    let line_text = source.lines().nth(line as usize).unwrap_or("");
-    let cursor_col = std::cmp::min(character as usize, line_text.len());
+    let line_text = &source[line_start..line_end];
     let text_before = &line_text[..cursor_col];
     let text_after = &line_text[cursor_col..];
 
@@ -149,6 +154,48 @@ pub fn detect_context(
     }
 
     CompletionContext::Free { prefix }
+}
+
+fn line_byte_bounds_without_newline(source: &str, line: u32) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut start = 0usize;
+
+    for _ in 0..line {
+        let next_newline = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|idx| start + idx)?;
+        start = next_newline + 1;
+    }
+
+    if start > bytes.len() {
+        return None;
+    }
+
+    let mut end = bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|idx| start + idx)
+        .unwrap_or(bytes.len());
+
+    if end > start && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+
+    Some((start, end))
+}
+
+fn clamp_line_byte_col_to_char_boundary(
+    source: &str,
+    line_start: usize,
+    line_end: usize,
+    byte_col: u32,
+) -> usize {
+    let mut cursor = line_start.saturating_add(byte_col as usize).min(line_end);
+    while cursor > line_start && !source.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
 }
 
 /// Check for `->` member access pattern.
@@ -519,12 +566,12 @@ mod tests {
     use php_lsp_parser::parser::FileParser;
     use php_lsp_parser::symbols::extract_file_symbols;
 
-    fn detect(code: &str, line: u32, col: u32) -> CompletionContext {
+    fn detect_at_byte_col(code: &str, line: u32, byte_col: u32) -> CompletionContext {
         let mut parser = FileParser::new();
         parser.parse_full(code);
         let tree = parser.tree().unwrap();
         let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
-        detect_context(tree, code, line, col, &file_symbols)
+        detect_context_at_byte_col(tree, code, line, byte_col, &file_symbols)
     }
 
     fn detect_at_marker(code: &str) -> CompletionContext {
@@ -534,15 +581,15 @@ mod tests {
         let prefix = &code[..offset];
         let line = prefix.bytes().filter(|b| *b == b'\n').count() as u32;
         let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-        let col = prefix[line_start..].len() as u32;
+        let byte_col = prefix[line_start..].len() as u32;
 
-        detect(&code, line, col)
+        detect_at_byte_col(&code, line, byte_col)
     }
 
     #[test]
     fn test_member_access_context() {
         let code = "<?php\n$obj->meth";
-        let ctx = detect(code, 1, 11);
+        let ctx = detect_at_byte_col(code, 1, 11);
         match ctx {
             CompletionContext::MemberAccess {
                 object_expr,
@@ -561,7 +608,7 @@ mod tests {
     #[test]
     fn test_member_access_context_detects_write_assignment() {
         let code = "<?php\n$subject->dirty = false;";
-        let ctx = detect(code, 1, 10);
+        let ctx = detect_at_byte_col(code, 1, 10);
         match ctx {
             CompletionContext::MemberAccess {
                 object_expr,
@@ -580,7 +627,7 @@ mod tests {
     #[test]
     fn test_member_access_context_inside_parenthesized_condition() {
         let code = "<?php\nif ($reflMethod->isSt) {}";
-        let ctx = detect(code, 1, 17);
+        let ctx = detect_at_byte_col(code, 1, 17);
         match ctx {
             CompletionContext::MemberAccess {
                 object_expr,
@@ -597,7 +644,7 @@ mod tests {
     #[test]
     fn test_member_access_context_keeps_property_chain() {
         let code = "<?php\n$this->client->reques";
-        let ctx = detect(code, 1, 21);
+        let ctx = detect_at_byte_col(code, 1, 21);
         match ctx {
             CompletionContext::MemberAccess {
                 object_expr,
@@ -614,7 +661,7 @@ mod tests {
     #[test]
     fn test_member_access_context_keeps_array_access_object() {
         let code = "<?php\n$users[0]->";
-        let ctx = detect(code, 1, 11);
+        let ctx = detect_at_byte_col(code, 1, 11);
         match ctx {
             CompletionContext::MemberAccess {
                 object_expr,
@@ -631,7 +678,7 @@ mod tests {
     #[test]
     fn test_array_key_context_inside_string_key() {
         let code = "<?php\n$row['fo";
-        let ctx = detect(code, 1, 8);
+        let ctx = detect_at_byte_col(code, 1, 8);
         match ctx {
             CompletionContext::ArrayKey {
                 array_expr,
@@ -649,7 +696,7 @@ mod tests {
     #[test]
     fn test_array_key_context_keeps_nested_array_access_base() {
         let code = "<?php\n$row['meta']['";
-        let ctx = detect(code, 1, 14);
+        let ctx = detect_at_byte_col(code, 1, 14);
         match ctx {
             CompletionContext::ArrayKey {
                 array_expr,
@@ -667,7 +714,7 @@ mod tests {
     #[test]
     fn test_array_key_context_after_open_bracket() {
         let code = "<?php\n$row[";
-        let ctx = detect(code, 1, 5);
+        let ctx = detect_at_byte_col(code, 1, 5);
         match ctx {
             CompletionContext::ArrayKey {
                 array_expr,
@@ -685,7 +732,7 @@ mod tests {
     #[test]
     fn test_member_access_context_keeps_method_array_access_object() {
         let code = "<?php\n$repo->findAll()[0]->";
-        let ctx = detect(code, 1, 21);
+        let ctx = detect_at_byte_col(code, 1, 21);
         match ctx {
             CompletionContext::MemberAccess {
                 object_expr,
@@ -702,7 +749,7 @@ mod tests {
     #[test]
     fn test_member_access_context_keeps_parenthesized_new_expression() {
         let code = "<?php\n(new Uri('https://example.com'))->set";
-        let ctx = detect(code, 1, 38);
+        let ctx = detect_at_byte_col(code, 1, 38);
         match ctx {
             CompletionContext::MemberAccess {
                 object_expr,
@@ -719,7 +766,7 @@ mod tests {
     #[test]
     fn test_member_access_context_keeps_bare_new_expression() {
         let code = "<?php\nnew \\ReflectionClass($service)->is";
-        let ctx = detect(code, 1, 35);
+        let ctx = detect_at_byte_col(code, 1, 35);
         match ctx {
             CompletionContext::MemberAccess {
                 object_expr,
@@ -736,7 +783,7 @@ mod tests {
     #[test]
     fn test_static_access_context() {
         let code = "<?php\nFoo::bar";
-        let ctx = detect(code, 1, 8);
+        let ctx = detect_at_byte_col(code, 1, 8);
         match ctx {
             CompletionContext::StaticAccess {
                 class_expr,
@@ -764,6 +811,62 @@ mod tests {
                 assert_eq!(member_prefix, "");
             }
             other => panic!("Expected StaticAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_context_clamps_invalid_byte_col_to_utf8_boundary() {
+        for code in ["<?php\n$привет", "<?php\n$中文", "<?php\n$བོད"] {
+            let ctx = detect_at_byte_col(code, 1, 2);
+            match ctx {
+                CompletionContext::Variable { prefix } => {
+                    assert_eq!(prefix, "");
+                }
+                other => panic!("Expected Variable for {code:?}, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_static_access_context_on_crlf_line() {
+        for code in [
+            "<?php\r\n// Привет\r\nTimezones::/*caret*/get",
+            "<?php\r\n// 中文测试\r\nTimezones::/*caret*/get",
+            "<?php\r\n// བོད་ཡིག\r\nTimezones::/*caret*/get",
+        ] {
+            let ctx = detect_at_marker(code);
+            match ctx {
+                CompletionContext::StaticAccess {
+                    class_expr,
+                    member_prefix,
+                    ..
+                } => {
+                    assert_eq!(class_expr, "Timezones");
+                    assert_eq!(member_prefix, "");
+                }
+                other => panic!("Expected StaticAccess for {code:?}, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_member_access_context_after_chinese_and_tibetan_text_on_same_line() {
+        for code in [
+            "<?php\n$label = '中文测试'; $target->/*caret*/complete",
+            "<?php\n$label = 'བོད་ཡིག'; $target->/*caret*/complete",
+        ] {
+            let ctx = detect_at_marker(code);
+            match ctx {
+                CompletionContext::MemberAccess {
+                    object_expr,
+                    member_prefix,
+                    ..
+                } => {
+                    assert_eq!(object_expr, "$target");
+                    assert_eq!(member_prefix, "");
+                }
+                other => panic!("Expected MemberAccess for {code:?}, got {:?}", other),
+            }
         }
     }
 
@@ -800,7 +903,7 @@ mod tests {
     #[test]
     fn test_variable_context() {
         let code = "<?php\n$use";
-        let ctx = detect(code, 1, 4);
+        let ctx = detect_at_byte_col(code, 1, 4);
         match ctx {
             CompletionContext::Variable { prefix } => {
                 assert_eq!(prefix, "use");
@@ -812,7 +915,7 @@ mod tests {
     #[test]
     fn test_use_statement_context_uses_text_before_cursor() {
         let code = "<?php\nnamespace App;\nuse Ven;\n";
-        let ctx = detect(code, 2, 7);
+        let ctx = detect_at_byte_col(code, 2, 7);
         match ctx {
             CompletionContext::UseStatement { prefix } => {
                 assert_eq!(prefix, "Ven");
@@ -824,7 +927,7 @@ mod tests {
     #[test]
     fn test_free_context() {
         let code = "<?php\narray_m";
-        let ctx = detect(code, 1, 7);
+        let ctx = detect_at_byte_col(code, 1, 7);
         match ctx {
             CompletionContext::Free { prefix } => {
                 assert_eq!(prefix, "array_m");

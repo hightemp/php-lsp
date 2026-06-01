@@ -68,6 +68,86 @@ echo $
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_context_uses_utf16_lsp_position_after_non_ascii_text() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    for (idx, (name, text)) in [
+        ("cyrillic-emoji", "Привет 😀"),
+        ("chinese", "中文测试"),
+        ("tibetan", "བོད་ཡིག"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let code_with_marker = format!(
+            "<?php\nclass Target {{ public function complete(): void {{}} }}\nfunction run(Target $target): void {{\n    $label = '{text}'; $target->/*caret*/\n}}\n"
+        );
+        let marker = "/*caret*/";
+        let marker_offset = code_with_marker
+            .find(marker)
+            .expect("test code should contain marker");
+        let code = code_with_marker.replace(marker, "");
+        let prefix = &code[..marker_offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = prefix[line_start..].encode_utf16().count() as u32;
+        let uri = format!("file:///test/utf16-completion-context-{name}.php");
+
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(&uri, &code))
+            .await
+            .unwrap();
+
+        let resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(2 + idx as i64, &uri, line, character))
+            .await
+            .unwrap();
+        let result = extract_result(resp);
+        let labels: Vec<String> = completion_items_from_result(&result)
+            .iter()
+            .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            labels.contains(&"complete".to_string()),
+            "completion should use the UTF-16 LSP position after {name} text, got: {labels:?}; result: {result}"
+        );
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_framework_string_key_completion_and_definition() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

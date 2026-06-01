@@ -3468,9 +3468,402 @@ while implementing these tasks.
       known limitations;
     - production-ready claims are backed by the audit regression suite.
 
+## Milestone: LLM Audit Correctness Follow-up (2026-06-12 -> 2026-06-26)
+
+**Goal:** triage and fix the new LLM audit findings after the PHA foundation
+milestone. Keep the work focused on correctness, cache/async reliability, and
+small maintainability guards. Do not add project-specific hardcode, and keep
+architecture documentation/risk notes current when behavior or invariants
+change.
+
+### Scope rules
+
+- Start this milestone after `PHA-041`, or explicitly carry any remaining
+  production-risk documentation updates into `PHB-018`.
+- Use Serena for Rust symbol search/refactoring when touching code.
+- For each bug fix, add the narrowest regression test that fails before the
+  change and passes after it.
+- Keep cosmetic cleanup out of critical bug tasks unless it is required to make
+  the fix safe.
+
+### Exit criteria
+
+- Critical correctness tasks `PHB-001`, `PHB-003`, `PHB-004`, `PHB-007`, and
+  `PHB-008` are fixed and covered by tests.
+- Cache/schema invariants from `PHB-010` and `PHB-015` are documented or
+  enforced by tests/tooling.
+- Follow-up docs/risk register list only the remaining limitations with clear
+  severity.
+- Validation before closing the milestone:
+  - `cargo fmt --all --check`;
+  - `cargo clippy --all-targets -- -D warnings`;
+  - `cargo test --all`;
+  - `npm run lint`;
+  - `npm run build`;
+  - focused real-project smoke on available local validation workspaces when a
+    task can affect indexing, navigation, completion, references, diagnostics,
+    templates, or cache behavior.
+
+### Critical correctness
+
+- [x] **PHB-001** Fix `detect_context` byte/UTF-16/UTF-8 and CRLF handling. *(done 2026-06-01)*
+  - Started 2026-06-01: fixing the completion-context cursor contract and
+    adding non-ASCII/CRLF regressions for direct context detection and the real
+    LSP completion path.
+  - Completed 2026-06-01: renamed the completion context entry point to
+    `detect_context_at_byte_col`, made the byte-column contract explicit, and
+    updated the LSP completion call site to pass the already-converted byte
+    column.
+  - Completed 2026-06-01: replaced `source.lines()`/`+1` line-offset handling
+    with byte-based line bounds that preserve CRLF width, clamp completion
+    cursor columns to valid UTF-8 boundaries, and avoid slicing `&str` at
+    invalid byte offsets.
+  - Regression tests:
+    - direct context detection clamps a byte column inside a Cyrillic character
+      without panicking; follow-up also covers Chinese and Tibetan byte columns;
+    - direct context detection works on a CRLF line after Cyrillic, Chinese, and
+      Tibetan text;
+    - direct member-access context detection works after Chinese and Tibetan
+      text on the same line;
+    - e2e completion sends a real UTF-16 LSP position after Cyrillic text and an
+      emoji, Chinese text, and Tibetan text and still resolves member
+      completion.
+  - Follow-up requested 2026-06-01: add explicit Chinese and Tibetan text
+    coverage for both direct context detection and the real LSP completion
+    path.
+  - Follow-up completed 2026-06-01: expanded the direct and e2e completion
+    regressions to cover Chinese and Tibetan text in addition to the original
+    Cyrillic/emoji case.
+  - Validation:
+    - `cargo test -p php-lsp-completion context -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_completion test_completion_context_uses_utf16_lsp_position_after_non_ascii_text -- --nocapture`;
+    - `cargo test -p php-lsp-completion`;
+    - `cargo test -p php-lsp-server --test e2e_completion`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy -p php-lsp-completion --all-targets -- -D warnings`;
+    - `cargo clippy -p php-lsp-server --test e2e_completion -- -D warnings`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`.
+  - Audit finding: `detect_context` mixes byte offsets, LSP UTF-16 columns, and
+    byte slicing assumptions; non-ASCII text and CRLF files can produce invalid
+    UTF-8 slices or wrong offsets.
+  - Affected code:
+    - `server/crates/php-lsp-completion/src/context.rs`;
+    - call sites passing cursor positions from `php-lsp-server`.
+  - Implementation:
+    - make the API contract explicit: either accept a byte column and never
+      treat it as a character column, or accept an LSP position and convert
+      through a UTF-16 line index in one place;
+    - compute line starts with newline width preserved, including CRLF;
+    - avoid `&str[..col]` slicing unless `col` is known to be a UTF-8 boundary;
+    - update helper/test names so byte columns and UTF-16 columns cannot be
+      confused.
+  - Regression tests:
+    - completion context after Cyrillic/emoji text on the same line;
+    - marker/context detection in a CRLF file;
+    - real LSP completion request path with UTF-16 input, not only direct
+      byte-marker helper tests.
+
+- [ ] **PHB-002** Audit and lock down array-key access byte slicing invariants.
+  - Audit finding: `check_array_key_access` currently appears safe because it
+    only slices at ASCII quote/bracket byte positions, but the pattern is easy
+    to regress.
+  - Affected code:
+    - `server/crates/php-lsp-completion/src/context.rs`.
+  - Implementation:
+    - keep byte-position operations local and documented only where they are
+      guaranteed to point at ASCII tokens;
+    - replace any ambiguous variable names that imply character indexes;
+    - avoid broad refactors unless tests expose a real bug.
+  - Regression tests:
+    - array-shape key completion after non-ASCII text before the key;
+    - quoted keys containing non-ASCII characters;
+    - unfinished quoted key before the cursor.
+
+- [ ] **PHB-003** Invalidate Twig render-context disk cache consistently on PHP changes.
+  - Audit finding: `didChange` refreshes open Twig documents through open PHP
+    buffers, but request-time disk Twig context cache invalidation is not
+    symmetric with save/watched-file/config invalidation.
+  - Affected code:
+    - `server/crates/php-lsp-server/src/lsp/diagnostics.rs`;
+    - `server/crates/php-lsp-server/src/lsp/templates.rs`;
+    - `server/crates/php-lsp-server/src/indexing/workspace.rs`.
+  - Implementation:
+    - define the cache ownership model for open PHP buffers vs disk-scanned PHP
+      files;
+    - invalidate only the affected Twig context cache entries when possible, or
+      clear the bounded cache when the dependency graph is not precise enough;
+    - keep the refresh bounded for large Symfony workspaces.
+  - Regression tests:
+    - edit a controller/render call while Twig context cache already contains a
+      disk result;
+    - close/open PHP files around the change and verify Twig completion/hover
+      does not use stale disk context;
+    - save and watched-file paths keep current behavior.
+
+- [ ] **PHB-004** Resolve `self`/`static`/`parent` in static-call chain type inference.
+  - Audit finding: `infer_static_call_expression_type` rejects
+    `self`, `static`, and `parent`, while definition/hover resolution supports
+    these scope names.
+  - Affected code:
+    - `server/crates/php-lsp-server/src/lsp/completion_helpers.rs`;
+    - current-class completion context from `php-lsp-completion`.
+  - Implementation:
+    - reuse the existing scope resolution rules instead of duplicating
+      `self`/`static`/`parent` handling;
+    - preserve late-static-bound behavior where the current type model cannot
+      prove a narrower subtype;
+    - keep failure conservative rather than returning an unrelated class.
+  - Regression tests:
+    - `self::make()->` member completion;
+    - `static::make()->` member completion;
+    - `parent::make()->` member completion in a child class.
+
+- [ ] **PHB-005** Make nullsafe member-access trimming precise.
+  - Audit finding: `trim_end_matches('?')` removes all trailing question marks
+    before `->`, not just the single nullsafe marker.
+  - Affected code:
+    - `server/crates/php-lsp-server/src/lsp/diagnostics.rs`;
+    - any shared member-access parser helper if extracted.
+  - Implementation:
+    - replace aggressive suffix trimming with a single-token check such as
+      `strip_suffix('?')` where appropriate;
+    - confirm ordinary `->` and `?->` diagnostics keep existing behavior.
+  - Regression tests:
+    - nullsafe property/method chain still infers the receiver type;
+    - ternary or coalesce expression before a member access is not distorted by
+      broad trailing-`?` trimming.
+
+- [ ] **PHB-006** Include `target_kind` in reference dedup sort keys.
+  - Audit finding: `collect_symbol_references_in_file` sorts references without
+    every field used by `dedup_by`, so equivalent duplicate records may not be
+    adjacent.
+  - Affected code:
+    - `server/crates/php-lsp-parser/src/references.rs`.
+  - Implementation:
+    - make the sort key and dedup equality key match exactly;
+    - keep declaration/reference ordering deterministic.
+  - Regression tests:
+    - synthetic same-range references with different/same `target_kind` are
+      preserved or deduplicated according to the equality rule;
+    - no duplicate reference results in a focused e2e references fixture.
+
+- [ ] **PHB-007** Recognize foreach key/value declarations through wrappers.
+  - Audit finding: `is_variable_declaration` compares foreach field node IDs
+    directly, so wrapped values such as references or destructuring may not mark
+    inner variables as declarations.
+  - Affected code:
+    - `server/crates/php-lsp-parser/src/references.rs`;
+    - compare with the foreach handling in
+      `server/crates/php-lsp-parser/src/semantic.rs`.
+  - Implementation:
+    - treat variable nodes inside foreach `key` and `value` field subtrees as
+      declarations;
+    - keep later variable usages in the foreach body as references;
+    - avoid duplicating divergent semantic/reference helper logic where a small
+      shared helper is practical.
+  - Regression tests:
+    - `foreach ($items as &$value)` declaration detection;
+    - `foreach ($items as $key => $value)` key/value declarations;
+    - destructuring/list foreach variables;
+    - references/rename do not count the declaration as a read usage.
+
+### Reliability, cache, and performance
+
+- [ ] **PHB-008** Make object-type resolve depth panic-safe with an RAII guard.
+  - Audit finding: thread-local `OBJECT_TYPE_RESOLVE_DEPTH` is restored only
+    after `try_resolve_object_type_inner`; a panic can leave a worker thread
+    with poisoned depth for the next task.
+  - Affected code:
+    - `server/crates/php-lsp-parser/src/resolve.rs`.
+  - Implementation:
+    - introduce a small guard that increments depth on creation and restores
+      the previous value in `Drop`;
+    - keep the max-depth behavior unchanged;
+    - add tests without relying on global process state leaking between tests.
+  - Regression tests:
+    - focused unit test that simulates/panics inside a guarded scope and then
+      confirms the next resolve attempt starts at the original depth;
+    - existing resolver recursion-depth tests still pass.
+
+- [ ] **PHB-009** Use `HashSet` for recursive hierarchy visited sets.
+  - Audit finding: `WorkspaceIndex::collect_members_recursive` and
+    `resolve_member_in_hierarchy` use `Vec::contains` plus repeated
+    allocations for visited class names.
+  - Affected code:
+    - `server/crates/php-lsp-index/src/workspace.rs`.
+  - Implementation:
+    - replace recursive visited vectors with `HashSet<String>` or an equivalent
+      borrowed-key structure;
+    - keep traversal order stable where user-facing ordering depends on it;
+    - avoid changing member precedence semantics.
+  - Regression tests:
+    - cyclic inheritance/trait/mixin graph does not recurse forever;
+    - member resolution result order stays compatible with current tests.
+
+- [ ] **PHB-010** Make cache metadata timestamp fallbacks explicit.
+  - Audit finding: cache metadata silently falls back to Unix epoch when
+    filesystem modification time is unavailable or before epoch.
+  - Affected code:
+    - `server/crates/php-lsp-index/src/cache.rs`.
+  - Implementation:
+    - decide whether unavailable mtime should be a recoverable cache miss, a
+      metadata flag, or an explicit log/debug condition;
+    - ensure content hash remains the correctness backstop;
+    - avoid making unusual filesystems crash the server.
+  - Regression tests:
+    - metadata equality still distinguishes same-size content changes;
+    - malformed/unavailable timestamp path is handled as documented, using a
+      test seam or platform-safe fixture where possible.
+
+### Maintainability, completion polish, and packaging guards
+
+- [ ] **PHB-011** Reduce duplicated parser helper logic where it affects behavior.
+  - Audit finding: helpers such as by-ref argument detection, argument naming,
+    variable normalization, parenthesis/type-expression parsing, and node range
+    conversion exist in multiple parser/server modules.
+  - Affected code:
+    - `server/crates/php-lsp-parser/src/resolve.rs`;
+    - `server/crates/php-lsp-parser/src/semantic.rs`;
+    - `server/crates/php-lsp-parser/src/references.rs`;
+    - `server/crates/php-lsp-parser/src/phpdoc.rs`;
+    - related `php-lsp-server/src/lsp/*` helpers.
+  - Implementation:
+    - extract only the helpers that have already diverged or block a bug fix;
+    - keep public APIs dependency-light and avoid moving server-specific logic
+      into `php-lsp-types`;
+    - add tests around the shared helper before replacing call sites.
+  - Acceptance:
+    - foreach declaration behavior from `PHB-007` does not diverge again;
+    - no broad behavior-preserving churn without a test or concrete mismatch.
+
+- [ ] **PHB-012** Improve namespace completion relevance and clean stale comments.
+  - Audit finding: namespace completion uses substring filtering and truncates
+    after generic sorting, so short prefixes can produce noisy results and drop
+    relevant matches; a stale comment remains near member sorting.
+  - Affected code:
+    - `server/crates/php-lsp-completion/src/provider.rs`.
+  - Implementation:
+    - rank prefix/exact/case-insensitive matches ahead of substring matches;
+    - truncate after relevance-aware ranking;
+    - remove or update stale comments.
+  - Regression tests:
+    - namespace completion prioritizes prefix matches over unrelated contains
+      matches;
+    - short prefixes keep exact/current-namespace candidates before truncation.
+
+- [ ] **PHB-013** Replace placeholder Cargo repository metadata.
+  - Audit finding: `server/Cargo.toml` still has
+    `repository = "https://github.com/TODO/php-lsp"`.
+  - Affected code:
+    - `server/Cargo.toml`.
+  - Implementation:
+    - set the correct repository URL if known, or remove the misleading field;
+    - keep crate metadata consistent across workspace members.
+  - Validation:
+    - `cargo metadata` succeeds;
+    - `cargo fmt --all --check`.
+
+- [ ] **PHB-014** Clarify duplicated module names and tracked auxiliary paths.
+  - Audit finding: server-side `indexing/cache.rs` and `indexing/stubs.rs`
+    are easy to confuse with `php-lsp-index/src/cache.rs` and `stubs.rs`; the
+    audit also flagged auxiliary tracked paths such as `client/node_modules`
+    README placeholders.
+  - Affected code/docs:
+    - `server/crates/php-lsp-server/src/indexing/*`;
+    - `server/crates/php-lsp-index/src/*`;
+    - `docs/architecture.md`;
+    - repository ignore/tracking rules where applicable.
+  - Implementation:
+    - update architecture docs and module comments to describe server
+      orchestration vs index-crate storage responsibilities;
+    - do not rename modules unless it materially reduces future mistakes;
+    - verify whether tracked auxiliary files are intentional before changing
+      them.
+  - Acceptance:
+    - future contributors can identify the correct cache/stubs module from the
+      docs without reading both implementations.
+
+- [ ] **PHB-015** Enforce cache schema-version bump discipline.
+  - Audit finding: `bincode` cache deserialization is not self-describing, so
+    serialized struct changes require a strict `CACHE_SCHEMA_VERSION` bump.
+  - Affected code:
+    - `server/crates/php-lsp-index/src/cache.rs`;
+    - any docs/tests describing disk cache compatibility.
+  - Implementation:
+    - document the invariant near `CACHE_SCHEMA_VERSION`;
+    - add a test fixture, schema fingerprint, or CI guard that fails when the
+      serialized cache shape changes without an intentional version update;
+    - keep malformed or legacy cache entries as cache misses, not crashes.
+  - Regression tests:
+    - stale schema is invalidated;
+    - malformed bincode remains a cache miss;
+    - schema-shape guard catches accidental serialized type changes where
+      feasible.
+
+- [ ] **PHB-016** Align PHPDoc literal parsing with supported PHP literal forms.
+  - Audit finding: `is_float_literal` and related literal helpers accept/reject
+    edge cases inconsistently, including forms such as `1.`, `-.5`, numeric
+    separators, hex integers, and scientific notation.
+  - Affected code:
+    - `server/crates/php-lsp-parser/src/phpdoc.rs`;
+    - any type-compatibility paths relying on parsed literal types.
+  - Implementation:
+    - decide the supported literal subset for PHPDoc type expressions;
+    - implement the subset consistently for int/float literals;
+    - reject ambiguous PHPDoc syntax conservatively.
+  - Regression tests:
+    - accepted float/int literal forms;
+    - rejected malformed literal forms;
+    - no regression for existing literal type compatibility tests.
+
+- [ ] **PHB-017** Fix PSR-0 underscore path mapping.
+  - Audit finding: PSR-0 resolution replaces underscores across the whole
+    relative namespace path, but PSR-0 maps underscores only in the class-name
+    segment.
+  - Affected code:
+    - `server/crates/php-lsp-index/src/composer.rs`.
+  - Implementation:
+    - split namespace path and class-name segment according to PSR-0 rules;
+    - preserve existing PSR-4/classmap behavior;
+    - keep rare PSR-0 projects working without introducing project-specific
+      exceptions.
+  - Regression tests:
+    - `App\\Foo_Bar\\Baz` keeps `Foo_Bar` as a namespace directory segment;
+    - `App\\Foo\\Legacy_Class` maps the class name underscore to
+      `Legacy/Class.php`;
+    - Composer autoload lookup still handles existing PSR-0 fixtures.
+
+### Documentation and risk follow-up
+
+- [ ] **PHB-018** Update docs and risk register for the LLM audit follow-up.
+  - Docs to update if behavior changes:
+    - `docs/architecture.md`;
+    - `docs/lsp-features.md`;
+    - `docs/production-risk-register.md`;
+    - `docs/production-baseline.md` if smoke/metrics change;
+    - README/configuration docs only when user-visible settings or claims
+      change.
+  - Acceptance:
+    - fixed audit findings are listed as closed with validation;
+    - deferred low-risk cleanup remains visible as known limitations;
+    - production claims do not overstate template, cache, or completion
+      behavior.
+
 ---
 
 ## Текущие задачи
+
+- [x] **T-2026-06-01-llm-audit-follow-up-milestone** Add the new LLM audit findings to the next milestone. *(done 2026-06-01)*
+  - Scope: convert the reported audit findings into actionable roadmap tasks
+    with priority, affected files, acceptance criteria, and validation targets.
+  - Constraint: planning/documentation only; do not change Rust behavior in this
+    task.
+  - Implemented: added the `LLM Audit Correctness Follow-up` milestone with
+    `PHB-001` through `PHB-018`, covering all reported findings and a docs/risk
+    follow-up task.
+  - Validation: Serena symbol/pattern search was used to verify key Rust entry
+    points; `git diff --check` passed.
 
 - [x] **T-2026-05-29-serena-rust-search-smoke** Test Serena search on Rust code. *(done 2026-05-29)*
   - Scope: tool smoke test only; use Serena to inspect/search Rust symbols and report whether it works.

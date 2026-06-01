@@ -166,7 +166,7 @@ impl PhpLspBackend {
         let type_cache = RequestTypeCache::new(&uri_str, self.current_document_version(&uri_str));
 
         // Detect completion context
-        let context = detect_context(&tree, &source, pos.line, byte_col, &file_symbols);
+        let context = detect_context_at_byte_col(&tree, &source, pos.line, byte_col, &file_symbols);
         let context = match context {
             php_lsp_completion::context::CompletionContext::MemberAccess {
                 object_expr,

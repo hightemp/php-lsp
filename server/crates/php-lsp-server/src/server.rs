@@ -24,7 +24,7 @@ use crate::util::lsp_text::{
 };
 use crate::util::uri::uri_to_path;
 use dashmap::DashMap;
-use php_lsp_completion::context::detect_context;
+use php_lsp_completion::context::detect_context_at_byte_col;
 use php_lsp_completion::provider::provide_completions_at_range;
 use php_lsp_index::cache::{self, CacheNamespace, CacheSourceFile, IndexCacheConfig};
 use php_lsp_index::composer::{parse_composer_json, NamespaceMap};
