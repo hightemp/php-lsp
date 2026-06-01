@@ -426,7 +426,9 @@ function run(): void {
                 location["range"]["start"]["character"]
                     .as_u64()
                     .unwrap_or(u64::MAX),
-                location["range"]["end"]["line"].as_u64().unwrap_or(u64::MAX),
+                location["range"]["end"]["line"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX),
                 location["range"]["end"]["character"]
                     .as_u64()
                     .unwrap_or(u64::MAX),

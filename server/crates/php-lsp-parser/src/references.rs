@@ -216,17 +216,20 @@ fn sort_and_dedup_symbol_references(references: &mut Vec<SymbolReference>) {
     references.dedup_by(symbol_references_equal_for_dedup);
 }
 
-fn symbol_references_equal_for_dedup(left: &mut SymbolReference, right: &mut SymbolReference) -> bool {
+fn symbol_references_equal_for_dedup(
+    left: &mut SymbolReference,
+    right: &mut SymbolReference,
+) -> bool {
     symbol_references_have_same_dedup_key(left, right)
 }
 
 fn symbol_references_have_same_dedup_key(left: &SymbolReference, right: &SymbolReference) -> bool {
-        left.target_fqn == right.target_fqn
-            && left.target_kind == right.target_kind
-            && left.range == right.range
-            && left.is_declaration == right.is_declaration
-            && left.starts_with_dollar == right.starts_with_dollar
-            && left.receiver == right.receiver
+    left.target_fqn == right.target_fqn
+        && left.target_kind == right.target_kind
+        && left.range == right.range
+        && left.is_declaration == right.is_declaration
+        && left.starts_with_dollar == right.starts_with_dollar
+        && left.receiver == right.receiver
 }
 
 fn symbol_reference_kind_rank(kind: PhpSymbolKind) -> u8 {
@@ -1536,8 +1539,7 @@ echo RenameTarget::STATE_ACTIVE;
         let duplicate_method = synthetic_symbol_reference(PhpSymbolKind::Method, false);
         let distinct_property_same_range =
             synthetic_symbol_reference(PhpSymbolKind::Property, false);
-        let distinct_method_with_dollar =
-            synthetic_symbol_reference(PhpSymbolKind::Method, true);
+        let distinct_method_with_dollar = synthetic_symbol_reference(PhpSymbolKind::Method, true);
         let mut refs = vec![
             duplicate_method.clone(),
             distinct_property_same_range,
