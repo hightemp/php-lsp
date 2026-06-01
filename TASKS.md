@@ -3753,7 +3753,7 @@ change.
     - cyclic inheritance/trait/mixin graph does not recurse forever;
     - member resolution result order stays compatible with current tests.
 
-- [ ] **PHB-010** Make cache metadata timestamp fallbacks explicit.
+- [x] **PHB-010** Make cache metadata timestamp fallbacks explicit. *(done 2026-06-01)*
   - Audit finding: cache metadata silently falls back to Unix epoch when
     filesystem modification time is unavailable or before epoch.
   - Affected code:

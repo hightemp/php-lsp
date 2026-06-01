@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 16;
+pub const CACHE_SCHEMA_VERSION: u32 = 17;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -112,8 +112,16 @@ impl CacheSourceFile {
 pub struct CachedFileMetadata {
     pub modified_secs: u64,
     pub modified_nanos: u32,
+    pub modified_status: ModifiedTimeStatus,
     pub size: u64,
     pub content_hash: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModifiedTimeStatus {
+    Available,
+    Unavailable,
+    BeforeUnixEpoch,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -462,14 +470,40 @@ pub fn stable_hash_bytes(bytes: &[u8]) -> u64 {
 pub fn file_metadata(path: &Path) -> io::Result<CachedFileMetadata> {
     let bytes = fs::read(path)?;
     let metadata = fs::metadata(path)?;
-    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-    let duration = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-    Ok(CachedFileMetadata {
-        modified_secs: duration.as_secs(),
-        modified_nanos: duration.subsec_nanos(),
-        size: metadata.len(),
-        content_hash: stable_hash_bytes(&bytes),
-    })
+    Ok(file_metadata_from_parts(
+        &bytes,
+        metadata.len(),
+        metadata.modified(),
+    ))
+}
+
+fn file_metadata_from_parts(
+    bytes: &[u8],
+    size: u64,
+    modified: io::Result<SystemTime>,
+) -> CachedFileMetadata {
+    let (modified_secs, modified_nanos, modified_status) = modified_time_parts(modified);
+    CachedFileMetadata {
+        modified_secs,
+        modified_nanos,
+        modified_status,
+        size,
+        content_hash: stable_hash_bytes(bytes),
+    }
+}
+
+fn modified_time_parts(modified: io::Result<SystemTime>) -> (u64, u32, ModifiedTimeStatus) {
+    match modified {
+        Ok(time) => match time.duration_since(UNIX_EPOCH) {
+            Ok(duration) => (
+                duration.as_secs(),
+                duration.subsec_nanos(),
+                ModifiedTimeStatus::Available,
+            ),
+            Err(_) => (0, 0, ModifiedTimeStatus::BeforeUnixEpoch),
+        },
+        Err(_) => (0, 0, ModifiedTimeStatus::Unavailable),
+    }
 }
 
 fn cache_miss_reason(
@@ -576,11 +610,13 @@ fn workspace_cache_sources(root: &Path, paths: &[PathBuf]) -> (Vec<CacheSourceFi
 }
 
 fn unix_ms(time: SystemTime) -> u64 {
-    let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    duration
-        .as_secs()
-        .saturating_mul(1000)
-        .saturating_add(u64::from(duration.subsec_millis()))
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration
+            .as_secs()
+            .saturating_mul(1000)
+            .saturating_add(u64::from(duration.subsec_millis())),
+        Err(_) => 0,
+    }
 }
 
 #[cfg(test)]
@@ -897,8 +933,73 @@ mod tests {
 
         assert_eq!(first.size, second.size);
         assert_ne!(first.content_hash, second.content_hash);
+        assert_ne!(first, second);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_metadata_records_timestamp_fallback_reason_and_keeps_hash_backstop() {
+        let unavailable = file_metadata_from_parts(
+            b"<?php A",
+            7,
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "modified time unavailable",
+            )),
+        );
+        assert_eq!(unavailable.modified_secs, 0);
+        assert_eq!(unavailable.modified_nanos, 0);
+        assert_eq!(unavailable.modified_status, ModifiedTimeStatus::Unavailable);
+
+        let unavailable_changed = file_metadata_from_parts(
+            b"<?php B",
+            7,
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "modified time unavailable",
+            )),
+        );
+        assert_eq!(unavailable.size, unavailable_changed.size);
+        assert_eq!(
+            unavailable.modified_status,
+            unavailable_changed.modified_status
+        );
+        assert_ne!(unavailable.content_hash, unavailable_changed.content_hash);
+        assert_ne!(unavailable, unavailable_changed);
+
+        let before_epoch_time = UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before Unix epoch should be representable");
+        let before_epoch = file_metadata_from_parts(b"<?php A", 7, Ok(before_epoch_time));
+        assert_eq!(before_epoch.modified_secs, 0);
+        assert_eq!(before_epoch.modified_nanos, 0);
+        assert_eq!(
+            before_epoch.modified_status,
+            ModifiedTimeStatus::BeforeUnixEpoch
+        );
+        assert_ne!(before_epoch, unavailable);
+
+        let available_time = UNIX_EPOCH
+            .checked_add(std::time::Duration::new(42, 7))
+            .expect("post-epoch timestamp should be representable");
+        let available = file_metadata_from_parts(b"<?php A", 7, Ok(available_time));
+        assert_eq!(available.modified_secs, 42);
+        assert_eq!(available.modified_nanos, 7);
+        assert_eq!(available.modified_status, ModifiedTimeStatus::Available);
+    }
+
+    #[test]
+    fn unix_ms_returns_zero_for_pre_epoch_times() {
+        let before_epoch_time = UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("one millisecond before Unix epoch should be representable");
+        assert_eq!(unix_ms(before_epoch_time), 0);
+
+        let available_time = UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(1500))
+            .expect("post-epoch timestamp should be representable");
+        assert_eq!(unix_ms(available_time), 1500);
     }
 
     #[test]
