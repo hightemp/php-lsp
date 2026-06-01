@@ -146,6 +146,9 @@ Tree-sitter and parser data use byte columns. LSP uses UTF-16 columns.
 Outbound LSP handlers must convert byte-backed ranges with
 `php_lsp_parser::utf16::range_byte_to_utf16` or `Utf16LineIndex`. Do not return
 `SymbolInfo.range` or `selection_range` directly as an LSP `Range`.
+Completion context detection receives byte columns after the server converts
+LSP UTF-16 positions and clamps them to valid UTF-8 boundaries before slicing,
+so non-ASCII text and CRLF line endings do not change the internal unit model.
 
 ### URI Model
 
@@ -253,6 +256,10 @@ Psalm type aliases may span multiple PHPDoc lines for common `array{...}` /
 `object{...}` shapes; file-level aliases are expanded for local `@var` shape
 hover and completion best-effort, while indexed signatures continue to expand
 aliases through `WorkspaceIndex`.
+PHPDoc literal parsing accepts the supported scalar subset deliberately:
+quoted strings, booleans, null, decimal/binary/octal/hex integers with numeric
+separators, and decimal or scientific floats. Unsupported or malformed numeric
+forms remain plain type names rather than guessed literals.
 
 ## Startup Flow
 
@@ -291,6 +298,9 @@ to an effective root:
   to the Composer project root.
 - Composer `autoload` and `autoload-dev` entries are parsed for PSR-4, PSR-0,
   classmap, and files entries.
+- PSR-0 candidate paths map namespace separators to directories and treat
+  underscores as path separators only in the unqualified class-name segment;
+  underscores inside namespace segments are preserved.
 - `phpLsp.includePaths` adds explicit directories or files.
 - `phpLsp.excludePaths` removes relative or absolute paths from indexing and
   lazy vendor work.
@@ -441,6 +451,10 @@ Cache invalidation checks:
 - Stub metadata hash or vendor metadata hash.
 - Per-file size and mtime.
 - Missing or extra files relative to the current source set.
+
+If a filesystem cannot provide a usable modification time, the cache metadata
+records that state explicitly and relies on the content hash and file size to
+avoid accepting stale file snapshots.
 
 Writes are atomic: the server writes a unique temporary file and renames it to
 `index.bin`.

@@ -3888,7 +3888,29 @@ change.
 
 ### Documentation and risk follow-up
 
-- [ ] **PHB-018** Update docs and risk register for the LLM audit follow-up.
+- [x] **PHB-018** Update docs and risk register for the LLM audit follow-up. *(done 2026-06-01)*
+  - Completed 2026-06-01: updated `docs/production-risk-register.md` with
+    PHB audit-closure evidence, owner task links, validation coverage, and
+    explicit residual limitations for completion, references, cache/vendor, and
+    PHPDoc/template behavior.
+  - Completed 2026-06-01: updated `docs/architecture.md` with the byte-column
+    completion context contract, PHPDoc literal subset, PSR-0 underscore
+    mapping rule, and cache timestamp fallback semantics.
+  - Completed 2026-06-01: updated `docs/lsp-features.md` to reflect supported
+    PHPDoc numeric literal parsing and prefix-ranked namespace completions
+    without changing partial template/static-analysis claims.
+  - Not changed: `docs/production-baseline.md`, README, and configuration docs;
+    PHB-018 did not introduce new smoke/performance measurements or
+    user-visible settings.
+  - Validation:
+    - Serena project search confirmed the current Rust entry points for
+      completion context, cache schema guards, PSR-0 mapping, resolve-depth
+      guard, namespace completion ranking, and PHPDoc literal parsing;
+    - `git diff --check`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`;
+    - `npm run lint && npm run build`.
   - Docs to update if behavior changes:
     - `docs/architecture.md`;
     - `docs/lsp-features.md`;
