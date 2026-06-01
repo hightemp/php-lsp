@@ -37,7 +37,6 @@ languages:
 - bash
 - yaml
 - toml
-- php
 - markdown
 - python
 
