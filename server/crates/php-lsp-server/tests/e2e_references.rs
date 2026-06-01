@@ -756,6 +756,112 @@ function run(string $name): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_foreach_wrapped_variable_references_and_rename() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+function run(array $items): void {
+    foreach ($items as &$value) {
+        echo $value;
+    }
+}
+"#;
+    let uri = "file:///test/ForeachWrappedVariableRefsRename.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (usage_line, usage_col) = line_col(code, "echo $value;");
+    let usage_character = usage_col + "echo ".len() as u32 + 1;
+    let refs_without_decl = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(
+            2,
+            uri,
+            usage_line,
+            usage_character,
+            false,
+        ))
+        .await
+        .unwrap();
+    let refs_without_decl_result = extract_result(refs_without_decl);
+    assert_eq!(
+        location_start_lines(&refs_without_decl_result),
+        BTreeSet::from([usage_line as u64]),
+        "foreach by-reference declaration should not be returned as a read usage: {refs_without_decl_result}"
+    );
+
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(
+            3,
+            uri,
+            usage_line,
+            usage_character,
+            "renamed",
+        ))
+        .await
+        .unwrap();
+    let rename_result = extract_result(rename);
+    let edits = rename_result
+        .get("changes")
+        .and_then(|changes| changes.get(uri))
+        .and_then(|edits| edits.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        edits.len(),
+        2,
+        "rename should update foreach declaration and body usage: {rename_result}"
+    );
+    assert_eq!(
+        workspace_edit_start_lines(&rename_result, uri),
+        BTreeSet::from([2, usage_line as u64]),
+        "rename should edit foreach declaration and usage lines: {rename_result}"
+    );
+    assert!(
+        edits
+            .iter()
+            .all(|edit| edit.get("newText").and_then(|text| text.as_str()) == Some("$renamed")),
+        "variable rename should preserve '$' prefix in foreach edits: {rename_result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_rename_rejects_invalid_new_names_by_symbol_kind() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

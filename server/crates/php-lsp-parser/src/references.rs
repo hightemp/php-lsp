@@ -3,6 +3,7 @@
 //! Given a target FQN and the file's CST + symbols, returns all locations
 //! in the file that reference the target.
 
+use crate::cst::{ancestor_field_contains, is_foreach_header_declared_variable};
 use crate::resolve::{
     resolve_scope_class_name_pub, symbol_at_position_with_resolvers, CallableParamTypeResolver,
     MemberTypeResolver, RefKind,
@@ -1295,6 +1296,12 @@ fn walk_variable_refs(
 }
 
 fn is_variable_declaration(node: Node, source: &str, var_name: &str) -> bool {
+    if ancestor_field_contains(node, "foreach_statement", &["key", "value"])
+        || is_foreach_header_declared_variable(node, source)
+    {
+        return true;
+    }
+
     let parent = match node.parent() {
         Some(p) => p,
         None => return false,
@@ -1309,12 +1316,6 @@ fn is_variable_declaration(node: Node, source: &str, var_name: &str) -> bool {
             .child_by_field_name("left")
             .map(|n| normalize_var_name(&source[n.byte_range()]) == var_name)
             .unwrap_or(false),
-        "foreach_statement" => ["key", "value"].iter().any(|field| {
-            parent
-                .child_by_field_name(field)
-                .map(|n| n.id() == node.id())
-                .unwrap_or(false)
-        }),
         "catch_clause" => ["name", "variable"].iter().any(|field| {
             parent
                 .child_by_field_name(field)
@@ -1672,6 +1673,87 @@ function run(string $x): void {
         let refs_no_decl = find_var_refs_at(code, line, col + 6, false);
         // assignment right + echo usage
         assert_eq!(refs_no_decl.len(), 2);
+    }
+
+    #[test]
+    fn test_find_variable_references_marks_foreach_wrapped_values_as_declarations() {
+        let code = r#"<?php
+function run(array $items): void {
+    foreach ($items as &$value) {
+        echo $value;
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "echo $value;");
+        let refs = find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, true);
+        assert_eq!(
+            refs.len(),
+            2,
+            "by-reference foreach value should count as declaration + body usage"
+        );
+
+        let refs_no_decl = find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, false);
+        assert_eq!(
+            refs_no_decl.len(),
+            1,
+            "by-reference foreach declaration should not be counted as a read usage"
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_marks_foreach_key_and_value_as_declarations() {
+        let code = r#"<?php
+function run(array $items): void {
+    foreach ($items as $key => $value) {
+        echo $key;
+        echo $value;
+    }
+}
+"#;
+        for (needle, var_name) in [("echo $key;", "$key"), ("echo $value;", "$value")] {
+            let (line, col) = find_line_col(code, needle);
+            let refs = find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, true);
+            assert_eq!(
+                refs.len(),
+                2,
+                "foreach {var_name} should count as declaration + body usage"
+            );
+
+            let refs_no_decl = find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, false);
+            assert_eq!(
+                refs_no_decl.len(),
+                1,
+                "foreach {var_name} declaration should be excluded when requested"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_variable_references_marks_foreach_destructuring_values_as_declarations() {
+        let code = r#"<?php
+function run(array $rows): void {
+    foreach ($rows as ['id' => $id, 'name' => $name]) {
+        echo $id;
+        echo $name;
+    }
+}
+"#;
+        for (needle, var_name) in [("echo $id;", "$id"), ("echo $name;", "$name")] {
+            let (line, col) = find_line_col(code, needle);
+            let refs = find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, true);
+            assert_eq!(
+                refs.len(),
+                2,
+                "foreach destructured {var_name} should count as declaration + body usage"
+            );
+
+            let refs_no_decl = find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, false);
+            assert_eq!(
+                refs_no_decl.len(),
+                1,
+                "foreach destructured {var_name} declaration should be excluded when requested"
+            );
+        }
     }
 
     #[test]

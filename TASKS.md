@@ -3700,7 +3700,7 @@ change.
       preserved or deduplicated according to the equality rule;
     - no duplicate reference results in a focused e2e references fixture.
 
-- [ ] **PHB-007** Recognize foreach key/value declarations through wrappers.
+- [x] **PHB-007** Recognize foreach key/value declarations through wrappers. *(done 2026-06-01)*
   - Audit finding: `is_variable_declaration` compares foreach field node IDs
     directly, so wrapped values such as references or destructuring may not mark
     inner variables as declarations.
