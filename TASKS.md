@@ -3412,7 +3412,32 @@ while implementing these tasks.
 
 ### Acceptance and Documentation
 
-- [ ] **PHA-040** Add regression suites for the audit's foundation failures.
+- [x] **PHA-040** Add regression suites for the audit's foundation failures.
+  - Completed 2026-06-01:
+    - added `e2e_foundation` regression coverage for project config command
+      self-trust, percent-encoded URI + UTF-16 definition ranges, current-class
+      `$this->` completion, same-named method/property rename safety, and the
+      bundled stubs guard failure path;
+    - strengthened the index cache replacement regression to assert atomic
+      overwrite leaves no temporary cache files behind;
+    - real-project smoke passed on `monica` and on `bdpn-ui/app` with the
+      validation exclude profile for generated/tooling trees (`var`, `runtime`,
+      `tools`, `node_modules`).
+  - Validation:
+    - `cargo test -p php-lsp-server --test e2e_foundation -- --nocapture`;
+    - `cargo test -p php-lsp-index cache_save_over_existing_file_replaces_previous_snapshot -- --nocapture`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo test -p php-lsp-index`;
+    - `cargo test -p php-lsp-types uri`;
+    - `cargo fmt --all --check`;
+    - `scripts/check-stubs.sh --kind source server/data/stubs`;
+    - `scripts/check-stubs.sh --kind bundled client/stubs`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`;
+    - `npm run lint`;
+    - `npm run build`;
+    - `scripts/audit-lsp-workspace.py --scenario pha040-monica-smoke --workspace /home/apanov/ForTesting/monica --server server/target/debug/php-lsp --stubs client/stubs --out target/php-lsp-profile/pha040-smoke --max-files 3 --batch-size 3 --no-include-vendor`;
+    - `PHP_LSP_CONFIG=target/php-lsp-profile/pha040-smoke/bdpn-smoke-config.toml scripts/audit-lsp-workspace.py --scenario pha040-bdpn-smoke --workspace /home/apanov/Projects/bdpn-ui/app --server server/target/debug/php-lsp --stubs client/stubs --out target/php-lsp-profile/pha040-smoke --max-files 3 --batch-size 3 --no-include-vendor`.
   - Required tests:
     - executable project config security behavior;
     - URI encoding/path round-trips;

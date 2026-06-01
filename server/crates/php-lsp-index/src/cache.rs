@@ -872,6 +872,15 @@ mod tests {
         let loaded = load_cache(&cache_path).unwrap();
         assert_eq!(loaded.files.len(), 1);
         assert_eq!(loaded.top_level.types[0].fqn, "App\\Bar");
+        let leaked_tmp_files: Vec<_> = fs::read_dir(cache_path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+            .collect();
+        assert!(
+            leaked_tmp_files.is_empty(),
+            "cache replacement should not leave temp files behind: {leaked_tmp_files:?}"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
