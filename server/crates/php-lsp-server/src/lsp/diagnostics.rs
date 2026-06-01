@@ -362,6 +362,8 @@ impl PhpLspBackend {
 
         self.publish_diagnostics(&uri).await;
         if uri_is_php_file(&uri) {
+            self.invalidate_twig_context_disk_cache_for_source_uri(uri.as_str())
+                .await;
             self.refresh_open_twig_contexts_and_republish_diagnostics()
                 .await;
         }
@@ -433,6 +435,8 @@ impl PhpLspBackend {
         let refresh_twig_contexts = uri_is_php_file(&uri);
         self.schedule_fast_diagnostics(uri, version).await;
         if refresh_twig_contexts {
+            self.invalidate_twig_context_disk_cache_for_source_uri(&uri_str)
+                .await;
             self.refresh_open_twig_contexts_and_republish_diagnostics()
                 .await;
         }

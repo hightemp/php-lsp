@@ -3603,7 +3603,36 @@ change.
     - quoted keys containing non-ASCII characters;
     - unfinished quoted key before the cursor.
 
-- [ ] **PHB-003** Invalidate Twig render-context disk cache consistently on PHP changes.
+- [x] **PHB-003** Invalidate Twig render-context disk cache consistently on PHP changes. *(done 2026-06-01)*
+  - Started 2026-06-01: auditing Twig render-context disk cache invalidation
+    across `didChange`, close/save, watched files, and workspace refresh paths.
+  - Completed 2026-06-01: added targeted Twig disk-cache eviction by PHP source
+    URI. `didOpen` and `didChange` for PHP sources now evict cached template
+    context entries that were derived from that source before refreshing open
+    Twig documents; save/watcher/config paths still use the existing full
+    request-FS cache invalidation.
+  - Completed 2026-06-01: documented the ownership model in
+    `docs/architecture.md`: open PHP buffers are authoritative, the disk cache
+    owns closed-file scan snapshots, and PHP open/change events evict only
+    entries mentioning the changed source URI.
+  - Regression tests:
+    - unit coverage for evicting only Twig disk-cache entries that include a
+      changed source URI while preserving unrelated template cache entries;
+    - e2e coverage for `didChange` followed by PHP close after a disk update,
+      verifying Twig completion stays on the refreshed disk context;
+    - e2e coverage for opening a changed PHP source after a warmed Twig disk
+      cache and then closing it, verifying stale cached context does not
+      return.
+  - Validation:
+    - `cargo test -p php-lsp-server test_twig_context_disk_cache_evicts_entries_for_source_uri -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_templates test_twig_context_types_refresh_after_controller_render_context_change -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_templates test_twig_context_disk_cache_is_evicted_for_opened_php_source_change -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_templates`;
+    - `cargo test -p php-lsp-server twig_context_disk_cache -- --nocapture`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`;
+    - `git diff --check`.
   - Audit finding: `didChange` refreshes open Twig documents through open PHP
     buffers, but request-time disk Twig context cache invalidation is not
     symmetric with save/watched-file/config invalidation.

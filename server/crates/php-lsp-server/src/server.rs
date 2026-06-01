@@ -901,6 +901,23 @@ impl TwigContextDiskCache {
         self.evict_over_capacity();
     }
 
+    fn evict_entries_for_source_uri(&mut self, source_uri: &str) -> usize {
+        let stale_keys: HashSet<_> = self
+            .entries
+            .iter()
+            .filter(|(_, files)| files.iter().any(|file| file.uri == source_uri))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let evicted = stale_keys.len();
+        if evicted == 0 {
+            return 0;
+        }
+
+        self.entries.retain(|key, _| !stale_keys.contains(key));
+        self.order.retain(|key| !stale_keys.contains(key));
+        evicted
+    }
+
     fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
@@ -1316,6 +1333,21 @@ impl PhpLspBackend {
             &self.twig_context_disk_cache,
         )
         .await;
+    }
+
+    async fn invalidate_twig_context_disk_cache_for_source_uri(&self, source_uri: &str) {
+        let evicted = self
+            .twig_context_disk_cache
+            .lock()
+            .await
+            .evict_entries_for_source_uri(source_uri);
+        if evicted > 0 {
+            tracing::debug!(
+                "Evicted {} Twig render-context disk cache entries for changed PHP source {}",
+                evicted,
+                source_uri
+            );
+        }
     }
 
     async fn cancel_debounced_diagnostics(&self, uri_str: &str) {

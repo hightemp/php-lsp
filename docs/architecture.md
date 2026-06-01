@@ -332,8 +332,12 @@ Twig context variables are inferred statically from simple PHP
 `render('template.html.twig', ['name' => expr])` call sites. The context scanner
 combines open PHP files from memory with a bounded, disk-backed cache for closed
 PHP files. Cache misses run through Tokio's blocking pool and file watcher/save
-events clear the cache. Open Twig documents are bounded-refresh candidates after
-PHP controller/render edits and workspace reindex completion: their context
+events clear the cache. Open PHP buffers are authoritative over cached disk
+scan results; opening or editing a PHP source evicts disk-cache entries that
+were derived from that source URI, so a later close falls back to a refreshed
+disk snapshot instead of stale render context. Open Twig documents are
+bounded-refresh candidates after PHP controller/render edits and workspace
+reindex completion: their context
 prelude, virtual PHP parser, diagnostics, and request-time hover/completion/inlay
 state are rebuilt from current open buffers plus the disk cache. The scanner
 does not boot Symfony, evaluate Twig extensions, run user code, or read the
@@ -520,7 +524,9 @@ Request-time filesystem work is kept bounded and off the async executor:
   cache misses run static project scans on the blocking pool.
 - Twig render-context inference uses a bounded disk-scan cache, always overlays
   open PHP files from memory, and refreshes a bounded set of open Twig documents
-  after relevant PHP/reindex events.
+  after relevant PHP/reindex events. PHP open/change events evict only Twig
+  disk-cache entries that include the changed source URI; save, watcher, and
+  configuration events still clear the whole request FS cache.
 - Formatter auto-detection and formatter temporary-file reads/writes run through
   blocking helpers around the external async command.
 - Inlay hint inference, including Doctrine source-inspection fallbacks, runs on

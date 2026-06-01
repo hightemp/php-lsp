@@ -189,6 +189,16 @@ pub fn did_open_notification_with_language(uri: &str, language_id: &str, text: &
         .finish()
 }
 
+pub fn did_close_notification(uri: &str) -> Request {
+    Request::build("textDocument/didClose")
+        .params(json!({
+            "textDocument": {
+                "uri": uri
+            }
+        }))
+        .finish()
+}
+
 pub fn did_change_full_notification(uri: &str, version: i32, text: &str) -> Request {
     Request::build("textDocument/didChange")
         .params(json!({

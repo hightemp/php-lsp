@@ -3046,6 +3046,66 @@ fn test_twig_context_disk_cache_evicts_lru_entries() {
     assert!(cache.get(&third).is_some());
 }
 
+#[test]
+fn test_twig_context_disk_cache_evicts_entries_for_source_uri() {
+    fn key(root: &str, template_name: &str) -> TwigContextDiskCacheKey {
+        TwigContextDiskCacheKey {
+            root: PathBuf::from(root),
+            template_name: template_name.to_string(),
+        }
+    }
+
+    fn value(uri: &str, name: &str, type_text: &str) -> TwigContextFileVariables {
+        TwigContextFileVariables {
+            uri: uri.to_string(),
+            variables: vec![TemplateVariableType {
+                name: name.to_string(),
+                type_text: type_text.to_string(),
+            }],
+        }
+    }
+
+    let mut cache = TwigContextDiskCache {
+        capacity: 4,
+        ..Default::default()
+    };
+    let controller_uri = "file:///workspace/src/Controller/DashboardController.php";
+    let dashboard = key("/workspace", "dashboard/show.html.twig");
+    let profile = key("/workspace", "profile/show.html.twig");
+    let unrelated = key("/workspace", "blog/show.html.twig");
+
+    cache.insert(
+        dashboard.clone(),
+        vec![
+            value(controller_uri, "user", "App\\Entity\\User"),
+            value(
+                "file:///workspace/src/Controller/TeamController.php",
+                "team",
+                "Team",
+            ),
+        ],
+    );
+    cache.insert(
+        profile.clone(),
+        vec![value(controller_uri, "profile", "App\\Entity\\Profile")],
+    );
+    cache.insert(
+        unrelated.clone(),
+        vec![value(
+            "file:///workspace/src/Controller/BlogController.php",
+            "post",
+            "App\\Entity\\Post",
+        )],
+    );
+
+    assert_eq!(cache.evict_entries_for_source_uri(controller_uri), 2);
+    assert!(cache.get(&dashboard).is_none());
+    assert!(cache.get(&profile).is_none());
+    assert!(cache.get(&unrelated).is_some());
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache.evict_entries_for_source_uri(controller_uri), 0);
+}
+
 #[tokio::test]
 async fn test_request_fs_cache_invalidation_clears_framework_and_twig_caches() {
     let framework_cache = Arc::new(Mutex::new(FrameworkStringKeyCache {
