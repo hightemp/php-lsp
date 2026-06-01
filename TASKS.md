@@ -3804,7 +3804,7 @@ change.
       matches;
     - short prefixes keep exact/current-namespace candidates before truncation.
 
-- [ ] **PHB-013** Replace placeholder Cargo repository metadata.
+- [x] **PHB-013** Replace placeholder Cargo repository metadata. *(done 2026-06-01)*
   - Audit finding: `server/Cargo.toml` still has
     `repository = "https://github.com/TODO/php-lsp"`.
   - Affected code:

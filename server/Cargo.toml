@@ -13,7 +13,7 @@ version = "0.6.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/TODO/php-lsp"
+repository = "https://github.com/hightemp/php-lsp"
 
 [workspace.dependencies]
 # LSP
