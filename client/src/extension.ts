@@ -851,7 +851,7 @@ function buildInitializationOptions(config: ReturnType<typeof workspace.getConfi
     config,
     "diagnostics.memberTypeNodeBudget",
     "diagnosticsMemberTypeNodeBudget",
-    64,
+    512,
   );
   setIfConfigured(
     options,

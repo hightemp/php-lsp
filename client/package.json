@@ -260,7 +260,7 @@
         },
         "phpLsp.diagnostics.memberTypeNodeBudget": {
           "type": "number",
-          "default": 64,
+          "default": 512,
           "minimum": 0,
           "scope": "resource",
           "description": "Maximum relevant AST nodes to inspect before skipping expensive member and type-compatibility diagnostics for a file. Set to 0 to disable this budget cap."

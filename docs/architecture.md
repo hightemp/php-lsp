@@ -524,7 +524,7 @@ signatures, and PHP-version checks. Per-category severity is controlled by
 
 Member access and type-compatibility diagnostics share a latency budget because
 they can resolve many call sites and inferred types in large files. The default
-`phpLsp.diagnostics.memberTypeNodeBudget` is `64` relevant syntax nodes. When a
+`phpLsp.diagnostics.memberTypeNodeBudget` is `512` relevant syntax nodes. When a
 file exceeds that budget, php-lsp skips those two expensive categories, logs the
 partial analysis, and by default publishes an informational `partial-analysis`
 diagnostic at the start of the file. Set the budget higher for large files or to

@@ -238,7 +238,7 @@ The VS Code extension contributes these settings under `phpLsp.*`:
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
 | `phpLsp.diagnostics.mode` | `basic-semantic` | `off`, `syntax-only`, or `basic-semantic`. |
 | `phpLsp.diagnostics.severity` | Category warnings | Per-category severity for `unknownSymbols`, `unused`, `duplicateSymbols`, `members`, `typeCompatibility`, `overrideSignatures`, and `phpVersion`; values are `off`, `error`, `warning`, `information`, or `hint`. |
-| `phpLsp.diagnostics.memberTypeNodeBudget` | `64` | Relevant AST-node budget for expensive member/type diagnostics per file. Set `0` to disable the cap. |
+| `phpLsp.diagnostics.memberTypeNodeBudget` | `512` | Relevant AST-node budget for expensive member/type diagnostics per file. Set `0` to disable the cap. |
 | `phpLsp.diagnostics.partialAnalysisDiagnostic` | `true` | Publish an informational diagnostic when member/type diagnostics are skipped by the budget. |
 | `phpLsp.allowProjectCommands` | `false` | Trust executable analyzer and formatter settings from `.php-lsp.toml`. Keep disabled for untrusted workspaces. |
 | `phpLsp.formatting.provider` | `auto` | `auto`, `none`, `pint`, `php-cs-fixer`, `phpcbf`, or `custom`. |

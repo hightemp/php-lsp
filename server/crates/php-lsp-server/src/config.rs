@@ -13,7 +13,7 @@ version = "8.2"
 mode = "basic-semantic"
 # Maximum relevant AST nodes before member/type diagnostics are skipped.
 # Set to 0 to disable the budget cap for this project.
-memberTypeNodeBudget = 64
+memberTypeNodeBudget = 512
 partialAnalysisDiagnostic = true
 
 [diagnostics.severity]

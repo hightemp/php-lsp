@@ -4292,3 +4292,8 @@ change.
   - Синхронизировать CLI analyze/fix со stub-loading LSP режима
   - Добавить PHPDoc virtual-property fallback для chain inference
   - Запустить релевантные Rust-тесты
+- [x] **T-2026-06-01-unknown-instance-method-diagnostic** Исправить пропуск diagnostics для несуществующего instance-метода `addMessageLog1`. *(done 2026-06-01)*
+  - Воспроизвести сценарий на типизированном параметре вроде `PortingRequest $portingRequest`
+  - Найти, почему member diagnostics не доходят до `RefKind::MethodCall`
+  - Добавить regression test без project-specific hardcode
+  - Запустить релевантные Rust-тесты

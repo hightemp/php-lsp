@@ -258,7 +258,7 @@ struct CompletionInferenceContext<'a> {
     byte_col: u32,
 }
 
-const DEFAULT_MEMBER_TYPE_DIAGNOSTIC_NODE_BUDGET: usize = 64;
+const DEFAULT_MEMBER_TYPE_DIAGNOSTIC_NODE_BUDGET: usize = 512;
 const DEFAULT_PARTIAL_ANALYSIS_DIAGNOSTIC: bool = true;
 
 fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {

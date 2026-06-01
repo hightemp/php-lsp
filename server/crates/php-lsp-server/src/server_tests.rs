@@ -1336,6 +1336,59 @@ class Demo {
 }
 
 #[test]
+fn test_compute_diagnostics_reports_unknown_method_on_imported_typed_parameter() {
+    let entity_uri = "file:///src/Domain/ImportedEntity.php";
+    let handler_uri = "file:///src/Application/ImportedEntityHandler.php";
+    let entity_code = r#"<?php
+namespace App\Domain;
+
+class ImportedEntity {
+    public function existingMethod(): array { return []; }
+}
+"#;
+    let handler_code = r#"<?php
+namespace App\Application;
+
+use App\Domain\ImportedEntity;
+
+class ImportedEntityHandler {
+    private function handle(ImportedEntity $entity): void
+    {
+        $result = $entity->existingMethod();
+        $entity->missingMethod($result);
+    }
+}
+"#;
+
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(&index, entity_uri, entity_code);
+    let parser = parse_and_index_php_file(&index, handler_uri, handler_code);
+
+    let diagnostics = compute_diagnostics(
+        handler_uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert!(
+        messages.contains(&"Unknown method: App\\Domain\\ImportedEntity::missingMethod"),
+        "Expected unknown method diagnostic for imported typed parameter, got: {:?}",
+        messages
+    );
+    assert!(
+        !messages.contains(&"Unknown method: App\\Domain\\ImportedEntity::existingMethod"),
+        "Existing imported method must not be reported as unknown: {:?}",
+        messages
+    );
+}
+
+#[test]
 fn test_compute_diagnostics_allows_nullsafe_member_access() {
     let uri = "file:///nullsafe-members.php";
     let code = r#"<?php
@@ -1922,6 +1975,58 @@ function configure(Service $service): void
 }
 
 #[test]
+fn test_compute_diagnostics_default_budget_covers_moderate_member_heavy_file() {
+    let uri = "file:///moderate-members.php";
+    let mut code = String::from(
+        r#"<?php
+namespace App;
+
+class Service {
+    public function ping(): void {}
+}
+
+function configure(Service $service): void
+{
+"#,
+    );
+    for _ in 0..80 {
+        code.push_str("    $service->ping();\n");
+    }
+    code.push_str("    $service->missing();\n}\n");
+
+    let mut parser = FileParser::new();
+    parser.parse_full(&code);
+
+    let index = WorkspaceIndex::new();
+    let symbols = extract_file_symbols(parser.tree().unwrap(), &code, uri);
+    index.update_file(uri, symbols);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert!(
+        messages.contains(&"Unknown method: App\\Service::missing"),
+        "Default budget should still run member diagnostics for moderate files, got: {:?}",
+        messages
+    );
+    assert!(
+        !messages.iter().any(|message| message
+            .contains("php-lsp skipped member and type diagnostics because this file exceeded")),
+        "Moderate file should not emit partial-analysis diagnostic, got: {:?}",
+        messages
+    );
+}
+
+#[test]
 fn test_compute_diagnostics_skips_member_type_checks_above_default_node_budget() {
     let diagnostics = compute_member_heavy_diagnostics(DiagnosticBudgetConfig::default());
     let messages: Vec<_> = diagnostics
@@ -1936,10 +2041,14 @@ fn test_compute_diagnostics_skips_member_type_checks_above_default_node_budget()
         "Member diagnostics should be skipped above budget, got: {:?}",
         messages
     );
+    let expected_partial = format!(
+        "php-lsp skipped member and type diagnostics because this file exceeded the diagnostics budget of {} relevant syntax nodes",
+        DEFAULT_MEMBER_TYPE_DIAGNOSTIC_NODE_BUDGET
+    );
     assert!(
-        messages.iter().any(|message| message.contains(
-            "php-lsp skipped member and type diagnostics because this file exceeded the diagnostics budget of 64 relevant syntax nodes"
-        )),
+        messages
+            .iter()
+            .any(|message| message.contains(&expected_partial)),
         "Expected a partial-analysis diagnostic, got: {:?}",
         messages
     );
