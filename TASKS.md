@@ -3653,7 +3653,7 @@ change.
       does not use stale disk context;
     - save and watched-file paths keep current behavior.
 
-- [ ] **PHB-004** Resolve `self`/`static`/`parent` in static-call chain type inference.
+- [x] **PHB-004** Resolve `self`/`static`/`parent` in static-call chain type inference. *(done 2026-06-01)*
   - Audit finding: `infer_static_call_expression_type` rejects
     `self`, `static`, and `parent`, while definition/hover resolution supports
     these scope names.

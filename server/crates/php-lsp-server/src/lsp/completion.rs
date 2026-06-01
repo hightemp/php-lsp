@@ -688,6 +688,8 @@ impl PhpLspBackend {
                 if let Some(class_fqn) = infer_static_call_expression_type(
                     object_expr,
                     file_symbols,
+                    source,
+                    completion_context_node_at_byte_col(tree, line, byte_col)?,
                     |class_fqn, method_name| {
                         self.resolve_completion_member_type_cached(
                             class_fqn,
@@ -817,6 +819,8 @@ impl PhpLspBackend {
                         infer_static_call_expression_type(
                             base_expr,
                             file_symbols,
+                            source,
+                            completion_context_node_at_byte_col(tree, line, byte_col)?,
                             |class_fqn, method_name| {
                                 self.resolve_completion_member_type_cached(
                                     class_fqn,
@@ -971,4 +975,17 @@ impl PhpLspBackend {
             }
         }
     }
+}
+
+fn completion_context_node_at_byte_col<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    line: u32,
+    byte_col: u32,
+) -> Option<tree_sitter::Node<'tree>> {
+    let point = tree_sitter::Point::new(line as usize, byte_col as usize);
+    let mut node = tree.root_node().descendant_for_point_range(point, point)?;
+    while !node.is_named() {
+        node = node.parent()?;
+    }
+    Some(node)
 }

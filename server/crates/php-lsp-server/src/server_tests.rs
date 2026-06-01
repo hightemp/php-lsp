@@ -278,10 +278,17 @@ fn test_infer_static_call_expression_type_with_resolver() {
         symbols: vec![],
         ..Default::default()
     };
+    let source = "<?php\nUser::query();\n";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let context_node = tree.root_node();
 
     let inferred = infer_static_call_expression_type(
         "User::query()",
         &file_symbols,
+        source,
+        context_node,
         |class_fqn, method_name| {
             assert_eq!(class_fqn, "App\\Models\\User");
             assert_eq!(method_name, "query");
@@ -290,11 +297,83 @@ fn test_infer_static_call_expression_type_with_resolver() {
     );
 
     assert_eq!(inferred.as_deref(), Some("App\\Database\\UserBuilder"));
-    assert!(
-        infer_static_call_expression_type("User::class", &file_symbols, |_, _| {
-            Some("never".to_string())
-        })
-        .is_none()
+    assert!(infer_static_call_expression_type(
+        "User::class",
+        &file_symbols,
+        source,
+        context_node,
+        |_, _| { Some("never".to_string()) }
+    )
+    .is_none());
+}
+
+#[test]
+fn test_infer_static_call_expression_type_resolves_scope_names() {
+    fn infer_marker_expression(code_with_marker: &str, expr: &str) -> Option<String> {
+        let marker = "/*caret*/";
+        let marker_offset = code_with_marker
+            .find(marker)
+            .expect("test code should contain marker");
+        let code = code_with_marker.replace(marker, "");
+        let prefix = &code[..marker_offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let byte_col = (prefix.len() - line_start) as u32;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(&code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, &code, "file:///scope-chain.php");
+        let point = tree_sitter::Point::new(line as usize, byte_col as usize);
+        let mut context_node = tree
+            .root_node()
+            .descendant_for_point_range(point, point)
+            .expect("context node");
+        while !context_node.is_named() {
+            context_node = context_node.parent().expect("named context node");
+        }
+
+        infer_static_call_expression_type(
+            expr,
+            &file_symbols,
+            &code,
+            context_node,
+            |class_fqn, method_name| Some(format!("{class_fqn}::{method_name}")),
+        )
+    }
+
+    let code = r#"<?php
+namespace App;
+class BaseFactory {
+    public static function makeParent(): void {}
+}
+class ChildFactory extends BaseFactory {
+    public static function makeSelf(): void {}
+    public static function makeStatic(): void {}
+    public function run(): void {
+        self::makeSelf()/*caret*/;
+        static::makeStatic();
+        parent::makeParent();
+    }
+}
+"#;
+    assert_eq!(
+        infer_marker_expression(code, "self::makeSelf()").as_deref(),
+        Some("App\\ChildFactory::makeSelf")
+    );
+
+    let code = code.replacen("self::makeSelf()/*caret*/", "self::makeSelf()", 1);
+    let code = code.replacen("static::makeStatic()", "static::makeStatic()/*caret*/", 1);
+    assert_eq!(
+        infer_marker_expression(&code, "static::makeStatic()").as_deref(),
+        Some("App\\ChildFactory::makeStatic")
+    );
+
+    let code = code.replacen("static::makeStatic()/*caret*/", "static::makeStatic()", 1);
+    let code = code.replacen("parent::makeParent()", "parent::makeParent()/*caret*/", 1);
+    assert_eq!(
+        infer_marker_expression(&code, "parent::makeParent()").as_deref(),
+        Some("App\\BaseFactory::makeParent")
     );
 }
 

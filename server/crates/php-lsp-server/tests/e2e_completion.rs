@@ -991,6 +991,122 @@ class Controller {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_member_access_from_scoped_static_call_chain() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+namespace App;
+
+class SelfProduct {
+    public function selfOnly(): void {}
+}
+
+class StaticProduct {
+    public function staticOnly(): void {}
+}
+
+class ParentProduct {
+    public function parentOnly(): void {}
+}
+
+class BaseFactory {
+    public static function makeParent(): ParentProduct { return new ParentProduct(); }
+}
+
+class ChildFactory extends BaseFactory {
+    public static function makeSelf(): SelfProduct { return new SelfProduct(); }
+    public static function makeStatic(): StaticProduct { return new StaticProduct(); }
+
+    public function run(): void {
+        self::makeSelf()->/*self*/;
+        static::makeStatic()->/*static*/;
+        parent::makeParent()->/*parent*/;
+    }
+}
+"#;
+    let markers = ["/*self*/", "/*static*/", "/*parent*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for known_marker in markers {
+            prefix = prefix.replace(known_marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = prefix[line_start..].encode_utf16().count() as u32;
+        (line, character)
+    };
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/scoped-static-call-chain-completion.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    for (request_id, marker, expected_label) in [
+        (2, "/*self*/", "selfOnly"),
+        (3, "/*static*/", "staticOnly"),
+        (4, "/*parent*/", "parentOnly"),
+    ] {
+        let (line, character) = marker_position(marker);
+        let resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(request_id, uri, line, character))
+            .await
+            .unwrap();
+        let result = extract_result(resp);
+        let labels: Vec<String> = completion_items_from_result(&result)
+            .iter()
+            .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+            .map(str::to_string)
+            .collect();
+
+        assert!(
+            labels.iter().any(|label| label == expected_label),
+            "expected scoped static-call chain completion to include {expected_label}, got: {:?}",
+            labels
+        );
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_and_definition_nullable_variable_from_method_return_assignment() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

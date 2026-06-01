@@ -1639,6 +1639,8 @@ pub(in crate::server) fn infer_new_expression_type(
 pub(in crate::server) fn infer_static_call_expression_type<F>(
     expr: &str,
     file_symbols: &php_lsp_types::FileSymbols,
+    source: &str,
+    context_node: tree_sitter::Node<'_>,
     mut resolver: F,
 ) -> Option<String>
 where
@@ -1647,7 +1649,7 @@ where
     let expr = trim_balanced_outer_parens(expr.trim());
     let (class_expr, after_scope) = expr.split_once("::")?;
     let class_name = class_expr.trim();
-    if class_name.is_empty() || matches!(class_name, "self" | "static" | "parent") {
+    if class_name.is_empty() {
         return None;
     }
 
@@ -1661,9 +1663,17 @@ where
         return None;
     }
 
-    let class_fqn = resolve_class_name_pub(class_name, file_symbols)
-        .trim_start_matches('\\')
-        .to_string();
+    let class_fqn = php_lsp_parser::resolve::resolve_scope_class_name_pub(
+        class_name,
+        context_node,
+        source,
+        file_symbols,
+    )
+    .trim_start_matches('\\')
+    .to_string();
+    if class_fqn.is_empty() || matches!(class_fqn.as_str(), "self" | "static" | "parent") {
+        return None;
+    }
     resolver(&class_fqn, method_name)
 }
 

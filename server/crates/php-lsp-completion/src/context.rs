@@ -492,7 +492,7 @@ fn extract_object_expr(text: &str) -> String {
             _ => {}
         }
 
-        if c.is_alphanumeric() || matches!(c, '_' | '$' | '\\' | '-' | '>' | '?') {
+        if c.is_alphanumeric() || matches!(c, '_' | '$' | '\\' | ':' | '-' | '>' | '?') {
             start = idx;
         } else {
             break;
@@ -848,6 +848,29 @@ mod tests {
                 assert_eq!(member_prefix, "is");
             }
             other => panic!("Expected MemberAccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_context_keeps_static_call_object() {
+        for (code, expected) in [
+            ("<?php\nself::make()->", "self::make()"),
+            ("<?php\nstatic::make()->", "static::make()"),
+            ("<?php\nparent::make()->", "parent::make()"),
+            ("<?php\nUser::query()->", "User::query()"),
+        ] {
+            let ctx = detect_at_byte_col(code, 1, code.lines().nth(1).unwrap().len() as u32);
+            match ctx {
+                CompletionContext::MemberAccess {
+                    object_expr,
+                    member_prefix,
+                    ..
+                } => {
+                    assert_eq!(object_expr, expected);
+                    assert_eq!(member_prefix, "");
+                }
+                other => panic!("Expected MemberAccess for {code:?}, got {:?}", other),
+            }
         }
     }
 
