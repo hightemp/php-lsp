@@ -481,7 +481,6 @@ fn provide_static_completions(
         &mut seen_labels,
     );
 
-    // Also add class constants and enum cases
     sort_completion_items(&mut items);
     items
 }
@@ -571,19 +570,19 @@ fn provide_namespace_completions_with_options(
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
-    // Search for types matching the prefix
-    let prefix_lower = prefix.to_lowercase();
-
     for entry in index.types.iter() {
         let sym = entry.value();
-        if sym.fqn.to_lowercase().contains(&prefix_lower)
-            || sym.name.to_lowercase().starts_with(&prefix_lower)
-        {
+        if let Some(match_rank) = namespace_completion_match_rank(&sym.name, &sym.fqn, prefix) {
             let mut item = CompletionItem {
                 label: sym.name.clone(),
                 kind: Some(symbol_kind_to_completion_kind(sym.kind)),
                 detail: Some(sym.fqn.clone()),
-                sort_text: Some(format!("0300_{}", sym.name.to_ascii_lowercase())),
+                sort_text: Some(format!(
+                    "0300_{}_{}_{}",
+                    match_rank,
+                    sym.name.to_ascii_lowercase(),
+                    sym.fqn.to_ascii_lowercase()
+                )),
                 filter_text: Some(format!("{} {}", sym.name, sym.fqn)),
                 data: Some(serde_json::Value::String(sym.fqn.clone())),
                 ..Default::default()
@@ -599,6 +598,31 @@ fn provide_namespace_completions_with_options(
     sort_completion_items(&mut items);
     items.truncate(100);
     items
+}
+
+fn namespace_completion_match_rank(name: &str, fqn: &str, prefix: &str) -> Option<&'static str> {
+    let prefix = prefix.trim().trim_start_matches('\\');
+    if prefix.is_empty() {
+        return Some("1000");
+    }
+
+    let name_lower = name.to_lowercase();
+    let fqn_lower = fqn.to_lowercase();
+    let prefix_lower = prefix.to_lowercase();
+
+    if name == prefix || fqn == prefix {
+        Some("0000")
+    } else if name.starts_with(prefix) || fqn.starts_with(prefix) {
+        Some("0100")
+    } else if name_lower == prefix_lower || fqn_lower == prefix_lower {
+        Some("0200")
+    } else if name_lower.starts_with(&prefix_lower) || fqn_lower.starts_with(&prefix_lower) {
+        Some("0300")
+    } else if name_lower.contains(&prefix_lower) || fqn_lower.contains(&prefix_lower) {
+        Some("0900")
+    } else {
+        None
+    }
 }
 
 /// Provide free context completions (classes, functions, keywords).
@@ -1030,6 +1054,87 @@ mod tests {
             Some("Vendor\\Package\\ClassName")
         );
         assert_eq!(item.detail.as_deref(), Some("Vendor\\Package\\ClassName"));
+    }
+
+    #[test]
+    fn test_namespace_completion_prioritizes_fqn_prefix_over_contains_matches() {
+        let file_symbols = FileSymbols {
+            symbols: vec![
+                make_symbol(
+                    "AlphaNoise",
+                    "Vendor\\App\\AlphaNoise",
+                    PhpSymbolKind::Class,
+                    None,
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "ZedService",
+                    "App\\ZedService",
+                    PhpSymbolKind::Class,
+                    None,
+                    Visibility::Public,
+                    false,
+                ),
+            ],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::Namespace {
+            prefix: "App\\".to_string(),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert_eq!(labels.first(), Some(&"ZedService"));
+        assert_eq!(labels, vec!["ZedService", "AlphaNoise"]);
+    }
+
+    #[test]
+    fn test_namespace_completion_keeps_prefix_matches_before_truncating_contains_noise() {
+        let mut symbols = Vec::new();
+        for idx in 0..120 {
+            symbols.push(make_symbol(
+                &format!("AlphaTyNoise{idx:03}"),
+                &format!("App\\AlphaTyNoise{idx:03}"),
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ));
+        }
+        symbols.push(make_symbol(
+            "TypeGuess",
+            "App\\TypeGuess",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        ));
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols,
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::Namespace {
+            prefix: "Ty".to_string(),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+
+        assert_eq!(
+            items.first().map(|item| item.label.as_str()),
+            Some("TypeGuess")
+        );
+        assert!(
+            items.iter().any(|item| item.label == "TypeGuess"),
+            "prefix match should survive namespace completion truncation"
+        );
     }
 
     #[test]

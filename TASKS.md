@@ -3789,7 +3789,7 @@ change.
     - foreach declaration behavior from `PHB-007` does not diverge again;
     - no broad behavior-preserving churn without a test or concrete mismatch.
 
-- [ ] **PHB-012** Improve namespace completion relevance and clean stale comments.
+- [x] **PHB-012** Improve namespace completion relevance and clean stale comments. *(done 2026-06-01)*
   - Audit finding: namespace completion uses substring filtering and truncates
     after generic sorting, so short prefixes can produce noisy results and drop
     relevant matches; a stale comment remains near member sorting.
