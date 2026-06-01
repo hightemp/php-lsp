@@ -2784,6 +2784,287 @@ pub(in crate::server) fn local_variable_inlay_tooltip(
     format!("Inferred local variable type: {type_text}")
 }
 
+pub(in crate::server) fn markdown_type_info_class_links(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> Option<String> {
+    let (markdown, has_links) =
+        markdown_type_info_inner(index, file_symbols, owner_fqn, uri, type_info);
+    has_links.then_some(markdown)
+}
+
+fn markdown_type_info_inner(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> (String, bool) {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            markdown_simple_type_name(index, file_symbols, owner_fqn, uri, name)
+        }
+        php_lsp_types::TypeInfo::Generic { base, args } => {
+            let (base, base_has_link) =
+                markdown_simple_type_name(index, file_symbols, owner_fqn, uri, base);
+            let mut has_links = base_has_link;
+            let args = args
+                .iter()
+                .map(|arg| {
+                    let (arg, arg_has_link) =
+                        markdown_type_info_inner(index, file_symbols, owner_fqn, uri, arg);
+                    has_links |= arg_has_link;
+                    arg
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            (format!("{base}&lt;{args}&gt;"), has_links)
+        }
+        php_lsp_types::TypeInfo::ArrayShape(items) => {
+            markdown_shape_type_info(index, file_symbols, owner_fqn, uri, "array", items)
+        }
+        php_lsp_types::TypeInfo::ObjectShape(items) => {
+            markdown_shape_type_info(index, file_symbols, owner_fqn, uri, "object", items)
+        }
+        php_lsp_types::TypeInfo::Callable {
+            params,
+            return_type,
+        } => {
+            let mut has_links = false;
+            let params = params
+                .iter()
+                .map(|param| {
+                    let (param, param_has_link) =
+                        markdown_type_info_inner(index, file_symbols, owner_fqn, uri, param);
+                    has_links |= param_has_link;
+                    param
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut markdown = format!("{}({params})", markdown_code_span("callable"));
+            if let Some(return_type) = return_type {
+                let (return_type, return_has_link) =
+                    markdown_type_info_inner(index, file_symbols, owner_fqn, uri, return_type);
+                has_links |= return_has_link;
+                markdown.push_str(": ");
+                markdown.push_str(&return_type);
+            }
+            (markdown, has_links)
+        }
+        php_lsp_types::TypeInfo::ClassString(Some(inner)) => {
+            let (inner, has_links) =
+                markdown_type_info_inner(index, file_symbols, owner_fqn, uri, inner);
+            (
+                format!("{}&lt;{inner}&gt;", markdown_code_span("class-string")),
+                has_links,
+            )
+        }
+        php_lsp_types::TypeInfo::ClassString(None) => (markdown_code_span("class-string"), false),
+        php_lsp_types::TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => {
+            let (target, target_has_link) =
+                markdown_type_info_inner(index, file_symbols, owner_fqn, uri, target);
+            let (if_type, if_has_link) =
+                markdown_type_info_inner(index, file_symbols, owner_fqn, uri, if_type);
+            let (else_type, else_has_link) =
+                markdown_type_info_inner(index, file_symbols, owner_fqn, uri, else_type);
+            (
+                format!(
+                    "({} is {target} ? {if_type} : {else_type})",
+                    markdown_code_span(subject)
+                ),
+                target_has_link || if_has_link || else_has_link,
+            )
+        }
+        php_lsp_types::TypeInfo::Union(types) => {
+            markdown_joined_type_info(index, file_symbols, owner_fqn, uri, types, "|")
+        }
+        php_lsp_types::TypeInfo::Intersection(types) => {
+            markdown_joined_type_info(index, file_symbols, owner_fqn, uri, types, "&")
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            let (inner, has_links) =
+                markdown_type_info_inner(index, file_symbols, owner_fqn, uri, inner);
+            (format!("?{inner}"), has_links)
+        }
+        php_lsp_types::TypeInfo::Self_ => {
+            markdown_special_type_name(index, owner_fqn, "self", owner_fqn)
+        }
+        php_lsp_types::TypeInfo::Static_ => {
+            markdown_special_type_name(index, owner_fqn, "static", owner_fqn)
+        }
+        php_lsp_types::TypeInfo::Parent_ => {
+            let parent_fqn = parent_type_fqn(index, file_symbols, owner_fqn);
+            match parent_fqn {
+                Some(parent_fqn) => {
+                    markdown_special_type_name(index, &parent_fqn, "parent", owner_fqn)
+                }
+                None => (markdown_code_span("parent"), false),
+            }
+        }
+        php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull
+        | php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed => (markdown_code_span(&type_info.to_string()), false),
+    }
+}
+
+fn markdown_joined_type_info(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    types: &[php_lsp_types::TypeInfo],
+    separator: &str,
+) -> (String, bool) {
+    let mut has_links = false;
+    let markdown = types
+        .iter()
+        .map(|type_info| {
+            let (part, part_has_link) =
+                markdown_type_info_inner(index, file_symbols, owner_fqn, uri, type_info);
+            has_links |= part_has_link;
+            part
+        })
+        .collect::<Vec<_>>()
+        .join(separator);
+    (markdown, has_links)
+}
+
+fn markdown_shape_type_info(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    shape_kind: &str,
+    items: &[php_lsp_types::ArrayShapeItem],
+) -> (String, bool) {
+    let mut has_links = false;
+    let items = items
+        .iter()
+        .map(|item| {
+            let (value, value_has_link) =
+                markdown_type_info_inner(index, file_symbols, owner_fqn, uri, &item.value);
+            has_links |= value_has_link;
+            match item.key.as_deref() {
+                Some(key) if item.optional => format!("{}?: {value}", markdown_code_span(key)),
+                Some(key) => format!("{}: {value}", markdown_code_span(key)),
+                None => value,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    (
+        format!("{}{{{items}}}", markdown_code_span(shape_kind)),
+        has_links,
+    )
+}
+
+fn markdown_simple_type_name(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    name: &str,
+) -> (String, bool) {
+    let display = name.trim();
+    let lower = display.trim_start_matches('\\').to_ascii_lowercase();
+    match lower.as_str() {
+        "self" | "static" => {
+            return markdown_special_type_name(index, owner_fqn, display, owner_fqn)
+        }
+        "parent" => {
+            let Some(parent_fqn) = parent_type_fqn(index, file_symbols, owner_fqn) else {
+                return (markdown_code_span(display), false);
+            };
+            return markdown_special_type_name(index, &parent_fqn, display, owner_fqn);
+        }
+        _ => {}
+    }
+    if is_builtin_type_name(display) {
+        return (markdown_code_span(display.trim_start_matches('\\')), false);
+    }
+
+    let target_fqn = simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, display);
+    markdown_type_name_link(index, display, target_fqn.as_deref())
+}
+
+fn markdown_special_type_name(
+    index: &WorkspaceIndex,
+    target_fqn: &str,
+    display: &str,
+    owner_fqn: &str,
+) -> (String, bool) {
+    if owner_fqn.trim().is_empty() || target_fqn.trim().is_empty() {
+        return (markdown_code_span(display), false);
+    }
+    markdown_type_name_link(index, display, Some(target_fqn))
+}
+
+fn markdown_type_name_link(
+    index: &WorkspaceIndex,
+    display: &str,
+    target_fqn: Option<&str>,
+) -> (String, bool) {
+    let Some(target_fqn) = target_fqn else {
+        return (markdown_code_span(display), false);
+    };
+    let Some(symbol) = index.resolve_fqn(target_fqn.trim_start_matches('\\')) else {
+        return (markdown_code_span(display), false);
+    };
+    if !is_class_like_symbol(&symbol) {
+        return (markdown_code_span(display), false);
+    }
+    let destination = markdown_file_location_destination(&symbol);
+    (
+        format!("[{}](<{}>)", markdown_code_span(display), destination),
+        true,
+    )
+}
+
+fn parent_type_fqn(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+) -> Option<String> {
+    let owner_fqn = owner_fqn.trim_start_matches('\\');
+    if owner_fqn.is_empty() {
+        return None;
+    }
+
+    file_symbols
+        .symbols
+        .iter()
+        .find(|symbol| fqn_matches(&symbol.fqn, owner_fqn))
+        .and_then(|symbol| symbol.extends.first().cloned())
+        .or_else(|| {
+            index
+                .resolve_fqn(owner_fqn)
+                .and_then(|symbol| symbol.extends.first().cloned())
+        })
+}
+
+fn is_class_like_symbol(symbol: &php_lsp_types::SymbolInfo) -> bool {
+    matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+    )
+}
+
 pub(in crate::server) fn local_variable_type_markdown(
     index: &WorkspaceIndex,
     type_hint: &LocalVariableInlayType,

@@ -56,7 +56,8 @@ phpstorm-stubs support.
   helpers, test doubles, trait-based test helpers, anonymous classes, and
   closure/destructuring variable scopes.
 - Hover for symbols, signatures, types, variables, PHPDoc, deprecation, and
-  PHPDoc virtual members.
+  PHPDoc virtual members, with clickable class links in type sections where
+  the target can be resolved.
 - Completion for classes, interfaces, traits, enums, functions, constants,
   methods, properties, variables, namespaces, keywords, snippets, PHPDoc virtual
   members, shape keys/properties, framework string keys, template paths, and

@@ -172,6 +172,9 @@ impl PhpLspBackend {
         let result = if let Some(sym) = symbol_info {
             // Build hover content
             let mut content = String::new();
+            let hover_file_symbols =
+                hover_file_symbols_for_uri(&self.index, &file_symbols, &sym.uri);
+            let type_owner_fqn = hover_symbol_type_owner_fqn(&sym);
 
             // Symbol kind label
             let kind_label = match sym.kind {
@@ -229,6 +232,38 @@ impl PhpLspBackend {
             }
             content.push_str("\n```\n");
 
+            if let Some(parent_fqn) = sym.parent_fqn.as_deref() {
+                append_class_fqn_link_line(
+                    &mut content,
+                    "Declared in",
+                    &self.index,
+                    parent_fqn,
+                    parent_fqn,
+                );
+            }
+
+            if let Some(ref sig) = sym.signature {
+                append_param_type_link_lines(
+                    &mut content,
+                    &self.index,
+                    &hover_file_symbols,
+                    type_owner_fqn,
+                    &sym.uri,
+                    &sig.params,
+                );
+                if let Some(ref ret) = sig.return_type {
+                    append_type_link_line(
+                        &mut content,
+                        "Returns",
+                        &self.index,
+                        &hover_file_symbols,
+                        type_owner_fqn,
+                        &sym.uri,
+                        ret,
+                    );
+                }
+            }
+
             // PHPDoc summary
             if let Some(ref doc) = sym.doc_comment {
                 let phpdoc = parse_phpdoc(doc);
@@ -246,9 +281,14 @@ impl PhpLspBackend {
                         content.push_str(&p.name);
                         content.push('`');
                         if let Some(ref t) = p.type_info {
-                            content.push_str(" — `");
-                            content.push_str(&t.to_string());
-                            content.push('`');
+                            content.push_str(" — ");
+                            content.push_str(&type_info_raw_with_links(
+                                &self.index,
+                                &hover_file_symbols,
+                                type_owner_fqn,
+                                &sym.uri,
+                                t,
+                            ));
                         }
                         if let Some(ref desc) = p.description {
                             content.push_str(" — ");
@@ -260,12 +300,24 @@ impl PhpLspBackend {
 
                 // @return
                 if let Some(ref ret) = phpdoc.return_type {
-                    content.push_str("\n**Returns:** `");
-                    content.push_str(&ret.to_string());
-                    content.push_str("`\n");
+                    content.push_str("\n**Returns:** ");
+                    content.push_str(&type_info_raw_with_links(
+                        &self.index,
+                        &hover_file_symbols,
+                        type_owner_fqn,
+                        &sym.uri,
+                        ret,
+                    ));
+                    content.push('\n');
                 }
 
-                for section in phpdoc_extra_markdown_sections(&phpdoc) {
+                for section in phpdoc_extra_markdown_sections_with_links(
+                    &self.index,
+                    &hover_file_symbols,
+                    type_owner_fqn,
+                    &sym.uri,
+                    &phpdoc,
+                ) {
                     content.push('\n');
                     content.push_str(&section);
                     content.push('\n');
@@ -293,7 +345,15 @@ impl PhpLspBackend {
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
-                    value: phpdoc_virtual_member_markdown(&virtual_member),
+                    value: phpdoc_virtual_member_markdown_with_links(
+                        &self.index,
+                        &hover_file_symbols_for_uri(
+                            &self.index,
+                            &file_symbols,
+                            &virtual_member.owner.uri,
+                        ),
+                        &virtual_member,
+                    ),
                 }),
                 range: Some(hover_range),
             })
@@ -301,7 +361,15 @@ impl PhpLspBackend {
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
-                    value: framework_virtual_member_markdown(&virtual_member),
+                    value: framework_virtual_member_markdown_with_links(
+                        &self.index,
+                        &hover_file_symbols_for_owner_fqn(
+                            &self.index,
+                            &file_symbols,
+                            &virtual_member.owner_fqn,
+                        ),
+                        &virtual_member,
+                    ),
                 }),
                 range: Some(hover_range),
             })
@@ -334,15 +402,23 @@ impl PhpLspBackend {
 
             if let Some(ref doc) = var_info.phpdoc_comment {
                 let phpdoc = parse_phpdoc(doc);
+                let local_type_owner_fqn =
+                    current_class_fqn_at_range(&file_symbols, sym_at_pos.range).unwrap_or_default();
                 if let Some(ref summary) = phpdoc.summary {
                     content.push_str("\n---\n\n");
                     content.push_str(summary);
                     content.push('\n');
                 }
                 if let Some(ref var_type) = phpdoc.var_type {
-                    content.push_str("\n**@var** `");
-                    content.push_str(&var_type.to_string());
-                    content.push_str("`\n");
+                    content.push_str("\n**@var** ");
+                    content.push_str(&type_info_raw_with_links(
+                        &self.index,
+                        &file_symbols,
+                        &local_type_owner_fqn,
+                        &uri_str,
+                        var_type,
+                    ));
+                    content.push('\n');
                 }
             }
 
@@ -364,4 +440,43 @@ impl PhpLspBackend {
             hover
         }))
     }
+}
+
+fn hover_file_symbols_for_uri(
+    index: &WorkspaceIndex,
+    fallback: &php_lsp_types::FileSymbols,
+    uri: &str,
+) -> php_lsp_types::FileSymbols {
+    index
+        .file_symbols
+        .get(uri)
+        .map(|entry| entry.value().clone())
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn hover_file_symbols_for_owner_fqn(
+    index: &WorkspaceIndex,
+    fallback: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+) -> php_lsp_types::FileSymbols {
+    index
+        .resolve_fqn(owner_fqn.trim_start_matches('\\'))
+        .map(|symbol| hover_file_symbols_for_uri(index, fallback, &symbol.uri))
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn hover_symbol_type_owner_fqn(symbol: &php_lsp_types::SymbolInfo) -> &str {
+    if let Some(parent_fqn) = symbol.parent_fqn.as_deref() {
+        return parent_fqn;
+    }
+    if matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+    ) {
+        return symbol.fqn.as_str();
+    }
+    ""
 }

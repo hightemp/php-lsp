@@ -271,6 +271,54 @@ pub(in crate::server) fn phpdoc_virtual_member_markdown(member: &PhpDocVirtualMe
     content
 }
 
+pub(in crate::server) fn phpdoc_virtual_member_markdown_with_links(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    member: &PhpDocVirtualMember,
+) -> String {
+    let mut content = phpdoc_virtual_member_markdown(member);
+    let owner_fqn = member.owner.fqn.as_str();
+    let uri = member.owner.uri.as_str();
+    append_class_fqn_link_line(&mut content, "Declared in", index, owner_fqn, owner_fqn);
+    match member.kind {
+        PhpDocVirtualMemberKind::Property => {
+            if let Some(ref type_info) = member.type_info {
+                append_type_link_line(
+                    &mut content,
+                    "Type",
+                    index,
+                    file_symbols,
+                    owner_fqn,
+                    uri,
+                    type_info,
+                );
+            }
+        }
+        PhpDocVirtualMemberKind::Method => {
+            if let Some(ref return_type) = member.return_type {
+                append_type_link_line(
+                    &mut content,
+                    "Returns",
+                    index,
+                    file_symbols,
+                    owner_fqn,
+                    uri,
+                    return_type,
+                );
+            }
+            append_param_type_link_lines(
+                &mut content,
+                index,
+                file_symbols,
+                owner_fqn,
+                uri,
+                &member.params,
+            );
+        }
+    }
+    content
+}
+
 fn format_phpdoc_params(params: &[php_lsp_types::ParamInfo]) -> String {
     params
         .iter()
@@ -363,6 +411,43 @@ pub(in crate::server) fn framework_virtual_member_markdown(
         content.push_str("\n---\n\n");
         content.push_str(detail);
         content.push('\n');
+    }
+    content
+}
+
+pub(in crate::server) fn framework_virtual_member_markdown_with_links(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    member: &crate::framework::VirtualMember,
+) -> String {
+    let mut content = framework_virtual_member_markdown(member);
+    let uri = index
+        .resolve_fqn(member.owner_fqn.trim_start_matches('\\'))
+        .map(|symbol| symbol.uri.clone())
+        .unwrap_or_default();
+    append_class_fqn_link_line(
+        &mut content,
+        "Declared in",
+        index,
+        &member.owner_fqn,
+        &member.owner_fqn,
+    );
+    if let Some(ref type_info) = member.type_info {
+        let label = match member.kind {
+            crate::framework::VirtualMemberKind::Method => "Returns",
+            crate::framework::VirtualMemberKind::Property
+            | crate::framework::VirtualMemberKind::StaticProperty
+            | crate::framework::VirtualMemberKind::ClassConstant => "Type",
+        };
+        append_type_link_line(
+            &mut content,
+            label,
+            index,
+            file_symbols,
+            &member.owner_fqn,
+            &uri,
+            type_info,
+        );
     }
     content
 }
@@ -696,6 +781,259 @@ pub(in crate::server) fn phpdoc_extra_markdown_sections(
     }
 
     sections
+}
+
+pub(in crate::server) fn phpdoc_extra_markdown_sections_with_links(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    phpdoc: &php_lsp_types::PhpDoc,
+) -> Vec<String> {
+    let mut sections = Vec::new();
+
+    if let Some(ref var_type) = phpdoc.var_type {
+        sections.push(format!(
+            "**@var** {}",
+            type_info_raw_with_links(index, file_symbols, owner_fqn, uri, var_type)
+        ));
+    }
+
+    if !phpdoc.throws.is_empty() {
+        let throws = phpdoc
+            .throws
+            .iter()
+            .map(|throw_type| {
+                format!(
+                    "- {}",
+                    type_info_raw_with_links(index, file_symbols, owner_fqn, uri, throw_type)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("**Throws:**\n\n{}", throws));
+    }
+
+    if !phpdoc.properties.is_empty() {
+        let properties = phpdoc
+            .properties
+            .iter()
+            .map(|property| {
+                let access = phpdoc_property_tag(property.access);
+                let type_info = property
+                    .type_info
+                    .as_ref()
+                    .map(|type_info| format!(" {}", type_info))
+                    .unwrap_or_default();
+                let description = property
+                    .description
+                    .as_ref()
+                    .map(|description| format!(" - {}", description))
+                    .unwrap_or_default();
+                let mut line = format!("- `{access}{type_info} ${}`{description}", property.name);
+                if let Some(ref type_info) = property.type_info {
+                    append_inline_type_links(
+                        &mut line,
+                        "Type",
+                        index,
+                        file_symbols,
+                        owner_fqn,
+                        uri,
+                        type_info,
+                    );
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("**PHPDoc properties:**\n\n{}", properties));
+    }
+
+    if !phpdoc.methods.is_empty() {
+        let methods = phpdoc
+            .methods
+            .iter()
+            .map(|method| {
+                let static_part = if method.is_static { "static " } else { "" };
+                let return_type = method
+                    .return_type
+                    .as_ref()
+                    .map(|return_type| format!("{} ", return_type))
+                    .unwrap_or_default();
+                let description = method
+                    .description
+                    .as_ref()
+                    .map(|description| format!(" - {}", description))
+                    .unwrap_or_default();
+                let params = format_phpdoc_params(&method.params);
+                let mut line = format!(
+                    "- `@method {static_part}{return_type}{}({params})`{description}",
+                    method.name
+                );
+                if let Some(ref return_type) = method.return_type {
+                    append_inline_type_links(
+                        &mut line,
+                        "Returns",
+                        index,
+                        file_symbols,
+                        owner_fqn,
+                        uri,
+                        return_type,
+                    );
+                }
+                append_inline_param_type_links(
+                    &mut line,
+                    index,
+                    file_symbols,
+                    owner_fqn,
+                    uri,
+                    &method.params,
+                );
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("**PHPDoc methods:**\n\n{}", methods));
+    }
+
+    sections
+}
+
+pub(in crate::server) fn type_info_raw_with_links(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> String {
+    let raw = markdown_code_span(&type_info.to_string());
+    match markdown_type_info_class_links(index, file_symbols, owner_fqn, uri, type_info) {
+        Some(links) => format!("{raw} — {links}"),
+        None => raw,
+    }
+}
+
+pub(in crate::server) fn append_type_link_line(
+    content: &mut String,
+    label: &str,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) {
+    let Some(links) =
+        markdown_type_info_class_links(index, file_symbols, owner_fqn, uri, type_info)
+    else {
+        return;
+    };
+    content.push('\n');
+    content.push_str("**");
+    content.push_str(label);
+    content.push_str(":** ");
+    content.push_str(&links);
+    content.push('\n');
+}
+
+pub(in crate::server) fn append_class_fqn_link_line(
+    content: &mut String,
+    label: &str,
+    index: &WorkspaceIndex,
+    display: &str,
+    target_fqn: &str,
+) {
+    let Some(symbol) = index.resolve_fqn(target_fqn.trim_start_matches('\\')) else {
+        return;
+    };
+    if !matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+    ) {
+        return;
+    }
+    let destination = markdown_file_location_destination(&symbol);
+    content.push('\n');
+    content.push_str("**");
+    content.push_str(label);
+    content.push_str(":** ");
+    content.push_str(&format!(
+        "[{}](<{}>)",
+        markdown_code_span(display),
+        destination
+    ));
+    content.push('\n');
+}
+
+pub(in crate::server) fn append_param_type_link_lines(
+    content: &mut String,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    params: &[php_lsp_types::ParamInfo],
+) {
+    let lines = params
+        .iter()
+        .filter_map(|param| {
+            let type_info = param.type_info.as_ref()?;
+            let links =
+                markdown_type_info_class_links(index, file_symbols, owner_fqn, uri, type_info)?;
+            Some(format!("- `${}`: {}", param.name, links))
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return;
+    }
+    content.push_str("\n**Parameter Types:**\n\n");
+    content.push_str(&lines.join("\n"));
+    content.push('\n');
+}
+
+fn append_inline_type_links(
+    line: &mut String,
+    label: &str,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) {
+    let Some(links) =
+        markdown_type_info_class_links(index, file_symbols, owner_fqn, uri, type_info)
+    else {
+        return;
+    };
+    line.push_str(" — ");
+    line.push_str(label);
+    line.push_str(": ");
+    line.push_str(&links);
+}
+
+fn append_inline_param_type_links(
+    line: &mut String,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    params: &[php_lsp_types::ParamInfo],
+) {
+    let parts = params
+        .iter()
+        .filter_map(|param| {
+            let type_info = param.type_info.as_ref()?;
+            let links =
+                markdown_type_info_class_links(index, file_symbols, owner_fqn, uri, type_info)?;
+            Some(format!("`${}`: {}", param.name, links))
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return;
+    }
+    line.push_str(" — Params: ");
+    line.push_str(&parts.join(", "));
 }
 
 pub(in crate::server) fn phpdoc_virtual_member_range(

@@ -174,6 +174,213 @@ function run(): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_signature_types_include_class_links() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class User {}
+class Response {}
+
+class Service {
+    public function assign(User $user): Response {
+        return new Response();
+    }
+}
+"#;
+    let uri = "file:///test/hover-signature-class-links.php";
+    let assign_position = utf16_position_at(code, "assign(User");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, assign_position.0, assign_position.1))
+        .await
+        .unwrap();
+    let hover = hover_markdown_value(&extract_result(hover));
+
+    assert!(
+        hover.contains(
+            "**Declared in:** [`App\\Service`](<file:///test/hover-signature-class-links.php#L7>)"
+        ),
+        "expected declaring class link in member hover, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("**Parameter Types:**")
+            && hover
+                .contains("- `$user`: [`User`](<file:///test/hover-signature-class-links.php#L4>)"),
+        "expected parameter class link in signature hover, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(
+            "**Returns:** [`Response`](<file:///test/hover-signature-class-links.php#L5>)"
+        ),
+        "expected return class link in signature hover, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_phpdoc_and_virtual_member_types_include_class_links() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class User {}
+
+/**
+ * @property User $owner Related owner
+ * @method User find(User $fallback)
+ */
+class Supported {}
+
+function demo(Supported $subject, User $fallback): void {
+    $subject->owner;
+    $subject->find($fallback);
+}
+"#;
+    let uri = "file:///test/hover-phpdoc-class-links.php";
+    let supported_position = utf16_position_at(code, "Supported {}\n\nfunction");
+    let owner_position = utf16_position_at(code, "owner;");
+    let find_position = utf16_position_at(code, "find($fallback");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let class_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            uri,
+            supported_position.0,
+            supported_position.1,
+        ))
+        .await
+        .unwrap();
+    let class_hover = hover_markdown_value(&extract_result(class_hover));
+    assert!(
+        class_hover.contains("@property User $owner")
+            && class_hover
+                .contains("Type: [`User`](<file:///test/hover-phpdoc-class-links.php#L4>)")
+            && class_hover.contains("@method User find(User $fallback)")
+            && class_hover
+                .contains("Returns: [`User`](<file:///test/hover-phpdoc-class-links.php#L4>)")
+            && class_hover
+                .contains("`$fallback`: [`User`](<file:///test/hover-phpdoc-class-links.php#L4>)"),
+        "expected class PHPDoc hover links, got: {}",
+        class_hover
+    );
+
+    let owner_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, owner_position.0, owner_position.1))
+        .await
+        .unwrap();
+    let owner_hover = hover_markdown_value(&extract_result(owner_hover));
+    assert!(
+        owner_hover.contains("@property User $owner")
+            && owner_hover
+                .contains("**Type:** [`User`](<file:///test/hover-phpdoc-class-links.php#L4>)"),
+        "expected virtual property type link, got: {}",
+        owner_hover
+    );
+
+    let method_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(4, uri, find_position.0, find_position.1))
+        .await
+        .unwrap();
+    let method_hover = hover_markdown_value(&extract_result(method_hover));
+    assert!(
+        method_hover.contains("@method User find(User $fallback)")
+            && method_hover.contains(
+                "**Returns:** [`App\\User`](<file:///test/hover-phpdoc-class-links.php#L4>)"
+            )
+            && method_hover.contains(
+                "- `$fallback`: [`User`](<file:///test/hover-phpdoc-class-links.php#L4>)"
+            ),
+        "expected virtual method type links, got: {}",
+        method_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_inline_phpdoc_var_overrides_weak_assignment_inference_for_hover_and_inlay() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

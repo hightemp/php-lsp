@@ -189,6 +189,12 @@
 
 ## Hotfix backlog (post-MVP)
 
+- [x] **H-HOVER-CLASS-LINKS-2026-06-01** Добавить ссылки на классы в hover markdown *(done 2026-06-01)*
+  - Найти все hover-поверхности, где выводятся типы, FQN, сигнатуры или связанные классы
+  - Переиспользовать существующий формат ссылок на definition для `Type:`
+  - Добавить focused tests для class links в hover
+  - Запустить релевантные Rust tests
+
 - [x] **H-UTF-LSP-SURFACE-2026-06-01** Покрыть UTF/emoji по LSP-facing parser/server surfaces *(done 2026-06-01)*
   - Проверить incremental edits, references, signature help, return-type insertion helpers
   - Проверить server-side LSP text helpers, rename/code-action/definition/document-symbol/inlay/formatting-sensitive ranges
