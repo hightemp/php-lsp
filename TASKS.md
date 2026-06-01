@@ -189,6 +189,12 @@
 
 ## Hotfix backlog (post-MVP)
 
+- [x] **H-UTF16-2026-06-01** Покрыть UTF-16/UTF-8 position conversions полным набором Unicode-тестов *(done 2026-06-01)*
+  - Добавить тесты для ASCII, BMP, Cyrillic, combining marks, emoji/surrogate pairs, ZWJ sequences, mixed Unicode, CRLF, empty lines и EOF
+  - Проверить indexed и one-off conversion helpers на согласованность
+  - Проверить обратное преобразование UTF-16 column → byte column
+  - Исправить найденные edge cases без hardcode
+
 - [x] **H-001** Built-in function resolution в namespace (definition/rename) *(done 2026-02-15)*
   - Символы вида `strlen()` внутри namespace не должны резолвиться только как `App\\Ns\\strlen`
   - Добавить fallback до global/built-in функции при lookup в server/resolve-path

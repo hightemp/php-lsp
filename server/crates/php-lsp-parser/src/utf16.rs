@@ -7,23 +7,27 @@
 /// Build a line-indexed lookup table for a source string.
 ///
 /// Each entry in the returned Vec corresponds to a source line and contains
-/// a list of (byte_offset_in_line, utf16_offset_in_line) for every character
-/// whose cumulative UTF-16 offset diverges from the byte offset. For ASCII-only
-/// lines the entry is empty, making the common case essentially free.
+/// a list of (byte_offset_in_line, utf16_offset_in_line) for every UTF-8
+/// character boundary. For ASCII-only lines the entry is empty, making the
+/// common case essentially free.
 ///
 /// Prefer building this once per file version and reusing it for all position
 /// conversions in that file.
 pub struct Utf16LineIndex {
-    /// For each line, a sorted list of (byte_offset, utf16_offset) at each
-    /// character boundary where they differ. Empty for ASCII-only lines.
+    /// For each line, a sorted list of (byte_offset, utf16_offset) at UTF-8
+    /// character boundaries. Empty for ASCII-only lines.
     lines: Vec<Vec<(usize, usize)>>,
+    /// UTF-8 byte length for each indexed line.
+    line_byte_lengths: Vec<usize>,
 }
 
 impl Utf16LineIndex {
     /// Build the index from source text.
     pub fn new(source: &str) -> Self {
         let mut lines = Vec::new();
+        let mut line_byte_lengths = Vec::new();
         for line_text in source.split('\n') {
+            line_byte_lengths.push(line_text.len());
             // Check if line is ASCII-only (fast path)
             if line_text.is_ascii() {
                 lines.push(Vec::new());
@@ -36,14 +40,15 @@ impl Utf16LineIndex {
                     let ch_utf16 = ch.len_utf16();
                     byte_off += ch_bytes;
                     utf16_off += ch_utf16;
-                    if byte_off != utf16_off {
-                        mappings.push((byte_off, utf16_off));
-                    }
+                    mappings.push((byte_off, utf16_off));
                 }
                 lines.push(mappings);
             }
         }
-        Utf16LineIndex { lines }
+        Utf16LineIndex {
+            lines,
+            line_byte_lengths,
+        }
     }
 
     /// Convert a tree-sitter byte column to a UTF-16 column for LSP.
@@ -55,18 +60,29 @@ impl Utf16LineIndex {
         let mappings = &self.lines[line];
         if mappings.is_empty() {
             // ASCII-only line: byte offset == UTF-16 offset
-            return byte_col;
+            return byte_col.min(self.line_len_utf8(line));
         }
         let byte_col = byte_col as usize;
         let mut utf16_col = byte_col;
         for &(b, u) in mappings.iter() {
-            if b <= byte_col {
-                utf16_col = u;
-            } else {
+            if byte_col < b {
                 break;
+            }
+            if byte_col == b {
+                utf16_col = u;
+                break;
+            } else {
+                utf16_col = u;
             }
         }
         utf16_col as u32
+    }
+
+    fn line_len_utf8(&self, line: usize) -> u32 {
+        self.line_byte_lengths
+            .get(line)
+            .copied()
+            .unwrap_or(u32::MAX as usize) as u32
     }
 }
 
@@ -81,7 +97,7 @@ pub fn byte_col_to_utf16(source: &str, line: u32, byte_col: u32) -> u32 {
     };
 
     if line_text.is_ascii() {
-        return byte_col;
+        return byte_col.min(line_text.len() as u32);
     }
 
     let byte_col = byte_col as usize;
@@ -122,7 +138,7 @@ pub fn utf16_col_to_byte(source: &str, line: u32, utf16_col: u32) -> u32 {
     };
 
     if line_text.is_ascii() {
-        return utf16_col;
+        return utf16_col.min(line_text.len() as u32);
     }
 
     let utf16_col = utf16_col as usize;
@@ -130,7 +146,10 @@ pub fn utf16_col_to_byte(source: &str, line: u32, utf16_col: u32) -> u32 {
     let mut utf16_off = 0usize;
 
     for ch in line_text.chars() {
-        if utf16_off >= utf16_col {
+        if utf16_col <= utf16_off {
+            break;
+        }
+        if utf16_col < utf16_off + ch.len_utf16() {
             break;
         }
         byte_off += ch.len_utf8();
@@ -143,6 +162,73 @@ pub fn utf16_col_to_byte(source: &str, line: u32, utf16_col: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_byte_to_utf16(line_text: &str, byte_col: u32) -> u32 {
+        let byte_col = byte_col as usize;
+        let mut byte_off = 0usize;
+        let mut utf16_off = 0usize;
+        for ch in line_text.chars() {
+            if byte_col <= byte_off {
+                break;
+            }
+            if byte_col < byte_off + ch.len_utf8() {
+                break;
+            }
+            byte_off += ch.len_utf8();
+            utf16_off += ch.len_utf16();
+        }
+        utf16_off as u32
+    }
+
+    fn reference_utf16_to_byte(line_text: &str, utf16_col: u32) -> u32 {
+        let utf16_col = utf16_col as usize;
+        let mut byte_off = 0usize;
+        let mut utf16_off = 0usize;
+        for ch in line_text.chars() {
+            if utf16_col <= utf16_off {
+                break;
+            }
+            if utf16_col < utf16_off + ch.len_utf16() {
+                break;
+            }
+            byte_off += ch.len_utf8();
+            utf16_off += ch.len_utf16();
+        }
+        byte_off as u32
+    }
+
+    fn line_text(source: &str, line: u32) -> &str {
+        source.split('\n').nth(line as usize).unwrap_or("")
+    }
+
+    fn assert_line_conversions(source: &str, line: u32) {
+        let idx = Utf16LineIndex::new(source);
+        let text = line_text(source, line);
+        let max_byte = text.len() as u32 + 4;
+        let max_utf16 = text.encode_utf16().count() as u32 + 4;
+
+        for byte_col in 0..=max_byte {
+            let expected = reference_byte_to_utf16(text, byte_col);
+            assert_eq!(
+                byte_col_to_utf16(source, line, byte_col),
+                expected,
+                "one-off byte->utf16 mismatch for line {line}, byte_col {byte_col}, text {text:?}"
+            );
+            assert_eq!(
+                idx.byte_col_to_utf16(line, byte_col),
+                expected,
+                "indexed byte->utf16 mismatch for line {line}, byte_col {byte_col}, text {text:?}"
+            );
+        }
+
+        for utf16_col in 0..=max_utf16 {
+            assert_eq!(
+                utf16_col_to_byte(source, line, utf16_col),
+                reference_utf16_to_byte(text, utf16_col),
+                "utf16->byte mismatch for line {line}, utf16_col {utf16_col}, text {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_ascii_only() {
@@ -190,6 +276,54 @@ mod tests {
         assert_eq!(byte_col_to_utf16(source, 1, 7), 6);
         assert_eq!(byte_col_to_utf16(source, 1, 8), 6);
         assert_eq!(byte_col_to_utf16(source, 1, 9), 6);
-        assert_eq!(idx.byte_col_to_utf16(1, 11), byte_col_to_utf16(source, 1, 11));
+        for col in 0..16 {
+            assert_eq!(
+                idx.byte_col_to_utf16(1, col),
+                byte_col_to_utf16(source, 1, col),
+                "mismatch at byte col {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exhaustive_unicode_line_conversions() {
+        let cases = [
+            "plain ascii",
+            "кириллица",
+            "Greek αβγ and Hebrew שלום",
+            "latin combining e\u{0301} a\u{0308}",
+            "precomposed é ü ñ",
+            "emoji 😀😇🚀",
+            "flags 🇺🇦🇯🇵",
+            "skin tones 👍🏽👩🏾",
+            "zwj family 👨\u{200d}👩\u{200d}👧\u{200d}👦",
+            "variation heart ♥\u{fe0f} text ♥",
+            "mixed $var = Привет😀e\u{0301}👩\u{200d}💻;",
+            "tabs\tand\tunicode\t😀",
+        ];
+
+        for case in cases {
+            let source = format!("<?php\n// {case}\n$value = '{case}';\n");
+            assert_line_conversions(&source, 1);
+            assert_line_conversions(&source, 2);
+        }
+    }
+
+    #[test]
+    fn test_crlf_empty_lines_and_eof_conversions() {
+        let source = "<?php\r\n\r\n$emoji = '😀';\r\n";
+
+        assert_line_conversions(source, 0);
+        assert_line_conversions(source, 1);
+        assert_line_conversions(source, 2);
+        assert_eq!(byte_col_to_utf16(source, 99, 7), 7);
+        assert_eq!(utf16_col_to_byte(source, 99, 7), 7);
+    }
+
+    #[test]
+    fn test_range_byte_to_utf16_multiline_unicode() {
+        let source = "<?php\n$one = 'Привет';\n$two = '😀';\n";
+
+        assert_eq!(range_byte_to_utf16(source, (1, 8, 2, 11)), (1, 8, 2, 8));
     }
 }
