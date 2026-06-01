@@ -3564,7 +3564,30 @@ change.
     - real LSP completion request path with UTF-16 input, not only direct
       byte-marker helper tests.
 
-- [ ] **PHB-002** Audit and lock down array-key access byte slicing invariants.
+- [x] **PHB-002** Audit and lock down array-key access byte slicing invariants. *(done 2026-06-01)*
+  - Started 2026-06-01: auditing `check_array_key_access` byte-position usage
+    and adding non-ASCII array-key context regressions.
+  - Completed 2026-06-01: renamed internal positions to byte-oriented names,
+    documented that slicing is only done at ASCII token byte offsets, and split
+    quoted string-key prefix validation from unquoted identifier-like prefix
+    validation.
+  - Completed 2026-06-01: quoted array-key context now accepts non-control
+    Unicode prefixes, including Tibetan combining marks, while unquoted `[key`
+    detection remains conservative.
+  - Regression tests:
+    - array-key context after Chinese/Tibetan text before the key;
+    - quoted Chinese and Tibetan key prefixes;
+    - unfinished quoted keys before the cursor;
+    - e2e array-shape completion for Chinese and Tibetan quoted PHPDoc keys
+      through real UTF-16 LSP completion positions.
+  - Validation:
+    - `cargo test -p php-lsp-completion context -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_completion test_shape_aware_completion_and_definition -- --nocapture`;
+    - `cargo test -p php-lsp-completion`;
+    - `cargo test -p php-lsp-server --test e2e_completion`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`.
   - Audit finding: `check_array_key_access` currently appears safe because it
     only slices at ASCII quote/bracket byte positions, but the pattern is easy
     to regress.

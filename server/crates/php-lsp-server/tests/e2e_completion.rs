@@ -446,7 +446,7 @@ class User {
 }
 
 function run(): void {
-    /** @var array{foo: User, bar?: int, 'quoted-key': string, meta: array{city: string}} $row */
+    /** @var array{foo: User, bar?: int, 'quoted-key': string, '中文键': string, 'བོད': string, meta: array{city: string}} $row */
     $row = [];
     /** @var list<User> $users */
     $users = [];
@@ -464,6 +464,8 @@ function run(): void {
     $literal['nested']['leaf/*literaldef*/'];
     $row['/*quoted*/'];
     $row['quoted-key/*quoteddef*/'];
+    $row['中/*unicode*/'];
+    $row['བོད/*tibetan*/'];
     /** @var RowAlias $aliasRow */
     $aliasRow = [];
     $aliasRow['/*alias*/'];
@@ -489,6 +491,8 @@ function run(): void {
         "/*literaldef*/",
         "/*quoted*/",
         "/*quoteddef*/",
+        "/*unicode*/",
+        "/*tibetan*/",
         "/*alias*/",
     ];
     let marker_position = |marker: &str| -> (u32, u32) {
@@ -501,7 +505,7 @@ function run(): void {
         }
         let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
         let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-        let character = (prefix.len() - line_start) as u32;
+        let character = prefix[line_start..].encode_utf16().count() as u32;
         (line, character)
     };
     let mut code = code_with_markers.to_string();
@@ -713,6 +717,48 @@ function run(): void {
         "completion inside existing quotes should not duplicate quotes"
     );
 
+    let (unicode_line, unicode_character) = marker_position("/*unicode*/");
+    let unicode_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(12, uri, unicode_line, unicode_character))
+        .await
+        .unwrap();
+    let unicode_result = extract_result(unicode_completion);
+    let unicode_labels: Vec<String> = completion_items_from_result(&unicode_result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        unicode_labels.contains(&"中文键".to_string()),
+        "quoted array-shape completion should handle Chinese key prefixes, got: {:?}; result: {}",
+        unicode_labels,
+        unicode_result
+    );
+
+    let (tibetan_line, tibetan_character) = marker_position("/*tibetan*/");
+    let tibetan_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(13, uri, tibetan_line, tibetan_character))
+        .await
+        .unwrap();
+    let tibetan_result = extract_result(tibetan_completion);
+    let tibetan_labels: Vec<String> = completion_items_from_result(&tibetan_result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        tibetan_labels.contains(&"བོད".to_string()),
+        "quoted array-shape completion should handle Tibetan key prefixes, got: {:?}; result: {}",
+        tibetan_labels,
+        tibetan_result
+    );
+
     let (quoted_def_line, quoted_def_character) = marker_position("/*quoteddef*/");
     let quoted_definition = service
         .ready()
@@ -739,7 +785,7 @@ function run(): void {
         .ready()
         .await
         .unwrap()
-        .call(completion_request(11, uri, alias_line, alias_character))
+        .call(completion_request(14, uri, alias_line, alias_character))
         .await
         .unwrap();
     let alias_result = extract_result(alias_completion);

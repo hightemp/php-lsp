@@ -272,23 +272,31 @@ fn starts_assignment_operator(text: &str) -> bool {
 /// Check for `$row['...` array key completion.
 fn check_array_key_access(text_before: &str) -> Option<CompletionContext> {
     let trimmed = text_before.trim_end();
-    let bracket_pos = trimmed.rfind('[')?;
+    // `rfind` returns byte offsets. Slicing below is valid because the offsets
+    // come from ASCII tokens (`[`, `'`, `"`), which are always UTF-8 boundaries.
+    let bracket_byte = trimmed.rfind('[')?;
 
-    if let Some(quote_pos) = trimmed.rfind(['\'', '"']).filter(|pos| *pos > bracket_pos) {
-        let quote = trimmed.as_bytes().get(quote_pos).copied()? as char;
-        let before_quote = &trimmed[..quote_pos];
-        if !before_quote[bracket_pos + 1..].trim().is_empty() {
+    if let Some((quote_byte, quote)) = trimmed
+        .char_indices()
+        .rev()
+        .find(|(idx, ch)| *idx > bracket_byte && matches!(ch, '\'' | '"'))
+    {
+        let before_quote = &trimmed[..quote_byte];
+        if !before_quote[bracket_byte + '['.len_utf8()..]
+            .trim()
+            .is_empty()
+        {
             return None;
         }
-        let key_prefix = &trimmed[quote_pos + quote.len_utf8()..];
+        let key_prefix = &trimmed[quote_byte + quote.len_utf8()..];
         if key_prefix.contains(quote) || key_prefix.contains(']') {
             return None;
         }
-        if !is_array_key_prefix(key_prefix) {
+        if !is_quoted_array_key_prefix(key_prefix) {
             return None;
         }
 
-        let array_expr = extract_object_expr(trimmed[..bracket_pos].trim_end());
+        let array_expr = extract_object_expr(trimmed[..bracket_byte].trim_end());
         if array_expr.is_empty() {
             return None;
         }
@@ -300,11 +308,11 @@ fn check_array_key_access(text_before: &str) -> Option<CompletionContext> {
         });
     }
 
-    let key_prefix = trimmed[bracket_pos + 1..].trim_start();
+    let key_prefix = trimmed[bracket_byte + '['.len_utf8()..].trim_start();
     if key_prefix.contains(']') || !is_array_key_prefix(key_prefix) {
         return None;
     }
-    let array_expr = extract_object_expr(trimmed[..bracket_pos].trim_end());
+    let array_expr = extract_object_expr(trimmed[..bracket_byte].trim_end());
     if array_expr.is_empty() {
         return None;
     }
@@ -313,6 +321,10 @@ fn check_array_key_access(text_before: &str) -> Option<CompletionContext> {
         key_prefix: key_prefix.to_string(),
         quote: None,
     })
+}
+
+fn is_quoted_array_key_prefix(prefix: &str) -> bool {
+    !prefix.chars().any(char::is_control)
 }
 
 fn is_array_key_prefix(prefix: &str) -> bool {
@@ -726,6 +738,65 @@ mod tests {
                 assert_eq!(quote, None);
             }
             other => panic!("Expected ArrayKey, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_array_key_context_after_non_ascii_text_before_key() {
+        let code = "<?php\n$label = '中文测试 བོད'; $row['fo/*caret*/";
+        let ctx = detect_at_marker(code);
+        match ctx {
+            CompletionContext::ArrayKey {
+                array_expr,
+                key_prefix,
+                quote,
+            } => {
+                assert_eq!(array_expr, "$row");
+                assert_eq!(key_prefix, "fo");
+                assert_eq!(quote, Some('\''));
+            }
+            other => panic!("Expected ArrayKey, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_array_key_context_accepts_quoted_non_ascii_prefixes() {
+        for (code, expected_prefix, expected_quote) in [
+            ("<?php\n$row['中文/*caret*/", "中文", '\''),
+            ("<?php\n$row[\"བོད/*caret*/", "བོད", '"'),
+        ] {
+            let ctx = detect_at_marker(code);
+            match ctx {
+                CompletionContext::ArrayKey {
+                    array_expr,
+                    key_prefix,
+                    quote,
+                } => {
+                    assert_eq!(array_expr, "$row");
+                    assert_eq!(key_prefix, expected_prefix);
+                    assert_eq!(quote, Some(expected_quote));
+                }
+                other => panic!("Expected ArrayKey for {code:?}, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_key_context_accepts_unfinished_quoted_key_before_cursor() {
+        for code in ["<?php\n$row['/*caret*/", "<?php\n$row[\"/*caret*/"] {
+            let ctx = detect_at_marker(code);
+            match ctx {
+                CompletionContext::ArrayKey {
+                    array_expr,
+                    key_prefix,
+                    quote,
+                } => {
+                    assert_eq!(array_expr, "$row");
+                    assert_eq!(key_prefix, "");
+                    assert!(quote.is_some());
+                }
+                other => panic!("Expected ArrayKey for {code:?}, got {:?}", other),
+            }
         }
     }
 
