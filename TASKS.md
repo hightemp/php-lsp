@@ -3853,7 +3853,7 @@ change.
     - schema-shape guard catches accidental serialized type changes where
       feasible.
 
-- [ ] **PHB-016** Align PHPDoc literal parsing with supported PHP literal forms.
+- [x] **PHB-016** Align PHPDoc literal parsing with supported PHP literal forms. *(done 2026-06-01)*
   - Audit finding: `is_float_literal` and related literal helpers accept/reject
     edge cases inconsistently, including forms such as `1.`, `-.5`, numeric
     separators, hex integers, and scientific notation.

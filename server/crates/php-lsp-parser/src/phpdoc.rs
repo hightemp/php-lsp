@@ -1425,27 +1425,119 @@ fn is_quoted_literal(s: &str) -> bool {
 }
 
 fn is_int_literal(s: &str) -> bool {
-    let digits = s.strip_prefix('-').unwrap_or(s);
-    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+    let Some(digits) = unsigned_numeric_literal_body(s) else {
+        return false;
+    };
+
+    if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        return digits_with_separators(hex, |ch| ch.is_ascii_hexdigit());
+    }
+    if let Some(binary) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        return digits_with_separators(binary, |ch| matches!(ch, '0' | '1'));
+    }
+    if let Some(octal) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
+        return digits_with_separators(octal, is_octal_digit);
+    }
+    if digits.starts_with('0') && digits.len() > 1 {
+        return digits_with_separators(digits, is_octal_digit);
+    }
+
+    digits_with_separators(digits, |ch| ch.is_ascii_digit())
 }
 
 fn is_float_literal(s: &str) -> bool {
+    let Some(digits) = unsigned_numeric_literal_body(s) else {
+        return false;
+    };
+
+    let mut exponent = None;
+    for (idx, ch) in digits.char_indices() {
+        if matches!(ch, 'e' | 'E') && exponent.replace(idx).is_some() {
+            return false;
+        }
+    }
+
+    if let Some(exponent_idx) = exponent {
+        let mantissa = &digits[..exponent_idx];
+        let exponent = &digits[exponent_idx + 1..];
+        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        return is_decimal_float_mantissa(mantissa) && is_decimal_lnum(exponent);
+    }
+
+    is_decimal_dnum(digits)
+}
+
+fn unsigned_numeric_literal_body(s: &str) -> Option<&str> {
     let digits = s.strip_prefix('-').unwrap_or(s);
-    if digits.is_empty() || !digits.contains('.') {
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
+fn is_decimal_float_mantissa(s: &str) -> bool {
+    is_decimal_lnum(s) || is_decimal_dnum(s)
+}
+
+fn is_decimal_lnum(s: &str) -> bool {
+    digits_with_separators(s, |ch| ch.is_ascii_digit())
+}
+
+fn is_decimal_dnum(s: &str) -> bool {
+    let mut dot = None;
+    for (idx, ch) in s.char_indices() {
+        if ch == '.' && dot.replace(idx).is_some() {
+            return false;
+        }
+    }
+
+    let Some(dot) = dot else {
+        return false;
+    };
+    let before = &s[..dot];
+    let after = &s[dot + 1..];
+    if before.is_empty() && after.is_empty() {
         return false;
     }
-    let mut dot_seen = false;
-    let mut digit_seen = false;
-    for ch in digits.chars() {
-        if ch == '.' && !dot_seen {
-            dot_seen = true;
-        } else if ch.is_ascii_digit() {
-            digit_seen = true;
+    if !before.is_empty() && !is_decimal_lnum(before) {
+        return false;
+    }
+    if !after.is_empty() && !is_decimal_lnum(after) {
+        return false;
+    }
+    true
+}
+
+fn is_octal_digit(ch: char) -> bool {
+    matches!(ch, '0'..='7')
+}
+
+fn digits_with_separators(s: &str, is_digit: impl Fn(char) -> bool) -> bool {
+    let mut saw_digit = false;
+    let mut previous_was_digit = false;
+
+    for ch in s.chars() {
+        if is_digit(ch) {
+            saw_digit = true;
+            previous_was_digit = true;
+        } else if ch == '_' && previous_was_digit {
+            previous_was_digit = false;
         } else {
             return false;
         }
     }
-    dot_seen && digit_seen
+
+    saw_digit && previous_was_digit
 }
 
 #[cfg(test)]
@@ -1790,6 +1882,49 @@ mod tests {
         assert_eq!(items[1].value, TypeInfo::LiteralInt("1".to_string()));
         assert_eq!(items[2].value, TypeInfo::LiteralBool(true));
         assert_eq!(items[3].value, TypeInfo::LiteralFloat("1.5".to_string()));
+    }
+
+    #[test]
+    fn test_parse_numeric_literal_type_forms() {
+        let accepted = [
+            ("0", TypeInfo::LiteralInt("0".to_string())),
+            ("123", TypeInfo::LiteralInt("123".to_string())),
+            ("1_234_567", TypeInfo::LiteralInt("1_234_567".to_string())),
+            ("0123", TypeInfo::LiteralInt("0123".to_string())),
+            ("0_123", TypeInfo::LiteralInt("0_123".to_string())),
+            ("0o7_1", TypeInfo::LiteralInt("0o7_1".to_string())),
+            ("0O71", TypeInfo::LiteralInt("0O71".to_string())),
+            ("0x1_A", TypeInfo::LiteralInt("0x1_A".to_string())),
+            ("0X1A", TypeInfo::LiteralInt("0X1A".to_string())),
+            ("0b10_10", TypeInfo::LiteralInt("0b10_10".to_string())),
+            ("0B1010", TypeInfo::LiteralInt("0B1010".to_string())),
+            ("-0x1A", TypeInfo::LiteralInt("-0x1A".to_string())),
+            ("1.5", TypeInfo::LiteralFloat("1.5".to_string())),
+            ("1.", TypeInfo::LiteralFloat("1.".to_string())),
+            (".5", TypeInfo::LiteralFloat(".5".to_string())),
+            ("-.5", TypeInfo::LiteralFloat("-.5".to_string())),
+            ("1_234.567", TypeInfo::LiteralFloat("1_234.567".to_string())),
+            ("1.2e3", TypeInfo::LiteralFloat("1.2e3".to_string())),
+            ("7E-10", TypeInfo::LiteralFloat("7E-10".to_string())),
+            ("1e+5", TypeInfo::LiteralFloat("1e+5".to_string())),
+            ("1_2e3_4", TypeInfo::LiteralFloat("1_2e3_4".to_string())),
+            ("1.e2", TypeInfo::LiteralFloat("1.e2".to_string())),
+            (".5e2", TypeInfo::LiteralFloat(".5e2".to_string())),
+        ];
+
+        for (raw, expected) in accepted {
+            assert_eq!(parse_literal_type(raw), Some(expected), "literal {raw}");
+        }
+    }
+
+    #[test]
+    fn test_reject_malformed_numeric_literal_type_forms() {
+        for raw in [
+            "", "-", "+1", "+1.2", "_1", "1_", "1__2", "09", "0_9", "0x", "0x_1", "0x1_", "0b102",
+            "0o128", ".", "-.", "1..2", "1_.2", "1._2", "1e", "1e+", "1e_2", "1__2e3", "1e2.3",
+        ] {
+            assert_eq!(parse_literal_type(raw), None, "literal {raw}");
+        }
     }
 
     #[test]
