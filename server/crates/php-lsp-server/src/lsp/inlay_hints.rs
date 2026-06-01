@@ -9,6 +9,7 @@ impl PhpLspBackend {
     ) -> Result<Option<Vec<InlayHint>>> {
         let uri_str = params.text_document.uri.as_str().to_string();
         let php_version = *self.php_version.lock().await;
+        let template_document = self.template_document(&uri_str);
 
         let (tree, source, file_symbols, document_version) = {
             let parser = match self.open_files.get(&uri_str) {
@@ -36,7 +37,12 @@ impl PhpLspBackend {
         };
 
         let index = self.index.clone();
-        let requested_range = params.range;
+        let original_requested_range = params.range;
+        let requested_range = if template_document.is_some() {
+            full_document_range(&source)
+        } else {
+            original_requested_range
+        };
         let compute_uri = uri_str.clone();
         let mut hints =
             match run_file_io_blocking("inlayHint compute", uri_str.clone(), move || {
@@ -59,6 +65,10 @@ impl PhpLspBackend {
                     Vec::new()
                 }
             };
+
+        if let Some(template) = &template_document {
+            hints = map_inlay_hints_to_template_original(template, original_requested_range, hints);
+        }
 
         self.hydrate_inlay_hint_label_locations(&mut hints).await;
 
@@ -87,6 +97,55 @@ impl PhpLspBackend {
             }
         }
     }
+}
+
+fn map_inlay_hints_to_template_original(
+    template: &TemplateDocument,
+    requested_range: Range,
+    hints: Vec<InlayHint>,
+) -> Vec<InlayHint> {
+    hints
+        .into_iter()
+        .filter_map(|mut hint| {
+            let original_position = template.map_virtual_position_to_original(hint.position)?;
+            if !position_in_range(original_position, requested_range) {
+                return None;
+            }
+            hint.position = original_position;
+
+            if let Some(text_edits) = hint.text_edits.take() {
+                let mut mapped_edits = Vec::with_capacity(text_edits.len());
+                for mut edit in text_edits {
+                    edit.range = template.map_virtual_range_to_original(edit.range)?;
+                    mapped_edits.push(edit);
+                }
+                hint.text_edits = Some(mapped_edits);
+            }
+
+            Some(hint)
+        })
+        .collect()
+}
+
+fn full_document_range(source: &str) -> Range {
+    let line = source.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = source.rfind('\n').map_or(0, |idx| idx + 1);
+    Range {
+        start: Position::new(0, 0),
+        end: Position::new(line, source[line_start..].encode_utf16().count() as u32),
+    }
+}
+
+fn position_in_range(position: Position, range: Range) -> bool {
+    position_after_or_equal(position, range.start) && position_before_or_equal(position, range.end)
+}
+
+fn position_after_or_equal(left: Position, right: Position) -> bool {
+    (left.line, left.character) >= (right.line, right.character)
+}
+
+fn position_before_or_equal(left: Position, right: Position) -> bool {
+    (left.line, left.character) <= (right.line, right.character)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -386,7 +386,7 @@ final class DashboardController
     let complete_marker = "/*complete*/";
     let template_marker = "/*template*/";
     let twig_with_markers = format!(
-        "🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད <h1>{{{{ user.name }}}}</h1>\n{{% for item in users %}}\n  {{{{ item.get{} }}}}\n{{% endfor %}}\n{{% include 'shared/_card.html.twig{}' %}}\n",
+        "🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད <h1>{{{{- user.name -}}}}</h1>\n{{%- for item in users -%}}\n  {{{{- item.get{} -}}}}\n{{%- endfor -%}}\n{{%- include 'shared/_card.html.twig{}' -%}}\n",
         complete_marker, template_marker
     );
     let marker_position = |marker: &str| -> (u32, u32) {
@@ -406,7 +406,7 @@ final class DashboardController
         .replace(complete_marker, "")
         .replace(template_marker, "");
     let hover_position = utf16_position_at(&twig, "user.name");
-    let definition_position = utf16_position_after(&twig, "user.");
+    let definition_position = utf16_position_after(&twig, "user.n");
 
     fs::write(&user_path, user_php).unwrap();
     fs::write(&controller_path, controller_php).unwrap();
@@ -572,10 +572,452 @@ final class DashboardController
     let tokens = decode_semantic_tokens(&extract_result(tokens_resp));
     assert!(
         tokens.iter().any(|(line, start, len, token_type, _)| {
-            (*line, *start, *len, *token_type) == (1, 3, 3, 11)
+            (*line, *start, *len, *token_type) == (1, 4, 3, 11)
         }),
         "expected Twig for keyword semantic token, got: {:?}",
         tokens
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_twig_template_inlay_hints_are_mapped_to_original_source() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-template-inlay-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/dashboard")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let user_path = tmp_root.join("src/Entity/User.php");
+    let controller_path = tmp_root.join("src/Controller/DashboardController.php");
+    let twig_path = tmp_root.join("templates/dashboard/inlay.html.twig");
+    let user_uri = file_uri(&user_path);
+    let controller_uri = file_uri(&controller_path);
+    let twig_uri = file_uri(&twig_path);
+
+    let user_php = r#"<?php
+namespace App\Entity;
+
+class User
+{
+    public function getName(): string { return ''; }
+    public function rename(string $name): string { return $name; }
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Entity\User;
+
+final class DashboardController
+{
+    public function show(): void
+    {
+        $this->render('dashboard/inlay.html.twig', [
+            'user' => new User(),
+            'users' => [new User()],
+        ]);
+    }
+}
+"#;
+    let twig = concat!(
+        "🇺🇸 <h1>{{- user.rename('Alice') -}}</h1>\n",
+        "{%- for item in users -%}\n",
+        "  {{- item.getName() -}}\n",
+        "{%- endfor -%}\n",
+        "{%- set current = user -%}\n",
+        "{{- current.getName() -}}\n",
+    );
+    let argument_position = utf16_position_at(twig, "'Alice'");
+    let item_type_position = utf16_position_after(twig, "item");
+    let current_type_position = utf16_position_after(twig, "current");
+
+    fs::write(&user_path, user_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&twig_path, twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&user_uri, user_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&controller_uri, controller_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(&twig_uri, "twig", twig))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "valid Twig should stay diagnostic-free before inlay hints, got: {}",
+        diagnostics
+    );
+
+    let inlay_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, &twig_uri, 0, 0, 99, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_resp);
+    let hints = inlay_result
+        .as_array()
+        .expect("Twig inlayHint should return mapped hints");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some("name:")
+                && hint["position"]["line"].as_u64() == Some(argument_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(argument_position.1 as u64)
+        }),
+        "expected Twig call argument inlay hint at original string argument, got labels {:?}: {}",
+        labels,
+        inlay_result
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": User")
+                && hint["position"]["line"].as_u64() == Some(item_type_position.0 as u64)
+                && hint["position"]["character"].as_u64()
+                    == Some(item_type_position.1 as u64)
+                && inlay_hint_has_label_part_location(hint, "User")
+        }),
+        "expected Twig foreach variable type inlay hint mapped to original item, got labels {:?}: {}",
+        labels,
+        inlay_result
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": User")
+                && hint["position"]["line"].as_u64() == Some(current_type_position.0 as u64)
+                && hint["position"]["character"].as_u64()
+                    == Some(current_type_position.1 as u64)
+        }),
+        "expected Twig set variable type inlay hint mapped to original current variable, got labels {:?}: {}",
+        labels,
+        inlay_result
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_twig_context_infers_typed_controller_parameter_variables() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-template-param-context-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/dashboard")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let user_path = tmp_root.join("src/Entity/User.php");
+    let controller_path = tmp_root.join("src/Controller/DashboardController.php");
+    let twig_path = tmp_root.join("templates/dashboard/param.html.twig");
+    let user_uri = file_uri(&user_path);
+    let controller_uri = file_uri(&controller_path);
+    let twig_uri = file_uri(&twig_path);
+
+    let user_php = r#"<?php
+namespace App\Entity;
+
+class User
+{
+    public string $name = '';
+    public function getName(): string { return $this->name; }
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Entity\User;
+
+final class DashboardController
+{
+    public function fallbackOnly(): void
+    {
+        $user = null;
+        $this->render('dashboard/param.html.twig', [
+            'user' => $user,
+        ]);
+    }
+
+    public function show(User $user): void
+    {
+        $messageLogs = [];
+        $this->render('dashboard/param.html.twig', [
+            'user' => $user,
+            'messageLogs' => $messageLogs,
+        ]);
+    }
+}
+"#;
+    let completion_marker = "/*complete*/";
+    let twig_with_marker = format!(
+        "{{{{ user.{} }}}}\n{{{{ user.name }}}}\n{{{{ messageLogs }}}}\n",
+        completion_marker
+    );
+    let completion_offset = twig_with_marker
+        .find(completion_marker)
+        .expect("test Twig should contain completion marker");
+    let completion_prefix = twig_with_marker[..completion_offset].replace(completion_marker, "");
+    let completion_line = completion_prefix
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u32;
+    let completion_line_start = completion_prefix
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let completion_character = completion_prefix[completion_line_start..]
+        .encode_utf16()
+        .count() as u32;
+    let twig = twig_with_marker.replace(completion_marker, "");
+    let hover_position = utf16_position_at(&twig, "user.name");
+    let definition_position = utf16_position_after(&twig, "user.n");
+
+    fs::write(&user_path, user_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&twig_path, &twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&user_uri, user_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&controller_uri, controller_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &twig_uri, "twig", &twig,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "typed parameter Twig context should suppress undefined variable diagnostics, got: {}",
+        diagnostics
+    );
+
+    let hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            &twig_uri,
+            hover_position.0,
+            hover_position.1,
+        ))
+        .await
+        .unwrap();
+    let hover = extract_result(hover_resp);
+    let hover_text = hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(
+        hover_text.contains("App\\Entity\\User") || hover_text.contains("User $user"),
+        "expected Twig hover to resolve typed controller parameter context, got: {}",
+        hover
+    );
+
+    let completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            3,
+            &twig_uri,
+            completion_line,
+            completion_character,
+        ))
+        .await
+        .unwrap();
+    let completion = extract_result(completion_resp);
+    let labels: Vec<String> = completion_items_from_result(&completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "getName") || labels.iter().any(|label| label == "name"),
+        "expected Twig completion from typed controller parameter to include User members, got: {:?}",
+        labels
+    );
+
+    let definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            4,
+            &twig_uri,
+            definition_position.0,
+            definition_position.1,
+        ))
+        .await
+        .unwrap();
+    let definition = extract_result(definition_resp);
+    assert_eq!(
+        definition.get("uri").and_then(|uri| uri.as_str()),
+        Some(user_uri.as_str()),
+        "Twig definition should jump from typed controller parameter member to PHP symbol, got: {}",
+        definition
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_twig_template_reports_twig_syntax_diagnostics() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-template-syntax-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("templates")).unwrap();
+    let twig_path = tmp_root.join("templates/broken.html.twig");
+    let twig_uri = php_lsp_types::uri::path_to_uri(&twig_path).unwrap();
+    let twig = "{% if user %}\n{{ user.name }\n";
+    fs::write(&twig_path, twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(&twig_uri, "twig", twig))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(1)).await;
+    let messages = published_diagnostic_messages(&diagnostics);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "Unclosed Twig expression"),
+        "expected unclosed Twig expression diagnostic, got: {}",
+        diagnostics
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Unclosed Twig `if` block")),
+        "expected unclosed Twig if block diagnostic, got: {}",
+        diagnostics
+    );
+    assert!(
+        diagnostics["diagnostics"].as_array().is_some_and(|items| {
+            items.iter().all(|diagnostic| {
+                diagnostic["code"].as_str() == Some("php-lsp.twigSyntax")
+                    && diagnostic["range"]["start"]["line"].as_u64().is_some()
+            })
+        }),
+        "Twig syntax diagnostics should carry explicit code and mapped original ranges, got: {}",
+        diagnostics
     );
 
     let _ = fs::remove_dir_all(&tmp_root);
@@ -619,7 +1061,11 @@ async fn test_twig_complex_expressions_are_best_effort_and_quiet() {
         "{{ user.active ? 'yes' : 'no' }}\n",
         "{{ user.name ?? 'n/a' }}\n",
         "{{ user['name'] }}\n",
+        "{% verbatim %}{{ user.name }{% endverbatim %}\n",
     );
+    let path_position = utf16_position_at(twig, "path('dashboard')");
+    let bracket_position = utf16_position_after(twig, "user[");
+    let filter_completion_position = utf16_position_after(twig, "user.name|");
     fs::write(&twig_path, twig).unwrap();
 
     service
@@ -644,6 +1090,59 @@ async fn test_twig_complex_expressions_are_best_effort_and_quiet() {
         Some(0),
         "unsupported Twig expressions should stay quiet, got: {}",
         diagnostics
+    );
+
+    let hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            &twig_uri,
+            path_position.0,
+            path_position.1,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(hover_resp).is_null(),
+        "unsupported Twig functions should not be mapped to misleading PHP hover"
+    );
+
+    let definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            3,
+            &twig_uri,
+            bracket_position.0,
+            bracket_position.1,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(definition_resp).is_null(),
+        "unsupported Twig bracket access should not return a misleading definition"
+    );
+
+    let completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            4,
+            &twig_uri,
+            filter_completion_position.0,
+            filter_completion_position.1,
+        ))
+        .await
+        .unwrap();
+    let completion = extract_result(completion_resp);
+    assert!(
+        completion_items_from_result(&completion).is_empty(),
+        "unsupported Twig filter expression should not return misleading completions, got: {}",
+        completion
     );
 
     let _ = fs::remove_dir_all(&tmp_root);

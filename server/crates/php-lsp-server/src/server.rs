@@ -1462,7 +1462,10 @@ impl PhpLspBackend {
             )
             .await;
             if let Some(template) = template_document {
-                diagnostics = template.map_safe_diagnostics_to_original(diagnostics);
+                diagnostics = template.map_diagnostics_to_original(
+                    diagnostics,
+                    diagnostics_config.mode == DiagnosticsMode::Off,
+                );
             }
 
             if document_versions.get(&task_uri_str).map(|current| *current) == Some(version) {
@@ -2040,7 +2043,10 @@ impl PhpLspBackend {
                     )
                     .await;
                     if let Some(template) = template_document {
-                        diags = template.map_safe_diagnostics_to_original(diags);
+                        diags = template.map_diagnostics_to_original(
+                            diags,
+                            diagnostics_config.mode == DiagnosticsMode::Off,
+                        );
                     }
                     if reindex_document_versions
                         .get(&uri_str)

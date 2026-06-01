@@ -225,7 +225,10 @@ impl PhpLspBackend {
                     )
                     .await;
                     if let Some(template) = template_document {
-                        diags = template.map_safe_diagnostics_to_original(diags);
+                        diags = template.map_diagnostics_to_original(
+                            diags,
+                            diagnostics_config.mode == DiagnosticsMode::Off,
+                        );
                     }
                     if reindex_document_versions
                         .get(&uri_str)

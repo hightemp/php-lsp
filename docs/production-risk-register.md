@@ -355,6 +355,14 @@ Current evidence:
   template expressions and static Twig template path lookup.
 - `PHB-003` invalidates Twig disk context cache entries when PHP render-context
   sources change, keeping open-template refresh and cached disk reads aligned.
+- `H-TWIG-LSP-SURFACE-2026-06-01` maps Twig inlay hints back to original
+  template ranges, adds conservative Twig delimiter/block syntax diagnostics,
+  and infers Twig context variables from typed controller parameters passed
+  through render arrays, falling back to `mixed` for render keys whose value
+  type cannot be inferred. The same task raised the default Tokio worker stack
+  to 8 MiB, with `PHP_LSP_WORKER_THREAD_STACK_SIZE` override, after real
+  `bdpn-ui` Twig diagnostics plus lazy vendor indexing exposed a worker stack
+  overflow on the runtime default.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request
@@ -380,8 +388,9 @@ Mitigation:
   resolution before member diagnostics.
 - `IE-044` / `IE-044A` / `PHA-030`: template diagnostics are mapped only when
   source ranges are exact and the diagnostic belongs to a conservative
-  expression allowlist; generated virtual PHP, syntax noise, template
-  functions, incomplete/magic properties, and uncertain ranges are suppressed.
+  expression allowlist; generated virtual PHP, template functions,
+  incomplete/magic properties, and uncertain ranges are suppressed. Twig
+  delimiter/block syntax diagnostics are computed from original template text.
 - `PHA-031`: open Twig documents refresh inferred render-context types after
   relevant PHP controller/render edits and workspace reindex completion, with a
   bounded open-template refresh limit.

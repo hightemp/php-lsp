@@ -208,12 +208,30 @@ pub(in crate::server) fn collect_twig_context_array_types(
         let Some(name) = php_string_literal_value_at_range(source, key_range.0, key_range.1) else {
             continue;
         };
-        if !is_template_variable_name(&name) || variables.contains_key(&name) {
+        if !is_template_variable_name(&name) {
             continue;
         }
-        if let Some(type_text) = infer_twig_context_value_type(source, value_range, file_symbols) {
+        let type_text = infer_twig_context_value_type(source, value_range, file_symbols)
+            .unwrap_or_else(|| "mixed".to_string());
+        merge_twig_context_variable_type(variables, name, type_text);
+    }
+}
+
+fn merge_twig_context_variable_type(
+    variables: &mut HashMap<String, String>,
+    name: String,
+    type_text: String,
+) {
+    if type_text == "mixed" {
+        variables.entry(name).or_insert(type_text);
+        return;
+    }
+
+    match variables.get(&name).map(String::as_str) {
+        None | Some("mixed") => {
             variables.insert(name, type_text);
         }
+        Some(_) => {}
     }
 }
 
@@ -257,8 +275,198 @@ pub(in crate::server) fn infer_twig_context_value_type(
         }
     }
 
+    if let Some(variable_name) = simple_php_variable_name(value) {
+        if let Some(type_text) =
+            infer_twig_context_variable_type(source, start, variable_name, file_symbols)
+        {
+            return Some(type_text);
+        }
+    }
+
     first_new_class_name(value)
         .map(|class_name| resolve_twig_context_class_name(file_symbols, class_name))
+}
+
+fn simple_php_variable_name(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let name = value.strip_prefix('$')?;
+    if name.is_empty() {
+        return None;
+    }
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    chars
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        .then_some(name)
+}
+
+fn infer_twig_context_variable_type(
+    source: &str,
+    value_start: usize,
+    variable_name: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<String> {
+    let position = byte_line_col_at_offset(source, value_start);
+    let signature_symbol = file_symbols
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+            ) && symbol.signature.is_some()
+                && byte_position_in_range(position, symbol.range)
+        })
+        .min_by_key(|symbol| symbol_range_len(symbol.range))?;
+
+    let signature = signature_symbol.signature.as_ref()?;
+    let param = signature
+        .params
+        .iter()
+        .find(|param| param.name.trim_start_matches('$') == variable_name)?;
+    twig_context_type_info_text(
+        file_symbols,
+        signature_symbol.parent_fqn.as_deref().unwrap_or(""),
+        param.type_info.as_ref()?,
+    )
+}
+
+fn twig_context_type_info_text(
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> Option<String> {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            twig_context_simple_type_text(file_symbols, owner_fqn, name)
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            twig_context_type_info_text(file_symbols, owner_fqn, inner)
+                .map(|inner| format!("?{inner}"))
+        }
+        php_lsp_types::TypeInfo::Union(types) => {
+            let parts: Vec<_> = types
+                .iter()
+                .filter_map(|type_info| {
+                    twig_context_type_info_text(file_symbols, owner_fqn, type_info)
+                })
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("|"))
+        }
+        php_lsp_types::TypeInfo::Intersection(types) => {
+            let parts: Vec<_> = types
+                .iter()
+                .filter_map(|type_info| {
+                    twig_context_type_info_text(file_symbols, owner_fqn, type_info)
+                })
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("&"))
+        }
+        php_lsp_types::TypeInfo::Generic { base, args } => {
+            let base = twig_context_simple_type_text(file_symbols, owner_fqn, base)?;
+            let args: Vec<_> = args
+                .iter()
+                .filter_map(|type_info| {
+                    twig_context_type_info_text(file_symbols, owner_fqn, type_info)
+                })
+                .collect();
+            Some(format!("{}<{}>", base, args.join(", ")))
+        }
+        php_lsp_types::TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => {
+            let parts: Vec<_> = [if_type.as_ref(), else_type.as_ref()]
+                .into_iter()
+                .filter_map(|type_info| {
+                    twig_context_type_info_text(file_symbols, owner_fqn, type_info)
+                })
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("|"))
+        }
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
+            (!owner_fqn.is_empty()).then(|| owner_fqn.to_string())
+        }
+        php_lsp_types::TypeInfo::Parent_ => Some("parent".to_string()),
+        php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::ObjectShape(_)
+        | php_lsp_types::TypeInfo::Callable { .. }
+        | php_lsp_types::TypeInfo::ClassString(_)
+        | php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull
+        | php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed => Some(type_info.to_string()),
+    }
+}
+
+fn twig_context_simple_type_text(
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    name: &str,
+) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+    if matches!(lower.as_str(), "self" | "static") {
+        return (!owner_fqn.is_empty()).then(|| owner_fqn.to_string());
+    }
+    if lower == "parent" || twig_context_builtin_type_name(&lower) {
+        return Some(name.trim_start_matches('\\').to_string());
+    }
+    Some(resolve_twig_context_class_name(file_symbols, name))
+}
+
+fn twig_context_builtin_type_name(lower: &str) -> bool {
+    matches!(
+        lower,
+        "array"
+            | "bool"
+            | "boolean"
+            | "callable"
+            | "false"
+            | "float"
+            | "int"
+            | "integer"
+            | "iterable"
+            | "mixed"
+            | "never"
+            | "null"
+            | "object"
+            | "resource"
+            | "self"
+            | "static"
+            | "string"
+            | "true"
+            | "void"
+    )
+}
+
+fn byte_line_col_at_offset(source: &str, offset: usize) -> (u32, u32) {
+    let bounded = offset.min(source.len());
+    let prefix = &source[..bounded];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+    (line, bounded.saturating_sub(line_start) as u32)
+}
+
+fn byte_position_in_range(position: (u32, u32), range: (u32, u32, u32, u32)) -> bool {
+    let start = (range.0, range.1);
+    let end = (range.2, range.3);
+    start <= position && position <= end
+}
+
+fn symbol_range_len(range: (u32, u32, u32, u32)) -> u64 {
+    let start = u64::from(range.0) << 32 | u64::from(range.1);
+    let end = u64::from(range.2) << 32 | u64::from(range.3);
+    end.saturating_sub(start)
 }
 
 pub(in crate::server) fn first_new_class_name(value: &str) -> Option<&str> {
@@ -608,7 +816,7 @@ async fn twig_variable_types_for_template_state(
             continue;
         }
         for variable in file.variables {
-            variables.insert(variable.name, variable.type_text);
+            merge_twig_context_variable_type(&mut variables, variable.name, variable.type_text);
         }
     }
 

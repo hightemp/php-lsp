@@ -18,6 +18,13 @@ which paths affect latency.
 The VS Code extension launches `php-lsp` over stdio. Server logs go to stderr
 through `tracing`, so they do not corrupt JSON-RPC messages.
 
+The server binary builds its Tokio runtime explicitly instead of relying on the
+attribute macro default. Worker threads use an 8 MiB stack by default because
+large framework projects can combine deeply nested PHPDoc/type expansion,
+template diagnostics, and lazy vendor indexing on worker tasks. The stack size
+can be overridden with `PHP_LSP_WORKER_THREAD_STACK_SIZE` in bytes; values below
+1 MiB are ignored and the default is used.
+
 ## Server Crate Layout
 
 The server crate is intentionally split by operational area. New code should
@@ -349,14 +356,18 @@ When an open document is recognized as a template, the server stores a
 - A conservative preprocessor emits virtual PHP only for supported expression
   and control-block ranges.
 - A source map converts template positions to virtual PHP positions for hover,
-  completion, definition, diagnostics, and semantic tokens, then maps returned
-  ranges back to the template.
+  completion, definition, inlay hints, diagnostics, and semantic tokens, then
+  maps returned ranges back to the template.
 - Template diagnostics run through a conservative allowlist after virtual PHP
-  analysis. Only exact source-mapped expression diagnostics such as undefined
-  Twig variables, unknown methods/class constants, unknown classes, and type
-  compatibility errors are published. Syntax noise, generated virtual PHP
-  ranges, template functions, incomplete/magic properties, and any partially
-  mapped ranges are suppressed instead of reporting whole-template errors.
+  analysis. Only exact source-mapped expression diagnostics such as unknown
+  methods/class constants, unknown classes, and type compatibility errors are
+  published. Twig undefined-variable diagnostics are suppressed because valid
+  templates frequently receive variables through includes, components, email
+  contexts, and extensions the server cannot statically see. Twig
+  delimiter/block syntax diagnostics are produced from the original template
+  source. Generated virtual PHP ranges, template functions, incomplete/magic
+  properties, and any partially mapped ranges are suppressed instead of
+  reporting whole-template errors.
 
 Blade support covers escaped/raw echo blocks and common `@if`, `@foreach`,
 `@isset`, and `@empty` directives. Twig support is a separate language path for
@@ -375,13 +386,18 @@ hover, completion, and inlay requests avoid pretending the Twig expression is
 ordinary PHP.
 
 Twig context variables are inferred statically from simple PHP
-`render('template.html.twig', ['name' => expr])` call sites. The context scanner
-combines open PHP files from memory with a bounded, disk-backed cache for closed
-PHP files. Cache misses run through Tokio's blocking pool and file watcher/save
-events clear the cache. Open PHP buffers are authoritative over cached disk
-scan results; opening or editing a PHP source evicts disk-cache entries that
-were derived from that source URI, so a later close falls back to a refreshed
-disk snapshot instead of stale render context. Open Twig documents are
+`render('template.html.twig', ['name' => expr])` call sites. Supported context
+expressions include `new Class()`, simple arrays of new objects, and typed
+controller parameter variables passed through to the render context. Render
+keys whose value type cannot be inferred still seed `mixed` variables in the
+virtual prelude so valid templates do not publish false undefined-variable
+diagnostics just because the server cannot infer a richer type. The context
+scanner combines open PHP files from memory with a bounded, disk-backed cache
+for closed PHP files. Cache misses run through Tokio's blocking pool and file
+watcher/save events clear the cache. Open PHP buffers are authoritative over
+cached disk scan results; opening or editing a PHP source evicts disk-cache
+entries that were derived from that source URI, so a later close falls back to a
+refreshed disk snapshot instead of stale render context. Open Twig documents are
 bounded-refresh candidates after PHP controller/render edits and workspace
 reindex completion: their context
 prelude, virtual PHP parser, diagnostics, and request-time hover/completion/inlay
@@ -514,7 +530,7 @@ Diagnostics are controlled by `phpLsp.diagnostics.mode`:
 | Mode | Behavior |
 |---|---|
 | `off` | No php-lsp diagnostics. |
-| `syntax-only` | Tree-sitter syntax diagnostics only. |
+| `syntax-only` | Tree-sitter syntax diagnostics, plus conservative Twig syntax diagnostics for Twig documents. |
 | `basic-semantic` | Syntax plus built-in semantic diagnostics. |
 
 Built-in semantic diagnostics include unknown symbols, unused imports/variables,

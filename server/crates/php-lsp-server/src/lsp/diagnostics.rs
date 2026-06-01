@@ -3709,7 +3709,8 @@ impl PhpLspBackend {
         )
         .await;
         if let Some(template) = &template_document {
-            diagnostics = template.map_safe_diagnostics_to_original(diagnostics);
+            diagnostics = template
+                .map_diagnostics_to_original(diagnostics, diagnostics_mode == DiagnosticsMode::Off);
         } else if should_preresolve_dependencies {
             diagnostics = self
                 .filter_lazy_resolved_symbol_diagnostics(diagnostics)

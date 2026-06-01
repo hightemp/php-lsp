@@ -10,8 +10,21 @@ use std::path::PathBuf;
 use tower_lsp::{LspService, Server};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() {
+const DEFAULT_WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+const MIN_WORKER_THREAD_STACK_SIZE: usize = 1024 * 1024;
+const WORKER_THREAD_STACK_SIZE_ENV: &str = "PHP_LSP_WORKER_THREAD_STACK_SIZE";
+
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(worker_thread_stack_size())
+        .build()
+        .expect("failed to build php-lsp Tokio runtime");
+
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     if handle_cli_command().await {
         return;
     }
@@ -33,6 +46,18 @@ async fn main() {
     let (service, socket) = LspService::new(PhpLspBackend::new);
 
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+fn worker_thread_stack_size() -> usize {
+    worker_thread_stack_size_from_env_value(std::env::var(WORKER_THREAD_STACK_SIZE_ENV).ok())
+}
+
+fn worker_thread_stack_size_from_env_value(value: Option<String>) -> usize {
+    value
+        .as_deref()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|size| *size >= MIN_WORKER_THREAD_STACK_SIZE)
+        .unwrap_or(DEFAULT_WORKER_THREAD_STACK_SIZE)
 }
 
 async fn handle_cli_command() -> bool {
@@ -116,4 +141,39 @@ fn print_help() {
         "php-lsp {}\n\nUsage:\n  php-lsp                 Start the LSP server on stdio\n  php-lsp analyze [PATH]  Analyze PHP files and print diagnostics\n  php-lsp analyze [PATH] --project-root <DIR> --severity <all|hint|info|warning|error> --format <table|json|github>\n  php-lsp fix [PATH] --dry-run\n  php-lsp fix [PATH] --dry-run --project-root <DIR> --rule <unused-imports|organize-imports|add-return-type> --format <table|json>\n  php-lsp init-config     Create .php-lsp.toml in the current directory\n  php-lsp init-config --path <path>\n  php-lsp --version",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        worker_thread_stack_size_from_env_value, DEFAULT_WORKER_THREAD_STACK_SIZE,
+        MIN_WORKER_THREAD_STACK_SIZE,
+    };
+
+    #[test]
+    fn worker_thread_stack_size_uses_default_for_missing_or_invalid_env() {
+        assert_eq!(
+            worker_thread_stack_size_from_env_value(None),
+            DEFAULT_WORKER_THREAD_STACK_SIZE
+        );
+        assert_eq!(
+            worker_thread_stack_size_from_env_value(Some("not-a-number".to_string())),
+            DEFAULT_WORKER_THREAD_STACK_SIZE
+        );
+        assert_eq!(
+            worker_thread_stack_size_from_env_value(Some(
+                (MIN_WORKER_THREAD_STACK_SIZE - 1).to_string()
+            )),
+            DEFAULT_WORKER_THREAD_STACK_SIZE
+        );
+    }
+
+    #[test]
+    fn worker_thread_stack_size_accepts_large_env_value() {
+        let configured = MIN_WORKER_THREAD_STACK_SIZE * 2;
+        assert_eq!(
+            worker_thread_stack_size_from_env_value(Some(configured.to_string())),
+            configured
+        );
+    }
 }

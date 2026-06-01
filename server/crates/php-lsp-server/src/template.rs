@@ -1,6 +1,8 @@
 use php_lsp_parser::utf16::{utf16_col_to_byte, Utf16LineIndex};
 use std::collections::HashSet;
-use tower_lsp::ls_types::{Diagnostic, NumberOrString, Position, Range, SemanticToken};
+use tower_lsp::ls_types::{
+    Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, SemanticToken,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TemplateKind {
@@ -72,6 +74,36 @@ impl TemplateDocument {
         ))
     }
 
+    pub(crate) fn map_virtual_position_to_original(&self, position: Position) -> Option<Position> {
+        let virtual_offset = byte_offset_for_position(&self.virtual_source, position)?;
+        let (original_offset, _) = self
+            .source_map
+            .virtual_range_to_original(virtual_offset, virtual_offset)?;
+        Some(position_for_byte_offset(
+            &self.original_source,
+            original_offset,
+        ))
+    }
+
+    pub(crate) fn syntax_diagnostics(&self) -> Vec<Diagnostic> {
+        match self.kind {
+            TemplateKind::Blade => Vec::new(),
+            TemplateKind::Twig => twig_syntax_diagnostics(&self.original_source),
+        }
+    }
+
+    pub(crate) fn map_diagnostics_to_original(
+        &self,
+        diagnostics: Vec<Diagnostic>,
+        diagnostics_mode_is_off: bool,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = self.map_safe_diagnostics_to_original(diagnostics);
+        if !diagnostics_mode_is_off {
+            diagnostics.extend(self.syntax_diagnostics());
+        }
+        diagnostics
+    }
+
     pub(crate) fn map_safe_diagnostics_to_original(
         &self,
         diagnostics: Vec<Diagnostic>,
@@ -108,18 +140,16 @@ impl TemplateDocument {
 
         let message = diagnostic.message.as_str();
         match diagnostic_code_str(diagnostic) {
-            Some("php-lsp.undefinedVariable") => self.kind == TemplateKind::Twig,
+            Some("php-lsp.undefinedVariable") => false,
             Some("php-lsp.unknownClass")
             | Some("php-lsp.argumentCountMismatch")
             | Some("php-lsp.typeCompatibility") => true,
             Some("php-lsp.members") => is_unknown_member_diagnostic_message(message),
-            Some("php-lsp.unknownSymbols") => {
-                is_unknown_symbol_diagnostic_message(message, self.kind)
-            }
+            Some("php-lsp.unknownSymbols") => is_unknown_symbol_diagnostic_message(message),
             _ => {
                 is_unknown_member_diagnostic_message(message)
                     || is_type_compatibility_diagnostic_message(message)
-                    || is_unknown_symbol_diagnostic_message(message, self.kind)
+                    || is_unknown_symbol_diagnostic_message(message)
             }
         }
     }
@@ -402,9 +432,8 @@ fn diagnostic_code_str(diagnostic: &Diagnostic) -> Option<&str> {
     }
 }
 
-fn is_unknown_symbol_diagnostic_message(message: &str, kind: TemplateKind) -> bool {
+fn is_unknown_symbol_diagnostic_message(message: &str) -> bool {
     message.starts_with("Unknown class: ")
-        || (kind == TemplateKind::Twig && message.starts_with("Undefined variable: "))
 }
 
 fn is_unknown_member_diagnostic_message(message: &str) -> bool {
@@ -551,9 +580,8 @@ pub(crate) fn preprocess_twig_template(
 
     while offset < source.len() {
         if source[offset..].starts_with("{#") {
-            let end = source[offset + 2..]
-                .find("#}")
-                .map(|relative| offset + 2 + relative + 2)
+            let end = twig_comment_delimiter_content(source, offset)
+                .map(|content| content.close_end)
                 .unwrap_or(source.len());
             semantic_tokens.push(TemplateSemanticToken {
                 original_start: offset,
@@ -566,38 +594,75 @@ pub(crate) fn preprocess_twig_template(
         }
 
         if source[offset..].starts_with("{{") {
-            if let Some(end) = source[offset + 2..]
-                .find("}}")
-                .map(|relative| offset + 2 + relative)
-            {
+            if let Some(content) = twig_delimiter_content(source, offset, "{{", "}}") {
                 push_twig_echo_fragment(
                     source,
-                    offset + 2,
-                    end,
+                    content.content_start,
+                    content.content_end,
                     &mut virtual_source,
                     &mut source_map,
                     &macro_aliases,
                 );
-                offset = end + 2;
+                offset = content.close_end;
                 continue;
             }
         }
 
         if source[offset..].starts_with("{%") {
-            if let Some(end) = source[offset + 2..]
-                .find("%}")
-                .map(|relative| offset + 2 + relative)
-            {
+            if let Some(content) = twig_delimiter_content(source, offset, "{%", "%}") {
                 push_twig_tag_fragment(
                     source,
-                    offset + 2,
-                    end,
+                    content.content_start,
+                    content.content_end,
                     &mut virtual_source,
                     &mut source_map,
                     &mut semantic_tokens,
                     &mut macro_aliases,
                 );
-                offset = end + 2;
+                if twig_tag_name(source, content.content_start, content.content_end)
+                    == Some("verbatim")
+                {
+                    if let Some(endverbatim) = find_twig_named_tag(
+                        source,
+                        content.close_end,
+                        twig_matching_end_tag_name(
+                            source,
+                            content.content_start,
+                            content.content_end,
+                        ),
+                    ) {
+                        push_twig_tag_fragment(
+                            source,
+                            endverbatim.content_start,
+                            endverbatim.content_end,
+                            &mut virtual_source,
+                            &mut source_map,
+                            &mut semantic_tokens,
+                            &mut macro_aliases,
+                        );
+                        offset = endverbatim.close_end;
+                    } else {
+                        offset = source.len();
+                    }
+                    continue;
+                }
+                if twig_tag_name(source, content.content_start, content.content_end)
+                    == Some("macro")
+                {
+                    offset = find_twig_named_tag(
+                        source,
+                        content.close_end,
+                        twig_matching_end_tag_name(
+                            source,
+                            content.content_start,
+                            content.content_end,
+                        ),
+                    )
+                    .map(|endmacro| endmacro.close_end)
+                    .unwrap_or(source.len());
+                    continue;
+                }
+                offset = content.close_end;
                 continue;
             }
         }
@@ -616,6 +681,407 @@ pub(crate) fn preprocess_twig_template(
         source_map,
         semantic_tokens,
         twig_variable_types: variable_types.to_vec(),
+    }
+}
+
+fn twig_syntax_diagnostics(source: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut block_stack: Vec<TwigBlock> = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < source.len() {
+        if source[offset..].starts_with("{#") {
+            match twig_comment_delimiter_content(source, offset) {
+                Some(content) => {
+                    offset = content.close_end;
+                }
+                None => {
+                    diagnostics.push(twig_syntax_diagnostic(
+                        source,
+                        offset,
+                        (offset + 2).min(source.len()),
+                        "Unclosed Twig comment",
+                    ));
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if source[offset..].starts_with("{{") {
+            match twig_delimiter_content(source, offset, "{{", "}}") {
+                Some(content) => {
+                    offset = content.close_end;
+                }
+                None => {
+                    diagnostics.push(twig_syntax_diagnostic(
+                        source,
+                        offset,
+                        (offset + 2).min(source.len()),
+                        "Unclosed Twig expression",
+                    ));
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if source[offset..].starts_with("{%") {
+            let Some(content) = twig_delimiter_content(source, offset, "{%", "%}") else {
+                diagnostics.push(twig_syntax_diagnostic(
+                    source,
+                    offset,
+                    (offset + 2).min(source.len()),
+                    "Unclosed Twig tag",
+                ));
+                break;
+            };
+
+            if twig_tag_name(source, content.content_start, content.content_end) == Some("verbatim")
+            {
+                if let Some(endverbatim) = find_twig_named_tag(
+                    source,
+                    content.close_end,
+                    twig_matching_end_tag_name(source, content.content_start, content.content_end),
+                ) {
+                    offset = endverbatim.close_end;
+                } else {
+                    diagnostics.push(twig_syntax_diagnostic(
+                        source,
+                        content.content_start,
+                        content.content_start + "verbatim".len(),
+                        "Unclosed Twig `verbatim` block, expected `endverbatim`",
+                    ));
+                    break;
+                }
+                continue;
+            }
+            check_twig_block_tag(
+                source,
+                offset,
+                content.content_start,
+                content.content_end,
+                &mut block_stack,
+                &mut diagnostics,
+            );
+            offset = content.close_end;
+            continue;
+        }
+
+        offset += source[offset..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+
+    for block in block_stack.into_iter().rev() {
+        diagnostics.push(twig_syntax_diagnostic(
+            source,
+            block.start,
+            block.end,
+            &format!(
+                "Unclosed Twig `{}` block, expected `{}`",
+                block.name, block.end_tag
+            ),
+        ));
+    }
+
+    diagnostics
+}
+
+#[derive(Debug, Clone)]
+struct TwigBlock {
+    name: String,
+    end_tag: &'static str,
+    start: usize,
+    end: usize,
+}
+
+fn check_twig_block_tag(
+    source: &str,
+    tag_start: usize,
+    content_start: usize,
+    content_end: usize,
+    block_stack: &mut Vec<TwigBlock>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some((name_start, name_end)) = twig_tag_name_range(source, content_start, content_end)
+    else {
+        diagnostics.push(twig_syntax_diagnostic(
+            source,
+            tag_start,
+            (tag_start + 2).min(source.len()),
+            "Missing Twig tag name",
+        ));
+        return;
+    };
+    if name_end <= name_start {
+        diagnostics.push(twig_syntax_diagnostic(
+            source,
+            tag_start,
+            (tag_start + 2).min(source.len()),
+            "Missing Twig tag name",
+        ));
+        return;
+    }
+
+    let Some(name) = source.get(name_start..name_end) else {
+        return;
+    };
+    let tag_range_end = name_end.max((tag_start + 2).min(source.len()));
+
+    if let Some(end_tag) = twig_opening_block_end_tag(name, source, name_end, content_end) {
+        block_stack.push(TwigBlock {
+            name: name.to_string(),
+            end_tag,
+            start: name_start,
+            end: tag_range_end,
+        });
+        return;
+    }
+
+    if twig_intermediate_block_tag(name) {
+        if block_stack.last().is_some_and(|block| {
+            (name == "else" && matches!(block.end_tag, "endif" | "endfor"))
+                || (name == "elseif" && block.end_tag == "endif")
+        }) {
+            return;
+        }
+
+        diagnostics.push(twig_syntax_diagnostic(
+            source,
+            name_start,
+            tag_range_end,
+            &format!("Unexpected Twig `{name}` tag"),
+        ));
+        return;
+    }
+
+    if twig_known_closing_block_tag(name) {
+        let Some(block) = block_stack.pop() else {
+            diagnostics.push(twig_syntax_diagnostic(
+                source,
+                name_start,
+                tag_range_end,
+                &format!("Unexpected Twig `{name}` tag"),
+            ));
+            return;
+        };
+        if block.end_tag != name {
+            diagnostics.push(twig_syntax_diagnostic(
+                source,
+                name_start,
+                tag_range_end,
+                &format!(
+                    "Mismatched Twig `{name}` tag, expected `{}` for `{}` block",
+                    block.end_tag, block.name
+                ),
+            ));
+        }
+    }
+}
+
+fn twig_matching_end_tag_name(
+    source: &str,
+    content_start: usize,
+    content_end: usize,
+) -> &'static str {
+    let Some((name_start, name_end)) = twig_tag_name_range(source, content_start, content_end)
+    else {
+        return "";
+    };
+    let Some(name) = source.get(name_start..name_end) else {
+        return "";
+    };
+    twig_opening_block_end_tag(name, source, name_end, content_end).unwrap_or("")
+}
+
+fn twig_opening_block_end_tag(
+    name: &str,
+    source: &str,
+    name_end: usize,
+    tag_end: usize,
+) -> Option<&'static str> {
+    match name {
+        "if" => Some("endif"),
+        "for" => Some("endfor"),
+        "block" => Some("endblock"),
+        "embed" => Some("endembed"),
+        "autoescape" => Some("endautoescape"),
+        "filter" => Some("endfilter"),
+        "apply" => Some("endapply"),
+        "with" => Some("endwith"),
+        "cache" => Some("endcache"),
+        "sandbox" => Some("endsandbox"),
+        "trans" => Some("endtrans"),
+        "macro" => Some("endmacro"),
+        "verbatim" => Some("endverbatim"),
+        "set" if twig_set_tag_starts_block(source, name_end, tag_end) => Some("endset"),
+        _ => None,
+    }
+}
+
+fn twig_set_tag_starts_block(source: &str, name_end: usize, tag_end: usize) -> bool {
+    !source
+        .get(name_end..tag_end)
+        .unwrap_or("")
+        .chars()
+        .any(|ch| ch == '=')
+}
+
+fn twig_intermediate_block_tag(name: &str) -> bool {
+    matches!(name, "else" | "elseif")
+}
+
+fn twig_known_closing_block_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "endif"
+            | "endfor"
+            | "endblock"
+            | "endembed"
+            | "endautoescape"
+            | "endfilter"
+            | "endapply"
+            | "endwith"
+            | "endcache"
+            | "endsandbox"
+            | "endtrans"
+            | "endmacro"
+            | "endverbatim"
+            | "endset"
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TwigDelimiterContent {
+    content_start: usize,
+    content_end: usize,
+    close_end: usize,
+}
+
+fn twig_delimiter_content(
+    source: &str,
+    open_start: usize,
+    open_delimiter: &str,
+    close_delimiter: &str,
+) -> Option<TwigDelimiterContent> {
+    let mut content_start = open_start + open_delimiter.len();
+    if source.as_bytes().get(content_start) == Some(&b'-') {
+        content_start += 1;
+    }
+
+    let close_start = find_twig_delimiter_close(source, content_start, close_delimiter)?;
+    let mut content_end = close_start;
+    if content_end > content_start && source.as_bytes().get(content_end - 1) == Some(&b'-') {
+        content_end -= 1;
+    }
+
+    Some(TwigDelimiterContent {
+        content_start,
+        content_end,
+        close_end: close_start + close_delimiter.len(),
+    })
+}
+
+fn twig_comment_delimiter_content(source: &str, open_start: usize) -> Option<TwigDelimiterContent> {
+    let mut content_start = open_start + "{#".len();
+    if source.as_bytes().get(content_start) == Some(&b'-') {
+        content_start += 1;
+    }
+
+    let close_start = source.get(content_start..)?.find("#}")? + content_start;
+    let mut content_end = close_start;
+    if content_end > content_start && source.as_bytes().get(content_end - 1) == Some(&b'-') {
+        content_end -= 1;
+    }
+
+    Some(TwigDelimiterContent {
+        content_start,
+        content_end,
+        close_end: close_start + "#}".len(),
+    })
+}
+
+fn twig_tag_name_range(
+    source: &str,
+    content_start: usize,
+    content_end: usize,
+) -> Option<(usize, usize)> {
+    let name_start = skip_ascii_ws_in_range(source, content_start, content_end);
+    let name_end = scan_identifier_end(source, name_start).min(content_end);
+    (name_end > name_start).then_some((name_start, name_end))
+}
+
+fn twig_tag_name(source: &str, content_start: usize, content_end: usize) -> Option<&str> {
+    let (name_start, name_end) = twig_tag_name_range(source, content_start, content_end)?;
+    source.get(name_start..name_end)
+}
+
+fn find_twig_named_tag(
+    source: &str,
+    mut offset: usize,
+    expected_name: &str,
+) -> Option<TwigDelimiterContent> {
+    while offset < source.len() {
+        let relative = source.get(offset..)?.find("{%")?;
+        let tag_start = offset + relative;
+        if let Some(content) = twig_delimiter_content(source, tag_start, "{%", "%}") {
+            if twig_tag_name(source, content.content_start, content.content_end)
+                == Some(expected_name)
+            {
+                return Some(content);
+            }
+        }
+        offset = tag_start + "{%".len();
+    }
+
+    None
+}
+
+fn find_twig_delimiter_close(source: &str, mut offset: usize, delimiter: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    while offset < source.len() {
+        let ch = source[offset..].chars().next()?;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if source[offset..].starts_with(delimiter) {
+            return Some(offset);
+        }
+
+        offset += ch.len_utf8();
+    }
+
+    None
+}
+
+fn twig_syntax_diagnostic(source: &str, start: usize, end: usize, message: &str) -> Diagnostic {
+    Diagnostic {
+        range: range_for_byte_offsets(source, start, end.max(start)),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("php-lsp.twigSyntax".to_string())),
+        source: Some("php-lsp".to_string()),
+        message: message.to_string(),
+        ..Default::default()
     }
 }
 
@@ -1272,12 +1738,13 @@ fn twig_template_path_context_at_position(
     let offset = byte_offset_for_position(source, position)?;
     let bounds = template_string_literal_bounds_at_offset(source, offset)?;
     let (tag_start, tag_end) = twig_tag_bounds_containing(source, bounds.quote_start)?;
-    if bounds.quote_start >= tag_end {
+    let content = twig_delimiter_content(source, tag_start, "{%", "%}")?;
+    if content.close_end != tag_end + "%}".len() || bounds.quote_start >= content.content_end {
         return None;
     }
 
-    let name_start = skip_ascii_ws_in_range(source, tag_start + 2, tag_end);
-    let name_end = scan_identifier_end(source, name_start).min(tag_end);
+    let (name_start, name_end) =
+        twig_tag_name_range(source, content.content_start, content.content_end)?;
     let name = source.get(name_start..name_end)?;
     if !matches!(
         name,
@@ -1822,6 +2289,128 @@ mod tests {
     }
 
     #[test]
+    fn twig_whitespace_control_maps_expression_and_block_content() {
+        let doc = preprocess_twig_template(
+            "<h1>{{- user.name -}}</h1>\n{%- for item in users -%}\n{{- item.name -}}\n{%- endfor -%}\n",
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+        assert!(doc.virtual_source().contains("$user->name"));
+        assert!(doc.virtual_source().contains("foreach ($users as $item)"));
+        assert!(doc.virtual_source().contains("$item->name"));
+        assert!(doc.syntax_diagnostics().is_empty());
+
+        let original_position = Position::new(0, 8);
+        let virtual_position = doc
+            .map_original_position_to_virtual(original_position)
+            .expect("Twig whitespace-control variable should map");
+        let virtual_offset = byte_offset_for_position(doc.virtual_source(), virtual_position)
+            .expect("virtual position offset");
+        assert_eq!(
+            doc.virtual_source()
+                .get(virtual_offset..virtual_offset + "$user".len()),
+            Some("$user")
+        );
+    }
+
+    #[test]
+    fn twig_verbatim_blocks_skip_inner_twig_syntax() {
+        let doc = preprocess_twig_template(
+            "{% verbatim %}{{ user.name }{% endverbatim %}\n{{ user.name }}\n",
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+        assert!(doc.syntax_diagnostics().is_empty());
+        assert_eq!(doc.virtual_source().matches("$user->name").count(), 1);
+
+        let tokens = doc.map_semantic_tokens_to_original(Vec::new());
+        assert!(
+            tokens.iter().any(|token| token.token_type == TOKEN_KEYWORD),
+            "expected verbatim keyword semantic tokens"
+        );
+    }
+
+    #[test]
+    fn twig_verbatim_finds_end_tag_after_literal_broken_tag_opener() {
+        let doc = preprocess_twig_template(
+            "{% verbatim %}{% broken {% endverbatim %}\n{{ user.name }}\n",
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+        assert!(doc.syntax_diagnostics().is_empty());
+        assert_eq!(doc.virtual_source().matches("$user->name").count(), 1);
+    }
+
+    #[test]
+    fn twig_comments_ignore_quotes_while_finding_close_delimiter() {
+        let doc = preprocess_twig_template(
+            "{# don't map {{ broken } #}\n{{ user.name }}\n",
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+        assert!(doc.syntax_diagnostics().is_empty());
+        assert_eq!(doc.virtual_source().matches("$user->name").count(), 1);
+
+        let tokens = doc.map_semantic_tokens_to_original(Vec::new());
+        assert!(
+            tokens.iter().any(|token| token.token_type == TOKEN_COMMENT),
+            "expected quoted Twig comment semantic token"
+        );
+    }
+
+    #[test]
+    fn twig_macro_blocks_are_valid_syntax_but_not_converted_to_php() {
+        let doc = preprocess_twig_template(
+            "{% macro input(name) %}{{ name }}{% endmacro %}\n{{ user.name }}\n",
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+        assert!(doc.syntax_diagnostics().is_empty());
+        assert!(!doc.virtual_source().contains("function input"));
+        assert!(!doc.virtual_source().contains("$name"));
+        assert!(doc.virtual_source().contains("$user->name"));
+    }
+
+    #[test]
+    fn twig_macro_body_is_still_checked_for_syntax_errors() {
+        let doc = preprocess_twig_template("{% macro input(name) %}{{ name }{% endmacro %}\n", &[]);
+        let messages: Vec<_> = doc
+            .syntax_diagnostics()
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "Unclosed Twig expression"),
+            "expected macro body expression diagnostic, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn twig_unknown_custom_paired_tags_do_not_report_syntax_errors() {
+        let doc = preprocess_twig_template(
+            "{% custom %}{{ user.name }}{% endcustom %}\n",
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+        assert!(doc.syntax_diagnostics().is_empty());
+        assert!(doc.virtual_source().contains("$user->name"));
+    }
+
+    #[test]
     fn twig_control_blocks_and_template_paths_are_detected() {
         let doc = preprocess_twig_template(
             "{% for item in users %}\n{{ item.name }}\n{% endfor %}\n{% include 'shared/card.html.twig' %}\n",
@@ -2045,6 +2634,37 @@ mod tests {
             source: Some("php-lsp".to_string()),
             code: Some(NumberOrString::String("php-lsp.members".to_string())),
             message: "Unknown property: User::$missing".to_string(),
+            ..Default::default()
+        };
+
+        assert!(doc
+            .map_safe_diagnostics_to_original(vec![diagnostic])
+            .is_empty());
+    }
+
+    #[test]
+    fn twig_safe_template_diagnostics_suppress_undefined_variables() {
+        let source = "{{ standaloneVariable }}";
+        let doc = preprocess_twig_template(source, &[]);
+        let original_start = source
+            .find("standaloneVariable")
+            .expect("variable in fixture");
+        let original_end = original_start + "standaloneVariable".len();
+        let virtual_start = doc
+            .source_map
+            .original_to_virtual(original_start)
+            .expect("variable start should map");
+        let virtual_end = doc
+            .source_map
+            .original_to_virtual(original_end)
+            .expect("variable end should map");
+        let diagnostic = Diagnostic {
+            range: range_for_byte_offsets(doc.virtual_source(), virtual_start, virtual_end),
+            source: Some("php-lsp".to_string()),
+            code: Some(NumberOrString::String(
+                "php-lsp.undefinedVariable".to_string(),
+            )),
+            message: "Undefined variable: $standaloneVariable".to_string(),
             ..Default::default()
         };
 

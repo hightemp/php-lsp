@@ -45,8 +45,9 @@ phpstorm-stubs support.
 - Framework-aware static providers for common Laravel string keys and Symfony
   Twig template names without booting the application.
 - Blade-like and Symfony/Twig template documents use virtual PHP plus source
-  maps for conservative hover, completion, definition, diagnostics, and semantic
-  tokens in supported template expressions and control blocks.
+  maps for conservative hover, completion, definition, inlay hints,
+  diagnostics, and semantic tokens in supported template expressions and
+  control blocks.
 - Override signature and PHP-version compatibility diagnostics.
 - Optional PHPStan and Psalm diagnostics through configured external commands.
 - Per-category diagnostic severity controls for unknown symbols, unused code,
@@ -205,15 +206,19 @@ phpstorm-stubs support.
   members are best-effort.
 - Template support is conservative. Blade-like and Twig documents are not full
   template-engine implementations; diagnostics are best-effort and published
-  only for a small allowlist of exact source-mapped expression errors; syntax
-  noise, generated virtual PHP, incomplete/magic properties, and uncertain
-  ranges stay suppressed. Complex Twig expressions such as filters, tests,
+  only for a small allowlist of exact source-mapped expression errors plus
+  conservative Twig delimiter/block syntax errors; generated virtual PHP,
+  incomplete/magic properties, and uncertain ranges stay suppressed. Complex
+  Twig expressions such as filters, tests,
   `in`, functions, macros, ternaries, null coalescing, and dynamic/bracket
   attribute access are explicit best-effort backlog items and are skipped rather
   than mapped to misleading PHP. Twig context variables are inferred only from
-  static `render(..., [...])` call sites and simple context expressions. Open
-  Twig documents refresh those inferred context types after relevant PHP
-  controller/render changes and workspace reindex events.
+  static `render(..., [...])` call sites, including `new Class()`, arrays of
+  new objects, and typed controller parameter variables; render keys whose
+  value type cannot be inferred are still seeded as `mixed` to avoid false
+  undefined-variable diagnostics. Open Twig documents refresh those inferred
+  context types after relevant PHP controller/render changes and workspace
+  reindex events.
 - Diagnostics are optimized for editor feedback: file changes publish fast
   in-process diagnostics, while full diagnostics and optional external analyzer
   runs are used on open/save and reconfiguration.
@@ -226,6 +231,12 @@ phpstorm-stubs support.
 ## Configuration
 
 The VS Code extension contributes these settings under `phpLsp.*`:
+
+Runtime environment:
+
+| Environment variable | Default | Description |
+|---|---:|---|
+| `PHP_LSP_WORKER_THREAD_STACK_SIZE` | `8388608` | Tokio worker-thread stack size in bytes. Values below 1 MiB are ignored. Raising this can help unusually deep framework/type/template workloads, but the default is intended for normal editor use. |
 
 | Setting | Default | Description |
 |---|---:|---|
@@ -404,7 +415,7 @@ The extension contributes these VS Code commands:
 - Ensure Composer metadata and `vendor/composer/installed.json` are available
   when you want built-in diagnostics to resolve external framework symbols.
 - Set `"phpLsp.diagnostics.mode": "syntax-only"` to keep only parser syntax
-  diagnostics.
+  diagnostics, plus conservative Twig syntax diagnostics for Twig documents.
 - Set `"phpLsp.diagnostics.mode": "off"` to disable built-in diagnostics.
 - If a large file reports partial analysis, raise
   `"phpLsp.diagnostics.memberTypeNodeBudget"` or set it to `0` to run

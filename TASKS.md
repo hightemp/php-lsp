@@ -189,6 +189,13 @@
 
 ## Hotfix backlog (post-MVP)
 
+- [x] **H-TWIG-LSP-SURFACE-2026-06-01** Проверить и покрыть LSP-фичи для Twig шаблонов *(done 2026-06-01)*
+  - Проверить реальные шаблоны `/home/apanov/Projects/bdpn-ui/app/templates`
+  - Добавить e2e-тесты для Twig completion, inlayHint, go-to-definition, hover и syntax diagnostics
+  - Исправить найденные gaps без project-specific hardcode
+  - Обновить документацию при изменении поведения
+  - Запустить релевантные Rust tests и verifier
+
 - [x] **H-HOVER-CLASS-LINKS-2026-06-01** Добавить ссылки на классы в hover markdown *(done 2026-06-01)*
   - Найти все hover-поверхности, где выводятся типы, FQN, сигнатуры или связанные классы
   - Переиспользовать существующий формат ссылок на definition для `Type:`
