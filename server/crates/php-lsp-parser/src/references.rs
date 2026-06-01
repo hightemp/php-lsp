@@ -1435,6 +1435,37 @@ $svc2 = new UserService();
     }
 
     #[test]
+    fn test_collected_reference_ranges_are_utf16_after_emoji() {
+        let code = "<?php\nnamespace App;\nclass Foo {}\n$emoji = \"😀\"; new Foo();\n";
+        let refs = collect_refs(code);
+
+        assert!(
+            refs.iter().any(|reference| {
+                reference.target_fqn == "App\\Foo"
+                    && !reference.is_declaration
+                    && reference.range == (3, 19, 3, 22)
+            }),
+            "class reference after emoji should use UTF-16 range, got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_variable_reference_ranges_are_utf16_after_emoji() {
+        let code = "<?php\n$emoji = \"😀\"; $target = 1; echo $target;\n";
+        let target_byte_col = code.lines().nth(1).unwrap().find("$target").unwrap() as u32;
+        let refs = find_var_refs_at(code, 1, target_byte_col, true);
+
+        assert!(
+            refs.iter().any(|reference| reference.range == (1, 17, 1, 24)),
+            "declaration range should use UTF-16 columns, got {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|reference| reference.range == (1, 35, 1, 42)),
+            "usage range should use UTF-16 columns, got {refs:?}"
+        );
+    }
+
+    #[test]
     fn test_find_class_references_type_hint() {
         let code = r#"<?php
 namespace App;

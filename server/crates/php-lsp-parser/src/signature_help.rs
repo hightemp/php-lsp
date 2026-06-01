@@ -168,6 +168,20 @@ mod tests {
     }
 
     #[test]
+    fn detects_active_parameter_after_emoji_byte_column() {
+        let source = "<?php\nfunction foo($a, $b) {}\n$emoji = \"😀\"; foo(1, 2);\n";
+        let byte_col_inside_second_arg = source
+            .lines()
+            .nth(2)
+            .and_then(|line| line.find('2'))
+            .expect("second argument byte column") as u32;
+        let ctx = context_for(source, 2, byte_col_inside_second_arg);
+
+        assert_eq!(ctx.symbol.fqn, "foo");
+        assert_eq!(ctx.active_parameter, 1);
+    }
+
+    #[test]
     fn detects_constructor_call() {
         let source = "<?php\nclass Foo { public function __construct($a) {} }\nnew Foo(1);\n";
         let ctx = context_for(source, 2, 9);

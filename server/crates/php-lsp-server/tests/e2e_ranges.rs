@@ -120,23 +120,23 @@ async fn test_lsp_ranges_are_utf16_after_non_ascii_prefixes() {
     let code = r#"<?php
 namespace App;
 
-/* контракт */ interface Contract {
-    /* контрактный метод */ public function makeTarget(): Target;
+/* 😀 контракт */ interface Contract {
+    /* 😀 контрактный метод */ public function makeTarget(): Target;
 }
 
-/* класс */ class Target {
-    /* свойство */ public int $value = 0;
+/* 😀 класс */ class Target {
+    /* 😀 свойство */ public int $value = 0;
 
-    /* метод */ public function callMe(): void {}
+    /* 😀 метод */ public function callMe(): void {}
 }
 
-/* реализация */ class TargetImpl implements Contract {
-    /* метод */ public function makeTarget(): Target { return new Target(); }
+/* 😀 реализация */ class TargetImpl implements Contract {
+    /* 😀 метод */ public function makeTarget(): Target { return new Target(); }
 }
 
-/* переменная */ $usage = new Target();
-/* вызов */ $usage->callMe();
-/* тип */ $made = (new TargetImpl())->makeTarget();
+/* 😀 переменная */ $usage = new Target();
+/* 😀 вызов */ $usage->callMe();
+/* 😀 тип */ $made = (new TargetImpl())->makeTarget();
 "#;
     let uri = "file:///test/utf16-ranges.php";
 

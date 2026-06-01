@@ -216,6 +216,34 @@ mod tests {
     }
 
     #[test]
+    fn test_incremental_edit_after_emoji_uses_utf16_positions() {
+        let mut parser = FileParser::new();
+        parser.parse_full("<?php\n$emoji = \"😀\"; $name = 1;\n");
+
+        parser.apply_edit(1, 15, 1, 20, "$value");
+
+        let source = parser.source();
+        assert!(source.contains("$emoji = \"😀\"; $value = 1;"));
+
+        let tree = parser.tree().expect("Should have a tree after edit");
+        assert!(!tree.root_node().has_error());
+    }
+
+    #[test]
+    fn test_incremental_delete_emoji_string_uses_utf16_positions() {
+        let mut parser = FileParser::new();
+        parser.parse_full("<?php\n$value = \"😀\";\n");
+
+        parser.apply_edit(1, 9, 1, 13, "\"ok\"");
+
+        let source = parser.source();
+        assert!(source.contains("$value = \"ok\";"));
+
+        let tree = parser.tree().expect("Should have a tree after edit");
+        assert!(!tree.root_node().has_error());
+    }
+
+    #[test]
     fn test_parse_empty_php() {
         let mut parser = FileParser::new();
         parser.parse_full("<?php\n");

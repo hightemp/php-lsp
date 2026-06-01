@@ -189,6 +189,12 @@
 
 ## Hotfix backlog (post-MVP)
 
+- [x] **H-UTF-LSP-SURFACE-2026-06-01** Покрыть UTF/emoji по LSP-facing parser/server surfaces *(done 2026-06-01)*
+  - Проверить incremental edits, references, signature help, return-type insertion helpers
+  - Проверить server-side LSP text helpers, rename/code-action/definition/document-symbol/inlay/formatting-sensitive ranges
+  - Добавить focused tests с emoji/non-ASCII/CRLF перед символами и edit ranges
+  - Запустить релевантные Rust tests
+
 - [x] **H-UNICODE-PHP-2026-06-01** Проверить Unicode/emoji в реальном PHP-коде *(done 2026-06-01)*
   - Покрыть PHP strings/comments с emoji и non-ASCII перед диагностируемыми токенами
   - Проверить LSP UTF-16 ranges для diagnostics, semantic tokens и symbol resolve в PHP-коде
