@@ -707,16 +707,22 @@ mod tests {
 
     #[test]
     fn uses_utf16_positions_after_emoji_in_php_code() {
-        let source = "<?php\n$emoji = \"😀\"; $after = 1;\n";
-        let tokens = parse_absolute_tokens(source);
+        let emoji = "🇺🇸 👨\u{200d}👩\u{200d}👧\u{200d}👦 👍🏽 ❤️ e\u{0301}";
+        let source = format!("<?php\n$emoji = \"{emoji}\"; $after = 1;\n");
+        let tokens = parse_absolute_tokens(&source);
+        let string_start = "$emoji = ".encode_utf16().count() as u32;
+        let string_len = emoji.encode_utf16().count() as u32 + 2;
+        let after_start = "$emoji = \"".encode_utf16().count() as u32
+            + emoji.encode_utf16().count() as u32
+            + "\"; ".encode_utf16().count() as u32;
 
         assert!(
-            has_token(&tokens, 1, 9, 4, TOKEN_STRING),
-            "emoji string token should use UTF-16 length, got {tokens:?}"
+            has_token(&tokens, 1, string_start, string_len, TOKEN_STRING),
+            "complex emoji string token should use UTF-16 length, got {tokens:?}"
         );
         assert!(
-            has_token(&tokens, 1, 15, 6, TOKEN_VARIABLE),
-            "variable after emoji should start at UTF-16 column 15, got {tokens:?}"
+            has_token(&tokens, 1, after_start, 6, TOKEN_VARIABLE),
+            "variable after complex emoji should start at UTF-16 column {after_start}, got {tokens:?}"
         );
     }
 }

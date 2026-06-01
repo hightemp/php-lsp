@@ -72,7 +72,10 @@ mod tests {
         let source = "<?php\r\n$emoji = \"😀\"; $target = 1;\r\n";
 
         assert_eq!(
-            text_at_lsp_range(source, Range::new(Position::new(1, 15), Position::new(1, 22))),
+            text_at_lsp_range(
+                source,
+                Range::new(Position::new(1, 15), Position::new(1, 22))
+            ),
             Some("$target")
         );
     }

@@ -240,6 +240,87 @@ async fn test_document_range_formatting_uses_custom_external_command() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_document_range_formatting_uses_utf16_range_after_complex_unicode_prefix() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let formatted_range = "    echo \"one\";\n";
+    let formatter_command = format!("printf '%s' '{}' > {{file}}", formatted_range);
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({
+                "formattingProvider": "custom",
+                "formattingCommand": formatter_command
+            })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code =
+        "<?php\nfunction ok(): void {\n/* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད */ echo \"one\";\necho \"two\";\n}\n";
+    let uri = "file:///test/RangeFormatComplexUnicode.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let start = utf16_position_at(code, "echo \"one\";");
+    let end = utf16_position_after(code, "echo \"one\";");
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(range_formatting_request(
+            2, uri, start.0, start.1, end.0, end.1,
+        ))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let edits = result.as_array().expect("range formatting edits array");
+    assert_eq!(edits.len(), 1, "expected one range edit");
+    assert_eq!(
+        edits[0]["newText"].as_str(),
+        Some(formatted_range),
+        "range formatter edit should contain formatted selection, got: {}",
+        result
+    );
+    assert_eq!(
+        edits[0]["range"]["start"]["line"].as_u64(),
+        Some(start.0 as u64)
+    );
+    assert_eq!(
+        edits[0]["range"]["start"]["character"].as_u64(),
+        Some(start.1 as u64)
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_on_type_formatting_returns_local_indentation_edits() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

@@ -36,6 +36,19 @@ fn make_symbol(
     }
 }
 
+fn make_symbol_for_uri(
+    uri: &str,
+    name: &str,
+    fqn: &str,
+    kind: PhpSymbolKind,
+    range: (u32, u32, u32, u32),
+    parent_fqn: Option<&str>,
+) -> SymbolInfo {
+    let mut symbol = make_symbol(name, fqn, kind, range, parent_fqn);
+    symbol.uri = uri.to_string();
+    symbol
+}
+
 fn offset_at(source: &str, line: u32, col: u32) -> usize {
     let mut current_line = 0u32;
     let mut line_start = 0usize;
@@ -658,12 +671,14 @@ fn test_workspace_symbol_lsp_range_converts_byte_columns_to_utf16() {
 #[test]
 fn test_workspace_reindex_keeps_vendor_and_stub_symbols() {
     let index = WorkspaceIndex::new();
+    let workspace_uri = "file:///tmp/project/src/Foo.php";
     index.update_file(
-        "file:///tmp/project/src/Foo.php",
+        workspace_uri,
         FileSymbols {
             namespace: Some("App".to_string()),
             use_statements: vec![],
-            symbols: vec![make_symbol(
+            symbols: vec![make_symbol_for_uri(
+                workspace_uri,
                 "Foo",
                 "App\\Foo",
                 PhpSymbolKind::Class,
@@ -673,12 +688,14 @@ fn test_workspace_reindex_keeps_vendor_and_stub_symbols() {
             ..Default::default()
         },
     );
+    let vendor_uri = "file:///tmp/project/vendor/acme/pkg/Bar.php";
     index.update_file(
-        "file:///tmp/project/vendor/acme/pkg/Bar.php",
+        vendor_uri,
         FileSymbols {
             namespace: Some("Vendor\\Pkg".to_string()),
             use_statements: vec![],
-            symbols: vec![make_symbol(
+            symbols: vec![make_symbol_for_uri(
+                vendor_uri,
                 "Bar",
                 "Vendor\\Pkg\\Bar",
                 PhpSymbolKind::Class,
@@ -688,12 +705,14 @@ fn test_workspace_reindex_keeps_vendor_and_stub_symbols() {
             ..Default::default()
         },
     );
+    let stub_uri = "phpstub://Core/Core.php";
     index.update_file(
-        "phpstub://Core/Core.php",
+        stub_uri,
         FileSymbols {
             namespace: None,
             use_statements: vec![],
-            symbols: vec![make_symbol(
+            symbols: vec![make_symbol_for_uri(
+                stub_uri,
                 "stdClass",
                 "stdClass",
                 PhpSymbolKind::Class,
@@ -828,7 +847,8 @@ fn test_vendor_file_lru_evicts_old_index_entries() {
         FileSymbols {
             namespace: Some("Vendor\\Pkg".to_string()),
             use_statements: vec![],
-            symbols: vec![make_symbol(
+            symbols: vec![make_symbol_for_uri(
+                uri1,
                 "One",
                 "Vendor\\Pkg\\One",
                 PhpSymbolKind::Class,
@@ -843,7 +863,8 @@ fn test_vendor_file_lru_evicts_old_index_entries() {
         FileSymbols {
             namespace: Some("Vendor\\Pkg".to_string()),
             use_statements: vec![],
-            symbols: vec![make_symbol(
+            symbols: vec![make_symbol_for_uri(
+                uri2,
                 "Two",
                 "Vendor\\Pkg\\Two",
                 PhpSymbolKind::Class,

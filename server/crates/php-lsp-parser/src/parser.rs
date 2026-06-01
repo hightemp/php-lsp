@@ -177,6 +177,29 @@ impl Default for FileParser {
 mod tests {
     use super::*;
 
+    fn utf16_position_at(source: &str, needle: &str) -> (u32, u32) {
+        let offset = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("needle `{needle}` not found"));
+        let prefix = &source[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+        let character = prefix[line_start..].encode_utf16().count() as u32;
+        (line, character)
+    }
+
+    fn utf16_position_after(source: &str, needle: &str) -> (u32, u32) {
+        let offset = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("needle `{needle}` not found"))
+            + needle.len();
+        let prefix = &source[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+        let character = prefix[line_start..].encode_utf16().count() as u32;
+        (line, character)
+    }
+
     #[test]
     fn test_parse_full_simple_class() {
         let mut parser = FileParser::new();
@@ -224,6 +247,23 @@ mod tests {
 
         let source = parser.source();
         assert!(source.contains("$emoji = \"😀\"; $value = 1;"));
+
+        let tree = parser.tree().expect("Should have a tree after edit");
+        assert!(!tree.root_node().has_error());
+    }
+
+    #[test]
+    fn test_incremental_edit_after_complex_emoji_uses_utf16_positions() {
+        let mut parser = FileParser::new();
+        let source = "<?php\n$emoji = \"🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ e\u{0301}\"; $name = 1;\n";
+        parser.parse_full(source);
+
+        let start = utf16_position_at(source, "$name");
+        let end = utf16_position_after(source, "$name");
+        parser.apply_edit(start.0, start.1, end.0, end.1, "$value");
+
+        let source = parser.source();
+        assert!(source.contains("\"🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ e\u{0301}\"; $value = 1;"));
 
         let tree = parser.tree().expect("Should have a tree after edit");
         assert!(!tree.root_node().has_error());

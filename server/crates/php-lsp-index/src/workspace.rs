@@ -1278,7 +1278,9 @@ mod tests {
 
         index.remove_file("file:///a.php");
 
-        let found = index.resolve_fqn("App\\Foo").expect("duplicate FQN remains");
+        let found = index
+            .resolve_fqn("App\\Foo")
+            .expect("duplicate FQN remains");
         assert_eq!(found.uri, "file:///b.php");
     }
 

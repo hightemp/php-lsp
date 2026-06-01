@@ -2081,6 +2081,110 @@ function outside(): string
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_code_action_extract_variable_uses_utf16_range_after_complex_unicode_prefix() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "8.2" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class UnicodeRefactorDemo
+{
+    public function compute(int $a, int $b): int
+    {
+        return /* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད */ $a + $b;
+    }
+}
+"#;
+    let uri = "file:///test/UnicodeRefactorDemo.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let start = utf16_position_at(code, "$a + $b");
+    let end = utf16_position_after(code, "$a + $b");
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            2,
+            uri,
+            (start, end),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let action = result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Extract variable `$extracted`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected extract variable action, got: {}", result));
+
+    let resolve_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(3, action))
+        .await
+        .unwrap();
+    let resolved = extract_result(resolve_resp);
+    let edits = resolved["edit"]["changes"][uri]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected extract variable edits, got: {}", resolved));
+    assert!(
+        edits
+            .iter()
+            .any(|edit| edit["newText"].as_str() == Some("        $extracted = $a + $b;\n"))
+            && edits
+                .iter()
+                .any(|edit| edit["newText"].as_str() == Some("$extracted")),
+        "expected UTF-16 range extract edits, got: {}",
+        resolved
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_action_update_phpdoc_from_signature() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

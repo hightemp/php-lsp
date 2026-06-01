@@ -2,9 +2,10 @@ use crate::server::{
     collect_php_files, compute_diagnostics_with_runtime_config,
     diagnostic_budget_config_from_settings, discover_workspace_root_config,
     lazy_resolvable_diagnostic_fqn, load_configured_stubs, load_effective_configuration_settings,
-    normalize_config_paths, parse_vendor_autoload_map, path_is_excluded, resolve_vendor_paths_from_map,
-    workspace_index_directories, DiagnosticBudgetConfig, DiagnosticSeverityConfig, DiagnosticsMode,
-    DiagnosticsRuntimeConfig, PhpVersion, VendorAutoloadMap, VENDOR_PRELOAD_ENTRYPOINT_LIMIT,
+    normalize_config_paths, parse_vendor_autoload_map, path_is_excluded,
+    resolve_vendor_paths_from_map, workspace_index_directories, DiagnosticBudgetConfig,
+    DiagnosticSeverityConfig, DiagnosticsMode, DiagnosticsRuntimeConfig, PhpVersion,
+    VendorAutoloadMap, VENDOR_PRELOAD_ENTRYPOINT_LIMIT,
 };
 use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -493,7 +494,8 @@ fn analyze_runtime_config(settings: &serde_json::Value) -> AnalyzeRuntimeConfig 
         let trimmed = path.trim();
         (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
     });
-    let stub_extensions = settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
+    let stub_extensions =
+        settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
     let include_paths = settings_string_array(settings, "includePaths", &["includePaths"])
         .map(normalize_config_paths)
         .unwrap_or_default();

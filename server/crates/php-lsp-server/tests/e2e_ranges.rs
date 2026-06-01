@@ -120,23 +120,23 @@ async fn test_lsp_ranges_are_utf16_after_non_ascii_prefixes() {
     let code = r#"<?php
 namespace App;
 
-/* 😀 контракт */ interface Contract {
-    /* 😀 контрактный метод */ public function makeTarget(): Target;
+/* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད контракт */ interface Contract {
+    /* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད контрактный метод */ public function makeTarget(): Target;
 }
 
-/* 😀 класс */ class Target {
-    /* 😀 свойство */ public int $value = 0;
+/* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད класс */ class Target {
+    /* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད свойство */ public int $value = 0;
 
-    /* 😀 метод */ public function callMe(): void {}
+    /* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད метод */ public function callMe(): void {}
 }
 
-/* 😀 реализация */ class TargetImpl implements Contract {
-    /* 😀 метод */ public function makeTarget(): Target { return new Target(); }
+/* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད реализация */ class TargetImpl implements Contract {
+    /* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད метод */ public function makeTarget(): Target { return new Target(); }
 }
 
-/* 😀 переменная */ $usage = new Target();
-/* 😀 вызов */ $usage->callMe();
-/* 😀 тип */ $made = (new TargetImpl())->makeTarget();
+/* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད переменная */ $usage = new Target();
+/* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད вызов */ $usage->callMe();
+/* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད тип */ $made = (new TargetImpl())->makeTarget();
 "#;
     let uri = "file:///test/utf16-ranges.php";
 
@@ -161,6 +161,7 @@ namespace App;
     let type_definition_call = utf16_position_at(code, "makeTarget();");
     let usage_variable = utf16_position_at(code, "$usage =");
     let usage_variable_call = utf16_position_at(code, "$usage->");
+    let made_variable_end = utf16_position_after(code, "$made");
 
     let definition_result = extract_result(
         service
@@ -399,6 +400,27 @@ namespace App;
     assert_lsp_range_start(type_item, class_keyword, "typeHierarchy range");
     assert_lsp_selection_range_start(type_item, class_name, "typeHierarchy selectionRange");
 
+    let inlay_result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(inlay_hint_request(14, uri, 0, 0, 99, 0))
+            .await
+            .unwrap(),
+    );
+    let inlay_hints = inlay_result
+        .as_array()
+        .expect("inlayHint should return array");
+    assert!(
+        inlay_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": Target")
+                && hint["position"]["line"].as_u64() == Some(made_variable_end.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(made_variable_end.1 as u64)
+        }),
+        "inlay hints should place inferred type after $made using UTF-16 range, got: {inlay_result}"
+    );
+
     let rename_result = extract_result(
         service
             .ready()
@@ -478,7 +500,7 @@ namespace App;
 
 class Demo {
     public function run(): void {
-        /* префикс */ Ser
+        /* 🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད префикс */ Ser
     }
 }
 "#;
@@ -562,7 +584,7 @@ async fn test_template_source_map_ranges_are_utf16_after_non_ascii_prefix() {
     let php_uri = "file:///test/BladeUser.php";
     let blade_uri = "file:///test/show.blade.php";
     let php_code = "<?php\nclass User {}\n";
-    let blade = "Привет {{ User::class }}\n";
+    let blade = "🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད {{ User::class }}\n";
     let user_position = utf16_position_at(blade, "User::class");
 
     service

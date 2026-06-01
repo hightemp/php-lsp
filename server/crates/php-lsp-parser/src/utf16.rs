@@ -294,7 +294,7 @@ mod tests {
             "latin combining e\u{0301} a\u{0308}",
             "precomposed é ü ñ",
             "emoji 😀😇🚀",
-            "flags 🇺🇦🇯🇵",
+            "american flag 🇺🇸",
             "skin tones 👍🏽👩🏾",
             "zwj family 👨\u{200d}👩\u{200d}👧\u{200d}👦",
             "variation heart ♥\u{fe0f} text ♥",

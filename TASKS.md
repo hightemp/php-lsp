@@ -3946,6 +3946,45 @@ change.
 
 ## Текущие задачи
 
+- [x] **T-2026-06-01-utf-hardening-emoji-regressions** Add UTF-16/LSP regression coverage for complex Unicode sequences. *(done 2026-06-01)*
+  - Scope: add focused unit and e2e tests for complex emoji and Unicode text
+    around LSP UTF-16 positions, byte offsets, text edits, and template source
+    maps.
+  - Test data: use the American flag `🇺🇸` for flag coverage, plus ZWJ emoji,
+    skin-tone emoji, variation selector, combining marks, Chinese, and Tibetan
+    text where relevant.
+  - Completed 2026-06-01: added parser/core UTF-16 conversion and incremental
+    edit regressions for complex emoji sequences, including `🇺🇸`, ZWJ family,
+    skin-tone emoji, variation selector, combining marks, Chinese, and Tibetan
+    text.
+  - Completed 2026-06-01: expanded e2e coverage for completion cursor
+    positions, hover/definition/references/rename/codeLens/inlay ranges,
+    completion text edits, Blade/Twig source maps, code-action extraction, and
+    range formatting after complex Unicode prefixes.
+  - Completed 2026-06-01: replaced brittle hardcoded PHPDoc fixture LSP
+    positions with computed UTF-16 positions and fixed server test fixtures so
+    indexed symbols carry the URI of the file being removed.
+  - Validation:
+    - Serena search was used to identify UTF-16/byte conversion entry points;
+    - `cargo test -p php-lsp-parser`;
+    - `cargo test -p php-lsp-server --test e2e_completion`;
+    - `cargo test -p php-lsp-server --test e2e_ranges`;
+    - `cargo test -p php-lsp-server --test e2e_templates`;
+    - `cargo test -p php-lsp-server --test e2e_code_actions`;
+    - `cargo test -p php-lsp-server --test e2e_formatting`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test --all`;
+    - `git diff --check`.
+  - Acceptance:
+    - parser UTF-16 conversion and incremental edit tests cover complex emoji
+      sequences;
+    - LSP hover, definition, references/rename, inlay hints, code actions,
+      formatting/ranges, completion, and template source-map paths have
+      regression coverage after complex Unicode prefixes;
+    - no production behavior or documentation claims change beyond test
+      coverage.
+
 - [x] **T-2026-06-01-llm-audit-follow-up-milestone** Add the new LLM audit findings to the next milestone. *(done 2026-06-01)*
   - Scope: convert the reported audit findings into actionable roadmap tasks
     with priority, affected files, acceptance criteria, and validation targets.

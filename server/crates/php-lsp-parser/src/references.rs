@@ -1456,11 +1456,13 @@ $svc2 = new UserService();
         let refs = find_var_refs_at(code, 1, target_byte_col, true);
 
         assert!(
-            refs.iter().any(|reference| reference.range == (1, 17, 1, 24)),
+            refs.iter()
+                .any(|reference| reference.range == (1, 17, 1, 24)),
             "declaration range should use UTF-16 columns, got {refs:?}"
         );
         assert!(
-            refs.iter().any(|reference| reference.range == (1, 35, 1, 42)),
+            refs.iter()
+                .any(|reference| reference.range == (1, 35, 1, 42)),
             "usage range should use UTF-16 columns, got {refs:?}"
         );
     }

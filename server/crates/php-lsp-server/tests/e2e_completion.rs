@@ -93,6 +93,10 @@ async fn test_completion_context_uses_utf16_lsp_position_after_non_ascii_text() 
         ("cyrillic-emoji", "Привет 😀"),
         ("chinese", "中文测试"),
         ("tibetan", "བོད་ཡིག"),
+        ("american-flag", "Ready 🇺🇸"),
+        ("zwj-family", "Family 👨‍👩‍👧‍👦"),
+        ("skin-tone", "Approve 👍🏽"),
+        ("variation-combining", "Heart ❤️ and cafe\u{0301}"),
     ]
     .into_iter()
     .enumerate()
@@ -1906,6 +1910,10 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
     let supported_path = fixture_root.join("src/PhpDoc/SupportedTags.php");
     let supported_uri = format!("file://{}", supported_path.display());
     let supported_content = fs::read_to_string(&supported_path).unwrap();
+    let supported_class_name = utf16_position_after(&supported_content, "class ");
+    let supported_build_method = utf16_position_at(&supported_content, "build(string");
+    let property_tag = utf16_position_at(&supported_content, "@property string $label");
+    let method_tag = utf16_position_at(&supported_content, "@method User findById");
     service
         .ready()
         .await
@@ -1917,6 +1925,15 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
     let usage_path = fixture_root.join("src/PhpDoc/VirtualMembers.php");
     let usage_uri = format!("file://{}", usage_path.display());
     let usage_content = fs::read_to_string(&usage_path).unwrap();
+    let label_completion = utf16_position_after(&usage_content, "$subject->");
+    let chained_completion_position = utf16_position_after(&usage_content, "$subject->owner->");
+    let dirty_arrow_offset = usage_content
+        .find("$subject->dirty")
+        .expect("fixture should contain dirty assignment")
+        + "$subject->".len();
+    let dirty_completion = utf16_position_for_offset(&usage_content, dirty_arrow_offset);
+    let label_usage = utf16_position_at(&usage_content, "label;");
+    let method_usage = utf16_position_at(&usage_content, "findById");
     service
         .ready()
         .await
@@ -1929,7 +1946,12 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(hover_request(2, &supported_uri, 18, 8))
+        .call(hover_request(
+            2,
+            &supported_uri,
+            supported_class_name.0,
+            supported_class_name.1,
+        ))
         .await
         .unwrap();
     let class_hover_result = extract_result(class_hover);
@@ -1946,7 +1968,12 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(hover_request(3, &supported_uri, 35, 22))
+        .call(hover_request(
+            3,
+            &supported_uri,
+            supported_build_method.0,
+            supported_build_method.1,
+        ))
         .await
         .unwrap();
     let method_hover_result = extract_result(method_hover);
@@ -1964,7 +1991,12 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(completion_request(4, &usage_uri, 11, 23))
+        .call(completion_request(
+            4,
+            &usage_uri,
+            label_completion.0,
+            label_completion.1,
+        ))
         .await
         .unwrap();
     let completion_result = extract_result(completion);
@@ -1992,15 +2024,20 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(completion_request(43, &usage_uri, 13, 29))
+        .call(completion_request(
+            43,
+            &usage_uri,
+            chained_completion_position.0,
+            chained_completion_position.1,
+        ))
         .await
         .unwrap();
     let chained_completion_result = extract_result(chained_completion);
     let chained_items = completion_items_from_result(&chained_completion_result);
     assert!(
-        chained_items.iter().any(|item| {
-            item.get("label").and_then(|value| value.as_str()) == Some("getName")
-        }),
+        chained_items
+            .iter()
+            .any(|item| { item.get("label").and_then(|value| value.as_str()) == Some("getName") }),
         "chained completion should infer @property User $owner, got: {}",
         chained_completion_result
     );
@@ -2016,7 +2053,12 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(completion_request(41, &usage_uri, 13, 14))
+        .call(completion_request(
+            41,
+            &usage_uri,
+            dirty_completion.0,
+            dirty_completion.1,
+        ))
         .await
         .unwrap();
     let write_completion_result = extract_result(write_completion);
@@ -2041,6 +2083,7 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
     let static_usage_uri = "file:///test/PhpDocStaticVirtualMembers.php";
     let static_usage_content =
         "<?php\nnamespace App\\PhpDoc;\nfunction makeSupported(): void\n{\n    SupportedTags::\n}\n";
+    let static_completion_position = utf16_position_after(static_usage_content, "SupportedTags::");
     service
         .ready()
         .await
@@ -2055,7 +2098,12 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(completion_request(42, static_usage_uri, 4, 19))
+        .call(completion_request(
+            42,
+            static_usage_uri,
+            static_completion_position.0,
+            static_completion_position.1,
+        ))
         .await
         .unwrap();
     let static_completion_result = extract_result(static_completion);
@@ -2110,7 +2158,7 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(hover_request(7, &usage_uri, 11, 25))
+        .call(hover_request(7, &usage_uri, label_usage.0, label_usage.1))
         .await
         .unwrap();
     let virtual_hover_result = extract_result(virtual_hover);
@@ -2126,7 +2174,12 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(8, &usage_uri, 11, 25))
+        .call(definition_request(
+            8,
+            &usage_uri,
+            label_usage.0,
+            label_usage.1,
+        ))
         .await
         .unwrap();
     let property_definition_result = extract_result(property_definition);
@@ -2140,7 +2193,7 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
     );
     assert_eq!(
         property_definition_result["range"]["start"]["line"].as_u64(),
-        Some(12),
+        Some(property_tag.0 as u64),
         "virtual property definition should point at @property tag name, got: {}",
         property_definition_result
     );
@@ -2149,7 +2202,12 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(definition_request(9, &usage_uri, 12, 24))
+        .call(definition_request(
+            9,
+            &usage_uri,
+            method_usage.0,
+            method_usage.1,
+        ))
         .await
         .unwrap();
     let method_definition_result = extract_result(method_definition);
@@ -2163,7 +2221,7 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
     );
     assert_eq!(
         method_definition_result["range"]["start"]["line"].as_u64(),
-        Some(15),
+        Some(method_tag.0 as u64),
         "virtual method definition should point at @method tag name, got: {}",
         method_definition_result
     );
@@ -2172,7 +2230,12 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(prepare_rename_request(10, &usage_uri, 11, 25))
+        .call(prepare_rename_request(
+            10,
+            &usage_uri,
+            label_usage.0,
+            label_usage.1,
+        ))
         .await
         .unwrap();
     assert!(
@@ -2184,7 +2247,13 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .ready()
         .await
         .unwrap()
-        .call(rename_request(11, &usage_uri, 11, 25, "caption"))
+        .call(rename_request(
+            11,
+            &usage_uri,
+            label_usage.0,
+            label_usage.1,
+            "caption",
+        ))
         .await
         .unwrap();
     let rename_error = extract_error_message(rename).unwrap_or_default();

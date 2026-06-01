@@ -682,7 +682,8 @@ fn fix_runtime_config(settings: &serde_json::Value) -> FixRuntimeConfig {
         let trimmed = path.trim();
         (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
     });
-    let stub_extensions = settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
+    let stub_extensions =
+        settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
     let include_paths = settings_string_array(settings, "includePaths", &["includePaths"])
         .map(normalize_config_paths)
         .unwrap_or_default();

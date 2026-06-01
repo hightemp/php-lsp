@@ -264,6 +264,29 @@ pub fn did_delete_files_notification(files: Vec<&str>) -> Request {
         .finish()
 }
 
+pub fn utf16_position_at(source: &str, needle: &str) -> (u32, u32) {
+    let offset = source
+        .find(needle)
+        .unwrap_or_else(|| panic!("needle `{needle}` not found"));
+    utf16_position_for_offset(source, offset)
+}
+
+pub fn utf16_position_after(source: &str, needle: &str) -> (u32, u32) {
+    let offset = source
+        .find(needle)
+        .unwrap_or_else(|| panic!("needle `{needle}` not found"))
+        + needle.len();
+    utf16_position_for_offset(source, offset)
+}
+
+pub fn utf16_position_for_offset(source: &str, offset: usize) -> (u32, u32) {
+    let prefix = &source[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+    let character = prefix[line_start..].encode_utf16().count() as u32;
+    (line, character)
+}
+
 pub fn hover_request(id: i64, uri: &str, line: u32, character: u32) -> Request {
     Request::build("textDocument/hover")
         .params(json!({

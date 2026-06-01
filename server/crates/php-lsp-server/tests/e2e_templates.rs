@@ -386,7 +386,7 @@ final class DashboardController
     let complete_marker = "/*complete*/";
     let template_marker = "/*template*/";
     let twig_with_markers = format!(
-        "<h1>{{{{ user.name }}}}</h1>\n{{% for item in users %}}\n  {{{{ item.get{} }}}}\n{{% endfor %}}\n{{% include 'shared/_card.html.twig{}' %}}\n",
+        "🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད <h1>{{{{ user.name }}}}</h1>\n{{% for item in users %}}\n  {{{{ item.get{} }}}}\n{{% endfor %}}\n{{% include 'shared/_card.html.twig{}' %}}\n",
         complete_marker, template_marker
     );
     let marker_position = |marker: &str| -> (u32, u32) {
@@ -398,13 +398,15 @@ final class DashboardController
         prefix = prefix.replace(template_marker, "");
         let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
         let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-        (line, (prefix.len() - line_start) as u32)
+        (line, prefix[line_start..].encode_utf16().count() as u32)
     };
     let (completion_line, completion_character) = marker_position(complete_marker);
     let (template_line, template_character) = marker_position(template_marker);
     let twig = twig_with_markers
         .replace(complete_marker, "")
         .replace(template_marker, "");
+    let hover_position = utf16_position_at(&twig, "user.name");
+    let definition_position = utf16_position_after(&twig, "user.");
 
     fs::write(&user_path, user_php).unwrap();
     fs::write(&controller_path, controller_php).unwrap();
@@ -455,7 +457,12 @@ final class DashboardController
         .ready()
         .await
         .unwrap()
-        .call(hover_request(2, &twig_uri, 0, 8))
+        .call(hover_request(
+            2,
+            &twig_uri,
+            hover_position.0,
+            hover_position.1,
+        ))
         .await
         .unwrap();
     let hover = extract_result(hover_resp);
@@ -470,7 +477,12 @@ final class DashboardController
         .ready()
         .await
         .unwrap()
-        .call(definition_request(3, &twig_uri, 0, 13))
+        .call(definition_request(
+            3,
+            &twig_uri,
+            definition_position.0,
+            definition_position.1,
+        ))
         .await
         .unwrap();
     let definition = extract_result(definition_resp);
