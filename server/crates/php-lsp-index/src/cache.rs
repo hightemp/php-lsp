@@ -1,4 +1,9 @@
-//! Disk cache for workspace index snapshots.
+//! Disk cache storage for workspace index snapshots.
+//!
+//! This module owns the cache schema version, serialized snapshot data model,
+//! namespace path layout, atomic load/save operations, and per-file freshness
+//! validation. Server runtime code should build `IndexCacheConfig` inputs in
+//! `php-lsp-server/src/indexing/cache.rs` and call this module for persistence.
 
 use crate::workspace::WorkspaceIndex;
 use php_lsp_types::uri::{path_to_uri, FileUriError};

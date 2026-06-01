@@ -1,4 +1,9 @@
-//! Stub indexing helpers.
+//! Server-side stub orchestration helpers.
+//!
+//! This module discovers and validates configured phpstorm-stubs paths, clears
+//! existing built-in symbols, and collects source files used by cache hashes.
+//! The actual stub parsing and symbol insertion are implemented by
+//! `php-lsp-index/src/stubs.rs`.
 
 use super::super::*;
 

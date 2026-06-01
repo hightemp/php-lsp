@@ -1,7 +1,9 @@
-//! phpstorm-stubs loader.
+//! phpstorm-stubs symbol loader.
 //!
 //! Loads PHP built-in function/class definitions from JetBrains/phpstorm-stubs.
 //! Parsed symbols are added to the workspace index with the `is_builtin` modifier.
+//! Server-side path discovery, validation, and cache-source collection live in
+//! `php-lsp-server/src/indexing/stubs.rs`.
 
 use crate::workspace::WorkspaceIndex;
 use php_lsp_parser::parser::FileParser;

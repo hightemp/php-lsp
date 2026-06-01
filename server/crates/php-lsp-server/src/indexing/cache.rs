@@ -1,4 +1,9 @@
-//! Index cache helpers.
+//! Server-side index cache orchestration helpers.
+//!
+//! This module translates runtime server configuration, stub paths, and vendor
+//! metadata into `php_lsp_index::cache::IndexCacheConfig` values and stable
+//! hash inputs. The persisted cache schema, bincode serialization, load/save
+//! logic, and per-file validation live in `php-lsp-index/src/cache.rs`.
 
 use super::super::*;
 use std::time::UNIX_EPOCH;

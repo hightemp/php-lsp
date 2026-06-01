@@ -3816,7 +3816,7 @@ change.
     - `cargo metadata` succeeds;
     - `cargo fmt --all --check`.
 
-- [ ] **PHB-014** Clarify duplicated module names and tracked auxiliary paths.
+- [x] **PHB-014** Clarify duplicated module names and tracked auxiliary paths. *(done 2026-06-01)*
   - Audit finding: server-side `indexing/cache.rs` and `indexing/stubs.rs`
     are easy to confuse with `php-lsp-index/src/cache.rs` and `stubs.rs`; the
     audit also flagged auxiliary tracked paths such as `client/node_modules`

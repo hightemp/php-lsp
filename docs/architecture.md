@@ -44,8 +44,8 @@ server/crates/php-lsp-server/src/
     document_links.rs        # include/require document links
   indexing/
     workspace.rs             # initialized, workspace sync, watched files, file operations
-    cache.rs                 # server-side index cache config/hash helpers
-    stubs.rs                 # server-side stub loading helpers
+    cache.rs                 # runtime cache config/hash inputs for php-lsp-index
+    stubs.rs                 # stub path discovery/validation and reload orchestration
     vendor.rs                # vendor autoload cache and lazy vendor LRU helpers
   util/
     uri.rs                   # shared URI/path helpers
@@ -56,6 +56,42 @@ server/crates/php-lsp-server/src/
 cross-feature helpers that are used by multiple LSP modules. When adding new
 request handling code, keep the `LanguageServer` trait method in `server.rs`
 as delegation and put the request body in `src/lsp/<feature>.rs`.
+
+## Indexing Module Boundaries
+
+Some server modules intentionally share names with `php-lsp-index` modules. The
+server crate owns runtime orchestration; the index crate owns storage and symbol
+loading primitives.
+
+| Path | Responsibility | Not Responsible For |
+|---|---|---|
+| `php-lsp-server/src/indexing/cache.rs` | Builds `IndexCacheConfig` values for workspace, stubs, and vendor caches from current server settings; hashes configured stub and vendor source metadata. | Cache file schema, `bincode` serialization, atomic save/load, or per-file freshness validation. |
+| `php-lsp-index/src/cache.rs` | Defines the cache schema version and serialized snapshot model; validates metadata; loads and saves namespace-scoped `index.bin` files. | Reading live LSP configuration, discovering stub paths, or deciding when the server should reindex. |
+| `php-lsp-server/src/indexing/stubs.rs` | Finds candidate phpstorm-stubs directories, rejects unusable paths, clears/reloads configured stub symbols, and collects stub source files for cache hashes. | Parsing stub PHP files or extracting built-in symbols. |
+| `php-lsp-index/src/stubs.rs` | Reads verified phpstorm-stubs files, extracts built-in symbols, and inserts them into `WorkspaceIndex`. | Choosing configured extension lists or fallback stub locations. |
+
+Use the server-side modules when the code needs `PhpLspBackend` state,
+configuration, logging, or LSP lifecycle behavior. Use the index-crate modules
+when the code needs pure index data structures, cache persistence, Composer
+metadata, or parser-backed symbol loading.
+
+## Generated And Auxiliary Paths
+
+Generated client and build outputs are local artifacts and should not be
+tracked:
+
+- `client/node_modules/`
+- `client/out/`
+- `client/bin/`
+- `client/stubs/`
+- `client/*.vsix`
+- `target/` and `server/target/`
+
+These paths are covered by the root `.gitignore`; `npm ci`,
+`npm run build`, `scripts/build-server.sh`, and `scripts/bundle-stubs.sh`
+recreate them as needed. `server/data/stubs/` is different: it is the
+intentional phpstorm-stubs git submodule used as the source for bundled PHP
+symbols.
 
 ## E2E Test Layout
 
@@ -180,7 +216,7 @@ from the `vendor` cache namespace.
 | Code actions/refactors | `src/lsp/code_action.rs` | parser helpers, return type helpers | symbol/member lookup | server unit tests + `tests/e2e_code_actions.rs` |
 | Inlay hints | `src/lsp/inlay_hints.rs` plus shared inference helpers in `server.rs` | type inference and local variable scans | indexed signatures/types | `tests/e2e_hover.rs` |
 | Templates | `template.rs` plus template-aware LSP handlers | virtual PHP/source maps | Twig context scans | `tests/e2e_templates.rs` |
-| Stubs/vendor/cache | `src/indexing/*` and lazy index paths | symbol extraction | `php-lsp-index::{stubs,composer,cache}` | index unit tests + `tests/e2e_indexing.rs` |
+| Stubs/vendor/cache | `src/indexing/*` runtime orchestration and lazy index paths | symbol extraction | `php-lsp-index::{stubs,composer,cache}` storage/loading primitives | index unit tests + `tests/e2e_indexing.rs` |
 
 ## Completion Context
 
