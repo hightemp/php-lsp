@@ -10,10 +10,11 @@ namespace App\PhpDoc;
 function exerciseVirtualMembers(SupportedTags $subject): void
 {
     $label = $subject->label;
+    $name = $subject->owner->getName();
     $user = $subject->findById(1);
     $subject->dirty = false;
 
     renderUser($user);
     echo $label;
+    echo $name;
 }
-

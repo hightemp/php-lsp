@@ -586,6 +586,7 @@ impl PhpLspBackend {
                     source,
                 )
             })
+            .or_else(|| phpdoc_virtual_property_type_fqn(&self.index, class_fqn, member_name))
     }
 
     pub(in crate::server) fn resolve_completion_member_type_cached(

@@ -101,6 +101,22 @@ pub(in crate::server) fn phpdoc_virtual_member(
     None
 }
 
+pub(in crate::server) fn phpdoc_virtual_property_type_fqn(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+) -> Option<String> {
+    let member_name = member_name.trim_start_matches('$');
+    let member = phpdoc_virtual_member(
+        index,
+        class_fqn,
+        member_name,
+        PhpDocVirtualMemberKind::Property,
+    )?;
+    let type_info = member.type_info.as_ref()?;
+    type_info_fqn_from_index(index, class_fqn, &member.owner.uri, type_info)
+}
+
 pub(in crate::server) fn framework_virtual_member_for_symbol(
     index: &WorkspaceIndex,
     sym: &SymbolAtPosition,

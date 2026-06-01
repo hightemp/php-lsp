@@ -11,6 +11,7 @@ use App\Model\User;
  * Multi-line summary should be merged into one sentence.
  *
  * @property string $label Human-readable label
+ * @property User $owner Related owner model
  * @property-read int $version Read-only version marker
  * @property-write bool $dirty Write-only state marker
  * @method User findById(int $id)
@@ -64,4 +65,3 @@ function renderUser(User $user): string
 
     return $name;
 }
-

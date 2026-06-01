@@ -1,8 +1,8 @@
 use crate::server::{
     build_organize_imports_edit, collect_php_files, compute_diagnostics_with_runtime_config,
     diagnostic_budget_config_from_settings, discover_workspace_root_config,
-    is_unused_import_diagnostic, load_effective_configuration_settings, normalize_config_paths,
-    return_type_hint, workspace_index_directories, DiagnosticBudgetConfig,
+    is_unused_import_diagnostic, load_configured_stubs, load_effective_configuration_settings,
+    normalize_config_paths, return_type_hint, workspace_index_directories, DiagnosticBudgetConfig,
     DiagnosticSeverityConfig, DiagnosticsMode, DiagnosticsRuntimeConfig, PhpVersion,
 };
 use crate::util::lsp_text::{lsp_position_to_byte, text_at_lsp_range};
@@ -128,6 +128,8 @@ struct FixRuntimeConfig {
     diagnostic_severity: DiagnosticSeverityConfig,
     diagnostic_budget: DiagnosticBudgetConfig,
     composer_enabled: bool,
+    stubs_path: Option<PathBuf>,
+    stub_extensions: Option<Vec<String>>,
     include_paths: Vec<PathBuf>,
     exclude_paths: Vec<PathBuf>,
 }
@@ -401,6 +403,14 @@ fn run_fix(args: &FixArgs) -> Result<FixReport, FixError> {
     all_files.sort();
 
     let index = WorkspaceIndex::new();
+    load_configured_stubs(
+        &index,
+        &project_root,
+        runtime_config.stubs_path.clone(),
+        runtime_config.stub_extensions.clone(),
+        runtime_config.php_version,
+        false,
+    );
     let mut parsed_by_path = HashMap::new();
     for path in all_files {
         let parsed = parse_fix_file(&path)?;
@@ -663,6 +673,16 @@ fn fix_runtime_config(settings: &serde_json::Value) -> FixRuntimeConfig {
     let diagnostic_budget = diagnostic_budget_config_from_settings(settings);
     let composer_enabled =
         settings_bool(settings, "composerEnabled", &["composer", "enabled"]).unwrap_or(true);
+    let stubs_path = settings_string_any(
+        settings,
+        "stubsPath",
+        &[&["stubs", "path"][..], &["bundledStubsPath"][..]],
+    )
+    .and_then(|path| {
+        let trimmed = path.trim();
+        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    });
+    let stub_extensions = settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
     let include_paths = settings_string_array(settings, "includePaths", &["includePaths"])
         .map(normalize_config_paths)
         .unwrap_or_default();
@@ -676,6 +696,8 @@ fn fix_runtime_config(settings: &serde_json::Value) -> FixRuntimeConfig {
         diagnostic_severity,
         diagnostic_budget,
         composer_enabled,
+        stubs_path,
+        stub_extensions,
         include_paths,
         exclude_paths,
     }
@@ -702,6 +724,22 @@ fn settings_string<'a>(
     nested_path: &[&str],
 ) -> Option<&'a str> {
     settings_value(settings, flat_key, nested_path).and_then(|value| value.as_str())
+}
+
+fn settings_string_any<'a>(
+    settings: &'a serde_json::Value,
+    flat_key: &str,
+    nested_paths: &[&[&str]],
+) -> Option<&'a str> {
+    if let Some(value) = settings.get(flat_key).and_then(|value| value.as_str()) {
+        return Some(value);
+    }
+    for nested_path in nested_paths {
+        if let Some(value) = settings_string(settings, flat_key, nested_path) {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn settings_bool(

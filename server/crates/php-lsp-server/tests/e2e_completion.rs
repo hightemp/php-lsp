@@ -1987,6 +1987,23 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         "completion should include @property-read detail, got: {}",
         completion_result
     );
+
+    let chained_completion = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(43, &usage_uri, 13, 29))
+        .await
+        .unwrap();
+    let chained_completion_result = extract_result(chained_completion);
+    let chained_items = completion_items_from_result(&chained_completion_result);
+    assert!(
+        chained_items.iter().any(|item| {
+            item.get("label").and_then(|value| value.as_str()) == Some("getName")
+        }),
+        "chained completion should infer @property User $owner, got: {}",
+        chained_completion_result
+    );
     assert!(
         !items
             .iter()

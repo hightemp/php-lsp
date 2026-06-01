@@ -58,18 +58,10 @@ impl Utf16LineIndex {
             return byte_col;
         }
         let byte_col = byte_col as usize;
-        // Find the last mapping at or before byte_col
         let mut utf16_col = byte_col;
         for &(b, u) in mappings.iter() {
             if b <= byte_col {
-                // At this byte offset the UTF-16 offset is `u`.
-                // Characters past this point: byte_col - b bytes, which are
-                // all after the divergence point, so we extrapolate:
-                // But actually `u` is the cumulative utf16 offset AT byte offset `b`.
-                // Any remaining bytes from `b` to `byte_col` are within the
-                // next character, so the UTF-16 offset at `byte_col` is just `u`
-                // plus whatever comes after.
-                utf16_col = u + (byte_col - b);
+                utf16_col = u;
             } else {
                 break;
             }
@@ -97,7 +89,10 @@ pub fn byte_col_to_utf16(source: &str, line: u32, byte_col: u32) -> u32 {
     let mut utf16_off = 0usize;
 
     for ch in line_text.chars() {
-        if byte_off >= byte_col {
+        if byte_col <= byte_off {
+            break;
+        }
+        if byte_col < byte_off + ch.len_utf8() && ch.len_utf8() != ch.len_utf16() {
             break;
         }
         byte_off += ch.len_utf8();
@@ -185,5 +180,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_index_clamps_inside_multibyte_character() {
+        let source = "<?php\n$x = '😀';\n";
+        let idx = Utf16LineIndex::new(source);
+
+        assert_eq!(byte_col_to_utf16(source, 1, 7), 6);
+        assert_eq!(byte_col_to_utf16(source, 1, 8), 6);
+        assert_eq!(byte_col_to_utf16(source, 1, 9), 6);
+        assert_eq!(idx.byte_col_to_utf16(1, 11), byte_col_to_utf16(source, 1, 11));
     }
 }

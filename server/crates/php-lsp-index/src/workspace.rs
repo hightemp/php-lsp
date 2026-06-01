@@ -108,18 +108,54 @@ impl WorkspaceIndex {
                     | PhpSymbolKind::Interface
                     | PhpSymbolKind::Trait
                     | PhpSymbolKind::Enum => {
-                        self.types.remove(&sym.fqn);
+                        self.remove_top_level_symbol(uri, sym, &self.types);
                     }
                     PhpSymbolKind::Function => {
-                        self.functions.remove(&sym.fqn);
+                        self.remove_top_level_symbol(uri, sym, &self.functions);
                     }
                     PhpSymbolKind::GlobalConstant => {
-                        self.constants.remove(&sym.fqn);
+                        self.remove_top_level_symbol(uri, sym, &self.constants);
                     }
                     _ => {}
                 }
             }
         }
+    }
+
+    fn remove_top_level_symbol(
+        &self,
+        removed_uri: &str,
+        removed_symbol: &SymbolInfo,
+        symbols: &DashMap<String, Arc<SymbolInfo>>,
+    ) {
+        let should_remove = symbols
+            .get(&removed_symbol.fqn)
+            .is_some_and(|entry| entry.uri == removed_uri);
+        if !should_remove {
+            return;
+        }
+
+        symbols.remove(&removed_symbol.fqn);
+
+        if let Some(replacement) = self.find_top_level_symbol_replacement(removed_symbol) {
+            symbols.insert(removed_symbol.fqn.clone(), replacement);
+        }
+    }
+
+    fn find_top_level_symbol_replacement(
+        &self,
+        removed_symbol: &SymbolInfo,
+    ) -> Option<Arc<SymbolInfo>> {
+        self.file_symbols.iter().find_map(|entry| {
+            entry
+                .symbols
+                .iter()
+                .find(|candidate| {
+                    candidate.fqn == removed_symbol.fqn && candidate.kind == removed_symbol.kind
+                })
+                .cloned()
+                .map(Arc::new)
+        })
     }
 
     /// Resolve a fully qualified name to a symbol.
@@ -1219,6 +1255,31 @@ mod tests {
 
         index.remove_file("file:///test.php");
         assert!(index.resolve_fqn("App\\Foo").is_none());
+    }
+
+    #[test]
+    fn test_remove_file_preserves_duplicate_fqn_from_other_file() {
+        let index = WorkspaceIndex::new();
+        let file_a = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![make_class("Foo", "App\\Foo", "file:///a.php")],
+            ..Default::default()
+        };
+        let file_b = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![make_class("Foo", "App\\Foo", "file:///b.php")],
+            ..Default::default()
+        };
+
+        index.update_file("file:///a.php", file_a);
+        index.update_file("file:///b.php", file_b);
+
+        index.remove_file("file:///a.php");
+
+        let found = index.resolve_fqn("App\\Foo").expect("duplicate FQN remains");
+        assert_eq!(found.uri, "file:///b.php");
     }
 
     #[test]

@@ -76,6 +76,7 @@ mod indexing;
 mod lsp;
 use indexing::cache::*;
 use indexing::stubs::*;
+pub(crate) use indexing::stubs::load_configured_stubs;
 use indexing::vendor::*;
 pub(crate) use indexing::vendor::{parse_vendor_autoload_map, resolve_vendor_paths_from_map};
 use indexing::workspace::*;

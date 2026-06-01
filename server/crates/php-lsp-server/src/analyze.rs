@@ -1,8 +1,8 @@
 use crate::server::{
     collect_php_files, compute_diagnostics_with_runtime_config,
     diagnostic_budget_config_from_settings, discover_workspace_root_config,
-    lazy_resolvable_diagnostic_fqn, load_effective_configuration_settings, normalize_config_paths,
-    parse_vendor_autoload_map, path_is_excluded, resolve_vendor_paths_from_map,
+    lazy_resolvable_diagnostic_fqn, load_configured_stubs, load_effective_configuration_settings,
+    normalize_config_paths, parse_vendor_autoload_map, path_is_excluded, resolve_vendor_paths_from_map,
     workspace_index_directories, DiagnosticBudgetConfig, DiagnosticSeverityConfig, DiagnosticsMode,
     DiagnosticsRuntimeConfig, PhpVersion, VendorAutoloadMap, VENDOR_PRELOAD_ENTRYPOINT_LIMIT,
 };
@@ -146,6 +146,8 @@ struct AnalyzeRuntimeConfig {
     diagnostic_budget: DiagnosticBudgetConfig,
     composer_enabled: bool,
     index_vendor: bool,
+    stubs_path: Option<PathBuf>,
+    stub_extensions: Option<Vec<String>>,
     include_paths: Vec<PathBuf>,
     exclude_paths: Vec<PathBuf>,
 }
@@ -370,6 +372,14 @@ fn run_analyze(args: &AnalyzeArgs) -> Result<AnalyzeReport, AnalyzeError> {
     all_files.sort();
 
     let index = WorkspaceIndex::new();
+    load_configured_stubs(
+        &index,
+        &project_root,
+        runtime_config.stubs_path.clone(),
+        runtime_config.stub_extensions.clone(),
+        runtime_config.php_version,
+        false,
+    );
     let vendor_autoload_map = runtime_config
         .index_vendor
         .then(|| parse_vendor_autoload_map(&project_root.join("vendor")))
@@ -474,6 +484,16 @@ fn analyze_runtime_config(settings: &serde_json::Value) -> AnalyzeRuntimeConfig 
     let composer_enabled =
         settings_bool(settings, "composerEnabled", &["composer", "enabled"]).unwrap_or(true);
     let index_vendor = settings_bool(settings, "indexVendor", &["indexVendor"]).unwrap_or(true);
+    let stubs_path = settings_string_any(
+        settings,
+        "stubsPath",
+        &[&["stubs", "path"][..], &["bundledStubsPath"][..]],
+    )
+    .and_then(|path| {
+        let trimmed = path.trim();
+        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    });
+    let stub_extensions = settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
     let include_paths = settings_string_array(settings, "includePaths", &["includePaths"])
         .map(normalize_config_paths)
         .unwrap_or_default();
@@ -488,6 +508,8 @@ fn analyze_runtime_config(settings: &serde_json::Value) -> AnalyzeRuntimeConfig 
         diagnostic_budget,
         composer_enabled,
         index_vendor,
+        stubs_path,
+        stub_extensions,
         include_paths,
         exclude_paths,
     }
@@ -514,6 +536,22 @@ fn settings_string<'a>(
     nested_path: &[&str],
 ) -> Option<&'a str> {
     settings_value(settings, flat_key, nested_path).and_then(|value| value.as_str())
+}
+
+fn settings_string_any<'a>(
+    settings: &'a serde_json::Value,
+    flat_key: &str,
+    nested_paths: &[&[&str]],
+) -> Option<&'a str> {
+    if let Some(value) = settings.get(flat_key).and_then(|value| value.as_str()) {
+        return Some(value);
+    }
+    for nested_path in nested_paths {
+        if let Some(value) = settings_string(settings, flat_key, nested_path) {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn settings_bool(

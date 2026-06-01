@@ -4228,3 +4228,10 @@ change.
 - [x] **T-2026-05-24** Подготовить предыдущий релиз с README в VSIX.
 - [x] **T-2026-05-24** Исправить Marketplace badges в `README.md`, которые показывают `retired badge`.
 - [x] **T-2026-05-25** Актуализировать всю документацию после повторного прохода по проекту.
+- [x] **H-AUDIT-2026-06-01** Исправить подтверждённые ошибки из аудита *(done 2026-06-01)*
+  - Проверить фактическую структуру репозитория, не полагаясь на неполный список файлов из аудита
+  - Исправить удаление duplicate FQN в `WorkspaceIndex::remove_file`
+  - Исправить CRLF/UTF-16 edge cases в conversion helpers
+  - Синхронизировать CLI analyze/fix со stub-loading LSP режима
+  - Добавить PHPDoc virtual-property fallback для chain inference
+  - Запустить релевантные Rust-тесты

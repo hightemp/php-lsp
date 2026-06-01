@@ -6,6 +6,7 @@
 
 use crate::cst::{argument_index, argument_name, is_by_ref_output_argument_variable};
 use crate::phpdoc::{parse_phpdoc, strip_exact_tag};
+use crate::utf16::utf16_col_to_byte;
 use php_lsp_types::{
     normalize_shape_key_text, FileSymbols, Signature, SymbolInfo, TypeInfo, UseKind,
 };
@@ -3965,13 +3966,19 @@ fn normalize_array_access_key(raw: &str) -> Option<String> {
 fn position_to_byte(source: &str, line: u32, character: u32) -> usize {
     let mut offset = 0usize;
     let line_idx = line as usize;
-    for (i, row) in source.lines().enumerate() {
+    for (i, row) in source.split_inclusive('\n').enumerate() {
+        let line_text = row.strip_suffix('\n').unwrap_or(row);
         if i == line_idx {
-            let col = character as usize;
-            return offset + col.min(row.len());
+            let byte_col = utf16_col_to_byte(source, line, character) as usize;
+            return offset + byte_col.min(line_text.len());
         }
-        offset += row.len() + 1;
+        offset += row.len();
     }
+
+    if line_idx == source.split_inclusive('\n').count() {
+        return source.len();
+    }
+
     source.len()
 }
 
@@ -4576,6 +4583,22 @@ mod tests {
             }
         }
         panic!("needle not found: {}", needle);
+    }
+
+    #[test]
+    fn test_position_to_byte_handles_crlf() {
+        let source = "<?php\r\n$first = 1;\r\n$second = $first;\r\n";
+        let expected = source.find("$second").unwrap();
+
+        assert_eq!(position_to_byte(source, 2, 0), expected);
+    }
+
+    #[test]
+    fn test_position_to_byte_converts_utf16_character() {
+        let source = "<?php\n$emoji = \"😀\";\n$result = $emoji;\n";
+        let expected = source.find("$result").unwrap();
+
+        assert_eq!(position_to_byte(source, 2, 0), expected);
     }
 
     struct ObjectTypeResolveDepthReset {
