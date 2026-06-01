@@ -3380,7 +3380,28 @@ while implementing these tasks.
   - Regression tests: edit a controller render context type and verify the open
     Twig document sees the new variable type without restart.
 
-- [ ] **PHA-032** Treat complex Twig expressions as an explicit best-effort parser backlog.
+- [x] **PHA-032** Treat complex Twig expressions as an explicit best-effort parser backlog.
+  - Completed 2026-06-01:
+    - added explicit unsupported Twig expression classification for filters,
+      tests, `in`, functions, imported/_self macros, ternaries, null coalescing,
+      ranges, and dynamic/bracket attribute access;
+    - unsupported expressions now emit valid unmapped placeholders (`null`,
+      `true`, or empty array iterables) instead of partially mapped PHP;
+    - simple variable/literal/operator/dot-member and object method-call
+      expressions remain best-effort mapped;
+    - added unit coverage for the classifier and unmapped placeholders plus an
+      e2e fixture that keeps complex Twig expressions quiet;
+    - README, architecture docs, LSP feature docs, and production risk register
+      document the explicit support limits.
+  - Validation:
+    - `cargo test -p php-lsp-server template::tests -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_templates test_twig_complex_expressions_are_best_effort_and_quiet -- --nocapture`;
+    - `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`;
+    - `cargo fmt --all --check`;
+    - `cargo clippy --all-targets -- -D warnings`;
+    - `cargo test -p php-lsp-server --tests`;
+    - `cargo test --all`;
+    - `git diff --check`.
   - Scope:
     - filters (`|`), tests (`is`), `in`, functions, macros, ternaries, null
       coalescing, and complex attribute access;

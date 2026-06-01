@@ -318,6 +318,16 @@ Blade support covers escaped/raw echo blocks and common `@if`, `@foreach`,
 `{% for item in items %}`, `{% set name = expr %}`, common structural tags, and
 static include/extends/embed path lookup.
 
+Twig expression conversion is intentionally conservative. Simple variable,
+literal, operator, dot-member, and object method-call expressions can be mapped
+to virtual PHP. Filters, tests, `in`, functions, macros imported with
+`import`/`from` or `_self`, ternaries, null coalescing, ranges, and
+dynamic/bracket attribute access are classified as unsupported expression
+backlog. Those expressions emit valid unmapped placeholders (`null`, `true`, or
+an empty array iterable) so parser state remains usable while diagnostics,
+hover, completion, and inlay requests avoid pretending the Twig expression is
+ordinary PHP.
+
 Twig context variables are inferred statically from simple PHP
 `render('template.html.twig', ['name' => expr])` call sites. The context scanner
 combines open PHP files from memory with a bounded, disk-backed cache for closed
@@ -327,8 +337,7 @@ PHP controller/render edits and workspace reindex completion: their context
 prelude, virtual PHP parser, diagnostics, and request-time hover/completion/inlay
 state are rebuilt from current open buffers plus the disk cache. The scanner
 does not boot Symfony, evaluate Twig extensions, run user code, or read the
-service container. Unsupported Twig filters/functions/tests remain best-effort
-and are treated as mixed unless a static provider models them.
+service container.
 
 ## Symbol Index
 

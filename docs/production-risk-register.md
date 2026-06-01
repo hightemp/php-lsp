@@ -365,6 +365,9 @@ Mitigation:
 - `PHA-031`: open Twig documents refresh inferred render-context types after
   relevant PHP controller/render edits and workspace reindex completion, with a
   bounded open-template refresh limit.
+- `PHA-032`: unsupported complex Twig expressions are explicitly classified and
+  skipped with unmapped placeholders instead of being partially converted into
+  misleading virtual PHP.
 
 Exit signal:
 

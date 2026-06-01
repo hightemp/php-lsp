@@ -206,8 +206,10 @@ phpstorm-stubs support.
   template-engine implementations; diagnostics are best-effort and published
   only for a small allowlist of exact source-mapped expression errors; syntax
   noise, generated virtual PHP, incomplete/magic properties, and uncertain
-  ranges stay suppressed. Twig filters/functions/tests are treated as mixed
-  unless statically modeled, and Twig context variables are inferred only from
+  ranges stay suppressed. Complex Twig expressions such as filters, tests,
+  `in`, functions, macros, ternaries, null coalescing, and dynamic/bracket
+  attribute access are explicit best-effort backlog items and are skipped rather
+  than mapped to misleading PHP. Twig context variables are inferred only from
   static `render(..., [...])` call sites and simple context expressions. Open
   Twig documents refresh those inferred context types after relevant PHP
   controller/render changes and workspace reindex events.

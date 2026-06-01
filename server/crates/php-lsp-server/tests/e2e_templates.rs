@@ -577,6 +577,74 @@ final class DashboardController
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_complex_expressions_are_best_effort_and_quiet() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-complex-expressions-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("templates")).unwrap();
+    let twig_path = tmp_root.join("templates/complex.html.twig");
+    let twig_uri = php_lsp_types::uri::path_to_uri(&twig_path).unwrap();
+    let twig = concat!(
+        "{% import 'forms.html.twig' as forms %}\n",
+        "{{ user.name|upper }}\n",
+        "{% if user is defined %}visible{% endif %}\n",
+        "{% if user.id in ids %}allowed{% endif %}\n",
+        "{% for item in users|filter(u => u.active) %}{{ item.name }}{% endfor %}\n",
+        "{% set label = attribute(user, dynamic_name) %}{{ label }}\n",
+        "{{ path('dashboard') }}\n",
+        "{{ forms.input(user) }}\n",
+        "{{ _self.card(user) }}\n",
+        "{{ user.active ? 'yes' : 'no' }}\n",
+        "{{ user.name ?? 'n/a' }}\n",
+        "{{ user['name'] }}\n",
+    );
+    fs::write(&twig_path, twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(&twig_uri, "twig", twig))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "unsupported Twig expressions should stay quiet, got: {}",
+        diagnostics
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_twig_context_types_refresh_after_controller_render_context_change() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
