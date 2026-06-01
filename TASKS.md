@@ -189,6 +189,12 @@
 
 ## Hotfix backlog (post-MVP)
 
+- [x] **H-UNICODE-PHP-2026-06-01** Проверить Unicode/emoji в реальном PHP-коде *(done 2026-06-01)*
+  - Покрыть PHP strings/comments с emoji и non-ASCII перед диагностируемыми токенами
+  - Проверить LSP UTF-16 ranges для diagnostics, semantic tokens и symbol resolve в PHP-коде
+  - Убедиться, что PHP parsing не ломается на emoji в строках/комментариях
+  - Запустить релевантные parser tests
+
 - [x] **H-UTF16-2026-06-01** Покрыть UTF-16/UTF-8 position conversions полным набором Unicode-тестов *(done 2026-06-01)*
   - Добавить тесты для ASCII, BMP, Cyrillic, combining marks, emoji/surrogate pairs, ZWJ sequences, mixed Unicode, CRLF, empty lines и EOF
   - Проверить indexed и one-off conversion helpers на согласованность

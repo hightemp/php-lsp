@@ -4682,6 +4682,15 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_symbol_after_emoji_uses_utf16_position() {
+        let code = "<?php\n$emoji = \"😀\"; strlen('hello');\n";
+        let result = parse_and_resolve(code, 1, 17).expect("strlen should resolve after emoji");
+
+        assert_eq!(result.ref_kind, RefKind::FunctionCall);
+        assert_eq!(result.name, "strlen");
+    }
+
+    #[test]
     fn test_resolve_qualified_function_call_without_double_namespace() {
         let code = "<?php\nnamespace App\\Diagnostics;\n\nApp\\Utils\\helper();\n";
         let result = parse_and_resolve(code, 3, 13);

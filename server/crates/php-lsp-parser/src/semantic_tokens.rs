@@ -704,4 +704,19 @@ mod tests {
 
         assert!(has_token(&tokens, 1, 11, 8, TOKEN_STRING));
     }
+
+    #[test]
+    fn uses_utf16_positions_after_emoji_in_php_code() {
+        let source = "<?php\n$emoji = \"😀\"; $after = 1;\n";
+        let tokens = parse_absolute_tokens(source);
+
+        assert!(
+            has_token(&tokens, 1, 9, 4, TOKEN_STRING),
+            "emoji string token should use UTF-16 length, got {tokens:?}"
+        );
+        assert!(
+            has_token(&tokens, 1, 15, 6, TOKEN_VARIABLE),
+            "variable after emoji should start at UTF-16 column 15, got {tokens:?}"
+        );
+    }
 }
