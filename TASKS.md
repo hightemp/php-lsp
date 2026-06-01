@@ -3738,7 +3738,7 @@ change.
       confirms the next resolve attempt starts at the original depth;
     - existing resolver recursion-depth tests still pass.
 
-- [ ] **PHB-009** Use `HashSet` for recursive hierarchy visited sets.
+- [x] **PHB-009** Use `HashSet` for recursive hierarchy visited sets. *(done 2026-06-01)*
   - Audit finding: `WorkspaceIndex::collect_members_recursive` and
     `resolve_member_in_hierarchy` use `Vec::contains` plus repeated
     allocations for visited class names.

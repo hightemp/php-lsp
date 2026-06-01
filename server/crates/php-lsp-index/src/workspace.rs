@@ -155,7 +155,7 @@ impl WorkspaceIndex {
             class_fqn,
             member_name,
             fqn,
-            &mut Vec::new(),
+            &mut HashSet::new(),
             &TemplateSubstitutions::new(),
         )
     }
@@ -167,13 +167,12 @@ impl WorkspaceIndex {
         class_fqn: &str,
         member_name: &str,
         original_fqn: &str,
-        visited: &mut Vec<String>,
+        visited: &mut HashSet<String>,
         substitutions: &TemplateSubstitutions,
     ) -> Option<Arc<SymbolInfo>> {
-        if visited.contains(&class_fqn.to_string()) {
+        if !visited.insert(class_fqn.to_string()) {
             return None;
         }
-        visited.push(class_fqn.to_string());
 
         let members = self.get_direct_members(class_fqn);
         // Prefer exact FQN match first
@@ -289,7 +288,7 @@ impl WorkspaceIndex {
         self.collect_members_recursive(
             type_fqn,
             &mut members,
-            &mut Vec::new(),
+            &mut HashSet::new(),
             &TemplateSubstitutions::new(),
         );
         members
@@ -298,7 +297,7 @@ impl WorkspaceIndex {
     /// Get a type symbol and all type symbols in its trait/parent/interface hierarchy.
     pub fn get_type_hierarchy_symbols(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
         let mut types = Vec::new();
-        self.collect_type_hierarchy_symbols(type_fqn, &mut types, &mut Vec::new());
+        self.collect_type_hierarchy_symbols(type_fqn, &mut types, &mut HashSet::new());
         types
     }
 
@@ -320,13 +319,12 @@ impl WorkspaceIndex {
         &self,
         type_fqn: &str,
         members: &mut Vec<Arc<SymbolInfo>>,
-        visited: &mut Vec<String>,
+        visited: &mut HashSet<String>,
         substitutions: &TemplateSubstitutions,
     ) {
-        if visited.contains(&type_fqn.to_string()) {
+        if !visited.insert(type_fqn.to_string()) {
             return;
         }
-        visited.push(type_fqn.to_string());
 
         // Collect direct members
         let direct = self.get_direct_members(type_fqn);
@@ -721,12 +719,11 @@ impl WorkspaceIndex {
         &self,
         type_fqn: &str,
         types: &mut Vec<Arc<SymbolInfo>>,
-        visited: &mut Vec<String>,
+        visited: &mut HashSet<String>,
     ) {
-        if visited.contains(&type_fqn.to_string()) {
+        if !visited.insert(type_fqn.to_string()) {
             return;
         }
-        visited.push(type_fqn.to_string());
 
         let Some(class_sym) = self.types.get(type_fqn).map(|r| r.value().clone()) else {
             return;
@@ -1167,6 +1164,27 @@ mod tests {
         }
     }
 
+    fn make_method(name: &str, parent_fqn: &str, uri: &str) -> SymbolInfo {
+        SymbolInfo {
+            name: name.to_string(),
+            fqn: format!("{parent_fqn}::{name}"),
+            kind: PhpSymbolKind::Method,
+            uri: uri.to_string(),
+            range: (1, 4, 3, 5),
+            selection_range: (1, 20, 1, 20 + name.len() as u32),
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            doc_comment: None,
+            signature: None,
+            parent_fqn: Some(parent_fqn.to_string()),
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
+        }
+    }
+
     #[test]
     fn test_update_and_resolve() {
         let index = WorkspaceIndex::new();
@@ -1525,6 +1543,91 @@ mod tests {
 
         // Should not hang — just return None
         assert!(index.resolve_fqn("A::nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_hierarchy_visited_sets_handle_trait_mixin_and_parent_cycles() {
+        let index = WorkspaceIndex::new();
+
+        let mut root = make_class("Root", "App\\Root", "file:///hierarchy.php");
+        root.extends = vec!["App\\Parent".to_string()];
+        root.traits = vec!["App\\SharedTrait".to_string()];
+        root.template_bindings = vec![TemplateBinding {
+            kind: TemplateBindingKind::Mixin,
+            target: "App\\Mixin".to_string(),
+            args: vec![],
+        }];
+
+        let mut parent = make_class("Parent", "App\\Parent", "file:///hierarchy.php");
+        parent.extends = vec!["App\\Root".to_string()];
+
+        let mut trait_sym = make_class("SharedTrait", "App\\SharedTrait", "file:///hierarchy.php");
+        trait_sym.kind = PhpSymbolKind::Trait;
+        trait_sym.traits = vec!["App\\Root".to_string()];
+
+        let mut mixin = make_class("Mixin", "App\\Mixin", "file:///hierarchy.php");
+        mixin.extends = vec!["App\\Root".to_string()];
+
+        index.update_file(
+            "file:///hierarchy.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![
+                    root,
+                    parent,
+                    make_method("parentMethod", "App\\Parent", "file:///hierarchy.php"),
+                    trait_sym,
+                    make_method("traitMethod", "App\\SharedTrait", "file:///hierarchy.php"),
+                    mixin,
+                    make_method("mixinMethod", "App\\Mixin", "file:///hierarchy.php"),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            index
+                .resolve_fqn("App\\Root::traitMethod")
+                .map(|sym| sym.fqn.clone())
+                .as_deref(),
+            Some("App\\SharedTrait::traitMethod")
+        );
+        assert_eq!(
+            index
+                .resolve_fqn("App\\Root::mixinMethod")
+                .map(|sym| sym.fqn.clone())
+                .as_deref(),
+            Some("App\\Mixin::mixinMethod")
+        );
+        assert_eq!(
+            index
+                .resolve_fqn("App\\Root::parentMethod")
+                .map(|sym| sym.fqn.clone())
+                .as_deref(),
+            Some("App\\Parent::parentMethod")
+        );
+        assert!(index.resolve_fqn("App\\Root::missing").is_none());
+
+        let member_names = index
+            .get_members("App\\Root")
+            .into_iter()
+            .map(|member| member.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            member_names,
+            vec!["traitMethod", "mixinMethod", "parentMethod"]
+        );
+
+        let hierarchy_fqns = index
+            .get_type_hierarchy_symbols("App\\Root")
+            .into_iter()
+            .map(|symbol| symbol.fqn.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hierarchy_fqns,
+            vec!["App\\Root", "App\\SharedTrait", "App\\Parent"]
+        );
     }
 
     #[test]
