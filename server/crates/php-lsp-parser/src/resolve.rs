@@ -18,6 +18,30 @@ thread_local! {
     static OBJECT_TYPE_RESOLVE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
+struct ObjectTypeResolveDepthGuard {
+    previous: usize,
+}
+
+impl ObjectTypeResolveDepthGuard {
+    fn enter() -> Option<Self> {
+        OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| {
+            let previous = depth.get();
+            if previous >= MAX_OBJECT_TYPE_RESOLVE_DEPTH {
+                return None;
+            }
+
+            depth.set(previous + 1);
+            Some(Self { previous })
+        })
+    }
+}
+
+impl Drop for ObjectTypeResolveDepthGuard {
+    fn drop(&mut self) {
+        OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| depth.set(self.previous));
+    }
+}
+
 /// Callback for resolving a member's type from an external source (e.g., workspace index).
 ///
 /// Takes `(class_fqn, member_name)` and returns the member's type FQN.
@@ -1145,23 +1169,14 @@ fn try_resolve_object_type<'a>(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<String> {
-    OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| {
-        let current = depth.get();
-        if current >= MAX_OBJECT_TYPE_RESOLVE_DEPTH {
-            return None;
-        }
-
-        depth.set(current + 1);
-        let result = try_resolve_object_type_inner(
-            object_node,
-            source,
-            file_symbols,
-            resolver,
-            callable_resolver,
-        );
-        depth.set(current);
-        result
-    })
+    let _depth_guard = ObjectTypeResolveDepthGuard::enter()?;
+    try_resolve_object_type_inner(
+        object_node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )
 }
 
 fn try_resolve_object_type_inner<'a>(
@@ -4656,6 +4671,66 @@ mod tests {
             }
         }
         panic!("needle not found: {}", needle);
+    }
+
+    struct ObjectTypeResolveDepthReset {
+        previous: usize,
+    }
+
+    impl ObjectTypeResolveDepthReset {
+        fn set(value: usize) -> Self {
+            let previous = OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| {
+                let previous = depth.get();
+                depth.set(value);
+                previous
+            });
+            Self { previous }
+        }
+    }
+
+    impl Drop for ObjectTypeResolveDepthReset {
+        fn drop(&mut self) {
+            OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| depth.set(self.previous));
+        }
+    }
+
+    fn object_type_resolve_depth() -> usize {
+        OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| depth.get())
+    }
+
+    #[test]
+    fn test_object_type_resolve_depth_guard_restores_after_panic() {
+        let _reset = ObjectTypeResolveDepthReset::set(MAX_OBJECT_TYPE_RESOLVE_DEPTH - 1);
+
+        let result = std::panic::catch_unwind(|| {
+            let _guard = ObjectTypeResolveDepthGuard::enter()
+                .expect("guard should enter below max resolve depth");
+            assert_eq!(object_type_resolve_depth(), MAX_OBJECT_TYPE_RESOLVE_DEPTH);
+            std::panic::resume_unwind(Box::new("simulated object type resolver panic"));
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            object_type_resolve_depth(),
+            MAX_OBJECT_TYPE_RESOLVE_DEPTH - 1
+        );
+
+        let guard = ObjectTypeResolveDepthGuard::enter()
+            .expect("next resolve attempt should start from the restored depth");
+        assert_eq!(object_type_resolve_depth(), MAX_OBJECT_TYPE_RESOLVE_DEPTH);
+        drop(guard);
+        assert_eq!(
+            object_type_resolve_depth(),
+            MAX_OBJECT_TYPE_RESOLVE_DEPTH - 1
+        );
+    }
+
+    #[test]
+    fn test_object_type_resolve_depth_guard_respects_max_depth() {
+        let _reset = ObjectTypeResolveDepthReset::set(MAX_OBJECT_TYPE_RESOLVE_DEPTH);
+
+        assert!(ObjectTypeResolveDepthGuard::enter().is_none());
+        assert_eq!(object_type_resolve_depth(), MAX_OBJECT_TYPE_RESOLVE_DEPTH);
     }
 
     #[test]

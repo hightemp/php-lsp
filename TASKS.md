@@ -3722,7 +3722,7 @@ change.
 
 ### Reliability, cache, and performance
 
-- [ ] **PHB-008** Make object-type resolve depth panic-safe with an RAII guard.
+- [x] **PHB-008** Make object-type resolve depth panic-safe with an RAII guard. *(done 2026-06-01)*
   - Audit finding: thread-local `OBJECT_TYPE_RESOLVE_DEPTH` is restored only
     after `try_resolve_object_type_inner`; a panic can leave a worker thread
     with poisoned depth for the next task.
