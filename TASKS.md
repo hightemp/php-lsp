@@ -195,7 +195,7 @@
 
 ---
 
-## Hotfix backlog (post-MVP)
+## Hotfix backlog (post-MVP) **Закрыт**
 
 - [x] **H-001** Built-in function resolution в namespace (definition/rename) *(done 2026-02-15)*
   - Символы вида `strlen()` внутри namespace не должны резолвиться только как `App\\Ns\\strlen`
@@ -4492,3 +4492,67 @@ change.
   - Implemented: журнал задач пересортирован сверху вниз по датам; свежий hotfix-блок перемещен ниже старых `H-001..H-026`.
   - Validation: `git diff --check` passed.
   - Validation: структурная проверка подтвердила 120 journal-записей от `2026-05-19` до `2026-06-02` без убывания дат.
+
+- [x] **H-TWIG-BDPN-TEMPLATES-AUDIT-2026-06-02** Аудит hover/definition/inlayHint по Twig шаблонам `bdpn-ui` *(done 2026-06-02)*
+  - Разбить `/home/apanov/Projects/bdpn-ui/app/templates/**/*.twig` на несколько независимых групп.
+  - Проверить LSP smoke для hover, go-to-definition и inlayHint на реально используемых Twig переменных/member chains.
+  - Все найденные gaps добавить отдельными задачами в backlog с точными файлами/позициями/симптомами.
+  - После аудита отметить umbrella-задачу done.
+
+- [ ] **H-TWIG-BDPN-ENTITY-FOREACH-CONTEXT-2026-06-02** Восстановить hover/definition/inlayHint для Twig foreach по entity collections и paginator items
+  - `porting_request/show.html.twig:367` `portingNumber.id` из `portingRequest.portingNumbers` должен резолвиться в `App\Entity\PortingNumber`.
+  - `porting_request/show.html.twig:424` `statusHistory.id` должен резолвиться в `App\Entity\RequestStatusHistory`.
+  - `porting_request/show.html.twig:560` `messageLog.id` должен резолвиться в `App\Entity\MessageLog`.
+  - `reverse_request/show.html.twig:179` `item.id` из `reverse.reversePortingNumbers` должен резолвиться в `App\Entity\ReversePortingNumber`.
+  - `porting_process/show.html.twig:768` `pn.phoneNumber`, `1217` `file.status`, `1479` `subscriber.id`, `1480-1488` `subscriber.fullName/organizationName/phoneNumbers` должны давать non-null hover/definition и foreach inlay.
+  - `subscriber/show.html.twig:148` `subscriberDataFile.fileName`, `185` `number.phoneNumber`, `231` `document.docNumber` должны давать non-null hover/definition/inlay.
+  - `subscriber/index.html.twig:48` `subscriber.id`, `operator/index.html.twig:48` `operator.operatorCode`, `user/index.html.twig:42` `user.email`, `timer/list_expired.html.twig:24` `timer.npId`, `route_update_request/index.html.twig:46` `rr.id` должны резолвиться из list/paginator context.
+
+- [ ] **H-TWIG-BDPN-OPTIONAL-RENDER-CONTEXT-2026-06-02** Улучшить Twig render context для nullable/conditional variables вместо `mixed`
+  - `verification_request/show.html.twig:54` `portingRequest.id` сейчас root hover `mixed $portingRequest`, member hover/definition `null`; ожидание `?App\Entity\PortingRequest`.
+  - `porting_process/show.html.twig:330` `portingProcess.role` сейчас root hover `mixed $portingProcess`, member hover/definition `null`; ожидание `?App\Entity\PortingProcess`.
+  - `data_request/show.html.twig:141-142` `errorCode.description` должен резолвиться в `App\Entity\ErrorCode`.
+  - `verification_request/show.html.twig:182-183` `errorCode.description` должен резолвиться в `App\Entity\ErrorCode`.
+
+- [ ] **H-TWIG-BDPN-ARRAY-SHAPE-CONTEXT-2026-06-02** Поддержать Twig hover/definition/inlayHint для array-shape и nested array context
+  - `message_log/index.html.twig:112` `{% for row in pagination %}` сейчас inlay неверно `row: MessageLog`; ожидание shape `array{messageLog: MessageLog, portingRequestId: ...}`.
+  - `message_log/index.html.twig:116` `message_log.id` и `119` `message_log.messageType.name` должны резолвиться через `row.messageLog`.
+  - `porting_process/index.html.twig:139` `row.npId` должен резолвиться из shape результата `fetchProcessesIndexFiltered()`.
+  - `verification_request/show.html.twig:142` `item.nr` должен резолвиться из shape `{'nr','code','description'}`.
+  - `sftp/index.html.twig:135` `it.size` должен резолвиться из array shape результата `SFTPService::listDirectory()`.
+  - `extended/form.html.twig:17` `f.type` и `68` `result.success` должны давать shape-key hover/definition.
+  - Debug arrays: `debug/config.html.twig` `config_params.encryption.*` / `config_params.sftp.*`, `debug/permissions.html.twig` `process_info.*` / `check.status`, `debug/logs.html.twig` `entry.severity` должны давать useful hover/definition.
+
+- [ ] **H-TWIG-BDPN-DTO-SERVICE-CONTEXT-2026-06-02** Поддержать Twig context для DTO/service-result объектов
+  - `sftp_csv/index.html.twig:81` `file.name` должен резолвиться в `SftpCsvArchiveMetadata`.
+  - `sftp_csv/view.html.twig:14` `file.name`, `40` `preview.csvName`, `50` `preview.perPageQueryValue`, `96` `preview.hasPreviousPage()` должны давать hover/definition.
+  - `components/autocomplete_input.html.twig:38` `item.code` должен давать non-null hover/definition для переданного item context.
+
+- [ ] **H-TWIG-SYMFONY-GLOBALS-FORMS-2026-06-02** Поддержать Symfony Twig globals, form fields и form errors
+  - `security/login.html.twig:11` `error.messageKey` должен резолвиться как `AuthenticationException::getMessageKey()`.
+  - `security/login.html.twig:16` `app.user.userIdentifier`, `base.html.twig:227` `app.user.id`, `base.html.twig:231` `app.user.email` должны резолвиться через `App\Entity\User`.
+  - `base.html.twig:40` `app.current_route` должен давать useful hover для Symfony app global current route string.
+  - `form/form_theme.html.twig:9` `error.message` должен резолвиться как Symfony `FormError`.
+  - `registration/register.html.twig:23` `registrationForm.email`, `34` `registrationForm.plainPassword`, `45` `registrationForm.agreeTerms` должны резолвиться к form fields.
+  - FormView fields: `debt_suspension/new.html.twig` `form.recipientOperator/repaymentType/phoneNumbersInput`, `operator/edit.html.twig` `form.name/inn/mnc/operatorCode`, `operator/new.html.twig` `form.mnc/operatorCode/isOwn`, request `new.html.twig` templates with `form.*` fields should not return `null`.
+  - `components/subscriber_autocomplete.html.twig:13` `form_field.vars.id` should provide useful hover/definition.
+
+- [ ] **H-TWIG-TEMPLATE-PATH-AND-ROUTE-DEFINITION-2026-06-02** Расширить Twig definition для template paths и route keys
+  - `extends 'base.html.twig'` should jump to `templates/base.html.twig` in `debug/*.html.twig` and `registration/register.html.twig`.
+  - `{% include 'email/inbound/_porting_header.html.twig' %}` in inbound email templates should jump to `templates/email/inbound/_porting_header.html.twig`.
+  - Static Twig path string `debug/email.html.twig:110` `email/timer_expired.html.twig` should jump to `templates/email/timer_expired.html.twig`.
+  - `path('app_debug_*')` in debug templates should jump to corresponding `DebugController` routes.
+  - `components/subscriber_autocomplete.html.twig:15-16` route keys `app_bdpn_subscriber_api_search` and `app_bdpn_subscriber_new` should jump to `SubscriberController` routes.
+
+- [ ] **H-TWIG-BDPN-EMAIL-DEBUG-CONTEXT-2026-06-02** Инферить Twig context для email/debug templates из controller/service render arrays
+  - `email/outbound/data_response.html.twig:26` `number` should have useful hover from `EmailNotifier` context.
+  - `email/inbound/donor_info.html.twig:23` `debt` should have useful hover from email context.
+  - `email/timer_expired.html.twig:23` `timerType` should have useful string/enum hover.
+  - `debug/email.html.twig:23` `recipients` should infer a useful list type instead of only `mixed`; `26` `e` should infer string foreach value.
+  - `debug/encryption.html.twig:46` `result.filename` should not return `null`.
+
+- [ ] **H-TWIG-INLAY-HINT-COVERAGE-2026-06-02** Восстановить inlayHint для Twig foreach/set variables, когда тип уже выводится или должен выводиться
+  - Inlay hints were empty for all 45 opened email/debug/components files in the audit; add focused coverage for representative typed contexts.
+  - Missing hints: `porting_process/show.html.twig:1478` `subscriber`, `data_request/index.html.twig:46` `num`, `data_request/show.html.twig:116` `num`, `debt_suspension/show.html.twig:126` `nr`.
+  - Missing hints: `debug/permissions.html.twig:138` `check`, `porting_request/show.html.twig:325` `transition`, `return_request/show.html.twig:132` `phone`, `route_update_request/show.html.twig:142` `phone`, `user/show.html.twig:77` `role`.
+  - Ensure fixes keep `: mixed` suppression for uncertain foreach variables but preserve class-linked inlay labels for typed object variables.
