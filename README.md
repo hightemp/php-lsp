@@ -213,16 +213,16 @@ phpstorm-stubs support.
   `in`, functions, macros, ternaries, null coalescing, and dynamic/bracket
   attribute access are explicit best-effort backlog items; their full expression
   semantics are skipped rather than mapped to misleading PHP, while simple
-  member chains inside those expressions can still be source-mapped for
-  hover/completion/definition. Twig object completion also offers getter-derived
-  property-style labels such as `id` for `getId()`. Twig context variables are
-  inferred only from
-  static `render(..., [...])` call sites, including `new Class()`, arrays of
-  new objects, typed controller parameter variables, and Knp-style paginator
-  variables backed by Doctrine repository/query-builder sources; render keys
-  whose value type cannot be inferred are still seeded as `mixed` to avoid
-  false undefined-variable diagnostics. Open Twig documents refresh those
-  inferred context types after relevant PHP controller/render changes and
+  member chains and root variables inside those expressions can still be
+  source-mapped for hover/completion/definition. Twig object completion also
+  offers getter-derived property-style labels such as `id` for `getId()`. Twig
+  context variables are inferred only from static `render(..., [...])` call
+  sites, including `new Class()`, arrays of new objects, typed controller
+  parameter variables, iterable repository method results, and Knp-style
+  paginator variables backed by Doctrine repository/query-builder sources;
+  render keys whose value type cannot be inferred are still seeded as `mixed`
+  to avoid false undefined-variable diagnostics. Open Twig documents refresh
+  those inferred context types after relevant PHP controller/render changes and
   workspace reindex events.
 - Diagnostics are optimized for editor feedback: file changes publish fast
   in-process diagnostics, while full diagnostics and optional external analyzer

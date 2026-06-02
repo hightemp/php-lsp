@@ -372,6 +372,13 @@ Current evidence:
   fragments and adds Twig-only getter-derived property completion aliases,
   restoring `dr.id`-style completion plus hover/definition inside `path(...)`,
   `is`, `slice`, and `date` expressions in the `bdpn-ui` data request table.
+- `H-TWIG-DEBT-SUSPENSION-MESSAGE-LOG-2026-06-02` extends the same unsupported
+  Twig expression fallback to root variables such as `messageLogs is defined`
+  and `messageLogs|length`, and resolves iterable repository method PHPDoc
+  return types against the method's declaring file before seeding Twig foreach
+  variables. This restored class-linked hover/inlay hints and property
+  hover/definition/completion for `messageLog.*` in the `bdpn-ui` debt
+  suspension message-log table.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

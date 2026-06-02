@@ -384,13 +384,14 @@ backlog. Those expressions emit valid unmapped placeholders (`null`, `true`, or
 an empty array iterable) so parser state remains usable while diagnostics,
 hover, completion, and inlay requests avoid pretending the Twig expression is
 ordinary PHP. For editor navigation inside those unsupported envelopes, simple
-member chains such as `item.owner.id` are additionally emitted as standalone
-no-op virtual PHP fragments. Only the member-chain tokens are source-mapped;
-the surrounding Twig function, filter, test, or operator tokens stay unmapped.
-Unfinished chains such as `item.` are mapped as well so member completion can
-run while the expression is still being typed. Type-preserving fallbacks such as
-`item.items|slice(...)` map the base expression once and avoid duplicate no-op
-fragments for that same chain.
+member chains such as `item.owner.id` and root variables such as
+`messageLogs` in `messageLogs is defined` / `messageLogs|length` are
+additionally emitted as standalone no-op virtual PHP fragments. Only those
+variable/member tokens are source-mapped; the surrounding Twig function, filter,
+test, or operator tokens stay unmapped. Unfinished chains such as `item.` are
+mapped as well so member completion can run while the expression is still being
+typed. Type-preserving fallbacks such as `item.items|slice(...)` map the base
+expression once and avoid duplicate no-op fragments for that same chain.
 Twig member completion post-processes getter-like methods into property-style
 aliases (`getId()` -> `id`, `isActive()` -> `active`) only for Twig documents.
 If a Twig property-style alias has no backing PHP property, hover and
@@ -403,11 +404,14 @@ continue to suppress `mixed` labels to avoid noise.
 Twig context variables are inferred statically from simple PHP
 `render('template.html.twig', ['name' => expr])` call sites. Supported context
 expressions include `new Class()`, simple arrays of new objects, and typed
-controller parameter variables passed through to the render context. Knp-style
-pagination variables can also expose Doctrine repository/query-builder item
-types, so `{% for item in pagination %}` can inherit the entity type without
-booting Symfony. Render keys whose value type cannot be inferred still seed
-`mixed` variables in the virtual prelude so valid templates do not publish
+controller parameter variables passed through to the render context. Repository
+method results with iterable PHPDoc/native return types can seed collection
+context variables, and short PHPDoc class names are resolved against the file
+where the indexed method is declared before they become Twig foreach item types.
+Knp-style pagination variables can also expose Doctrine repository/query-builder
+item types, so `{% for item in pagination %}` can inherit the entity type
+without booting Symfony. Render keys whose value type cannot be inferred still
+seed `mixed` variables in the virtual prelude so valid templates do not publish
 false undefined-variable diagnostics just because the server cannot infer a
 richer type. The context scanner combines open PHP files from memory with a
 bounded, disk-backed cache for closed PHP files. Cache misses run through

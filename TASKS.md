@@ -210,6 +210,12 @@
   - Покрыть filters/tests/path arguments и nested member chains релевантными tests
   - Обновить документацию при изменении поведения, запустить tests и verifier
 
+- [x] **H-TWIG-DEBT-SUSPENSION-MESSAGE-LOG-2026-06-02** Восстановить Twig LSP для messageLogs/messageLog в `debt_suspension/show.html.twig` *(done 2026-06-02)*
+  - Reproduce отсутствующие hover, go-to-definition, inlayHint и autocomplete на `messageLogs`/`messageLog.*`
+  - Исправить вывод ссылок на класс в hover и inlayHint для Twig foreach-переменных
+  - Добавить focused tests для `is defined`, collection length и property access внутри Twig foreach
+  - Обновить документацию при изменении поведения, запустить tests и verifier
+
 - [x] **H-HOVER-CLASS-LINKS-2026-06-01** Добавить ссылки на классы в hover markdown *(done 2026-06-01)*
   - Найти все hover-поверхности, где выводятся типы, FQN, сигнатуры или связанные классы
   - Переиспользовать существующий формат ссылок на definition для `Type:`

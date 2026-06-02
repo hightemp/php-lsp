@@ -1537,6 +1537,376 @@ final class DataRequestController
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_context_infers_repository_array_assignment_for_message_logs() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-message-log-context-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Repository")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/debt_suspension")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let message_log_path = tmp_root.join("src/Entity/MessageLog.php");
+    let message_type_path = tmp_root.join("src/Entity/MessageTypes.php");
+    let error_code_path = tmp_root.join("src/Entity/ErrorCode.php");
+    let repository_path = tmp_root.join("src/Repository/MessageLogRepository.php");
+    let controller_path = tmp_root.join("src/Controller/DebtSuspensionController.php");
+    let twig_path = tmp_root.join("templates/debt_suspension/show.html.twig");
+    let message_log_uri = file_uri(&message_log_path);
+    let message_type_uri = file_uri(&message_type_path);
+    let twig_uri = file_uri(&twig_path);
+
+    let message_log_php = r#"<?php
+namespace App\Entity;
+
+class MessageLog
+{
+    private int $id = 0;
+    private ?MessageTypes $messageType = null;
+    private string $direction = '';
+    private ?ErrorCode $errorCode = null;
+
+    public function getId(): int { return $this->id; }
+    public function getMessageType(): ?MessageTypes { return $this->messageType; }
+    public function getDirection(): string { return $this->direction; }
+    public function getErrorCode(): ?ErrorCode { return $this->errorCode; }
+}
+"#;
+    let message_type_php = r#"<?php
+namespace App\Entity;
+
+class MessageTypes
+{
+    private string $name = '';
+    public function getName(): string { return $this->name; }
+}
+"#;
+    let error_code_php = r#"<?php
+namespace App\Entity;
+
+class ErrorCode
+{
+    private int $code = 0;
+    public function getCode(): int { return $this->code; }
+}
+"#;
+    let repository_php = r#"<?php
+namespace App\Repository;
+
+use App\Entity\MessageLog;
+
+class MessageLogRepository
+{
+    /**
+     * @return MessageLog[]
+     */
+    public function findAllByNpId(string $npId): array
+    {
+        return [];
+    }
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Repository\MessageLogRepository;
+
+final class DebtSuspensionController
+{
+    public function show(MessageLogRepository $messageLogRepository): void
+    {
+        $logs = [];
+        $npId = '123';
+        if ('' !== $npId) {
+            $logs = $messageLogRepository->findAllByNpId($npId);
+        }
+
+        $this->render('debt_suspension/show.html.twig', [
+            'messageLogs' => $logs,
+        ]);
+    }
+}
+"#;
+    let completion_marker = "/*complete*/";
+    let twig_with_marker = format!(
+        concat!(
+            "{{% if messageLogs is defined and messageLogs|length > 0 %}}\n",
+            "{{% for messageLog in messageLogs %}}\n",
+            "{{{{ messageLog.{} }}}}\n",
+            "{{{{ messageLog.id }}}}\n",
+            "{{{{ messageLog.messageType.name }}}}\n",
+            "{{{{ messageLog.errorCode.code }}}}\n",
+            "{{% endfor %}}\n",
+            "{{% endif %}}\n",
+        ),
+        completion_marker
+    );
+    let twig = twig_with_marker.replace(completion_marker, "");
+    let completion_offset = twig_with_marker
+        .find(completion_marker)
+        .expect("test Twig should contain completion marker");
+    let completion_prefix = twig_with_marker[..completion_offset].replace(completion_marker, "");
+    let completion_position = utf16_position_for_offset(&twig, completion_prefix.len());
+    let message_logs_position = utf16_position_at(&twig, "messageLogs is defined");
+    let message_logs_definition_position = message_logs_position;
+    let foreach_variable_offset = twig.find("messageLog in messageLogs").unwrap();
+    let foreach_variable_position =
+        utf16_position_for_offset(&twig, foreach_variable_offset + "messageLog".len());
+    let message_log_hover_position = utf16_position_at(&twig, "messageLog in messageLogs");
+    let id_hover_position = utf16_position_at(&twig, "id }}");
+    let id_definition_position = utf16_position_after(&twig, "messageLog.i");
+    let nested_name_position = utf16_position_at(&twig, "name }}");
+    let end_position = utf16_position_for_offset(&twig, twig.len());
+
+    fs::write(&message_log_path, message_log_php).unwrap();
+    fs::write(&message_type_path, message_type_php).unwrap();
+    fs::write(&error_code_path, error_code_php).unwrap();
+    fs::write(&repository_path, repository_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&twig_path, &twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &twig_uri, "twig", &twig,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "messageLogs Twig fixture should stay diagnostic-clean, got: {}",
+        diagnostics
+    );
+
+    let message_logs_hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            &twig_uri,
+            message_logs_position.0,
+            message_logs_position.1,
+        ))
+        .await
+        .unwrap();
+    let message_logs_hover = extract_result(message_logs_hover_resp);
+    let message_logs_hover_text = message_logs_hover["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message_logs_hover_text.contains("array<int, App\\Entity\\MessageLog> $messageLogs")
+            || message_logs_hover_text.contains("array<int, MessageLog> $messageLogs")
+            || message_logs_hover_text.contains("array $messageLogs"),
+        "expected Twig hover on `messageLogs is defined` to resolve collection type, got: {}",
+        message_logs_hover
+    );
+
+    let message_logs_definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            3,
+            &twig_uri,
+            message_logs_definition_position.0,
+            message_logs_definition_position.1,
+        ))
+        .await
+        .unwrap();
+    let message_logs_definition = extract_result(message_logs_definition_resp);
+    assert_eq!(
+        message_logs_definition
+            .get("uri")
+            .and_then(|uri| uri.as_str()),
+        Some(twig_uri.as_str()),
+        "context variable definition should stay mapped to Twig source when generated prelude is the declaration, got: {}",
+        message_logs_definition
+    );
+
+    let message_log_hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            4,
+            &twig_uri,
+            message_log_hover_position.0,
+            message_log_hover_position.1,
+        ))
+        .await
+        .unwrap();
+    let message_log_hover = extract_result(message_log_hover_resp);
+    let message_log_hover_text = message_log_hover["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message_log_hover_text.contains("MessageLog $messageLog")
+            && message_log_hover_text.contains(message_log_uri.as_str()),
+        "expected Twig foreach variable hover to include clickable MessageLog class link, got: {}",
+        message_log_hover
+    );
+
+    let completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            5,
+            &twig_uri,
+            completion_position.0,
+            completion_position.1,
+        ))
+        .await
+        .unwrap();
+    let completion = extract_result(completion_resp);
+    let labels: Vec<String> = completion_items_from_result(&completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    for expected in ["id", "messageType", "direction", "errorCode"] {
+        assert!(
+            labels.iter().any(|label| label == expected),
+            "expected Twig messageLog completion `{expected}`, got: {:?}",
+            labels
+        );
+    }
+
+    let id_hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            6,
+            &twig_uri,
+            id_hover_position.0,
+            id_hover_position.1,
+        ))
+        .await
+        .unwrap();
+    let id_hover = extract_result(id_hover_resp);
+    let id_hover_text = id_hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(
+        id_hover_text.contains("getId") || id_hover_text.contains("property"),
+        "expected Twig messageLog.id hover to resolve property/getter, got: {}",
+        id_hover
+    );
+
+    let id_definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            7,
+            &twig_uri,
+            id_definition_position.0,
+            id_definition_position.1,
+        ))
+        .await
+        .unwrap();
+    let id_definition = extract_result(id_definition_resp);
+    assert_eq!(
+        id_definition.get("uri").and_then(|uri| uri.as_str()),
+        Some(message_log_uri.as_str()),
+        "Twig messageLog.id definition should jump to MessageLog, got: {}",
+        id_definition
+    );
+
+    let nested_name_definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            8,
+            &twig_uri,
+            nested_name_position.0,
+            nested_name_position.1,
+        ))
+        .await
+        .unwrap();
+    let nested_name_definition = extract_result(nested_name_definition_resp);
+    assert_eq!(
+        nested_name_definition
+            .get("uri")
+            .and_then(|uri| uri.as_str()),
+        Some(message_type_uri.as_str()),
+        "Twig nested messageLog.messageType.name definition should jump to MessageTypes, got: {}",
+        nested_name_definition
+    );
+
+    let inlay_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(
+            9,
+            &twig_uri,
+            0,
+            0,
+            end_position.0,
+            end_position.1,
+        ))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_resp);
+    let hints = inlay_result.as_array().cloned().unwrap_or_default();
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": MessageLog")
+                && hint["position"]["line"].as_u64() == Some(foreach_variable_position.0 as u64)
+                && hint["position"]["character"].as_u64()
+                    == Some(foreach_variable_position.1 as u64)
+                && inlay_hint_has_label_part_location(hint, "MessageLog")
+        }),
+        "expected Twig messageLog foreach inlay hint to include MessageLog class link, got: {}",
+        inlay_result
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_twig_paginator_context_prefers_explicit_iterable_item_type() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();

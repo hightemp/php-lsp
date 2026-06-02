@@ -477,15 +477,49 @@ impl PhpLspBackend {
                 end: Position::new(def.2, def.3),
             };
             if let Some(template) = &template_document {
-                let Some(mapped) = template.map_virtual_range_to_original(range) else {
+                if let Some(mapped) = template.map_virtual_range_to_original(range) {
+                    range = mapped;
+                } else if template.kind() == crate::template::TemplateKind::Twig {
+                    if let Some(current_variable) = sym_at_pos
+                        .as_ref()
+                        .filter(|sym| sym.ref_kind == RefKind::Variable)
+                        .and_then(|sym| {
+                            template.map_virtual_range_to_original(range_from_byte_range(
+                                &source, sym.range,
+                            ))
+                        })
+                    {
+                        range = current_variable;
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
                     return Ok(None);
-                };
-                range = mapped;
+                }
             }
             return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri,
                 range,
             })));
+        }
+
+        if let Some(template) = &template_document {
+            if template.kind() == crate::template::TemplateKind::Twig {
+                if let Some(range) = sym_at_pos
+                    .as_ref()
+                    .filter(|sym| sym.ref_kind == RefKind::Variable)
+                    .and_then(|sym| {
+                        template.map_virtual_range_to_original(range_from_byte_range(
+                            &source, sym.range,
+                        ))
+                    })
+                {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri,
+                        range,
+                    })));
+                }
+            }
         }
 
         if let Some(ref framework_string_key_context) = framework_string_key_context {

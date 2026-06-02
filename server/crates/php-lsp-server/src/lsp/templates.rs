@@ -767,9 +767,11 @@ fn twig_context_repository_method_paginated_item_type(
     if let Some(symbol) = index.resolve_fqn(&method_fqn) {
         if let Some(return_type) = symbol_effective_return_type(&symbol) {
             if let Some(value_type) = iterable_value_type_info(&return_type, None) {
-                return twig_context_type_info_text(
+                return twig_context_type_info_text_for_symbol(
+                    index,
                     file_symbols,
-                    symbol.parent_fqn.as_deref().unwrap_or(repository_fqn),
+                    &symbol,
+                    repository_fqn,
                     &value_type,
                 );
             }
@@ -787,6 +789,21 @@ fn twig_context_repository_method_paginated_item_type(
     ) || lower.ends_with("qb")
         || lower.ends_with("querybuilder"))
     .then(|| fallback_entity_fqn.to_string())
+}
+
+fn twig_context_type_info_text_for_symbol(
+    index: &WorkspaceIndex,
+    fallback_file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+    fallback_owner_fqn: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> Option<String> {
+    let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(fallback_owner_fqn);
+    if let Some(symbol_file_symbols) = index.file_symbols.get(&symbol.uri) {
+        return twig_context_type_info_text(&symbol_file_symbols, owner_fqn, type_info);
+    }
+
+    twig_context_type_info_text(fallback_file_symbols, owner_fqn, type_info)
 }
 
 fn twig_context_type_is_paginated_source(type_info: &php_lsp_types::TypeInfo) -> bool {
