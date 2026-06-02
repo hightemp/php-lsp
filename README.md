@@ -211,8 +211,12 @@ phpstorm-stubs support.
   incomplete/magic properties, and uncertain ranges stay suppressed. Complex
   Twig expressions such as filters, tests,
   `in`, functions, macros, ternaries, null coalescing, and dynamic/bracket
-  attribute access are explicit best-effort backlog items and are skipped rather
-  than mapped to misleading PHP. Twig context variables are inferred only from
+  attribute access are explicit best-effort backlog items; their full expression
+  semantics are skipped rather than mapped to misleading PHP, while simple
+  member chains inside those expressions can still be source-mapped for
+  hover/completion/definition. Twig object completion also offers getter-derived
+  property-style labels such as `id` for `getId()`. Twig context variables are
+  inferred only from
   static `render(..., [...])` call sites, including `new Class()`, arrays of
   new objects, typed controller parameter variables, and Knp-style paginator
   variables backed by Doctrine repository/query-builder sources; render keys

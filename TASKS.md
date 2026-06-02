@@ -203,6 +203,13 @@
   - Обновить документацию при изменении поведения
   - Запустить релевантные Rust tests и verifier
 
+- [x] **H-TWIG-DATA-REQUEST-SURFACE-2026-06-02** Проверить и добить Twig LSP по всему `data_request/index.html.twig` *(done 2026-06-02)*
+  - Снять LSP-smoke по всем `dr.*`, `dr.status.*`, `dr.subscriber.*`, `shown/num/badgeClass`
+  - Исправить gaps hover, go-to-definition, inlayHint и autocomplete без project-specific hardcode
+  - Добавить property-style autocomplete aliases для Twig object member access
+  - Покрыть filters/tests/path arguments и nested member chains релевантными tests
+  - Обновить документацию при изменении поведения, запустить tests и verifier
+
 - [x] **H-HOVER-CLASS-LINKS-2026-06-01** Добавить ссылки на классы в hover markdown *(done 2026-06-01)*
   - Найти все hover-поверхности, где выводятся типы, FQN, сигнатуры или связанные классы
   - Переиспользовать существующий формат ссылок на definition для `Type:`

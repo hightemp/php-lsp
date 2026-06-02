@@ -979,10 +979,13 @@ async fn test_twig_context_infers_paginated_repository_item_variables() {
     let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
     let root_uri = file_uri(&tmp_root);
     let entity_path = tmp_root.join("src/Entity/DataRequest.php");
+    let subscriber_path = tmp_root.join("src/Entity/Subscriber.php");
+    let status_path = tmp_root.join("src/Entity/DataRequestStatus.php");
     let repository_path = tmp_root.join("src/Repository/DataRequestRepository.php");
     let controller_path = tmp_root.join("src/Controller/DataRequestController.php");
     let twig_path = tmp_root.join("templates/data_request/index.html.twig");
     let entity_uri = file_uri(&entity_path);
+    let subscriber_uri = file_uri(&subscriber_path);
     let twig_uri = file_uri(&twig_path);
 
     let entity_php = r#"<?php
@@ -990,9 +993,40 @@ namespace App\Entity;
 
 class DataRequest
 {
-    public int $id = 0;
-    public string $npId = '';
+    private int $id = 0;
+    private string $npId = '';
+    /** @var array<int, string> */
+    private $numbers = [];
+    private ?DataRequestStatus $status = null;
+    private ?Subscriber $subscriber = null;
+    private \DateTimeImmutable $createdAt;
+
+    public function getId(): int { return $this->id; }
     public function getNpId(): string { return $this->npId; }
+    public function getNumbers(): array { return $this->numbers; }
+    public function getStatus(): ?DataRequestStatus { return $this->status; }
+    public function getSubscriber(): ?Subscriber { return $this->subscriber; }
+    public function getCreatedAt(): \DateTimeImmutable { return $this->createdAt; }
+    public function getDisplayName(): string { return (string) $this->id; }
+    public function getFormattedId(string $prefix): string { return $prefix.$this->id; }
+}
+"#;
+    let subscriber_php = r#"<?php
+namespace App\Entity;
+
+class Subscriber
+{
+    private int $id = 0;
+    public function getId(): int { return $this->id; }
+}
+"#;
+    let status_php = r#"<?php
+namespace App\Entity;
+
+class DataRequestStatus
+{
+    public function bootstrapBadgeClass(): string { return ''; }
+    public function label(): string { return ''; }
 }
 "#;
     let repository_php = r#"<?php
@@ -1030,24 +1064,70 @@ final class DataRequestController
 }
 "#;
     let completion_marker = "/*complete*/";
-    let twig_with_marker = format!(
-        "{{% for dr in pagination %}}\n{{{{ dr.{} }}}}\n{{{{ dr.id }}}}\n{{% endfor %}}\n",
-        completion_marker
+    let path_completion_marker = "/*pathcomplete*/";
+    let twig_with_markers = format!(
+        concat!(
+            "{{% for dr in pagination %}}\n",
+            "{{{{ dr.{} }}}}\n",
+            "{{{{ dr.id }}}}\n",
+            "{{{{ dr.displayName }}}}\n",
+            "{{% if dr.numbers is iterable and dr.numbers|length > 0 %}}\n",
+            "{{% set shown = dr.numbers|slice(0, 5) %}}\n",
+            "{{% for num in shown %}}{{{{ num }}}}{{% endfor %}}\n",
+            "{{% if dr.status is not null %}}\n",
+            "{{% set badgeClass = dr.status.bootstrapBadgeClass() %}}\n",
+            "{{{{ badgeClass }}}} {{{{ dr.status.label() }}}}\n",
+            "{{% endif %}}\n",
+            "{{{{ path('subscriber_show', {{'id': dr.subscriber.id}}) }}}}\n",
+            "{{{{ path('subscriber_show', {{'id': dr.{}}}) }}}}\n",
+            "{{{{ dr.subscriber.id }}}}\n",
+            "{{{{ dr.createdAt|date('d.m.Y') }}}}\n",
+            "{{{{ path('data_request_show', {{'id': dr.id}}) }}}}\n",
+            "{{% endif %}}\n",
+            "{{% endfor %}}\n"
+        ),
+        completion_marker, path_completion_marker
     );
-    let completion_offset = twig_with_marker
-        .find(completion_marker)
-        .expect("test Twig should contain completion marker");
-    let completion_position = utf16_position_for_offset(
-        &twig_with_marker.replace(completion_marker, ""),
-        completion_offset,
-    );
-    let twig = twig_with_marker.replace(completion_marker, "");
+    let twig = twig_with_markers
+        .replace(completion_marker, "")
+        .replace(path_completion_marker, "");
+    let marker_position = |marker: &str| {
+        let marker_offset = twig_with_markers
+            .find(marker)
+            .expect("test Twig should contain marker");
+        let prefix = twig_with_markers[..marker_offset]
+            .replace(completion_marker, "")
+            .replace(path_completion_marker, "");
+        utf16_position_for_offset(&twig, prefix.len())
+    };
+    let completion_position = marker_position(completion_marker);
+    let path_trailing_completion_position = marker_position(path_completion_marker);
     let hover_position = utf16_position_at(&twig, "dr.id");
     let definition_position = utf16_position_after(&twig, "dr.i");
+    let display_name_position = utf16_position_at(&twig, "displayName");
     let foreach_variable_position = utf16_position_after(&twig, "dr");
+    let filter_completion_position =
+        utf16_position_for_offset(&twig, twig.find("dr.numbers is").unwrap() + "dr.".len());
+    let nested_path_offset = twig.find("dr.subscriber.id})").unwrap();
+    let nested_path_position =
+        utf16_position_for_offset(&twig, nested_path_offset + "dr.subscriber.".len());
+    let path_id_offset = twig.find("dr.id})").unwrap();
+    let path_id_position = utf16_position_for_offset(&twig, path_id_offset + "dr.".len());
+    let shown_variable_offset = twig.find("shown =").unwrap();
+    let shown_variable_position =
+        utf16_position_for_offset(&twig, shown_variable_offset + "shown".len());
+    let num_foreach_offset = twig.find("num in shown").unwrap();
+    let num_foreach_variable_position =
+        utf16_position_for_offset(&twig, num_foreach_offset + "num".len());
+    let shown_usage_position =
+        utf16_position_for_offset(&twig, num_foreach_offset + "num in ".len());
+    let num_hover_offset = twig.find("num }}").unwrap();
+    let num_hover_position = utf16_position_for_offset(&twig, num_hover_offset + 1);
     let end_position = utf16_position_for_offset(&twig, twig.len());
 
     fs::write(&entity_path, entity_php).unwrap();
+    fs::write(&subscriber_path, subscriber_php).unwrap();
+    fs::write(&status_path, status_php).unwrap();
     fs::write(&repository_path, repository_php).unwrap();
     fs::write(&controller_path, controller_php).unwrap();
     fs::write(&twig_path, &twig).unwrap();
@@ -1134,13 +1214,100 @@ final class DataRequestController
         .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
         .map(str::to_string)
         .collect();
+    for expected in [
+        "id",
+        "npId",
+        "numbers",
+        "status",
+        "subscriber",
+        "createdAt",
+        "displayName",
+    ] {
+        assert!(
+            labels.iter().any(|label| label == expected),
+            "expected Twig property-style completion `{expected}` from paginator item, got: {:?}",
+            labels
+        );
+    }
     assert!(
-        labels.iter().any(|label| label == "id")
-            && labels
-                .iter()
-                .any(|label| label == "getNpId" || label == "npId"),
-        "expected Twig completion from paginator item to include DataRequest members, got: {:?}",
+        !labels.iter().any(|label| label == "formattedId"),
+        "Twig property-style completion should not alias getters with required arguments, got: {:?}",
         labels
+    );
+
+    let filter_completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            33,
+            &twig_uri,
+            filter_completion_position.0,
+            filter_completion_position.1,
+        ))
+        .await
+        .unwrap();
+    let filter_completion = extract_result(filter_completion_resp);
+    let filter_labels: Vec<String> = completion_items_from_result(&filter_completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        filter_labels.iter().any(|label| label == "numbers"),
+        "expected Twig completion inside filter/test expression to include DataRequest property aliases, got: {:?}",
+        filter_labels
+    );
+
+    let nested_completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            34,
+            &twig_uri,
+            nested_path_position.0,
+            nested_path_position.1,
+        ))
+        .await
+        .unwrap();
+    let nested_completion = extract_result(nested_completion_resp);
+    let nested_labels: Vec<String> = completion_items_from_result(&nested_completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        nested_labels.iter().any(|label| label == "id"),
+        "expected Twig completion inside path() nested member chain to include Subscriber property aliases, got: {:?}",
+        nested_labels
+    );
+
+    let path_trailing_completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            35,
+            &twig_uri,
+            path_trailing_completion_position.0,
+            path_trailing_completion_position.1,
+        ))
+        .await
+        .unwrap();
+    let path_trailing_completion = extract_result(path_trailing_completion_resp);
+    let path_trailing_labels: Vec<String> = completion_items_from_result(&path_trailing_completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        path_trailing_labels.iter().any(|label| label == "id")
+            && path_trailing_labels
+                .iter()
+                .any(|label| label == "displayName"),
+        "expected Twig completion after trailing `dr.` inside path() to include DataRequest property aliases, got: {:?}",
+        path_trailing_labels
     );
 
     let definition_resp = service
@@ -1162,6 +1329,155 @@ final class DataRequestController
         "Twig definition should jump from paginator item member to PHP symbol, got: {}",
         definition
     );
+
+    let display_name_hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            36,
+            &twig_uri,
+            display_name_position.0,
+            display_name_position.1,
+        ))
+        .await
+        .unwrap();
+    let display_name_hover = extract_result(display_name_hover_resp);
+    let display_name_hover_text = display_name_hover["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        display_name_hover_text.contains("getDisplayName"),
+        "expected Twig getter-derived property alias hover to resolve backing getter, got: {}",
+        display_name_hover
+    );
+
+    let display_name_definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            37,
+            &twig_uri,
+            display_name_position.0,
+            display_name_position.1,
+        ))
+        .await
+        .unwrap();
+    let display_name_definition = extract_result(display_name_definition_resp);
+    assert_eq!(
+        display_name_definition
+            .get("uri")
+            .and_then(|uri| uri.as_str()),
+        Some(entity_uri.as_str()),
+        "Twig getter-derived property alias definition should jump to backing getter, got: {}",
+        display_name_definition
+    );
+
+    for (request_id, needle, expected_hover) in [
+        (40, "numbers is", "numbers"),
+        (41, "numbers|slice", "numbers"),
+        (42, "status is", "status"),
+        (43, "id})", "id"),
+        (44, "createdAt|date", "DateTimeImmutable"),
+    ] {
+        let position = utf16_position_at(&twig, needle);
+        let hover_resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(request_id, &twig_uri, position.0, position.1))
+            .await
+            .unwrap();
+        let hover = extract_result(hover_resp);
+        let hover_text = hover["contents"]["value"].as_str().unwrap_or_default();
+        assert!(
+            hover_text.contains(expected_hover),
+            "expected Twig hover on `{needle}` to include `{expected_hover}`, got: {}",
+            hover
+        );
+    }
+
+    let shown_hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            45,
+            &twig_uri,
+            shown_usage_position.0,
+            shown_usage_position.1,
+        ))
+        .await
+        .unwrap();
+    let shown_hover = extract_result(shown_hover_resp);
+    let shown_hover_text = shown_hover["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        shown_hover_text.contains("$shown")
+            && (shown_hover_text.contains("array<int, string>")
+                || shown_hover_text.contains("array")),
+        "expected Twig set variable hover to keep slice base collection type, got: {}",
+        shown_hover
+    );
+
+    let num_hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            46,
+            &twig_uri,
+            num_hover_position.0,
+            num_hover_position.1,
+        ))
+        .await
+        .unwrap();
+    let num_hover = extract_result(num_hover_resp);
+    let num_hover_text = num_hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(
+        num_hover_text.contains("string $num"),
+        "expected Twig foreach item hover to infer string from sliced list, got: {}",
+        num_hover
+    );
+
+    for (request_id, position, expected_uri) in [
+        (
+            50,
+            utf16_position_at(&twig, "numbers is"),
+            entity_uri.as_str(),
+        ),
+        (
+            51,
+            utf16_position_at(&twig, "status is"),
+            entity_uri.as_str(),
+        ),
+        (52, nested_path_position, subscriber_uri.as_str()),
+        (53, path_id_position, entity_uri.as_str()),
+        (
+            54,
+            utf16_position_at(&twig, "createdAt|date"),
+            entity_uri.as_str(),
+        ),
+    ] {
+        let definition_resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(
+                request_id, &twig_uri, position.0, position.1,
+            ))
+            .await
+            .unwrap();
+        let definition = extract_result(definition_resp);
+        assert_eq!(
+            definition.get("uri").and_then(|uri| uri.as_str()),
+            Some(expected_uri),
+            "Twig definition at request {request_id} should jump to PHP symbol, got: {}",
+            definition
+        );
+    }
 
     let inlay_resp = service
         .ready()
@@ -1187,6 +1503,26 @@ final class DataRequestController
                     == Some(foreach_variable_position.1 as u64)
         }),
         "expected Twig inlay hint for paginator item variable, got: {}",
+        inlay_result
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint)
+                .is_some_and(|label| label == ": array<int, string>" || label == ": array")
+                && hint["position"]["line"].as_u64() == Some(shown_variable_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(shown_variable_position.1 as u64)
+        }),
+        "expected Twig inlay hint for sliced set variable, got: {}",
+        inlay_result
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": string")
+                && hint["position"]["line"].as_u64() == Some(num_foreach_variable_position.0 as u64)
+                && hint["position"]["character"].as_u64()
+                    == Some(num_foreach_variable_position.1 as u64)
+        }),
+        "expected Twig inlay hint for sliced foreach item variable, got: {}",
         inlay_result
     );
 

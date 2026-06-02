@@ -288,6 +288,12 @@ impl PhpLspBackend {
                     }
                 }
             }
+            if template_document
+                .as_ref()
+                .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig)
+            {
+                add_twig_property_style_member_aliases(&self.index, &mut lsp_items, member_prefix);
+            }
         }
         if let php_lsp_completion::context::CompletionContext::StaticAccess {
             class_fqn,
@@ -975,6 +981,122 @@ impl PhpLspBackend {
                 items.push(item);
             }
         }
+    }
+}
+
+fn add_twig_property_style_member_aliases(
+    index: &WorkspaceIndex,
+    items: &mut Vec<lsp_types::CompletionItem>,
+    member_prefix: &str,
+) {
+    let mut seen_labels: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
+    let aliases: Vec<_> = items
+        .iter()
+        .filter(|item| item.kind == Some(lsp_types::CompletionItemKind::METHOD))
+        .filter(|item| twig_method_completion_can_be_property_accessor(index, item))
+        .filter_map(|item| {
+            let alias = twig_property_alias_for_getter_method(&item.label)?;
+            twig_completion_label_matches_prefix(&alias, member_prefix).then(|| {
+                (
+                    alias,
+                    item.label.clone(),
+                    item.detail.clone(),
+                    item.tags.clone(),
+                )
+            })
+        })
+        .collect();
+
+    for (alias, method_label, method_detail, tags) in aliases {
+        if !seen_labels.insert(alias.clone()) {
+            continue;
+        }
+        items.push(lsp_types::CompletionItem {
+            label: alias.clone(),
+            kind: Some(lsp_types::CompletionItemKind::PROPERTY),
+            detail: method_detail
+                .as_deref()
+                .map(|detail| format!("Twig property for {method_label}{detail}")),
+            sort_text: Some(format!(
+                "0099_{}_{}",
+                twig_completion_prefix_rank(&alias, member_prefix),
+                alias.to_ascii_lowercase()
+            )),
+            filter_text: Some(format!("{alias} {method_label}")),
+            insert_text: Some(alias),
+            tags,
+            commit_characters: Some(vec![";".to_string(), ",".to_string()]),
+            ..Default::default()
+        });
+    }
+
+    items.sort_by(|a, b| {
+        a.sort_text
+            .as_deref()
+            .unwrap_or(&a.label)
+            .cmp(b.sort_text.as_deref().unwrap_or(&b.label))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+}
+
+fn twig_method_completion_can_be_property_accessor(
+    index: &WorkspaceIndex,
+    item: &lsp_types::CompletionItem,
+) -> bool {
+    item.data
+        .as_ref()
+        .and_then(|data| data.as_str())
+        .and_then(|fqn| index.resolve_fqn(fqn))
+        .as_deref()
+        .is_some_and(twig_method_symbol_can_be_property_accessor)
+}
+
+fn twig_property_alias_for_getter_method(label: &str) -> Option<String> {
+    for prefix in ["get", "is", "has"] {
+        let Some(suffix) = label.strip_prefix(prefix) else {
+            continue;
+        };
+        if suffix.is_empty() {
+            continue;
+        }
+        let mut chars = suffix.chars();
+        let first = chars.next()?;
+        if !first.is_ascii_uppercase() {
+            continue;
+        }
+        let mut alias = String::new();
+        alias.push(first.to_ascii_lowercase());
+        alias.push_str(chars.as_str());
+        return Some(alias);
+    }
+
+    None
+}
+
+fn twig_completion_label_matches_prefix(label: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return true;
+    }
+    label
+        .to_ascii_lowercase()
+        .contains(&prefix.to_ascii_lowercase())
+}
+
+fn twig_completion_prefix_rank(label: &str, prefix: &str) -> &'static str {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return "1000";
+    }
+
+    let normalized_label = label.to_ascii_lowercase();
+    let normalized_prefix = prefix.to_ascii_lowercase();
+    if normalized_label.starts_with(&normalized_prefix) {
+        "0000"
+    } else if normalized_label.contains(&normalized_prefix) {
+        "0100"
+    } else {
+        "1000"
     }
 }
 

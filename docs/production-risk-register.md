@@ -367,6 +367,11 @@ Current evidence:
   for Knp-style paginator variables backed by Doctrine repository/query-builder
   sources, restoring hover/completion/definition/inlay hints for foreach item
   variables in paginated Twig tables.
+- `H-TWIG-DATA-REQUEST-SURFACE-2026-06-02` maps simple Twig member chains inside
+  otherwise unsupported filters/tests/functions as standalone no-op virtual PHP
+  fragments and adds Twig-only getter-derived property completion aliases,
+  restoring `dr.id`-style completion plus hover/definition inside `path(...)`,
+  `is`, `slice`, and `date` expressions in the `bdpn-ui` data request table.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

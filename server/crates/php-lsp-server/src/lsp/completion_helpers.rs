@@ -2082,6 +2082,57 @@ pub(in crate::server) fn resolve_member_type_from_index(
     };
 
     symbol_return_type_fqn(index, class_fqn, &sym)
+        .or_else(|| symbol_effective_return_type(&sym).map(|type_info| type_info.to_string()))
+}
+
+pub(in crate::server) fn twig_property_accessor_method_for_alias(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    property_name: &str,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    let property_name = property_name.trim_start_matches('$');
+    if property_name.is_empty() {
+        return None;
+    }
+
+    let mut chars = property_name.chars();
+    let first = chars.next()?;
+    let mut suffix = String::new();
+    suffix.push(first.to_ascii_uppercase());
+    suffix.push_str(chars.as_str());
+
+    ["get", "is", "has"].into_iter().find_map(|prefix| {
+        let method_fqn = format!("{class_fqn}::{prefix}{suffix}");
+        let symbol = index.resolve_fqn(&method_fqn)?;
+        twig_method_symbol_can_be_property_accessor(&symbol).then_some(symbol)
+    })
+}
+
+pub(in crate::server) fn twig_property_accessor_method_for_symbol(
+    index: &WorkspaceIndex,
+    sym_at_pos: &SymbolAtPosition,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    if sym_at_pos.ref_kind != RefKind::PropertyAccess {
+        return None;
+    }
+    let (class_fqn, property_name) = sym_at_pos.fqn.rsplit_once("::$")?;
+    twig_property_accessor_method_for_alias(index, class_fqn, property_name)
+}
+
+pub(in crate::server) fn twig_method_symbol_can_be_property_accessor(
+    symbol: &php_lsp_types::SymbolInfo,
+) -> bool {
+    if symbol.kind != php_lsp_types::PhpSymbolKind::Method {
+        return false;
+    }
+
+    let Some(signature) = &symbol.signature else {
+        return false;
+    };
+    signature
+        .params
+        .iter()
+        .all(|param| param.default_value.is_some() || param.is_variadic)
 }
 
 pub(in crate::server) fn resolve_function_return_type_from_index(

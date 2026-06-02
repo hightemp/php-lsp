@@ -429,6 +429,15 @@ pub(in crate::server) fn add_local_variable_type_inlay_hint(
     else {
         return;
     };
+    if enclosing_foreach_statement_for_variable(ctx.source, variable_node).is_some()
+        && type_hint
+            .display
+            .trim()
+            .trim_start_matches('\\')
+            .eq_ignore_ascii_case("mixed")
+    {
+        return;
+    }
 
     let end = variable_node.end_position();
     let position = Position::new(
@@ -1557,10 +1566,14 @@ pub(in crate::server) fn symbol_effective_return_type(
         .signature
         .as_ref()
         .and_then(|signature| signature.return_type.as_ref());
-    let phpdoc = symbol
-        .doc_comment
-        .as_deref()
-        .and_then(|doc| parse_phpdoc(doc).return_type);
+    let phpdoc = symbol.doc_comment.as_deref().and_then(|doc| {
+        let parsed = parse_phpdoc(doc);
+        if symbol.kind == php_lsp_types::PhpSymbolKind::Property {
+            parsed.var_type
+        } else {
+            parsed.return_type
+        }
+    });
 
     match (native, phpdoc) {
         (Some(native), Some(phpdoc))

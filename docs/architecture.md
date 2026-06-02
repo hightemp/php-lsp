@@ -383,7 +383,22 @@ dynamic/bracket attribute access are classified as unsupported expression
 backlog. Those expressions emit valid unmapped placeholders (`null`, `true`, or
 an empty array iterable) so parser state remains usable while diagnostics,
 hover, completion, and inlay requests avoid pretending the Twig expression is
-ordinary PHP.
+ordinary PHP. For editor navigation inside those unsupported envelopes, simple
+member chains such as `item.owner.id` are additionally emitted as standalone
+no-op virtual PHP fragments. Only the member-chain tokens are source-mapped;
+the surrounding Twig function, filter, test, or operator tokens stay unmapped.
+Unfinished chains such as `item.` are mapped as well so member completion can
+run while the expression is still being typed. Type-preserving fallbacks such as
+`item.items|slice(...)` map the base expression once and avoid duplicate no-op
+fragments for that same chain.
+Twig member completion post-processes getter-like methods into property-style
+aliases (`getId()` -> `id`, `isActive()` -> `active`) only for Twig documents.
+If a Twig property-style alias has no backing PHP property, hover and
+definition can fall back to the zero-required-argument getter method that
+created the alias.
+When a mapped `foreach` iterates a known but non-parameterized `array` or
+`iterable`, the value variable can still expose `mixed` in hover; inlay hints
+continue to suppress `mixed` labels to avoid noise.
 
 Twig context variables are inferred statically from simple PHP
 `render('template.html.twig', ['name' => expr])` call sites. Supported context

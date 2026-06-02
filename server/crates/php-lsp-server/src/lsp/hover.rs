@@ -142,6 +142,13 @@ impl PhpLspBackend {
                 }
             }
         };
+        let symbol_info = symbol_info.or_else(|| {
+            template_document
+                .as_ref()
+                .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig)
+                .then(|| twig_property_accessor_method_for_symbol(&self.index, &sym_at_pos))
+                .flatten()
+        });
 
         let virtual_member = if symbol_info.is_none() {
             phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)

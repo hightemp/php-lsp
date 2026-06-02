@@ -1116,17 +1116,29 @@ fn push_twig_echo_fragment(
 ) {
     let (expr_start, expr_end) = trim_ascii_range(source, original_start, original_end);
     virtual_source.push_str("<?php echo ");
-    if !append_converted_twig_expression(
+    let mapped = append_converted_twig_expression(
         source,
         expr_start,
         expr_end,
         virtual_source,
         source_map,
         macro_aliases,
-    ) {
+    );
+    if !mapped {
         virtual_source.push_str("null");
     }
     virtual_source.push_str("; ?>\n");
+    if !mapped {
+        append_twig_partial_member_chain_fragments(
+            source,
+            expr_start,
+            expr_end,
+            virtual_source,
+            source_map,
+            macro_aliases,
+            None,
+        );
+    }
 }
 
 fn push_twig_tag_fragment(
@@ -1166,17 +1178,29 @@ fn push_twig_tag_fragment(
             } else {
                 virtual_source.push_str("<?php elseif (");
             }
-            if !append_converted_twig_expression(
+            let mapped = append_converted_twig_expression(
                 source,
                 expr_start,
                 expr_end,
                 virtual_source,
                 source_map,
                 macro_aliases,
-            ) {
+            );
+            if !mapped {
                 virtual_source.push_str("true");
             }
             virtual_source.push_str("): ?>\n");
+            if !mapped {
+                append_twig_partial_member_chain_fragments(
+                    source,
+                    expr_start,
+                    expr_end,
+                    virtual_source,
+                    source_map,
+                    macro_aliases,
+                    None,
+                );
+            }
         }
         "else" => virtual_source.push_str("<?php else: ?>\n"),
         "endif" => virtual_source.push_str("<?php endif; ?>\n"),
@@ -1310,14 +1334,27 @@ fn push_twig_for_fragment(
     }
 
     virtual_source.push_str("<?php foreach (");
-    if !append_converted_twig_expression(
+    let mapped = append_converted_twig_expression(
         source,
         collection_start,
         collection_end,
         virtual_source,
         source_map,
         macro_aliases,
-    ) {
+    );
+    let preserved_base_range = (!mapped)
+        .then(|| {
+            append_twig_type_preserving_filter_base_expression(
+                source,
+                collection_start,
+                collection_end,
+                virtual_source,
+                source_map,
+                macro_aliases,
+            )
+        })
+        .flatten();
+    if !mapped && preserved_base_range.is_none() {
         virtual_source.push_str("(array) []");
     }
     virtual_source.push_str(" as ");
@@ -1331,6 +1368,17 @@ fn push_twig_for_fragment(
         virtual_source.len(),
     );
     virtual_source.push_str("): ?>\n");
+    if !mapped {
+        append_twig_partial_member_chain_fragments(
+            source,
+            collection_start,
+            collection_end,
+            virtual_source,
+            source_map,
+            macro_aliases,
+            preserved_base_range,
+        );
+    }
 }
 
 fn push_twig_set_fragment(
@@ -1366,17 +1414,41 @@ fn push_twig_set_fragment(
         virtual_source.len(),
     );
     virtual_source.push_str(" = ");
-    if !append_converted_twig_expression(
+    let mapped = append_converted_twig_expression(
         source,
         expr_start,
         expr_end,
         virtual_source,
         source_map,
         macro_aliases,
-    ) {
+    );
+    let preserved_base_range = (!mapped)
+        .then(|| {
+            append_twig_type_preserving_filter_base_expression(
+                source,
+                expr_start,
+                expr_end,
+                virtual_source,
+                source_map,
+                macro_aliases,
+            )
+        })
+        .flatten();
+    if !mapped && preserved_base_range.is_none() {
         virtual_source.push_str("null");
     }
     virtual_source.push_str("; ?>\n");
+    if !mapped {
+        append_twig_partial_member_chain_fragments(
+            source,
+            expr_start,
+            expr_end,
+            virtual_source,
+            source_map,
+            macro_aliases,
+            preserved_base_range,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1424,6 +1496,243 @@ fn append_converted_twig_expression(
         );
     }
     true
+}
+
+fn append_twig_partial_member_chain_fragments(
+    source: &str,
+    original_start: usize,
+    original_end: usize,
+    virtual_source: &mut String,
+    source_map: &mut TemplateSourceMap,
+    macro_aliases: &HashSet<String>,
+    excluded_range: Option<(usize, usize)>,
+) {
+    for (chain_start, chain_end) in
+        twig_partial_member_chain_ranges(source, original_start, original_end, macro_aliases)
+    {
+        if excluded_range.is_some_and(|(start, end)| chain_start == start && chain_end == end) {
+            continue;
+        }
+        if unsupported_twig_expression(source, chain_start, chain_end, macro_aliases).is_some() {
+            continue;
+        }
+
+        let (converted, segments) = convert_twig_expression_to_php(source, chain_start, chain_end);
+        if converted.trim().is_empty() {
+            continue;
+        }
+
+        virtual_source.push_str("<?php ");
+        let virtual_base = virtual_source.len();
+        virtual_source.push_str(&converted);
+        virtual_source.push_str("; ?>\n");
+        for segment in segments {
+            source_map.push_segment(
+                segment.original_start,
+                segment.original_end,
+                virtual_base + segment.virtual_start,
+                virtual_base + segment.virtual_end,
+            );
+        }
+    }
+}
+
+fn append_twig_type_preserving_filter_base_expression(
+    source: &str,
+    original_start: usize,
+    original_end: usize,
+    virtual_source: &mut String,
+    source_map: &mut TemplateSourceMap,
+    macro_aliases: &HashSet<String>,
+) -> Option<(usize, usize)> {
+    let (base_start, base_end) =
+        twig_type_preserving_filter_base_range(source, original_start, original_end)?;
+    if unsupported_twig_expression(source, base_start, base_end, macro_aliases).is_some() {
+        return None;
+    }
+
+    let (converted, segments) = convert_twig_expression_to_php(source, base_start, base_end);
+    if converted.trim().is_empty() {
+        return None;
+    }
+
+    let virtual_base = virtual_source.len();
+    virtual_source.push_str(&converted);
+    for segment in segments {
+        source_map.push_segment(
+            segment.original_start,
+            segment.original_end,
+            virtual_base + segment.virtual_start,
+            virtual_base + segment.virtual_end,
+        );
+    }
+    Some((base_start, base_end))
+}
+
+fn twig_type_preserving_filter_base_range(
+    source: &str,
+    original_start: usize,
+    original_end: usize,
+) -> Option<(usize, usize)> {
+    let pipe = find_top_level_twig_pipe(source, original_start, original_end)?;
+    let filter_start = skip_ascii_ws_in_range(source, pipe + '|'.len_utf8(), original_end);
+    let filter_end = scan_twig_identifier_end(source, filter_start, original_end);
+    let filter = source.get(filter_start..filter_end)?;
+    if filter != "slice" {
+        return None;
+    }
+
+    let (base_start, base_end) = trim_ascii_range(source, original_start, pipe);
+    (base_start < base_end).then_some((base_start, base_end))
+}
+
+fn find_top_level_twig_pipe(source: &str, start: usize, end: usize) -> Option<usize> {
+    let mut offset = start;
+    let mut paren_depth = 0usize;
+
+    while offset < end {
+        let ch = source[offset..end].chars().next()?;
+        if ch == '\'' || ch == '"' {
+            let close = find_quoted_string_end(source, offset, end, ch)
+                .unwrap_or(end.saturating_sub(ch.len_utf8()));
+            offset = (close + ch.len_utf8()).min(end);
+            continue;
+        }
+
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '|' if paren_depth == 0 => return Some(offset),
+            _ => {}
+        }
+
+        offset += ch.len_utf8();
+    }
+
+    None
+}
+
+fn twig_partial_member_chain_ranges(
+    source: &str,
+    original_start: usize,
+    original_end: usize,
+    macro_aliases: &HashSet<String>,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut offset = original_start;
+
+    while offset < original_end {
+        let Some(ch) = source[offset..original_end].chars().next() else {
+            break;
+        };
+
+        if ch == '\'' || ch == '"' {
+            let close = find_quoted_string_end(source, offset, original_end, ch)
+                .unwrap_or(original_end.saturating_sub(ch.len_utf8()));
+            offset = (close + ch.len_utf8()).min(original_end);
+            continue;
+        }
+
+        if !is_twig_identifier_start(ch) {
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        let root_start = offset;
+        let root_end = scan_twig_identifier_end(source, root_start, original_end);
+        let root = source.get(root_start..root_end).unwrap_or("");
+        let root_lower = root.to_ascii_lowercase();
+        if root == "_self"
+            || macro_aliases.contains(root)
+            || is_twig_expression_keyword(&root_lower)
+        {
+            offset = root_end;
+            continue;
+        }
+
+        let mut cursor = root_end;
+        let mut chain_end = root_end;
+        let mut has_member = false;
+
+        while cursor < original_end && source[cursor..original_end].starts_with('.') {
+            let dot_end = cursor + '.'.len_utf8();
+            if source[dot_end..original_end].starts_with('.') {
+                break;
+            }
+            let Some(member_ch) = source[dot_end..original_end].chars().next() else {
+                chain_end = dot_end;
+                has_member = true;
+                break;
+            };
+            if !is_twig_identifier_start(member_ch) {
+                chain_end = dot_end;
+                has_member = true;
+                break;
+            }
+
+            let member_end = scan_twig_identifier_end(source, dot_end, original_end);
+            chain_end = member_end;
+            cursor = member_end;
+            has_member = true;
+
+            if twig_next_non_ws_char(source, cursor, original_end) == Some('(') {
+                let call_open = skip_ascii_ws_in_range(source, cursor, original_end);
+                let Some(call_close) =
+                    find_balanced_twig_parenthesis_end(source, call_open, original_end)
+                else {
+                    break;
+                };
+                cursor = (call_close + ')'.len_utf8()).min(original_end);
+                chain_end = cursor;
+            }
+        }
+
+        if has_member {
+            ranges.push((root_start, chain_end));
+            offset = chain_end;
+        } else {
+            offset = root_end;
+        }
+    }
+
+    ranges
+}
+
+fn is_twig_expression_keyword(lower: &str) -> bool {
+    matches!(
+        lower,
+        "and" | "or" | "not" | "is" | "in" | "matches" | "as" | "with" | "only"
+    ) || is_twig_literal(lower)
+}
+
+fn find_balanced_twig_parenthesis_end(source: &str, open: usize, end: usize) -> Option<usize> {
+    if source.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+
+    let mut offset = open;
+    let mut depth = 0usize;
+    while offset < end {
+        let ch = source[offset..end].chars().next()?;
+        if ch == '\'' || ch == '"' {
+            let close = find_quoted_string_end(source, offset, end, ch)?;
+            offset = (close + ch.len_utf8()).min(end);
+            continue;
+        }
+
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(offset);
+            }
+        }
+
+        offset += ch.len_utf8();
+    }
+
+    None
 }
 
 fn unsupported_twig_expression(
@@ -2522,13 +2831,13 @@ mod tests {
         assert!(doc.virtual_source().contains("$label = null"));
 
         for needle in [
-            "user.name|upper",
+            "upper",
             "user is defined",
             "users|filter",
             "attribute",
             "forms.input",
             "_self.card",
-            "user.name ??",
+            "??",
             "user['name']",
         ] {
             let original_offset = source.find(needle).expect("fixture needle");
@@ -2537,6 +2846,94 @@ mod tests {
                 doc.map_original_position_to_virtual(original_position)
                     .is_none(),
                 "unsupported Twig expression `{needle}` should not map to virtual PHP"
+            );
+        }
+    }
+
+    #[test]
+    fn twig_unsupported_expressions_map_inner_member_chains_to_virtual_php() {
+        let source = concat!(
+            "{{ user.name|upper }}\n",
+            "{% if user.items is iterable and user.items|length > 0 %}visible{% endif %}\n",
+            "{% set shown = user.items|slice(0, 5) %}\n",
+            "{{ path('profile', {'id': user.profile.id}) }}\n",
+            "{{ path('profile', {'id': user.}) }}\n",
+            "{{ user.createdAt|date('d.m.Y') }}\n",
+        );
+        let doc = preprocess_twig_template(
+            source,
+            &[TemplateVariableType {
+                name: "user".to_string(),
+                type_text: "App\\Entity\\User".to_string(),
+            }],
+        );
+
+        for expected in [
+            "$shown = $user->items;",
+            "$user->name;",
+            "$user->items;",
+            "$user->profile->id;",
+            "$user->;",
+            "$user->createdAt;",
+        ] {
+            assert!(
+                doc.virtual_source().contains(expected),
+                "expected partial Twig member chain `{expected}` in virtual PHP, got: {}",
+                doc.virtual_source()
+            );
+        }
+        assert_eq!(
+            doc.virtual_source().matches("$user->items;").count(),
+            3,
+            "slice base should be mapped by the assignment without a duplicate no-op fragment, got: {}",
+            doc.virtual_source()
+        );
+
+        for needle in [
+            "user.name",
+            "user.items",
+            "user.profile.id",
+            "user.createdAt",
+        ] {
+            let original_offset = source.find(needle).expect("fixture member chain");
+            let original_position = position_for_byte_offset(source, original_offset);
+            let virtual_position = doc
+                .map_original_position_to_virtual(original_position)
+                .unwrap_or_else(|| panic!("member chain `{needle}` should map"));
+            let virtual_offset = byte_offset_for_position(doc.virtual_source(), virtual_position)
+                .expect("virtual position offset");
+            assert_eq!(
+                doc.virtual_source()
+                    .get(virtual_offset..virtual_offset + "$user".len()),
+                Some("$user"),
+                "member chain `{needle}` should map to a virtual PHP variable"
+            );
+        }
+        let trailing_dot_offset = source
+            .find("user.})")
+            .map(|offset| offset + "user.".len())
+            .expect("fixture trailing member access");
+        let trailing_dot_position = position_for_byte_offset(source, trailing_dot_offset);
+        let trailing_virtual_position = doc
+            .map_original_position_to_virtual(trailing_dot_position)
+            .expect("trailing member access cursor should map");
+        let trailing_virtual_offset =
+            byte_offset_for_position(doc.virtual_source(), trailing_virtual_position)
+                .expect("trailing virtual offset");
+        assert_eq!(
+            doc.virtual_source()
+                .get(trailing_virtual_offset.saturating_sub("->".len())..trailing_virtual_offset),
+            Some("->"),
+            "cursor after trailing Twig dot should map after virtual PHP member arrow"
+        );
+
+        for needle in ["upper", "path", "date"] {
+            let original_offset = source.find(needle).expect("fixture unsupported token");
+            let original_position = position_for_byte_offset(source, original_offset);
+            assert!(
+                doc.map_original_position_to_virtual(original_position)
+                    .is_none(),
+                "unsupported Twig token `{needle}` should stay unmapped"
             );
         }
     }

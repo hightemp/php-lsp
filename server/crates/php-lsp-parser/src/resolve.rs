@@ -1289,8 +1289,15 @@ fn try_resolve_object_type_inner<'a>(
             // Fallback: use the cross-file resolver for inherited properties
             if let Some(ref resolve_fn) = resolver {
                 let member_name = format!("${}", prop_name);
-                if let Some(type_fqn) = resolve_fn(&class_fqn, &member_name) {
-                    return Some(type_fqn);
+                if let Some(type_text) = resolve_fn(&class_fqn, &member_name) {
+                    if let Some(type_fqn) = resolve_object_fqn_from_member_type_text(
+                        &type_text,
+                        object_node,
+                        source,
+                        file_symbols,
+                    ) {
+                        return Some(type_fqn);
+                    }
                 }
             }
             None
@@ -1333,8 +1340,15 @@ fn try_resolve_object_type_inner<'a>(
 
             // Fallback: use the cross-file resolver to get the method's return type
             if let Some(ref resolve_fn) = resolver {
-                if let Some(type_fqn) = resolve_fn(&class_fqn, method_name) {
-                    return Some(type_fqn);
+                if let Some(type_text) = resolve_fn(&class_fqn, method_name) {
+                    if let Some(type_fqn) = resolve_object_fqn_from_member_type_text(
+                        &type_text,
+                        object_node,
+                        source,
+                        file_symbols,
+                    ) {
+                        return Some(type_fqn);
+                    }
                 }
             }
 
@@ -1364,8 +1378,17 @@ fn try_resolve_object_type_inner<'a>(
                                 );
                                 for alt_type in &alt_types {
                                     if let Some(ref resolve_fn) = resolver {
-                                        if let Some(type_fqn) = resolve_fn(alt_type, method_name) {
-                                            return Some(type_fqn);
+                                        if let Some(type_text) = resolve_fn(alt_type, method_name) {
+                                            if let Some(type_fqn) =
+                                                resolve_object_fqn_from_member_type_text(
+                                                    &type_text,
+                                                    object_node,
+                                                    source,
+                                                    file_symbols,
+                                                )
+                                            {
+                                                return Some(type_fqn);
+                                            }
                                         }
                                     }
                                 }
@@ -1396,6 +1419,83 @@ fn try_resolve_object_type_inner<'a>(
         }
         // Static call: Foo::create() — can't resolve return type without full type info
         _ => None,
+    }
+}
+
+fn resolve_object_fqn_from_member_type_text(
+    type_text: &str,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    let type_info = type_info_from_type_text(type_text);
+    object_fqn_from_resolved_member_type_info(&type_info, context_node, source, file_symbols)
+}
+
+fn object_fqn_from_resolved_member_type_info(
+    type_info: &TypeInfo,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    match type_info {
+        TypeInfo::Simple(name) => {
+            if is_builtin_non_object_type(name) {
+                None
+            } else {
+                Some(name.trim_start_matches('\\').to_string())
+            }
+        }
+        TypeInfo::Nullable(inner) => {
+            object_fqn_from_resolved_member_type_info(inner, context_node, source, file_symbols)
+        }
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            for ty in types {
+                if let Some(resolved) = object_fqn_from_resolved_member_type_info(
+                    ty,
+                    context_node,
+                    source,
+                    file_symbols,
+                ) {
+                    return Some(resolved);
+                }
+            }
+            None
+        }
+        TypeInfo::Self_ | TypeInfo::Static_ => {
+            find_parent_class_fqn(context_node, source, file_symbols)
+        }
+        TypeInfo::Parent_ => find_extended_parent_class_fqn(context_node, source, file_symbols),
+        TypeInfo::Generic { base, .. } => {
+            if is_builtin_non_object_type(base) {
+                None
+            } else {
+                Some(base.trim_start_matches('\\').to_string())
+            }
+        }
+        TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => object_fqn_from_resolved_member_type_info(if_type, context_node, source, file_symbols)
+            .or_else(|| {
+                object_fqn_from_resolved_member_type_info(
+                    else_type,
+                    context_node,
+                    source,
+                    file_symbols,
+                )
+            }),
+        TypeInfo::ClassString(_)
+        | TypeInfo::ArrayShape(_)
+        | TypeInfo::ObjectShape(_)
+        | TypeInfo::Callable { .. }
+        | TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed => None,
     }
 }
 
@@ -3170,6 +3270,10 @@ fn infer_literal_expression_type_info(node: Node, source: &str) -> Option<TypeIn
 
 fn type_info_from_type_text(type_text: &str) -> TypeInfo {
     let type_text = type_text.trim();
+    if let Some(type_info) = parse_phpdoc(&format!("/** @var {type_text} */")).var_type {
+        return type_info;
+    }
+
     if let Some(inner) = type_text.strip_prefix('?') {
         return TypeInfo::Nullable(Box::new(type_info_from_type_text(inner)));
     }
@@ -3332,7 +3436,7 @@ fn infer_expression_type_info(
                 .or_else(|| {
                     resolver.and_then(|resolve_fn| {
                         resolve_fn(&class_fqn, &format!("${}", &source[name.byte_range()]))
-                            .map(TypeInfo::Simple)
+                            .map(|type_text| type_info_from_type_text(&type_text))
                     })
                 })
         }
@@ -3352,7 +3456,8 @@ fn infer_expression_type_info(
                 })
                 .or_else(|| {
                     resolver.and_then(|resolve_fn| {
-                        resolve_fn(&class_fqn, &source[name.byte_range()]).map(TypeInfo::Simple)
+                        resolve_fn(&class_fqn, &source[name.byte_range()])
+                            .map(|type_text| type_info_from_type_text(&type_text))
                     })
                 })
         }
@@ -3800,6 +3905,7 @@ pub fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) ->
         TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
             .iter()
             .find_map(|ty| iterable_value_type_info(ty, key_text)),
+        TypeInfo::Simple(name) if is_plain_iterable_type_name(name) => Some(TypeInfo::Mixed),
         TypeInfo::Generic { base, args } => generic_value_type_arg(base, args).cloned(),
         TypeInfo::ArrayShape(items) => array_shape_value_type(items, key_text).cloned(),
         TypeInfo::Conditional {
@@ -3808,6 +3914,13 @@ pub fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) ->
             .or_else(|| iterable_value_type_info(else_type, key_text)),
         _ => None,
     }
+}
+
+fn is_plain_iterable_type_name(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches('\\').to_ascii_lowercase().as_str(),
+        "array" | "iterable" | "traversable" | "iterator" | "iteratoraggregate" | "generator"
+    )
 }
 
 fn iterable_key_type_info(type_info: &TypeInfo) -> Option<TypeInfo> {
@@ -5198,6 +5311,88 @@ function run(): void {
         let result = parse_and_resolve(code, line, col).expect("foreach value should resolve");
         assert_eq!(result.fqn, "App\\Entity\\User::getName");
         assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_infer_foreach_value_from_member_assigned_collection() {
+        let code = r#"<?php
+namespace App;
+
+/**
+ * @var array<int, \App\Entity\DataRequest> $pagination
+ */
+$pagination = [];
+foreach ($pagination as $dr):
+    $shown = $dr->numbers;
+    foreach ($shown as $num):
+        $num;
+    endforeach;
+endforeach;
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let (line, col) = find_line_col(code, "$num;");
+        let node = find_node_at_point(tree.root_node(), Point::new(line as usize, col as usize))
+            .expect("variable node");
+        let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+            (class_fqn == "App\\Entity\\DataRequest" && member_name == "$numbers")
+                .then(|| "array<int, string>".to_string())
+        };
+        let info = infer_variable_hover_info_at_node_with_resolvers(
+            node,
+            code,
+            &file_symbols,
+            node.start_byte(),
+            "$num",
+            Some(&resolver),
+            None,
+        )
+        .expect("foreach value should infer from assigned member collection");
+
+        assert_eq!(info.type_display.as_deref(), Some("string"));
+    }
+
+    #[test]
+    fn test_infer_foreach_value_from_member_assigned_plain_array() {
+        let code = r#"<?php
+namespace App;
+
+/**
+ * @var array<int, \App\Entity\DataRequest> $pagination
+ */
+$pagination = [];
+foreach ($pagination as $dr):
+    $shown = $dr->numbers;
+    foreach ($shown as $num):
+        $num;
+    endforeach;
+endforeach;
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let (line, col) = find_line_col(code, "$num;");
+        let node = find_node_at_point(tree.root_node(), Point::new(line as usize, col as usize))
+            .expect("variable node");
+        let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+            (class_fqn == "App\\Entity\\DataRequest" && member_name == "$numbers")
+                .then(|| "array".to_string())
+        };
+        let info = infer_variable_hover_info_at_node_with_resolvers(
+            node,
+            code,
+            &file_symbols,
+            node.start_byte(),
+            "$num",
+            Some(&resolver),
+            None,
+        )
+        .expect("foreach value should infer mixed from plain array");
+
+        assert_eq!(info.type_display.as_deref(), Some("mixed"));
     }
 
     #[test]

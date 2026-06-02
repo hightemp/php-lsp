@@ -535,6 +535,13 @@ impl PhpLspBackend {
         } else {
             symbol_info
         };
+        let symbol_info = symbol_info.or_else(|| {
+            template_document
+                .as_ref()
+                .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig)
+                .then(|| twig_property_accessor_method_for_symbol(&self.index, &sym_at_pos))
+                .flatten()
+        });
 
         let result = if let Some(sym) = symbol_info {
             self.location_for_symbol_selection(&sym, "gotoDefinition source read")
