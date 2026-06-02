@@ -128,10 +128,11 @@ pub(in crate::server) fn collect_twig_context_php_files_recursive(
     }
 }
 
-pub(in crate::server) fn collect_twig_render_context_types(
+fn collect_twig_render_context_types(
     template_name: &str,
     source: &str,
     file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
     variables: &mut HashMap<String, String>,
 ) {
     let mut offset = 0usize;
@@ -150,7 +151,13 @@ pub(in crate::server) fn collect_twig_render_context_types(
             if php_string_literal_value_at_range(source, template_arg.0, template_arg.1)
                 .is_some_and(|name| normalize_twig_key(&name) == normalize_twig_key(template_name))
             {
-                collect_twig_context_array_types(source, context_arg, file_symbols, variables);
+                collect_twig_context_array_types(
+                    source,
+                    context_arg,
+                    file_symbols,
+                    index,
+                    variables,
+                );
             }
         }
         offset = close_paren + 1;
@@ -185,10 +192,11 @@ pub(in crate::server) fn next_twig_render_call(
     None
 }
 
-pub(in crate::server) fn collect_twig_context_array_types(
+fn collect_twig_context_array_types(
     source: &str,
     range: (usize, usize),
     file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
     variables: &mut HashMap<String, String>,
 ) {
     let (start, end) = range;
@@ -211,7 +219,7 @@ pub(in crate::server) fn collect_twig_context_array_types(
         if !is_template_variable_name(&name) {
             continue;
         }
-        let type_text = infer_twig_context_value_type(source, value_range, file_symbols)
+        let type_text = infer_twig_context_value_type(source, value_range, file_symbols, index)
             .unwrap_or_else(|| "mixed".to_string());
         merge_twig_context_variable_type(variables, name, type_text);
     }
@@ -259,10 +267,21 @@ pub(in crate::server) fn php_array_inner_range(
     None
 }
 
-pub(in crate::server) fn infer_twig_context_value_type(
+fn infer_twig_context_value_type(
     source: &str,
     range: (usize, usize),
     file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+) -> Option<String> {
+    infer_twig_context_value_type_inner(source, range, file_symbols, index, &mut HashSet::new())
+}
+
+fn infer_twig_context_value_type_inner(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    visited_variables: &mut HashSet<String>,
 ) -> Option<String> {
     let (start, end) = trim_source_range(source, range.0, range.1);
     let value = source.get(start..end)?.trim();
@@ -276,11 +295,31 @@ pub(in crate::server) fn infer_twig_context_value_type(
     }
 
     if let Some(variable_name) = simple_php_variable_name(value) {
+        if let Some(type_text) = infer_twig_context_assignment_value_type(
+            source,
+            start,
+            variable_name,
+            file_symbols,
+            index,
+            visited_variables,
+        ) {
+            return Some(type_text);
+        }
         if let Some(type_text) =
             infer_twig_context_variable_type(source, start, variable_name, file_symbols)
         {
             return Some(type_text);
         }
+    }
+
+    if let Some(item_type) = infer_twig_paginated_source_item_type(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        visited_variables,
+    ) {
+        return Some(format!("array<int, {item_type}>"));
     }
 
     first_new_class_name(value)
@@ -301,6 +340,475 @@ fn simple_php_variable_name(value: &str) -> Option<&str> {
     chars
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
         .then_some(name)
+}
+
+fn infer_twig_context_assignment_value_type(
+    source: &str,
+    value_start: usize,
+    variable_name: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<String> {
+    if !visited_variables.insert(variable_name.to_string()) {
+        return None;
+    }
+
+    let assignment =
+        latest_simple_variable_assignment_before(source, value_start, variable_name, file_symbols)?;
+    infer_twig_context_value_type_inner(source, assignment, file_symbols, index, visited_variables)
+}
+
+fn latest_simple_variable_assignment_before(
+    source: &str,
+    value_start: usize,
+    variable_name: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<(usize, usize)> {
+    let scope_start = containing_callable_byte_range(source, value_start, file_symbols)
+        .map(|range| range.0)
+        .unwrap_or(0);
+    let search_end = value_start.min(source.len());
+    let needle = format!("${variable_name}");
+    let mut latest = None;
+    let mut offset = scope_start;
+
+    while offset < search_end {
+        let Some(relative) = source.get(offset..search_end)?.find(&needle) else {
+            break;
+        };
+        let variable_start = offset + relative;
+        let after_variable = variable_start + needle.len();
+        if source
+            .as_bytes()
+            .get(after_variable)
+            .is_some_and(|byte| is_ident_byte(*byte))
+        {
+            offset = after_variable;
+            continue;
+        }
+
+        let equals = skip_ascii_ws_server(source, after_variable);
+        if source.as_bytes().get(equals) != Some(&b'=')
+            || source
+                .as_bytes()
+                .get(equals + 1)
+                .is_some_and(|byte| matches!(*byte, b'=' | b'>'))
+        {
+            offset = after_variable;
+            continue;
+        }
+
+        let rhs_start = skip_ascii_ws_server(source, equals + 1);
+        if let Some(rhs_end) = find_php_statement_end(source, rhs_start, search_end) {
+            latest = Some(trim_source_range(source, rhs_start, rhs_end));
+            offset = rhs_end + 1;
+        } else {
+            offset = after_variable;
+        }
+    }
+
+    latest
+}
+
+fn containing_callable_byte_range(
+    source: &str,
+    offset: usize,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<(usize, usize)> {
+    let position = byte_line_col_at_offset(source, offset);
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method
+            ) && byte_position_in_range(position, symbol.range)
+        })
+        .filter_map(|symbol| {
+            let start = byte_offset_from_line_col(source, symbol.range.0, symbol.range.1)?;
+            let end = byte_offset_from_line_col(source, symbol.range.2, symbol.range.3)?;
+            Some((start, end))
+        })
+        .min_by_key(|(start, end)| end.saturating_sub(*start))
+}
+
+fn byte_offset_from_line_col(source: &str, line: u32, col: u32) -> Option<usize> {
+    let mut current_line = 0u32;
+    let mut line_start = 0usize;
+    for (offset, byte) in source.bytes().enumerate() {
+        if current_line == line {
+            return Some((line_start + col as usize).min(source.len()));
+        }
+        if byte == b'\n' {
+            current_line += 1;
+            line_start = offset + 1;
+        }
+    }
+    (current_line == line).then_some((line_start + col as usize).min(source.len()))
+}
+
+fn find_php_statement_end(source: &str, start: usize, limit: usize) -> Option<usize> {
+    find_top_level_token(source, start, limit, b';')
+}
+
+fn find_top_level_token(source: &str, start: usize, end: usize, token: u8) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut offset = start;
+
+    while offset < end {
+        let ch = source[offset..end].chars().next()?;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ if ch.len_utf8() == 1
+                && ch as u8 == token
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0 =>
+            {
+                return Some(offset);
+            }
+            _ => {}
+        }
+        offset += ch.len_utf8();
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PhpMemberCallParts<'a> {
+    object_range: (usize, usize),
+    method_name: &'a str,
+    args_range: (usize, usize),
+}
+
+fn infer_twig_paginated_source_item_type(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<String> {
+    let index = index?;
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    let value = source.get(start..end)?.trim();
+
+    if value.starts_with('[') || value.starts_with("array") {
+        if let Some(class_name) = first_new_class_name(value) {
+            return Some(resolve_twig_context_class_name(file_symbols, class_name));
+        }
+    }
+
+    if let Some(variable_name) = simple_php_variable_name(value) {
+        let assignment =
+            latest_simple_variable_assignment_before(source, start, variable_name, file_symbols)?;
+        if !visited_variables.insert(format!("paginate-source:{variable_name}")) {
+            return None;
+        }
+        return infer_twig_paginated_source_item_type(
+            source,
+            assignment,
+            file_symbols,
+            Some(index),
+            visited_variables,
+        );
+    }
+
+    let call = php_member_call_parts(source, start, end)?;
+    if call.method_name.eq_ignore_ascii_case("paginate") {
+        if !twig_context_member_receiver_is_paginator(
+            source,
+            call.object_range,
+            file_symbols,
+            visited_variables,
+        ) {
+            return None;
+        }
+        let args = split_top_level_spans(
+            source
+                .get(call.args_range.0..call.args_range.1)
+                .unwrap_or(""),
+            call.args_range.0,
+        );
+        let first_arg = args.first().copied()?;
+        return infer_twig_paginated_source_item_type(
+            source,
+            first_arg,
+            file_symbols,
+            Some(index),
+            visited_variables,
+        );
+    }
+
+    twig_context_repository_member_call_entity(source, call, file_symbols, index, visited_variables)
+}
+
+fn twig_context_member_receiver_is_paginator(
+    source: &str,
+    object_range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    visited_variables: &mut HashSet<String>,
+) -> bool {
+    twig_context_expression_type_text(source, object_range, file_symbols, None, visited_variables)
+        .is_some_and(|type_text| type_text.to_ascii_lowercase().contains("paginator"))
+}
+
+fn twig_context_repository_member_call_entity(
+    source: &str,
+    call: PhpMemberCallParts<'_>,
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: &WorkspaceIndex,
+    visited_variables: &mut HashSet<String>,
+) -> Option<String> {
+    let receiver_type = twig_context_expression_type_text(
+        source,
+        call.object_range,
+        file_symbols,
+        Some(index),
+        visited_variables,
+    )?;
+    let repository_fqn = receiver_type
+        .trim()
+        .trim_start_matches('?')
+        .trim_start_matches('\\');
+    let entity_fqn = doctrine_repository_entity_from_type_text(index, repository_fqn)?;
+    twig_context_repository_method_paginated_item_type(
+        index,
+        repository_fqn,
+        call.method_name,
+        file_symbols,
+        &entity_fqn,
+    )
+}
+
+fn twig_context_expression_type_text(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<String> {
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    let value = source.get(start..end)?.trim();
+    if let Some(variable_name) = simple_php_variable_name(value) {
+        return infer_twig_context_assignment_value_type(
+            source,
+            start,
+            variable_name,
+            file_symbols,
+            index,
+            visited_variables,
+        )
+        .or_else(|| infer_twig_context_variable_type(source, start, variable_name, file_symbols));
+    }
+    first_new_class_name(value)
+        .map(|class_name| resolve_twig_context_class_name(file_symbols, class_name))
+}
+
+fn php_member_call_parts<'a>(
+    source: &'a str,
+    start: usize,
+    end: usize,
+) -> Option<PhpMemberCallParts<'a>> {
+    let mut latest = None;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut offset = start;
+
+    while offset < end {
+        let ch = source[offset..end].chars().next()?;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if paren_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+            && (source[offset..end].starts_with("->") || source[offset..end].starts_with("?->"))
+        {
+            let operator_len = if source[offset..end].starts_with("?->") {
+                "?->".len()
+            } else {
+                "->".len()
+            };
+            let method_start = skip_ascii_ws_server(source, offset + operator_len);
+            let method_end = scan_php_class_name_end(source, method_start);
+            if method_end <= method_start {
+                offset += operator_len;
+                continue;
+            }
+            let open = skip_ascii_ws_server(source, method_end);
+            if source.as_bytes().get(open) != Some(&b'(') {
+                offset = method_end;
+                continue;
+            }
+            let Some(close) = find_matching_delimiter(source, open, '(', ')') else {
+                return latest;
+            };
+            if close > end {
+                return latest;
+            }
+            latest = Some(PhpMemberCallParts {
+                object_range: trim_source_range(source, start, offset),
+                method_name: source.get(method_start..method_end)?,
+                args_range: (open + 1, close),
+            });
+            offset = close + 1;
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+        offset += ch.len_utf8();
+    }
+
+    latest
+}
+
+fn doctrine_repository_entity_from_type_text(
+    index: &WorkspaceIndex,
+    repository_fqn: &str,
+) -> Option<String> {
+    let repository_fqn = repository_fqn.trim_start_matches('\\');
+    let symbol = index.resolve_fqn(repository_fqn)?;
+    for binding in &symbol.template_bindings {
+        if binding.kind == php_lsp_types::TemplateBindingKind::Extends
+            && is_doctrine_repository_base(&binding.target)
+        {
+            if let Some(entity_fqn) = binding.args.first().and_then(type_info_simple_fqn) {
+                return Some(entity_fqn);
+            }
+        }
+    }
+
+    conventional_entity_fqn_for_repository(index, repository_fqn)
+}
+
+fn conventional_entity_fqn_for_repository(
+    index: &WorkspaceIndex,
+    repository_fqn: &str,
+) -> Option<String> {
+    let repository_short = repository_fqn.rsplit('\\').next()?;
+    let entity_short = repository_short.strip_suffix("Repository")?;
+    let direct_candidate = repository_fqn
+        .replace("\\Repository\\", "\\Entity\\")
+        .strip_suffix("Repository")
+        .map(str::to_string);
+    if let Some(candidate) = direct_candidate {
+        if let Some(symbol) = index.resolve_fqn(&candidate) {
+            if matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class) {
+                return Some(symbol.fqn.clone());
+            }
+        }
+    }
+
+    let mut candidates = index.types.iter().filter_map(|entry| {
+        let symbol = entry.value();
+        (matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class)
+            && symbol.name == entity_short
+            && symbol.fqn.contains("\\Entity\\"))
+        .then(|| symbol.fqn.clone())
+    });
+    let first = candidates.next()?;
+    candidates.next().is_none().then_some(first)
+}
+
+fn twig_context_repository_method_paginated_item_type(
+    index: &WorkspaceIndex,
+    repository_fqn: &str,
+    method_name: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    fallback_entity_fqn: &str,
+) -> Option<String> {
+    let method_fqn = format!("{repository_fqn}::{method_name}");
+    if let Some(symbol) = index.resolve_fqn(&method_fqn) {
+        if let Some(return_type) = symbol_effective_return_type(&symbol) {
+            if let Some(value_type) = iterable_value_type_info(&return_type, None) {
+                return twig_context_type_info_text(
+                    file_symbols,
+                    symbol.parent_fqn.as_deref().unwrap_or(repository_fqn),
+                    &value_type,
+                );
+            }
+            if twig_context_type_is_paginated_source(&return_type) {
+                return Some(fallback_entity_fqn.to_string());
+            }
+            return None;
+        }
+    }
+
+    let lower = method_name.to_ascii_lowercase();
+    (matches!(
+        lower.as_str(),
+        "findall" | "findby" | "matching" | "createquerybuilder"
+    ) || lower.ends_with("qb")
+        || lower.ends_with("querybuilder"))
+    .then(|| fallback_entity_fqn.to_string())
+}
+
+fn twig_context_type_is_paginated_source(type_info: &php_lsp_types::TypeInfo) -> bool {
+    match type_info {
+        php_lsp_types::TypeInfo::Nullable(inner) => twig_context_type_is_paginated_source(inner),
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            types.iter().any(twig_context_type_is_paginated_source)
+        }
+        php_lsp_types::TypeInfo::Generic { base, .. } => {
+            let lower = base.trim_start_matches('\\').to_ascii_lowercase();
+            matches!(lower.as_str(), "array" | "iterable" | "traversable")
+        }
+        php_lsp_types::TypeInfo::Simple(name) => {
+            let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+            lower == "array"
+                || lower == "iterable"
+                || lower.ends_with("\\querybuilder")
+                || lower.ends_with("\\query")
+                || lower.ends_with("querybuilder")
+        }
+        _ => false,
+    }
 }
 
 fn infer_twig_context_variable_type(
@@ -701,6 +1209,7 @@ pub(in crate::server) fn map_location_for_template(
 async fn cached_twig_context_file_variables_for_state(
     root: &Path,
     template_name: &str,
+    index: Arc<WorkspaceIndex>,
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
 ) -> Vec<TwigContextFileVariables> {
     let key = TwigContextDiskCacheKey {
@@ -734,6 +1243,7 @@ async fn cached_twig_context_file_variables_for_state(
                 &template_name,
                 &source,
                 &file_symbols,
+                Some(&index),
                 &mut variables,
             );
             if variables.is_empty() {
@@ -770,7 +1280,7 @@ async fn cached_twig_context_file_variables_for_state(
 async fn twig_variable_types_for_template_state(
     uri_str: &str,
     open_files: &Arc<DashMap<String, FileParser>>,
-    index: &WorkspaceIndex,
+    index: &Arc<WorkspaceIndex>,
     workspace_roots: &[PathBuf],
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
 ) -> Vec<TemplateVariableType> {
@@ -805,12 +1315,22 @@ async fn twig_variable_types_for_template_state(
                     .map(|tree| extract_file_symbols(tree, &source, source_uri.as_str()))
             })
             .unwrap_or_default();
-        collect_twig_render_context_types(&template_name, &source, &file_symbols, &mut variables);
+        collect_twig_render_context_types(
+            &template_name,
+            &source,
+            &file_symbols,
+            Some(index.as_ref()),
+            &mut variables,
+        );
     }
 
-    for file in
-        cached_twig_context_file_variables_for_state(&root, &template_name, twig_context_disk_cache)
-            .await
+    for file in cached_twig_context_file_variables_for_state(
+        &root,
+        &template_name,
+        index.clone(),
+        twig_context_disk_cache,
+    )
+    .await
     {
         if open_php_uris.contains(&file.uri) {
             continue;
@@ -831,7 +1351,7 @@ async fn twig_variable_types_for_template_state(
 pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
     open_files: &Arc<DashMap<String, FileParser>>,
     template_documents: &Arc<DashMap<String, TemplateDocument>>,
-    index: &WorkspaceIndex,
+    index: &Arc<WorkspaceIndex>,
     workspace_roots: &[PathBuf],
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
     semantic_tokens_cache: &Arc<Mutex<SemanticTokensCache>>,

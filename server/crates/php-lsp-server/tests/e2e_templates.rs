@@ -957,6 +957,458 @@ final class DashboardController
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_context_infers_paginated_repository_item_variables() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-pagination-context-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Repository")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/data_request")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let entity_path = tmp_root.join("src/Entity/DataRequest.php");
+    let repository_path = tmp_root.join("src/Repository/DataRequestRepository.php");
+    let controller_path = tmp_root.join("src/Controller/DataRequestController.php");
+    let twig_path = tmp_root.join("templates/data_request/index.html.twig");
+    let entity_uri = file_uri(&entity_path);
+    let twig_uri = file_uri(&twig_path);
+
+    let entity_php = r#"<?php
+namespace App\Entity;
+
+class DataRequest
+{
+    public int $id = 0;
+    public string $npId = '';
+    public function getNpId(): string { return $this->npId; }
+}
+"#;
+    let repository_php = r#"<?php
+namespace App\Repository;
+
+use App\Entity\DataRequest;
+use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Doctrine\ORM\QueryBuilder;
+
+class DataRequestRepository extends ServiceEntityRepository
+{
+    public function createIndexQb(): QueryBuilder
+    {
+        return $this->createQueryBuilder('dr');
+    }
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Repository\DataRequestRepository;
+use Knp\Component\Pager\PaginatorInterface;
+
+final class DataRequestController
+{
+    public function index(PaginatorInterface $paginator, DataRequestRepository $dataRequestRepository): void
+    {
+        $qb = $dataRequestRepository->createIndexQb();
+        $pagination = $paginator->paginate($qb, 1, 10);
+
+        $this->render('data_request/index.html.twig', [
+            'pagination' => $pagination,
+        ]);
+    }
+}
+"#;
+    let completion_marker = "/*complete*/";
+    let twig_with_marker = format!(
+        "{{% for dr in pagination %}}\n{{{{ dr.{} }}}}\n{{{{ dr.id }}}}\n{{% endfor %}}\n",
+        completion_marker
+    );
+    let completion_offset = twig_with_marker
+        .find(completion_marker)
+        .expect("test Twig should contain completion marker");
+    let completion_position = utf16_position_for_offset(
+        &twig_with_marker.replace(completion_marker, ""),
+        completion_offset,
+    );
+    let twig = twig_with_marker.replace(completion_marker, "");
+    let hover_position = utf16_position_at(&twig, "dr.id");
+    let definition_position = utf16_position_after(&twig, "dr.i");
+    let foreach_variable_position = utf16_position_after(&twig, "dr");
+    let end_position = utf16_position_for_offset(&twig, twig.len());
+
+    fs::write(&entity_path, entity_php).unwrap();
+    fs::write(&repository_path, repository_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&twig_path, &twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &twig_uri, "twig", &twig,
+        ))
+        .await
+        .unwrap();
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "early opened paginated Twig context should stay diagnostic-clean, got: {}",
+        diagnostics
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+    let refreshed_diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        refreshed_diagnostics["diagnostics"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "refreshed paginated Twig context should stay diagnostic-clean, got: {}",
+        refreshed_diagnostics
+    );
+
+    let hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            &twig_uri,
+            hover_position.0,
+            hover_position.1,
+        ))
+        .await
+        .unwrap();
+    let hover = extract_result(hover_resp);
+    let hover_text = hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(
+        hover_text.contains("DataRequest $dr"),
+        "expected Twig hover to resolve paginator item variable type, got: {}",
+        hover
+    );
+
+    let completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            3,
+            &twig_uri,
+            completion_position.0,
+            completion_position.1,
+        ))
+        .await
+        .unwrap();
+    let completion = extract_result(completion_resp);
+    let labels: Vec<String> = completion_items_from_result(&completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "id")
+            && labels
+                .iter()
+                .any(|label| label == "getNpId" || label == "npId"),
+        "expected Twig completion from paginator item to include DataRequest members, got: {:?}",
+        labels
+    );
+
+    let definition_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            4,
+            &twig_uri,
+            definition_position.0,
+            definition_position.1,
+        ))
+        .await
+        .unwrap();
+    let definition = extract_result(definition_resp);
+    assert_eq!(
+        definition.get("uri").and_then(|uri| uri.as_str()),
+        Some(entity_uri.as_str()),
+        "Twig definition should jump from paginator item member to PHP symbol, got: {}",
+        definition
+    );
+
+    let inlay_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(
+            5,
+            &twig_uri,
+            0,
+            0,
+            end_position.0,
+            end_position.1,
+        ))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_resp);
+    let hints = inlay_result.as_array().cloned().unwrap_or_default();
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": DataRequest")
+                && hint["position"]["line"].as_u64() == Some(foreach_variable_position.0 as u64)
+                && hint["position"]["character"].as_u64()
+                    == Some(foreach_variable_position.1 as u64)
+        }),
+        "expected Twig inlay hint for paginator item variable, got: {}",
+        inlay_result
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_twig_paginator_context_prefers_explicit_iterable_item_type() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-pagination-explicit-item-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Repository")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/data_request")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let entity_path = tmp_root.join("src/Entity/DataRequest.php");
+    let repository_path = tmp_root.join("src/Repository/DataRequestRepository.php");
+    let controller_path = tmp_root.join("src/Controller/DataRequestController.php");
+    let twig_path = tmp_root.join("templates/data_request/codes.html.twig");
+    let twig_uri = file_uri(&twig_path);
+
+    let entity_php = r#"<?php
+namespace App\Entity;
+
+class DataRequest
+{
+    public int $id = 0;
+    public function getId(): int { return $this->id; }
+}
+"#;
+    let repository_php = r#"<?php
+namespace App\Repository;
+
+use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+
+class DataRequestRepository extends ServiceEntityRepository
+{
+    /**
+     * @return array<int, string>
+     */
+    public function npCodes(): array
+    {
+        return [];
+    }
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Repository\DataRequestRepository;
+use Knp\Component\Pager\PaginatorInterface;
+
+final class DataRequestController
+{
+    public function codes(PaginatorInterface $paginator, DataRequestRepository $dataRequestRepository): void
+    {
+        $pagination = $paginator->paginate($dataRequestRepository->npCodes(), 1, 10);
+
+        $this->render('data_request/codes.html.twig', [
+            'pagination' => $pagination,
+        ]);
+    }
+}
+"#;
+    let completion_marker = "/*complete*/";
+    let twig_with_marker = format!(
+        "{{% for code in pagination %}}\n{{{{ code }}}}\n{{{{ code.{} }}}}\n{{% endfor %}}\n",
+        completion_marker
+    );
+    let completion_offset = twig_with_marker
+        .find(completion_marker)
+        .expect("test Twig should contain completion marker");
+    let completion_position = utf16_position_for_offset(
+        &twig_with_marker.replace(completion_marker, ""),
+        completion_offset,
+    );
+    let twig = twig_with_marker.replace(completion_marker, "");
+    let hover_position = utf16_position_at(&twig, "code }}");
+    let foreach_variable_position = utf16_position_after(&twig, "code");
+    let end_position = utf16_position_for_offset(&twig, twig.len());
+
+    fs::write(&entity_path, entity_php).unwrap();
+    fs::write(&repository_path, repository_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&twig_path, &twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &twig_uri, "twig", &twig,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "explicit paginator item Twig context should stay diagnostic-clean, got: {}",
+        diagnostics
+    );
+
+    let hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            &twig_uri,
+            hover_position.0,
+            hover_position.1,
+        ))
+        .await
+        .unwrap();
+    let hover = extract_result(hover_resp);
+    let hover_text = hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(
+        hover_text.contains("string $code"),
+        "expected Twig hover to keep explicit paginator item string type, got: {}",
+        hover
+    );
+
+    let completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            3,
+            &twig_uri,
+            completion_position.0,
+            completion_position.1,
+        ))
+        .await
+        .unwrap();
+    let completion = extract_result(completion_resp);
+    let labels: Vec<String> = completion_items_from_result(&completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !labels.iter().any(|label| label == "getId" || label == "id"),
+        "explicit string paginator item should not fall back to DataRequest members, got: {:?}",
+        labels
+    );
+
+    let inlay_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(
+            4,
+            &twig_uri,
+            0,
+            0,
+            end_position.0,
+            end_position.1,
+        ))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_resp);
+    let hints = inlay_result.as_array().cloned().unwrap_or_default();
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": string")
+                && hint["position"]["line"].as_u64() == Some(foreach_variable_position.0 as u64)
+                && hint["position"]["character"].as_u64()
+                    == Some(foreach_variable_position.1 as u64)
+        }),
+        "expected Twig inlay hint for explicit paginator item string type, got: {}",
+        inlay_result
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_twig_template_reports_twig_syntax_diagnostics() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();

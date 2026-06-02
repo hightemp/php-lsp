@@ -214,11 +214,12 @@ phpstorm-stubs support.
   attribute access are explicit best-effort backlog items and are skipped rather
   than mapped to misleading PHP. Twig context variables are inferred only from
   static `render(..., [...])` call sites, including `new Class()`, arrays of
-  new objects, and typed controller parameter variables; render keys whose
-  value type cannot be inferred are still seeded as `mixed` to avoid false
-  undefined-variable diagnostics. Open Twig documents refresh those inferred
-  context types after relevant PHP controller/render changes and workspace
-  reindex events.
+  new objects, typed controller parameter variables, and Knp-style paginator
+  variables backed by Doctrine repository/query-builder sources; render keys
+  whose value type cannot be inferred are still seeded as `mixed` to avoid
+  false undefined-variable diagnostics. Open Twig documents refresh those
+  inferred context types after relevant PHP controller/render changes and
+  workspace reindex events.
 - Diagnostics are optimized for editor feedback: file changes publish fast
   in-process diagnostics, while full diagnostics and optional external analyzer
   runs are used on open/save and reconfiguration.

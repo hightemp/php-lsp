@@ -363,6 +363,10 @@ Current evidence:
   to 8 MiB, with `PHP_LSP_WORKER_THREAD_STACK_SIZE` override, after real
   `bdpn-ui` Twig diagnostics plus lazy vendor indexing exposed a worker stack
   overflow on the runtime default.
+- `H-TWIG-PAGINATION-CONTEXT-2026-06-02` extends Twig render-context inference
+  for Knp-style paginator variables backed by Doctrine repository/query-builder
+  sources, restoring hover/completion/definition/inlay hints for foreach item
+  variables in paginated Twig tables.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

@@ -196,6 +196,13 @@
   - Обновить документацию при изменении поведения
   - Запустить релевантные Rust tests и verifier
 
+- [x] **H-TWIG-PAGINATION-CONTEXT-2026-06-02** Восстановить Twig LSP для переменных из пагинации *(done 2026-06-02)*
+  - Reproduce отсутствующие hover, inlayHint, go-to-definition и autocomplete в `data_request/index.html.twig`
+  - Вывести тип элемента `{% for dr in pagination %}` из render context без project-specific hardcode
+  - Добавить focused e2e/unit tests для Twig foreach по paginator context
+  - Обновить документацию при изменении поведения
+  - Запустить релевантные Rust tests и verifier
+
 - [x] **H-HOVER-CLASS-LINKS-2026-06-01** Добавить ссылки на классы в hover markdown *(done 2026-06-01)*
   - Найти все hover-поверхности, где выводятся типы, FQN, сигнатуры или связанные классы
   - Переиспользовать существующий формат ссылок на definition для `Type:`

@@ -2012,6 +2012,7 @@ impl PhpLspBackend {
             }
             let workspace_roots: Vec<PathBuf> =
                 configs.iter().map(|config| config.root.clone()).collect();
+            twig_context_disk_cache.lock().await.clear();
             refresh_open_twig_contexts_for_state(
                 &open_files,
                 &template_documents,
