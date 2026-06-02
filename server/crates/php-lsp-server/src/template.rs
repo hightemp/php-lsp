@@ -1,7 +1,7 @@
 use php_lsp_parser::utf16::{utf16_col_to_byte, Utf16LineIndex};
 use std::collections::HashSet;
 use tower_lsp::ls_types::{
-    Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, SemanticToken,
+    Diagnostic, DiagnosticSeverity, Location, NumberOrString, Position, Range, SemanticToken, Uri,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +14,21 @@ pub(crate) enum TemplateKind {
 pub(crate) struct TemplateVariableType {
     pub(crate) name: String,
     pub(crate) type_text: String,
+    pub(crate) shape_definitions: Vec<TemplateShapeKeyDefinition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TemplateShapeDefinitionTarget {
+    Direct,
+    IterableValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TemplateShapeKeyDefinition {
+    pub(crate) target: TemplateShapeDefinitionTarget,
+    pub(crate) path: Vec<String>,
+    pub(crate) uri: String,
+    pub(crate) range: (u32, u32, u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +65,30 @@ impl TemplateDocument {
             TemplateKind::Blade => self.clone(),
             TemplateKind::Twig => preprocess_twig_template(&self.original_source, variable_types),
         }
+    }
+
+    pub(crate) fn twig_shape_key_definition(
+        &self,
+        variable_name: &str,
+        target: TemplateShapeDefinitionTarget,
+        path: &[String],
+    ) -> Option<Location> {
+        let normalized_variable = variable_name.trim_start_matches('$');
+        let definition = self
+            .twig_variable_types
+            .iter()
+            .find(|variable| variable.name == normalized_variable)?
+            .shape_definitions
+            .iter()
+            .find(|definition| definition.target == target && definition.path == path)?;
+        let uri = definition.uri.parse::<Uri>().ok()?;
+        Some(Location {
+            uri,
+            range: Range {
+                start: Position::new(definition.range.0, definition.range.1),
+                end: Position::new(definition.range.2, definition.range.3),
+            },
+        })
     }
 
     pub(crate) fn map_original_position_to_virtual(&self, position: Position) -> Option<Position> {
@@ -2748,6 +2787,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
         assert!(doc.virtual_source().contains("$user->name"));
@@ -2772,6 +2812,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+            shape_definitions: Vec::new(),
             }],
         );
         assert!(doc.virtual_source().contains("$user->name"));
@@ -2799,6 +2840,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
         assert!(doc.syntax_diagnostics().is_empty());
@@ -2818,6 +2860,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
         assert!(doc.syntax_diagnostics().is_empty());
@@ -2831,6 +2874,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
         assert!(doc.syntax_diagnostics().is_empty());
@@ -2850,6 +2894,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
         assert!(doc.syntax_diagnostics().is_empty());
@@ -2881,6 +2926,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
         assert!(doc.syntax_diagnostics().is_empty());
@@ -2988,6 +3034,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
 
@@ -3035,6 +3082,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
 
@@ -3115,6 +3163,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
         let generated_prelude = Range::new(Position::new(1, 0), Position::new(1, 5));
@@ -3248,6 +3297,7 @@ mod tests {
             &[TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         );
         let original_start = source.find("123").expect("numeric literal in fixture");

@@ -219,13 +219,20 @@ phpstorm-stubs support.
   Twig `foreach` over Doctrine entity collections exposed through
   property-style access can infer item hover/completion/definition/inlay types
   from indexed ORM `targetEntity` property metadata and `add*/remove*`
-  collection mutator signatures. Twig
-  context variables are inferred only from static `render(..., [...])` call
-  sites, including `new Class()`, arrays of new objects, typed controller
-  parameter variables, nullable locals assigned conditionally before render,
-  indexed `$this->service->method()` return types, iterable repository method
-  results, Doctrine magic `find*`/`findOneBy*` repository results, and Knp-style
-  paginator variables backed by Doctrine repository/query-builder sources.
+  collection mutator signatures. Twig attribute access over PHPDoc and inferred
+  array shapes can expose shape-key hover, completion, source-backed definition,
+  and inlay types for patterns such as `row.messageLog`, nested
+  `config_params.sftp.port`, and local `{% set message_log = row.messageLog %}`
+  variables. Shape-key definitions point at the PHPDoc shape key or literal
+  array key when the static context scanner has that source range. Twig context
+  variables are inferred only from static `render(..., [...])` call sites,
+  including `new Class()`, arrays of new objects, typed controller parameter
+  variables, nullable locals assigned conditionally before render, indexed
+  `$this->service->method()` return types, iterable repository method results,
+  literal nested array shapes, `$items[] = [...]` append-built shapes,
+  `compact('name')` variables, Doctrine magic `find*`/`findOneBy*` repository
+  results, and Knp-style paginator variables backed by Doctrine
+  repository/query-builder sources.
   Custom Doctrine repositories can be resolved from indexed
   `@extends ServiceEntityRepository<Entity>` PHPDoc or ORM `repositoryClass`
   attributes without synchronous request-time source reads;

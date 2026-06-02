@@ -2363,6 +2363,604 @@ final class DebtSuspensionController
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_context_infers_array_shape_rows_nested_arrays_and_compact_variables() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-array-shape-context-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Repository")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/message_log")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/extended")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let message_log_path = tmp_root.join("src/Entity/MessageLog.php");
+    let message_type_path = tmp_root.join("src/Entity/MessageTypes.php");
+    let repository_path = tmp_root.join("src/Repository/MessageLogRepository.php");
+    let controller_path = tmp_root.join("src/Controller/ShapeController.php");
+    let index_twig_path = tmp_root.join("templates/message_log/index.html.twig");
+    let form_twig_path = tmp_root.join("templates/extended/form.html.twig");
+    let message_log_uri = file_uri(&message_log_path);
+    let message_type_uri = file_uri(&message_type_path);
+    let repository_uri = file_uri(&repository_path);
+    let controller_uri = file_uri(&controller_path);
+    let index_twig_uri = file_uri(&index_twig_path);
+    let form_twig_uri = file_uri(&form_twig_path);
+
+    let message_log_php = r#"<?php
+namespace App\Entity;
+
+class MessageLog
+{
+    private int $id = 0;
+    private ?MessageTypes $messageType = null;
+
+    public function getId(): int { return $this->id; }
+    public function getMessageType(): ?MessageTypes { return $this->messageType; }
+}
+"#;
+    let message_type_php = r#"<?php
+namespace App\Entity;
+
+class MessageTypes
+{
+    private string $name = '';
+    public function getName(): string { return $this->name; }
+}
+"#;
+    let repository_php = r#"<?php
+namespace App\Repository;
+
+use App\Entity\MessageLog;
+
+final class MessageLogRepository
+{
+    /**
+     * @return list<array{messageLog: MessageLog, portingRequestId: int, npId: string}>
+     */
+    public function fetchRows(): array
+    {
+        return [];
+    }
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Repository\MessageLogRepository;
+
+final class ShapeController
+{
+    public function index(MessageLogRepository $repository): void
+    {
+        $pagination = $repository->fetchRows();
+
+        $items = [];
+        $items[] = ['🇺🇸中国བོད' => 'label', 'nr' => 'NR-1', 'code' => 'ERR', 'description' => 'Failure'];
+
+        $fields = [
+            ['name' => 'operatorCode', 'type' => 'choice', 'required' => true],
+            ['name' => 'comment', 'type' => 'text', 'required' => false],
+        ];
+        $result = ['success' => true, 'message' => 'Saved'];
+        $configParams = [
+            'encryption' => ['temp_dir_path' => '/tmp/lsp', 'enabled' => true],
+            'sftp' => ['host' => 'localhost', 'port' => 22],
+        ];
+
+        $this->render('message_log/index.html.twig', [
+            'pagination' => $pagination,
+            'items' => $items,
+            'config_params' => $configParams,
+        ]);
+        $this->render('extended/form.html.twig', compact('fields', 'result'));
+    }
+}
+"#;
+
+    let row_completion_marker = "/*rowcomplete*/";
+    let index_twig_with_marker = format!(
+        concat!(
+            "{{% for row in pagination %}}\n",
+            "{{{{ row.{}messageLog }}}}\n",
+            "{{% set message_log = row.messageLog %}}\n",
+            "{{{{ message_log.id }}}}\n",
+            "{{{{ message_log.messageType.name }}}}\n",
+            "{{{{ row.npId }}}}\n",
+            "{{% endfor %}}\n",
+            "{{% for item in items %}}\n",
+            "{{{{ item.nr }}}} {{{{ item.description }}}}\n",
+            "{{% endfor %}}\n",
+            "{{{{ config_params.encryption.temp_dir_path }}}}\n",
+            "{{% set enc = config_params.encryption %}}\n",
+            "{{{{ enc.temp_dir_path }}}}\n",
+            "{{{{ config_params.sftp.port }}}}\n",
+        ),
+        row_completion_marker
+    );
+    let index_twig = index_twig_with_marker.replace(row_completion_marker, "");
+    let row_completion_prefix = index_twig_with_marker
+        [..index_twig_with_marker.find(row_completion_marker).unwrap()]
+        .replace(row_completion_marker, "");
+    let row_completion_position =
+        utf16_position_for_offset(&index_twig, row_completion_prefix.len());
+    let row_foreach_offset = index_twig.find("row in pagination").unwrap();
+    let row_inlay_position =
+        utf16_position_for_offset(&index_twig, row_foreach_offset + "row".len());
+    let message_log_set_offset = index_twig.find("message_log =").unwrap();
+    let message_log_inlay_position =
+        utf16_position_for_offset(&index_twig, message_log_set_offset + "message_log".len());
+    let message_log_id_hover_position = utf16_position_at(&index_twig, "id }}");
+    let message_log_id_definition_position = utf16_position_after(&index_twig, "message_log.i");
+    let message_type_name_definition_position = utf16_position_at(&index_twig, "name }}");
+    let row_np_id_hover_position = utf16_position_at(&index_twig, "npId }}");
+    let row_np_id_definition_position = utf16_position_after(&index_twig, "row.n");
+    let item_foreach_offset = index_twig.find("item in items").unwrap();
+    let item_inlay_position =
+        utf16_position_for_offset(&index_twig, item_foreach_offset + "item".len());
+    let item_nr_hover_position = utf16_position_at(&index_twig, "nr }}");
+    let item_nr_definition_position = utf16_position_after(&index_twig, "item.n");
+    let config_temp_hover_position = utf16_position_at(&index_twig, "temp_dir_path");
+    let config_temp_definition_position = config_temp_hover_position;
+    let enc_temp_definition_position = utf16_position_after(&index_twig, "enc.t");
+    let config_port_hover_position = utf16_position_at(&index_twig, "port }}");
+    let config_port_definition_position = config_port_hover_position;
+    let index_end_position = utf16_position_for_offset(&index_twig, index_twig.len());
+
+    let field_completion_marker = "/*fieldcomplete*/";
+    let form_twig_with_marker = format!(
+        concat!(
+            "{{% for f in fields %}}\n",
+            "{{{{ f.{}type }}}}\n",
+            "{{{{ f.type }}}}\n",
+            "{{% endfor %}}\n",
+            "{{{{ result.success }}}}\n",
+        ),
+        field_completion_marker
+    );
+    let form_twig = form_twig_with_marker.replace(field_completion_marker, "");
+    let field_completion_prefix = form_twig_with_marker
+        [..form_twig_with_marker.find(field_completion_marker).unwrap()]
+        .replace(field_completion_marker, "");
+    let field_completion_position =
+        utf16_position_for_offset(&form_twig, field_completion_prefix.len());
+    let field_foreach_offset = form_twig.find("f in fields").unwrap();
+    let field_inlay_position =
+        utf16_position_for_offset(&form_twig, field_foreach_offset + "f".len());
+    let field_type_hover_position = utf16_position_at(&form_twig, "type }}");
+    let field_type_definition_position = utf16_position_after(&form_twig, "f.t");
+    let result_success_hover_position = utf16_position_at(&form_twig, "success");
+    let result_success_definition_position = utf16_position_after(&form_twig, "result.s");
+    let form_end_position = utf16_position_for_offset(&form_twig, form_twig.len());
+
+    fs::write(&message_log_path, message_log_php).unwrap();
+    fs::write(&message_type_path, message_type_php).unwrap();
+    fs::write(&repository_path, repository_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&index_twig_path, &index_twig).unwrap();
+    fs::write(&form_twig_path, &form_twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &index_twig_uri,
+            "twig",
+            &index_twig,
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &form_twig_uri,
+            "twig",
+            &form_twig,
+        ))
+        .await
+        .unwrap();
+
+    let index_diagnostics =
+        next_publish_diagnostics(&mut notifications, &index_twig_uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        index_diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "array-shape Twig index fixture should stay diagnostic-clean, got: {}",
+        index_diagnostics
+    );
+    let form_diagnostics =
+        next_publish_diagnostics(&mut notifications, &form_twig_uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        form_diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "array-shape Twig compact fixture should stay diagnostic-clean, got: {}",
+        form_diagnostics
+    );
+
+    let row_completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            2,
+            &index_twig_uri,
+            row_completion_position.0,
+            row_completion_position.1,
+        ))
+        .await
+        .unwrap();
+    let row_completion = extract_result(row_completion_resp);
+    let row_labels: Vec<String> = completion_items_from_result(&row_completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    for expected in ["messageLog", "portingRequestId", "npId"] {
+        assert!(
+            row_labels.iter().any(|label| label == expected),
+            "expected Twig row shape completion `{expected}`, got: {:?}",
+            row_labels
+        );
+    }
+
+    let field_completion_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            3,
+            &form_twig_uri,
+            field_completion_position.0,
+            field_completion_position.1,
+        ))
+        .await
+        .unwrap();
+    let field_completion = extract_result(field_completion_resp);
+    let field_labels: Vec<String> = completion_items_from_result(&field_completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    for expected in ["name", "type", "required"] {
+        assert!(
+            field_labels.iter().any(|label| label == expected),
+            "expected Twig compact field shape completion `{expected}`, got: {:?}",
+            field_labels
+        );
+    }
+
+    let row_np_id_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                4,
+                &index_twig_uri,
+                row_np_id_hover_position.0,
+                row_np_id_hover_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        hover_markdown_value(&row_np_id_hover).contains("string npId"),
+        "expected Twig row.npId hover from array shape, got: {}",
+        row_np_id_hover
+    );
+
+    let message_log_id_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                5,
+                &index_twig_uri,
+                message_log_id_hover_position.0,
+                message_log_id_hover_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let message_log_id_hover_text = hover_markdown_value(&message_log_id_hover);
+    assert!(
+        message_log_id_hover_text.contains("getId") || message_log_id_hover_text.contains("$id"),
+        "expected Twig set variable member hover to resolve MessageLog id, got: {}",
+        message_log_id_hover
+    );
+
+    for (request_id, position, expected_text) in [
+        (6, item_nr_hover_position, "string nr"),
+        (7, config_temp_hover_position, "string temp_dir_path"),
+        (8, config_port_hover_position, "int port"),
+    ] {
+        let hover = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(hover_request(
+                    request_id,
+                    &index_twig_uri,
+                    position.0,
+                    position.1,
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            hover_markdown_value(&hover).contains(expected_text),
+            "expected Twig shape hover `{expected_text}`, got: {}",
+            hover
+        );
+    }
+
+    for (request_id, position, expected_text) in [
+        (9, field_type_hover_position, "string type"),
+        (10, result_success_hover_position, "bool success"),
+    ] {
+        let hover = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(hover_request(
+                    request_id,
+                    &form_twig_uri,
+                    position.0,
+                    position.1,
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            hover_markdown_value(&hover).contains(expected_text),
+            "expected Twig compact shape hover `{expected_text}`, got: {}",
+            hover
+        );
+    }
+
+    let source_position = |source: &str, needle: &str| {
+        let (line, character) = utf16_position_at(source, needle);
+        (line as u64, character as u64)
+    };
+    for (request_id, uri, position, expected_uri, expected_position) in [
+        (
+            11,
+            index_twig_uri.as_str(),
+            row_np_id_definition_position,
+            repository_uri.as_str(),
+            source_position(repository_php, "npId"),
+        ),
+        (
+            12,
+            index_twig_uri.as_str(),
+            item_nr_definition_position,
+            controller_uri.as_str(),
+            source_position(controller_php, "nr"),
+        ),
+        (
+            13,
+            form_twig_uri.as_str(),
+            field_type_definition_position,
+            controller_uri.as_str(),
+            source_position(controller_php, "type"),
+        ),
+        (
+            14,
+            form_twig_uri.as_str(),
+            result_success_definition_position,
+            controller_uri.as_str(),
+            source_position(controller_php, "success"),
+        ),
+        (
+            15,
+            index_twig_uri.as_str(),
+            config_temp_definition_position,
+            controller_uri.as_str(),
+            source_position(controller_php, "temp_dir_path"),
+        ),
+        (
+            16,
+            index_twig_uri.as_str(),
+            enc_temp_definition_position,
+            controller_uri.as_str(),
+            source_position(controller_php, "temp_dir_path"),
+        ),
+        (
+            17,
+            index_twig_uri.as_str(),
+            config_port_definition_position,
+            controller_uri.as_str(),
+            source_position(controller_php, "port"),
+        ),
+    ] {
+        let definition = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(definition_request(request_id, uri, position.0, position.1))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            definition.get("uri").and_then(|value| value.as_str()),
+            Some(expected_uri),
+            "expected Twig source-backed shape definition request {request_id} to resolve `{expected_uri}`, got: {}",
+            definition
+        );
+        assert_eq!(
+            definition["range"]["start"]["line"].as_u64(),
+            Some(expected_position.0),
+            "expected Twig source-backed shape definition request {request_id} to jump to source line {}, got: {}",
+            expected_position.0,
+            definition
+        );
+        assert_eq!(
+            definition["range"]["start"]["character"].as_u64(),
+            Some(expected_position.1),
+            "expected Twig source-backed shape definition request {request_id} to jump to source character {}, got: {}",
+            expected_position.1,
+            definition
+        );
+    }
+
+    for (request_id, uri, position, expected_uri) in [
+        (
+            18,
+            index_twig_uri.as_str(),
+            message_log_id_definition_position,
+            message_log_uri.as_str(),
+        ),
+        (
+            19,
+            index_twig_uri.as_str(),
+            message_type_name_definition_position,
+            message_type_uri.as_str(),
+        ),
+    ] {
+        let definition = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(definition_request(request_id, uri, position.0, position.1))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            definition.get("uri").and_then(|value| value.as_str()),
+            Some(expected_uri),
+            "expected Twig definition request {request_id} to resolve `{expected_uri}`, got: {}",
+            definition
+        );
+    }
+
+    let index_inlay = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(inlay_hint_request(
+                20,
+                &index_twig_uri,
+                0,
+                0,
+                index_end_position.0,
+                index_end_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let index_hints = index_inlay.as_array().cloned().unwrap_or_default();
+    assert!(
+        index_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).is_some_and(|label| {
+                label.contains("messageLog: App\\Entity\\MessageLog")
+                    && label.contains("portingRequestId: int")
+                    && label.contains("npId: string")
+            }) && hint["position"]["line"].as_u64() == Some(row_inlay_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(row_inlay_position.1 as u64)
+        }),
+        "expected Twig row foreach inlay hint to show array shape, got: {}",
+        index_inlay
+    );
+    assert!(
+        index_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": MessageLog")
+                && hint["position"]["line"].as_u64() == Some(message_log_inlay_position.0 as u64)
+                && hint["position"]["character"].as_u64()
+                    == Some(message_log_inlay_position.1 as u64)
+                && inlay_hint_has_label_part_location(hint, "MessageLog")
+        }),
+        "expected Twig set variable inlay hint from row.messageLog with class link, got: {}",
+        index_inlay
+    );
+    assert!(
+        index_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).is_some_and(|label| {
+                label.contains("nr: string")
+                    && label.contains("code: string")
+                    && label.contains("description: string")
+            }) && hint["position"]["line"].as_u64() == Some(item_inlay_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(item_inlay_position.1 as u64)
+        }),
+        "expected Twig item foreach inlay hint from append-built array shape, got: {}",
+        index_inlay
+    );
+
+    let form_inlay = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(inlay_hint_request(
+                21,
+                &form_twig_uri,
+                0,
+                0,
+                form_end_position.0,
+                form_end_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let form_hints = form_inlay.as_array().cloned().unwrap_or_default();
+    assert!(
+        form_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).is_some_and(|label| {
+                label.contains("array{name: string")
+                    && label.contains("type: string")
+                    && label.contains("required: bool")
+            }) && hint["position"]["line"].as_u64() == Some(field_inlay_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(field_inlay_position.1 as u64)
+        }),
+        "expected Twig compact foreach inlay hint to show field array shape, got: {}",
+        form_inlay
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_twig_foreach_entity_collection_members_from_doctrine_target_entity() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();

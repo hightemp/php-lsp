@@ -338,6 +338,7 @@ impl PhpLspBackend {
             local_var_def,
             this_class_def,
             shape_def,
+            shape_member_info,
             framework_string_key_context,
             file_symbols,
             source,
@@ -393,6 +394,7 @@ impl PhpLspBackend {
                     .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig),
                 allow_blocking_file_io: false,
             };
+            let shape_member_info = shape_member_access_info_at_position(&ctx, pos.line, byte_col);
             let inferred_member_symbol = server_member_symbol_at_position(&ctx, pos.line, byte_col);
             let primary_sym = symbol_at_position_with_resolvers(
                 tree,
@@ -434,27 +436,46 @@ impl PhpLspBackend {
                 local_var_def,
                 this_class_def,
                 shape_def,
+                shape_member_info,
                 framework_string_key_context,
                 file_symbols,
                 source,
             )
         };
 
+        if let (Some(template), Some(info)) = (&template_document, &shape_member_info) {
+            if let Some(variable_name) = &info.definition_variable_name {
+                if let Some(location) = template.twig_shape_key_definition(
+                    variable_name,
+                    info.definition_target,
+                    &info.definition_path,
+                ) {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                }
+            }
+            return Ok(None);
+        }
+
         if let Some(def) = shape_def {
-            let mut range = Range {
+            let range = Range {
                 start: Position::new(def.0, def.1),
                 end: Position::new(def.2, def.3),
             };
             if let Some(template) = &template_document {
-                let Some(mapped) = template.map_virtual_range_to_original(range) else {
-                    return Ok(None);
-                };
-                range = mapped;
+                if let Some(mapped) = template.map_virtual_range_to_original(range) {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri,
+                        range: mapped,
+                    })));
+                } else {
+                    // Fall through to source-backed Twig shape definitions below.
+                }
+            } else {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri,
+                    range,
+                })));
             }
-            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                uri,
-                range,
-            })));
         }
 
         if let Some((target_uri, def)) = this_class_def {

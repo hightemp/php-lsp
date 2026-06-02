@@ -4533,7 +4533,7 @@ change.
   - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
   - Validation: Verifier subagent rerun reported no findings.
 
-- [ ] **H-TWIG-BDPN-ARRAY-SHAPE-CONTEXT-2026-06-02** Поддержать Twig hover/definition/inlayHint для array-shape и nested array context
+- [x] **H-TWIG-BDPN-ARRAY-SHAPE-CONTEXT-2026-06-02** Поддержать Twig hover/definition/inlayHint для array-shape и nested array context *(done 2026-06-02)*
   - `message_log/index.html.twig:112` `{% for row in pagination %}` сейчас inlay неверно `row: MessageLog`; ожидание shape `array{messageLog: MessageLog, portingRequestId: ...}`.
   - `message_log/index.html.twig:116` `message_log.id` и `119` `message_log.messageType.name` должны резолвиться через `row.messageLog`.
   - `porting_process/index.html.twig:139` `row.npId` должен резолвиться из shape результата `fetchProcessesIndexFiltered()`.
@@ -4541,6 +4541,14 @@ change.
   - `sftp/index.html.twig:135` `it.size` должен резолвиться из array shape результата `SFTPService::listDirectory()`.
   - `extended/form.html.twig:17` `f.type` и `68` `result.success` должны давать shape-key hover/definition.
   - Debug arrays: `debug/config.html.twig` `config_params.encryption.*` / `config_params.sftp.*`, `debug/permissions.html.twig` `process_info.*` / `check.status`, `debug/logs.html.twig` `entry.severity` должны давать useful hover/definition.
+  - Implemented: Twig context inference now preserves PHPDoc/inferred array-shape records from repository rows, literal nested arrays, append-built arrays, and `compact(...)` variables.
+  - Implemented: Twig array-shape attribute access supports shape-key completion, hover, inlay types, source-backed definition, nested keys, `foreach` item variables, and `{% set %}` aliases such as `enc = config_params.encryption`.
+  - Implemented: shape-key definitions point to PHPDoc/literal source ranges when available and avoid misleading no-op jumps back to the current Twig token.
+  - Regression: e2e covers `row.npId`, `row.messageLog`, `item.nr`, `config_params.encryption.temp_dir_path`, `f.type`, `result.success`, entity chaining through `row.messageLog`, source-backed definition ranges, `list<array{...}>`, and non-ASCII UTF-16 range handling.
+  - Docs: updated README, `docs/lsp-features.md`, `docs/architecture.md`, and `docs/production-risk-register.md`.
+  - Validation: `cargo test -p php-lsp-server lsp::templates::tests::` and `cargo test -p php-lsp-server --test e2e_templates` passed.
+  - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
+  - Validation: Verifier rerun reported no findings.
 
 - [ ] **H-TWIG-BDPN-DTO-SERVICE-CONTEXT-2026-06-02** Поддержать Twig context для DTO/service-result объектов
   - `sftp_csv/index.html.twig:81` `file.name` должен резолвиться в `SftpCsvArchiveMetadata`.

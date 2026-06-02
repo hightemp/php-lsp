@@ -3263,6 +3263,7 @@ fn test_twig_context_disk_cache_evicts_lru_entries() {
             variables: vec![TemplateVariableType {
                 name: name.to_string(),
                 type_text: type_text.to_string(),
+                shape_definitions: Vec::new(),
             }],
         }
     }
@@ -3309,6 +3310,7 @@ fn test_twig_context_disk_cache_evicts_entries_for_source_uri() {
             variables: vec![TemplateVariableType {
                 name: name.to_string(),
                 type_text: type_text.to_string(),
+                shape_definitions: Vec::new(),
             }],
         }
     }
@@ -3387,6 +3389,7 @@ async fn test_request_fs_cache_invalidation_clears_framework_and_twig_caches() {
             variables: vec![TemplateVariableType {
                 name: "user".to_string(),
                 type_text: "App\\Entity\\User".to_string(),
+                shape_definitions: Vec::new(),
             }],
         }],
     );

@@ -403,6 +403,15 @@ mutator signatures such as `addItem(Item $item)` / `removeItem(Item $item)`.
 The mutator fallback also covers getter names that do not exactly match the
 backing collection property, for example `getStatusHistory()` returning
 `$statusHistories`.
+Twig attribute access also treats PHPDoc and inferred `array{...}` shapes as
+property-style records inside Twig documents. This lets `row.npId`, nested
+chains such as `config_params.encryption.temp_dir_path`, and `{% set
+message_log = row.messageLog %}` feed hover, completion, definition, and inlay
+hints from shape keys without changing normal PHP `->` semantics. The inferred
+Twig context stores source-backed shape-key definition metadata when keys come
+from indexed PHPDoc, literal render arrays, append-built arrays, or `compact`
+locals, so `textDocument/definition` can jump to the PHP source key instead of
+falling back to the current Twig member token.
 When a mapped `foreach` iterates a known but non-parameterized `array` or
 `iterable`, the value variable can still expose `mixed` in hover; inlay hints
 continue to suppress `mixed` labels to avoid noise.
@@ -412,11 +421,15 @@ Twig context variables are inferred statically from simple PHP
 expressions include `new Class()`, simple arrays of new objects, typed
 controller parameter variables passed through to the render context, nullable
 locals assigned conditionally before render, and indexed
-`$this->service->method()` return types. Repository method results with iterable
-PHPDoc/native return types can seed collection context variables; Doctrine magic
-`find*` and `findOneBy*` repository results can seed entity or nullable entity
-context variables. Short PHPDoc class names are resolved against the file where
-the indexed method is declared before they become Twig foreach item types.
+`$this->service->method()` return types. Literal associative arrays are rendered
+as nested array shapes, `$items[] = [...]` append patterns become
+`array<int, array{...}>`, and `compact('name')` render contexts look up the
+latest local assignment or parameter type for each compacted variable.
+Repository method results with iterable PHPDoc/native return types can seed
+collection context variables; Doctrine magic `find*` and `findOneBy*`
+repository results can seed entity or nullable entity context variables. Short
+PHPDoc class names are resolved against the file where the indexed method is
+declared before they become Twig foreach item types.
 Knp-style pagination variables can also expose Doctrine repository/query-builder
 item types, so `{% for item in pagination %}` can inherit the entity type
 without booting Symfony. Custom Doctrine repositories are resolved from indexed

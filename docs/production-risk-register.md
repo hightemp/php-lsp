@@ -379,6 +379,12 @@ Current evidence:
   variables. This restored class-linked hover/inlay hints and property
   hover/definition/completion for `messageLog.*` in the `bdpn-ui` debt
   suspension message-log table.
+- `H-TWIG-BDPN-ARRAY-SHAPE-CONTEXT-2026-06-02` adds Twig array-shape context
+  support for repository rows, literal nested arrays, append-built arrays, and
+  `compact(...)` render variables. Shape-key hover, source-backed definition,
+  completion, and inlay hints now work for records such as `row.npId`,
+  `row.messageLog`, `item.nr`, `config_params.encryption.temp_dir_path`,
+  `f.type`, and `result.success`.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

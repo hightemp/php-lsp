@@ -1107,6 +1107,7 @@ pub(in crate::server) fn byte_offset_to_line_col(source: &str, byte_offset: usiz
 pub(in crate::server) enum ShapeCompletionKind {
     ArrayKey,
     ObjectProperty,
+    TwigAttribute,
 }
 
 pub(in crate::server) fn shape_completion_items_from_type_info(
@@ -1144,6 +1145,13 @@ pub(in crate::server) fn shape_completion_items_from_type_info(
                         format!("object shape property: {}", item.value)
                     }
                 }
+                ShapeCompletionKind::TwigAttribute => {
+                    if item.optional {
+                        format!("optional Twig shape attribute: {}", item.value)
+                    } else {
+                        format!("Twig shape attribute: {}", item.value)
+                    }
+                }
             };
             let insert_text = match (kind, quote) {
                 (ShapeCompletionKind::ArrayKey, None) => Some(format!("'{key}'")),
@@ -1154,7 +1162,9 @@ pub(in crate::server) fn shape_completion_items_from_type_info(
                 label: key.clone(),
                 kind: Some(match kind {
                     ShapeCompletionKind::ArrayKey => lsp_types::CompletionItemKind::FIELD,
-                    ShapeCompletionKind::ObjectProperty => lsp_types::CompletionItemKind::PROPERTY,
+                    ShapeCompletionKind::ObjectProperty | ShapeCompletionKind::TwigAttribute => {
+                        lsp_types::CompletionItemKind::PROPERTY
+                    }
                 }),
                 detail: Some(detail),
                 sort_text: Some(format!(
@@ -1166,7 +1176,7 @@ pub(in crate::server) fn shape_completion_items_from_type_info(
                 insert_text,
                 commit_characters: Some(match kind {
                     ShapeCompletionKind::ArrayKey => vec!["'".to_string(), "\"".to_string()],
-                    ShapeCompletionKind::ObjectProperty => {
+                    ShapeCompletionKind::ObjectProperty | ShapeCompletionKind::TwigAttribute => {
                         vec!["(".to_string(), ";".to_string(), ",".to_string()]
                     }
                 }),
@@ -1199,11 +1209,19 @@ pub(in crate::server) fn collect_shape_completion_items(
             collect_shape_completion_items(if_type, kind, seen, out);
             collect_shape_completion_items(else_type, kind, seen, out);
         }
-        php_lsp_types::TypeInfo::ArrayShape(items) if kind == ShapeCompletionKind::ArrayKey => {
+        php_lsp_types::TypeInfo::ArrayShape(items)
+            if matches!(
+                kind,
+                ShapeCompletionKind::ArrayKey | ShapeCompletionKind::TwigAttribute
+            ) =>
+        {
             collect_named_shape_items(items, seen, out);
         }
         php_lsp_types::TypeInfo::ObjectShape(items)
-            if kind == ShapeCompletionKind::ObjectProperty =>
+            if matches!(
+                kind,
+                ShapeCompletionKind::ObjectProperty | ShapeCompletionKind::TwigAttribute
+            ) =>
         {
             collect_named_shape_items(items, seen, out);
         }
@@ -1249,14 +1267,14 @@ pub(in crate::server) enum ShapeDefinitionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::server) struct ShapePathSegment {
-    key: String,
-    kind: ShapeDefinitionKind,
+    pub(in crate::server) key: String,
+    pub(in crate::server) kind: ShapeDefinitionKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::server) struct ShapeDefinitionAccess {
-    root_var: String,
-    segments: Vec<ShapePathSegment>,
+    pub(in crate::server) root_var: String,
+    pub(in crate::server) segments: Vec<ShapePathSegment>,
 }
 
 pub(in crate::server) fn shape_definition_at_position(

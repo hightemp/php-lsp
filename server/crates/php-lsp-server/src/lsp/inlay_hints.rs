@@ -1,5 +1,7 @@
 //! Inlay Hints LSP handlers extracted from `server.rs`.
 
+use crate::template::TemplateShapeDefinitionTarget;
+
 use super::super::*;
 
 impl PhpLspBackend {
@@ -418,6 +420,18 @@ pub(in crate::server) struct LocalVariableHoverData {
     pub(in crate::server) phpdoc_comment: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(in crate::server) struct ShapeMemberAccessInfo {
+    pub(in crate::server) member_name: String,
+    pub(in crate::server) type_info: php_lsp_types::TypeInfo,
+    pub(in crate::server) owner_fqn: String,
+    pub(in crate::server) uri: String,
+    pub(in crate::server) range: (u32, u32, u32, u32),
+    pub(in crate::server) definition_variable_name: Option<String>,
+    pub(in crate::server) definition_target: TemplateShapeDefinitionTarget,
+    pub(in crate::server) definition_path: Vec<String>,
+}
+
 pub(in crate::server) fn add_local_variable_type_inlay_hint(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
@@ -558,6 +572,17 @@ pub(in crate::server) fn local_variable_inlay_type_from_expression(
         | "nullsafe_member_call_expression"
         | "scoped_call_expression" => {
             local_variable_inlay_type_from_call_expression(ctx, expression)
+        }
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            server_expression_type_info(ctx, expression).and_then(|type_info| {
+                local_variable_inlay_type_from_type_info(
+                    ctx,
+                    &type_info.owner_fqn,
+                    &type_info.uri,
+                    &type_info.type_info,
+                    true,
+                )
+            })
         }
         "cast_expression" => local_variable_inlay_type_from_cast_expression(ctx, expression),
         "conditional_expression" => {
@@ -729,6 +754,17 @@ pub(in crate::server) fn server_member_access_expression_type_info(
     }
 
     let receiver_type = server_expression_type_info(ctx, object)?;
+    if let Some(shape_type) = shape_attribute_type_info_for_access(
+        &receiver_type.type_info,
+        property_name,
+        ctx.allow_twig_property_accessors,
+    ) {
+        return Some(IndexedExpressionTypeInfo {
+            type_info: shape_type,
+            owner_fqn: receiver_type.owner_fqn,
+            uri: receiver_type.uri,
+        });
+    }
     let receiver_fqn = type_info_fqn_from_index(
         ctx.index,
         &receiver_type.owner_fqn,
@@ -952,6 +988,233 @@ pub(in crate::server) fn server_member_symbol_at_position(
     None
 }
 
+pub(in crate::server) fn shape_member_access_info_at_position(
+    ctx: &InlayHintContext<'_>,
+    line: u32,
+    byte_col: u32,
+) -> Option<ShapeMemberAccessInfo> {
+    let point = tree_sitter::Point::new(line as usize, byte_col as usize);
+    let mut node = ctx
+        .tree
+        .root_node()
+        .descendant_for_point_range(point, point)?;
+    while !node.is_named() {
+        node = node.parent()?;
+    }
+
+    let point_range = (line, byte_col, line, byte_col);
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "member_access_expression" | "nullsafe_member_access_expression"
+        ) {
+            let name_node = member_reference_name_node(candidate)?;
+            if byte_range_contains(node_range_node(name_node), point_range) {
+                let object = candidate.child_by_field_name("object")?;
+                let receiver_type = server_expression_type_info(ctx, object)?;
+                let member_name = node_text(ctx.source, name_node).trim().to_string();
+                let property_name = member_name.trim_start_matches('$');
+                if property_name.is_empty() {
+                    return None;
+                }
+                let type_info = shape_attribute_type_info_for_access(
+                    &receiver_type.type_info,
+                    property_name,
+                    ctx.allow_twig_property_accessors,
+                )?;
+                let (definition_variable_name, definition_target, definition_path) =
+                    shape_member_definition_lookup(ctx, candidate).unwrap_or_else(|| {
+                        (
+                            None,
+                            TemplateShapeDefinitionTarget::Direct,
+                            vec![php_lsp_types::normalize_shape_key_text(property_name)],
+                        )
+                    });
+                return Some(ShapeMemberAccessInfo {
+                    member_name,
+                    type_info,
+                    owner_fqn: receiver_type.owner_fqn,
+                    uri: receiver_type.uri,
+                    range: node_range_node(name_node),
+                    definition_variable_name,
+                    definition_target,
+                    definition_path,
+                });
+            }
+        }
+        current = candidate.parent();
+    }
+
+    None
+}
+
+fn shape_member_definition_lookup(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<(Option<String>, TemplateShapeDefinitionTarget, Vec<String>)> {
+    let (root_node, path) = shape_member_access_root_and_path(ctx.source, expression)?;
+    if let Some(foreach_stmt) = enclosing_foreach_statement_for_variable(ctx.source, root_node) {
+        let iterable_node = foreach_iterable_node_for_inlay(foreach_stmt)?;
+        if iterable_node.kind() == "variable_name" {
+            return variable_text_for_node(ctx.source, iterable_node).map(|name| {
+                (
+                    Some(name.trim_start_matches('$').to_string()),
+                    TemplateShapeDefinitionTarget::IterableValue,
+                    path,
+                )
+            });
+        }
+    }
+
+    shape_member_alias_definition_lookup(ctx, root_node, &path).or_else(|| {
+        variable_text_for_node(ctx.source, root_node).map(|name| {
+            (
+                Some(name.trim_start_matches('$').to_string()),
+                TemplateShapeDefinitionTarget::Direct,
+                path,
+            )
+        })
+    })
+}
+
+fn shape_member_alias_definition_lookup(
+    ctx: &InlayHintContext<'_>,
+    root_node: tree_sitter::Node,
+    current_path: &[String],
+) -> Option<(Option<String>, TemplateShapeDefinitionTarget, Vec<String>)> {
+    let variable_name = variable_text_for_node(ctx.source, root_node)?;
+    let scope = local_variable_scope_node(root_node);
+    let (_, rhs) = latest_assignment_rhs_before_usage(
+        scope,
+        &variable_name,
+        root_node.start_byte(),
+        ctx.source,
+    )?;
+    let (rhs_root, mut path) = shape_member_access_root_and_path(ctx.source, rhs)?;
+    path.extend(current_path.iter().cloned());
+
+    if let Some(foreach_stmt) = enclosing_foreach_statement_for_variable(ctx.source, rhs_root) {
+        let iterable_node = foreach_iterable_node_for_inlay(foreach_stmt)?;
+        if iterable_node.kind() == "variable_name" {
+            return variable_text_for_node(ctx.source, iterable_node).map(|name| {
+                (
+                    Some(name.trim_start_matches('$').to_string()),
+                    TemplateShapeDefinitionTarget::IterableValue,
+                    path,
+                )
+            });
+        }
+    }
+
+    variable_text_for_node(ctx.source, rhs_root).map(|name| {
+        (
+            Some(name.trim_start_matches('$').to_string()),
+            TemplateShapeDefinitionTarget::Direct,
+            path,
+        )
+    })
+}
+
+fn shape_member_access_root_and_path<'tree>(
+    source: &str,
+    expression: tree_sitter::Node<'tree>,
+) -> Option<(tree_sitter::Node<'tree>, Vec<String>)> {
+    let expression = normalized_expression_node(expression);
+    if !matches!(
+        expression.kind(),
+        "member_access_expression" | "nullsafe_member_access_expression"
+    ) {
+        return None;
+    }
+    let name_node = member_reference_name_node(expression)?;
+    let member_name = node_text(source, name_node).trim();
+    let property_name = member_name.trim_start_matches('$');
+    if property_name.is_empty() {
+        return None;
+    }
+    let object = normalized_expression_node(expression.child_by_field_name("object")?);
+    let key = php_lsp_types::normalize_shape_key_text(property_name);
+    if object.kind() == "variable_name" {
+        return Some((object, vec![key]));
+    }
+    let (root, mut path) = shape_member_access_root_and_path(source, object)?;
+    path.push(key);
+    Some((root, path))
+}
+
+pub(in crate::server) fn shape_attribute_type_info_for_access(
+    type_info: &php_lsp_types::TypeInfo,
+    property_name: &str,
+    allow_array_shape_attribute: bool,
+) -> Option<php_lsp_types::TypeInfo> {
+    match type_info {
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            shape_attribute_type_info_for_access(inner, property_name, allow_array_shape_attribute)
+        }
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            let mut matches = Vec::new();
+            for ty in types {
+                if let Some(found) = shape_attribute_type_info_for_access(
+                    ty,
+                    property_name,
+                    allow_array_shape_attribute,
+                ) {
+                    if !matches.iter().any(|existing| existing == &found) {
+                        matches.push(found);
+                    }
+                }
+            }
+            match matches.len() {
+                0 => None,
+                1 => matches.into_iter().next(),
+                _ => Some(php_lsp_types::TypeInfo::Union(matches)),
+            }
+        }
+        php_lsp_types::TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => {
+            let mut matches = Vec::new();
+            for ty in [if_type.as_ref(), else_type.as_ref()] {
+                if let Some(found) = shape_attribute_type_info_for_access(
+                    ty,
+                    property_name,
+                    allow_array_shape_attribute,
+                ) {
+                    if !matches.iter().any(|existing| existing == &found) {
+                        matches.push(found);
+                    }
+                }
+            }
+            match matches.len() {
+                0 => None,
+                1 => matches.into_iter().next(),
+                _ => Some(php_lsp_types::TypeInfo::Union(matches)),
+            }
+        }
+        php_lsp_types::TypeInfo::ArrayShape(items) if allow_array_shape_attribute => {
+            shape_item_type_info(items, property_name)
+        }
+        php_lsp_types::TypeInfo::ObjectShape(items) => shape_item_type_info(items, property_name),
+        _ => None,
+    }
+}
+
+fn shape_item_type_info(
+    items: &[php_lsp_types::ArrayShapeItem],
+    property_name: &str,
+) -> Option<php_lsp_types::TypeInfo> {
+    let normalized = php_lsp_types::normalize_shape_key_text(property_name);
+    items
+        .iter()
+        .find(|item| {
+            item.key
+                .as_deref()
+                .is_some_and(|key| php_lsp_types::normalize_shape_key_text(key) == normalized)
+        })
+        .map(|item| item.value.clone())
+}
+
 pub(in crate::server) fn server_expression_type_info(
     ctx: &InlayHintContext<'_>,
     expression: tree_sitter::Node,
@@ -1006,11 +1269,34 @@ pub(in crate::server) fn server_variable_type_info(
         });
     }
 
+    if let Some(type_info) = server_variable_assignment_type_info(ctx, variable_node) {
+        return Some(type_info);
+    }
+
     call_site_variable_phpdoc_type(ctx, variable_node).map(|type_info| IndexedExpressionTypeInfo {
         type_info,
         owner_fqn: current_class_fqn(ctx.file_symbols).unwrap_or_default(),
         uri: String::new(),
     })
+}
+
+fn server_variable_assignment_type_info(
+    ctx: &InlayHintContext<'_>,
+    variable_node: tree_sitter::Node,
+) -> Option<IndexedExpressionTypeInfo> {
+    let variable_name = variable_text_for_node(ctx.source, variable_node)?;
+    let scope = local_variable_scope_node(variable_node);
+    let (_, rhs) = latest_assignment_rhs_before_usage(
+        scope,
+        &variable_name,
+        variable_node.start_byte(),
+        ctx.source,
+    )?;
+    let rhs = normalized_expression_node(rhs);
+    if rhs.kind() == "variable_name" {
+        return None;
+    }
+    server_expression_type_info(ctx, rhs)
 }
 
 pub(in crate::server) fn doctrine_repository_call_type_info(

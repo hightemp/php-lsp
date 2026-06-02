@@ -270,6 +270,9 @@ impl PhpLspBackend {
                 &inference_ctx,
                 object_expr,
                 member_prefix,
+                template_document
+                    .as_ref()
+                    .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig),
             );
             if let Some(class_fqn) = class_fqn {
                 let mut seen_labels: HashSet<String> =
@@ -1015,18 +1018,21 @@ impl PhpLspBackend {
         ctx: &CompletionInferenceContext<'_>,
         object_expr: &str,
         member_prefix: &str,
+        allow_twig_array_shape_attributes: bool,
     ) {
         let Some(type_info) = self.infer_completion_type_info(ctx, object_expr) else {
             return;
         };
 
         let mut seen: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
-        for item in shape_completion_items_from_type_info(
-            &type_info,
-            ShapeCompletionKind::ObjectProperty,
-            member_prefix,
-            None,
-        ) {
+        let shape_kind = if allow_twig_array_shape_attributes {
+            ShapeCompletionKind::TwigAttribute
+        } else {
+            ShapeCompletionKind::ObjectProperty
+        };
+        for item in
+            shape_completion_items_from_type_info(&type_info, shape_kind, member_prefix, None)
+        {
             if seen.insert(item.label.clone()) {
                 items.push(item);
             }

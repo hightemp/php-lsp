@@ -19,7 +19,7 @@ impl PhpLspBackend {
         tracing::debug!("hover: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position and local variable hover info inside a block so DashMap guard is dropped.
-        let (sym_at_pos, local_var_hover, file_symbols, source) = {
+        let (sym_at_pos, local_var_hover, shape_member_hover, file_symbols, source) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -79,6 +79,7 @@ impl PhpLspBackend {
                 .and_then(|variable_node| local_variable_hover_data(&ctx, variable_node));
 
             let inferred_member_symbol = server_member_symbol_at_position(&ctx, pos.line, byte_col);
+            let shape_member_hover = shape_member_access_info_at_position(&ctx, pos.line, byte_col);
 
             // Find symbol at cursor position (with resolver for chains)
             let primary_sym_at_pos = symbol_at_position_with_request_cache(
@@ -122,7 +123,13 @@ impl PhpLspBackend {
                 }
             };
 
-            (sym_at_pos, local_var_hover, file_symbols, source)
+            (
+                sym_at_pos,
+                local_var_hover,
+                shape_member_hover,
+                file_symbols,
+                source,
+            )
         };
 
         // Look up symbol in index (with lazy vendor fallback)
@@ -391,6 +398,39 @@ impl PhpLspBackend {
                     value: content,
                 }),
                 range: Some(hover_range),
+            })
+        } else if let Some(shape_member_hover) = shape_member_hover {
+            let display = local_variable_type_info_display(
+                &self.index,
+                &shape_member_hover.owner_fqn,
+                &shape_member_hover.uri,
+                &shape_member_hover.type_info,
+                &file_symbols,
+            );
+            let type_hint = LocalVariableInlayType {
+                display: display.clone(),
+                target_fqn: single_inlay_target_fqn_from_type_info(
+                    &self.index,
+                    &shape_member_hover.owner_fqn,
+                    &shape_member_hover.uri,
+                    &shape_member_hover.type_info,
+                ),
+            };
+            let mut content = String::new();
+            content.push_str("```php\n");
+            content.push_str(&display);
+            content.push(' ');
+            content.push_str(&shape_member_hover.member_name);
+            content.push_str("\n```\n");
+            content.push_str("\n**Type:** ");
+            content.push_str(&local_variable_type_markdown(&self.index, &type_hint));
+            content.push('\n');
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: content,
+                }),
+                range: Some(range_from_byte_range(&source, shape_member_hover.range)),
             })
         } else if let Some(var_info) = local_var_hover {
             let mut content = String::new();
