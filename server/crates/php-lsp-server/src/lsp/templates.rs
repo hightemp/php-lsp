@@ -239,6 +239,19 @@ fn merge_twig_context_variable_type(
         None | Some("mixed") => {
             variables.insert(name, type_text);
         }
+        Some("null") => {
+            variables.insert(name, twig_context_type_text_with_null(&type_text));
+        }
+        Some(existing) if type_text == "null" => {
+            variables.insert(name, twig_context_type_text_with_null(existing));
+        }
+        Some(existing) if twig_context_type_text_has_null(&type_text) => {
+            if let Some(merged) =
+                merge_twig_context_type_texts(vec![existing.to_string(), type_text])
+            {
+                variables.insert(name, merged);
+            }
+        }
         Some(_) => {}
     }
 }
@@ -285,6 +298,9 @@ fn infer_twig_context_value_type_inner(
 ) -> Option<String> {
     let (start, end) = trim_source_range(source, range.0, range.1);
     let value = source.get(start..end)?.trim();
+    if value.eq_ignore_ascii_case("null") {
+        return Some("null".to_string());
+    }
     if value.starts_with('[') || value.starts_with("array") {
         if let Some(class_name) = first_new_class_name(value) {
             return Some(format!(
@@ -310,6 +326,26 @@ fn infer_twig_context_value_type_inner(
         {
             return Some(type_text);
         }
+    }
+
+    if let Some(type_text) = twig_context_member_call_type_text(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        visited_variables,
+    ) {
+        return Some(type_text);
+    }
+
+    if let Some(type_text) = twig_context_member_access_type_text(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        visited_variables,
+    ) {
+        return Some(type_text);
     }
 
     if let Some(item_type) = infer_twig_paginated_source_item_type(
@@ -354,9 +390,28 @@ fn infer_twig_context_assignment_value_type(
         return None;
     }
 
-    let assignment =
-        latest_simple_variable_assignment_before(source, value_start, variable_name, file_symbols)?;
-    infer_twig_context_value_type_inner(source, assignment, file_symbols, index, visited_variables)
+    let assignments =
+        simple_variable_assignments_before(source, value_start, variable_name, file_symbols)?;
+    let latest = assignments.last().copied()?;
+    let latest_type = infer_twig_context_value_type_inner(
+        source,
+        latest,
+        file_symbols,
+        index,
+        visited_variables,
+    )?;
+    if latest_type == "null" || twig_context_type_text_has_null(&latest_type) {
+        return Some(latest_type);
+    }
+
+    let has_previous_null = assignments[..assignments.len().saturating_sub(1)]
+        .iter()
+        .any(|assignment| php_source_range_is_null_literal(source, *assignment));
+    if has_previous_null {
+        return Some(twig_context_type_text_with_null(&latest_type));
+    }
+
+    Some(latest_type)
 }
 
 fn latest_simple_variable_assignment_before(
@@ -365,12 +420,23 @@ fn latest_simple_variable_assignment_before(
     variable_name: &str,
     file_symbols: &php_lsp_types::FileSymbols,
 ) -> Option<(usize, usize)> {
+    simple_variable_assignments_before(source, value_start, variable_name, file_symbols)?
+        .into_iter()
+        .last()
+}
+
+fn simple_variable_assignments_before(
+    source: &str,
+    value_start: usize,
+    variable_name: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<Vec<(usize, usize)>> {
     let scope_start = containing_callable_byte_range(source, value_start, file_symbols)
         .map(|range| range.0)
         .unwrap_or(0);
     let search_end = value_start.min(source.len());
     let needle = format!("${variable_name}");
-    let mut latest = None;
+    let mut assignments = Vec::new();
     let mut offset = scope_start;
 
     while offset < search_end {
@@ -401,14 +467,108 @@ fn latest_simple_variable_assignment_before(
 
         let rhs_start = skip_ascii_ws_server(source, equals + 1);
         if let Some(rhs_end) = find_php_statement_end(source, rhs_start, search_end) {
-            latest = Some(trim_source_range(source, rhs_start, rhs_end));
+            assignments.push(trim_source_range(source, rhs_start, rhs_end));
             offset = rhs_end + 1;
         } else {
             offset = after_variable;
         }
     }
 
-    latest
+    (!assignments.is_empty()).then_some(assignments)
+}
+
+fn merge_twig_context_type_texts(types: Vec<String>) -> Option<String> {
+    let mut non_null = Vec::<String>::new();
+    let mut saw_null = false;
+    let mut saw_mixed = false;
+
+    for type_text in types {
+        for part in split_twig_context_union_type_text(&type_text) {
+            if part.eq_ignore_ascii_case("mixed") {
+                saw_mixed = true;
+                continue;
+            }
+            if part.eq_ignore_ascii_case("null") {
+                saw_null = true;
+                continue;
+            }
+
+            if let Some(inner) = part.strip_prefix('?') {
+                saw_null = true;
+                if !inner.is_empty() && !non_null.iter().any(|existing| existing == inner) {
+                    non_null.push(inner.to_string());
+                }
+                continue;
+            }
+
+            if !non_null.iter().any(|existing| existing == part) {
+                non_null.push(part.to_string());
+            }
+        }
+    }
+
+    if non_null.is_empty() {
+        return saw_null
+            .then(|| "null".to_string())
+            .or_else(|| saw_mixed.then(|| "mixed".to_string()));
+    }
+
+    if saw_null && non_null.len() == 1 {
+        return Some(format!("?{}", non_null[0]));
+    }
+
+    let joined = non_null.join("|");
+    Some(if saw_null {
+        format!("{joined}|null")
+    } else {
+        joined
+    })
+}
+
+fn twig_context_type_text_has_null(type_text: &str) -> bool {
+    split_twig_context_union_type_text(type_text)
+        .into_iter()
+        .any(|part| part == "null" || part.starts_with('?'))
+}
+
+fn twig_context_type_text_with_null(type_text: &str) -> String {
+    merge_twig_context_type_texts(vec![type_text.to_string(), "null".to_string()])
+        .unwrap_or_else(|| type_text.to_string())
+}
+
+fn php_source_range_is_null_literal(source: &str, range: (usize, usize)) -> bool {
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    source
+        .get(start..end)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("null"))
+}
+
+fn split_twig_context_union_type_text(type_text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut angle_depth = 0usize;
+
+    for (offset, ch) in type_text.char_indices() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '|' if angle_depth == 0 => {
+                let part = type_text[start..offset].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = offset + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let part = type_text[start..].trim();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+
+    parts
 }
 
 fn containing_callable_byte_range(
@@ -504,6 +664,12 @@ struct PhpMemberCallParts<'a> {
     object_range: (usize, usize),
     method_name: &'a str,
     args_range: (usize, usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PhpMemberAccessParts<'a> {
+    object_range: (usize, usize),
+    member_name: &'a str,
 }
 
 fn infer_twig_paginated_source_item_type(
@@ -614,6 +780,9 @@ fn twig_context_expression_type_text(
 ) -> Option<String> {
     let (start, end) = trim_source_range(source, range.0, range.1);
     let value = source.get(start..end)?.trim();
+    if value == "$this" {
+        return containing_class_fqn_at_offset(source, start, file_symbols);
+    }
     if let Some(variable_name) = simple_php_variable_name(value) {
         return infer_twig_context_assignment_value_type(
             source,
@@ -625,8 +794,113 @@ fn twig_context_expression_type_text(
         )
         .or_else(|| infer_twig_context_variable_type(source, start, variable_name, file_symbols));
     }
+    if let Some(type_text) = twig_context_member_call_type_text(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        visited_variables,
+    ) {
+        return Some(type_text);
+    }
+    if let Some(type_text) = twig_context_member_access_type_text(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        visited_variables,
+    ) {
+        return Some(type_text);
+    }
     first_new_class_name(value)
         .map(|class_name| resolve_twig_context_class_name(file_symbols, class_name))
+}
+
+fn twig_context_member_call_type_text(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<String> {
+    let index = index?;
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    let call = php_member_call_parts(source, start, end)?;
+    let receiver_type = twig_context_expression_type_text(
+        source,
+        call.object_range,
+        file_symbols,
+        Some(index),
+        visited_variables,
+    )?;
+    for receiver_fqn in twig_context_candidate_type_fqns(&receiver_type) {
+        if let Some(type_text) = twig_context_repository_member_call_type_text(
+            index,
+            &receiver_fqn,
+            call.method_name,
+            file_symbols,
+        ) {
+            return Some(type_text);
+        }
+
+        let method_fqn = format!("{receiver_fqn}::{}", call.method_name);
+        let Some(symbol) = index.resolve_member(&method_fqn) else {
+            continue;
+        };
+        if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Method) {
+            continue;
+        }
+        if let Some(return_type) = symbol_effective_return_type(&symbol) {
+            return twig_context_type_info_text_for_symbol(
+                index,
+                file_symbols,
+                &symbol,
+                &receiver_fqn,
+                &return_type,
+            );
+        }
+    }
+
+    None
+}
+
+fn twig_context_member_access_type_text(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<String> {
+    let index = index?;
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    let access = php_member_access_parts(source, start, end)?;
+    let receiver_type = twig_context_expression_type_text(
+        source,
+        access.object_range,
+        file_symbols,
+        Some(index),
+        visited_variables,
+    )?;
+    for receiver_fqn in twig_context_candidate_type_fqns(&receiver_type) {
+        let property_fqn = format!("{receiver_fqn}::${}", access.member_name);
+        let Some(symbol) = index.resolve_member(&property_fqn) else {
+            continue;
+        };
+        if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Property) {
+            continue;
+        }
+        if let Some(property_type) = symbol_effective_return_type(&symbol) {
+            return twig_context_type_info_text_for_symbol(
+                index,
+                file_symbols,
+                &symbol,
+                &receiver_fqn,
+                &property_type,
+            );
+        }
+    }
+
+    None
 }
 
 fn php_member_call_parts<'a>(
@@ -708,6 +982,163 @@ fn php_member_call_parts<'a>(
     latest
 }
 
+fn php_member_access_parts<'a>(
+    source: &'a str,
+    start: usize,
+    end: usize,
+) -> Option<PhpMemberAccessParts<'a>> {
+    let mut latest = None;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut offset = start;
+
+    while offset < end {
+        let ch = source[offset..end].chars().next()?;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if paren_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+            && (source[offset..end].starts_with("->") || source[offset..end].starts_with("?->"))
+        {
+            let operator_len = if source[offset..end].starts_with("?->") {
+                "?->".len()
+            } else {
+                "->".len()
+            };
+            let member_start = skip_ascii_ws_server(source, offset + operator_len);
+            let member_end = scan_php_class_name_end(source, member_start);
+            if member_end <= member_start {
+                offset += operator_len;
+                continue;
+            }
+            let after_member = skip_ascii_ws_server(source, member_end);
+            if source.as_bytes().get(after_member) == Some(&b'(') {
+                offset = member_end;
+                continue;
+            }
+            latest = Some(PhpMemberAccessParts {
+                object_range: trim_source_range(source, start, offset),
+                member_name: source.get(member_start..member_end)?,
+            });
+            offset = member_end;
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+        offset += ch.len_utf8();
+    }
+
+    latest
+}
+
+fn twig_context_candidate_type_fqns(type_text: &str) -> Vec<String> {
+    split_twig_context_union_type_text(type_text)
+        .into_iter()
+        .filter_map(|part| {
+            let candidate = part
+                .trim()
+                .trim_start_matches('?')
+                .trim_start_matches('\\')
+                .split_once('<')
+                .map(|(base, _)| base)
+                .unwrap_or_else(|| part.trim().trim_start_matches('?').trim_start_matches('\\'))
+                .trim();
+            let lower = candidate.to_ascii_lowercase();
+            (!candidate.is_empty() && !twig_context_builtin_type_name(&lower))
+                .then(|| candidate.to_string())
+        })
+        .collect()
+}
+
+fn containing_class_fqn_at_offset(
+    source: &str,
+    offset: usize,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<String> {
+    let position = byte_line_col_at_offset(source, offset);
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                php_lsp_types::PhpSymbolKind::Class
+                    | php_lsp_types::PhpSymbolKind::Interface
+                    | php_lsp_types::PhpSymbolKind::Trait
+                    | php_lsp_types::PhpSymbolKind::Enum
+            ) && byte_position_in_range(position, symbol.range)
+        })
+        .min_by_key(|symbol| symbol_range_len(symbol.range))
+        .map(|symbol| symbol.fqn.clone())
+}
+
+fn twig_context_repository_member_call_type_text(
+    index: &WorkspaceIndex,
+    repository_fqn: &str,
+    method_name: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<String> {
+    let repository_fqn = repository_fqn.trim_start_matches('\\');
+    let entity_fqn = doctrine_repository_entity_from_type_text(index, repository_fqn)?;
+
+    let method_fqn = format!("{repository_fqn}::{method_name}");
+    if let Some(symbol) = index.resolve_member(&method_fqn) {
+        if let Some(return_type) = symbol_effective_return_type(&symbol) {
+            if let Some(value_type) = iterable_value_type_info(&return_type, None) {
+                let item_type = twig_context_type_info_text_for_symbol(
+                    index,
+                    file_symbols,
+                    &symbol,
+                    repository_fqn,
+                    &value_type,
+                )?;
+                return Some(format!("array<int, {item_type}>"));
+            }
+            return twig_context_type_info_text_for_symbol(
+                index,
+                file_symbols,
+                &symbol,
+                repository_fqn,
+                &return_type,
+            );
+        }
+    }
+
+    let lower = method_name.to_ascii_lowercase();
+    if lower == "find" || lower.starts_with("findoneby") {
+        return Some(format!("?{entity_fqn}"));
+    }
+    if lower == "findall" || lower == "matching" || lower == "findby" || lower.starts_with("findby")
+    {
+        return Some(format!("array<int, {entity_fqn}>"));
+    }
+
+    None
+}
+
 fn doctrine_repository_entity_from_type_text(
     index: &WorkspaceIndex,
     repository_fqn: &str,
@@ -724,7 +1155,33 @@ fn doctrine_repository_entity_from_type_text(
         }
     }
 
+    if let Some(entity_fqn) =
+        doctrine_repository_entity_from_repository_class_binding(index, repository_fqn)
+    {
+        return Some(entity_fqn);
+    }
+
     conventional_entity_fqn_for_repository(index, repository_fqn)
+}
+
+fn doctrine_repository_entity_from_repository_class_binding(
+    index: &WorkspaceIndex,
+    repository_fqn: &str,
+) -> Option<String> {
+    let repository_fqn = repository_fqn.trim_start_matches('\\');
+    index.types.iter().find_map(|entry| {
+        let symbol = entry.value();
+        if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class) {
+            return None;
+        }
+
+        symbol.template_bindings.iter().find_map(|binding| {
+            if binding.kind != php_lsp_types::TemplateBindingKind::RepositoryClass {
+                return None;
+            }
+            fqn_eq(&binding.target, repository_fqn).then(|| symbol.fqn.clone())
+        })
+    })
 }
 
 fn conventional_entity_fqn_for_repository(

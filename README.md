@@ -222,7 +222,9 @@ phpstorm-stubs support.
   collection mutator signatures. Twig
   context variables are inferred only from static `render(..., [...])` call
   sites, including `new Class()`, arrays of new objects, typed controller
-  parameter variables, iterable repository method results, and Knp-style
+  parameter variables, nullable locals assigned conditionally before render,
+  indexed `$this->service->method()` return types, iterable repository method
+  results, Doctrine magic `find*`/`findOneBy*` repository results, and Knp-style
   paginator variables backed by Doctrine repository/query-builder sources.
   Custom Doctrine repositories can be resolved from indexed
   `@extends ServiceEntityRepository<Entity>` PHPDoc or ORM `repositoryClass`

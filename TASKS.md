@@ -4520,11 +4520,18 @@ change.
   - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
   - Validation: Verifier subagent rerun reported no issues.
 
-- [ ] **H-TWIG-BDPN-OPTIONAL-RENDER-CONTEXT-2026-06-02** Улучшить Twig render context для nullable/conditional variables вместо `mixed`
+- [x] **H-TWIG-BDPN-OPTIONAL-RENDER-CONTEXT-2026-06-02** Улучшить Twig render context для nullable/conditional variables вместо `mixed` *(done 2026-06-02)*
   - `verification_request/show.html.twig:54` `portingRequest.id` сейчас root hover `mixed $portingRequest`, member hover/definition `null`; ожидание `?App\Entity\PortingRequest`.
   - `porting_process/show.html.twig:330` `portingProcess.role` сейчас root hover `mixed $portingProcess`, member hover/definition `null`; ожидание `?App\Entity\PortingProcess`.
   - `data_request/show.html.twig:141-142` `errorCode.description` должен резолвиться в `App\Entity\ErrorCode`.
   - `verification_request/show.html.twig:182-183` `errorCode.description` должен резолвиться в `App\Entity\ErrorCode`.
+  - Implemented: render-context inference теперь выводит nullable locals из `null` + условного assignment без превращения в `mixed`.
+  - Implemented: Twig context scanner резолвит indexed PHP member call/access expressions вроде `$this->service->method()` и `$this->property`.
+  - Implemented: Doctrine repository magic `find`/`findOneBy*`/`findBy*` даёт entity/collection context, включая repositories, связанные только через ORM `repositoryClass`.
+  - Implemented: merge нескольких render call sites сохраняет `null` как nullable у точного типа, а не отбрасывает его.
+  - Validation: `cargo test -p php-lsp-server --test e2e_templates` passed.
+  - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
+  - Validation: Verifier subagent rerun reported no findings.
 
 - [ ] **H-TWIG-BDPN-ARRAY-SHAPE-CONTEXT-2026-06-02** Поддержать Twig hover/definition/inlayHint для array-shape и nested array context
   - `message_log/index.html.twig:112` `{% for row in pagination %}` сейчас inlay неверно `row: MessageLog`; ожидание shape `array{messageLog: MessageLog, portingRequestId: ...}`.

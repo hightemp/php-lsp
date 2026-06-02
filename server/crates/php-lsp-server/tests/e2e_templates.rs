@@ -897,7 +897,7 @@ final class DashboardController
     let hover = extract_result(hover_resp);
     let hover_text = hover["contents"]["value"].as_str().unwrap_or_default();
     assert!(
-        hover_text.contains("App\\Entity\\User") || hover_text.contains("User $user"),
+        hover_text.contains("?App\\Entity\\User $user"),
         "expected Twig hover to resolve typed controller parameter context, got: {}",
         hover
     );
@@ -944,6 +944,462 @@ final class DashboardController
         Some(user_uri.as_str()),
         "Twig definition should jump from typed controller parameter member to PHP symbol, got: {}",
         definition
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_twig_context_infers_nullable_conditional_render_variables() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-nullable-render-context-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Repository")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Service")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/optional")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let request_path = tmp_root.join("src/Entity/PortingRequest.php");
+    let error_code_path = tmp_root.join("src/Entity/ErrorCode.php");
+    let process_path = tmp_root.join("src/Entity/PortingProcess.php");
+    let request_repository_path = tmp_root.join("src/Repository/PortingRequestRepository.php");
+    let error_code_repository_path = tmp_root.join("src/Repository/ErrorCodeRepository.php");
+    let manager_path = tmp_root.join("src/Service/PortingProcessManager.php");
+    let controller_path = tmp_root.join("src/Controller/OptionalController.php");
+    let twig_path = tmp_root.join("templates/optional/show.html.twig");
+    let request_uri = file_uri(&request_path);
+    let error_code_uri = file_uri(&error_code_path);
+    let process_uri = file_uri(&process_path);
+    let twig_uri = file_uri(&twig_path);
+
+    let request_php = r#"<?php
+namespace App\Entity;
+
+class PortingRequest
+{
+    private int $id = 0;
+    public function getId(): int { return $this->id; }
+}
+"#;
+    let error_code_php = r#"<?php
+namespace App\Entity;
+
+use App\Repository\ErrorCodeRepository;
+use Doctrine\ORM\Mapping as ORM;
+
+#[ORM\Entity(repositoryClass: ErrorCodeRepository::class)]
+class ErrorCode
+{
+    private string $description = '';
+    public function getDescription(): string { return $this->description; }
+}
+"#;
+    let process_php = r#"<?php
+namespace App\Entity;
+
+class PortingProcess
+{
+    private string $role = '';
+    public function getRole(): string { return $this->role; }
+}
+"#;
+    let request_repository_php = r#"<?php
+namespace App\Repository;
+
+use App\Entity\PortingRequest;
+use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+
+/**
+ * @extends ServiceEntityRepository<PortingRequest>
+ */
+class PortingRequestRepository extends ServiceEntityRepository
+{
+}
+"#;
+    let error_code_repository_php = r#"<?php
+namespace App\Repository;
+
+use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+
+class ErrorCodeRepository extends ServiceEntityRepository
+{
+}
+"#;
+    let manager_php = r#"<?php
+namespace App\Service;
+
+use App\Entity\PortingProcess;
+
+class PortingProcessManager
+{
+    public function getOrCreateProcess(string $npId): ?PortingProcess
+    {
+        return null;
+    }
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Repository\ErrorCodeRepository;
+use App\Repository\PortingRequestRepository;
+use App\Service\PortingProcessManager;
+
+final class OptionalController
+{
+    public function __construct(private PortingProcessManager $portingProcessManager)
+    {
+    }
+
+    public function show(
+        string $npId,
+        PortingRequestRepository $portingRequestRepository,
+        ErrorCodeRepository $errorCodeRepository,
+    ): void {
+        $portingRequest = null;
+        if ('' !== trim($npId)) {
+            $portingRequest = $portingRequestRepository->findOneBy(['npId' => $npId]);
+        }
+
+        $errorCode = null;
+        if ('' !== $npId) {
+            $errorCode = $errorCodeRepository->findOneBy(['code' => 'ERR']);
+        }
+
+        $portingProcess = $this->portingProcessManager->getOrCreateProcess($npId);
+
+        $this->render('optional/show.html.twig', [
+            'portingRequest' => $portingRequest,
+            'errorCode' => $errorCode,
+            'portingProcess' => $portingProcess,
+        ]);
+    }
+}
+"#;
+    let completion_marker = "/*complete*/";
+    let twig_with_marker = format!(
+        concat!(
+            "{{% if portingRequest %}}\n",
+            "{{{{ portingRequest.id }}}}\n",
+            "{{% endif %}}\n",
+            "{{% if errorCode and errorCode.description %}}\n",
+            "{{{{ errorCode.description }}}}\n",
+            "{{{{ errorCode.{} }}}}\n",
+            "{{% endif %}}\n",
+            "{{{{ portingProcess.role == 'donor' ? 'Donor' : 'Recipient' }}}}\n",
+        ),
+        completion_marker
+    );
+    let twig = twig_with_marker.replace(completion_marker, "");
+    let completion_prefix = twig_with_marker[..twig_with_marker.find(completion_marker).unwrap()]
+        .replace(completion_marker, "");
+    let completion_position = utf16_position_for_offset(&twig, completion_prefix.len());
+    let porting_request_root_position = utf16_position_at(&twig, "portingRequest %}");
+    let porting_request_id_hover_position = utf16_position_for_offset(
+        &twig,
+        twig.find("portingRequest.id").unwrap() + "portingRequest.".len(),
+    );
+    let porting_request_id_definition_position = utf16_position_after(&twig, "portingRequest.i");
+    let error_code_condition_position = utf16_position_for_offset(
+        &twig,
+        twig.find("errorCode.description %}").unwrap() + "errorCode.".len(),
+    );
+    let error_code_description_definition_position = utf16_position_after(&twig, "errorCode.d");
+    let process_role_hover_position = utf16_position_for_offset(
+        &twig,
+        twig.find("portingProcess.role").unwrap() + "portingProcess.".len(),
+    );
+    let process_role_definition_position = utf16_position_after(&twig, "portingProcess.r");
+
+    fs::write(&request_path, request_php).unwrap();
+    fs::write(&error_code_path, error_code_php).unwrap();
+    fs::write(&process_path, process_php).unwrap();
+    fs::write(&request_repository_path, request_repository_php).unwrap();
+    fs::write(&error_code_repository_path, error_code_repository_php).unwrap();
+    fs::write(&manager_path, manager_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&twig_path, &twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&request_uri, request_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&error_code_uri, error_code_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&process_uri, process_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            &file_uri(&request_repository_path),
+            request_repository_php,
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            &file_uri(&error_code_repository_path),
+            error_code_repository_php,
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&file_uri(&manager_path), manager_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            &file_uri(&controller_path),
+            controller_php,
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &twig_uri, "twig", &twig,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "nullable render context Twig fixture should stay diagnostic-clean, got: {}",
+        diagnostics
+    );
+
+    let root_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                2,
+                &twig_uri,
+                porting_request_root_position.0,
+                porting_request_root_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let root_hover_text = hover_markdown_value(&root_hover);
+    assert!(
+        root_hover_text.contains("?App\\Entity\\PortingRequest $portingRequest"),
+        "expected nullable PortingRequest root hover from conditional render context, got: {}",
+        root_hover
+    );
+
+    let request_id_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                3,
+                &twig_uri,
+                porting_request_id_hover_position.0,
+                porting_request_id_hover_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let request_id_hover_text = hover_markdown_value(&request_id_hover);
+    assert!(
+        request_id_hover_text.contains("getId")
+            || request_id_hover_text.contains("$id")
+            || request_id_hover_text.contains("int"),
+        "expected PortingRequest member hover from nullable context, got: {}",
+        request_id_hover
+    );
+    let request_id_definition = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(
+                4,
+                &twig_uri,
+                porting_request_id_definition_position.0,
+                porting_request_id_definition_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        request_id_definition
+            .get("uri")
+            .and_then(|uri| uri.as_str()),
+        Some(request_uri.as_str()),
+        "expected PortingRequest.id definition to jump to entity symbol, got: {}",
+        request_id_definition
+    );
+
+    let error_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                5,
+                &twig_uri,
+                error_code_condition_position.0,
+                error_code_condition_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let error_hover_text = hover_markdown_value(&error_hover);
+    assert!(
+        error_hover_text.contains("getDescription")
+            || error_hover_text.contains("$description")
+            || error_hover_text.contains("string"),
+        "expected ErrorCode.description hover inside Twig condition, got: {}",
+        error_hover
+    );
+    let error_definition = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(
+                6,
+                &twig_uri,
+                error_code_description_definition_position.0,
+                error_code_description_definition_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        error_definition.get("uri").and_then(|uri| uri.as_str()),
+        Some(error_code_uri.as_str()),
+        "expected ErrorCode.description definition to jump to entity symbol, got: {}",
+        error_definition
+    );
+
+    let process_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                7,
+                &twig_uri,
+                process_role_hover_position.0,
+                process_role_hover_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let process_hover_text = hover_markdown_value(&process_hover);
+    assert!(
+        process_hover_text.contains("getRole")
+            || process_hover_text.contains("$role")
+            || process_hover_text.contains("string"),
+        "expected PortingProcess.role hover from service member call render context, got: {}",
+        process_hover
+    );
+    let process_definition = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(
+                8,
+                &twig_uri,
+                process_role_definition_position.0,
+                process_role_definition_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        process_definition.get("uri").and_then(|uri| uri.as_str()),
+        Some(process_uri.as_str()),
+        "expected PortingProcess.role definition to jump to entity symbol, got: {}",
+        process_definition
+    );
+
+    let completion = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(
+                9,
+                &twig_uri,
+                completion_position.0,
+                completion_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let labels: Vec<String> = completion_items_from_result(&completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "description")
+            || labels.iter().any(|label| label == "getDescription"),
+        "expected ErrorCode property-style completion from nullable render context, got: {:?}",
+        labels
     );
 
     let _ = fs::remove_dir_all(&tmp_root);

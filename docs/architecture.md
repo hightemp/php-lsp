@@ -409,11 +409,14 @@ continue to suppress `mixed` labels to avoid noise.
 
 Twig context variables are inferred statically from simple PHP
 `render('template.html.twig', ['name' => expr])` call sites. Supported context
-expressions include `new Class()`, simple arrays of new objects, and typed
-controller parameter variables passed through to the render context. Repository
-method results with iterable PHPDoc/native return types can seed collection
-context variables, and short PHPDoc class names are resolved against the file
-where the indexed method is declared before they become Twig foreach item types.
+expressions include `new Class()`, simple arrays of new objects, typed
+controller parameter variables passed through to the render context, nullable
+locals assigned conditionally before render, and indexed
+`$this->service->method()` return types. Repository method results with iterable
+PHPDoc/native return types can seed collection context variables; Doctrine magic
+`find*` and `findOneBy*` repository results can seed entity or nullable entity
+context variables. Short PHPDoc class names are resolved against the file where
+the indexed method is declared before they become Twig foreach item types.
 Knp-style pagination variables can also expose Doctrine repository/query-builder
 item types, so `{% for item in pagination %}` can inherit the entity type
 without booting Symfony. Custom Doctrine repositories are resolved from indexed
