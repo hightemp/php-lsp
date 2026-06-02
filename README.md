@@ -215,11 +215,18 @@ phpstorm-stubs support.
   semantics are skipped rather than mapped to misleading PHP, while simple
   member chains and root variables inside those expressions can still be
   source-mapped for hover/completion/definition. Twig object completion also
-  offers getter-derived property-style labels such as `id` for `getId()`. Twig
+  offers getter-derived property-style labels such as `id` for `getId()`.
+  Twig `foreach` over Doctrine entity collections exposed through
+  property-style access can infer item hover/completion/definition/inlay types
+  from indexed ORM `targetEntity` property metadata and `add*/remove*`
+  collection mutator signatures. Twig
   context variables are inferred only from static `render(..., [...])` call
   sites, including `new Class()`, arrays of new objects, typed controller
   parameter variables, iterable repository method results, and Knp-style
-  paginator variables backed by Doctrine repository/query-builder sources;
+  paginator variables backed by Doctrine repository/query-builder sources.
+  Custom Doctrine repositories can be resolved from indexed
+  `@extends ServiceEntityRepository<Entity>` PHPDoc or ORM `repositoryClass`
+  attributes without synchronous request-time source reads;
   render keys whose value type cannot be inferred are still seeded as `mixed`
   to avoid false undefined-variable diagnostics. Open Twig documents refresh
   those inferred context types after relevant PHP controller/render changes and

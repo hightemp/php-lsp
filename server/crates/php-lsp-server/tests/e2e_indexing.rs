@@ -145,6 +145,7 @@ class ServiceEntityRepository {}
             r#"<?php
 namespace App\Entity;
 
+#[\Doctrine\ORM\Mapping\Entity(repositoryClass: \App\Repository\NumberStatusRepository::class)]
 class NumberStatus {}
 class RequestStatus {}
 "#,
@@ -164,9 +165,6 @@ namespace App\Repository;
 use App\Entity\NumberStatus;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
 
-/**
- * @extends ServiceEntityRepository<NumberStatus>
- */
 class NumberStatusRepository extends ServiceEntityRepository {
     public function findByNameOrCreate(string $name): NumberStatus { return new NumberStatus(); }
 }

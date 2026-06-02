@@ -396,7 +396,13 @@ Twig member completion post-processes getter-like methods into property-style
 aliases (`getId()` -> `id`, `isActive()` -> `active`) only for Twig documents.
 If a Twig property-style alias has no backing PHP property, hover and
 definition can fall back to the zero-required-argument getter method that
-created the alias.
+created the alias. Twig `foreach` over Doctrine entity collections exposed
+through property-style access can infer item hover, completion, definition, and
+inlay types from indexed ORM `targetEntity` property metadata and collection
+mutator signatures such as `addItem(Item $item)` / `removeItem(Item $item)`.
+The mutator fallback also covers getter names that do not exactly match the
+backing collection property, for example `getStatusHistory()` returning
+`$statusHistories`.
 When a mapped `foreach` iterates a known but non-parameterized `array` or
 `iterable`, the value variable can still expose `mixed` in hover; inlay hints
 continue to suppress `mixed` labels to avoid noise.
@@ -410,7 +416,10 @@ context variables, and short PHPDoc class names are resolved against the file
 where the indexed method is declared before they become Twig foreach item types.
 Knp-style pagination variables can also expose Doctrine repository/query-builder
 item types, so `{% for item in pagination %}` can inherit the entity type
-without booting Symfony. Render keys whose value type cannot be inferred still
+without booting Symfony. Custom Doctrine repositories are resolved from indexed
+`@extends ServiceEntityRepository<Entity>` PHPDoc and indexed ORM
+`repositoryClass` attributes; request handlers avoid synchronous source reads
+for this lookup. Render keys whose value type cannot be inferred still
 seed `mixed` variables in the virtual prelude so valid templates do not publish
 false undefined-variable diagnostics just because the server cannot infer a
 richer type. The context scanner combines open PHP files from memory with a

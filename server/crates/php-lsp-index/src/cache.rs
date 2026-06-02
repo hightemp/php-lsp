@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// bytes. The cache schema fixture test below guards the representative binary
 /// shape so CI fails until this version and its fingerprint are updated
 /// together.
-pub const CACHE_SCHEMA_VERSION: u32 = 17;
+pub const CACHE_SCHEMA_VERSION: u32 = 18;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -642,9 +642,9 @@ mod tests {
     };
     use std::io::Write;
 
-    const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 17;
+    const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 18;
     const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3187;
-    const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x7bff_b1ed_2030_e33c;
+    const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x72d0_eca8_e36d_7745;
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

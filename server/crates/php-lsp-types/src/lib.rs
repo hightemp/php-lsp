@@ -267,6 +267,7 @@ pub enum TemplateBindingKind {
     Implements,
     Use,
     Mixin,
+    RepositoryClass,
 }
 
 /// A generic relation declared by `@extends`, `@implements`, `@use`, or `@mixin`.

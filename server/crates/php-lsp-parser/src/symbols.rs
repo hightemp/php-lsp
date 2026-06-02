@@ -460,7 +460,21 @@ fn extract_class_like(
         .as_ref()
         .map(|doc_node| node_text(*doc_node, source).to_string());
     let templates = phpdoc_templates(doc_comment.as_deref());
-    let template_bindings = phpdoc_template_bindings(doc_comment.as_deref(), result);
+    let mut template_bindings = phpdoc_template_bindings(doc_comment.as_deref(), result);
+    if let Some(repository_name) =
+        doctrine_repository_class_name_from_attribute_text(&attribute_prefix_for_node(node, source))
+    {
+        let repository_fqn = resolve_class_name_in_file(&repository_name, result)
+            .trim_start_matches('\\')
+            .to_string();
+        if !repository_fqn.is_empty() {
+            template_bindings.push(TemplateBinding {
+                kind: TemplateBindingKind::RepositoryClass,
+                target: repository_fqn,
+                args: vec![],
+            });
+        }
+    }
 
     // Extract extends (base_clause) and implements (class_interface_clause)
     let extends_fqns = extract_base_clause(node, source, result);
@@ -788,11 +802,15 @@ fn extract_properties(
     let visibility = extract_visibility(node, source);
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
+    let attribute_text = attribute_prefix_for_node(node, source);
 
     // Extract type annotation if present
     let native_type_info = node
         .child_by_field_name("type")
-        .map(|t| parse_type_node(t, source));
+        .map(|t| parse_type_node(t, source))
+        .map(|type_info| {
+            refine_doctrine_collection_type_from_target_entity(type_info, &attribute_text, result)
+        });
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -832,6 +850,94 @@ fn extract_properties(
             }
         }
     }
+}
+
+fn refine_doctrine_collection_type_from_target_entity(
+    type_info: TypeInfo,
+    attribute_text: &str,
+    file_symbols: &FileSymbols,
+) -> TypeInfo {
+    let Some(collection_base) = collection_base_type_name(&type_info) else {
+        return type_info;
+    };
+    let Some(target_name) = doctrine_target_entity_class_name_from_attribute_text(attribute_text)
+    else {
+        return type_info;
+    };
+    let target_fqn = resolve_class_name_in_file(&target_name, file_symbols)
+        .trim_start_matches('\\')
+        .to_string();
+    if target_fqn.is_empty() {
+        return type_info;
+    }
+
+    TypeInfo::Generic {
+        base: collection_base,
+        args: vec![
+            TypeInfo::Simple("int".to_string()),
+            TypeInfo::Simple(target_fqn),
+        ],
+    }
+}
+
+fn attribute_prefix_for_node(node: Node, source: &str) -> String {
+    let immediate = immediate_attribute_prefix(source, node.start_byte());
+    let leading = leading_attribute_prefix_from_text(node_text(node, source));
+    match (immediate.is_empty(), leading.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => immediate,
+        (true, false) => leading,
+        (false, false) => format!("{immediate} {leading}"),
+    }
+}
+
+fn collection_base_type_name(type_info: &TypeInfo) -> Option<String> {
+    match type_info {
+        TypeInfo::Simple(name) if is_collection_type_name(name) => Some(name.clone()),
+        TypeInfo::Nullable(inner) => collection_base_type_name(inner),
+        _ => None,
+    }
+}
+
+fn is_collection_type_name(name: &str) -> bool {
+    let lower = name.trim_start_matches('\\').to_ascii_lowercase();
+    lower == "collection"
+        || lower.ends_with("\\collection")
+        || lower == "doctrine\\common\\collections\\collection"
+}
+
+fn doctrine_target_entity_class_name_from_attribute_text(text: &str) -> Option<String> {
+    let marker_start = text.rfind("targetEntity")?;
+    doctrine_class_name_argument_from_attribute_text(&text[marker_start..], "targetEntity")
+}
+
+fn doctrine_repository_class_name_from_attribute_text(text: &str) -> Option<String> {
+    let marker_start = text.rfind("repositoryClass")?;
+    doctrine_class_name_argument_from_attribute_text(&text[marker_start..], "repositoryClass")
+}
+
+fn doctrine_class_name_argument_from_attribute_text(text: &str, argument: &str) -> Option<String> {
+    let marker_start = text.find(argument)?;
+    let after_marker = &text[marker_start + argument.len()..];
+    let separator = after_marker
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, ':' | '=').then_some(idx))?;
+    let after_separator = after_marker[separator + 1..].trim_start();
+    let mut end = 0usize;
+    for (idx, ch) in after_separator.char_indices() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\\') {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    let class_name = after_separator[..end].trim();
+    if class_name.is_empty() || !after_separator[end..].trim_start().starts_with("::class") {
+        return None;
+    }
+
+    Some(class_name.to_string())
 }
 
 fn extract_class_constants(
@@ -2144,6 +2250,37 @@ class UserRepository extends BaseRepository {}
             cls.template_bindings[1].args,
             vec![TypeInfo::Simple("Vendor\\Entity\\User".to_string())]
         );
+    }
+
+    #[test]
+    fn test_extract_doctrine_repository_class_attribute_metadata() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App\Entity;
+
+use App\Repository\OrderRepository;
+use Doctrine\ORM\Mapping as ORM;
+
+#[ORM\Entity(repositoryClass: OrderRepository::class)]
+class Order {}
+"#,
+        );
+        let cls = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Class && s.name == "Order")
+            .unwrap();
+
+        assert_eq!(cls.template_bindings.len(), 1);
+        assert_eq!(
+            cls.template_bindings[0].kind,
+            TemplateBindingKind::RepositoryClass
+        );
+        assert_eq!(
+            cls.template_bindings[0].target,
+            "App\\Repository\\OrderRepository"
+        );
+        assert!(cls.template_bindings[0].args.is_empty());
     }
 
     #[test]

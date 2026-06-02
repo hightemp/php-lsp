@@ -388,6 +388,10 @@ impl PhpLspBackend {
                 type_cache: &type_cache,
                 utf16_index: &utf16_index,
                 requested_range: (0, 0, u32::MAX, u32::MAX),
+                allow_twig_property_accessors: template_document
+                    .as_ref()
+                    .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig),
+                allow_blocking_file_io: false,
             };
             let inferred_member_symbol = server_member_symbol_at_position(&ctx, pos.line, byte_col);
             let primary_sym = symbol_at_position_with_resolvers(
@@ -401,7 +405,7 @@ impl PhpLspBackend {
             );
             let sym = match primary_sym {
                 Some(s)
-                    if matches!(s.ref_kind, RefKind::MethodCall)
+                    if matches!(s.ref_kind, RefKind::MethodCall | RefKind::PropertyAccess)
                         && self.index.resolve_fqn(&s.fqn).is_none() =>
                 {
                     inferred_member_symbol.or(Some(s))

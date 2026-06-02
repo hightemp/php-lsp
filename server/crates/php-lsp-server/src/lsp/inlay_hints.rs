@@ -163,6 +163,7 @@ pub(in crate::server) fn inlay_hints(
     let byte_range = lsp_range_to_byte_range(source, requested_range);
     let mut hints = Vec::new();
     let type_cache = RequestTypeCache::new(uri_str, document_version);
+    let allow_twig_property_accessors = crate::template::is_twig_template_uri(uri_str);
     let ctx = InlayHintContext {
         tree,
         source,
@@ -171,6 +172,8 @@ pub(in crate::server) fn inlay_hints(
         type_cache: &type_cache,
         utf16_index: &utf16_index,
         requested_range: byte_range,
+        allow_twig_property_accessors,
+        allow_blocking_file_io: true,
     };
 
     collect_call_argument_inlay_hints(&ctx, tree.root_node(), &mut hints);
@@ -214,6 +217,8 @@ pub(in crate::server) struct InlayHintContext<'a> {
     pub(in crate::server) type_cache: &'a RequestTypeCache,
     pub(in crate::server) utf16_index: &'a Utf16LineIndex,
     pub(in crate::server) requested_range: (u32, u32, u32, u32),
+    pub(in crate::server) allow_twig_property_accessors: bool,
+    pub(in crate::server) allow_blocking_file_io: bool,
 }
 
 pub(in crate::server) fn collect_call_argument_inlay_hints(
@@ -500,8 +505,16 @@ pub(in crate::server) fn local_variable_inlay_type(
                 Some(&resolver),
                 Some(&callable_param_resolver),
             );
-            let allow_scalar =
+            let is_foreach_variable =
                 enclosing_foreach_statement_for_variable(ctx.source, variable_node).is_some();
+            let allow_scalar = is_foreach_variable;
+
+            if is_foreach_variable {
+                if let Some(type_hint) = foreach_variable_inlay_type_from_index(ctx, variable_node)
+                {
+                    return Some(type_hint);
+                }
+            }
 
             if let Some(type_hint) = parser_info.as_ref().and_then(|info| {
                 info.phpdoc_comment.as_ref().and_then(|_| {
@@ -517,8 +530,11 @@ pub(in crate::server) fn local_variable_inlay_type(
                 return Some(type_hint);
             }
 
-            if let Some(type_hint) = foreach_variable_inlay_type_from_index(ctx, variable_node) {
-                return Some(type_hint);
+            if !is_foreach_variable {
+                if let Some(type_hint) = foreach_variable_inlay_type_from_index(ctx, variable_node)
+                {
+                    return Some(type_hint);
+                }
             }
 
             parser_info.as_ref().and_then(|info| {
@@ -621,9 +637,9 @@ pub(in crate::server) fn merge_conditional_branch_type_infos(
 
 #[derive(Debug, Clone)]
 pub(in crate::server) struct IndexedExpressionTypeInfo {
-    type_info: php_lsp_types::TypeInfo,
-    owner_fqn: String,
-    uri: String,
+    pub(in crate::server) type_info: php_lsp_types::TypeInfo,
+    pub(in crate::server) owner_fqn: String,
+    pub(in crate::server) uri: String,
 }
 
 pub(in crate::server) fn foreach_variable_inlay_type_from_index(
@@ -632,7 +648,7 @@ pub(in crate::server) fn foreach_variable_inlay_type_from_index(
 ) -> Option<LocalVariableInlayType> {
     let foreach_stmt = enclosing_foreach_statement_for_variable(ctx.source, variable_node)?;
     let iterable_node = foreach_iterable_node_for_inlay(foreach_stmt)?;
-    let iterable_type = indexed_expression_type_info(ctx, iterable_node)?;
+    let iterable_type = server_expression_type_info(ctx, iterable_node)?;
     let value_type = iterable_value_type_info(&iterable_type.type_info, None)?;
 
     local_variable_inlay_type_from_type_info(
@@ -649,20 +665,39 @@ pub(in crate::server) fn enclosing_foreach_statement_for_variable<'tree>(
     variable_node: tree_sitter::Node<'tree>,
 ) -> Option<tree_sitter::Node<'tree>> {
     let variable_name = variable_text_for_node(source, variable_node)?;
-    let mut current = variable_node;
+    let mut root = variable_node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
 
-    loop {
-        if current.kind() == "foreach_statement" {
-            let value_node = foreach_value_variable_node_for_inlay(current, source)?;
-            if variable_text_for_node(source, value_node).as_deref() == Some(&variable_name)
-                && variable_node.start_byte() >= current.start_byte()
-                && variable_node.end_byte() <= current.end_byte()
+    let mut best = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "foreach_statement"
+            && variable_node.start_byte() >= node.start_byte()
+            && variable_node.end_byte() <= node.end_byte()
+            && foreach_value_variable_node_for_inlay(node, source)
+                .and_then(|value_node| variable_text_for_node(source, value_node))
+                .as_deref()
+                == Some(variable_name.as_str())
+            && best
+                .map(|candidate: tree_sitter::Node| node.start_byte() > candidate.start_byte())
+                .unwrap_or(true)
+        {
+            best = Some(node);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if variable_node.start_byte() >= child.start_byte()
+                && variable_node.start_byte() <= child.end_byte()
             {
-                return Some(current);
+                stack.push(child);
             }
         }
-        current = current.parent()?;
     }
+
+    best
 }
 
 pub(in crate::server) fn foreach_iterable_node_for_inlay(
@@ -673,18 +708,73 @@ pub(in crate::server) fn foreach_iterable_node_for_inlay(
         .flatten()
 }
 
-pub(in crate::server) fn indexed_expression_type_info(
+pub(in crate::server) fn server_member_access_expression_type_info(
     ctx: &InlayHintContext<'_>,
     expression: tree_sitter::Node,
 ) -> Option<IndexedExpressionTypeInfo> {
     let expression = normalized_expression_node(expression);
-    match expression.kind() {
-        "function_call_expression"
-        | "member_call_expression"
-        | "nullsafe_member_call_expression"
-        | "scoped_call_expression" => indexed_call_expression_type_info(ctx, expression),
-        _ => None,
+    if !matches!(
+        expression.kind(),
+        "member_access_expression" | "nullsafe_member_access_expression"
+    ) {
+        return None;
     }
+
+    let object = expression.child_by_field_name("object")?;
+    let name_node = member_reference_name_node(expression)?;
+    let member_name = node_text(ctx.source, name_node).trim();
+    let property_name = member_name.trim_start_matches('$');
+    if property_name.is_empty() {
+        return None;
+    }
+
+    let receiver_type = server_expression_type_info(ctx, object)?;
+    let receiver_fqn = type_info_fqn_from_index(
+        ctx.index,
+        &receiver_type.owner_fqn,
+        &receiver_type.uri,
+        &receiver_type.type_info,
+    )?;
+    let symbol = if ctx.allow_twig_property_accessors {
+        twig_property_accessor_method_for_alias(ctx.index, &receiver_fqn, property_name).or_else(
+            || {
+                ctx.index
+                    .resolve_fqn(&format!("{receiver_fqn}::${property_name}"))
+            },
+        )?
+    } else {
+        ctx.index
+            .resolve_fqn(&format!("{receiver_fqn}::${property_name}"))?
+    };
+    if !matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Property | php_lsp_types::PhpSymbolKind::Method
+    ) {
+        return None;
+    }
+
+    let type_info = symbol_effective_return_type(&symbol)?;
+    let owner_fqn = symbol
+        .parent_fqn
+        .clone()
+        .filter(|owner| !owner.is_empty())
+        .unwrap_or(receiver_fqn);
+    let type_info = match symbol.kind {
+        php_lsp_types::PhpSymbolKind::Method => {
+            doctrine_collection_getter_return_type_info(ctx, &symbol, &owner_fqn, &type_info)
+                .unwrap_or(type_info)
+        }
+        php_lsp_types::PhpSymbolKind::Property => {
+            doctrine_collection_property_type_info(ctx, &symbol, &owner_fqn, &type_info)
+                .unwrap_or(type_info)
+        }
+        _ => type_info,
+    };
+    Some(IndexedExpressionTypeInfo {
+        type_info,
+        owner_fqn,
+        uri: symbol.uri.clone(),
+    })
 }
 
 pub(in crate::server) fn indexed_call_expression_type_info(
@@ -795,6 +885,50 @@ pub(in crate::server) fn server_member_symbol_at_position(
     while let Some(candidate) = current {
         if matches!(
             candidate.kind(),
+            "member_access_expression" | "nullsafe_member_access_expression"
+        ) {
+            let name_node = member_reference_name_node(candidate)?;
+            if byte_range_contains(node_range_node(name_node), point_range) {
+                let object = candidate.child_by_field_name("object")?;
+                let receiver_type = server_expression_type_info(ctx, object)?;
+                let receiver_fqn = type_info_fqn_from_index(
+                    ctx.index,
+                    &receiver_type.owner_fqn,
+                    &receiver_type.uri,
+                    &receiver_type.type_info,
+                )?;
+                let member_name = node_text(ctx.source, name_node).trim();
+                let property_name = member_name.trim_start_matches('$');
+                if property_name.is_empty() {
+                    return None;
+                }
+                let symbol = if ctx.allow_twig_property_accessors {
+                    twig_property_accessor_method_for_alias(ctx.index, &receiver_fqn, property_name)
+                        .or_else(|| {
+                            ctx.index
+                                .resolve_fqn(&format!("{receiver_fqn}::${property_name}"))
+                        })?
+                } else {
+                    ctx.index
+                        .resolve_fqn(&format!("{receiver_fqn}::${property_name}"))?
+                };
+                let ref_kind = if symbol.kind == php_lsp_types::PhpSymbolKind::Method {
+                    RefKind::MethodCall
+                } else {
+                    RefKind::PropertyAccess
+                };
+                return Some(SymbolAtPosition {
+                    fqn: symbol.fqn.clone(),
+                    name: member_name.to_string(),
+                    ref_kind,
+                    object_expr: Some(node_text(ctx.source, object).trim().to_string()),
+                    range: node_range_node(name_node),
+                });
+            }
+        }
+
+        if matches!(
+            candidate.kind(),
             "member_call_expression" | "nullsafe_member_call_expression"
         ) {
             let name_node = member_reference_name_node(candidate)?;
@@ -849,6 +983,9 @@ pub(in crate::server) fn server_expression_type_info(
         | "member_call_expression"
         | "nullsafe_member_call_expression"
         | "scoped_call_expression" => indexed_call_expression_type_info(ctx, expression),
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            server_member_access_expression_type_info(ctx, expression)
+        }
         _ => None,
     }
 }
@@ -860,7 +997,7 @@ pub(in crate::server) fn server_variable_type_info(
     if let Some(foreach_stmt) = enclosing_foreach_statement_for_variable(ctx.source, variable_node)
     {
         let iterable_node = foreach_iterable_node_for_inlay(foreach_stmt)?;
-        let iterable_type = indexed_expression_type_info(ctx, iterable_node)?;
+        let iterable_type = server_expression_type_info(ctx, iterable_node)?;
         let value_type = iterable_value_type_info(&iterable_type.type_info, None)?;
         return Some(IndexedExpressionTypeInfo {
             type_info: value_type,
@@ -956,8 +1093,17 @@ pub(in crate::server) fn doctrine_repository_class_for_entity(
         "doctrine-repository-class",
         normalized_entity,
         || {
-            doctrine_repository_class_from_template_binding(ctx.index, normalized_entity).or_else(
+            doctrine_repository_class_from_entity_binding(ctx.index, normalized_entity).or_else(
                 || {
+                    if let Some(repository_fqn) = doctrine_repository_class_from_template_binding(
+                        ctx.index,
+                        normalized_entity,
+                    ) {
+                        return Some(repository_fqn);
+                    }
+                    if !ctx.allow_blocking_file_io {
+                        return None;
+                    }
                     doctrine_repository_class_from_entity_attribute(
                         ctx.index,
                         ctx.file_symbols,
@@ -967,6 +1113,21 @@ pub(in crate::server) fn doctrine_repository_class_for_entity(
             )
         },
     )
+}
+
+pub(in crate::server) fn doctrine_repository_class_from_entity_binding(
+    index: &WorkspaceIndex,
+    entity_fqn: &str,
+) -> Option<String> {
+    let entity = index.resolve_fqn(entity_fqn)?;
+    entity.template_bindings.iter().find_map(|binding| {
+        if binding.kind != php_lsp_types::TemplateBindingKind::RepositoryClass {
+            return None;
+        }
+        let repository_fqn = binding.target.trim_start_matches('\\');
+        (!repository_fqn.is_empty() && index.resolve_fqn(repository_fqn).is_some())
+            .then(|| repository_fqn.to_string())
+    })
 }
 
 pub(in crate::server) fn doctrine_repository_class_from_template_binding(
@@ -1081,19 +1242,55 @@ pub(in crate::server) fn doctrine_collection_getter_return_type_info(
     return_type: &php_lsp_types::TypeInfo,
 ) -> Option<php_lsp_types::TypeInfo> {
     let collection_base = collection_base_type_name(return_type)?;
-    let path = uri_to_path(&method.uri)?;
-    let source = std::fs::read_to_string(path).ok()?;
-    let property_name = returned_this_property_name_from_method_source(&source, method)
-        .or_else(|| property_name_from_getter(&method.name))?;
-    let target_fqn = doctrine_collection_target_entity_for_property(
+    let target_fqn = doctrine_collection_item_type_from_getter_property(
         ctx.index,
         ctx.file_symbols,
-        &method.uri,
         owner_fqn,
-        &property_name,
-        method.range.0 as usize,
-        &source,
-    )?;
+        &method.uri,
+        &method.name,
+    )
+    .or_else(|| {
+        doctrine_collection_item_type_from_method_mutators(
+            ctx.index,
+            ctx.file_symbols,
+            owner_fqn,
+            &method.uri,
+            &method.name,
+        )
+    })?;
+
+    Some(php_lsp_types::TypeInfo::Generic {
+        base: collection_base,
+        args: vec![
+            php_lsp_types::TypeInfo::Simple("int".to_string()),
+            php_lsp_types::TypeInfo::Simple(target_fqn),
+        ],
+    })
+}
+
+pub(in crate::server) fn doctrine_collection_property_type_info(
+    ctx: &InlayHintContext<'_>,
+    property: &php_lsp_types::SymbolInfo,
+    owner_fqn: &str,
+    property_type: &php_lsp_types::TypeInfo,
+) -> Option<php_lsp_types::TypeInfo> {
+    let collection_base = collection_base_type_name(property_type)?;
+    let property_name = property.name.trim_start_matches('$');
+    if property_name.is_empty() {
+        return None;
+    }
+
+    let target_fqn =
+        collection_item_type_fqn_from_type_info(ctx.index, owner_fqn, &property.uri, property_type)
+            .or_else(|| {
+                doctrine_collection_item_type_from_property_mutators(
+                    ctx.index,
+                    ctx.file_symbols,
+                    owner_fqn,
+                    &property.uri,
+                    property_name,
+                )
+            })?;
 
     Some(php_lsp_types::TypeInfo::Generic {
         base: collection_base,
@@ -1111,6 +1308,9 @@ pub(in crate::server) fn collection_base_type_name(
         php_lsp_types::TypeInfo::Simple(name) if is_collection_type_name(name) => {
             Some(name.clone())
         }
+        php_lsp_types::TypeInfo::Generic { base, .. } if is_collection_type_name(base) => {
+            Some(base.clone())
+        }
         php_lsp_types::TypeInfo::Nullable(inner) => collection_base_type_name(inner),
         _ => None,
     }
@@ -1123,28 +1323,145 @@ pub(in crate::server) fn is_collection_type_name(name: &str) -> bool {
         || lower == "doctrine\\common\\collections\\collection"
 }
 
-pub(in crate::server) fn returned_this_property_name_from_method_source(
-    source: &str,
-    method: &php_lsp_types::SymbolInfo,
+pub(in crate::server) fn doctrine_collection_item_type_from_getter_property(
+    index: &WorkspaceIndex,
+    current_file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    method_name: &str,
 ) -> Option<String> {
-    let start = method.range.0 as usize;
-    let end = method.range.2 as usize;
-    let method_source = source
-        .lines()
-        .skip(start)
-        .take(end.saturating_sub(start) + 1)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let marker = "return $this->";
-    let after_marker = method_source
-        .find(marker)
-        .map(|idx| &method_source[idx + marker.len()..])?;
-    let end = after_marker
-        .char_indices()
-        .find_map(|(idx, ch)| (!(ch.is_ascii_alphanumeric() || ch == '_')).then_some(idx))
-        .unwrap_or(after_marker.len());
-    let property = after_marker[..end].trim();
-    (!property.is_empty()).then(|| property.to_string())
+    let property_name = property_name_from_getter(method_name)?;
+    let property = index.resolve_fqn(&format!("{owner_fqn}::${property_name}"))?;
+    if property.kind != php_lsp_types::PhpSymbolKind::Property
+        || property.parent_fqn.as_deref() != Some(owner_fqn)
+    {
+        return None;
+    }
+    let property_type = symbol_effective_return_type(&property)?;
+    collection_item_type_fqn_from_type_info(index, owner_fqn, &property.uri, &property_type)
+        .or_else(|| {
+            doctrine_collection_item_type_from_property_mutators(
+                index,
+                current_file_symbols,
+                owner_fqn,
+                uri,
+                &property_name,
+            )
+        })
+}
+
+pub(in crate::server) fn collection_item_type_fqn_from_type_info(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> Option<String> {
+    match type_info {
+        php_lsp_types::TypeInfo::Generic { base, args } if is_collection_type_name(base) => args
+            .get(1)
+            .and_then(|item| type_info_fqn_from_index(index, owner_fqn, uri, item)),
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            collection_item_type_fqn_from_type_info(index, owner_fqn, uri, inner)
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::server) fn doctrine_collection_item_type_from_method_mutators(
+    index: &WorkspaceIndex,
+    current_file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    method_name: &str,
+) -> Option<String> {
+    let suffix = collection_suffix_from_getter(method_name)?;
+    doctrine_collection_item_type_from_mutators(
+        index,
+        current_file_symbols,
+        owner_fqn,
+        uri,
+        &suffix,
+    )
+}
+
+pub(in crate::server) fn doctrine_collection_item_type_from_property_mutators(
+    index: &WorkspaceIndex,
+    current_file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    property_name: &str,
+) -> Option<String> {
+    let suffix = collection_suffix_from_property_name(property_name)?;
+    doctrine_collection_item_type_from_mutators(
+        index,
+        current_file_symbols,
+        owner_fqn,
+        uri,
+        &suffix,
+    )
+}
+
+pub(in crate::server) fn doctrine_collection_item_type_from_mutators(
+    index: &WorkspaceIndex,
+    current_file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    collection_suffix: &str,
+) -> Option<String> {
+    let owner = index.resolve_fqn(owner_fqn)?;
+    if owner.uri != uri {
+        return None;
+    }
+
+    let owner_file_symbols = index.file_symbols.get(uri);
+    let file_symbols = owner_file_symbols
+        .as_ref()
+        .map(|symbols| symbols.value())
+        .unwrap_or(current_file_symbols);
+
+    for candidate in collection_mutator_method_candidates(collection_suffix) {
+        let Some(symbol) = index.resolve_fqn(&format!("{owner_fqn}::{candidate}")) else {
+            continue;
+        };
+        if symbol.kind != php_lsp_types::PhpSymbolKind::Method
+            || symbol.parent_fqn.as_deref() != Some(owner_fqn)
+        {
+            continue;
+        }
+        let Some(signature) = symbol.signature.as_ref() else {
+            continue;
+        };
+        let Some(param_type) = signature
+            .params
+            .iter()
+            .find_map(|param| param.type_info.as_ref())
+        else {
+            continue;
+        };
+
+        if let Some(fqn) = type_info_fqn_from_index(index, owner_fqn, &symbol.uri, param_type)
+            .filter(|fqn| index.resolve_fqn(fqn).is_some())
+        {
+            return Some(fqn);
+        }
+
+        if let Some(resolved) = type_info_simple_fqn(param_type)
+            .map(|fqn| resolve_class_name_pub(&fqn, file_symbols))
+            .map(|fqn| fqn.trim_start_matches('\\').to_string())
+            .filter(|fqn| !fqn.is_empty() && index.resolve_fqn(fqn).is_some())
+        {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+pub(in crate::server) fn collection_suffix_from_getter(method_name: &str) -> Option<String> {
+    ["get", "is", "has"]
+        .iter()
+        .find_map(|prefix| method_name.strip_prefix(prefix))
+        .and_then(collection_suffix_from_property_name)
 }
 
 pub(in crate::server) fn property_name_from_getter(method_name: &str) -> Option<String> {
@@ -1156,63 +1473,44 @@ pub(in crate::server) fn property_name_from_getter(method_name: &str) -> Option<
     Some(property)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(in crate::server) fn doctrine_collection_target_entity_for_property(
-    index: &WorkspaceIndex,
-    current_file_symbols: &php_lsp_types::FileSymbols,
-    uri: &str,
-    owner_fqn: &str,
-    property_name: &str,
-    before_line: usize,
-    source: &str,
-) -> Option<String> {
-    let owner = index.resolve_fqn(owner_fqn)?;
-    if owner.uri != uri {
+pub(in crate::server) fn collection_suffix_from_property_name(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_start_matches('$');
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() && first != '_' {
         return None;
     }
+    let mut suffix = first.to_ascii_uppercase().to_string();
+    suffix.push_str(chars.as_str());
+    Some(suffix)
+}
 
-    let property_pattern = format!("${property_name}");
-    let lines: Vec<&str> = source.lines().collect();
-    let search_end = before_line.min(lines.len().saturating_sub(1));
-    for line_index in 0..=search_end {
-        let line = lines[line_index];
-        if !line.contains(&property_pattern) || !line.contains("Collection") {
-            continue;
-        }
-
-        let start_line = line_index.saturating_sub(32);
-        let metadata = lines[start_line..=line_index].join("\n");
-        let Some(target_name) = doctrine_target_entity_class_name_from_attribute_text(&metadata)
-        else {
-            continue;
-        };
-
-        let owner_file_symbols = index.file_symbols.get(uri);
-        let file_symbols = owner_file_symbols
-            .as_ref()
-            .map(|symbols| symbols.value())
-            .unwrap_or(current_file_symbols);
-        let resolved = resolve_class_name_pub(&target_name, file_symbols)
-            .trim_start_matches('\\')
-            .to_string();
-        if !resolved.is_empty()
-            && (index.resolve_fqn(&resolved).is_some()
-                || file_symbols
-                    .symbols
-                    .iter()
-                    .any(|symbol| symbol.fqn == resolved))
-        {
-            return Some(resolved);
+pub(in crate::server) fn collection_mutator_method_candidates(
+    collection_suffix: &str,
+) -> Vec<String> {
+    let mut suffixes = vec![collection_suffix.to_string()];
+    if let Some(singular) = singular_collection_suffix(collection_suffix) {
+        if !suffixes.iter().any(|suffix| suffix == &singular) {
+            suffixes.push(singular);
         }
     }
 
-    None
+    let mut methods = Vec::with_capacity(suffixes.len() * 2);
+    for suffix in suffixes {
+        methods.push(format!("add{suffix}"));
+        methods.push(format!("remove{suffix}"));
+    }
+    methods
 }
 
-pub(in crate::server) fn doctrine_target_entity_class_name_from_attribute_text(
-    text: &str,
-) -> Option<String> {
-    doctrine_class_name_argument_from_attribute_text(text, "targetEntity")
+pub(in crate::server) fn singular_collection_suffix(collection_suffix: &str) -> Option<String> {
+    if let Some(stem) = collection_suffix.strip_suffix("ies") {
+        return (!stem.is_empty()).then(|| format!("{stem}y"));
+    }
+    collection_suffix
+        .strip_suffix('s')
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_string)
 }
 
 pub(in crate::server) fn doctrine_class_name_argument_from_attribute_text(
@@ -1234,7 +1532,7 @@ pub(in crate::server) fn doctrine_class_name_argument_from_attribute_text(
         }
     }
 
-    let class_name = after_separator[..end].trim().trim_start_matches('\\');
+    let class_name = after_separator[..end].trim();
     if class_name.is_empty() || !after_separator[end..].trim_start().starts_with("::class") {
         return None;
     }
@@ -2418,12 +2716,15 @@ pub(in crate::server) fn local_variable_hover_data(
         Some(&resolver),
         Some(&callable_param_resolver),
     );
-    let type_hint = parser_info
-        .as_ref()
-        .and_then(|info| {
-            info.phpdoc_comment
-                .as_ref()
-                .and_then(|_| local_variable_type_from_hover_info(info, ctx.file_symbols, true))
+    let foreach_type_hint = foreach_variable_inlay_type_from_index(ctx, variable_node)
+        .filter(|_| enclosing_foreach_statement_for_variable(ctx.source, variable_node).is_some());
+    let type_hint = foreach_type_hint
+        .or_else(|| {
+            parser_info.as_ref().and_then(|info| {
+                info.phpdoc_comment
+                    .as_ref()
+                    .and_then(|_| local_variable_type_from_hover_info(info, ctx.file_symbols, true))
+            })
         })
         .or_else(|| rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs)))
         .or_else(|| foreach_variable_inlay_type_from_index(ctx, variable_node))

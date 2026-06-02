@@ -761,6 +761,21 @@ impl PhpLspBackend {
             "completion-variable-type",
             var_name,
             || {
+                if crate::template::is_twig_template_uri(source_uri) {
+                    if let Some(type_fqn) = self.infer_twig_completion_variable_type(
+                        tree,
+                        source_uri,
+                        source,
+                        file_symbols,
+                        line,
+                        byte_col,
+                        var_name,
+                        type_cache,
+                    ) {
+                        return Some(type_fqn);
+                    }
+                }
+
                 let resolve_member_type = |class_fqn: &str, member_name: &str| {
                     self.resolve_completion_member_type_cached(
                         class_fqn,
@@ -785,6 +800,41 @@ impl PhpLspBackend {
                     Some(&callable_param_resolver),
                 )
             },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::server) fn infer_twig_completion_variable_type(
+        &self,
+        tree: &tree_sitter::Tree,
+        _source_uri: &str,
+        source: &str,
+        file_symbols: &php_lsp_types::FileSymbols,
+        line: u32,
+        byte_col: u32,
+        var_name: &str,
+        type_cache: &RequestTypeCache,
+    ) -> Option<String> {
+        let variable_node =
+            completion_variable_node_before_position(tree, source, line, byte_col, var_name)?;
+        let utf16_index = Utf16LineIndex::new(source);
+        let ctx = InlayHintContext {
+            tree,
+            source,
+            file_symbols,
+            index: &self.index,
+            type_cache,
+            utf16_index: &utf16_index,
+            requested_range: (0, 0, u32::MAX, u32::MAX),
+            allow_twig_property_accessors: true,
+            allow_blocking_file_io: false,
+        };
+        let type_info = server_variable_type_info(&ctx, variable_node)?;
+        type_info_fqn_from_index(
+            &self.index,
+            &type_info.owner_fqn,
+            &type_info.uri,
+            &type_info.type_info,
         )
     }
 
@@ -1111,4 +1161,38 @@ fn completion_context_node_at_byte_col<'tree>(
         node = node.parent()?;
     }
     Some(node)
+}
+
+fn completion_variable_node_before_position<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    source: &str,
+    line: u32,
+    byte_col: u32,
+    var_name: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    let usage_byte = line_col_to_byte_offset(source, line, byte_col)?;
+    let mut best = None;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() > usage_byte {
+            continue;
+        }
+        if node.kind() == "variable_name"
+            && node.end_byte() <= usage_byte
+            && variable_text_for_node(source, node).as_deref() == Some(var_name)
+            && best
+                .map(|candidate: tree_sitter::Node| node.start_byte() > candidate.start_byte())
+                .unwrap_or(true)
+        {
+            best = Some(node);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.start_byte() <= usage_byte {
+                stack.push(child);
+            }
+        }
+    }
+    best
 }

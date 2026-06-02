@@ -1907,6 +1907,419 @@ final class DebtSuspensionController
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_foreach_entity_collection_members_from_doctrine_target_entity() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-entity-collection-context-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/porting_request")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let request_path = tmp_root.join("src/Entity/PortingRequest.php");
+    let number_path = tmp_root.join("src/Entity/PortingNumber.php");
+    let history_path = tmp_root.join("src/Entity/RequestStatusHistory.php");
+    let status_path = tmp_root.join("src/Entity/RequestStatus.php");
+    let controller_path = tmp_root.join("src/Controller/PortingRequestController.php");
+    let twig_path = tmp_root.join("templates/porting_request/show.html.twig");
+    let number_uri = file_uri(&number_path);
+    let history_uri = file_uri(&history_path);
+    let status_uri = file_uri(&status_path);
+    let twig_uri = file_uri(&twig_path);
+
+    let request_php = r#"<?php
+namespace App\Entity;
+
+use Doctrine\Common\Collections\Collection;
+use Doctrine\ORM\Mapping as ORM;
+
+class PortingRequest
+{
+    #[ORM\OneToMany(
+        targetEntity: PortingNumber::class,
+        mappedBy: 'request',
+        cascade: ['persist']
+    )]
+    private Collection $portingNumbers;
+
+    #[ORM\OneToMany(
+        targetEntity: RequestStatusHistory::class,
+        mappedBy: 'request',
+        cascade: ['persist']
+    )]
+    private Collection $statusHistories;
+
+    public function getPortingNumbers(): Collection
+    {
+        return $this->portingNumbers;
+    }
+
+    public function addPortingNumber(PortingNumber $portingNumber): static
+    {
+        return $this;
+    }
+
+    public function removePortingNumber(PortingNumber $portingNumber): static
+    {
+        return $this;
+    }
+
+    public function getStatusHistory(): Collection
+    {
+        return $this->statusHistories;
+    }
+
+    public function addStatusHistory(RequestStatusHistory $statusHistory): static
+    {
+        return $this;
+    }
+
+    public function removeStatusHistory(RequestStatusHistory $statusHistory): static
+    {
+        return $this;
+    }
+}
+"#;
+    let number_php = r#"<?php
+namespace App\Entity;
+
+class PortingNumber
+{
+    private ?int $id = null;
+    private string $phoneNumber = '';
+
+    public function getId(): ?int { return $this->id; }
+    public function getPhoneNumber(): string { return $this->phoneNumber; }
+}
+"#;
+    let history_php = r#"<?php
+namespace App\Entity;
+
+class RequestStatusHistory
+{
+    private ?int $id = null;
+    private ?RequestStatus $status = null;
+
+    public function getId(): ?int { return $this->id; }
+    public function getStatus(): ?RequestStatus { return $this->status; }
+}
+"#;
+    let status_php = r#"<?php
+namespace App\Entity;
+
+class RequestStatus
+{
+    private string $name = '';
+    public function getName(): string { return $this->name; }
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Entity\PortingRequest;
+
+final class PortingRequestController
+{
+    public function show(PortingRequest $portingRequest): void
+    {
+        $this->render('porting_request/show.html.twig', [
+            'portingRequest' => $portingRequest,
+        ]);
+    }
+}
+"#;
+    let completion_marker = "/*complete*/";
+    let twig_with_marker = format!(
+        concat!(
+            "{{% for portingNumber in portingRequest.portingNumbers %}}\n",
+            "{{{{ portingNumber.{} }}}}\n",
+            "{{{{ portingNumber.id }}}}\n",
+            "{{{{ portingNumber.phoneNumber }}}}\n",
+            "{{% endfor %}}\n",
+            "{{% for statusHistory in portingRequest.statusHistory %}}\n",
+            "{{{{ statusHistory.id }}}}\n",
+            "{{{{ statusHistory.status.name }}}}\n",
+            "{{% endfor %}}\n",
+        ),
+        completion_marker
+    );
+    let twig = twig_with_marker.replace(completion_marker, "");
+    let completion_prefix = twig_with_marker[..twig_with_marker.find(completion_marker).unwrap()]
+        .replace(completion_marker, "");
+    let completion_position = utf16_position_for_offset(&twig, completion_prefix.len());
+    let porting_number_hover_position = utf16_position_at(&twig, "portingNumber.id");
+    let porting_number_id_definition_position = utf16_position_after(&twig, "portingNumber.i");
+    let porting_number_id_member_hover_offset =
+        twig.find("portingNumber.id").unwrap() + "portingNumber.".len();
+    let porting_number_id_member_hover_position =
+        utf16_position_for_offset(&twig, porting_number_id_member_hover_offset);
+    let status_history_hover_position = utf16_position_at(&twig, "statusHistory.id");
+    let status_history_id_definition_position = utf16_position_after(&twig, "statusHistory.i");
+    let status_member_hover_offset =
+        twig.find("statusHistory.status.name").unwrap() + "statusHistory.".len();
+    let status_member_hover_position = utf16_position_for_offset(&twig, status_member_hover_offset);
+    let status_name_member_hover_offset =
+        twig.find("statusHistory.status.name").unwrap() + "statusHistory.status.".len();
+    let status_name_member_hover_position =
+        utf16_position_for_offset(&twig, status_name_member_hover_offset);
+    let status_name_definition_position = utf16_position_at(&twig, "name }}");
+    let porting_number_inlay_offset = twig.find("portingNumber in portingRequest").unwrap();
+    let porting_number_inlay_position =
+        utf16_position_for_offset(&twig, porting_number_inlay_offset + "portingNumber".len());
+    let status_history_inlay_offset = twig.find("statusHistory in portingRequest").unwrap();
+    let status_history_inlay_position =
+        utf16_position_for_offset(&twig, status_history_inlay_offset + "statusHistory".len());
+    let end_position = utf16_position_for_offset(&twig, twig.len());
+
+    fs::write(&request_path, request_php).unwrap();
+    fs::write(&number_path, number_php).unwrap();
+    fs::write(&history_path, history_php).unwrap();
+    fs::write(&status_path, status_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&twig_path, &twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &twig_uri, "twig", &twig,
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics =
+        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "entity collection Twig fixture should stay diagnostic-clean, got: {}",
+        diagnostics
+    );
+
+    let porting_number_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                2,
+                &twig_uri,
+                porting_number_hover_position.0,
+                porting_number_hover_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let porting_number_hover_text = porting_number_hover["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        porting_number_hover_text.contains("PortingNumber $portingNumber")
+            && porting_number_hover_text.contains(number_uri.as_str()),
+        "expected Twig foreach variable hover to resolve PortingNumber with a class link, got: {}",
+        porting_number_hover
+    );
+
+    let status_history_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                3,
+                &twig_uri,
+                status_history_hover_position.0,
+                status_history_hover_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let status_history_hover_text = status_history_hover["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        status_history_hover_text.contains("RequestStatusHistory $statusHistory")
+            && status_history_hover_text.contains(history_uri.as_str()),
+        "expected Twig foreach variable hover to resolve RequestStatusHistory with a class link, got: {}",
+        status_history_hover
+    );
+
+    for (request_id, position, expected_method, expected_uri) in [
+        (
+            4,
+            porting_number_id_member_hover_position,
+            "getId",
+            number_uri.as_str(),
+        ),
+        (
+            5,
+            status_member_hover_position,
+            "getStatus",
+            status_uri.as_str(),
+        ),
+        (
+            6,
+            status_name_member_hover_position,
+            "getName",
+            status_uri.as_str(),
+        ),
+    ] {
+        let hover = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(hover_request(request_id, &twig_uri, position.0, position.1))
+                .await
+                .unwrap(),
+        );
+        let hover_text = hover["contents"]["value"].as_str().unwrap_or_default();
+        assert!(
+            hover_text.contains(expected_method) && hover_text.contains(expected_uri),
+            "expected Twig property hover `{expected_method}` with class link `{expected_uri}`, got: {}",
+            hover
+        );
+    }
+
+    let completion = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(
+                7,
+                &twig_uri,
+                completion_position.0,
+                completion_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let labels: Vec<String> = completion_items_from_result(&completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    for expected in ["id", "phoneNumber"] {
+        assert!(
+            labels.iter().any(|label| label == expected),
+            "expected Twig completion `{expected}` from Doctrine collection item, got: {:?}",
+            labels
+        );
+    }
+
+    for (request_id, position, expected_uri) in [
+        (
+            8,
+            porting_number_id_definition_position,
+            number_uri.as_str(),
+        ),
+        (
+            9,
+            status_history_id_definition_position,
+            history_uri.as_str(),
+        ),
+        (10, status_name_definition_position, status_uri.as_str()),
+    ] {
+        let definition = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(definition_request(
+                    request_id, &twig_uri, position.0, position.1,
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            definition.get("uri").and_then(|uri| uri.as_str()),
+            Some(expected_uri),
+            "Twig definition request {request_id} should jump to expected entity symbol, got: {}",
+            definition
+        );
+    }
+
+    let inlay_result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(inlay_hint_request(
+                11,
+                &twig_uri,
+                0,
+                0,
+                end_position.0,
+                end_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let hints = inlay_result.as_array().cloned().unwrap_or_default();
+    for (expected_label, expected_position, expected_link) in [
+        (
+            ": PortingNumber",
+            porting_number_inlay_position,
+            "PortingNumber",
+        ),
+        (
+            ": RequestStatusHistory",
+            status_history_inlay_position,
+            "RequestStatusHistory",
+        ),
+    ] {
+        assert!(
+            hints.iter().any(|hint| {
+                inlay_hint_label_text(hint).as_deref() == Some(expected_label)
+                    && hint["position"]["line"].as_u64() == Some(expected_position.0 as u64)
+                    && hint["position"]["character"].as_u64()
+                        == Some(expected_position.1 as u64)
+                    && inlay_hint_has_label_part_location(hint, expected_link)
+            }),
+            "expected Twig entity collection inlay hint `{expected_label}` with class link, got: {}",
+            inlay_result
+        );
+    }
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_twig_paginator_context_prefers_explicit_iterable_item_type() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();

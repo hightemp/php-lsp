@@ -4499,7 +4499,7 @@ change.
   - Все найденные gaps добавить отдельными задачами в backlog с точными файлами/позициями/симптомами.
   - После аудита отметить umbrella-задачу done.
 
-- [ ] **H-TWIG-BDPN-ENTITY-FOREACH-CONTEXT-2026-06-02** Восстановить hover/definition/inlayHint для Twig foreach по entity collections и paginator items
+- [x] **H-TWIG-BDPN-ENTITY-FOREACH-CONTEXT-2026-06-02** Восстановить hover/definition/inlayHint для Twig foreach по entity collections и paginator items *(done 2026-06-02)*
   - `porting_request/show.html.twig:367` `portingNumber.id` из `portingRequest.portingNumbers` должен резолвиться в `App\Entity\PortingNumber`.
   - `porting_request/show.html.twig:424` `statusHistory.id` должен резолвиться в `App\Entity\RequestStatusHistory`.
   - `porting_request/show.html.twig:560` `messageLog.id` должен резолвиться в `App\Entity\MessageLog`.
@@ -4507,6 +4507,18 @@ change.
   - `porting_process/show.html.twig:768` `pn.phoneNumber`, `1217` `file.status`, `1479` `subscriber.id`, `1480-1488` `subscriber.fullName/organizationName/phoneNumbers` должны давать non-null hover/definition и foreach inlay.
   - `subscriber/show.html.twig:148` `subscriberDataFile.fileName`, `185` `number.phoneNumber`, `231` `document.docNumber` должны давать non-null hover/definition/inlay.
   - `subscriber/index.html.twig:48` `subscriber.id`, `operator/index.html.twig:48` `operator.operatorCode`, `user/index.html.twig:42` `user.email`, `timer/list_expired.html.twig:24` `timer.npId`, `route_update_request/index.html.twig:46` `rr.id` должны резолвиться из list/paginator context.
+  - Implemented: Twig property-style member access теперь резолвит getter aliases для hover, definition, completion и foreach inlay через общий indexed type path.
+  - Implemented: Doctrine `Collection` property signatures индексируются как `Collection<int, TargetEntity>` из ORM `targetEntity`, плюс добавлен fallback по `add*/remove*` collection mutators.
+  - Implemented: custom Doctrine repositories индексируются из ORM `repositoryClass`; explicit `repositoryClass` имеет приоритет над `@extends ServiceEntityRepository<Entity>`.
+  - Implemented: async hover/definition/completion не вызывают blocking `read_to_string`; source-read fallback оставлен только под `allow_blocking_file_io=true` внутри `inlayHint` blocking compute.
+  - Implemented: cache schema bumped to `18`, чтобы старый `index.bin` не скрывал новое извлечение символов.
+  - Validation: `cargo test -p php-lsp-server --test e2e_templates` passed.
+  - Validation: `cargo test -p php-lsp-server --test e2e_hover test_foreach_value_inlay_and_hover_from_doctrine_collection_target_entity` passed.
+  - Validation: `cargo test -p php-lsp-server --test e2e_indexing test_doctrine_get_repository_chain_infers_custom_and_standard_returns` passed.
+  - Validation: `cargo test -p php-lsp-parser symbols` passed.
+  - Validation: `cargo test -p php-lsp-index cache_schema_fixture_matches_version_guard` passed.
+  - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
+  - Validation: Verifier subagent rerun reported no issues.
 
 - [ ] **H-TWIG-BDPN-OPTIONAL-RENDER-CONTEXT-2026-06-02** Улучшить Twig render context для nullable/conditional variables вместо `mixed`
   - `verification_request/show.html.twig:54` `portingRequest.id` сейчас root hover `mixed $portingRequest`, member hover/definition `null`; ожидание `?App\Entity\PortingRequest`.

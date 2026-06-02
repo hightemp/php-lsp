@@ -65,6 +65,10 @@ impl PhpLspBackend {
                 type_cache: &type_cache,
                 utf16_index: &utf16_index,
                 requested_range: (0, 0, u32::MAX, u32::MAX),
+                allow_twig_property_accessors: template_document
+                    .as_ref()
+                    .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig),
+                allow_blocking_file_io: false,
             };
             let variable_node_at_position = variable_name_node_at_range(
                 tree,
@@ -90,7 +94,7 @@ impl PhpLspBackend {
             );
             let sym_at_pos = match primary_sym_at_pos {
                 Some(s)
-                    if matches!(s.ref_kind, RefKind::MethodCall)
+                    if matches!(s.ref_kind, RefKind::MethodCall | RefKind::PropertyAccess)
                         && self.index.resolve_fqn(&s.fqn).is_none() =>
                 {
                     inferred_member_symbol.unwrap_or(s)
