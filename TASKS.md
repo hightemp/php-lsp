@@ -1,5 +1,13 @@
 # PHP Language Server — Roadmap и задачи
 
+## Как вести этот файл
+
+- Файл читается сверху вниз: старые задачи выше, новые задачи ниже.
+- Новые одиночные задачи добавлять только в конец раздела `## Журнал задач (append-only)`.
+- Если задача большая, добавлять новый milestone в конец `## Журнал задач (append-only)` по шаблону из этого раздела.
+- Не вставлять новые задачи в начало файла, начало раздела или перед уже существующими задачами.
+- При завершении менять `[ ]` на `[x]`, добавлять дату `*(done YYYY-MM-DD)*` и краткие строки `Implemented`/`Validation`, не перемещая задачу.
+
 ## Обзор этапов
 
 | Этап | Срок | Цель |
@@ -188,57 +196,6 @@
 ---
 
 ## Hotfix backlog (post-MVP)
-
-- [x] **H-TWIG-LSP-SURFACE-2026-06-01** Проверить и покрыть LSP-фичи для Twig шаблонов *(done 2026-06-01)*
-  - Проверить реальные шаблоны `/home/apanov/Projects/bdpn-ui/app/templates`
-  - Добавить e2e-тесты для Twig completion, inlayHint, go-to-definition, hover и syntax diagnostics
-  - Исправить найденные gaps без project-specific hardcode
-  - Обновить документацию при изменении поведения
-  - Запустить релевантные Rust tests и verifier
-
-- [x] **H-TWIG-PAGINATION-CONTEXT-2026-06-02** Восстановить Twig LSP для переменных из пагинации *(done 2026-06-02)*
-  - Reproduce отсутствующие hover, inlayHint, go-to-definition и autocomplete в `data_request/index.html.twig`
-  - Вывести тип элемента `{% for dr in pagination %}` из render context без project-specific hardcode
-  - Добавить focused e2e/unit tests для Twig foreach по paginator context
-  - Обновить документацию при изменении поведения
-  - Запустить релевантные Rust tests и verifier
-
-- [x] **H-TWIG-DATA-REQUEST-SURFACE-2026-06-02** Проверить и добить Twig LSP по всему `data_request/index.html.twig` *(done 2026-06-02)*
-  - Снять LSP-smoke по всем `dr.*`, `dr.status.*`, `dr.subscriber.*`, `shown/num/badgeClass`
-  - Исправить gaps hover, go-to-definition, inlayHint и autocomplete без project-specific hardcode
-  - Добавить property-style autocomplete aliases для Twig object member access
-  - Покрыть filters/tests/path arguments и nested member chains релевантными tests
-  - Обновить документацию при изменении поведения, запустить tests и verifier
-
-- [x] **H-TWIG-DEBT-SUSPENSION-MESSAGE-LOG-2026-06-02** Восстановить Twig LSP для messageLogs/messageLog в `debt_suspension/show.html.twig` *(done 2026-06-02)*
-  - Reproduce отсутствующие hover, go-to-definition, inlayHint и autocomplete на `messageLogs`/`messageLog.*`
-  - Исправить вывод ссылок на класс в hover и inlayHint для Twig foreach-переменных
-  - Добавить focused tests для `is defined`, collection length и property access внутри Twig foreach
-  - Обновить документацию при изменении поведения, запустить tests и verifier
-
-- [x] **H-HOVER-CLASS-LINKS-2026-06-01** Добавить ссылки на классы в hover markdown *(done 2026-06-01)*
-  - Найти все hover-поверхности, где выводятся типы, FQN, сигнатуры или связанные классы
-  - Переиспользовать существующий формат ссылок на definition для `Type:`
-  - Добавить focused tests для class links в hover
-  - Запустить релевантные Rust tests
-
-- [x] **H-UTF-LSP-SURFACE-2026-06-01** Покрыть UTF/emoji по LSP-facing parser/server surfaces *(done 2026-06-01)*
-  - Проверить incremental edits, references, signature help, return-type insertion helpers
-  - Проверить server-side LSP text helpers, rename/code-action/definition/document-symbol/inlay/formatting-sensitive ranges
-  - Добавить focused tests с emoji/non-ASCII/CRLF перед символами и edit ranges
-  - Запустить релевантные Rust tests
-
-- [x] **H-UNICODE-PHP-2026-06-01** Проверить Unicode/emoji в реальном PHP-коде *(done 2026-06-01)*
-  - Покрыть PHP strings/comments с emoji и non-ASCII перед диагностируемыми токенами
-  - Проверить LSP UTF-16 ranges для diagnostics, semantic tokens и symbol resolve в PHP-коде
-  - Убедиться, что PHP parsing не ломается на emoji в строках/комментариях
-  - Запустить релевантные parser tests
-
-- [x] **H-UTF16-2026-06-01** Покрыть UTF-16/UTF-8 position conversions полным набором Unicode-тестов *(done 2026-06-01)*
-  - Добавить тесты для ASCII, BMP, Cyrillic, combining marks, emoji/surrogate pairs, ZWJ sequences, mixed Unicode, CRLF, empty lines и EOF
-  - Проверить indexed и one-off conversion helpers на согласованность
-  - Проверить обратное преобразование UTF-16 column → byte column
-  - Исправить найденные edge cases без hardcode
 
 - [x] **H-001** Built-in function resolution в namespace (definition/rename) *(done 2026-02-15)*
   - Символы вида `strlen()` внутри namespace не должны резолвиться только как `App\\Ns\\strlen`
@@ -485,6 +442,57 @@
     - **symbols.rs**: в `extract_method` после создания Method символа добавлен проход по `property_promotion_parameter` нодам — для каждого создаётся дополнительный `SymbolInfo` с `kind: Property`, `fqn: Class::$name`, правильными visibility/modifiers и типом.
   - **Тесты**: 1 новый тест `test_promoted_constructor_params_emit_property_symbols` — проверяет что promoted параметры создают Property символы с правильным FQN, visibility, readonly модификатором и типом, а обычные параметры — нет.
   - 148 unit тестов, 16 e2e тестов, clippy clean.
+
+- [x] **H-UTF16-2026-06-01** Покрыть UTF-16/UTF-8 position conversions полным набором Unicode-тестов *(done 2026-06-01)*
+  - Добавить тесты для ASCII, BMP, Cyrillic, combining marks, emoji/surrogate pairs, ZWJ sequences, mixed Unicode, CRLF, empty lines и EOF
+  - Проверить indexed и one-off conversion helpers на согласованность
+  - Проверить обратное преобразование UTF-16 column → byte column
+  - Исправить найденные edge cases без hardcode
+
+- [x] **H-UNICODE-PHP-2026-06-01** Проверить Unicode/emoji в реальном PHP-коде *(done 2026-06-01)*
+  - Покрыть PHP strings/comments с emoji и non-ASCII перед диагностируемыми токенами
+  - Проверить LSP UTF-16 ranges для diagnostics, semantic tokens и symbol resolve в PHP-коде
+  - Убедиться, что PHP parsing не ломается на emoji в строках/комментариях
+  - Запустить релевантные parser tests
+
+- [x] **H-UTF-LSP-SURFACE-2026-06-01** Покрыть UTF/emoji по LSP-facing parser/server surfaces *(done 2026-06-01)*
+  - Проверить incremental edits, references, signature help, return-type insertion helpers
+  - Проверить server-side LSP text helpers, rename/code-action/definition/document-symbol/inlay/formatting-sensitive ranges
+  - Добавить focused tests с emoji/non-ASCII/CRLF перед символами и edit ranges
+  - Запустить релевантные Rust tests
+
+- [x] **H-HOVER-CLASS-LINKS-2026-06-01** Добавить ссылки на классы в hover markdown *(done 2026-06-01)*
+  - Найти все hover-поверхности, где выводятся типы, FQN, сигнатуры или связанные классы
+  - Переиспользовать существующий формат ссылок на definition для `Type:`
+  - Добавить focused tests для class links в hover
+  - Запустить релевантные Rust tests
+
+- [x] **H-TWIG-LSP-SURFACE-2026-06-01** Проверить и покрыть LSP-фичи для Twig шаблонов *(done 2026-06-01)*
+  - Проверить реальные шаблоны `/home/apanov/Projects/bdpn-ui/app/templates`
+  - Добавить e2e-тесты для Twig completion, inlayHint, go-to-definition, hover и syntax diagnostics
+  - Исправить найденные gaps без project-specific hardcode
+  - Обновить документацию при изменении поведения
+  - Запустить релевантные Rust tests и verifier
+
+- [x] **H-TWIG-PAGINATION-CONTEXT-2026-06-02** Восстановить Twig LSP для переменных из пагинации *(done 2026-06-02)*
+  - Reproduce отсутствующие hover, inlayHint, go-to-definition и autocomplete в `data_request/index.html.twig`
+  - Вывести тип элемента `{% for dr in pagination %}` из render context без project-specific hardcode
+  - Добавить focused e2e/unit tests для Twig foreach по paginator context
+  - Обновить документацию при изменении поведения
+  - Запустить релевантные Rust tests и verifier
+
+- [x] **H-TWIG-DATA-REQUEST-SURFACE-2026-06-02** Проверить и добить Twig LSP по всему `data_request/index.html.twig` *(done 2026-06-02)*
+  - Снять LSP-smoke по всем `dr.*`, `dr.status.*`, `dr.subscriber.*`, `shown/num/badgeClass`
+  - Исправить gaps hover, go-to-definition, inlayHint и autocomplete без project-specific hardcode
+  - Добавить property-style autocomplete aliases для Twig object member access
+  - Покрыть filters/tests/path arguments и nested member chains релевантными tests
+  - Обновить документацию при изменении поведения, запустить tests и verifier
+
+- [x] **H-TWIG-DEBT-SUSPENSION-MESSAGE-LOG-2026-06-02** Восстановить Twig LSP для messageLogs/messageLog в `debt_suspension/show.html.twig` *(done 2026-06-02)*
+  - Reproduce отсутствующие hover, go-to-definition, inlayHint и autocomplete на `messageLogs`/`messageLog.*`
+  - Исправить вывод ссылок на класс в hover и inlayHint для Twig foreach-переменных
+  - Добавить focused tests для `is defined`, collection length и property access внутри Twig foreach
+  - Обновить документацию при изменении поведения, запустить tests и verifier
 
 ---
 
@@ -3977,7 +3985,433 @@ change.
 
 ---
 
-## Текущие задачи
+## Журнал задач (append-only)
+
+Этот раздел является единственным местом для новых оперативных задач. Он должен расти только вниз: новые записи добавляются после последней записи в `### Записи`.
+
+### Правила вставки
+
+- Новую одиночную задачу добавлять в конец `### Записи`.
+- Новый milestone для большой задачи добавлять в конец `### Записи` целым блоком `### Milestone: ...`, затем добавлять его задачи внутри этого блока сверху вниз.
+- Не сортировать старые записи заново при обычной работе и не переносить свежие задачи наверх.
+- Если задача была добавлена как `[ ]`, при завершении менять ее на `[x]`, добавлять `*(done YYYY-MM-DD)*` и строки результата, не перемещая блок.
+- Для новых задач использовать уникальный ID с датой: `T-YYYY-MM-DD-short-name` или milestone-префикс вроде `GA-001`.
+
+### Шаблон одиночной задачи
+
+```markdown
+- [ ] **T-YYYY-MM-DD-short-name** Краткое описание задачи.
+  - Scope: что входит в задачу.
+  - Constraint: что нельзя делать или ломать.
+  - Validation target: какие проверки нужно запустить.
+```
+
+### Шаблон milestone
+
+```markdown
+### Milestone: <название> (YYYY-MM-DD -> YYYY-MM-DD)
+
+**Статус:** planned
+**Цель:** кратко описать результат большой задачи.
+
+#### Exit criteria
+
+- Проверяемый критерий готовности.
+
+#### Задачи
+
+- [ ] **<PREFIX>-001** Первая задача milestone.
+  - Scope: ...
+  - Validation target: ...
+- [ ] **<PREFIX>-002** Вторая задача milestone.
+  - Scope: ...
+  - Validation target: ...
+```
+
+### Записи
+
+- [x] **T-2026-05-19** Добавить `.semantic-search` в ignore и проверить статус `server/data/stubs`.
+
+- [x] **T-2026-05-19** Добавить release/downloads badge в README и перенести нижний счётчик наверх.
+
+- [x] **T-2026-05-19** Дополнить README полным набором badge для GitHub и VS Marketplace.
+
+- [x] **T-2026-05-19** Добавить Rust MSRV badge из `server/Cargo.toml` в README.
+
+- [x] **T-2026-05-19** Перенести блок новых задач в конец `TASKS.md`.
+
+- [x] **T-2026-05-19** Проанализировать отсутствующие LSP-возможности относительно обычных LSP серверов.
+
+- [x] **T-2026-05-19** Добавить отсутствующие LSP-возможности в roadmap `TASKS.md`.
+
+- [x] **T-2026-05-19** Добавить отдельный tracking checklist для LSP parity задач.
+
+- [x] **T-2026-05-19** Реализовать `LP-001 / V1-001` `textDocument/signatureHelp`.
+
+- [x] **T-2026-05-19** Реализовать `LP-002 / V1-002` quick-fix `Add use`.
+
+- [x] **T-2026-05-19** Реализовать `LP-003 / V1-003` `source.organizeImports`.
+
+- [x] **T-2026-05-19** Реализовать `LP-004 / V1-004` code action `Add return type`.
+
+- [x] **T-2026-05-19** Реализовать `LP-005 / V1-005` `textDocument/formatting`.
+
+- [x] **T-2026-05-19** Реализовать `LP-006 / V1-006` `textDocument/rangeFormatting`.
+
+- [x] **T-2026-05-19** Реализовать `LP-007 / V1-015` `textDocument/onTypeFormatting`.
+
+- [x] **T-2026-05-19** Реализовать `LP-008 / V1-007` `textDocument/semanticTokens/full`.
+
+- [x] **T-2026-05-19** Реализовать `LP-009 / V1-008` `textDocument/semanticTokens/full/delta`.
+
+- [x] **T-2026-05-19** Реализовать `LP-010 / V1-016` `textDocument/declaration`.
+
+- [x] **T-2026-05-19** Реализовать `LP-011 / V1-017` `textDocument/typeDefinition`.
+
+- [x] **T-2026-05-19** Реализовать `LP-012 / V1-018` `textDocument/documentHighlight`.
+
+- [x] **T-2026-05-19** Реализовать `LP-013 / V1-019` `textDocument/selectionRange`.
+
+- [x] **T-2026-05-19** Реализовать `LP-014 / V1-020` `textDocument/linkedEditingRange`.
+
+- [x] **T-2026-05-19** Реализовать `LP-015 / V1-021` Completion polish.
+
+- [x] **T-2026-05-19** Реализовать `LP-016 / V1-022` `workspace/didChangeWatchedFiles`.
+
+- [x] **T-2026-05-19** Реализовать `LP-017 / V1-023` `workspace/didChangeConfiguration`.
+
+- [x] **T-2026-05-19** Реализовать `LP-018 / V1-024` Workspace file operations.
+
+- [x] **T-2026-05-20** Реализовать `LP-019 / V1-025` Basic diagnostics parity.
+
+- [x] **T-2026-05-20** Реализовать `LP-020 / V1-026` Type/member diagnostics.
+
+- [x] **T-2026-05-20** Реализовать `LP-021 / VN-001` `textDocument/inlayHint`.
+
+- [x] **T-2026-05-20** Реализовать `LP-022 / VN-002` call hierarchy.
+
+- [x] **T-2026-05-20** Реализовать `LP-023 / VN-003` type hierarchy.
+
+- [x] **T-2026-05-20** Реализовать `LP-024 / VN-004` `textDocument/implementation`.
+
+- [x] **T-2026-05-20** Реализовать `LP-025 / VN-005` multi-root workspace support.
+
+- [x] **T-2026-05-20** Реализовать `LP-026 / VN-006` PHPStan diagnostics integration.
+
+- [x] **T-2026-05-20** Реализовать `LP-027 / VN-007` Psalm diagnostics integration.
+
+- [x] **T-2026-05-20** Реализовать `LP-028 / VN-008` `textDocument/codeLens`.
+
+- [x] **T-2026-05-20** Реализовать `LP-029 / VN-009` `textDocument/foldingRange`.
+
+- [x] **T-2026-05-20** Актуализировать `README.md` по статусу, возможностям и настройкам.
+
+- [x] **T-2026-05-20** Убрать упоминание `TASKS.md` из `README.md`.
+
+- [x] **T-2026-05-20** Исправить ложные diagnostics `Static method called as instance method` на instance setters.
+
+- [x] **T-2026-05-20** Подтягивать parent interfaces/classes при lazy indexing для diagnostics.
+
+- [x] **T-2026-05-20** Учитывать методы из `use Trait;` при member diagnostics.
+
+- [x] **T-2026-05-20** Подтягивать class return types методов при lazy diagnostics indexing.
+
+- [x] **T-2026-05-20** Сделать kind-aware member resolution для diagnostics.
+
+- [x] **T-2026-05-20** Исправить completion после member access, чтобы методы шли первыми.
+
+- [x] **T-2026-05-20** Исправить ложные diagnostics в PHPUnit mock chains и `::class` в `EmailNotifierTest.php`.
+
+- [x] **T-2026-05-20** Исправить ложный `Undefined variable` для value-переменной в `foreach`.
+
+- [x] **T-2026-05-20** Ускорить публикацию diagnostics при правках открытого файла.
+
+- [x] **T-2026-05-20** Исправить ложные diagnostics в `ChangeUserPasswordCommandTest.php`.
+
+- [x] **T-2026-05-20** Прогнать php-lsp diagnostics по файлам `/home/apanov/Projects/bdpn-ui/app/tests`.
+
+- [x] **T-2026-05-20** Снизить false positive diagnostics, найденные полным прогоном `app/tests`.
+
+- [x] **T-2026-05-20** Обновить `README.md` с учетом текущего статуса и `Makefile`.
+
+- [x] **T-2026-05-20** Добавить VS Code status bar popup со статусом индексации и полезной информацией расширения.
+
+- [x] **T-2026-05-20** Добавить настройку `phpLsp.excludePaths` и учитывать ее при индексации.
+
+- [x] **T-2026-05-20** Проверить, что все `phpLsp.*` настройки объявлены, передаются серверу и реально используются.
+
+- [x] **T-2026-05-20** Протестировать php-lsp diagnostics по файлам `/home/apanov/Projects/bdpn-ui/app/src` и найти неточности.
+
+- [x] **T-2026-05-20** Исправить ложные diagnostics, найденные прогоном `/home/apanov/Projects/bdpn-ui/app/src`.
+
+- [x] **T-2026-05-20** Убрать hardcode имен framework methods из suppress unused-parameter diagnostics.
+
+- [x] **T-2026-05-20** Проверить production-код на project-specific hardcode и убрать найденное.
+
+- [x] **T-2026-05-21** Исправить GitHub downloads badge в README.
+
+- [x] **T-2026-05-21** Изучить код проекта и составить список недостающих работ для production LSP сервера.
+
+- [x] **T-2026-05-21** Добавить milestone production-readiness с подробным расписанием задач.
+
+- [x] **T-2026-05-22** Обновить submodule `server/data/stubs` из upstream.
+
+- [x] **T-2026-05-23** Разобраться, почему `go to definition` не работает на `parent` в `AbstractObjectNormalizer.php`.
+
+- [x] **T-2026-05-23** Прогнать LSP-сервер по `/home/hightemp/ForTesting/symfony` и отловить ошибки работы.
+
+- [x] **T-2026-05-23** Убрать Symfony-specific hardcode `is_symfony_configurator_file` из diagnostics.
+
+- [x] **T-2026-05-23** Разобраться, почему completion не показывает методы `ReflectionMethod` для `$reflMethod->` в Symfony `CallbackValidator.php`.
+
+- [x] **T-2026-05-23** Протестировать autocomplete по `/home/hightemp/ForTesting/symfony` на падения и некорректные ответы.
+
+- [x] **T-2026-05-23** Исправить completion `Blank::` внутри chained call в Symfony `BlankValidator.php`.
+
+- [x] **T-2026-05-23** Расширить Symfony autocomplete-аудит проверкой полноты ожидаемых labels по разным контекстам.
+
+- [x] **T-2026-05-23** Разобрать остаточные Symfony autocomplete label misses: external PHPUnit symbols, `parent::` в anonymous class/trait, nullable/member chains.
+
+- [x] **T-2026-05-23** Исправить autocomplete для member-chain, начинающейся с `(new ClassName())`.
+
+- [x] **T-2026-05-23** Исправить resolution/completion `parent::` внутри anonymous class.
+
+- [x] **T-2026-05-23** Довести Symfony autocomplete/go-to-definition audit-fix-verify цикл до стабильного состояния.
+  - [x] Свежий аудит `/home/hightemp/ForTesting/symfony` по completion и definition.
+  - [x] Исправить воспроизводимые баги без Symfony-specific hardcode.
+  - [x] Добавить regression tests на исправленные случаи.
+  - [x] Прогнать `fmt`, `test`, `clippy`, `release build`, `git diff --check`.
+
+- [x] **T-2026-05-24** Разобраться, почему member autocomplete в `CallbackValidator.php` показывает переменные после `$reflMethod->setAccessible`.
+
+- [x] **T-2026-05-24** Разобраться, почему go-to-definition не работает для `$this`.
+
+- [x] **T-2026-05-24** Исправить VS Marketplace badge в README под текущий `publisher`/`name` из `client/package.json`.
+
+- [x] **T-2026-05-24** Добавить публикацию VS Code extension в Marketplace в release workflow.
+
+- [x] **T-2026-05-24** Исправить CI clippy failure `clippy::question_mark` в completion member-chain inference.
+
+- [x] **T-2026-05-24** Переименовать VS Code extension package `name` в `ht-php-lsp` для Marketplace publish.
+
+- [x] **T-2026-05-24** Бампнуть release version до `0.5.4` для публикации обновленного Marketplace package.
+
+- [x] **T-2026-05-24** Исправить completion и go-to-definition для переменных, объявленных output-аргументом `preg_match` (`$matches` в Symfony `DateValidator.php`).
+
+- [x] **T-2026-05-24** Разобраться и исправить отсутствие `README.md` в опубликованном VS Code extension package.
+
+- [x] **T-2026-05-24** Добавить в `README.md` badge с поддерживаемыми версиями PHP.
+
+- [x] **T-2026-05-24** Подготовить предыдущий релиз с README в VSIX.
+
+- [x] **T-2026-05-24** Исправить Marketplace badges в `README.md`, которые показывают `retired badge`.
+
+- [x] **T-2026-05-25** Добавить новый milestone IDE intelligence/tooling expansion без ссылок на внешние проекты.
+
+- [x] **T-2026-05-25** Добавить Monica в список локальных проектов для production validation.
+
+- [x] **T-2026-05-25** Добавить список локальных проектов для production validation.
+
+- [x] **T-2026-05-25** Разбить production-ready gaps на новый milestone задач для Codex.
+
+- [x] **T-2026-05-25** Актуализировать всю документацию после повторного прохода по проекту.
+
+- [x] **T-2026-05-28-server-full-module-split** Split `php-lsp-server` into focused LSP/indexing modules and split the large e2e suite. *(done 2026-05-28)*
+  - Scope: make the structural split recommended in the architecture audit so future work does not need to read/edit the whole `server.rs` or `tests/e2e.rs`.
+  - Implementation target: introduce `src/lsp/` modules for feature-specific server helpers/handlers (`completion`, `hover`, `definition`, `references`, `rename`, `diagnostics`, `code_action`, `formatting`, `inlay_hints`, `semantic_tokens`, `hierarchy`, `document_symbols`, `folding`, `document_links`).
+  - Implementation target: introduce `src/indexing/` modules for workspace/vendor/stubs/cache indexing helpers.
+  - Implementation target: split `tests/e2e.rs` into focused e2e files with shared helpers in `tests/support/mod.rs`.
+  - Constraint: this is a behavior-preserving file/module extraction; do not change URI encoding, range semantics, diagnostics behavior, or completion behavior as part of this task.
+  - Implemented: moved `LanguageServer` request bodies into focused `src/lsp/*` modules while keeping `server.rs` as trait wiring/delegation.
+  - Implemented: moved code-action edit/refactor/import/PHPDoc helper internals into `src/lsp/code_action.rs` so `server.rs` no longer owns the largest code-action block.
+  - Implemented: moved workspace/file-operation handlers into `src/indexing/workspace.rs` and cache/stub/vendor helpers into `src/indexing/cache.rs`, `src/indexing/stubs.rs`, and `src/indexing/vendor.rs`.
+  - Implemented: replaced the single `tests/e2e.rs` with focused e2e targets plus shared helpers in `tests/support/mod.rs`.
+  - Validation: `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server`, `cargo fmt --all --check`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step1** Start splitting large server files into focused modules. *(done 2026-05-28)*
+  - Scope: make the first behavior-preserving code split from the large `server.rs`/CLI helper surface.
+  - Implementation target: introduce focused `php-lsp-server/src/util/` modules for shared URI and LSP range/text helpers and migrate existing users.
+  - Constraint: do not mix this with functional URI encoding changes from `PHA-002`; this task is only file/module extraction unless tests force a small compatibility fix.
+  - Follow-up: keep larger LSP feature-handler extraction (`lsp/completion.rs`, `lsp/hover.rs`, diagnostics, code actions, inlay hints) as separate incremental refactors.
+  - Implemented: added `src/util/uri.rs` for shared `path_to_uri` / `uri_to_path` helpers and moved the existing round-trip regression there.
+  - Implemented: added `src/util/lsp_text.rs` for shared `lsp_position_to_byte` / `text_at_lsp_range` helpers and removed duplicated implementations from `server.rs` and `fix.rs`.
+  - Implemented: migrated `server.rs`, `analyze.rs`, and `fix.rs` to use the new utility modules without changing URI semantics yet.
+  - Validation: `cargo fmt --all --check`, targeted util tests, `cargo check -p php-lsp-server`, and `cargo test -p php-lsp-server` passed.
+
+- [x] **T-2026-05-28-server-split-step2** Continue reducing `php-lsp-server/src/server.rs` by moving remaining pure helper blocks into focused modules. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; do not change URI/range semantics, diagnostics, completion, or indexing behavior.
+  - Implementation target: move small self-contained helper groups out of `server.rs` before touching complex inference/diagnostics code.
+  - Candidate modules: request cache/cancellation helpers, shell/external command helpers, semantic-token delta helpers, workspace-symbol helpers, document-link/folding helpers, and other pure LSP utility blocks.
+  - Validation target: `cargo fmt --all --check`, focused `php-lsp-server` check/tests, clippy for `php-lsp-server`, and `git diff --check`.
+  - Implemented: moved semantic-token legend/range/delta helpers into `src/lsp/semantic_tokens.rs`.
+  - Implemented: moved document-link static include/require helpers into `src/lsp/document_links.rs` and kept the shared static-string helper available to code actions.
+  - Implemented: moved folding range helpers into `src/lsp/folding.rs`.
+  - Implemented: moved workspace-symbol candidate/ranking/range helpers into `src/lsp/document_symbols.rs`.
+  - Implemented: moved formatter auto-detect, external formatter, range-formatting, and on-type indentation helpers into `src/lsp/formatting.rs`.
+  - Implemented: moved PHPStan/Psalm JSON parsing and runner helpers into `src/lsp/diagnostics.rs`.
+  - Result: `server.rs` reduced from 18,123 lines at task start to 16,785 lines after this extraction.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo test -p php-lsp-server`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step3** Move hierarchy/reference helper logic out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep LSP response shapes, ranges, indexing, diagnostics, and inference behavior unchanged.
+  - Implementation target: move call/type hierarchy and implementation helper functions into `src/lsp/hierarchy.rs`.
+  - Implementation target: move code lens reference helper functions into `src/lsp/references.rs`.
+  - Implementation target: centralize small `Range` tuple conversion helpers where the focused LSP modules can share them.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused hierarchy/reference/symbol e2e tests or full `php-lsp-server` tests, clippy, and `git diff --check`.
+  - Implemented: moved call/type hierarchy, implementation-location, and outgoing/incoming call collection helpers into `src/lsp/hierarchy.rs`.
+  - Implemented: moved code-lens symbol filtering/title helpers into `src/lsp/references.rs`.
+  - Implemented: added shared `range_from_tuple` and `range_from_byte_range` helpers to `src/util/lsp_text.rs`.
+  - Result: `server.rs` reduced from 16,785 lines to 16,300 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo test -p php-lsp-server --test e2e_hierarchy --test e2e_references --test e2e_definition --test e2e_symbols`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step4** Move inlay/local-variable inference helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep URI/range semantics, diagnostics, completion, indexing, hover, and inlay behavior unchanged.
+  - Implementation target: move the cohesive inlay hint, local-variable type display, local-variable hover, and shared call-site type helper block into `src/lsp/inlay_hints.rs` so `server.rs` stops owning feature-specific inference/display code.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused inlay/hover/completion diagnostics tests where practical, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved the inlay hint generation, local-variable type inference/display, local-variable hover support, and shared call-site type inference helpers into `src/lsp/inlay_hints.rs`.
+  - Result: `server.rs` reduced from 16,300 lines to 13,327 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server inlay --tests`, `cargo test -p php-lsp-server hover --tests`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step5** Move diagnostics core helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep URI/range semantics, diagnostic messages/codes/severity, indexing behavior, and LSP response shapes unchanged.
+  - Implementation target: move `compute_*diagnostics`, semantic/member/type/override/PHP-version/duplicate-symbol diagnostics helpers, and supporting diagnostic inference structs into `src/lsp/diagnostics.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused diagnostics tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved core diagnostic computation, semantic diagnostic mapping/category helpers, member/type/override/PHP-version diagnostics, duplicate-symbol checks, and supporting diagnostic inference structs into `src/lsp/diagnostics.rs`.
+  - Result: `server.rs` reduced from 13,327 lines to 10,537 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server compute_diagnostics_`, `cargo test -p php-lsp-server --test e2e_diagnostics`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step6** Move virtual-member and shape completion helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep hover markdown, completion item data, definition ranges, URI/range semantics, and LSP response shapes unchanged.
+  - Implementation target: move PHPDoc/framework virtual-member helpers, framework string-key helpers, shape completion/definition helpers, and completion type-resolution helpers into a focused `src/lsp/completion_helpers.rs` module.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused hover/completion/definition tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: added `src/lsp/completion_helpers.rs` and moved PHPDoc/framework virtual-member helpers, framework string-key helpers, shape completion/definition helpers, local-variable completion helpers, and completion type-resolution helpers into it.
+  - Result: `server.rs` reduced from 10,537 lines to 8,807 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_completion --test e2e_hover --test e2e_definition`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step7** Move template/Twig context helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep Blade/Twig preprocessing, virtual-document mapping, diagnostics suppression, hover/completion/definition behavior, and URI/range semantics unchanged.
+  - Implementation target: move template document kind detection, Twig template path/name helpers, and Twig render-context inference helpers into `src/lsp/templates.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused template e2e tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: added `src/lsp/templates.rs` and moved template document kind detection, Twig path/name helpers, and Twig render-context type inference helpers into it.
+  - Result: `server.rs` reduced from 8,807 lines to 8,419 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_templates`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step8** Move workspace/config helper leftovers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep configuration merge/trust behavior, workspace root discovery, include/exclude path semantics, watched-file metadata handling, and indexing behavior unchanged.
+  - Implementation target: move path exclusion, PHP file collection, workspace root/config discovery, project command trust sanitization, Composer metadata change detection, and indexed-root removal helpers into `src/indexing/workspace.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused indexing/initialize/config tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved path exclusion/PHP file collection, workspace root/config discovery, project command trust sanitization, Composer metadata change detection, and indexed-root removal helpers into `src/indexing/workspace.rs`.
+  - Result: `server.rs` reduced from 8,419 lines to 7,855 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_initialize --test e2e_indexing`, `cargo test -p php-lsp-server path_is_excluded`, `cargo test -p php-lsp-server collect_php_files`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step9** Move vendor autoload helper leftovers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep Composer installed.json parsing, vendor PSR-4 resolution, lazy vendor indexing, cache-source behavior, and indexing response behavior unchanged.
+  - Implementation target: move vendor autoload parsing/resolution helpers into `src/indexing/vendor.rs` and keep CLI-facing vendor APIs re-exported from `server`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused vendor/indexing tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved vendor autoload parsing, vendor package path resolution, cached vendor autoload lookup, and test-only vendor path resolution into `src/indexing/vendor.rs`.
+  - Result: `server.rs` reduced from 7,855 lines to 7,712 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server vendor`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step10** Move the remaining unit test block out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving test-file extraction only; keep test names, assertions, fixtures, and helper behavior unchanged.
+  - Implementation target: move the trailing `server.rs` unit test module body into `src/server_tests.rs` and leave `server.rs` with only a small `#[cfg(test)] mod tests` declaration.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved the trailing `server.rs` unit test module body into `src/server_tests.rs` and left `server.rs` with a small `#[cfg(test)]` module declaration.
+  - Result: `server.rs` reduced from 7,712 lines to 4,774 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step11** Move workspace indexing execution helpers out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep PHP file parsing/index updates, cache load/save behavior, vendor preload behavior, progress notifications, cancellation, and diagnostics republish behavior unchanged.
+  - Implementation target: move workspace parse/index helpers, cached vendor file load/save helpers, vendor preload entrypoint helper, and `index_workspace` into `src/indexing/workspace.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused indexing/vendor tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved workspace file parse/index helpers, cached vendor file load/save helpers, vendor preload entrypoint helper, and `index_workspace` into `src/indexing/workspace.rs`.
+  - Result: `server.rs` reduced from 4,774 lines to 4,191 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_indexing`, `cargo test -p php-lsp-server vendor`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step12** Move remaining LSP helper tail out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; keep rename/reference behavior, signature help labels, template definition mapping, external analyzer/formatter command behavior, LSP conversion behavior, and completion auto-import edits unchanged.
+  - Implementation target: move rename/reference/document-symbol helpers into owning LSP modules, external command helpers into `src/lsp/external_command.rs`, shared LSP conversion helpers into `src/lsp/conversions.rs`, and completion auto-import helpers into `src/lsp/completion_helpers.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused references/completion/definition/formatting tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved rename helpers into `src/lsp/rename.rs`, document-highlight/reference helpers into `src/lsp/references.rs`, selection/linked-editing helpers into `src/lsp/document_symbols.rs`, signature-help and completion auto-import helpers into `src/lsp/completion_helpers.rs`, template definition mapping into `src/lsp/templates.rs`, external command helpers into `src/lsp/external_command.rs`, and LSP conversion helpers into `src/lsp/conversions.rs`.
+  - Result: `server.rs` reduced from 4,191 lines to 3,572 lines in this step.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_references --test e2e_completion --test e2e_definition --test e2e_formatting`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-server-split-step13** Move feature-specific `PhpLspBackend` method groups out of `server.rs`. *(done 2026-05-28)*
+  - Scope: behavior-preserving extraction only; preserve method names/call sites and only widen to `pub(in crate::server)` where sibling modules need access.
+  - Implementation target: move template document helpers to `src/lsp/templates.rs`, completion inference helpers to `src/lsp/completion.rs`, lazy vendor/index resolution helpers to `src/indexing/vendor.rs`, analyzer/diagnostic publishing helpers to `src/lsp/diagnostics.rs`, and PHP file reindex/remove/rename helpers to `src/indexing/workspace.rs`.
+  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, relevant focused e2e tests, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
+  - Implemented: moved template document helpers into `src/lsp/templates.rs`, completion member/type inference helpers into `src/lsp/completion.rs`, lazy vendor/index resolution helpers into `src/indexing/vendor.rs`, analyzer/diagnostic publishing helpers into `src/lsp/diagnostics.rs`, definition import lookup into `src/lsp/definition.rs`, and PHP file reindex/remove/rename helpers into `src/indexing/workspace.rs`.
+  - Result: `server.rs` reduced from 3,572 lines to 2,043 lines in this step, satisfying the <=5,000 line target.
+  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_templates --test e2e_completion --test e2e_definition --test e2e_diagnostics --test e2e_indexing`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-e2e-definition-helper-scope** Make the vendor fixture helper reference explicit in `e2e_definition.rs` for IDE/rust-analyzer diagnostics. *(done 2026-05-28)*
+  - Scope: address the editor diagnostic `cannot find function vendor_resolve_fixture_root` without changing test behavior.
+  - Validation target: focused `e2e_definition` test target, rustfmt, clippy, and whitespace check.
+  - Implemented: changed vendor fixture helper calls in `e2e_definition.rs` to `support::vendor_resolve_fixture_root()`.
+  - Validation: `cargo fmt --all --check`, `cargo clippy -p php-lsp-server --test e2e_definition -- -D warnings`, `cargo test -p php-lsp-server --test e2e_definition`, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-e2e-split-lint** Check and fix linter failures in split `php-lsp-server` e2e completion/definition tests. *(done 2026-05-28)*
+  - Scope: inspect `server/crates/php-lsp-server/tests/e2e_completion.rs` and `server/crates/php-lsp-server/tests/e2e_definition.rs`.
+  - Validation target: run focused formatting/lint/test commands for the affected integration test targets and keep the fix behavior-preserving.
+  - Result: no linter/test failure reproduced on the current tree; no code changes were needed.
+  - Validation: `cargo fmt --all --check`, `cargo clippy -p php-lsp-server --test e2e_completion --test e2e_definition -- -D warnings`, `cargo clippy --all-targets -- -D warnings`, and `cargo test -p php-lsp-server --test e2e_completion --test e2e_definition` passed.
+
+- [x] **T-2026-05-28-document-split-structure** Document the new split server/test structure and update agent guidance. *(done 2026-05-28)*
+  - Scope: update existing English documentation only; do not create duplicate markdown files.
+  - Implementation target: document the new `php-lsp-server/src/lsp`, `src/indexing`, `src/util`, and split e2e test layout.
+  - Implementation target: update `AGENTS.md` where-to-look routes and test-selection commands so future agents use the new files instead of old `server.rs` / `tests/e2e.rs` assumptions.
+  - Implemented: updated `AGENTS.md` with the new `php-lsp-server` module map, focused e2e targets, and feature-specific "where to look" routes.
+  - Implemented: updated `docs/architecture.md` with the server crate layout, split e2e test layout, feature ownership map, and public entry point map.
+  - Implemented: updated `make test-e2e` to run the split e2e suite with `cargo test -p php-lsp-server --tests`.
+  - Validation: `make -n test-e2e`, stale e2e/server.rs reference scan, and `git diff --check` passed.
+
+- [x] **T-2026-05-28-agent-onboarding** Improve agent-facing project guidance without duplicating existing docs. *(done 2026-05-28)*
+  - Scope: update existing `AGENTS.md`, architecture/feature documentation, and build shortcuts so future Codex/LLM work has a concise project map, invariants, recipes, and test-selection guidance.
+  - Constraint: do not create duplicate markdown files when an equivalent document already exists; extend existing files such as `AGENTS.md`, `docs/architecture.md`, `docs/lsp-features.md`, and `Makefile`.
+  - Scope: add short source-code comments only for fragile shared invariants that affect many LSP features.
+  - Implemented: expanded the existing root `AGENTS.md` with a crate map, architecture rules, test-selection guidance, "where to look" routes, and known pitfalls.
+  - Implemented: updated the existing `docs/architecture.md` with shared invariants, position/URI/symbol model rules, a feature ownership map, and public entry points instead of creating duplicate architecture/API docs.
+  - Implemented: kept `docs/lsp-features.md` focused on user-visible LSP behavior and linked it to the architecture feature ownership map.
+  - Implemented: extended the existing `Makefile` with focused server/client/check/e2e targets instead of adding a `justfile`.
+  - Implemented: added source comments for fragile shared type invariants in `php-lsp-types` and the server module position convention.
+  - Validation: `cargo fmt --all --check`, `make -n check-server`, `make -n check-client`, and `make -n test-e2e` passed.
+
+- [x] **T-2026-05-28** Analyze GPT-5.5 static production audit and add a follow-up hardening milestone. *(done 2026-05-28)*
+
+- [x] **T-2026-05-28** Пройти `/home/apanov/Projects/bdpn-ui` PHP+Twig и найти текущие ошибки/false positives `php-lsp` *(done 2026-05-28)*
+  - Scope: run CLI diagnostics against the Symfony app PHP tree with project root `/home/apanov/Projects/bdpn-ui/app`.
+  - Scope: inspect Twig coverage separately because CLI `analyze` currently targets PHP files, while Twig diagnostics are served through template documents in LSP mode.
+  - Deliverable: concise list of reproducible `php-lsp` issues with file/line, message, likely cause, and whether it looks like project code or `php-lsp` false positive/gap.
+  - Audit command path: real LSP stdio session with `rootUri=/home/apanov/Projects/bdpn-ui/app`, `stubsPath=/home/apanov/Projects/php-lsp/client/stubs`, `phpVersion=8.4`, workspace index ready before opening documents.
+  - Result: 266 PHP files + 102 Twig files opened; workspace index loaded 4013 PHP files from cache; 889 diagnostics in 84 files.
+  - PHP result: 118 diagnostics in 35 files. Main `php-lsp` gaps are unresolved Symfony Console/Doctrine/PasswordHasher classes in `ChangeUserPasswordCommand.php`, missing `@method` support on `VerifyEmailHelperInterface`, incomplete `positive-int` literal compatibility for Symfony `Assert\Length`, missing/dynamic SimpleXML property handling, missing bundled/default SOAP stubs, and false override-signature noise.
+  - Twig result: 771 syntax diagnostics in 49 templates, dominated by valid Twig expressions such as `asset()/path()`, `starts with`, inline ternaries, filters, and long HTML attributes that the current virtual-PHP preprocessor cannot model safely.
+  - CLI note: `php-lsp analyze app/src` produced 1668 warnings because CLI analyze does not use the LSP lazy vendor indexing path; this is a separate CLI parity gap and should not be treated as editor-equivalent output.
+
+- [x] **T-2026-05-28** Проверить и исправить false positive `arrayp` type mismatch для `LoggerInterface::info` context в `DeactivateConfirmService.php` *(done 2026-05-28)*
+  - Причина: PHPDoc shorthand `mixed[]` из `Psr\Log\LoggerInterface` парсился
+    как простой тип `mixed[]`, перезаписывал native `array $context` и давал
+    ложный mismatch для литерала массива.
+  - Исправлено: PHPDoc parser теперь разворачивает `T[]` / `T[][]` в generic
+    array type, поэтому `mixed[]` принимает `[$soapRequest]`.
+  - Cache schema bumped to invalidate old workspace/stubs/vendor symbol
+    snapshots that may already contain `mixed[]` as a simple type.
+  - Regression: добавлены parser test для `mixed[]`/`User[][]`, diagnostics
+    test для PHPDoc `mixed[]` argument и точный diagnostics test для
+    `Psr\Log\LoggerInterface::info(..., mixed[] $context)`.
+  - Validation: targeted parser/server tests, `cargo test --all`,
+    `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`.
+
+- [x] **T-2026-05-29-serena-rust-search-smoke** Test Serena search on Rust code. *(done 2026-05-29)*
+  - Scope: tool smoke test only; use Serena to inspect/search Rust symbols and report whether it works.
+  - Validation target: successful Serena symbol/pattern query output.
+  - Result: Serena `get_symbols_overview`, `find_symbol`, `find_referencing_symbols`, `search_for_pattern`, and file diagnostics worked on Rust files.
+
+- [x] **T-2026-05-29-agents-update** Update `AGENTS.md` after the `server.rs` split. *(done 2026-05-29)*
+  - Scope: documentation-only update; keep repository guidance aligned with the current `php-lsp-server` module layout and test-selection routes.
+  - Validation target: `git diff --check`.
+  - Implemented: updated `php-lsp-server` layout notes, test-selection guidance, and Where To Look routes for the split `lsp/*`, `indexing/*`, and `server_tests.rs` files.
+  - Validation: `git diff --check` passed.
 
 - [x] **T-2026-06-01-utf-hardening-emoji-regressions** Add UTF-16/LSP regression coverage for complex Unicode sequences. *(done 2026-06-01)*
   - Scope: add focused unit and e2e tests for complex emoji and Unicode text
@@ -4029,295 +4463,6 @@ change.
   - Validation: Serena symbol/pattern search was used to verify key Rust entry
     points; `git diff --check` passed.
 
-- [x] **T-2026-05-29-serena-rust-search-smoke** Test Serena search on Rust code. *(done 2026-05-29)*
-  - Scope: tool smoke test only; use Serena to inspect/search Rust symbols and report whether it works.
-  - Validation target: successful Serena symbol/pattern query output.
-  - Result: Serena `get_symbols_overview`, `find_symbol`, `find_referencing_symbols`, `search_for_pattern`, and file diagnostics worked on Rust files.
-
-- [x] **T-2026-05-29-agents-update** Update `AGENTS.md` after the `server.rs` split. *(done 2026-05-29)*
-  - Scope: documentation-only update; keep repository guidance aligned with the current `php-lsp-server` module layout and test-selection routes.
-  - Validation target: `git diff --check`.
-  - Implemented: updated `php-lsp-server` layout notes, test-selection guidance, and Where To Look routes for the split `lsp/*`, `indexing/*`, and `server_tests.rs` files.
-  - Validation: `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step13** Move feature-specific `PhpLspBackend` method groups out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; preserve method names/call sites and only widen to `pub(in crate::server)` where sibling modules need access.
-  - Implementation target: move template document helpers to `src/lsp/templates.rs`, completion inference helpers to `src/lsp/completion.rs`, lazy vendor/index resolution helpers to `src/indexing/vendor.rs`, analyzer/diagnostic publishing helpers to `src/lsp/diagnostics.rs`, and PHP file reindex/remove/rename helpers to `src/indexing/workspace.rs`.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, relevant focused e2e tests, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: moved template document helpers into `src/lsp/templates.rs`, completion member/type inference helpers into `src/lsp/completion.rs`, lazy vendor/index resolution helpers into `src/indexing/vendor.rs`, analyzer/diagnostic publishing helpers into `src/lsp/diagnostics.rs`, definition import lookup into `src/lsp/definition.rs`, and PHP file reindex/remove/rename helpers into `src/indexing/workspace.rs`.
-  - Result: `server.rs` reduced from 3,572 lines to 2,043 lines in this step, satisfying the <=5,000 line target.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_templates --test e2e_completion --test e2e_definition --test e2e_diagnostics --test e2e_indexing`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step12** Move remaining LSP helper tail out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; keep rename/reference behavior, signature help labels, template definition mapping, external analyzer/formatter command behavior, LSP conversion behavior, and completion auto-import edits unchanged.
-  - Implementation target: move rename/reference/document-symbol helpers into owning LSP modules, external command helpers into `src/lsp/external_command.rs`, shared LSP conversion helpers into `src/lsp/conversions.rs`, and completion auto-import helpers into `src/lsp/completion_helpers.rs`.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused references/completion/definition/formatting tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: moved rename helpers into `src/lsp/rename.rs`, document-highlight/reference helpers into `src/lsp/references.rs`, selection/linked-editing helpers into `src/lsp/document_symbols.rs`, signature-help and completion auto-import helpers into `src/lsp/completion_helpers.rs`, template definition mapping into `src/lsp/templates.rs`, external command helpers into `src/lsp/external_command.rs`, and LSP conversion helpers into `src/lsp/conversions.rs`.
-  - Result: `server.rs` reduced from 4,191 lines to 3,572 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_references --test e2e_completion --test e2e_definition --test e2e_formatting`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step11** Move workspace indexing execution helpers out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; keep PHP file parsing/index updates, cache load/save behavior, vendor preload behavior, progress notifications, cancellation, and diagnostics republish behavior unchanged.
-  - Implementation target: move workspace parse/index helpers, cached vendor file load/save helpers, vendor preload entrypoint helper, and `index_workspace` into `src/indexing/workspace.rs`.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused indexing/vendor tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: moved workspace file parse/index helpers, cached vendor file load/save helpers, vendor preload entrypoint helper, and `index_workspace` into `src/indexing/workspace.rs`.
-  - Result: `server.rs` reduced from 4,774 lines to 4,191 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_indexing`, `cargo test -p php-lsp-server vendor`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step10** Move the remaining unit test block out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving test-file extraction only; keep test names, assertions, fixtures, and helper behavior unchanged.
-  - Implementation target: move the trailing `server.rs` unit test module body into `src/server_tests.rs` and leave `server.rs` with only a small `#[cfg(test)] mod tests` declaration.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: moved the trailing `server.rs` unit test module body into `src/server_tests.rs` and left `server.rs` with a small `#[cfg(test)]` module declaration.
-  - Result: `server.rs` reduced from 7,712 lines to 4,774 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step9** Move vendor autoload helper leftovers out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; keep Composer installed.json parsing, vendor PSR-4 resolution, lazy vendor indexing, cache-source behavior, and indexing response behavior unchanged.
-  - Implementation target: move vendor autoload parsing/resolution helpers into `src/indexing/vendor.rs` and keep CLI-facing vendor APIs re-exported from `server`.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused vendor/indexing tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: moved vendor autoload parsing, vendor package path resolution, cached vendor autoload lookup, and test-only vendor path resolution into `src/indexing/vendor.rs`.
-  - Result: `server.rs` reduced from 7,855 lines to 7,712 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server vendor`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step8** Move workspace/config helper leftovers out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; keep configuration merge/trust behavior, workspace root discovery, include/exclude path semantics, watched-file metadata handling, and indexing behavior unchanged.
-  - Implementation target: move path exclusion, PHP file collection, workspace root/config discovery, project command trust sanitization, Composer metadata change detection, and indexed-root removal helpers into `src/indexing/workspace.rs`.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused indexing/initialize/config tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: moved path exclusion/PHP file collection, workspace root/config discovery, project command trust sanitization, Composer metadata change detection, and indexed-root removal helpers into `src/indexing/workspace.rs`.
-  - Result: `server.rs` reduced from 8,419 lines to 7,855 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_initialize --test e2e_indexing`, `cargo test -p php-lsp-server path_is_excluded`, `cargo test -p php-lsp-server collect_php_files`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step7** Move template/Twig context helpers out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; keep Blade/Twig preprocessing, virtual-document mapping, diagnostics suppression, hover/completion/definition behavior, and URI/range semantics unchanged.
-  - Implementation target: move template document kind detection, Twig template path/name helpers, and Twig render-context inference helpers into `src/lsp/templates.rs`.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused template e2e tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: added `src/lsp/templates.rs` and moved template document kind detection, Twig path/name helpers, and Twig render-context type inference helpers into it.
-  - Result: `server.rs` reduced from 8,807 lines to 8,419 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_templates`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step6** Move virtual-member and shape completion helpers out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; keep hover markdown, completion item data, definition ranges, URI/range semantics, and LSP response shapes unchanged.
-  - Implementation target: move PHPDoc/framework virtual-member helpers, framework string-key helpers, shape completion/definition helpers, and completion type-resolution helpers into a focused `src/lsp/completion_helpers.rs` module.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused hover/completion/definition tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: added `src/lsp/completion_helpers.rs` and moved PHPDoc/framework virtual-member helpers, framework string-key helpers, shape completion/definition helpers, local-variable completion helpers, and completion type-resolution helpers into it.
-  - Result: `server.rs` reduced from 10,537 lines to 8,807 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server --test e2e_completion --test e2e_hover --test e2e_definition`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step5** Move diagnostics core helpers out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; keep URI/range semantics, diagnostic messages/codes/severity, indexing behavior, and LSP response shapes unchanged.
-  - Implementation target: move `compute_*diagnostics`, semantic/member/type/override/PHP-version/duplicate-symbol diagnostics helpers, and supporting diagnostic inference structs into `src/lsp/diagnostics.rs`.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused diagnostics tests, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: moved core diagnostic computation, semantic diagnostic mapping/category helpers, member/type/override/PHP-version diagnostics, duplicate-symbol checks, and supporting diagnostic inference structs into `src/lsp/diagnostics.rs`.
-  - Result: `server.rs` reduced from 13,327 lines to 10,537 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server compute_diagnostics_`, `cargo test -p php-lsp-server --test e2e_diagnostics`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step4** Move inlay/local-variable inference helpers out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; keep URI/range semantics, diagnostics, completion, indexing, hover, and inlay behavior unchanged.
-  - Implementation target: move the cohesive inlay hint, local-variable type display, local-variable hover, and shared call-site type helper block into `src/lsp/inlay_hints.rs` so `server.rs` stops owning feature-specific inference/display code.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused inlay/hover/completion diagnostics tests where practical, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `git diff --check`, and updated `server.rs` line count.
-  - Implemented: moved the inlay hint generation, local-variable type inference/display, local-variable hover support, and shared call-site type inference helpers into `src/lsp/inlay_hints.rs`.
-  - Result: `server.rs` reduced from 16,300 lines to 13,327 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server inlay --tests`, `cargo test -p php-lsp-server hover --tests`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step3** Move hierarchy/reference helper logic out of `server.rs`. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; keep LSP response shapes, ranges, indexing, diagnostics, and inference behavior unchanged.
-  - Implementation target: move call/type hierarchy and implementation helper functions into `src/lsp/hierarchy.rs`.
-  - Implementation target: move code lens reference helper functions into `src/lsp/references.rs`.
-  - Implementation target: centralize small `Range` tuple conversion helpers where the focused LSP modules can share them.
-  - Validation target: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, focused hierarchy/reference/symbol e2e tests or full `php-lsp-server` tests, clippy, and `git diff --check`.
-  - Implemented: moved call/type hierarchy, implementation-location, and outgoing/incoming call collection helpers into `src/lsp/hierarchy.rs`.
-  - Implemented: moved code-lens symbol filtering/title helpers into `src/lsp/references.rs`.
-  - Implemented: added shared `range_from_tuple` and `range_from_byte_range` helpers to `src/util/lsp_text.rs`.
-  - Result: `server.rs` reduced from 16,785 lines to 16,300 lines in this step.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo test -p php-lsp-server --test e2e_hierarchy --test e2e_references --test e2e_definition --test e2e_symbols`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step2** Continue reducing `php-lsp-server/src/server.rs` by moving remaining pure helper blocks into focused modules. *(done 2026-05-28)*
-  - Scope: behavior-preserving extraction only; do not change URI/range semantics, diagnostics, completion, or indexing behavior.
-  - Implementation target: move small self-contained helper groups out of `server.rs` before touching complex inference/diagnostics code.
-  - Candidate modules: request cache/cancellation helpers, shell/external command helpers, semantic-token delta helpers, workspace-symbol helpers, document-link/folding helpers, and other pure LSP utility blocks.
-  - Validation target: `cargo fmt --all --check`, focused `php-lsp-server` check/tests, clippy for `php-lsp-server`, and `git diff --check`.
-  - Implemented: moved semantic-token legend/range/delta helpers into `src/lsp/semantic_tokens.rs`.
-  - Implemented: moved document-link static include/require helpers into `src/lsp/document_links.rs` and kept the shared static-string helper available to code actions.
-  - Implemented: moved folding range helpers into `src/lsp/folding.rs`.
-  - Implemented: moved workspace-symbol candidate/ranking/range helpers into `src/lsp/document_symbols.rs`.
-  - Implemented: moved formatter auto-detect, external formatter, range-formatting, and on-type indentation helpers into `src/lsp/formatting.rs`.
-  - Implemented: moved PHPStan/Psalm JSON parsing and runner helpers into `src/lsp/diagnostics.rs`.
-  - Result: `server.rs` reduced from 18,123 lines at task start to 16,785 lines after this extraction.
-  - Validation: `cargo fmt --all --check`, `cargo check -p php-lsp-server --tests`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo test -p php-lsp-server`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-e2e-definition-helper-scope** Make the vendor fixture helper reference explicit in `e2e_definition.rs` for IDE/rust-analyzer diagnostics. *(done 2026-05-28)*
-  - Scope: address the editor diagnostic `cannot find function vendor_resolve_fixture_root` without changing test behavior.
-  - Validation target: focused `e2e_definition` test target, rustfmt, clippy, and whitespace check.
-  - Implemented: changed vendor fixture helper calls in `e2e_definition.rs` to `support::vendor_resolve_fixture_root()`.
-  - Validation: `cargo fmt --all --check`, `cargo clippy -p php-lsp-server --test e2e_definition -- -D warnings`, `cargo test -p php-lsp-server --test e2e_definition`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-e2e-split-lint** Check and fix linter failures in split `php-lsp-server` e2e completion/definition tests. *(done 2026-05-28)*
-  - Scope: inspect `server/crates/php-lsp-server/tests/e2e_completion.rs` and `server/crates/php-lsp-server/tests/e2e_definition.rs`.
-  - Validation target: run focused formatting/lint/test commands for the affected integration test targets and keep the fix behavior-preserving.
-  - Result: no linter/test failure reproduced on the current tree; no code changes were needed.
-  - Validation: `cargo fmt --all --check`, `cargo clippy -p php-lsp-server --test e2e_completion --test e2e_definition -- -D warnings`, `cargo clippy --all-targets -- -D warnings`, and `cargo test -p php-lsp-server --test e2e_completion --test e2e_definition` passed.
-
-- [x] **T-2026-05-28-document-split-structure** Document the new split server/test structure and update agent guidance. *(done 2026-05-28)*
-  - Scope: update existing English documentation only; do not create duplicate markdown files.
-  - Implementation target: document the new `php-lsp-server/src/lsp`, `src/indexing`, `src/util`, and split e2e test layout.
-  - Implementation target: update `AGENTS.md` where-to-look routes and test-selection commands so future agents use the new files instead of old `server.rs` / `tests/e2e.rs` assumptions.
-  - Implemented: updated `AGENTS.md` with the new `php-lsp-server` module map, focused e2e targets, and feature-specific "where to look" routes.
-  - Implemented: updated `docs/architecture.md` with the server crate layout, split e2e test layout, feature ownership map, and public entry point map.
-  - Implemented: updated `make test-e2e` to run the split e2e suite with `cargo test -p php-lsp-server --tests`.
-  - Validation: `make -n test-e2e`, stale e2e/server.rs reference scan, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-full-module-split** Split `php-lsp-server` into focused LSP/indexing modules and split the large e2e suite. *(done 2026-05-28)*
-  - Scope: make the structural split recommended in the architecture audit so future work does not need to read/edit the whole `server.rs` or `tests/e2e.rs`.
-  - Implementation target: introduce `src/lsp/` modules for feature-specific server helpers/handlers (`completion`, `hover`, `definition`, `references`, `rename`, `diagnostics`, `code_action`, `formatting`, `inlay_hints`, `semantic_tokens`, `hierarchy`, `document_symbols`, `folding`, `document_links`).
-  - Implementation target: introduce `src/indexing/` modules for workspace/vendor/stubs/cache indexing helpers.
-  - Implementation target: split `tests/e2e.rs` into focused e2e files with shared helpers in `tests/support/mod.rs`.
-  - Constraint: this is a behavior-preserving file/module extraction; do not change URI encoding, range semantics, diagnostics behavior, or completion behavior as part of this task.
-  - Implemented: moved `LanguageServer` request bodies into focused `src/lsp/*` modules while keeping `server.rs` as trait wiring/delegation.
-  - Implemented: moved code-action edit/refactor/import/PHPDoc helper internals into `src/lsp/code_action.rs` so `server.rs` no longer owns the largest code-action block.
-  - Implemented: moved workspace/file-operation handlers into `src/indexing/workspace.rs` and cache/stub/vendor helpers into `src/indexing/cache.rs`, `src/indexing/stubs.rs`, and `src/indexing/vendor.rs`.
-  - Implemented: replaced the single `tests/e2e.rs` with focused e2e targets plus shared helpers in `tests/support/mod.rs`.
-  - Validation: `cargo check -p php-lsp-server --tests`, `cargo test -p php-lsp-server`, `cargo fmt --all --check`, `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, and `git diff --check` passed.
-
-- [x] **T-2026-05-28-server-split-step1** Start splitting large server files into focused modules. *(done 2026-05-28)*
-  - Scope: make the first behavior-preserving code split from the large `server.rs`/CLI helper surface.
-  - Implementation target: introduce focused `php-lsp-server/src/util/` modules for shared URI and LSP range/text helpers and migrate existing users.
-  - Constraint: do not mix this with functional URI encoding changes from `PHA-002`; this task is only file/module extraction unless tests force a small compatibility fix.
-  - Follow-up: keep larger LSP feature-handler extraction (`lsp/completion.rs`, `lsp/hover.rs`, diagnostics, code actions, inlay hints) as separate incremental refactors.
-  - Implemented: added `src/util/uri.rs` for shared `path_to_uri` / `uri_to_path` helpers and moved the existing round-trip regression there.
-  - Implemented: added `src/util/lsp_text.rs` for shared `lsp_position_to_byte` / `text_at_lsp_range` helpers and removed duplicated implementations from `server.rs` and `fix.rs`.
-  - Implemented: migrated `server.rs`, `analyze.rs`, and `fix.rs` to use the new utility modules without changing URI semantics yet.
-  - Validation: `cargo fmt --all --check`, targeted util tests, `cargo check -p php-lsp-server`, and `cargo test -p php-lsp-server` passed.
-
-- [x] **T-2026-05-28-agent-onboarding** Improve agent-facing project guidance without duplicating existing docs. *(done 2026-05-28)*
-  - Scope: update existing `AGENTS.md`, architecture/feature documentation, and build shortcuts so future Codex/LLM work has a concise project map, invariants, recipes, and test-selection guidance.
-  - Constraint: do not create duplicate markdown files when an equivalent document already exists; extend existing files such as `AGENTS.md`, `docs/architecture.md`, `docs/lsp-features.md`, and `Makefile`.
-  - Scope: add short source-code comments only for fragile shared invariants that affect many LSP features.
-  - Implemented: expanded the existing root `AGENTS.md` with a crate map, architecture rules, test-selection guidance, "where to look" routes, and known pitfalls.
-  - Implemented: updated the existing `docs/architecture.md` with shared invariants, position/URI/symbol model rules, a feature ownership map, and public entry points instead of creating duplicate architecture/API docs.
-  - Implemented: kept `docs/lsp-features.md` focused on user-visible LSP behavior and linked it to the architecture feature ownership map.
-  - Implemented: extended the existing `Makefile` with focused server/client/check/e2e targets instead of adding a `justfile`.
-  - Implemented: added source comments for fragile shared type invariants in `php-lsp-types` and the server module position convention.
-  - Validation: `cargo fmt --all --check`, `make -n check-server`, `make -n check-client`, and `make -n test-e2e` passed.
-
-- [x] **T-2026-05-28** Analyze GPT-5.5 static production audit and add a follow-up hardening milestone. *(done 2026-05-28)*
-- [x] **T-2026-05-28** Пройти `/home/apanov/Projects/bdpn-ui` PHP+Twig и найти текущие ошибки/false positives `php-lsp` *(done 2026-05-28)*
-  - Scope: run CLI diagnostics against the Symfony app PHP tree with project root `/home/apanov/Projects/bdpn-ui/app`.
-  - Scope: inspect Twig coverage separately because CLI `analyze` currently targets PHP files, while Twig diagnostics are served through template documents in LSP mode.
-  - Deliverable: concise list of reproducible `php-lsp` issues with file/line, message, likely cause, and whether it looks like project code or `php-lsp` false positive/gap.
-  - Audit command path: real LSP stdio session with `rootUri=/home/apanov/Projects/bdpn-ui/app`, `stubsPath=/home/apanov/Projects/php-lsp/client/stubs`, `phpVersion=8.4`, workspace index ready before opening documents.
-  - Result: 266 PHP files + 102 Twig files opened; workspace index loaded 4013 PHP files from cache; 889 diagnostics in 84 files.
-  - PHP result: 118 diagnostics in 35 files. Main `php-lsp` gaps are unresolved Symfony Console/Doctrine/PasswordHasher classes in `ChangeUserPasswordCommand.php`, missing `@method` support on `VerifyEmailHelperInterface`, incomplete `positive-int` literal compatibility for Symfony `Assert\Length`, missing/dynamic SimpleXML property handling, missing bundled/default SOAP stubs, and false override-signature noise.
-  - Twig result: 771 syntax diagnostics in 49 templates, dominated by valid Twig expressions such as `asset()/path()`, `starts with`, inline ternaries, filters, and long HTML attributes that the current virtual-PHP preprocessor cannot model safely.
-  - CLI note: `php-lsp analyze app/src` produced 1668 warnings because CLI analyze does not use the LSP lazy vendor indexing path; this is a separate CLI parity gap and should not be treated as editor-equivalent output.
-- [x] **T-2026-05-28** Проверить и исправить false positive `arrayp` type mismatch для `LoggerInterface::info` context в `DeactivateConfirmService.php` *(done 2026-05-28)*
-  - Причина: PHPDoc shorthand `mixed[]` из `Psr\Log\LoggerInterface` парсился
-    как простой тип `mixed[]`, перезаписывал native `array $context` и давал
-    ложный mismatch для литерала массива.
-  - Исправлено: PHPDoc parser теперь разворачивает `T[]` / `T[][]` в generic
-    array type, поэтому `mixed[]` принимает `[$soapRequest]`.
-  - Cache schema bumped to invalidate old workspace/stubs/vendor symbol
-    snapshots that may already contain `mixed[]` as a simple type.
-  - Regression: добавлены parser test для `mixed[]`/`User[][]`, diagnostics
-    test для PHPDoc `mixed[]` argument и точный diagnostics test для
-    `Psr\Log\LoggerInterface::info(..., mixed[] $context)`.
-  - Validation: targeted parser/server tests, `cargo test --all`,
-    `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`.
-- [x] **T-2026-05-25** Добавить новый milestone IDE intelligence/tooling expansion без ссылок на внешние проекты.
-- [x] **T-2026-05-25** Добавить Monica в список локальных проектов для production validation.
-- [x] **T-2026-05-25** Добавить список локальных проектов для production validation.
-- [x] **T-2026-05-25** Разбить production-ready gaps на новый milestone задач для Codex.
-- [x] **T-2026-05-19** Добавить `.semantic-search` в ignore и проверить статус `server/data/stubs`.
-- [x] **T-2026-05-19** Добавить release/downloads badge в README и перенести нижний счётчик наверх.
-- [x] **T-2026-05-19** Дополнить README полным набором badge для GitHub и VS Marketplace.
-- [x] **T-2026-05-19** Добавить Rust MSRV badge из `server/Cargo.toml` в README.
-- [x] **T-2026-05-19** Перенести блок новых задач в конец `TASKS.md`.
-- [x] **T-2026-05-19** Проанализировать отсутствующие LSP-возможности относительно обычных LSP серверов.
-- [x] **T-2026-05-19** Добавить отсутствующие LSP-возможности в roadmap `TASKS.md`.
-- [x] **T-2026-05-19** Добавить отдельный tracking checklist для LSP parity задач.
-- [x] **T-2026-05-19** Реализовать `LP-001 / V1-001` `textDocument/signatureHelp`.
-- [x] **T-2026-05-19** Реализовать `LP-002 / V1-002` quick-fix `Add use`.
-- [x] **T-2026-05-19** Реализовать `LP-003 / V1-003` `source.organizeImports`.
-- [x] **T-2026-05-19** Реализовать `LP-004 / V1-004` code action `Add return type`.
-- [x] **T-2026-05-19** Реализовать `LP-005 / V1-005` `textDocument/formatting`.
-- [x] **T-2026-05-19** Реализовать `LP-006 / V1-006` `textDocument/rangeFormatting`.
-- [x] **T-2026-05-19** Реализовать `LP-007 / V1-015` `textDocument/onTypeFormatting`.
-- [x] **T-2026-05-19** Реализовать `LP-008 / V1-007` `textDocument/semanticTokens/full`.
-- [x] **T-2026-05-19** Реализовать `LP-009 / V1-008` `textDocument/semanticTokens/full/delta`.
-- [x] **T-2026-05-19** Реализовать `LP-010 / V1-016` `textDocument/declaration`.
-- [x] **T-2026-05-19** Реализовать `LP-011 / V1-017` `textDocument/typeDefinition`.
-- [x] **T-2026-05-19** Реализовать `LP-012 / V1-018` `textDocument/documentHighlight`.
-- [x] **T-2026-05-19** Реализовать `LP-013 / V1-019` `textDocument/selectionRange`.
-- [x] **T-2026-05-19** Реализовать `LP-014 / V1-020` `textDocument/linkedEditingRange`.
-- [x] **T-2026-05-19** Реализовать `LP-015 / V1-021` Completion polish.
-- [x] **T-2026-05-19** Реализовать `LP-016 / V1-022` `workspace/didChangeWatchedFiles`.
-- [x] **T-2026-05-19** Реализовать `LP-017 / V1-023` `workspace/didChangeConfiguration`.
-- [x] **T-2026-05-19** Реализовать `LP-018 / V1-024` Workspace file operations.
-- [x] **T-2026-05-20** Реализовать `LP-019 / V1-025` Basic diagnostics parity.
-- [x] **T-2026-05-20** Реализовать `LP-020 / V1-026` Type/member diagnostics.
-- [x] **T-2026-05-20** Реализовать `LP-021 / VN-001` `textDocument/inlayHint`.
-- [x] **T-2026-05-20** Реализовать `LP-022 / VN-002` call hierarchy.
-- [x] **T-2026-05-20** Реализовать `LP-023 / VN-003` type hierarchy.
-- [x] **T-2026-05-20** Реализовать `LP-024 / VN-004` `textDocument/implementation`.
-- [x] **T-2026-05-20** Реализовать `LP-025 / VN-005` multi-root workspace support.
-- [x] **T-2026-05-20** Реализовать `LP-026 / VN-006` PHPStan diagnostics integration.
-- [x] **T-2026-05-20** Реализовать `LP-027 / VN-007` Psalm diagnostics integration.
-- [x] **T-2026-05-20** Реализовать `LP-028 / VN-008` `textDocument/codeLens`.
-- [x] **T-2026-05-20** Реализовать `LP-029 / VN-009` `textDocument/foldingRange`.
-- [x] **T-2026-05-20** Актуализировать `README.md` по статусу, возможностям и настройкам.
-- [x] **T-2026-05-20** Убрать упоминание `TASKS.md` из `README.md`.
-- [x] **T-2026-05-20** Исправить ложные diagnostics `Static method called as instance method` на instance setters.
-- [x] **T-2026-05-20** Подтягивать parent interfaces/classes при lazy indexing для diagnostics.
-- [x] **T-2026-05-20** Учитывать методы из `use Trait;` при member diagnostics.
-- [x] **T-2026-05-20** Подтягивать class return types методов при lazy diagnostics indexing.
-- [x] **T-2026-05-20** Сделать kind-aware member resolution для diagnostics.
-- [x] **T-2026-05-20** Исправить completion после member access, чтобы методы шли первыми.
-- [x] **T-2026-05-20** Исправить ложные diagnostics в PHPUnit mock chains и `::class` в `EmailNotifierTest.php`.
-- [x] **T-2026-05-20** Исправить ложный `Undefined variable` для value-переменной в `foreach`.
-- [x] **T-2026-05-20** Ускорить публикацию diagnostics при правках открытого файла.
-- [x] **T-2026-05-20** Исправить ложные diagnostics в `ChangeUserPasswordCommandTest.php`.
-- [x] **T-2026-05-20** Прогнать php-lsp diagnostics по файлам `/home/apanov/Projects/bdpn-ui/app/tests`.
-- [x] **T-2026-05-20** Снизить false positive diagnostics, найденные полным прогоном `app/tests`.
-- [x] **T-2026-05-20** Обновить `README.md` с учетом текущего статуса и `Makefile`.
-- [x] **T-2026-05-20** Добавить VS Code status bar popup со статусом индексации и полезной информацией расширения.
-- [x] **T-2026-05-20** Добавить настройку `phpLsp.excludePaths` и учитывать ее при индексации.
-- [x] **T-2026-05-20** Проверить, что все `phpLsp.*` настройки объявлены, передаются серверу и реально используются.
-- [x] **T-2026-05-20** Протестировать php-lsp diagnostics по файлам `/home/apanov/Projects/bdpn-ui/app/src` и найти неточности.
-- [x] **T-2026-05-20** Исправить ложные diagnostics, найденные прогоном `/home/apanov/Projects/bdpn-ui/app/src`.
-- [x] **T-2026-05-20** Убрать hardcode имен framework methods из suppress unused-parameter diagnostics.
-- [x] **T-2026-05-20** Проверить production-код на project-specific hardcode и убрать найденное.
-- [x] **T-2026-05-21** Исправить GitHub downloads badge в README.
-- [x] **T-2026-05-21** Изучить код проекта и составить список недостающих работ для production LSP сервера.
-- [x] **T-2026-05-21** Добавить milestone production-readiness с подробным расписанием задач.
-- [x] **T-2026-05-22** Обновить submodule `server/data/stubs` из upstream.
-- [x] **T-2026-05-23** Разобраться, почему `go to definition` не работает на `parent` в `AbstractObjectNormalizer.php`.
-- [x] **T-2026-05-23** Прогнать LSP-сервер по `/home/hightemp/ForTesting/symfony` и отловить ошибки работы.
-- [x] **T-2026-05-23** Убрать Symfony-specific hardcode `is_symfony_configurator_file` из diagnostics.
-- [x] **T-2026-05-23** Разобраться, почему completion не показывает методы `ReflectionMethod` для `$reflMethod->` в Symfony `CallbackValidator.php`.
-- [x] **T-2026-05-23** Протестировать autocomplete по `/home/hightemp/ForTesting/symfony` на падения и некорректные ответы.
-- [x] **T-2026-05-23** Исправить completion `Blank::` внутри chained call в Symfony `BlankValidator.php`.
-- [x] **T-2026-05-23** Расширить Symfony autocomplete-аудит проверкой полноты ожидаемых labels по разным контекстам.
-- [x] **T-2026-05-23** Разобрать остаточные Symfony autocomplete label misses: external PHPUnit symbols, `parent::` в anonymous class/trait, nullable/member chains.
-- [x] **T-2026-05-23** Исправить autocomplete для member-chain, начинающейся с `(new ClassName())`.
-- [x] **T-2026-05-23** Исправить resolution/completion `parent::` внутри anonymous class.
-- [x] **T-2026-05-23** Довести Symfony autocomplete/go-to-definition audit-fix-verify цикл до стабильного состояния.
-  - [x] Свежий аудит `/home/hightemp/ForTesting/symfony` по completion и definition.
-  - [x] Исправить воспроизводимые баги без Symfony-specific hardcode.
-  - [x] Добавить regression tests на исправленные случаи.
-  - [x] Прогнать `fmt`, `test`, `clippy`, `release build`, `git diff --check`.
-- [x] **T-2026-05-24** Разобраться, почему member autocomplete в `CallbackValidator.php` показывает переменные после `$reflMethod->setAccessible`.
-- [x] **T-2026-05-24** Разобраться, почему go-to-definition не работает для `$this`.
-- [x] **T-2026-05-24** Исправить VS Marketplace badge в README под текущий `publisher`/`name` из `client/package.json`.
-- [x] **T-2026-05-24** Добавить публикацию VS Code extension в Marketplace в release workflow.
-- [x] **T-2026-05-24** Исправить CI clippy failure `clippy::question_mark` в completion member-chain inference.
-- [x] **T-2026-05-24** Переименовать VS Code extension package `name` в `ht-php-lsp` для Marketplace publish.
-- [x] **T-2026-05-24** Бампнуть release version до `0.5.4` для публикации обновленного Marketplace package.
-- [x] **T-2026-05-24** Исправить completion и go-to-definition для переменных, объявленных output-аргументом `preg_match` (`$matches` в Symfony `DateValidator.php`).
-- [x] **T-2026-05-24** Разобраться и исправить отсутствие `README.md` в опубликованном VS Code extension package.
-- [x] **T-2026-05-24** Добавить в `README.md` badge с поддерживаемыми версиями PHP.
-- [x] **T-2026-05-24** Подготовить предыдущий релиз с README в VSIX.
-- [x] **T-2026-05-24** Исправить Marketplace badges в `README.md`, которые показывают `retired badge`.
-- [x] **T-2026-05-25** Актуализировать всю документацию после повторного прохода по проекту.
 - [x] **H-AUDIT-2026-06-01** Исправить подтверждённые ошибки из аудита *(done 2026-06-01)*
   - Проверить фактическую структуру репозитория, не полагаясь на неполный список файлов из аудита
   - Исправить удаление duplicate FQN в `WorkspaceIndex::remove_file`
@@ -4325,13 +4470,25 @@ change.
   - Синхронизировать CLI analyze/fix со stub-loading LSP режима
   - Добавить PHPDoc virtual-property fallback для chain inference
   - Запустить релевантные Rust-тесты
+
 - [x] **T-2026-06-01-unknown-instance-method-diagnostic** Исправить пропуск diagnostics для несуществующего instance-метода `addMessageLog1`. *(done 2026-06-01)*
   - Воспроизвести сценарий на типизированном параметре вроде `PortingRequest $portingRequest`
   - Найти, почему member diagnostics не доходят до `RefKind::MethodCall`
   - Добавить regression test без project-specific hardcode
   - Запустить релевантные Rust-тесты
+
 - [x] **T-2026-06-01-foreach-variable-definition** Исправить go-to-definition для `$portingNumber` и других `foreach` value-переменных. *(done 2026-06-01)*
   - Воспроизвести проблему на `CompleteHandler.php`
   - Найти пробел в local variable definition lookup для `foreach`
   - Добавить regression test без project-specific hardcode
   - Запустить релевантные Rust-тесты
+
+- [x] **T-2026-06-02-tasks-append-only-format** Переформатировать `TASKS.md` под последовательный append-only журнал задач. *(done 2026-06-02)*
+  - Добавить явные правила: новые задачи и milestone добавлять в конец, а не в начало файла.
+  - Переформатировать текущий задачник так, чтобы записи шли сверху вниз по времени.
+  - Добавить шаблон milestone для больших задач.
+  - Implemented: добавлен верхний раздел `Как вести этот файл` с правилом append-only.
+  - Implemented: `Текущие задачи` заменен на `Журнал задач (append-only)` с правилами, шаблоном одиночной задачи и шаблоном milestone.
+  - Implemented: журнал задач пересортирован сверху вниз по датам; свежий hotfix-блок перемещен ниже старых `H-001..H-026`.
+  - Validation: `git diff --check` passed.
+  - Validation: структурная проверка подтвердила 120 journal-записей от `2026-05-19` до `2026-06-02` без убывания дат.
