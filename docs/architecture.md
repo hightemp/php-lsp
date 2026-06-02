@@ -435,18 +435,21 @@ item types, so `{% for item in pagination %}` can inherit the entity type
 without booting Symfony. Custom Doctrine repositories are resolved from indexed
 `@extends ServiceEntityRepository<Entity>` PHPDoc and indexed ORM
 `repositoryClass` attributes; request handlers avoid synchronous source reads
-for this lookup. Render keys whose value type cannot be inferred still
+for this lookup. A bounded Twig include scan also handles one-level
+`{% include 'partial.html.twig' with {'items': items} %}` calls by evaluating
+the caller template's static render context and copying simple `with` object
+values into the included template. Render keys whose value type cannot be inferred still
 seed `mixed` variables in the virtual prelude so valid templates do not publish
 false undefined-variable diagnostics just because the server cannot infer a
-richer type. The context scanner combines open PHP files from memory with a
+richer type. The context scanner combines open PHP/Twig files from memory with a
 bounded, disk-backed cache for closed PHP files. Cache misses run through
 Tokio's blocking pool and file watcher/save events clear the cache. Open PHP
 buffers are authoritative over cached disk scan results; opening or editing a
 PHP source evicts disk-cache
 entries that were derived from that source URI, so a later close falls back to a
 refreshed disk snapshot instead of stale render context. Open Twig documents are
-bounded-refresh candidates after PHP controller/render edits and workspace
-reindex completion: their context
+bounded-refresh candidates after PHP controller/render edits, open Twig caller
+edits, and workspace reindex completion: their context
 prelude, virtual PHP parser, diagnostics, and request-time hover/completion/inlay
 state are rebuilt from current open buffers plus the disk cache. The scanner
 does not boot Symfony, evaluate Twig extensions, run user code, or read the

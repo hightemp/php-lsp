@@ -232,7 +232,10 @@ phpstorm-stubs support.
   literal nested array shapes, `$items[] = [...]` append-built shapes,
   `compact('name')` variables, Doctrine magic `find*`/`findOneBy*` repository
   results, and Knp-style paginator variables backed by Doctrine
-  repository/query-builder sources.
+  repository/query-builder sources. One-level Twig `{% include ... with {...}
+  %}` calls can pass those inferred caller variables into component templates,
+  so included partials can resolve foreach item hover/completion/definition and
+  inlay hints without hardcoded template names.
   Custom Doctrine repositories can be resolved from indexed
   `@extends ServiceEntityRepository<Entity>` PHPDoc or ORM `repositoryClass`
   attributes without synchronous request-time source reads;

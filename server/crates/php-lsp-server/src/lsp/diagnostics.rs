@@ -388,6 +388,7 @@ impl PhpLspBackend {
                 .fold(template, |template, change| {
                     template.apply_change(change.range, &change.text)
                 });
+            let refresh_twig_contexts = updated.kind() == TemplateKind::Twig;
             let mut parser = FileParser::new();
             parser.parse_full(updated.virtual_source());
             self.template_documents.insert(uri_str.clone(), updated);
@@ -395,6 +396,10 @@ impl PhpLspBackend {
             self.open_files.insert(uri_str.clone(), parser);
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
             self.schedule_fast_diagnostics(uri, version).await;
+            if refresh_twig_contexts {
+                self.refresh_open_twig_contexts_and_republish_diagnostics()
+                    .await;
+            }
             return;
         }
 

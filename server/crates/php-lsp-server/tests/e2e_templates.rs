@@ -1993,6 +1993,584 @@ final class DataRequestController
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_context_infers_dto_service_results_and_include_item_context() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-dto-service-context-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Repository")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Service/SftpCsv")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/sftp_csv")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/data_request")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/components")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let metadata_path = tmp_root.join("src/Service/SftpCsv/SftpCsvArchiveMetadata.php");
+    let preview_path = tmp_root.join("src/Service/SftpCsv/SftpCsvPreview.php");
+    let catalog_path = tmp_root.join("src/Service/SftpCsv/SftpCsvFileCatalog.php");
+    let previewer_path = tmp_root.join("src/Service/SftpCsv/SftpCsvArchivePreviewer.php");
+    let error_code_path = tmp_root.join("src/Entity/ErrorCode.php");
+    let error_code_repository_path = tmp_root.join("src/Repository/ErrorCodeRepository.php");
+    let controller_path = tmp_root.join("src/Controller/SftpCsvViewerController.php");
+    let data_controller_path = tmp_root.join("src/Controller/DataRequestController.php");
+    let index_twig_path = tmp_root.join("templates/sftp_csv/index.html.twig");
+    let view_twig_path = tmp_root.join("templates/sftp_csv/view.html.twig");
+    let data_twig_path = tmp_root.join("templates/data_request/show.html.twig");
+    let component_twig_path = tmp_root.join("templates/components/autocomplete_input.html.twig");
+
+    let metadata_uri = file_uri(&metadata_path);
+    let preview_uri = file_uri(&preview_path);
+    let error_code_uri = file_uri(&error_code_path);
+    let index_twig_uri = file_uri(&index_twig_path);
+    let view_twig_uri = file_uri(&view_twig_path);
+    let data_twig_uri = file_uri(&data_twig_path);
+    let component_twig_uri = file_uri(&component_twig_path);
+
+    let metadata_php = r#"<?php
+namespace App\Service\SftpCsv;
+
+final readonly class SftpCsvArchiveMetadata
+{
+    public function __construct(
+        public string $type,
+        public string $name,
+        public string $path,
+        public int $size = 0,
+    ) {
+    }
+}
+"#;
+    let preview_php = r#"<?php
+namespace App\Service\SftpCsv;
+
+final readonly class SftpCsvPreview
+{
+    public function __construct(
+        public string $csvName,
+        public int $page,
+        public int $perPage,
+    ) {
+    }
+
+    public function hasPreviousPage(): bool
+    {
+        return $this->page > 1;
+    }
+
+    public function getPerPageQueryValue(): string
+    {
+        return (string)$this->perPage;
+    }
+}
+"#;
+    let catalog_php = r#"<?php
+namespace App\Service\SftpCsv;
+
+final class SftpCsvFileCatalog
+{
+    public function createFromDirectoryItem(string $type, array $item): ?SftpCsvArchiveMetadata
+    {
+        return null;
+    }
+
+    public function createFromSelection(string $type, string $fileName): SftpCsvArchiveMetadata
+    {
+        return new SftpCsvArchiveMetadata($type, $fileName, '/tmp/'.$fileName);
+    }
+}
+"#;
+    let previewer_php = r#"<?php
+namespace App\Service\SftpCsv;
+
+final class SftpCsvArchivePreviewer
+{
+    public function preview(string $remotePath, int $page, int $perPage): SftpCsvPreview
+    {
+        return new SftpCsvPreview('report.csv', $page, $perPage);
+    }
+}
+"#;
+    let error_code_php = r#"<?php
+namespace App\Entity;
+
+class ErrorCode
+{
+    private int $code = 0;
+    private ?string $description = null;
+
+    public function getCode(): int { return $this->code; }
+    public function getDescription(): ?string { return $this->description; }
+}
+"#;
+    let error_code_repository_php = r#"<?php
+namespace App\Repository;
+
+use App\Entity\ErrorCode;
+use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+
+/**
+ * @extends ServiceEntityRepository<ErrorCode>
+ */
+class ErrorCodeRepository extends ServiceEntityRepository
+{
+}
+"#;
+    let controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Service\SftpCsv\SftpCsvArchiveMetadata;
+use App\Service\SftpCsv\SftpCsvArchivePreviewer;
+use App\Service\SftpCsv\SftpCsvFileCatalog;
+
+final class SftpCsvViewerController
+{
+    public function __construct(
+        private readonly SftpCsvFileCatalog $catalog,
+        private readonly SftpCsvArchivePreviewer $previewer,
+    ) {
+    }
+
+    public function index(): void
+    {
+        $type = 'incoming';
+        $files = [];
+        foreach ([['name' => 'archive.zip']] as $item) {
+            $metadata = $this->catalog->createFromDirectoryItem($type, $item);
+            if ($metadata instanceof SftpCsvArchiveMetadata) {
+                $files[] = $metadata;
+            }
+        }
+
+        $this->render('sftp_csv/index.html.twig', [
+            'files' => $files,
+        ]);
+    }
+
+    public function view(): void
+    {
+        $metadata = $this->catalog->createFromSelection('incoming', 'archive.zip');
+        $preview = $this->previewer->preview($metadata->path, 1, 50);
+
+        $this->render('sftp_csv/view.html.twig', [
+            'file' => $metadata,
+            'preview' => $preview,
+        ]);
+    }
+}
+"#;
+    let data_controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Repository\ErrorCodeRepository;
+
+final class DataRequestController
+{
+    public function show(ErrorCodeRepository $errorCodeRepository): void
+    {
+        $errorCodes = $errorCodeRepository->findAll();
+
+        $this->render('data_request/show.html.twig', [
+            'errorCodes' => $errorCodes,
+        ]);
+    }
+}
+"#;
+    let file_completion_marker = "/*filecomplete*/";
+    let index_twig_with_marker = format!(
+        concat!(
+            "{{% for file in files %}}\n",
+            "{{{{ file.{}name }}}} {{{{ file.type }}}}\n",
+            "{{% endfor %}}\n"
+        ),
+        file_completion_marker
+    );
+    let index_twig = index_twig_with_marker.replace(file_completion_marker, "");
+    let view_twig = concat!(
+        "{{ file.name }}\n",
+        "{{ preview.csvName }}\n",
+        "{{ preview.perPageQueryValue }}\n",
+        "{{ preview.hasPreviousPage() ? 'yes' : 'no' }}\n"
+    );
+    let data_twig = concat!(
+        "{% include 'components/autocomplete_input.html.twig' with {\n",
+        "    'id': 'reject_code',\n",
+        "    'name': 'reject_code',\n",
+        "    'items': errorCodes\n",
+        "} %}\n"
+    );
+    let item_completion_marker = "/*itemcomplete*/";
+    let component_twig_with_marker = format!(
+        concat!(
+            "{{% for item in items %}}\n",
+            "{{{{ item.{}code }}}} {{{{ item.description }}}}\n",
+            "{{% endfor %}}\n"
+        ),
+        item_completion_marker
+    );
+    let component_twig = component_twig_with_marker.replace(item_completion_marker, "");
+
+    let file_completion_prefix = index_twig_with_marker
+        [..index_twig_with_marker.find(file_completion_marker).unwrap()]
+        .replace(file_completion_marker, "");
+    let file_completion_position =
+        utf16_position_for_offset(&index_twig, file_completion_prefix.len());
+    let index_file_name_hover_position = utf16_position_at(&index_twig, "name }}");
+    let index_file_name_definition_position = utf16_position_after(&index_twig, "file.n");
+    let file_inlay_offset = index_twig.find("file in files").unwrap();
+    let file_inlay_position =
+        utf16_position_for_offset(&index_twig, file_inlay_offset + "file".len());
+    let index_end_position = utf16_position_for_offset(&index_twig, index_twig.len());
+    let view_file_name_hover_position = utf16_position_at(view_twig, "name }}");
+    let view_file_name_definition_position = utf16_position_after(view_twig, "file.n");
+    let csv_name_hover_position = utf16_position_at(view_twig, "csvName");
+    let csv_name_definition_position = utf16_position_after(view_twig, "preview.c");
+    let per_page_hover_position = utf16_position_at(view_twig, "perPageQueryValue");
+    let per_page_definition_position = utf16_position_after(view_twig, "preview.p");
+    let has_previous_hover_position = utf16_position_at(view_twig, "hasPreviousPage");
+    let has_previous_definition_position = utf16_position_after(view_twig, "preview.h");
+    let item_completion_prefix = component_twig_with_marker[..component_twig_with_marker
+        .find(item_completion_marker)
+        .unwrap()]
+        .replace(item_completion_marker, "");
+    let item_completion_position =
+        utf16_position_for_offset(&component_twig, item_completion_prefix.len());
+    let item_code_hover_position = utf16_position_at(&component_twig, "code }}");
+    let item_code_definition_position = utf16_position_after(&component_twig, "item.c");
+    let item_inlay_offset = component_twig.find("item in items").unwrap();
+    let item_inlay_position =
+        utf16_position_for_offset(&component_twig, item_inlay_offset + "item".len());
+    let component_end_position = utf16_position_for_offset(&component_twig, component_twig.len());
+
+    fs::write(&metadata_path, metadata_php).unwrap();
+    fs::write(&preview_path, preview_php).unwrap();
+    fs::write(&catalog_path, catalog_php).unwrap();
+    fs::write(&previewer_path, previewer_php).unwrap();
+    fs::write(&error_code_path, error_code_php).unwrap();
+    fs::write(&error_code_repository_path, error_code_repository_php).unwrap();
+    fs::write(&controller_path, controller_php).unwrap();
+    fs::write(&data_controller_path, data_controller_php).unwrap();
+    fs::write(&index_twig_path, &index_twig).unwrap();
+    fs::write(&view_twig_path, view_twig).unwrap();
+    fs::write(&data_twig_path, data_twig).unwrap();
+    fs::write(&component_twig_path, &component_twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+    for (uri, language, source) in [
+        (index_twig_uri.as_str(), "twig", index_twig.as_str()),
+        (view_twig_uri.as_str(), "twig", view_twig),
+        (data_twig_uri.as_str(), "twig", data_twig),
+        (component_twig_uri.as_str(), "twig", component_twig.as_str()),
+    ] {
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification_with_language(uri, language, source))
+            .await
+            .unwrap();
+    }
+
+    for (uri, label) in [
+        (&index_twig_uri, "index"),
+        (&view_twig_uri, "view"),
+        (&data_twig_uri, "include caller"),
+        (&component_twig_uri, "include component"),
+    ] {
+        let diagnostics =
+            next_publish_diagnostics(&mut notifications, uri, Duration::from_secs(2)).await;
+        assert_eq!(
+            diagnostics["diagnostics"].as_array().map(Vec::len),
+            Some(0),
+            "DTO/service Twig {label} fixture should stay diagnostic-clean, got: {}",
+            diagnostics
+        );
+    }
+
+    for (request_id, uri, position, expected_labels) in [
+        (
+            2,
+            index_twig_uri.as_str(),
+            file_completion_position,
+            ["name", "type"].as_slice(),
+        ),
+        (
+            3,
+            component_twig_uri.as_str(),
+            item_completion_position,
+            ["code", "description"].as_slice(),
+        ),
+    ] {
+        let completion = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(completion_request(request_id, uri, position.0, position.1))
+                .await
+                .unwrap(),
+        );
+        let labels: Vec<String> = completion_items_from_result(&completion)
+            .iter()
+            .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+            .map(str::to_string)
+            .collect();
+        for expected in expected_labels {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "expected Twig completion request {request_id} to include `{expected}`, got: {:?}",
+                labels
+            );
+        }
+    }
+
+    for (request_id, uri, position, expected_text) in [
+        (
+            4,
+            index_twig_uri.as_str(),
+            index_file_name_hover_position,
+            "SftpCsvArchiveMetadata::$name",
+        ),
+        (
+            5,
+            view_twig_uri.as_str(),
+            view_file_name_hover_position,
+            "SftpCsvArchiveMetadata::$name",
+        ),
+        (
+            6,
+            view_twig_uri.as_str(),
+            csv_name_hover_position,
+            "SftpCsvPreview::$csvName",
+        ),
+        (
+            7,
+            view_twig_uri.as_str(),
+            per_page_hover_position,
+            "getPerPageQueryValue",
+        ),
+        (
+            8,
+            view_twig_uri.as_str(),
+            has_previous_hover_position,
+            "hasPreviousPage",
+        ),
+        (
+            9,
+            component_twig_uri.as_str(),
+            item_code_hover_position,
+            "ErrorCode::$code",
+        ),
+    ] {
+        let hover = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(hover_request(request_id, uri, position.0, position.1))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            hover_markdown_value(&hover).contains(expected_text),
+            "expected Twig hover request {request_id} to include `{expected_text}`, got: {}",
+            hover
+        );
+    }
+
+    for (request_id, uri, position, expected_uri) in [
+        (
+            10,
+            index_twig_uri.as_str(),
+            index_file_name_definition_position,
+            metadata_uri.as_str(),
+        ),
+        (
+            11,
+            view_twig_uri.as_str(),
+            view_file_name_definition_position,
+            metadata_uri.as_str(),
+        ),
+        (
+            12,
+            view_twig_uri.as_str(),
+            csv_name_definition_position,
+            preview_uri.as_str(),
+        ),
+        (
+            13,
+            view_twig_uri.as_str(),
+            per_page_definition_position,
+            preview_uri.as_str(),
+        ),
+        (
+            14,
+            view_twig_uri.as_str(),
+            has_previous_definition_position,
+            preview_uri.as_str(),
+        ),
+        (
+            15,
+            component_twig_uri.as_str(),
+            item_code_definition_position,
+            error_code_uri.as_str(),
+        ),
+    ] {
+        let definition = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(definition_request(request_id, uri, position.0, position.1))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            definition.get("uri").and_then(|uri| uri.as_str()),
+            Some(expected_uri),
+            "expected Twig definition request {request_id} to resolve `{expected_uri}`, got: {}",
+            definition
+        );
+    }
+
+    let index_inlay = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(inlay_hint_request(
+                16,
+                &index_twig_uri,
+                0,
+                0,
+                index_end_position.0,
+                index_end_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let index_hints = index_inlay.as_array().cloned().unwrap_or_default();
+    assert!(
+        index_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint)
+                .is_some_and(|label| label.contains("SftpCsvArchiveMetadata"))
+                && hint["position"]["line"].as_u64() == Some(file_inlay_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(file_inlay_position.1 as u64)
+                && inlay_hint_has_label_part_location(hint, "SftpCsvArchiveMetadata")
+        }),
+        "expected Twig SFTP file foreach inlay hint to include SftpCsvArchiveMetadata class link, got: {}",
+        index_inlay
+    );
+
+    let component_inlay = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(inlay_hint_request(
+                17,
+                &component_twig_uri,
+                0,
+                0,
+                component_end_position.0,
+                component_end_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let component_hints = component_inlay.as_array().cloned().unwrap_or_default();
+    assert!(
+        component_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": ErrorCode")
+                && hint["position"]["line"].as_u64() == Some(item_inlay_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(item_inlay_position.1 as u64)
+                && inlay_hint_has_label_part_location(hint, "ErrorCode")
+        }),
+        "expected Twig include component item inlay hint to include ErrorCode class link, got: {}",
+        component_inlay
+    );
+
+    let data_twig_without_items = concat!(
+        "{% include 'components/autocomplete_input.html.twig' with {\n",
+        "    'id': 'reject_code',\n",
+        "    'name': 'reject_code',\n",
+        "    'items': []\n",
+        "} %}\n"
+    );
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(
+            &data_twig_uri,
+            2,
+            data_twig_without_items,
+        ))
+        .await
+        .unwrap();
+    let _ = next_publish_diagnostics(
+        &mut notifications,
+        &component_twig_uri,
+        Duration::from_secs(2),
+    )
+    .await;
+    let changed_component_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                18,
+                &component_twig_uri,
+                item_code_hover_position.0,
+                item_code_hover_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        changed_component_hover.is_null()
+            || !hover_markdown_value(&changed_component_hover).contains("ErrorCode"),
+        "expected Twig include component context to refresh after caller didChange, got stale hover: {}",
+        changed_component_hover
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_twig_context_infers_repository_array_assignment_for_message_logs() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();

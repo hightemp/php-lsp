@@ -4550,10 +4550,16 @@ change.
   - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
   - Validation: Verifier rerun reported no findings.
 
-- [ ] **H-TWIG-BDPN-DTO-SERVICE-CONTEXT-2026-06-02** Поддержать Twig context для DTO/service-result объектов
+- [x] **H-TWIG-BDPN-DTO-SERVICE-CONTEXT-2026-06-02** Поддержать Twig context для DTO/service-result объектов
   - `sftp_csv/index.html.twig:81` `file.name` должен резолвиться в `SftpCsvArchiveMetadata`.
   - `sftp_csv/view.html.twig:14` `file.name`, `40` `preview.csvName`, `50` `preview.perPageQueryValue`, `96` `preview.hasPreviousPage()` должны давать hover/definition.
   - `components/autocomplete_input.html.twig:38` `item.code` должен давать non-null hover/definition для переданного item context.
+  - Implementation: Twig context now also scans one-level `{% include ... with {...} %}` callers and copies simple inferred caller variables into included component templates; open Twig caller edits refresh other open Twig contexts.
+  - Tests: added e2e coverage for SFTP DTO/service render context, include component `items` context, completion, hover, definition, inlay hints, and caller `didChange` refresh.
+  - Docs: updated README, `docs/lsp-features.md`, `docs/architecture.md`, and `docs/production-risk-register.md`.
+  - Validation: `cargo test -p php-lsp-server lsp::templates::tests::` and `cargo test -p php-lsp-server --test e2e_templates` passed.
+  - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
+  - Validation: final review after prior verifier findings reported no remaining issues.
 
 - [ ] **H-TWIG-SYMFONY-GLOBALS-FORMS-2026-06-02** Поддержать Symfony Twig globals, form fields и form errors
   - `security/login.html.twig:11` `error.messageKey` должен резолвиться как `AuthenticationException::getMessageKey()`.

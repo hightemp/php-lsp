@@ -385,6 +385,11 @@ Current evidence:
   completion, and inlay hints now work for records such as `row.npId`,
   `row.messageLog`, `item.nr`, `config_params.encryption.temp_dir_path`,
   `f.type`, and `result.success`.
+- `H-TWIG-BDPN-DTO-SERVICE-CONTEXT-2026-06-02` keeps service-returned DTOs and
+  repository result collections available through Twig render context and
+  one-level `{% include ... with {...} %}` component context. Hover,
+  completion, definition, and inlay hints now cover SFTP CSV DTO/service result
+  fields and included autocomplete items such as `item.code`.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request
