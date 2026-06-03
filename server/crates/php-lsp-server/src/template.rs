@@ -1681,7 +1681,7 @@ fn twig_type_preserving_filter_base_range(
     let filter_start = skip_ascii_ws_in_range(source, pipe + '|'.len_utf8(), original_end);
     let filter_end = scan_twig_identifier_end(source, filter_start, original_end);
     let filter = source.get(filter_start..filter_end)?;
-    if filter != "slice" {
+    if !matches!(filter, "slice" | "filter") {
         return None;
     }
 
@@ -3043,7 +3043,7 @@ mod tests {
         assert!(doc.virtual_source().contains("<?php $user; ?>"));
         assert!(doc
             .virtual_source()
-            .contains("<?php foreach ((array) [] as $item): ?>"));
+            .contains("<?php foreach ($users as $item): ?>"));
         assert!(doc.virtual_source().contains("$label = null"));
 
         for needle in ["user is defined", "users|filter", "user['name']"] {

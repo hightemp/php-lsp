@@ -6323,3 +6323,247 @@ function run(ServiceLocator $locator): void {
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_twig_inlay_hints_cover_append_built_filter_and_repository_contexts() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-inlay-coverage-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Repository")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/debug")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/porting_process")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let subscriber_path = tmp_root.join("src/Entity/Subscriber.php");
+    let subscriber_repository_path = tmp_root.join("src/Repository/SubscriberRepository.php");
+    let debug_controller_path = tmp_root.join("src/Controller/DebugController.php");
+    let porting_controller_path = tmp_root.join("src/Controller/PortingProcessController.php");
+    let debug_twig_path = tmp_root.join("templates/debug/permissions.html.twig");
+    let porting_twig_path = tmp_root.join("templates/porting_process/show.html.twig");
+    let subscriber_uri = file_uri(&subscriber_path);
+    let subscriber_repository_uri = file_uri(&subscriber_repository_path);
+    let debug_controller_uri = file_uri(&debug_controller_path);
+    let porting_controller_uri = file_uri(&porting_controller_path);
+    let debug_twig_uri = file_uri(&debug_twig_path);
+    let porting_twig_uri = file_uri(&porting_twig_path);
+
+    let subscriber_php = r#"<?php
+namespace App\Entity;
+
+class Subscriber
+{
+    public int $id = 0;
+    public string $fullName = '';
+    public function getId(): int { return $this->id; }
+    public function getFullName(): string { return $this->fullName; }
+}
+"#;
+    let subscriber_repository_php = r#"<?php
+namespace App\Repository;
+
+use App\Entity\Subscriber;
+use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Doctrine\Persistence\ManagerRegistry;
+
+class SubscriberRepository extends ServiceEntityRepository
+{
+    public function __construct(ManagerRegistry $registry)
+    {
+        parent::__construct($registry, Subscriber::class);
+    }
+}
+"#;
+    let debug_controller_php = r#"<?php
+namespace App\Controller;
+
+final class DebugController
+{
+    public function permissions(): void
+    {
+        $paths = [
+            ['path' => '/tmp/app.log', 'label' => 'log', 'category' => 'logs', 'need' => 'rw'],
+        ];
+        $checks = [];
+        foreach ($paths as $entry) {
+            $checks[] = $this->checkPath($entry['path'], $entry['label'], $entry['category'], $entry['need']);
+        }
+
+        $this->render('debug/permissions.html.twig', [
+            'checks' => $checks,
+        ]);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function checkPath(string $path, string $label, string $category, string $need): array
+    {
+        return [
+            'path' => $path,
+            'label' => $label,
+            'category' => $category,
+            'need' => $need,
+            'status' => 'ok',
+        ];
+    }
+}
+"#;
+    let porting_controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Repository\SubscriberRepository;
+
+final class PortingProcessController
+{
+    public function show(SubscriberRepository $subscriberRepository): void
+    {
+        $subscribers = $subscriberRepository->findAll();
+
+        $this->render('porting_process/show.html.twig', [
+            'subscribers' => $subscribers,
+        ]);
+    }
+}
+"#;
+    let debug_twig = concat!(
+        "{% for check in checks %}\n",
+        "  {{ check.status }}\n",
+        "{% endfor %}\n",
+        "{% for check in checks|filter(c => c.category == 'logs') %}\n",
+        "  {{ check.status }}\n",
+        "{% endfor %}\n",
+    );
+    let porting_twig = concat!(
+        "{% for subscriber in subscribers %}\n",
+        "  {{ subscriber.fullName }}\n",
+        "{% endfor %}\n",
+    );
+    let simple_check_position = utf16_position_for_offset(
+        debug_twig,
+        debug_twig.find("{% for check").unwrap() + "{% for check".len(),
+    );
+    let filtered_check_position = utf16_position_for_offset(
+        debug_twig,
+        debug_twig.find("{% for check in checks|filter").unwrap() + "{% for check".len(),
+    );
+    let subscriber_position = utf16_position_for_offset(
+        porting_twig,
+        porting_twig.find("{% for subscriber").unwrap() + "{% for subscriber".len(),
+    );
+
+    fs::write(&subscriber_path, subscriber_php).unwrap();
+    fs::write(&subscriber_repository_path, subscriber_repository_php).unwrap();
+    fs::write(&debug_controller_path, debug_controller_php).unwrap();
+    fs::write(&porting_controller_path, porting_controller_php).unwrap();
+    fs::write(&debug_twig_path, debug_twig).unwrap();
+    fs::write(&porting_twig_path, porting_twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    for (uri, text, language_id) in [
+        (&subscriber_uri, subscriber_php, "php"),
+        (&subscriber_repository_uri, subscriber_repository_php, "php"),
+        (&debug_controller_uri, debug_controller_php, "php"),
+        (&porting_controller_uri, porting_controller_php, "php"),
+        (&debug_twig_uri, debug_twig, "twig"),
+        (&porting_twig_uri, porting_twig, "twig"),
+    ] {
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification_with_language(uri, language_id, text))
+            .await
+            .unwrap();
+    }
+
+    let debug_diagnostics =
+        next_publish_diagnostics(&mut notifications, &debug_twig_uri, Duration::from_secs(1)).await;
+    assert_eq!(
+        debug_diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "debug Twig fixture should be diagnostic-free, got: {}",
+        debug_diagnostics
+    );
+    let porting_diagnostics = next_publish_diagnostics(
+        &mut notifications,
+        &porting_twig_uri,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(
+        porting_diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "porting Twig fixture should be diagnostic-free, got: {}",
+        porting_diagnostics
+    );
+
+    let debug_inlay = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, &debug_twig_uri, 0, 0, 99, 0))
+        .await
+        .unwrap();
+    let debug_result = extract_result(debug_inlay);
+    let debug_hints = debug_result.as_array().cloned().unwrap_or_default();
+    for expected_position in [simple_check_position, filtered_check_position] {
+        assert!(
+            debug_hints.iter().any(|hint| {
+                inlay_hint_label_text(hint).is_some_and(|label| label == ": array<string, mixed>")
+                    && hint["position"]["line"].as_u64() == Some(expected_position.0 as u64)
+                    && hint["position"]["character"].as_u64() == Some(expected_position.1 as u64)
+            }),
+            "expected Twig check foreach inlay hint at {:?}, got: {}",
+            expected_position,
+            debug_result
+        );
+    }
+
+    let porting_inlay = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(3, &porting_twig_uri, 0, 0, 99, 0))
+        .await
+        .unwrap();
+    let porting_result = extract_result(porting_inlay);
+    let porting_hints = porting_result.as_array().cloned().unwrap_or_default();
+    assert!(
+        porting_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": Subscriber")
+                && hint["position"]["line"].as_u64() == Some(subscriber_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(subscriber_position.1 as u64)
+                && inlay_hint_has_label_part_location(hint, "Subscriber")
+        }),
+        "expected Twig subscriber foreach inlay hint with class link, got: {}",
+        porting_result
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}

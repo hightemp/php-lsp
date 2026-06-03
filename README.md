@@ -214,7 +214,9 @@ phpstorm-stubs support.
   attribute access are explicit best-effort backlog items; their full expression
   semantics are skipped rather than mapped to misleading PHP, while simple
   member chains and root variables inside those expressions can still be
-  source-mapped for hover/completion/definition. Twig object completion also
+  source-mapped for hover/completion/definition. Type-preserving Twig filters
+  such as `slice` and `filter` keep the base collection available for foreach
+  hover/completion/definition/inlay inference. Twig object completion also
   offers getter-derived property-style labels such as `id` for `getId()`.
   Definition can still navigate static Twig template-path literals that exist
   under `templates/`, including HTML attribute values, and Symfony `path()` /

@@ -395,8 +395,11 @@ additionally emitted as standalone no-op virtual PHP fragments. Only those
 variable/member tokens are source-mapped; the surrounding Twig function, filter,
 test, or operator tokens stay unmapped. Unfinished chains such as `item.` are
 mapped as well so member completion can run while the expression is still being
-typed. Type-preserving fallbacks such as `item.items|slice(...)` map the base
-expression once and avoid duplicate no-op fragments for that same chain.
+typed. Type-preserving fallbacks such as `item.items|slice(...)` and
+`checks|filter(...)` map the base expression once and avoid duplicate no-op
+fragments for that same chain. The filter callback itself is not treated as
+ordinary PHP; only the collection base keeps its existing type for downstream
+foreach hover/completion/definition/inlay inference.
 Twig member completion post-processes getter-like methods into property-style
 aliases (`getId()` -> `id`, `isActive()` -> `active`) only for Twig documents.
 If a Twig property-style alias has no backing PHP property, hover and

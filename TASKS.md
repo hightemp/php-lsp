@@ -4602,8 +4602,15 @@ change.
   - Validation: `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`, `cargo test -p php-lsp-server lsp::templates::tests:: -- --nocapture`, `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
   - Validation: Verifier rerun reported no blockers or remaining remarks.
 
-- [ ] **H-TWIG-INLAY-HINT-COVERAGE-2026-06-02** Восстановить inlayHint для Twig foreach/set variables, когда тип уже выводится или должен выводиться
+- [x] **H-TWIG-INLAY-HINT-COVERAGE-2026-06-02** Восстановить inlayHint для Twig foreach/set variables, когда тип уже выводится или должен выводиться *(completed 2026-06-03)*
   - Inlay hints were empty for all 45 opened email/debug/components files in the audit; add focused coverage for representative typed contexts.
   - Missing hints: `porting_process/show.html.twig:1478` `subscriber`, `data_request/index.html.twig:46` `num`, `data_request/show.html.twig:116` `num`, `debt_suspension/show.html.twig:126` `nr`.
   - Missing hints: `debug/permissions.html.twig:138` `check`, `porting_request/show.html.twig:325` `transition`, `return_request/show.html.twig:132` `phone`, `route_update_request/show.html.twig:142` `phone`, `user/show.html.twig:77` `role`.
   - Ensure fixes keep `: mixed` suppression for uncertain foreach variables but preserve class-linked inlay labels for typed object variables.
+  - Implemented: Twig `filter` is now treated as a type-preserving fallback for the collection base, so `{% for item in items|filter(...) %}` can keep existing foreach hover/completion/definition/inlay inference without treating the callback as full Twig/PHP semantics.
+  - Tests: added focused e2e coverage for append-built context arrays, filtered foreach variables, Doctrine repository `findAll()` context variables, exact inlay positions, and class-linked object inlay labels.
+  - Notes: verified that `return_request` and `route_update_request` already return `: string`; unparameterized PHP arrays such as `DataRequest::getNumbers()`, `DebtSuspension::getPhoneNumbers()`, and `User::getRoles()` still suppress noisy `: mixed` foreach inlay hints by design; `porting_request/show` has a template/controller context-name mismatch (`allTransitions` vs `availableTransitions`) and is not guessed.
+  - Docs: updated README, LSP feature notes, architecture notes, and production risk register.
+  - Validation: `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`, `cargo test -p php-lsp-server template::tests:: -- --nocapture`, `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
+  - Validation: real BDPn JSON-RPC check after indexing/diagnostics confirmed `debug/permissions.html.twig` simple `checks` and filtered `checks|filter(...)` both return `: array<string, mixed>` inlay hints.
+  - Validation: Verifier reported no blockers or remaining remarks.

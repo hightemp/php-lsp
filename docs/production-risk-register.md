@@ -406,6 +406,10 @@ Current evidence:
   can now recover hover/definition context from service `notify(..., [...])`
   calls and branchy controller `$result = [...]` arrays without booting
   Symfony.
+- `H-TWIG-INLAY-HINT-COVERAGE-2026-06-02` preserves Twig foreach item types
+  through type-preserving `filter` expressions and adds focused inlay coverage
+  for append-built context arrays and Doctrine repository `findAll()` context
+  variables. Mixed foreach values remain suppressed as inlay hints.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request
