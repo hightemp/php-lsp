@@ -236,7 +236,9 @@ fn collect_twig_render_context_types(
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
 ) {
     let mut offset = 0usize;
-    while let Some((_, name_end, open_paren)) = next_twig_render_call(ctx.source, offset) {
+    while let Some((name_start, name_end, open_paren)) = next_twig_context_call(ctx.source, offset)
+    {
+        let call_name = ctx.source.get(name_start..name_end).unwrap_or("");
         let Some(close_paren) = find_matching_delimiter(ctx.source, open_paren, '(', ')') else {
             offset = name_end;
             continue;
@@ -245,9 +247,12 @@ fn collect_twig_render_context_types(
             ctx.source.get(open_paren + 1..close_paren).unwrap_or(""),
             open_paren + 1,
         );
-        if args.len() >= 2 {
-            let template_arg = trim_source_range(ctx.source, args[0].0, args[0].1);
-            let context_arg = trim_source_range(ctx.source, args[1].0, args[1].1);
+        for (arg_index, pair) in args.windows(2).enumerate() {
+            if !twig_context_call_accepts_template_argument(call_name, arg_index) {
+                continue;
+            }
+            let template_arg = trim_source_range(ctx.source, pair[0].0, pair[0].1);
+            let context_arg = trim_source_range(ctx.source, pair[1].0, pair[1].1);
             if php_string_literal_value_at_range(ctx.source, template_arg.0, template_arg.1)
                 .is_some_and(|name| normalize_twig_key(&name) == normalize_twig_key(template_name))
                 && !collect_twig_context_compact_types(
@@ -262,6 +267,13 @@ fn collect_twig_render_context_types(
         }
         offset = close_paren + 1;
     }
+}
+
+fn twig_context_call_accepts_template_argument(call_name: &str, arg_index: usize) -> bool {
+    matches!(
+        (call_name, arg_index),
+        ("render" | "renderView", 0) | ("notify", 1)
+    )
 }
 
 fn collect_twig_context_compact_types(
@@ -325,10 +337,7 @@ fn collect_twig_context_compact_types(
     found
 }
 
-pub(in crate::server) fn next_twig_render_call(
-    source: &str,
-    from: usize,
-) -> Option<(usize, usize, usize)> {
+fn next_twig_context_call(source: &str, from: usize) -> Option<(usize, usize, usize)> {
     let mut offset = from;
     while offset < source.len() {
         let byte = *source.as_bytes().get(offset)?;
@@ -342,12 +351,9 @@ pub(in crate::server) fn next_twig_render_call(
         while offset < source.len() && is_ident_byte(source.as_bytes()[offset]) {
             offset += 1;
         }
-        let name = source.get(start..offset)?;
-        if matches!(name, "render" | "renderView") {
-            let open = skip_ascii_ws_server(source, offset);
-            if source.as_bytes().get(open) == Some(&b'(') {
-                return Some((start, offset, open));
-            }
+        let open = skip_ascii_ws_server(source, offset);
+        if source.as_bytes().get(open) == Some(&b'(') {
+            return Some((start, offset, open));
         }
     }
     None
@@ -559,13 +565,21 @@ fn collect_twig_context_assignment_shape_definitions(
     }
 
     let mut definitions = Vec::new();
-    if let Some(latest_assignment) = latest_simple_variable_assignment_before(
-        ctx.source,
-        value_start,
-        variable_name,
-        ctx.file_symbols,
-    ) {
-        if php_source_range_is_empty_array_literal(ctx.source, latest_assignment) {
+    if let Some(assignments) =
+        simple_variable_assignments_before(ctx.source, value_start, variable_name, ctx.file_symbols)
+    {
+        for assignment in assignments {
+            if php_source_range_is_empty_array_literal(ctx.source, assignment) {
+                continue;
+            }
+            definitions.extend(collect_twig_context_value_shape_definitions(
+                ctx,
+                assignment,
+                default_target,
+                visited_variables,
+            ));
+        }
+        if definitions.is_empty() {
             if let Some(append_values) = simple_variable_array_append_values_before(
                 ctx.source,
                 value_start,
@@ -581,13 +595,6 @@ fn collect_twig_context_assignment_shape_definitions(
                     ));
                 }
             }
-        } else {
-            definitions.extend(collect_twig_context_value_shape_definitions(
-                ctx,
-                latest_assignment,
-                default_target,
-                visited_variables,
-            ));
         }
     }
 
@@ -1183,7 +1190,29 @@ fn infer_twig_context_value_type_inner(
         }
     }
 
+    if let Some(type_text) = twig_context_ternary_type_text(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        php_sources,
+        visited_variables,
+    ) {
+        return Some(type_text);
+    }
+
     if let Some(type_text) = twig_context_symfony_form_value_type_text(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        php_sources,
+        visited_variables,
+    ) {
+        return Some(type_text);
+    }
+
+    if let Some(type_text) = twig_context_array_function_type_text(
         source,
         (start, end),
         file_symbols,
@@ -1373,12 +1402,32 @@ fn infer_twig_context_value_type_info_for_shape(
     ) {
         return Some(type_info);
     }
+    if let Some(type_info) = twig_context_ternary_type_info(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        php_sources,
+        visited_variables,
+    ) {
+        return Some(type_info);
+    }
     if let Some(class_name) = first_new_class_name(value) {
         return Some(php_lsp_types::TypeInfo::Simple(
             resolve_twig_context_class_name(file_symbols, class_name),
         ));
     }
     if let Some(type_text) = twig_context_symfony_form_value_type_text(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        php_sources,
+        visited_variables,
+    ) {
+        return twig_context_type_text_to_type_info(&type_text);
+    }
+    if let Some(type_text) = twig_context_array_function_type_text(
         source,
         (start, end),
         file_symbols,
@@ -1424,6 +1473,218 @@ fn infer_twig_context_value_type_info_for_shape(
 
 fn twig_context_type_text_to_type_info(type_text: &str) -> Option<php_lsp_types::TypeInfo> {
     parse_phpdoc(&format!("/** @var {type_text} $value */")).var_type
+}
+
+fn twig_context_array_function_type_text(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<String> {
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    let (name, args_range) = php_function_call_parts(source, start, end)?;
+    let args = split_top_level_spans(
+        source.get(args_range.0..args_range.1).unwrap_or(""),
+        args_range.0,
+    );
+
+    match name {
+        "array_values" | "array_filter" => {
+            let first_arg = args.first().copied()?;
+            let type_text = infer_twig_context_value_type_inner(
+                source,
+                first_arg,
+                file_symbols,
+                index,
+                php_sources,
+                visited_variables,
+            )?;
+            Some(twig_context_array_only_type_text(&type_text))
+        }
+        "array_map" => {
+            let return_type = args
+                .first()
+                .copied()
+                .and_then(|arg| twig_context_callable_return_type(source, arg, file_symbols))
+                .unwrap_or_else(|| "mixed".to_string());
+            Some(format!("array<int, {return_type}>"))
+        }
+        "explode" | "preg_split" => Some("array<int, string>".to_string()),
+        "array_keys" => Some("array<int, string|int>".to_string()),
+        _ => None,
+    }
+}
+
+fn twig_context_ternary_type_text(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<String> {
+    let (truthy, falsy) = twig_context_ternary_branches(source, range)?;
+    let types = [truthy, falsy]
+        .into_iter()
+        .filter_map(|branch| {
+            infer_twig_context_value_type_inner(
+                source,
+                branch,
+                file_symbols,
+                index,
+                php_sources,
+                visited_variables,
+            )
+        })
+        .collect::<Vec<_>>();
+    merge_twig_context_type_texts(types)
+}
+
+fn twig_context_ternary_type_info(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<php_lsp_types::TypeInfo> {
+    let (truthy, falsy) = twig_context_ternary_branches(source, range)?;
+    let types = [truthy, falsy]
+        .into_iter()
+        .filter_map(|branch| {
+            infer_twig_context_value_type_info_for_shape(
+                source,
+                branch,
+                file_symbols,
+                index,
+                php_sources,
+                visited_variables,
+            )
+        })
+        .collect::<Vec<_>>();
+    merge_twig_context_type_infos(types)
+}
+
+fn twig_context_ternary_branches(
+    source: &str,
+    range: (usize, usize),
+) -> Option<((usize, usize), (usize, usize))> {
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    let question = find_top_level_token(source, start, end, b'?')?;
+    if source
+        .as_bytes()
+        .get(question + 1)
+        .is_some_and(|byte| *byte == b'?')
+    {
+        return None;
+    }
+    let colon = find_top_level_token(source, question + 1, end, b':')?;
+    Some((
+        trim_source_range(source, question + 1, colon),
+        trim_source_range(source, colon + 1, end),
+    ))
+}
+
+fn twig_context_array_only_type_text(type_text: &str) -> String {
+    let mut parts = split_twig_context_union_type_text(type_text)
+        .into_iter()
+        .filter(|part| twig_context_type_text_is_array_like(part))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return type_text.to_string();
+    }
+    if parts.len() > 1 {
+        let has_richer_array = parts.iter().any(|part| {
+            part.starts_with("array<") || part.starts_with("list<") || part.starts_with("array{")
+        });
+        if has_richer_array {
+            parts.retain(|part| part != "array");
+        }
+    }
+    parts.join("|")
+}
+
+fn twig_context_type_text_is_array_like(type_text: &str) -> bool {
+    let type_text = type_text.trim_start_matches('?');
+    type_text == "array"
+        || type_text.starts_with("array<")
+        || type_text.starts_with("list<")
+        || type_text.starts_with("array{")
+}
+
+fn php_function_call_parts(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Option<(&str, (usize, usize))> {
+    let mut offset = start;
+    if source.get(offset..end)?.starts_with('\\') {
+        offset += 1;
+    }
+    let name_start = offset;
+    while offset < end {
+        let byte = *source.as_bytes().get(offset)?;
+        if !is_ident_byte(byte) && byte != b'\\' {
+            break;
+        }
+        offset += 1;
+    }
+    let name = source.get(name_start..offset)?.rsplit('\\').next()?;
+    if name.is_empty() {
+        return None;
+    }
+    let open = skip_ascii_ws_server(source, offset);
+    if open >= end || source.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+    let close = find_matching_delimiter(source, open, '(', ')')?;
+    if close != end.saturating_sub(1) {
+        return None;
+    }
+    Some((name, (open + 1, close)))
+}
+
+fn twig_context_callable_return_type(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<String> {
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    if let Some(function_name) = php_string_literal_value_at_range(source, start, end) {
+        if matches!(function_name.as_str(), "trim" | "strval") {
+            return Some("string".to_string());
+        }
+    }
+
+    let arrow = find_top_level_double_arrow(source, start, end)?;
+    let signature = source.get(start..arrow)?.trim_end();
+    if let Some(type_start) = signature.rfind(':') {
+        let type_text = signature.get(type_start + 1..)?.trim();
+        if !type_text.is_empty() {
+            return Some(resolve_twig_context_type_text(file_symbols, type_text));
+        }
+    }
+    None
+}
+
+fn resolve_twig_context_type_text(
+    file_symbols: &php_lsp_types::FileSymbols,
+    type_text: &str,
+) -> String {
+    let type_text = type_text.trim();
+    let nullable = type_text.strip_prefix('?');
+    let bare = nullable.unwrap_or(type_text).trim();
+    if bare.is_empty()
+        || bare.contains(['|', '&', '<', '>', '[', ']'])
+        || twig_context_builtin_type_name(bare)
+    {
+        return type_text.to_string();
+    }
+    let resolved = resolve_twig_context_class_name(file_symbols, bare);
+    nullable.map(|_| format!("?{resolved}")).unwrap_or(resolved)
 }
 
 fn merge_twig_context_type_infos(
@@ -1516,26 +1777,20 @@ fn infer_twig_context_assignment_value_type(
     } else if let Some(assignments) =
         simple_variable_assignments_before(source, value_start, variable_name, file_symbols)
     {
-        assignments.last().copied().and_then(|latest| {
-            let latest_type = infer_twig_context_value_type_inner(
-                source,
-                latest,
-                file_symbols,
-                index,
-                php_sources,
-                visited_variables,
-            )?;
-            if latest_type == "null" || twig_context_type_text_has_null(&latest_type) {
-                Some(latest_type)
-            } else if assignments[..assignments.len().saturating_sub(1)]
-                .iter()
-                .any(|assignment| php_source_range_is_null_literal(source, *assignment))
-            {
-                Some(twig_context_type_text_with_null(&latest_type))
-            } else {
-                Some(latest_type)
-            }
-        })
+        let types = assignments
+            .into_iter()
+            .filter_map(|assignment| {
+                infer_twig_context_value_type_inner(
+                    source,
+                    assignment,
+                    file_symbols,
+                    index,
+                    php_sources,
+                    visited_variables,
+                )
+            })
+            .collect::<Vec<_>>();
+        merge_twig_context_type_texts(types)
     } else {
         None
     };
@@ -1723,6 +1978,15 @@ fn merge_twig_context_type_texts(types: Vec<String>) -> Option<String> {
             .or_else(|| saw_mixed.then(|| "mixed".to_string()));
     }
 
+    if non_null.len() > 1 && non_null.iter().any(|part| part == "array") {
+        let has_richer_array = non_null.iter().any(|part| {
+            part.starts_with("array<") || part.starts_with("list<") || part.starts_with("array{")
+        });
+        if has_richer_array {
+            non_null.retain(|part| part != "array");
+        }
+    }
+
     if saw_null && non_null.len() == 1 {
         return Some(format!("?{}", non_null[0]));
     }
@@ -1744,13 +2008,6 @@ fn twig_context_type_text_has_null(type_text: &str) -> bool {
 fn twig_context_type_text_with_null(type_text: &str) -> String {
     merge_twig_context_type_texts(vec![type_text.to_string(), "null".to_string()])
         .unwrap_or_else(|| type_text.to_string())
-}
-
-fn php_source_range_is_null_literal(source: &str, range: (usize, usize)) -> bool {
-    let (start, end) = trim_source_range(source, range.0, range.1);
-    source
-        .get(start..end)
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("null"))
 }
 
 fn php_source_range_is_empty_array_literal(source: &str, range: (usize, usize)) -> bool {

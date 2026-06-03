@@ -4589,12 +4589,18 @@ change.
   - Validation: `cargo test -p php-lsp-server string_key -- --nocapture`, `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`, `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
   - Validation: Verifier reported no blockers or remaining remarks.
 
-- [ ] **H-TWIG-BDPN-EMAIL-DEBUG-CONTEXT-2026-06-02** Инферить Twig context для email/debug templates из controller/service render arrays
+- [x] **H-TWIG-BDPN-EMAIL-DEBUG-CONTEXT-2026-06-02** Инферить Twig context для email/debug templates из controller/service render arrays *(completed 2026-06-03)*
   - `email/outbound/data_response.html.twig:26` `number` should have useful hover from `EmailNotifier` context.
   - `email/inbound/donor_info.html.twig:23` `debt` should have useful hover from email context.
   - `email/timer_expired.html.twig:23` `timerType` should have useful string/enum hover.
   - `debug/email.html.twig:23` `recipients` should infer a useful list type instead of only `mixed`; `26` `e` should infer string foreach value.
   - `debug/encryption.html.twig:46` `result.filename` should not return `null`.
+  - Implemented: Twig context collection now recognizes static context arrays passed through known literal-template calls, including Symfony `render`/`renderView` and notifier-style `notify($subject, $template, $context)`, without treating unrelated calls like `info('template.html.twig', [...])` as render context.
+  - Implemented: context assignment inference now merges branch assignments, keeps non-empty array shapes from earlier branches, resolves ternary branches, and understands common email/debug list pipelines such as `explode`, `preg_split`, `array_map`, `array_filter`, `array_values`, and `array_keys`.
+  - Tests: added BDPn-shaped e2e coverage for outbound/inbound/timer email templates, debug email recipient lists, debug encryption shape definitions, and a negative non-render call case.
+  - Docs: updated README, LSP feature notes, architecture notes, and the production risk register for the broader Twig context inference.
+  - Validation: `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`, `cargo test -p php-lsp-server lsp::templates::tests:: -- --nocapture`, `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
+  - Validation: Verifier rerun reported no blockers or remaining remarks.
 
 - [ ] **H-TWIG-INLAY-HINT-COVERAGE-2026-06-02** Восстановить inlayHint для Twig foreach/set variables, когда тип уже выводится или должен выводиться
   - Inlay hints were empty for all 45 opened email/debug/components files in the audit; add focused coverage for representative typed contexts.

@@ -422,14 +422,20 @@ When a mapped `foreach` iterates a known but non-parameterized `array` or
 continue to suppress `mixed` labels to avoid noise.
 
 Twig context variables are inferred statically from simple PHP
-`render('template.html.twig', ['name' => expr])` call sites. Supported context
-expressions include `new Class()`, simple arrays of new objects, typed
-controller parameter variables passed through to the render context, nullable
-locals assigned conditionally before render, and indexed
-`$this->service->method()` return types. Literal associative arrays are rendered
-as nested array shapes, `$items[] = [...]` append patterns become
-`array<int, array{...}>`, and `compact('name')` render contexts look up the
-latest local assignment or parameter type for each compacted variable.
+`render('template.html.twig', ['name' => expr])` call sites and from other
+literal-template call sites where the next top-level argument is a static
+context array, for example notifier helpers that call
+`notify($subject, 'email/foo.html.twig', [...])`. Supported context expressions
+include `new Class()`, simple arrays of new objects, typed controller parameter
+variables passed through to the render context, nullable locals assigned
+conditionally before render, and indexed `$this->service->method()` return
+types. Literal associative arrays are rendered as nested array shapes,
+`$items[] = [...]` append patterns become `array<int, array{...}>`, and common
+list pipelines such as `array_values(array_filter($items))`,
+`array_map(static fn (...): string => ..., ...)`, `explode(...)`, and
+`preg_split(...)` preserve or infer iterable value types. `compact('name')`
+render contexts look up the latest local assignment or parameter type for each
+compacted variable.
 Repository method results with iterable PHPDoc/native return types can seed
 collection context variables; Doctrine magic `find*` and `findOneBy*`
 repository results can seed entity or nullable entity context variables. Short

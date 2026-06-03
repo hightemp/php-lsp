@@ -228,14 +228,16 @@ phpstorm-stubs support.
   `config_params.sftp.port`, and local `{% set message_log = row.messageLog %}`
   variables. Shape-key definitions point at the PHPDoc shape key or literal
   array key when the static context scanner has that source range. Twig context
-  variables are inferred only from static `render(..., [...])` call sites,
-  including `new Class()`, arrays of new objects, typed controller parameter
-  variables, nullable locals assigned conditionally before render, indexed
+  variables are inferred from static `render(..., [...])` call sites and
+  literal-template helpers whose next argument is a context array, including
+  `new Class()`, arrays of new objects, typed controller parameter variables,
+  nullable locals assigned conditionally before render, indexed
   `$this->service->method()` return types, iterable repository method results,
-  literal nested array shapes, `$items[] = [...]` append-built shapes,
-  `compact('name')` variables, Doctrine magic `find*`/`findOneBy*` repository
-  results, and Knp-style paginator variables backed by Doctrine
-  repository/query-builder sources. One-level Twig `{% include ... with {...}
+  literal nested array shapes, `$items[] = [...]` append-built shapes, common
+  `array_values` / `array_filter` / `array_map` / `explode` / `preg_split`
+  list pipelines, `compact('name')` variables, Doctrine magic `find*` /
+  `findOneBy*` repository results, and Knp-style paginator variables backed by
+  Doctrine repository/query-builder sources. One-level Twig `{% include ... with {...}
   %}` calls can pass those inferred caller variables into component templates,
   so included partials can resolve foreach item hover/completion/definition and
   inlay hints without hardcoded template names.

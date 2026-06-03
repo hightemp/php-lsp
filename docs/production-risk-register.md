@@ -400,6 +400,12 @@ Current evidence:
   template files under `templates/` are resolved from tag strings and static
   HTML attribute values, while `path()` / `url()` route names jump to PHP 8
   `#[Route(name: ...)]` attributes through the framework string-key cache.
+- `H-TWIG-BDPN-EMAIL-DEBUG-CONTEXT-2026-06-02` extends static Twig context
+  inference to literal-template notifier/service helpers and preserves list
+  element types through common PHP array pipelines. Email/debug Twig templates
+  can now recover hover/definition context from service `notify(..., [...])`
+  calls and branchy controller `$result = [...]` arrays without booting
+  Symfony.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

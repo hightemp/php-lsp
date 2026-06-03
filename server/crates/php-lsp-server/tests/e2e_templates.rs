@@ -4351,6 +4351,343 @@ class SecurityController extends AbstractController
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_context_infers_email_notifier_and_debug_render_arrays() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-email-debug-context-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Service/Notification")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/email/outbound")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/email/inbound")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/email")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/debug")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let notifier_path = tmp_root.join("src/Service/Notification/EmailNotifier.php");
+    let debug_controller_path = tmp_root.join("src/Controller/DebugController.php");
+    let data_response_path = tmp_root.join("templates/email/outbound/data_response.html.twig");
+    let donor_info_path = tmp_root.join("templates/email/inbound/donor_info.html.twig");
+    let timer_path = tmp_root.join("templates/email/timer_expired.html.twig");
+    let fake_path = tmp_root.join("templates/email/fake.html.twig");
+    let debug_email_path = tmp_root.join("templates/debug/email.html.twig");
+    let debug_encryption_path = tmp_root.join("templates/debug/encryption.html.twig");
+
+    let notifier_php = r#"<?php
+namespace App\Service\Notification;
+
+class EmailNotifier
+{
+    public function notify(string $subject, string $template, array $context): void {}
+
+    public function notifyInboundDonorInfo(string $npId, string $processType, string $debt, string $debtRepayDate, string $status): void
+    {
+        $url = 'https://example.test/request';
+        $this->info('email/fake.html.twig', [
+            'fake' => ['value' => 'not a Twig render context'],
+        ]);
+        $this->notify('Входящий NP Donor Info', 'email/inbound/donor_info.html.twig', [
+            'npId' => $npId,
+            'processType' => $processType,
+            'debt' => $debt,
+            'debtRepayDate' => $debtRepayDate,
+            'status' => $status,
+            'url' => $url,
+        ]);
+    }
+
+    public function notifyTimerExpired(string $timerType, string $npId): void
+    {
+        $url = 'https://example.test/timer';
+        $this->notify('Истек таймер ' . $timerType, 'email/timer_expired.html.twig', [
+            'timerType' => $timerType,
+            'npId' => $npId,
+            'url' => $url,
+        ]);
+    }
+
+    public function notifyOutboundDataResponse(string $npId, string $processType, array $numbers = []): void
+    {
+        $url = 'https://example.test/data-response';
+        $this->notify('BDPN: Отправлено NP Data Response', 'email/outbound/data_response.html.twig', [
+            'npId' => $npId,
+            'processType' => $processType,
+            'numbers' => $numbers,
+            'url' => $url,
+        ]);
+    }
+}
+"#;
+    let debug_controller_php = r#"<?php
+namespace App\Controller;
+
+class DebugController
+{
+    public function email(): mixed
+    {
+        $recipients = 'first@example.test, second@example.test';
+        if (\is_string($recipients)) {
+            $recipients = '' !== trim($recipients) ? array_map('trim', explode(',', $recipients)) : [];
+        }
+        if (!\is_array($recipients)) {
+            $recipients = [];
+        }
+        $recipients = array_values(array_filter($recipients, static fn (string $v): bool => '' !== $v));
+
+        $result = null;
+        $result = [
+            'title' => 'MailerInterface: письмо отправлено',
+            'details' => [
+                'subject' => 'Test subject',
+                'cc' => $recipients,
+            ],
+        ];
+
+        return $this->render('debug/email.html.twig', [
+            'recipients' => $recipients,
+            'result' => $result,
+        ]);
+    }
+
+    public function encryption(): mixed
+    {
+        $result = null;
+        $cipher = 'cipher';
+        $plain = 'plain';
+        $result = [
+            'title' => 'Зашифрованные данные (Base64)',
+            'base64' => $cipher,
+            'filename' => 'encrypted.txt',
+        ];
+        $result = [
+            'title' => 'Расшифрованные данные',
+            'text' => $plain,
+            'filename' => 'decrypted.txt',
+        ];
+
+        return $this->render('debug/encryption.html.twig', [
+            'result' => $result,
+        ]);
+    }
+}
+"#;
+    let data_response_twig = concat!(
+        "{% for number in numbers %}\n",
+        "  {{ number }}\n",
+        "{% endfor %}\n",
+    );
+    let donor_info_twig = "{{ debt|default('') }}\n";
+    let timer_twig = "{{ timerType|default('') }}\n";
+    let fake_twig = "{{ fake.value }}\n";
+    let debug_email_twig = concat!(
+        "{% if recipients is not empty %}\n",
+        "  {% for e in recipients %}\n",
+        "    {{ e }}\n",
+        "  {% endfor %}\n",
+        "{% endif %}\n",
+        "{{ result.details.subject }}\n",
+    );
+    let debug_encryption_twig = concat!(
+        "{% if result %}\n",
+        "  {{ result.filename|default('result.bin') }}\n",
+        "{% endif %}\n",
+    );
+
+    fs::write(&notifier_path, notifier_php).unwrap();
+    fs::write(&debug_controller_path, debug_controller_php).unwrap();
+    fs::write(&data_response_path, data_response_twig).unwrap();
+    fs::write(&donor_info_path, donor_info_twig).unwrap();
+    fs::write(&timer_path, timer_twig).unwrap();
+    fs::write(&fake_path, fake_twig).unwrap();
+    fs::write(&debug_email_path, debug_email_twig).unwrap();
+    fs::write(&debug_encryption_path, debug_encryption_twig).unwrap();
+
+    let notifier_uri = file_uri(&notifier_path);
+    let debug_controller_uri = file_uri(&debug_controller_path);
+    let data_response_uri = file_uri(&data_response_path);
+    let donor_info_uri = file_uri(&donor_info_path);
+    let timer_uri = file_uri(&timer_path);
+    let fake_uri = file_uri(&fake_path);
+    let debug_email_uri = file_uri(&debug_email_path);
+    let debug_encryption_uri = file_uri(&debug_encryption_path);
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    for (uri, language, source) in [
+        (notifier_uri.as_str(), "php", notifier_php),
+        (debug_controller_uri.as_str(), "php", debug_controller_php),
+        (data_response_uri.as_str(), "twig", data_response_twig),
+        (donor_info_uri.as_str(), "twig", donor_info_twig),
+        (timer_uri.as_str(), "twig", timer_twig),
+        (fake_uri.as_str(), "twig", fake_twig),
+        (debug_email_uri.as_str(), "twig", debug_email_twig),
+        (debug_encryption_uri.as_str(), "twig", debug_encryption_twig),
+    ] {
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification_with_language(uri, language, source))
+            .await
+            .unwrap();
+    }
+
+    for uri in [
+        data_response_uri.as_str(),
+        donor_info_uri.as_str(),
+        timer_uri.as_str(),
+        fake_uri.as_str(),
+        debug_email_uri.as_str(),
+        debug_encryption_uri.as_str(),
+    ] {
+        let diagnostics =
+            next_publish_diagnostics(&mut notifications, uri, Duration::from_secs(2)).await;
+        assert_eq!(
+            diagnostics["diagnostics"].as_array().map(Vec::len),
+            Some(0),
+            "Twig fixture `{uri}` should stay diagnostic-clean, got: {}",
+            diagnostics
+        );
+    }
+
+    for (request_id, uri, source, needle, expected) in [
+        (
+            2,
+            data_response_uri.as_str(),
+            data_response_twig,
+            "number }}",
+            "mixed $number",
+        ),
+        (
+            3,
+            donor_info_uri.as_str(),
+            donor_info_twig,
+            "debt|",
+            "string $debt",
+        ),
+        (
+            4,
+            timer_uri.as_str(),
+            timer_twig,
+            "timerType|",
+            "string $timerType",
+        ),
+        (
+            5,
+            debug_email_uri.as_str(),
+            debug_email_twig,
+            "recipients is",
+            "array<int, string> $recipients",
+        ),
+        (
+            6,
+            debug_email_uri.as_str(),
+            debug_email_twig,
+            "e }}",
+            "string $e",
+        ),
+    ] {
+        let (line, character) = utf16_position_at(source, needle);
+        let hover = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(hover_request(request_id, uri, line, character))
+                .await
+                .unwrap(),
+        );
+        let markdown = hover_markdown_value(&hover);
+        assert!(
+            markdown.contains(expected),
+            "expected `{needle}` hover to contain `{expected}`, got: {}",
+            markdown
+        );
+    }
+
+    let fake_hover_position = utf16_position_at(fake_twig, "fake.value");
+    let fake_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                8,
+                &fake_uri,
+                fake_hover_position.0,
+                fake_hover_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        fake_hover.is_null(),
+        "non-template helper calls should not seed Twig context, got: {}",
+        fake_hover
+    );
+
+    let filename_definition_position = utf16_position_after(debug_encryption_twig, "result.f");
+    let definition = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(
+                7,
+                &debug_encryption_uri,
+                filename_definition_position.0,
+                filename_definition_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let expected_filename_line = utf16_position_at(debug_controller_php, "'filename'").0;
+    assert_eq!(
+        definition.get("uri").and_then(|value| value.as_str()),
+        Some(debug_controller_uri.as_str()),
+        "expected result.filename definition to jump to DebugController source, got: {}",
+        definition
+    );
+    assert_eq!(
+        definition["range"]["start"]["line"].as_u64(),
+        Some(expected_filename_line as u64),
+        "expected result.filename definition to point at literal array key, got: {}",
+        definition
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_twig_foreach_entity_collection_members_from_doctrine_target_entity() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
