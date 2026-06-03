@@ -140,7 +140,7 @@ fn extract_from_node(
 ) {
     match node.kind() {
         "namespace_use_declaration" => {
-            extract_use_statements(node, source, result);
+            extract_use_statements(node, source, result, current_ns);
         }
         "class_declaration" => {
             extract_class_like(
@@ -214,23 +214,34 @@ fn extract_children(
 }
 
 /// Extract use statements from a `namespace_use_declaration`.
-fn extract_use_statements(node: Node, source: &str, result: &mut FileSymbols) {
+fn extract_use_statements(
+    node: Node,
+    source: &str,
+    result: &mut FileSymbols,
+    current_ns: &Option<String>,
+) {
     // Determine use kind (function/const/normal)
     let kind = determine_use_kind(node, source);
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "namespace_use_clause" {
-            extract_single_use_clause(child, source, result, kind);
+            extract_single_use_clause(child, source, result, kind, current_ns);
         } else if child.kind() == "namespace_use_group" {
-            extract_use_group(child, node, source, result, kind);
+            extract_use_group(child, node, source, result, kind, current_ns);
         }
     }
 }
 
 /// Extract a single use clause. The CST structure is:
 /// namespace_use_clause -> qualified_name, [as, name(alias)]
-fn extract_single_use_clause(clause: Node, source: &str, result: &mut FileSymbols, kind: UseKind) {
+fn extract_single_use_clause(
+    clause: Node,
+    source: &str,
+    result: &mut FileSymbols,
+    kind: UseKind,
+    current_ns: &Option<String>,
+) {
     let mut fqn: Option<String> = None;
     let mut alias: Option<String> = None;
     let mut saw_as = false;
@@ -264,6 +275,7 @@ fn extract_single_use_clause(clause: Node, source: &str, result: &mut FileSymbol
             fqn,
             alias,
             kind,
+            namespace: current_ns.clone(),
             range,
         });
     }
@@ -275,6 +287,7 @@ fn extract_use_group(
     source: &str,
     result: &mut FileSymbols,
     kind: UseKind,
+    current_ns: &Option<String>,
 ) {
     // Get prefix from parent
     let prefix = parent
@@ -308,6 +321,7 @@ fn extract_use_group(
                     fqn,
                     alias,
                     kind,
+                    namespace: current_ns.clone(),
                     range,
                 });
             }
@@ -455,6 +469,7 @@ fn extract_class_like(
     let fqn = make_fqn(current_ns, &name);
 
     let modifiers = extract_modifiers(node, source);
+    let attributes = attribute_groups_for_node(node, source);
     let doc_comment_node = find_doc_comment_node(node, source);
     let doc_comment = doc_comment_node
         .as_ref()
@@ -493,6 +508,7 @@ fn extract_class_like(
         selection_range: node_range(name_node),
         visibility: Visibility::Public,
         modifiers,
+        attributes,
         doc_comment: doc_comment.clone(),
         signature: None,
         parent_fqn: None,
@@ -564,6 +580,7 @@ fn extract_phpdoc_virtual_methods(
                 is_static: method.is_static,
                 ..SymbolModifiers::default()
             },
+            attributes: vec![],
             doc_comment: Some(doc_comment.to_string()),
             signature: Some(Signature {
                 params: method.params,
@@ -664,6 +681,7 @@ fn extract_method(
 
     let visibility = extract_visibility(node, source);
     let modifiers = extract_modifiers(node, source);
+    let attributes = attribute_groups_for_node(node, source);
     let doc_comment = find_doc_comment(node, source);
     let templates = phpdoc_templates(doc_comment.as_deref());
     let mut signature = extract_signature(node, source, php_version);
@@ -682,6 +700,7 @@ fn extract_method(
         selection_range: node_range(name_node),
         visibility,
         modifiers,
+        attributes,
         doc_comment,
         signature: Some(signature),
         parent_fqn: Some(parent_fqn.to_string()),
@@ -705,6 +724,7 @@ fn extract_method(
                 }
                 let prop_vis = extract_visibility(child, source);
                 let prop_mods = extract_modifiers(child, source);
+                let prop_attributes = attribute_groups_for_node(child, source);
                 let prop_type = child
                     .child_by_field_name("type")
                     .map(|t| parse_type_node(t, source));
@@ -722,6 +742,7 @@ fn extract_method(
                         selection_range: node_range(name_node),
                         visibility: prop_vis,
                         modifiers: prop_mods,
+                        attributes: prop_attributes,
                         doc_comment: None,
                         signature: prop_type.map(|t| Signature {
                             params: vec![],
@@ -758,6 +779,7 @@ fn extract_function(
     };
     let name = node_text(name_node, source).to_string();
     let fqn = make_fqn(current_ns, &name);
+    let attributes = attribute_groups_for_node(node, source);
     let doc_comment = find_doc_comment(node, source);
     let templates = phpdoc_templates(doc_comment.as_deref());
     let mut signature = extract_signature(node, source, php_version);
@@ -776,6 +798,7 @@ fn extract_function(
         selection_range: node_range(name_node),
         visibility: Visibility::Public,
         modifiers: SymbolModifiers::default(),
+        attributes,
         doc_comment,
         signature: Some(signature),
         parent_fqn: None,
@@ -803,6 +826,7 @@ fn extract_properties(
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
     let attribute_text = attribute_prefix_for_node(node, source);
+    let attributes = attribute_groups_for_node(node, source);
 
     // Extract type annotation if present
     let native_type_info = node
@@ -835,6 +859,7 @@ fn extract_properties(
                     selection_range: node_range(name_node),
                     visibility,
                     modifiers,
+                    attributes: attributes.clone(),
                     doc_comment: doc_comment.clone(),
                     signature: type_info.as_ref().map(|t| Signature {
                         params: vec![],
@@ -881,14 +906,104 @@ fn refine_doctrine_collection_type_from_target_entity(
 }
 
 fn attribute_prefix_for_node(node: Node, source: &str) -> String {
-    let immediate = immediate_attribute_prefix(source, node.start_byte());
-    let leading = leading_attribute_prefix_from_text(node_text(node, source));
-    match (immediate.is_empty(), leading.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => immediate,
-        (true, false) => leading,
-        (false, false) => format!("{immediate} {leading}"),
+    attribute_groups_for_node(node, source)
+        .into_iter()
+        .map(|attribute| attribute.text)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn attribute_groups_for_node(node: Node, source: &str) -> Vec<SymbolAttribute> {
+    let mut groups = immediate_attribute_groups(source, node.start_byte());
+    groups.extend(leading_attribute_groups_for_node(node, source));
+    groups.sort_by_key(|attribute| {
+        (
+            attribute.range.0,
+            attribute.range.1,
+            attribute.range.2,
+            attribute.range.3,
+            attribute.text.clone(),
+        )
+    });
+    groups.dedup_by(|left, right| left.range == right.range && left.text == right.text);
+    groups
+}
+
+fn immediate_attribute_groups(source: &str, start_byte: usize) -> Vec<SymbolAttribute> {
+    let mut end = start_byte.min(source.len());
+    let mut ranges = Vec::new();
+
+    loop {
+        end = trim_end_ascii_whitespace(source, end);
+        if end == 0 || !source[..end].ends_with(']') {
+            break;
+        }
+
+        let Some(start) = find_attribute_group_start(source, end) else {
+            break;
+        };
+        ranges.push((start, end));
+        end = start;
     }
+
+    ranges.reverse();
+    ranges
+        .into_iter()
+        .map(|(start, end)| symbol_attribute_from_byte_range(source, start, end))
+        .collect()
+}
+
+fn leading_attribute_groups_for_node(node: Node, source: &str) -> Vec<SymbolAttribute> {
+    let text = node_text(node, source);
+    let mut offset = 0usize;
+    let mut groups = Vec::new();
+
+    loop {
+        while text
+            .as_bytes()
+            .get(offset)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            offset += 1;
+        }
+        if !text[offset..].starts_with("#[") {
+            break;
+        }
+
+        let Some(end_relative) = matching_attribute_group_end(&text[offset..]) else {
+            break;
+        };
+        let start = node.start_byte() + offset;
+        let end = start + end_relative;
+        groups.push(symbol_attribute_from_byte_range(source, start, end));
+        offset += end_relative;
+    }
+
+    groups
+}
+
+fn symbol_attribute_from_byte_range(source: &str, start: usize, end: usize) -> SymbolAttribute {
+    let (start_line, start_col) = byte_offset_to_point(source, start);
+    let (end_line, end_col) = byte_offset_to_point(source, end);
+    SymbolAttribute {
+        text: source[start..end].to_string(),
+        range: (start_line, start_col, end_line, end_col),
+    }
+}
+
+fn byte_offset_to_point(source: &str, offset: usize) -> (u32, u32) {
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    let offset = offset.min(source.len());
+
+    for (idx, byte) in source.as_bytes().iter().take(offset).enumerate() {
+        if *byte == b'\n' {
+            line += 1;
+            line_start = idx + 1;
+        }
+    }
+
+    (line, (offset - line_start) as u32)
 }
 
 fn collection_base_type_name(type_info: &TypeInfo) -> Option<String> {
@@ -955,6 +1070,7 @@ fn extract_class_constants(
     let visibility = extract_visibility(node, source);
     let modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
+    let attributes = attribute_groups_for_node(node, source);
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -979,6 +1095,7 @@ fn extract_class_constants(
                     selection_range: node_range(name_node),
                     visibility,
                     modifiers,
+                    attributes: attributes.clone(),
                     doc_comment: doc_comment.clone(),
                     signature: None,
                     parent_fqn: Some(parent_fqn.to_string()),
@@ -1006,6 +1123,7 @@ fn extract_global_constants(
     }
 
     let doc_comment = find_doc_comment(node, source);
+    let attributes = attribute_groups_for_node(node, source);
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1028,6 +1146,7 @@ fn extract_global_constants(
                     selection_range: node_range(name_node),
                     visibility: Visibility::Public,
                     modifiers: SymbolModifiers::default(),
+                    attributes: attributes.clone(),
                     doc_comment: doc_comment.clone(),
                     signature: None,
                     parent_fqn: None,
@@ -1061,6 +1180,7 @@ fn extract_enum_case(
     let name = node_text(name_node, source).to_string();
     let fqn = format!("{}::{}", parent_fqn, name);
     let doc_comment = find_doc_comment(node, source);
+    let attributes = attribute_groups_for_node(node, source);
 
     result.symbols.push(SymbolInfo {
         name,
@@ -1071,6 +1191,7 @@ fn extract_enum_case(
         selection_range: node_range(name_node),
         visibility: Visibility::Public,
         modifiers: SymbolModifiers::default(),
+        attributes,
         doc_comment,
         signature: None,
         parent_fqn: Some(parent_fqn.to_string()),
@@ -1670,8 +1791,23 @@ fn leading_attribute_prefix_from_text(text: &str) -> String {
 
 fn matching_attribute_group_end(text: &str) -> Option<usize> {
     let mut depth = 0usize;
+    let mut quote = None;
+    let mut escape = false;
+
     for (idx, ch) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
         match ch {
+            '\'' | '"' if depth > 0 => quote = Some(ch),
             '[' => depth = depth.saturating_add(1),
             ']' => {
                 depth = depth.saturating_sub(1);
@@ -1693,19 +1829,20 @@ fn trim_end_ascii_whitespace(source: &str, mut end: usize) -> usize {
 }
 
 fn find_attribute_group_start(source: &str, end: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (idx, ch) in source[..end].char_indices().rev() {
-        match ch {
-            ']' => depth = depth.saturating_add(1),
-            '[' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 && idx > 0 && source.as_bytes().get(idx - 1) == Some(&b'#') {
-                    return Some(idx - 1);
-                }
-            }
-            _ => {}
+    let end = end.min(source.len());
+    let mut search_end = end;
+
+    while let Some(start) = source[..search_end].rfind("#[") {
+        if matching_attribute_group_end(&source[start..end]) == Some(end - start) {
+            return Some(start);
         }
+
+        if start == 0 {
+            break;
+        }
+        search_end = start;
     }
+
     None
 }
 
@@ -1967,12 +2104,38 @@ mod tests {
         assert_eq!(syms.use_statements[0].fqn, "App\\Service\\Foo");
         assert_eq!(syms.use_statements[0].alias, None);
         assert_eq!(syms.use_statements[0].kind, UseKind::Class);
+        assert_eq!(syms.use_statements[0].namespace, None);
 
         assert_eq!(syms.use_statements[1].fqn, "App\\Entity\\Bar");
         assert_eq!(syms.use_statements[1].alias, Some("B".to_string()));
 
         assert_eq!(syms.use_statements[2].fqn, "App\\helper");
         assert_eq!(syms.use_statements[2].kind, UseKind::Function);
+        assert_eq!(syms.use_statements[2].namespace, None);
+    }
+
+    #[test]
+    fn test_extract_use_statement_namespace_scopes() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App\Controller {
+use Symfony\Component\Routing\Attribute\Route;
+}
+namespace App\Api {
+use App\Attribute\Route as LocalRoute;
+}
+"#,
+        );
+
+        assert_eq!(syms.use_statements.len(), 2);
+        assert_eq!(
+            syms.use_statements[0].namespace.as_deref(),
+            Some("App\\Controller")
+        );
+        assert_eq!(
+            syms.use_statements[1].namespace.as_deref(),
+            Some("App\\Api")
+        );
     }
 
     #[test]
@@ -2281,6 +2444,95 @@ class Order {}
             "App\\Repository\\OrderRepository"
         );
         assert!(cls.template_bindings[0].args.is_empty());
+        assert_eq!(cls.attributes.len(), 1);
+        assert_eq!(
+            cls.attributes[0].text,
+            r#"#[ORM\Entity(repositoryClass: OrderRepository::class)]"#
+        );
+        assert_eq!(cls.attributes[0].range, (6, 0, 6, 54));
+    }
+
+    #[test]
+    fn test_extract_symbol_attribute_metadata_for_members() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App\Controller;
+
+use Doctrine\ORM\Mapping as ORM;
+use Symfony\Component\Routing\Attribute\Route;
+
+class DashboardController {
+    #[Route('/dashboard', name: 'app_dashboard')]
+    public function dashboard(): void {}
+
+    #[ORM\ManyToOne(targetEntity: User::class)]
+    private User $owner;
+}
+"#,
+        );
+        let method = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Method && s.name == "dashboard")
+            .unwrap();
+        let property = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.name == "owner")
+            .unwrap();
+
+        assert_eq!(method.attributes.len(), 1);
+        assert_eq!(
+            method.attributes[0].text,
+            r#"#[Route('/dashboard', name: 'app_dashboard')]"#
+        );
+        assert_eq!(method.attributes[0].range.0, 7);
+        assert_eq!(method.attributes[0].range.1, 4);
+
+        assert_eq!(property.attributes.len(), 1);
+        assert_eq!(
+            property.attributes[0].text,
+            r#"#[ORM\ManyToOne(targetEntity: User::class)]"#
+        );
+        assert_eq!(property.attributes[0].range.0, 10);
+        assert_eq!(property.attributes[0].range.1, 4);
+    }
+
+    #[test]
+    fn test_extract_symbol_attribute_metadata_ignores_brackets_inside_strings() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App\Controller;
+
+use Symfony\Component\Routing\Attribute\Route;
+use Symfony\Component\Validator\Constraints as Assert;
+
+class FileController {
+    private string $open = '[';
+
+    #[Route('/file[0-9].csv', name: 'file_[id]')]
+    #[Assert\Regex(pattern: '/^[a-z]+$/')]
+    public function download(): void {}
+}
+"#,
+        );
+        let method = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Method && s.name == "download")
+            .unwrap();
+
+        assert_eq!(
+            method
+                .attributes
+                .iter()
+                .map(|attribute| attribute.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "#[Route('/file[0-9].csv', name: 'file_[id]')]",
+                "#[Assert\\Regex(pattern: '/^[a-z]+$/')]",
+            ]
+        );
     }
 
     #[test]

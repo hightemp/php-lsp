@@ -365,6 +365,15 @@ pub struct PhpDocMethod {
     pub description: Option<String>,
 }
 
+/// PHP 8 attribute group attached to a symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolAttribute {
+    /// Raw attribute group text, for example `#[ORM\Entity(...)]`.
+    pub text: String,
+    /// Source byte-column range (start line, start col, end line, end col).
+    pub range: (u32, u32, u32, u32),
+}
+
 /// Full information about a symbol in the index.
 ///
 /// `range` and `selection_range` use tree-sitter byte columns, not LSP UTF-16
@@ -387,6 +396,9 @@ pub struct SymbolInfo {
     pub visibility: Visibility,
     /// Modifiers
     pub modifiers: SymbolModifiers,
+    /// PHP 8 attribute groups attached to this symbol.
+    #[serde(default)]
+    pub attributes: Vec<SymbolAttribute>,
     /// Raw doc comment
     pub doc_comment: Option<String>,
     /// Parsed signature (for functions/methods)
@@ -416,6 +428,9 @@ pub struct UseStatement {
     pub fqn: String,
     pub alias: Option<String>,
     pub kind: UseKind,
+    /// Namespace scope where this use statement is declared.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Source byte-column range (start line, start col, end line, end col).
     pub range: (u32, u32, u32, u32),
 }

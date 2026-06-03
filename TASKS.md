@@ -4668,12 +4668,23 @@ change.
   - Validation: `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
   - Validation: Verifier reported no findings; residual risk is only that UI rendering was not manually checked in VS Code.
 
-- [ ] **H-HOVER-FRAMEWORK-ROLES-AND-ATTRIBUTES-2026-06-03** Добавить framework-aware role/attribute sections для Symfony и Doctrine hover
+- [x] **H-HOVER-FRAMEWORK-ROLES-AND-ATTRIBUTES-2026-06-03** Добавить framework-aware role/attribute sections для Symfony и Doctrine hover *(completed 2026-06-03)*
   - Show concise role metadata similar to PhpStorm, for example `Entity`, `Repository`, `Controller`, `FormType`, `Service`, when inferred from attributes, inheritance, implemented interfaces, or framework provider metadata.
   - Surface relevant PHP attributes above classes/methods/properties in hover, including `#[Route(...)]`, Doctrine `#[Entity(...)]`, `#[Table(...)]`, `#[Index(...)]`, ORM association attributes, and repository class metadata.
   - Store or expose attribute text/ranges through parser/index metadata instead of adding blocking source reads in async hover paths.
   - Use existing Doctrine/Symfony helpers where possible and keep matching generic enough to avoid BDPn-specific hardcode.
   - Add parser/index tests for attribute extraction plus e2e hover tests for Symfony controller action and Doctrine entity hover.
+  - Implemented: `SymbolInfo` now stores PHP 8 attribute groups with parser byte-column ranges and index cache schema was bumped for the serialized shape.
+  - Implemented: indexed hover renders attributes above source-like declarations and adds `Framework`, `Attributes`, and Doctrine `Repository` metadata without request-time source reads.
+  - Implemented: role inference covers Symfony controllers/actions/FormType/service attributes and Doctrine entities, repositories, fields, and associations from indexed attributes/hierarchy.
+  - Tests: added parser coverage for class/method/property attribute extraction plus e2e hover coverage for Symfony `#[Route]` controller/action and Doctrine entity/repository/property attributes.
+  - Regression: role inference ignores attribute argument/string text and does not treat local `AbstractController`/`EntityRepository` basenames as Symfony/Doctrine roles.
+  - Regression: framework attribute roles resolve imports/current symbol namespace, including aliased `Route` attributes and local `Route` attributes that must not infer Symfony roles.
+  - Regression: attribute group extraction ignores `[`/`]` inside quoted attribute arguments.
+  - Regression: `UseStatement` now stores namespace scope, so attribute imports from an earlier namespace do not leak into later namespace blocks.
+  - Docs: updated README, LSP feature docs, architecture notes, and production risk register for indexed attributes/framework hover metadata.
+  - Validation: `cargo test --all`, `cargo test -p php-lsp-server --test e2e_hover -- --nocapture`, parser use-scope tests, cache schema guard, `cargo clippy --all-targets --all -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+  - Validation: Verifier rerun reported no blocking findings after namespace-scoped import fix.
 
 - [ ] **H-HOVER-METHOD-IMPLEMENTS-OVERRIDES-2026-06-03** Показывать method-level implements/overrides links в hover
   - For interface implementations and inherited method overrides, add linked `Implements` / `Overrides` lines like PhpStorm shows for `ObjectManager::getRepository`.

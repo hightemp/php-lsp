@@ -663,6 +663,608 @@ $repo = new DataRequestRepository();
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_symfony_controller_roles_and_route_attributes() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace Symfony\Bundle\FrameworkBundle\Controller {
+abstract class AbstractController {}
+}
+
+namespace Symfony\Component\Routing\Attribute {
+class Route {}
+}
+
+namespace App\Controller {
+
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+use Symfony\Component\Routing\Attribute\Route as SymfonyRoute;
+
+#[SymfonyRoute('/data-request')]
+final class DataRequestController extends AbstractController
+{
+    #[SymfonyRoute('/{id<\d+>}', name: 'app_data_request_show', methods: ['GET'])]
+    public function show(): void {}
+}
+
+$controller = new DataRequestController();
+$controller->show();
+}
+"#;
+    let uri = "file:///test/hover-symfony-controller-attributes.php";
+    let class_position = utf16_position_at(code, "DataRequestController();");
+    let method_position = utf16_position_at(code, "show();");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let class_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, class_position.0, class_position.1))
+        .await
+        .unwrap();
+    let class_hover = hover_markdown_value(&extract_result(class_hover));
+
+    assert!(
+        class_hover.contains(
+            "```php\n#[SymfonyRoute('/data-request')]\nfinal class DataRequestController\n```"
+        ),
+        "expected route attribute above controller declaration, got: {}",
+        class_hover
+    );
+    assert!(
+        class_hover.contains("**Framework:** `Controller`"),
+        "expected controller framework role, got: {}",
+        class_hover
+    );
+    assert!(
+        class_hover.contains("**Attributes:**")
+            && class_hover.contains("`#[SymfonyRoute('/data-request')]`"),
+        "expected route attribute metadata section, got: {}",
+        class_hover
+    );
+
+    let method_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, method_position.0, method_position.1))
+        .await
+        .unwrap();
+    let method_hover = hover_markdown_value(&extract_result(method_hover));
+
+    assert!(
+        method_hover.contains("```php\n#[SymfonyRoute('/{id<\\d+>}', name: 'app_data_request_show', methods: ['GET'])]\npublic function show(): void\n```"),
+        "expected route attribute above controller action declaration, got: {}",
+        method_hover
+    );
+    assert!(
+        method_hover.contains("**Framework:** `Controller action`"),
+        "expected controller action role, got: {}",
+        method_hover
+    );
+    assert!(
+        method_hover.contains(
+            "`#[SymfonyRoute('/{id<\\d+>}', name: 'app_data_request_show', methods: ['GET'])]`"
+        ),
+        "expected action route attribute metadata, got: {}",
+        method_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_doctrine_entity_roles_repository_and_property_attributes() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace Doctrine\ORM\Mapping {
+class Entity {}
+class Table {}
+class Index {}
+class Id {}
+class Column {}
+class ManyToOne {}
+}
+
+namespace App\Repository {
+class DataRequestRepository {}
+}
+
+namespace App\Entity {
+
+use App\Repository\DataRequestRepository;
+use Doctrine\ORM\Mapping as ORM;
+
+#[ORM\Entity(repositoryClass: DataRequestRepository::class)]
+#[ORM\Table(name: 'data_requests')]
+#[ORM\Index(name: 'idx_data_requests_status', columns: ['status'])]
+class DataRequest
+{
+    #[ORM\Id]
+    #[ORM\Column(type: 'integer')]
+    private int $id;
+
+    #[ORM\ManyToOne(targetEntity: Subscriber::class)]
+    private ?Subscriber $subscriber = null;
+}
+
+class Subscriber {}
+
+$request = new DataRequest();
+$request->subscriber;
+}
+"#;
+    let uri = "file:///test/hover-doctrine-entity-attributes.php";
+    let class_position = utf16_position_at(code, "DataRequest();");
+    let property_position = utf16_position_at(code, "subscriber;");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let class_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, class_position.0, class_position.1))
+        .await
+        .unwrap();
+    let class_hover = hover_markdown_value(&extract_result(class_hover));
+
+    assert!(
+        class_hover.contains("```php\n#[ORM\\Entity(repositoryClass: DataRequestRepository::class)]\n#[ORM\\Table(name: 'data_requests')]\n#[ORM\\Index(name: 'idx_data_requests_status', columns: ['status'])]\nclass DataRequest\n```"),
+        "expected Doctrine attributes above entity declaration, got: {}",
+        class_hover
+    );
+    assert!(
+        class_hover.contains("**Framework:** `Entity`"),
+        "expected entity framework role, got: {}",
+        class_hover
+    );
+    assert!(
+        class_hover.contains("**Repository:**")
+            && class_hover.contains(
+                "DataRequestRepository`](<file:///test/hover-doctrine-entity-attributes.php#L12>)"
+            ),
+        "expected linked repositoryClass metadata, got: {}",
+        class_hover
+    );
+    assert!(
+        class_hover.contains("**Attributes:**")
+            && class_hover
+                .contains("`#[ORM\\Entity(repositoryClass: DataRequestRepository::class)]`")
+            && class_hover.contains("`#[ORM\\Table(name: 'data_requests')]`")
+            && class_hover
+                .contains("`#[ORM\\Index(name: 'idx_data_requests_status', columns: ['status'])]`"),
+        "expected Doctrine entity attribute metadata, got: {}",
+        class_hover
+    );
+
+    let property_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            3,
+            uri,
+            property_position.0,
+            property_position.1,
+        ))
+        .await
+        .unwrap();
+    let property_hover = hover_markdown_value(&extract_result(property_hover));
+
+    assert!(
+        property_hover.contains("```php\n#[ORM\\ManyToOne(targetEntity: Subscriber::class)]\nprivate ?Subscriber $subscriber\n```"),
+        "expected Doctrine association attribute above property declaration, got: {}",
+        property_hover
+    );
+    assert!(
+        property_hover.contains("**Framework:** `Doctrine association`"),
+        "expected Doctrine association framework role, got: {}",
+        property_hover
+    );
+    assert!(
+        property_hover.contains("`#[ORM\\ManyToOne(targetEntity: Subscriber::class)]`"),
+        "expected Doctrine association attribute metadata, got: {}",
+        property_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_framework_roles_avoid_attribute_argument_and_basename_false_positives() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App\Attribute {
+class Route {}
+}
+
+namespace App {
+
+class AbstractController {}
+class EntityRepository {}
+class Custom {}
+
+final class LocalController extends AbstractController
+{
+    #[Custom(label: 'Route')]
+    public function show(): void {}
+
+    #[\App\Attribute\Route]
+    public function localRoute(): void {}
+}
+
+final class LocalRepository extends EntityRepository {}
+
+$controller = new LocalController();
+$controller->show();
+$controller->localRoute();
+$repository = new LocalRepository();
+}
+"#;
+    let uri = "file:///test/hover-framework-role-false-positives.php";
+    let controller_position = utf16_position_at(code, "LocalController();");
+    let method_position = utf16_position_at(code, "show();");
+    let local_route_position = utf16_position_at(code, "localRoute();");
+    let repository_position = utf16_position_at(code, "LocalRepository();");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let controller_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            uri,
+            controller_position.0,
+            controller_position.1,
+        ))
+        .await
+        .unwrap();
+    let controller_hover = hover_markdown_value(&extract_result(controller_hover));
+    assert!(
+        !controller_hover.contains("**Framework:**"),
+        "local AbstractController basename must not infer Symfony controller role, got: {}",
+        controller_hover
+    );
+
+    let method_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, method_position.0, method_position.1))
+        .await
+        .unwrap();
+    let method_hover = hover_markdown_value(&extract_result(method_hover));
+    assert!(
+        method_hover.contains("`#[Custom(label: 'Route')]`")
+            && !method_hover.contains("Controller action"),
+        "attribute argument text must not infer route/controller action role, got: {}",
+        method_hover
+    );
+
+    let local_route_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            4,
+            uri,
+            local_route_position.0,
+            local_route_position.1,
+        ))
+        .await
+        .unwrap();
+    let local_route_hover = hover_markdown_value(&extract_result(local_route_hover));
+    assert!(
+        local_route_hover.contains("`#[\\App\\Attribute\\Route]`")
+            && !local_route_hover.contains("Controller action"),
+        "local Route attribute FQN must not infer Symfony controller action role, got: {}",
+        local_route_hover
+    );
+
+    let repository_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            5,
+            uri,
+            repository_position.0,
+            repository_position.1,
+        ))
+        .await
+        .unwrap();
+    let repository_hover = hover_markdown_value(&extract_result(repository_hover));
+    assert!(
+        !repository_hover.contains("**Framework:**"),
+        "local EntityRepository basename must not infer Doctrine repository role, got: {}",
+        repository_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_framework_roles_use_nearest_namespace_import_for_attributes() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace Symfony\Bundle\FrameworkBundle\Controller {
+abstract class AbstractController {}
+}
+
+namespace Symfony\Component\Routing\Attribute {
+class Route {}
+}
+
+namespace App\Attribute {
+class Route {}
+}
+
+namespace App\Controller {
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+use Symfony\Component\Routing\Attribute\Route;
+
+final class WebController extends AbstractController
+{
+    #[Route('/web')]
+    public function webShow(): void {}
+}
+
+$web = new WebController();
+$web->webShow();
+}
+
+namespace App\Api {
+use App\Attribute\Route;
+
+#[Route]
+final class LocalAction
+{
+    public function localShow(): void {}
+}
+
+$api = new LocalAction();
+$api->localShow();
+}
+"#;
+    let uri = "file:///test/hover-framework-role-scoped-imports.php";
+    let local_position = utf16_position_at(code, "LocalAction();");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let local_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, local_position.0, local_position.1))
+        .await
+        .unwrap();
+    let local_hover = hover_markdown_value(&extract_result(local_hover));
+    assert!(
+        local_hover.contains("`#[Route]`") && !local_hover.contains("Controller action"),
+        "local Route import after an earlier Symfony Route import must not infer Symfony role, got: {}",
+        local_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_framework_roles_do_not_leak_imports_into_later_namespace() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace Symfony\Component\Routing\Attribute {
+class Route {}
+}
+
+namespace App\Controller {
+use Symfony\Component\Routing\Attribute\Route;
+
+final class WebController
+{
+    #[Route('/web')]
+    public function webShow(): void {}
+}
+}
+
+namespace App\NoLocalImport {
+
+#[Route]
+final class NoLocalImportAction
+{
+    public function noLocalShow(): void {}
+}
+
+$noLocal = new NoLocalImportAction();
+$noLocal->noLocalShow();
+}
+"#;
+    let uri = "file:///test/hover-framework-role-import-leak.php";
+    let no_local_position = utf16_position_at(code, "NoLocalImportAction();");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let no_local_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            uri,
+            no_local_position.0,
+            no_local_position.1,
+        ))
+        .await
+        .unwrap();
+    let no_local_hover = hover_markdown_value(&extract_result(no_local_hover));
+    assert!(
+        no_local_hover.contains("`#[Route]`") && !no_local_hover.contains("Controller action"),
+        "an unimported Route in a later namespace must not reuse an earlier Symfony import, got: {}",
+        no_local_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_hover_parameters_section_includes_all_signature_params() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

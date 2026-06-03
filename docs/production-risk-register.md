@@ -422,6 +422,11 @@ Current evidence:
 - `H-HOVER-CLASS-RELATIONS-AND-TEMPLATES-2026-06-03` surfaces indexed
   `extends`, `implements`, trait uses, PHPDoc mixins, template params, and
   generic bindings in hover without reparsing source in the request path.
+- `H-HOVER-FRAMEWORK-ROLES-AND-ATTRIBUTES-2026-06-03` stores PHP 8 attribute
+  groups on indexed symbols and uses them for Symfony/Doctrine hover metadata,
+  including controller/action/entity/repository/association roles, rendered
+  attributes, and linked Doctrine `repositoryClass` targets without
+  request-time source reads.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

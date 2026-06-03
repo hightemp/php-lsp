@@ -1481,6 +1481,7 @@ mod tests {
             uri: String::new(),
             visibility: php_lsp_types::Visibility::Public,
             modifiers: Default::default(),
+            attributes: vec![],
             doc_comment: None,
             signature: None,
             parent_fqn: None,
@@ -1502,6 +1503,7 @@ mod tests {
             uri: String::new(),
             visibility: php_lsp_types::Visibility::Public,
             modifiers: Default::default(),
+            attributes: vec![],
             doc_comment: None,
             signature: Some(Signature {
                 params,

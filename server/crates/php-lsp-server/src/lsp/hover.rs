@@ -211,6 +211,7 @@ impl PhpLspBackend {
 
             // PHP code block with signature
             content.push_str("```php\n");
+            append_hover_symbol_attributes_declaration(&mut content, &sym);
             append_hover_symbol_declaration(&mut content, &sym, kind_label);
             content.push_str("\n```\n");
 
@@ -227,6 +228,12 @@ impl PhpLspBackend {
                 );
             }
             append_hover_symbol_source_line(&mut content, &sym);
+            append_hover_framework_metadata_lines(
+                &mut content,
+                &self.index,
+                &hover_file_symbols,
+                &sym,
+            );
             append_hover_relation_and_template_lines(
                 &mut content,
                 &self.index,
@@ -485,6 +492,16 @@ fn hover_symbol_type_owner_fqn(symbol: &php_lsp_types::SymbolInfo) -> &str {
     ""
 }
 
+fn append_hover_symbol_attributes_declaration(
+    content: &mut String,
+    symbol: &php_lsp_types::SymbolInfo,
+) {
+    for attribute in hover_display_attributes(symbol) {
+        content.push_str(&attribute.text);
+        content.push('\n');
+    }
+}
+
 fn append_hover_symbol_declaration(
     content: &mut String,
     symbol: &php_lsp_types::SymbolInfo,
@@ -651,6 +668,427 @@ fn hover_symbol_source_label(symbol: &php_lsp_types::SymbolInfo) -> String {
         return format!("{}:{line}", path.display());
     }
     format!("{}:{line}", symbol.uri)
+}
+
+fn append_hover_framework_metadata_lines(
+    content: &mut String,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+) {
+    let roles = hover_framework_roles(index, file_symbols, symbol);
+    if !roles.is_empty() {
+        content.push('\n');
+        content.push_str("**Framework:** ");
+        content.push_str(
+            &roles
+                .iter()
+                .map(|role| markdown_code_span(role))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        content.push('\n');
+    }
+
+    append_hover_repository_metadata_line(content, index, file_symbols, symbol);
+    append_hover_attribute_metadata_lines(content, symbol);
+}
+
+fn append_hover_repository_metadata_line(
+    content: &mut String,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+) {
+    let owner_fqn = hover_symbol_type_owner_fqn(symbol);
+    let mut seen = std::collections::HashSet::new();
+    let repositories = symbol
+        .template_bindings
+        .iter()
+        .filter(|binding| binding.kind == php_lsp_types::TemplateBindingKind::RepositoryClass)
+        .filter_map(|binding| {
+            if seen.insert(normalized_hover_relation_target(&binding.target)) {
+                Some(hover_type_info_markdown(
+                    index,
+                    file_symbols,
+                    owner_fqn,
+                    &symbol.uri,
+                    &php_lsp_types::TypeInfo::Simple(binding.target.clone()),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if repositories.is_empty() {
+        return;
+    }
+
+    content.push('\n');
+    content.push_str("**Repository:** ");
+    content.push_str(&repositories.join(", "));
+    content.push('\n');
+}
+
+fn append_hover_attribute_metadata_lines(content: &mut String, symbol: &php_lsp_types::SymbolInfo) {
+    let attributes = hover_display_attributes(symbol);
+    if attributes.is_empty() {
+        return;
+    }
+
+    content.push_str("\n**Attributes:**\n\n");
+    for attribute in attributes {
+        content.push_str("- ");
+        content.push_str(&markdown_code_span(&attribute.text));
+        content.push('\n');
+    }
+}
+
+fn hover_display_attributes(
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Vec<&php_lsp_types::SymbolAttribute> {
+    symbol
+        .attributes
+        .iter()
+        .filter(|attribute| !hover_attribute_is_internal(&attribute.text))
+        .collect()
+}
+
+fn hover_attribute_is_internal(text: &str) -> bool {
+    hover_attribute_has_leaf_name(text, "PhpStormStubsElementAvailable")
+        || hover_attribute_has_leaf_name(text, "PhpStormStubsAttributeAvailable")
+}
+
+fn hover_framework_roles(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Vec<&'static str> {
+    let relation_fqns = hover_symbol_relation_fqns(index, symbol);
+    let mut roles = Vec::new();
+
+    if hover_symbol_has_any_attribute_fqn(
+        file_symbols,
+        symbol,
+        &[
+            "Doctrine\\ORM\\Mapping\\Entity",
+            "Doctrine\\ORM\\Mapping\\Embeddable",
+            "Doctrine\\ORM\\Mapping\\MappedSuperclass",
+        ],
+    ) {
+        roles.push("Entity");
+    }
+    if hover_symbol_has_any_attribute_fqn(
+        file_symbols,
+        symbol,
+        &["Symfony\\Component\\Routing\\Attribute\\Route"],
+    ) {
+        if matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Method) {
+            roles.push("Controller action");
+        } else if hover_symbol_is_class_like(symbol) {
+            roles.push("Controller");
+        }
+    }
+    if matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Property)
+        && hover_symbol_has_any_attribute_fqn(
+            file_symbols,
+            symbol,
+            &[
+                "Doctrine\\ORM\\Mapping\\OneToMany",
+                "Doctrine\\ORM\\Mapping\\ManyToOne",
+                "Doctrine\\ORM\\Mapping\\OneToOne",
+                "Doctrine\\ORM\\Mapping\\ManyToMany",
+            ],
+        )
+    {
+        roles.push("Doctrine association");
+    }
+    if matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Property)
+        && hover_symbol_has_any_attribute_fqn(
+            file_symbols,
+            symbol,
+            &[
+                "Doctrine\\ORM\\Mapping\\Column",
+                "Doctrine\\ORM\\Mapping\\Id",
+                "Doctrine\\ORM\\Mapping\\GeneratedValue",
+            ],
+        )
+    {
+        roles.push("Doctrine field");
+    }
+    if hover_symbol_is_class_like(symbol)
+        && hover_any_fqn_matches_exact(
+            &relation_fqns,
+            &[
+                "Doctrine\\Bundle\\DoctrineBundle\\Repository\\ServiceEntityRepository",
+                "Doctrine\\ORM\\EntityRepository",
+            ],
+        )
+    {
+        roles.push("Repository");
+    }
+    if hover_symbol_is_class_like(symbol)
+        && hover_any_fqn_matches_exact(
+            &relation_fqns,
+            &["Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController"],
+        )
+    {
+        roles.push("Controller");
+    }
+    if hover_symbol_is_class_like(symbol)
+        && hover_any_fqn_matches_exact(&relation_fqns, &["Symfony\\Component\\Form\\AbstractType"])
+    {
+        roles.push("FormType");
+    }
+    if hover_symbol_is_class_like(symbol)
+        && hover_symbol_has_any_attribute_fqn(
+            file_symbols,
+            symbol,
+            &[
+                "Symfony\\Component\\DependencyInjection\\Attribute\\AsAlias",
+                "Symfony\\Component\\DependencyInjection\\Attribute\\AsDecorator",
+                "Symfony\\Component\\DependencyInjection\\Attribute\\AsTaggedItem",
+                "Symfony\\Component\\DependencyInjection\\Attribute\\Autoconfigure",
+                "Symfony\\Component\\DependencyInjection\\Attribute\\AutoconfigureTag",
+                "Symfony\\Component\\DependencyInjection\\Attribute\\Autowire",
+                "Symfony\\Component\\DependencyInjection\\Attribute\\AutowireDecorated",
+                "Symfony\\Contracts\\Service\\Attribute\\Required",
+            ],
+        )
+    {
+        roles.push("Service");
+    }
+
+    roles.sort_unstable();
+    roles.dedup();
+    roles
+}
+
+fn hover_symbol_relation_fqns(
+    index: &WorkspaceIndex,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Vec<String> {
+    let mut fqns = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push_fqn = |fqn: &str| {
+        let normalized = normalized_hover_relation_target(fqn);
+        if !normalized.is_empty() && seen.insert(normalized) {
+            fqns.push(fqn.trim_start_matches('\\').to_string());
+        }
+    };
+
+    push_fqn(&symbol.fqn);
+    for fqn in symbol
+        .extends
+        .iter()
+        .chain(symbol.implements.iter())
+        .chain(symbol.traits.iter())
+    {
+        push_fqn(fqn);
+    }
+
+    let hierarchy_root = if hover_symbol_is_class_like(symbol) {
+        Some(symbol.fqn.as_str())
+    } else {
+        symbol.parent_fqn.as_deref()
+    };
+
+    if let Some(root_fqn) = hierarchy_root {
+        for hierarchy_symbol in index.get_type_hierarchy_symbols(root_fqn) {
+            push_fqn(&hierarchy_symbol.fqn);
+            for fqn in hierarchy_symbol
+                .extends
+                .iter()
+                .chain(hierarchy_symbol.implements.iter())
+                .chain(hierarchy_symbol.traits.iter())
+            {
+                push_fqn(fqn);
+            }
+        }
+    }
+
+    fqns
+}
+
+fn hover_symbol_is_class_like(symbol: &php_lsp_types::SymbolInfo) -> bool {
+    matches!(
+        symbol.kind,
+        php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum
+    )
+}
+
+fn hover_any_fqn_matches_exact(fqns: &[String], expected_fqns: &[&str]) -> bool {
+    fqns.iter().any(|fqn| {
+        let normalized = normalized_hover_relation_target(fqn);
+        expected_fqns
+            .iter()
+            .any(|expected| normalized == normalized_hover_relation_target(expected))
+    })
+}
+
+fn hover_symbol_has_any_attribute_fqn(
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+    expected_fqns: &[&str],
+) -> bool {
+    symbol.attributes.iter().any(|attribute| {
+        hover_attribute_group_names(&attribute.text)
+            .iter()
+            .map(|name| hover_resolve_attribute_name(file_symbols, symbol, name))
+            .any(|fqn| {
+                expected_fqns.iter().any(|expected| {
+                    normalized_hover_relation_target(&fqn)
+                        == normalized_hover_relation_target(expected)
+                })
+            })
+    })
+}
+
+fn hover_resolve_attribute_name(
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+    attribute_name: &str,
+) -> String {
+    let attribute_name = attribute_name.trim();
+    if attribute_name.starts_with('\\') {
+        return attribute_name.trim_start_matches('\\').to_string();
+    }
+
+    let (head, tail) = attribute_name
+        .split_once('\\')
+        .map_or((attribute_name, ""), |(head, tail)| (head, tail));
+    if let Some(import_fqn) = hover_file_class_import_fqn(file_symbols, symbol, head) {
+        if tail.is_empty() {
+            return import_fqn;
+        }
+        return format!("{import_fqn}\\{tail}");
+    }
+
+    if let Some(namespace) = hover_symbol_namespace(symbol) {
+        return format!("{namespace}\\{attribute_name}");
+    }
+
+    attribute_name.to_string()
+}
+
+fn hover_symbol_namespace(symbol: &php_lsp_types::SymbolInfo) -> Option<&str> {
+    let owner = symbol.parent_fqn.as_deref().unwrap_or(&symbol.fqn);
+    owner
+        .rsplit_once('\\')
+        .map(|(namespace, _)| namespace)
+        .filter(|namespace| !namespace.is_empty())
+}
+
+fn hover_file_class_import_fqn(
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+    alias: &str,
+) -> Option<String> {
+    file_symbols
+        .use_statements
+        .iter()
+        .filter(|use_statement| use_statement.kind == php_lsp_types::UseKind::Class)
+        .filter(|use_statement| {
+            use_statement.namespace.as_deref() == hover_symbol_namespace(symbol)
+        })
+        .filter(|use_statement| use_statement.range.0 <= symbol.range.0)
+        .filter(|use_statement| {
+            let import_alias = use_statement
+                .alias
+                .as_deref()
+                .or_else(|| use_statement.fqn.rsplit('\\').next())
+                .unwrap_or(use_statement.fqn.as_str());
+            import_alias.eq_ignore_ascii_case(alias)
+        })
+        .max_by_key(|use_statement| use_statement.range)
+        .map(|use_statement| use_statement.fqn.trim_start_matches('\\').to_string())
+}
+
+fn hover_attribute_name_matches(attribute_name: &str, leaf_name: &str) -> bool {
+    attribute_name
+        .trim_start_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or(attribute_name)
+        .eq_ignore_ascii_case(leaf_name)
+}
+
+fn hover_attribute_has_leaf_name(text: &str, leaf_name: &str) -> bool {
+    hover_attribute_group_names(text)
+        .iter()
+        .any(|name| hover_attribute_name_matches(name, leaf_name))
+}
+
+fn hover_attribute_group_names(text: &str) -> Vec<String> {
+    let mut remaining = text.trim_start();
+    let mut names = Vec::new();
+
+    if let Some(stripped) = remaining.strip_prefix("#[") {
+        remaining = stripped;
+    }
+    if let Some(stripped) = remaining.strip_suffix(']') {
+        remaining = stripped;
+    }
+
+    let mut part_start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut quote = None;
+    let mut escape = false;
+
+    for (idx, ch) in remaining.char_indices() {
+        if let Some(active_quote) = quote {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ',' if paren_depth == 0 && bracket_depth == 0 => {
+                if let Some(name) =
+                    hover_attribute_name_from_group_part(&remaining[part_start..idx])
+                {
+                    names.push(name);
+                }
+                part_start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(name) = hover_attribute_name_from_group_part(&remaining[part_start..]) {
+        names.push(name);
+    }
+
+    names
+}
+
+fn hover_attribute_name_from_group_part(part: &str) -> Option<String> {
+    let part = part.trim_start();
+    let mut end = 0usize;
+    for (idx, ch) in part.char_indices() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\\') {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    (end > 0).then(|| part[..end].to_string())
 }
 
 fn append_hover_relation_and_template_lines(

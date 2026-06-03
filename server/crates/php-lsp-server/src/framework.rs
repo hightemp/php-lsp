@@ -2626,6 +2626,7 @@ mod tests {
             selection_range: (0, 0, 0, 0),
             visibility: php_lsp_types::Visibility::Public,
             modifiers: php_lsp_types::SymbolModifiers::default(),
+            attributes: Vec::new(),
             doc_comment: None,
             signature: None,
             parent_fqn: None,

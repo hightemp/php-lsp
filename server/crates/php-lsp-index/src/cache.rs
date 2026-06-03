@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// bytes. The cache schema fixture test below guards the representative binary
 /// shape so CI fails until this version and its fingerprint are updated
 /// together.
-pub const CACHE_SCHEMA_VERSION: u32 = 18;
+pub const CACHE_SCHEMA_VERSION: u32 = 20;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -642,9 +642,9 @@ mod tests {
     };
     use std::io::Write;
 
-    const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 18;
-    const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3187;
-    const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x72d0_eca8_e36d_7745;
+    const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 20;
+    const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3263;
+    const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x4da2_f324_127f_8758;
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -667,6 +667,7 @@ mod tests {
             selection_range: (0, 6, 0, 9),
             visibility: Visibility::Public,
             modifiers: SymbolModifiers::default(),
+            attributes: vec![],
             doc_comment: None,
             signature: None,
             parent_fqn: None,
@@ -695,6 +696,7 @@ mod tests {
                 is_deprecated: true,
                 is_builtin: false,
             },
+            attributes: vec![],
             doc_comment: Some("/** @template T of object */".to_string()),
             signature: Some(Signature {
                 params: vec![ParamInfo {
@@ -765,18 +767,21 @@ mod tests {
                             fqn: "Vendor\\Package\\Thing".to_string(),
                             alias: Some("ThingAlias".to_string()),
                             kind: UseKind::Class,
+                            namespace: Some("App".to_string()),
                             range: (0, 5, 0, 32),
                         },
                         UseStatement {
                             fqn: "Vendor\\Package\\helper".to_string(),
                             alias: None,
                             kind: UseKind::Function,
+                            namespace: Some("App".to_string()),
                             range: (1, 5, 1, 40),
                         },
                         UseStatement {
                             fqn: "Vendor\\Package\\APP_CONST".to_string(),
                             alias: Some("APP_CONST_ALIAS".to_string()),
                             kind: UseKind::Constant,
+                            namespace: Some("App".to_string()),
                             range: (2, 5, 2, 44),
                         },
                     ],

@@ -4722,6 +4722,7 @@ mod tests {
             selection_range: (12, 20, 12, 29),
             visibility: php_lsp_types::Visibility::Public,
             modifiers: php_lsp_types::SymbolModifiers::default(),
+            attributes: Vec::new(),
             doc_comment: Some(comment.to_string()),
             signature: None,
             parent_fqn: Some("App\\Repository\\MessageLogRepository".to_string()),

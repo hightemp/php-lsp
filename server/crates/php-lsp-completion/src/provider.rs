@@ -933,6 +933,7 @@ mod tests {
                 is_static,
                 ..Default::default()
             },
+            attributes: vec![],
             doc_comment: None,
             signature: if matches!(kind, PhpSymbolKind::Method | PhpSymbolKind::Function) {
                 Some(Signature {
@@ -999,6 +1000,7 @@ mod tests {
                 selection_range: (0, 6, 0, 17),
                 visibility: Visibility::Public,
                 modifiers: SymbolModifiers::default(),
+                attributes: vec![],
                 doc_comment: None,
                 signature: None,
                 parent_fqn: None,
@@ -1196,6 +1198,7 @@ mod tests {
                 selection_range: (0, 9, 0, 13),
                 visibility: Visibility::Public,
                 modifiers: SymbolModifiers::default(),
+                attributes: vec![],
                 doc_comment: None,
                 signature: Some(Signature {
                     params: vec![ParamInfo {
@@ -1244,6 +1247,7 @@ mod tests {
                     selection_range: (0, 6, 0, 9),
                     visibility: Visibility::Public,
                     modifiers: SymbolModifiers::default(),
+                    attributes: vec![],
                     doc_comment: None,
                     signature: None,
                     parent_fqn: None,
@@ -1262,6 +1266,7 @@ mod tests {
                     selection_range: (2, 13, 2, 17),
                     visibility: Visibility::Public,
                     modifiers: SymbolModifiers::default(),
+                    attributes: vec![],
                     doc_comment: None,
                     signature: Some(Signature {
                         params: vec![],
