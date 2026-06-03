@@ -415,6 +415,10 @@ Current evidence:
   now include scalar, array, mixed, untyped, nullable, defaulted, by-reference,
   variadic, and PHPDoc-refined parameters with descriptions and class links
   where resolvable.
+- `H-HOVER-LOCAL-DECLARATION-SOURCE-LINKS-2026-06-03` keeps indexed symbol hover
+  declarations source-like by moving FQNs out of the PHP code block and adding
+  linked `Symbol` and `Source` metadata for PHP, vendor-path, and mapped Twig
+  getter hovers.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

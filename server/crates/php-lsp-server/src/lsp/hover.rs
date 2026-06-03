@@ -216,6 +216,7 @@ impl PhpLspBackend {
 
             let parsed_phpdoc = sym.doc_comment.as_deref().map(parse_phpdoc);
 
+            append_hover_symbol_identity_line(&mut content, &sym);
             if let Some(parent_fqn) = sym.parent_fqn.as_deref() {
                 append_class_fqn_link_line(
                     &mut content,
@@ -225,6 +226,7 @@ impl PhpLspBackend {
                     parent_fqn,
                 );
             }
+            append_hover_symbol_source_line(&mut content, &sym);
 
             if let Some(ref sig) = sym.signature {
                 let phpdoc_params = parsed_phpdoc
@@ -482,10 +484,40 @@ fn append_hover_symbol_declaration(
     symbol: &php_lsp_types::SymbolInfo,
     kind_label: &str,
 ) {
+    match symbol.kind {
+        php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::Method => {
+            append_hover_callable_declaration(content, symbol, kind_label);
+        }
+        php_lsp_types::PhpSymbolKind::Property => {
+            append_hover_property_declaration(content, symbol);
+        }
+        php_lsp_types::PhpSymbolKind::ClassConstant => {
+            append_hover_class_constant_declaration(content, symbol);
+        }
+        php_lsp_types::PhpSymbolKind::GlobalConstant => {
+            append_hover_global_constant_declaration(content, symbol);
+        }
+        php_lsp_types::PhpSymbolKind::EnumCase => {
+            content.push_str("case ");
+            content.push_str(&symbol.name);
+        }
+        _ => {
+            content.push_str(&hover_symbol_prefix(symbol, kind_label));
+            content.push(' ');
+            content.push_str(&hover_source_like_symbol_name(symbol));
+        }
+    }
+}
+
+fn append_hover_callable_declaration(
+    content: &mut String,
+    symbol: &php_lsp_types::SymbolInfo,
+    kind_label: &str,
+) {
     if let Some(signature) = symbol.signature.as_ref() {
         content.push_str(&hover_signature_prefix(symbol, kind_label));
         content.push(' ');
-        content.push_str(&symbol.fqn);
+        content.push_str(&hover_source_like_symbol_name(symbol));
         if signature.params.is_empty() {
             content.push_str("()");
         } else {
@@ -509,7 +541,110 @@ fn append_hover_symbol_declaration(
 
     content.push_str(&hover_symbol_prefix(symbol, kind_label));
     content.push(' ');
-    content.push_str(&symbol.fqn);
+    content.push_str(&hover_source_like_symbol_name(symbol));
+}
+
+fn append_hover_property_declaration(content: &mut String, symbol: &php_lsp_types::SymbolInfo) {
+    content.push_str(&hover_member_prefix(symbol));
+    if let Some(type_info) = symbol
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.return_type.as_ref())
+    {
+        content.push(' ');
+        content.push_str(&type_info.to_string());
+    }
+    content.push(' ');
+    content.push('$');
+    content.push_str(symbol.name.trim_start_matches('$'));
+}
+
+fn append_hover_class_constant_declaration(
+    content: &mut String,
+    symbol: &php_lsp_types::SymbolInfo,
+) {
+    content.push_str(&hover_member_prefix(symbol));
+    content.push_str(" const ");
+    if let Some(type_info) = symbol
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.return_type.as_ref())
+    {
+        content.push_str(&type_info.to_string());
+        content.push(' ');
+    }
+    content.push_str(&symbol.name);
+}
+
+fn append_hover_global_constant_declaration(
+    content: &mut String,
+    symbol: &php_lsp_types::SymbolInfo,
+) {
+    content.push_str("const ");
+    if let Some(type_info) = symbol
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.return_type.as_ref())
+    {
+        content.push_str(&type_info.to_string());
+        content.push(' ');
+    }
+    content.push_str(&hover_source_like_symbol_name(symbol));
+}
+
+fn hover_source_like_symbol_name(symbol: &php_lsp_types::SymbolInfo) -> String {
+    match symbol.kind {
+        php_lsp_types::PhpSymbolKind::Method
+        | php_lsp_types::PhpSymbolKind::Property
+        | php_lsp_types::PhpSymbolKind::ClassConstant
+        | php_lsp_types::PhpSymbolKind::EnumCase
+        | php_lsp_types::PhpSymbolKind::Class
+        | php_lsp_types::PhpSymbolKind::Interface
+        | php_lsp_types::PhpSymbolKind::Trait
+        | php_lsp_types::PhpSymbolKind::Enum
+        | php_lsp_types::PhpSymbolKind::Function
+        | php_lsp_types::PhpSymbolKind::GlobalConstant => symbol.name.clone(),
+        php_lsp_types::PhpSymbolKind::Namespace => symbol.fqn.clone(),
+    }
+}
+
+fn hover_member_prefix(symbol: &php_lsp_types::SymbolInfo) -> String {
+    let mut parts = vec![hover_visibility_label(symbol.visibility)];
+    push_hover_member_modifiers(&mut parts, symbol);
+    parts.join(" ")
+}
+
+fn append_hover_symbol_identity_line(content: &mut String, symbol: &php_lsp_types::SymbolInfo) {
+    let destination = markdown_file_location_destination(symbol);
+    content.push('\n');
+    content.push_str("**Symbol:** ");
+    content.push_str(&format!(
+        "[{}](<{}>)",
+        markdown_code_span(&symbol.fqn),
+        destination
+    ));
+    content.push('\n');
+}
+
+fn append_hover_symbol_source_line(content: &mut String, symbol: &php_lsp_types::SymbolInfo) {
+    let destination = markdown_file_location_destination(symbol);
+    let source_label = hover_symbol_source_label(symbol);
+    content.push('\n');
+    content.push_str("**Source:** ");
+    content.push_str(&format!(
+        "[{}](<{}>)",
+        markdown_code_span(&source_label),
+        destination
+    ));
+    content.push('\n');
+}
+
+fn hover_symbol_source_label(symbol: &php_lsp_types::SymbolInfo) -> String {
+    let line = symbol.selection_range.0.saturating_add(1);
+    if let Some(path) = uri_to_path(&symbol.uri) {
+        return format!("{}:{line}", path.display());
+    }
+    format!("{}:{line}", symbol.uri)
 }
 
 fn hover_signature_prefix(symbol: &php_lsp_types::SymbolInfo, kind_label: &str) -> String {

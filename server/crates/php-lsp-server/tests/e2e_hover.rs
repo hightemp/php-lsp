@@ -30,16 +30,21 @@ async fn test_open_file_and_hover() {
 namespace App;
 
 class Greeter {
+    public string $prefix = 'Hello';
+
     /** Say hello to someone. */
     public function greet(string $name): string {
-        return "Hello, $name!";
+        return "$this->prefix, $name!";
     }
 }
 
 $g = new Greeter();
 $g->greet("World");
+$g->prefix;
 "#;
     let uri = "file:///test/Greeter.php";
+    let class_position = utf16_position_at(code, "Greeter();");
+    let property_position = utf16_position_at(code, "prefix;\n");
 
     service
         .ready()
@@ -54,24 +59,58 @@ $g->greet("World");
         .ready()
         .await
         .unwrap()
-        .call(hover_request(2, uri, 10, 12))
+        .call(hover_request(2, uri, class_position.0, class_position.1))
         .await
         .unwrap();
 
     let result = extract_result(resp);
-    // Result should contain hover content with "class" and "Greeter"
-    if !result.is_null() {
-        let contents = result
-            .get("contents")
-            .and_then(|c| c.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        assert!(
-            contents.contains("class") || contents.contains("Greeter"),
-            "hover should mention class or Greeter, got: {}",
-            contents
-        );
-    }
+    let contents = hover_markdown_value(&result);
+    assert!(
+        contents.contains("```php\nclass Greeter\n```"),
+        "class hover should use source-like local declaration, got: {}",
+        contents
+    );
+    assert!(
+        contents.contains("**Symbol:** [`App\\Greeter`](<file:///test/Greeter.php#L4>)"),
+        "class hover should expose linked FQN metadata, got: {}",
+        contents
+    );
+    assert!(
+        contents.contains("**Source:** [`/test/Greeter.php:4`](<file:///test/Greeter.php#L4>)"),
+        "class hover should expose clickable source metadata, got: {}",
+        contents
+    );
+
+    let property_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            3,
+            uri,
+            property_position.0,
+            property_position.1,
+        ))
+        .await
+        .unwrap();
+    let property_hover = hover_markdown_value(&extract_result(property_resp));
+    assert!(
+        property_hover.contains("```php\npublic string $prefix\n```"),
+        "property hover should use source-like local declaration, got: {}",
+        property_hover
+    );
+    assert!(
+        property_hover
+            .contains("**Symbol:** [`App\\Greeter::$prefix`](<file:///test/Greeter.php#L5>)"),
+        "property hover should expose linked FQN metadata, got: {}",
+        property_hover
+    );
+    assert!(
+        property_hover
+            .contains("**Source:** [`/test/Greeter.php:5`](<file:///test/Greeter.php#L5>)"),
+        "property hover should expose clickable source metadata, got: {}",
+        property_hover
+    );
 
     // Shutdown
     service
@@ -228,10 +267,29 @@ class Service {
     let hover = hover_markdown_value(&extract_result(hover));
 
     assert!(
+        hover.contains("```php\npublic function assign(\n    User $user\n): Response\n```"),
+        "expected source-like local method declaration, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(
+            "**Symbol:** [`App\\Service::assign`](<file:///test/hover-signature-class-links.php#L8>)"
+        ),
+        "expected linked FQN metadata in member hover, got: {}",
+        hover
+    );
+    assert!(
         hover.contains(
             "**Declared in:** [`App\\Service`](<file:///test/hover-signature-class-links.php#L7>)"
         ),
         "expected declaring class link in member hover, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(
+            "**Source:** [`/test/hover-signature-class-links.php:8`](<file:///test/hover-signature-class-links.php#L8>)"
+        ),
+        "expected clickable source metadata in member hover, got: {}",
         hover
     );
     assert!(
@@ -248,6 +306,119 @@ class Service {
         ),
         "expected return class link in signature hover, got: {}",
         hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_constant_declarations_use_source_like_metadata() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+const GLOBAL_LIMIT = 10;
+
+class Settings
+{
+    public const string MODE = 'safe';
+
+    public function read(): void
+    {
+        self::MODE;
+        GLOBAL_LIMIT;
+    }
+}
+"#;
+    let uri = "file:///test/hover-constants.php";
+    let mode_position = utf16_position_at(code, "MODE;");
+    let global_position = utf16_position_at(code, "GLOBAL_LIMIT;");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let mode_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, mode_position.0, mode_position.1))
+        .await
+        .unwrap();
+    let mode_hover = hover_markdown_value(&extract_result(mode_hover));
+    assert!(
+        mode_hover.contains("```php\npublic const MODE\n```"),
+        "class constant hover should use source-like declaration, got: {}",
+        mode_hover
+    );
+    assert!(
+        mode_hover
+            .contains("**Symbol:** [`App\\Settings::MODE`](<file:///test/hover-constants.php#L8>)"),
+        "class constant hover should expose linked FQN metadata, got: {}",
+        mode_hover
+    );
+    assert!(
+        mode_hover.contains(
+            "**Source:** [`/test/hover-constants.php:8`](<file:///test/hover-constants.php#L8>)"
+        ),
+        "class constant hover should expose clickable source metadata, got: {}",
+        mode_hover
+    );
+
+    let global_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, global_position.0, global_position.1))
+        .await
+        .unwrap();
+    let global_hover = hover_markdown_value(&extract_result(global_hover));
+    assert!(
+        global_hover.contains("```php\nconst GLOBAL_LIMIT\n```"),
+        "global constant hover should use source-like declaration, got: {}",
+        global_hover
+    );
+    assert!(
+        global_hover
+            .contains("**Symbol:** [`App\\GLOBAL_LIMIT`](<file:///test/hover-constants.php#L4>)"),
+        "global constant hover should expose linked FQN metadata, got: {}",
+        global_hover
+    );
+    assert!(
+        global_hover.contains(
+            "**Source:** [`/test/hover-constants.php:4`](<file:///test/hover-constants.php#L4>)"
+        ),
+        "global constant hover should expose clickable source metadata, got: {}",
+        global_hover
     );
 
     service
@@ -334,8 +505,27 @@ class Service {
     let hover = hover_markdown_value(&extract_result(hover));
 
     assert!(
-        hover.contains("```php\npublic function App\\Service::configure("),
+        hover.contains("```php\npublic function configure("),
         "expected PHP-highlighted multiline function signature, got: {}",
+        hover
+    );
+    assert!(
+        !hover.contains("public function App\\Service::configure("),
+        "method FQN should stay outside the code block, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(
+            "**Symbol:** [`App\\Service::configure`](<file:///test/hover-rich-parameters.php#L15>)"
+        ),
+        "expected linked FQN metadata in method hover, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(
+            "**Source:** [`/test/hover-rich-parameters.php:15`](<file:///test/hover-rich-parameters.php#L15>)"
+        ),
+        "expected clickable source metadata in method hover, got: {}",
         hover
     );
     assert!(
@@ -1532,8 +1722,23 @@ function parse(string $responseXml): void {
     );
     let method_hover = hover_markdown_value(&method_hover);
     assert!(
-        method_hover.contains("public function SimpleXMLElement::registerXPathNamespace"),
+        method_hover.contains("```php\npublic function registerXPathNamespace(")
+            && !method_hover.contains("public function SimpleXMLElement::registerXPathNamespace"),
         "expected method hover on SimpleXMLElement receiver, got: {}",
+        method_hover
+    );
+    assert!(
+        method_hover.contains(
+            "**Symbol:** [`SimpleXMLElement::registerXPathNamespace`](<file:///test/simplexml-inlay-hover.php#L10>)"
+        ),
+        "expected linked FQN metadata for SimpleXMLElement method hover, got: {}",
+        method_hover
+    );
+    assert!(
+        method_hover.contains(
+            "**Source:** [`/test/simplexml-inlay-hover.php:10`](<file:///test/simplexml-inlay-hover.php#L10>)"
+        ),
+        "expected clickable source metadata for SimpleXMLElement method hover, got: {}",
         method_hover
     );
 
@@ -1717,6 +1922,127 @@ function update(ReverseRequest $reverseRequest): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_source_line_for_vendor_path_symbol() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-hover-vendor-source-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    let vendor_dir = tmp_root.join("vendor/acme/package/src");
+    let src_dir = tmp_root.join("src");
+    fs::create_dir_all(&vendor_dir).unwrap();
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let vendor_path = vendor_dir.join("Library.php");
+    let app_path = src_dir.join("App.php");
+    let root_uri = php_lsp_types::uri::path_to_uri(&tmp_root).unwrap();
+    let vendor_uri = php_lsp_types::uri::path_to_uri(&vendor_path).unwrap();
+    let app_uri = php_lsp_types::uri::path_to_uri(&app_path).unwrap();
+
+    let vendor_php = r#"<?php
+namespace VendorPkg;
+
+class Library
+{
+    public function normalize(string $value): string { return trim($value); }
+}
+"#;
+    let app_php = r#"<?php
+namespace App;
+
+use VendorPkg\Library;
+
+function run(Library $library): void
+{
+    $library->normalize(' value ');
+}
+"#;
+    fs::write(&vendor_path, vendor_php).unwrap();
+    fs::write(&app_path, app_php).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&vendor_uri, vendor_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&app_uri, app_php))
+        .await
+        .unwrap();
+
+    let normalize_position = utf16_position_at(app_php, "normalize(");
+    let hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            &app_uri,
+            normalize_position.0,
+            normalize_position.1,
+        ))
+        .await
+        .unwrap();
+    let hover = hover_markdown_value(&extract_result(hover_response));
+
+    assert!(
+        hover.contains("```php\npublic function normalize(\n    string $value\n): string\n```"),
+        "vendor-path method hover should use source-like local declaration, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(&format!(
+            "**Symbol:** [`VendorPkg\\Library::normalize`](<{}#L6>)",
+            vendor_uri
+        )),
+        "vendor-path method hover should expose linked FQN metadata, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(&format!(
+            "**Source:** [`{}:6`](<{}#L6>)",
+            vendor_path.display(),
+            vendor_uri
+        )),
+        "vendor-path method hover should expose clickable vendor source metadata, got: {}",
+        hover
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_foreach_value_inlay_and_hover_from_doctrine_collection_target_entity() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -1884,9 +2210,20 @@ function update(Order $order): void {
     let sku_hover_result = extract_result(sku_hover_response);
     let sku_hover = hover_markdown_value(&sku_hover_result);
     assert!(
-        sku_hover.contains("public function App\\Entity\\OrderItem::sku")
+        sku_hover.contains("```php\npublic function sku(): string")
+            && !sku_hover.contains("public function App\\Entity\\OrderItem::sku")
             && sku_hover.contains(": string"),
         "expected method hover from Doctrine targetEntity foreach receiver, got: {}",
+        sku_hover
+    );
+    assert!(
+        sku_hover.contains("**Symbol:** [`App\\Entity\\OrderItem::sku`]"),
+        "expected linked FQN metadata for Doctrine targetEntity method hover, got: {}",
+        sku_hover
+    );
+    assert!(
+        sku_hover.contains("**Source:**") && sku_hover.contains("src/Entity/Order.php:9"),
+        "expected clickable source metadata for Doctrine targetEntity method hover, got: {}",
         sku_hover
     );
 
@@ -1905,9 +2242,15 @@ function update(Order $order): void {
     let get_status_hover_result = extract_result(get_status_hover_response);
     let get_status_hover = hover_markdown_value(&get_status_hover_result);
     assert!(
-        get_status_hover.contains("public function App\\Entity\\OrderItem::getStatus")
+        get_status_hover.contains("```php\npublic function getStatus(): ?OrderStatus")
+            && !get_status_hover.contains("public function App\\Entity\\OrderItem::getStatus")
             && get_status_hover.contains("?OrderStatus"),
         "expected nullable method hover from Doctrine targetEntity foreach receiver, got: {}",
+        get_status_hover
+    );
+    assert!(
+        get_status_hover.contains("**Symbol:** [`App\\Entity\\OrderItem::getStatus`]"),
+        "expected linked FQN metadata for nullable method hover, got: {}",
         get_status_hover
     );
 

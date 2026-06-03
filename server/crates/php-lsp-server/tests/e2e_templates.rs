@@ -365,6 +365,7 @@ class User
 {
     public string $name = '';
     public function getName(): string { return $this->name; }
+    public function getDisplayName(): string { return 'Visible Name'; }
 }
 "#;
     let controller_php = r#"<?php
@@ -385,9 +386,10 @@ final class DashboardController
 "#;
     let complete_marker = "/*complete*/";
     let template_marker = "/*template*/";
+    let accessor_marker = "/*accessor*/";
     let twig_with_markers = format!(
-        "🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད <h1>{{{{- user.name -}}}}</h1>\n{{%- for item in users -%}}\n  {{{{- item.get{} -}}}}\n{{%- endfor -%}}\n{{%- include 'shared/_card.html.twig{}' -%}}\n",
-        complete_marker, template_marker
+        "🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ é བོད <h1>{{{{- user.name -}}}}</h1>\n<p>{{{{ user.display{}Name }}}}</p>\n{{%- for item in users -%}}\n  {{{{- item.get{} -}}}}\n{{%- endfor -%}}\n{{%- include 'shared/_card.html.twig{}' -%}}\n",
+        accessor_marker, complete_marker, template_marker
     );
     let marker_position = |marker: &str| -> (u32, u32) {
         let marker_offset = twig_with_markers
@@ -396,15 +398,18 @@ final class DashboardController
         let mut prefix = twig_with_markers[..marker_offset].to_string();
         prefix = prefix.replace(complete_marker, "");
         prefix = prefix.replace(template_marker, "");
+        prefix = prefix.replace(accessor_marker, "");
         let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
         let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
         (line, prefix[line_start..].encode_utf16().count() as u32)
     };
     let (completion_line, completion_character) = marker_position(complete_marker);
     let (template_line, template_character) = marker_position(template_marker);
+    let (accessor_line, accessor_character) = marker_position(accessor_marker);
     let twig = twig_with_markers
         .replace(complete_marker, "")
-        .replace(template_marker, "");
+        .replace(template_marker, "")
+        .replace(accessor_marker, "");
     let hover_position = utf16_position_at(&twig, "user.name");
     let definition_position = utf16_position_after(&twig, "user.n");
 
@@ -473,12 +478,49 @@ final class DashboardController
         hover
     );
 
+    let accessor_hover_resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            3,
+            &twig_uri,
+            accessor_line,
+            accessor_character,
+        ))
+        .await
+        .unwrap();
+    let accessor_hover = extract_result(accessor_hover_resp);
+    let accessor_hover_text = hover_markdown_value(&accessor_hover);
+    assert!(
+        accessor_hover_text.contains("```php\npublic function getDisplayName(): string\n```"),
+        "expected Twig property accessor hover to use local getter declaration, got: {}",
+        accessor_hover_text
+    );
+    assert!(
+        accessor_hover_text.contains(&format!(
+            "**Symbol:** [`App\\Entity\\User::getDisplayName`](<{}#L8>)",
+            user_uri
+        )),
+        "expected Twig property accessor hover to expose linked FQN metadata, got: {}",
+        accessor_hover_text
+    );
+    assert!(
+        accessor_hover_text.contains(&format!(
+            "**Source:** [`{}:8`](<{}#L8>)",
+            user_path.display(),
+            user_uri
+        )),
+        "expected Twig property accessor hover to expose clickable source metadata, got: {}",
+        accessor_hover_text
+    );
+
     let definition_resp = service
         .ready()
         .await
         .unwrap()
         .call(definition_request(
-            3,
+            4,
             &twig_uri,
             definition_position.0,
             definition_position.1,
@@ -497,7 +539,7 @@ final class DashboardController
         .await
         .unwrap()
         .call(completion_request(
-            4,
+            5,
             &twig_uri,
             completion_line,
             completion_character,
@@ -521,7 +563,7 @@ final class DashboardController
         .await
         .unwrap()
         .call(completion_request(
-            5,
+            6,
             &twig_uri,
             template_line,
             template_character,
@@ -547,7 +589,7 @@ final class DashboardController
         .await
         .unwrap()
         .call(definition_request(
-            6,
+            7,
             &twig_uri,
             template_line,
             template_character,
@@ -566,13 +608,13 @@ final class DashboardController
         .ready()
         .await
         .unwrap()
-        .call(semantic_tokens_full_request(7, &twig_uri))
+        .call(semantic_tokens_full_request(8, &twig_uri))
         .await
         .unwrap();
     let tokens = decode_semantic_tokens(&extract_result(tokens_resp));
     assert!(
         tokens.iter().any(|(line, start, len, token_type, _)| {
-            (*line, *start, *len, *token_type) == (1, 4, 3, 11)
+            (*line, *start, *len, *token_type) == (2, 4, 3, 11)
         }),
         "expected Twig for keyword semantic token, got: {:?}",
         tokens
@@ -2855,8 +2897,11 @@ final class DebtSuspensionController
     let id_hover = extract_result(id_hover_resp);
     let id_hover_text = id_hover["contents"]["value"].as_str().unwrap_or_default();
     assert!(
-        id_hover_text.contains("getId") || id_hover_text.contains("property"),
-        "expected Twig messageLog.id hover to resolve property/getter, got: {}",
+        id_hover_text.contains("```php\nprivate int $id\n```")
+            && id_hover_text.contains("**Symbol:** [`App\\Entity\\MessageLog::$id`]")
+            && id_hover_text.contains("**Source:**")
+            && id_hover_text.contains("MessageLog.php:6"),
+        "expected Twig messageLog.id hover to resolve property with source metadata, got: {}",
         id_hover
     );
 

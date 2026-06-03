@@ -56,10 +56,10 @@ phpstorm-stubs support.
 - Test-friendly diagnostics for common PHPUnit patterns, including assertion
   helpers, test doubles, trait-based test helpers, anonymous classes, and
   closure/destructuring variable scopes.
-- Hover for symbols, PHP-like signatures, complete parameter lists, types,
-  variables, PHPDoc summaries/descriptions, deprecation, and PHPDoc virtual
-  members, with clickable class links in type sections where the target can be
-  resolved.
+- Hover for symbols, source-like PHP signatures, linked FQN/source metadata,
+  complete parameter lists, types, variables, PHPDoc summaries/descriptions,
+  deprecation, and PHPDoc virtual members, with clickable class links in type
+  sections where the target can be resolved.
 - Completion for classes, interfaces, traits, enums, functions, constants,
   methods, properties, variables, namespaces, keywords, snippets, PHPDoc virtual
   members, shape keys/properties, framework string keys, template paths, and

@@ -4634,12 +4634,22 @@ change.
   - Gap: current hover code block still uses the indexed FQN in the declaration line, while PhpStorm presents a source-like local declaration and keeps FQN/source context outside the signature.
   - Result: created follow-up tasks below instead of mixing broad hover metadata work into the already completed Markdown/signature task.
 
-- [ ] **H-HOVER-LOCAL-DECLARATION-SOURCE-LINKS-2026-06-03** Сделать declaration block ближе к исходному PHP и добавить source/FQN metadata
+- [x] **H-HOVER-LOCAL-DECLARATION-SOURCE-LINKS-2026-06-03** Сделать declaration block ближе к исходному PHP и добавить source/FQN metadata *(completed 2026-06-03)*
   - Render code-block declarations in a source-like form: `public function show(...)`, `private function handle...(...)`, `class DataRequest`, not `public function App\Controller\Foo::show(...)`.
   - Keep fully qualified owner/name outside the code block as linked metadata, so navigation stays available without making the signature noisy.
   - Add a stable `Source` line with clickable file/line for every indexed class/function/method/property/constant hover when the target URI/range is known.
   - Preserve existing class links in `Declared in`, `Parameters`, `Returns`, `Type`, and local-variable hover.
   - Add e2e coverage for class, method, property, vendor stub, and Twig-property-accessor hover output.
+  - Implemented: indexed hover declarations now use local source-like names in the PHP code block while `Symbol` metadata links the full FQN to the declaration range.
+  - Implemented: indexed symbol hover now emits clickable `Source` metadata from `SymbolInfo.selection_range` without request-time source reads.
+  - Implemented: property and constant hovers render source-like declarations instead of treating type signatures as callables.
+  - Tests: added/updated e2e coverage for class hover, method hover, property hover, class/global constant hover, vendor-path method hover, SimpleXML-style stub hover, Doctrine/Twig getter-backed hovers, and source/FQN metadata.
+  - Docs: updated README, LSP feature matrix, architecture ownership notes, and production risk register.
+  - Validation: `cargo test -p php-lsp-server --test e2e_hover -- --nocapture` passed.
+  - Validation: `cargo test -p php-lsp-server --test e2e_templates -- --nocapture` passed.
+  - Validation: `cargo test -p php-lsp-server --tests` passed.
+  - Validation: `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+  - Validation: Verifier rerun reported no findings after constant coverage was added.
 
 - [ ] **H-HOVER-CLASS-RELATIONS-AND-TEMPLATES-2026-06-03** Показывать в hover class/interface relations, traits, templates и generic bindings
   - Use existing `SymbolInfo.extends`, `implements`, `traits`, `templates`, and `template_bindings` instead of reparsing source ad hoc.
