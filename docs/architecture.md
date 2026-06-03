@@ -373,7 +373,12 @@ Blade support covers escaped/raw echo blocks and common `@if`, `@foreach`,
 `@isset`, and `@empty` directives. Twig support is a separate language path for
 `.twig` / `.html.twig` files and covers `{{ expr }}`, `{% if %}`,
 `{% for item in items %}`, `{% set name = expr %}`, common structural tags, and
-static include/extends/embed path lookup.
+static include/extends/embed path lookup. Definition also has a direct
+original-source fallback for literal Twig template paths that exist under
+`templates/`, including ordinary HTML attribute values, and for Symfony
+`path()` / `url()` route keys. Route definitions use the same framework
+string-key cache and scan PHP 8 `#[Route(..., name: ...)]` attributes without
+booting Symfony.
 
 Twig expression conversion is intentionally conservative. Simple variable,
 literal, operator, dot-member, and object method-call expressions can be mapped

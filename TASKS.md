@@ -4576,12 +4576,18 @@ change.
   - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
   - Validation: Verifier follow-up reported no remaining issues.
 
-- [ ] **H-TWIG-TEMPLATE-PATH-AND-ROUTE-DEFINITION-2026-06-02** Расширить Twig definition для template paths и route keys
+- [x] **H-TWIG-TEMPLATE-PATH-AND-ROUTE-DEFINITION-2026-06-02** Расширить Twig definition для template paths и route keys *(completed 2026-06-03)*
   - `extends 'base.html.twig'` should jump to `templates/base.html.twig` in `debug/*.html.twig` and `registration/register.html.twig`.
   - `{% include 'email/inbound/_porting_header.html.twig' %}` in inbound email templates should jump to `templates/email/inbound/_porting_header.html.twig`.
   - Static Twig path string `debug/email.html.twig:110` `email/timer_expired.html.twig` should jump to `templates/email/timer_expired.html.twig`.
   - `path('app_debug_*')` in debug templates should jump to corresponding `DebugController` routes.
   - `components/subscriber_autocomplete.html.twig:15-16` route keys `app_bdpn_subscriber_api_search` and `app_bdpn_subscriber_new` should jump to `SubscriberController` routes.
+  - Implemented: Twig definition now resolves existing static template-path literals from original template source, including include/extends tags and HTML attribute values.
+  - Implemented: Symfony route string keys are provided from PHP 8 `#[Route(..., name: ...)]` attributes and Twig `path()` / `url()` route arguments jump to those source ranges.
+  - Tests: added unit coverage for Twig direct string-key detection and Symfony route attribute scanning, plus e2e coverage for template paths and route keys matching the BDPn debug/subscriber cases.
+  - Docs: updated README, LSP feature matrix, architecture notes, and production risk register.
+  - Validation: `cargo test -p php-lsp-server string_key -- --nocapture`, `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`, `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
+  - Validation: Verifier reported no blockers or remaining remarks.
 
 - [ ] **H-TWIG-BDPN-EMAIL-DEBUG-CONTEXT-2026-06-02** Инферить Twig context для email/debug templates из controller/service render arrays
   - `email/outbound/data_response.html.twig:26` `number` should have useful hover from `EmailNotifier` context.

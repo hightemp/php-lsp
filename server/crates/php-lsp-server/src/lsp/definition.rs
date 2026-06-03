@@ -321,6 +321,39 @@ impl PhpLspBackend {
                     .await
                     .map(GotoDefinitionResponse::Scalar));
             }
+            let original_source = template.original_source();
+            let original_byte_col =
+                utf16_col_to_byte(original_source, original_pos.line, original_pos.character);
+            if let Some(path_context) = twig_static_template_path_context_at_position(
+                original_source,
+                original_pos.line,
+                original_byte_col,
+            ) {
+                if let Some(location) = self
+                    .twig_template_location(&uri_str, &path_context.key)
+                    .await
+                {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                }
+            }
+            if let Some(route_context) = twig_route_key_context_at_position(
+                original_source,
+                original_pos.line,
+                original_byte_col,
+            ) {
+                let file_symbols = php_lsp_types::FileSymbols::default();
+                if let Some(location) = self
+                    .framework_string_key_location(
+                        &uri_str,
+                        &file_symbols,
+                        original_source,
+                        &route_context,
+                    )
+                    .await
+                {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                }
+            }
         }
         let pos = if let Some(template) = &template_document {
             match template.map_original_position_to_virtual(original_pos) {

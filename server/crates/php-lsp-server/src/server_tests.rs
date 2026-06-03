@@ -423,6 +423,42 @@ fn test_framework_string_key_context_detection() {
 }
 
 #[test]
+fn test_twig_direct_string_key_context_detection() {
+    let source = "<input value=\"email/timer_expired.html.twig\">\n{{ path('app_debug_email') }}\n{{ url('app_debug_logs', {level: 'error'}) }}\n";
+    let position = |needle: &str| -> (u32, u32) {
+        let offset = source.find(needle).expect("needle should exist");
+        let line = source[..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32;
+        let line_start = source[..offset].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        (line, (offset - line_start) as u32)
+    };
+
+    let (line, byte_col) = position("email/timer_expired");
+    let template_context = twig_static_template_path_context_at_position(source, line, byte_col)
+        .expect("static HTML template string should be detected");
+    assert_eq!(template_context.domain, "twig");
+    assert_eq!(template_context.key, "email/timer_expired.html.twig");
+    assert!(
+        twig_route_key_context_at_position(source, line, byte_col).is_none(),
+        "HTML string values should not be treated as route keys"
+    );
+
+    let (line, byte_col) = position("app_debug_email");
+    let route_context = twig_route_key_context_at_position(source, line, byte_col)
+        .expect("Twig path() route key should be detected");
+    assert_eq!(route_context.domain, "route");
+    assert_eq!(route_context.key, "app_debug_email");
+
+    let (line, byte_col) = position("app_debug_logs");
+    let url_context = twig_route_key_context_at_position(source, line, byte_col)
+        .expect("Twig url() route key should be detected");
+    assert_eq!(url_context.domain, "route");
+    assert_eq!(url_context.key, "app_debug_logs");
+}
+
+#[test]
 fn test_phpdoc_extra_markdown_sections_include_virtual_members() {
     let phpdoc = parse_phpdoc(
             "/**\n * @property-read string $slug Service slug\n * @method User owner()\n * @throws \\RuntimeException\n */",

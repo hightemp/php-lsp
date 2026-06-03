@@ -1,0 +1,6 @@
+[semantic-search-mcp]
+command = "uvx"
+args = ["semantic-search-mcp"]
+enabled = true
+startup_timeout_sec = 20
+tool_timeout_sec = 60

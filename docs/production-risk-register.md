@@ -395,6 +395,11 @@ Current evidence:
   Hover, completion, definition, and inlay hints now cover `app.current_route`,
   `app.user.*`, `error.messageKey`, form errors, `form.field`, and included
   component values such as `form_field.vars.id` without booting Symfony.
+- `H-TWIG-TEMPLATE-PATH-AND-ROUTE-DEFINITION-2026-06-02` extends Twig
+  definition for template-path literals and Symfony route keys. Existing
+  template files under `templates/` are resolved from tag strings and static
+  HTML attribute values, while `path()` / `url()` route names jump to PHP 8
+  `#[Route(name: ...)]` attributes through the framework string-key cache.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

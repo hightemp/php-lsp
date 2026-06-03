@@ -42,8 +42,8 @@ phpstorm-stubs support.
 - Closure and arrow-function parameter inference from `callable(...)`
   signatures, including generic map/filter-style collection callbacks and
   `array_map`-style helpers.
-- Framework-aware static providers for common Laravel string keys and Symfony
-  Twig template names without booting the application.
+- Framework-aware static providers for common Laravel string keys, Symfony
+  Twig template names, and Symfony route names without booting the application.
 - Blade-like and Symfony/Twig template documents use virtual PHP plus source
   maps for conservative hover, completion, definition, inlay hints,
   diagnostics, and semantic tokens in supported template expressions and
@@ -74,7 +74,7 @@ phpstorm-stubs support.
 
 - Go to definition for indexed symbols, local variables, `$this`, constructors,
   PHPDoc virtual members, PHPDoc/literal shape keys, static framework string
-  keys, template paths, and lazy vendor fallback.
+  keys, template paths, Symfony Twig route keys, and lazy vendor fallback.
 - Go to declaration for imports, with definition fallback.
 - Go to type definition for inferred variables, members, function returns, and
   indexed symbol types.
@@ -216,6 +216,9 @@ phpstorm-stubs support.
   member chains and root variables inside those expressions can still be
   source-mapped for hover/completion/definition. Twig object completion also
   offers getter-derived property-style labels such as `id` for `getId()`.
+  Definition can still navigate static Twig template-path literals that exist
+  under `templates/`, including HTML attribute values, and Symfony `path()` /
+  `url()` route keys backed by PHP 8 `#[Route(name: ...)]` attributes.
   Twig `foreach` over Doctrine entity collections exposed through
   property-style access can infer item hover/completion/definition/inlay types
   from indexed ORM `targetEntity` property metadata and `add*/remove*`

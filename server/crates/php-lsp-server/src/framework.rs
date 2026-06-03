@@ -505,8 +505,7 @@ impl FrameworkProviderCache {
 
 static DOCTRINE_REPOSITORY_PROVIDER: DoctrineRepositoryProvider = DoctrineRepositoryProvider;
 static SYMFONY_CONTROLLER_PROVIDER: SymfonyControllerProvider = SymfonyControllerProvider;
-static SYMFONY_TWIG_STRING_KEY_PROVIDER: SymfonyTwigStringKeyProvider =
-    SymfonyTwigStringKeyProvider;
+static SYMFONY_STRING_KEY_PROVIDER: SymfonyStringKeyProvider = SymfonyStringKeyProvider;
 static LARAVEL_ELOQUENT_PROVIDER: LaravelEloquentProvider = LaravelEloquentProvider;
 static LARAVEL_STRING_KEY_PROVIDER: LaravelStringKeyProvider = LaravelStringKeyProvider;
 
@@ -514,7 +513,7 @@ pub(crate) fn default_framework_provider_registry() -> FrameworkProviderRegistry
     FrameworkProviderRegistry::new(vec![
         &DOCTRINE_REPOSITORY_PROVIDER,
         &SYMFONY_CONTROLLER_PROVIDER,
-        &SYMFONY_TWIG_STRING_KEY_PROVIDER,
+        &SYMFONY_STRING_KEY_PROVIDER,
         &LARAVEL_ELOQUENT_PROVIDER,
         &LARAVEL_STRING_KEY_PROVIDER,
     ])
@@ -608,11 +607,11 @@ impl VirtualMemberProvider for SymfonyControllerProvider {
     }
 }
 
-struct SymfonyTwigStringKeyProvider;
+struct SymfonyStringKeyProvider;
 
-impl VirtualMemberProvider for SymfonyTwigStringKeyProvider {
+impl VirtualMemberProvider for SymfonyStringKeyProvider {
     fn id(&self) -> &'static str {
-        "symfony.twig"
+        "symfony.string-keys"
     }
 
     fn priority(&self) -> u16 {
@@ -632,9 +631,6 @@ impl VirtualMemberProvider for SymfonyTwigStringKeyProvider {
         ctx: &FrameworkProviderContext<'_>,
         query: &FrameworkStringKeyQuery,
     ) -> Vec<FrameworkStringKey> {
-        if query.domain != "twig" {
-            return Vec::new();
-        }
         let Some(root) = ctx.workspace_root else {
             return Vec::new();
         };
@@ -642,7 +638,11 @@ impl VirtualMemberProvider for SymfonyTwigStringKeyProvider {
             return Vec::new();
         }
 
-        let mut keys = collect_symfony_twig_template_keys(self.id(), root, &query.prefix);
+        let mut keys = match query.domain.as_str() {
+            "twig" => collect_symfony_twig_template_keys(self.id(), root, &query.prefix),
+            "route" => collect_symfony_route_keys(self.id(), root, &query.prefix),
+            _ => Vec::new(),
+        };
         keys.sort_by(|left, right| left.key.cmp(&right.key));
         keys
     }
@@ -2136,6 +2136,35 @@ fn collect_symfony_twig_template_keys(
     keys
 }
 
+fn collect_symfony_route_keys(
+    provider_id: &'static str,
+    root: &Path,
+    prefix: &str,
+) -> Vec<FrameworkStringKey> {
+    let src_dir = root.join("src");
+    let mut keys = Vec::new();
+    for path in collect_static_files(&src_dir, &["php"], 4096) {
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(uri) = path_to_file_uri(&path) else {
+            continue;
+        };
+        for parsed in parse_symfony_route_attribute_names(&source) {
+            if parsed.key.starts_with(prefix) {
+                keys.push(framework_string_key(
+                    provider_id,
+                    parsed.key,
+                    "Symfony route name",
+                    uri.clone(),
+                    parsed.range,
+                ));
+            }
+        }
+    }
+    keys
+}
+
 fn framework_string_key(
     provider_id: &'static str,
     key: String,
@@ -2274,6 +2303,109 @@ fn parse_named_call_string_args(source: &str, call_name: &str) -> Vec<StaticStri
         index = name_start + needle.len();
     }
     keys
+}
+
+fn parse_symfony_route_attribute_names(source: &str) -> Vec<StaticStringKey> {
+    let mut keys = Vec::new();
+    let mut index = 0usize;
+    while let Some(relative) = source[index..].find("#[") {
+        let group_start = index + relative;
+        let bracket_start = group_start + 1;
+        let Some(group_end) = find_matching_delimiter(source, bracket_start, '[', ']') else {
+            break;
+        };
+        parse_symfony_route_attribute_group(source, bracket_start + 1, group_end, &mut keys);
+        index = group_end + 1;
+    }
+    keys
+}
+
+fn parse_symfony_route_attribute_group(
+    source: &str,
+    start: usize,
+    end: usize,
+    keys: &mut Vec<StaticStringKey>,
+) {
+    let mut index = start;
+    while index < end {
+        let Some(relative) = source[index..end].find("Route") else {
+            break;
+        };
+        let name_start = index + relative;
+        if !attribute_name_boundary_before(source, name_start) {
+            index = name_start + "Route".len();
+            continue;
+        }
+        let after_name = skip_ascii_ws(source, name_start + "Route".len());
+        if after_name >= end || source.as_bytes().get(after_name) != Some(&b'(') {
+            index = name_start + "Route".len();
+            continue;
+        }
+        let Some(args_end) = find_matching_delimiter(source, after_name, '(', ')') else {
+            break;
+        };
+        if args_end <= end {
+            if let Some(key) = parse_named_string_argument(source, after_name + 1, args_end, "name")
+            {
+                keys.push(key);
+            }
+        }
+        index = args_end.saturating_add(1);
+    }
+}
+
+fn parse_named_string_argument(
+    source: &str,
+    start: usize,
+    end: usize,
+    argument_name: &str,
+) -> Option<StaticStringKey> {
+    let mut index = start;
+    while index < end {
+        let Some(relative) = source[index..end].find(argument_name) else {
+            break;
+        };
+        let name_start = index + relative;
+        let name_end = name_start + argument_name.len();
+        if !identifier_boundary(source, name_start, name_end) {
+            index = name_end;
+            continue;
+        }
+        let separator = skip_ascii_ws(source, name_end);
+        if separator >= end || source.as_bytes().get(separator) != Some(&b':') {
+            index = name_end;
+            continue;
+        }
+        let value_start = skip_ascii_ws(source, separator + 1);
+        let (value, quote_start, quote_end) = next_quoted_string(source, value_start)?;
+        if quote_start >= end || quote_start != value_start {
+            return None;
+        }
+        return Some(StaticStringKey {
+            key: value,
+            range: range_for_offsets(source, quote_start + 1, quote_end.saturating_sub(1)),
+        });
+    }
+    None
+}
+
+fn attribute_name_boundary_before(source: &str, start: usize) -> bool {
+    source
+        .get(..start)
+        .and_then(|prefix| prefix.chars().next_back())
+        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+}
+
+fn identifier_boundary(source: &str, start: usize, end: usize) -> bool {
+    let before_ok = source
+        .get(..start)
+        .and_then(|prefix| prefix.chars().next_back())
+        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+    let after_ok = source
+        .get(end..)
+        .and_then(|suffix| suffix.chars().next())
+        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+    before_ok && after_ok
 }
 
 fn php_key_from_relative_path(path: &Path) -> Option<String> {
@@ -3141,6 +3273,70 @@ class User extends Model
                 },
             )
             .is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn symfony_string_key_provider_scans_route_attributes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "php-lsp-symfony-string-keys-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src/Controller")).unwrap();
+        fs::create_dir_all(tmp.join("templates")).unwrap();
+        fs::write(
+            tmp.join("src/Controller/DebugController.php"),
+            r#"<?php
+namespace App\Controller;
+
+use Symfony\Component\Routing\Attribute\Route;
+
+class DebugController
+{
+    #[Route('/debug/email', name: 'app_debug_email', methods: ['GET', 'POST'])]
+    public function email(): void {}
+
+    #[\Symfony\Component\Routing\Attribute\Route(
+        path: '/debug/logs',
+        name: 'app_debug_logs',
+        methods: ['GET']
+    )]
+    public function logs(): void {}
+}
+"#,
+        )
+        .unwrap();
+
+        let index = WorkspaceIndex::new();
+        let ctx = FrameworkProviderContext::new(&index).with_workspace(Some(tmp.as_path()), None);
+        let registry = default_framework_provider_registry();
+
+        let routes = registry.string_keys(
+            &ctx,
+            &FrameworkStringKeyQuery {
+                domain: "route".to_string(),
+                prefix: "app_debug_".to_string(),
+            },
+        );
+
+        assert!(
+            routes.iter().any(|key| key.key == "app_debug_email"),
+            "Symfony route attributes should expose route names: {:?}",
+            routes
+        );
+        let logs = routes
+            .iter()
+            .find(|key| key.key == "app_debug_logs")
+            .expect("multiline route attribute should be exposed");
+        assert!(
+            logs.sources
+                .iter()
+                .any(|source| matches!(source, VirtualMemberSource::SourceRange { .. })),
+            "route keys should retain source ranges: {:?}",
+            logs
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

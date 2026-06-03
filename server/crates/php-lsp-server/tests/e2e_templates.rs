@@ -5046,6 +5046,244 @@ async fn test_twig_template_reports_twig_syntax_diagnostics() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_definition_resolves_template_paths_and_symfony_routes() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-template-route-definition-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/debug")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/email/inbound")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/email")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/registration")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates/components")).unwrap();
+
+    let root_uri = php_lsp_types::uri::path_to_uri(&tmp_root).unwrap();
+    let debug_controller_path = tmp_root.join("src/Controller/DebugController.php");
+    let subscriber_controller_path = tmp_root.join("src/Controller/SubscriberController.php");
+    let base_path = tmp_root.join("templates/base.html.twig");
+    let debug_twig_path = tmp_root.join("templates/debug/email.html.twig");
+    let registration_twig_path = tmp_root.join("templates/registration/register.html.twig");
+    let header_path = tmp_root.join("templates/email/inbound/_porting_header.html.twig");
+    let timer_path = tmp_root.join("templates/email/timer_expired.html.twig");
+    let component_path = tmp_root.join("templates/components/subscriber_autocomplete.html.twig");
+
+    let debug_controller = r#"<?php
+namespace App\Controller;
+
+use Symfony\Component\Routing\Attribute\Route;
+
+class DebugController
+{
+    #[Route('/debug/email', name: 'app_debug_email', methods: ['GET', 'POST'])]
+    public function email(): void {}
+
+    #[Route(
+        path: '/debug/logs',
+        name: 'app_debug_logs',
+        methods: ['GET']
+    )]
+    public function logs(): void {}
+}
+"#;
+    let subscriber_controller = r#"<?php
+namespace App\Controller;
+
+use Symfony\Component\Routing\Attribute\Route;
+
+class SubscriberController
+{
+    #[Route('/api/subscribers/search', name: 'app_bdpn_subscriber_api_search', methods: ['GET'])]
+    public function search(): void {}
+
+    #[Route('/subscriber/new', name: 'app_bdpn_subscriber_new', methods: ['GET', 'POST'])]
+    public function new(): void {}
+}
+"#;
+    let debug_twig = concat!(
+        "{% extends 'base.html.twig' %}\n",
+        "{% include 'email/inbound/_porting_header.html.twig' %}\n",
+        "<input class=\"form-control\" name=\"template\" value=\"email/timer_expired.html.twig\">\n",
+        "{{ path('app_debug_email') }}\n",
+        "{{ url('app_debug_logs') }}\n",
+    );
+    let registration_twig = "{% extends 'base.html.twig' %}\n";
+    let component_twig = concat!(
+        "{% set search_url = search_url|default(path('app_bdpn_subscriber_api_search')) %}\n",
+        "{% set create_url = create_url|default(path('app_bdpn_subscriber_new')) %}\n",
+    );
+
+    fs::write(&debug_controller_path, debug_controller).unwrap();
+    fs::write(&subscriber_controller_path, subscriber_controller).unwrap();
+    fs::write(&base_path, "<main>{% block body %}{% endblock %}</main>\n").unwrap();
+    fs::write(&debug_twig_path, debug_twig).unwrap();
+    fs::write(&registration_twig_path, registration_twig).unwrap();
+    fs::write(&header_path, "<header>Inbound</header>\n").unwrap();
+    fs::write(&timer_path, "<p>Timer expired</p>\n").unwrap();
+    fs::write(&component_path, component_twig).unwrap();
+
+    let debug_twig_uri = php_lsp_types::uri::path_to_uri(&debug_twig_path).unwrap();
+    let registration_twig_uri = php_lsp_types::uri::path_to_uri(&registration_twig_path).unwrap();
+    let component_uri = php_lsp_types::uri::path_to_uri(&component_path).unwrap();
+    let debug_controller_uri = php_lsp_types::uri::path_to_uri(&debug_controller_path).unwrap();
+    let subscriber_controller_uri =
+        php_lsp_types::uri::path_to_uri(&subscriber_controller_path).unwrap();
+    let base_uri = php_lsp_types::uri::path_to_uri(&base_path).unwrap();
+    let header_uri = php_lsp_types::uri::path_to_uri(&header_path).unwrap();
+    let timer_uri = php_lsp_types::uri::path_to_uri(&timer_path).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    for (uri, source) in [
+        (debug_twig_uri.as_str(), debug_twig),
+        (registration_twig_uri.as_str(), registration_twig),
+        (component_uri.as_str(), component_twig),
+    ] {
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification_with_language(uri, "twig", source))
+            .await
+            .unwrap();
+    }
+
+    for (request_id, uri, source, needle, expected_uri) in [
+        (
+            2,
+            debug_twig_uri.as_str(),
+            debug_twig,
+            "base.html.twig",
+            base_uri.as_str(),
+        ),
+        (
+            3,
+            registration_twig_uri.as_str(),
+            registration_twig,
+            "base.html.twig",
+            base_uri.as_str(),
+        ),
+        (
+            4,
+            debug_twig_uri.as_str(),
+            debug_twig,
+            "email/inbound/_porting_header.html.twig",
+            header_uri.as_str(),
+        ),
+        (
+            5,
+            debug_twig_uri.as_str(),
+            debug_twig,
+            "email/timer_expired.html.twig",
+            timer_uri.as_str(),
+        ),
+    ] {
+        let (line, character) = utf16_position_at(source, needle);
+        let definition = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(definition_request(request_id, uri, line, character))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            definition.get("uri").and_then(|value| value.as_str()),
+            Some(expected_uri),
+            "expected Twig template path `{needle}` to resolve `{expected_uri}`, got: {}",
+            definition
+        );
+    }
+
+    for (request_id, uri, source, needle, expected_uri, expected_source) in [
+        (
+            6,
+            debug_twig_uri.as_str(),
+            debug_twig,
+            "app_debug_email",
+            debug_controller_uri.as_str(),
+            debug_controller,
+        ),
+        (
+            7,
+            debug_twig_uri.as_str(),
+            debug_twig,
+            "app_debug_logs",
+            debug_controller_uri.as_str(),
+            debug_controller,
+        ),
+        (
+            8,
+            component_uri.as_str(),
+            component_twig,
+            "app_bdpn_subscriber_api_search",
+            subscriber_controller_uri.as_str(),
+            subscriber_controller,
+        ),
+        (
+            9,
+            component_uri.as_str(),
+            component_twig,
+            "app_bdpn_subscriber_new",
+            subscriber_controller_uri.as_str(),
+            subscriber_controller,
+        ),
+    ] {
+        let (line, character) = utf16_position_at(source, needle);
+        let definition = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(definition_request(request_id, uri, line, character))
+                .await
+                .unwrap(),
+        );
+        let expected_line = utf16_position_at(expected_source, needle).0;
+        assert_eq!(
+            definition.get("uri").and_then(|value| value.as_str()),
+            Some(expected_uri),
+            "expected Twig route key `{needle}` to resolve `{expected_uri}`, got: {}",
+            definition
+        );
+        assert_eq!(
+            definition["range"]["start"]["line"].as_u64(),
+            Some(expected_line as u64),
+            "expected route key `{needle}` to jump to the source route name range, got: {}",
+            definition
+        );
+    }
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_twig_complex_expressions_are_best_effort_and_quiet() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();

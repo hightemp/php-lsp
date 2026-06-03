@@ -593,6 +593,72 @@ pub(in crate::server) fn framework_string_key_context_at_position(
     })
 }
 
+pub(in crate::server) fn twig_static_template_path_context_at_position(
+    source: &str,
+    line: u32,
+    byte_col: u32,
+) -> Option<FrameworkStringKeyAtPosition> {
+    let offset = line_col_to_byte_offset(source, line, byte_col)?;
+    let bounds = string_literal_bounds_at_offset(source, offset)?;
+    let prefix = source.get(bounds.content_start..offset)?.to_string();
+    let key = source
+        .get(bounds.content_start..bounds.content_end)
+        .unwrap_or(prefix.as_str())
+        .to_string();
+    Some(FrameworkStringKeyAtPosition {
+        domain: "twig",
+        prefix,
+        key,
+    })
+}
+
+pub(in crate::server) fn twig_route_key_context_at_position(
+    source: &str,
+    line: u32,
+    byte_col: u32,
+) -> Option<FrameworkStringKeyAtPosition> {
+    let offset = line_col_to_byte_offset(source, line, byte_col)?;
+    let bounds = string_literal_bounds_at_offset(source, offset)?;
+    let (expression_start, expression_end) =
+        twig_delimiter_bounds_containing(source, bounds.quote_start)?;
+    if bounds.content_end > expression_end {
+        return None;
+    }
+
+    let open_paren = previous_non_ws_char(source, bounds.quote_start)?;
+    if open_paren < expression_start || source.as_bytes().get(open_paren).copied()? != b'(' {
+        return None;
+    }
+    if !source
+        .get(open_paren + 1..bounds.quote_start)?
+        .trim()
+        .is_empty()
+    {
+        return None;
+    }
+
+    let name_end = previous_non_ws_char(source, open_paren)?;
+    if name_end < expression_start {
+        return None;
+    }
+    let name_start = scan_identifier_start(source, name_end + 1).max(expression_start);
+    let name = source.get(name_start..=name_end)?;
+    if !matches!(name, "path" | "url") {
+        return None;
+    }
+
+    let prefix = source.get(bounds.content_start..offset)?.to_string();
+    let key = source
+        .get(bounds.content_start..bounds.content_end)
+        .unwrap_or(prefix.as_str())
+        .to_string();
+    Some(FrameworkStringKeyAtPosition {
+        domain: "route",
+        prefix,
+        key,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::server) struct StringLiteralBounds {
     quote_start: usize,
@@ -637,6 +703,40 @@ pub(in crate::server) fn string_literal_bounds_at_offset(
         content_start,
         content_end,
     })
+}
+
+fn twig_delimiter_bounds_containing(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let before = source.get(..offset)?;
+    let echo_open = before.rfind("{{").map(|idx| (idx, "}}"));
+    let tag_open = before.rfind("{%").map(|idx| (idx, "%}"));
+    let (open, close_token) = match (echo_open, tag_open) {
+        (Some(left), Some(right)) => {
+            if left.0 > right.0 {
+                left
+            } else {
+                right
+            }
+        }
+        (Some(open), None) | (None, Some(open)) => open,
+        (None, None) => return None,
+    };
+
+    let last_echo_close = before.rfind("}}");
+    let last_tag_close = before.rfind("%}");
+    let last_close = match (last_echo_close, last_tag_close) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(close), None) | (None, Some(close)) => Some(close),
+        (None, None) => None,
+    };
+    if last_close.is_some_and(|close| close > open) {
+        return None;
+    }
+
+    let close = source
+        .get(offset..)?
+        .find(close_token)
+        .map(|relative| offset + relative)?;
+    Some((open + 2, close))
 }
 
 pub(in crate::server) fn find_unescaped_quote(
