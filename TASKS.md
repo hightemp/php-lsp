@@ -4627,3 +4627,50 @@ change.
   - Docs: updated README, LSP feature matrix, architecture ownership notes, and production risk register.
   - Validation: `cargo test -p php-lsp-server --test e2e_hover -- --nocapture`, `cargo test -p php-lsp-server --tests`, `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
   - Validation: Verifier reported no findings and reran the focused hover parameter/class-link checks.
+
+- [x] **H-HOVER-PHPSTORM-GAP-AUDIT-2026-06-03** Сравнить текущий hover с hover PhpStorm на скриншотах и разложить оставшиеся улучшения *(completed 2026-06-03)*
+  - Baseline: `H-HOVER-PHPSTORM-LIKE-MARKDOWN-2026-06-03` already covers PHP-like signatures, PHPDoc summaries, complete signature parameter lists, return/type links, deprecated markers, and virtual `@method` parameter rendering.
+  - Gap: PhpStorm hover also shows richer symbol metadata: framework role (`Entity`, repository, controller), attributes such as `#[Route]` and Doctrine metadata, `Implements`, `Templates`, source location, and call-site-specialized generic return types.
+  - Gap: current hover code block still uses the indexed FQN in the declaration line, while PhpStorm presents a source-like local declaration and keeps FQN/source context outside the signature.
+  - Result: created follow-up tasks below instead of mixing broad hover metadata work into the already completed Markdown/signature task.
+
+- [ ] **H-HOVER-LOCAL-DECLARATION-SOURCE-LINKS-2026-06-03** Сделать declaration block ближе к исходному PHP и добавить source/FQN metadata
+  - Render code-block declarations in a source-like form: `public function show(...)`, `private function handle...(...)`, `class DataRequest`, not `public function App\Controller\Foo::show(...)`.
+  - Keep fully qualified owner/name outside the code block as linked metadata, so navigation stays available without making the signature noisy.
+  - Add a stable `Source` line with clickable file/line for every indexed class/function/method/property/constant hover when the target URI/range is known.
+  - Preserve existing class links in `Declared in`, `Parameters`, `Returns`, `Type`, and local-variable hover.
+  - Add e2e coverage for class, method, property, vendor stub, and Twig-property-accessor hover output.
+
+- [ ] **H-HOVER-CLASS-RELATIONS-AND-TEMPLATES-2026-06-03** Показывать в hover class/interface relations, traits, templates и generic bindings
+  - Use existing `SymbolInfo.extends`, `implements`, `traits`, `templates`, and `template_bindings` instead of reparsing source ad hoc.
+  - Add linked sections matching the useful PhpStorm parts: `Extends`, `Implements`, `Uses`, `Templates`, and generic bindings from `@extends`, `@implements`, `@use`, `@mixin`.
+  - Render template bounds and variance where available, e.g. `T of object`, covariant/contravariant template params.
+  - Avoid duplicate lines when native `implements` and PHPDoc `@implements` point to the same target.
+  - Add e2e coverage for Doctrine repository generics and ordinary PHP interfaces/traits.
+
+- [ ] **H-HOVER-FRAMEWORK-ROLES-AND-ATTRIBUTES-2026-06-03** Добавить framework-aware role/attribute sections для Symfony и Doctrine hover
+  - Show concise role metadata similar to PhpStorm, for example `Entity`, `Repository`, `Controller`, `FormType`, `Service`, when inferred from attributes, inheritance, implemented interfaces, or framework provider metadata.
+  - Surface relevant PHP attributes above classes/methods/properties in hover, including `#[Route(...)]`, Doctrine `#[Entity(...)]`, `#[Table(...)]`, `#[Index(...)]`, ORM association attributes, and repository class metadata.
+  - Store or expose attribute text/ranges through parser/index metadata instead of adding blocking source reads in async hover paths.
+  - Use existing Doctrine/Symfony helpers where possible and keep matching generic enough to avoid BDPn-specific hardcode.
+  - Add parser/index tests for attribute extraction plus e2e hover tests for Symfony controller action and Doctrine entity hover.
+
+- [ ] **H-HOVER-METHOD-IMPLEMENTS-OVERRIDES-2026-06-03** Показывать method-level implements/overrides links в hover
+  - For interface implementations and inherited method overrides, add linked `Implements` / `Overrides` lines like PhpStorm shows for `ObjectManager::getRepository`.
+  - Prefer exact hierarchy resolution from `WorkspaceIndex`; avoid expensive full-workspace scans in the hover hot path.
+  - Handle vendor stubs and project classes consistently, including inherited Doctrine/Symfony methods.
+  - Add e2e coverage for a class implementing an interface method, a child overriding a parent method, and a vendor-interface implementation.
+
+- [ ] **H-HOVER-CALLSITE-GENERIC-SPECIALIZATION-2026-06-03** Специализировать hover generic methods по receiver/call-site context
+  - When hovering a generic method call such as `$this->em->getRepository(ReverseRequest::class)->findOneBy(...)`, show a call-site-specific return type such as `ReverseRequest|null` alongside the declared generic/stub type.
+  - Reuse existing type inference used by completion/inlay/definition so hover, autocomplete, and diagnostics agree.
+  - Preserve the original declaration link/source, but add a clear `Resolved returns` or equivalent section for the concrete call-site type.
+  - Cover Doctrine `EntityManagerInterface::getRepository<T>()`, `EntityRepository<T>::find/findOneBy/findBy`, and non-Doctrine generic fixtures.
+  - Add e2e tests that would fail if hover falls back to only `object|null` or `EntityRepository<T>`.
+
+- [ ] **H-HOVER-MARKDOWN-READABILITY-POLISH-2026-06-03** Довести визуальную структуру Markdown hover до устойчивого читаемого формата
+  - Normalize section order across indexed symbols, virtual PHPDoc members, framework virtual members, local variables, and Twig shape members.
+  - Prefer short labels and compact sections: declaration, role/relations, parameters, returns/type, docs, source.
+  - Avoid duplicate `Returns` when native return type and PHPDoc `@return` are equivalent; keep both only when PHPDoc refines native `mixed`/`object`/generic types.
+  - Make long parameter lists and array-shape/generic types readable without relying on VS Code wrapping quirks.
+  - Add snapshot-style e2e assertions for representative hover Markdown blocks.
