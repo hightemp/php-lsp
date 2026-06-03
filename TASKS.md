@@ -4698,12 +4698,18 @@ change.
   - Validation: `cargo test --all`, `cargo test -p php-lsp-server --test e2e_hover -- --nocapture`, `cargo clippy --all-targets --all -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
   - Validation: Verifier rerun reported no blocking findings.
 
-- [ ] **H-HOVER-CALLSITE-GENERIC-SPECIALIZATION-2026-06-03** Специализировать hover generic methods по receiver/call-site context
+- [x] **H-HOVER-CALLSITE-GENERIC-SPECIALIZATION-2026-06-03** Специализировать hover generic methods по receiver/call-site context *(completed 2026-06-03)*
   - When hovering a generic method call such as `$this->em->getRepository(ReverseRequest::class)->findOneBy(...)`, show a call-site-specific return type such as `ReverseRequest|null` alongside the declared generic/stub type.
   - Reuse existing type inference used by completion/inlay/definition so hover, autocomplete, and diagnostics agree.
   - Preserve the original declaration link/source, but add a clear `Resolved returns` or equivalent section for the concrete call-site type.
   - Cover Doctrine `EntityManagerInterface::getRepository<T>()`, `EntityRepository<T>::find/findOneBy/findBy`, and non-Doctrine generic fixtures.
   - Add e2e tests that would fail if hover falls back to only `object|null` or `EntityRepository<T>`.
+  - Implemented: hover now detects call expressions at the hovered function/method name and reuses the existing indexed call expression type resolver to append a concrete `Resolved returns` section when it refines the declared/PHPDoc return type.
+  - Implemented: Doctrine `getRepository(Entity::class)` and chained repository `find`/`findOneBy`/`findBy` hovers show concrete entity/repository return types with class links, without project-specific hardcode in `hover.rs`.
+  - Tests: added e2e coverage for non-Doctrine `class-string<T>` and conditional generic calls, plus Doctrine `getRepository`, `find`, `findOneBy`, and `findBy` hover specialization.
+  - Docs: updated README, LSP feature matrix, architecture notes, and production risk register for call-site-specialized hover returns.
+  - Validation: `cargo test -p php-lsp-server --test e2e_hover test_hover_callsite_ -- --nocapture`, `cargo test -p php-lsp-server --test e2e_hover -- --nocapture`, `cargo test --all`, `cargo clippy --all-targets --all -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+  - Validation: Verifier rerun after TASKS closure reported no blocking findings.
 
 - [ ] **H-HOVER-MARKDOWN-READABILITY-POLISH-2026-06-03** Довести визуальную структуру Markdown hover до устойчивого читаемого формата
   - Normalize section order across indexed symbols, virtual PHPDoc members, framework virtual members, local variables, and Twig shape members.

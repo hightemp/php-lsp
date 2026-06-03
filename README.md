@@ -36,7 +36,8 @@ phpstorm-stubs support.
   and collection patterns.
 - Call-site inference for PHPStan/Psalm conditional return types and
   `class-string<T>` factory/service-locator patterns in hover, completion
-  chains, and local variable type inlay hints.
+  chains, local variable type inlay hints, and Doctrine
+  `getRepository<T>()` / repository `find*` hovers.
 - Shape-aware inference for PHPDoc `array{...}` / `object{...}` and literal
   array shapes in completion and key navigation.
 - Closure and arrow-function parameter inference from `callable(...)`
@@ -60,8 +61,8 @@ phpstorm-stubs support.
   class and method-level relation links, template/generic bindings,
   Symfony/Doctrine framework roles, indexed PHP 8 attributes, complete parameter
   lists, types, variables, PHPDoc summaries/descriptions, deprecation, and
-  PHPDoc virtual members, with clickable class links in type sections where the
-  target can be resolved.
+  PHPDoc virtual members, plus call-site-specialized generic return sections
+  with clickable class links where the target can be resolved.
 - Completion for classes, interfaces, traits, enums, functions, constants,
   methods, properties, variables, namespaces, keywords, snippets, PHPDoc virtual
   members, shape keys/properties, framework string keys, template paths, and
@@ -199,10 +200,10 @@ phpstorm-stubs support.
   references and rename are local-scope oriented.
 - Type inference includes common PHPDoc generic inheritance bindings,
   `class-string<T>` call-site bindings, conditional return fallbacks, and
-  class/file-scoped PHPStan/Psalm type aliases, callback parameter inference,
-  `Generator<TKey,TValue>` foreach key/value inference, and best-effort
-  PHPDoc/literal shapes, but it is still shallow compared with mature PHP
-  static analyzers.
+  Doctrine repository call-site bindings, class/file-scoped PHPStan/Psalm type
+  aliases, callback parameter inference, `Generator<TKey,TValue>` foreach
+  key/value inference, and best-effort PHPDoc/literal shapes, but it is still
+  shallow compared with mature PHP static analyzers.
 - Built-in semantic diagnostics depend on indexed project and vendor symbols.
   If Composer/vendor metadata is absent, external framework classes can be
   reported as unknown; dynamic framework APIs such as some Eloquent relation

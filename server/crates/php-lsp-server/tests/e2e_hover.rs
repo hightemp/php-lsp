@@ -781,6 +781,296 @@ function run(EntityManager $em): void
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_callsite_generic_resolved_returns() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class Widget {}
+
+class ServiceLocator
+{
+    /**
+     * @template T of object
+     * @param class-string<T> $class
+     * @return T
+     */
+    public function make($class) {}
+
+    /**
+     * @template T of object
+     * @param class-string<T>|string $class
+     * @return ($class is class-string<T> ? T : object)
+     */
+    public function conditional($class) {}
+}
+
+function run(ServiceLocator $locator): void
+{
+    $locator->make(Widget::class);
+    $locator->conditional(Widget::class);
+}
+"#;
+    let uri = "file:///test/hover-callsite-generic.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let make_position = utf16_position_at(code, "make(Widget");
+    let make_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, make_position.0, make_position.1))
+        .await
+        .unwrap();
+    let make_hover = hover_markdown_value(&extract_result(make_hover));
+
+    assert!(
+        make_hover.contains("**Resolved returns:**")
+            && make_hover.contains("[`App\\Widget`](<file:///test/hover-callsite-generic.php#L4>)"),
+        "expected generic class-string call hover to show concrete Widget return, got: {}",
+        make_hover
+    );
+
+    let conditional_position = utf16_position_at(code, "conditional(Widget");
+    let conditional_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            3,
+            uri,
+            conditional_position.0,
+            conditional_position.1,
+        ))
+        .await
+        .unwrap();
+    let conditional_hover = hover_markdown_value(&extract_result(conditional_hover));
+
+    assert!(
+        conditional_hover.contains("**Resolved returns:**")
+            && conditional_hover
+                .contains("[`App\\Widget`](<file:///test/hover-callsite-generic.php#L4>)"),
+        "expected conditional generic call hover to show concrete Widget return, got: {}",
+        conditional_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_callsite_doctrine_repository_resolved_returns() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace Doctrine\ORM {
+/**
+ * @template TEntity of object
+ */
+class EntityRepository
+{
+    /**
+     * @return TEntity|null
+     */
+    public function find($id): ?object {}
+
+    /**
+     * @return TEntity|null
+     */
+    public function findOneBy(array $criteria): ?object {}
+
+    /**
+     * @return list<TEntity>
+     */
+    public function findBy(array $criteria): array {}
+}
+}
+
+namespace Doctrine\Persistence {
+use Doctrine\ORM\EntityRepository;
+
+interface ObjectManager
+{
+    /**
+     * @template T of object
+     * @param class-string<T> $className
+     * @return EntityRepository<T>
+     */
+    public function getRepository(string $className): EntityRepository;
+}
+}
+
+namespace App\Entity {
+class RequestStatus {}
+}
+
+namespace App {
+use App\Entity\RequestStatus;
+use Doctrine\Persistence\ObjectManager;
+
+function run(ObjectManager $em): void
+{
+    $em->getRepository(RequestStatus::class)->find(123);
+    $em->getRepository(RequestStatus::class)->findOneBy(['name' => 'completed']);
+    $em->getRepository(RequestStatus::class)->findBy(['name' => 'completed']);
+}
+}
+"#;
+    let uri = "file:///test/hover-callsite-doctrine.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let repository_position = utf16_position_at(code, "getRepository(RequestStatus");
+    let repository_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            uri,
+            repository_position.0,
+            repository_position.1,
+        ))
+        .await
+        .unwrap();
+    let repository_hover = hover_markdown_value(&extract_result(repository_hover));
+
+    assert!(
+        repository_hover.contains("**Resolved returns:**")
+            && repository_hover.contains("EntityRepository<App\\Entity\\RequestStatus>")
+            && repository_hover.contains(
+                "[`App\\Entity\\RequestStatus`](<file:///test/hover-callsite-doctrine.php#L"
+            ),
+        "expected getRepository hover to show concrete EntityRepository<RequestStatus>, got: {}",
+        repository_hover
+    );
+
+    let find_position = utf16_position_at(code, "find(123");
+    let find_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, find_position.0, find_position.1))
+        .await
+        .unwrap();
+    let find_hover = hover_markdown_value(&extract_result(find_hover));
+
+    assert!(
+        find_hover.contains("**Resolved returns:**")
+            && find_hover.contains(
+                "[`App\\Entity\\RequestStatus`](<file:///test/hover-callsite-doctrine.php#L"
+            ),
+        "expected repository find hover to show concrete RequestStatus return, got: {}",
+        find_hover
+    );
+
+    let find_position = utf16_position_at(code, "findOneBy(['name'");
+    let find_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(4, uri, find_position.0, find_position.1))
+        .await
+        .unwrap();
+    let find_hover = hover_markdown_value(&extract_result(find_hover));
+
+    assert!(
+        find_hover.contains("**Resolved returns:**")
+            && find_hover.contains(
+                "[`App\\Entity\\RequestStatus`](<file:///test/hover-callsite-doctrine.php#L"
+            ),
+        "expected repository findOneBy hover to show concrete RequestStatus return, got: {}",
+        find_hover
+    );
+
+    let find_by_position = utf16_position_at(code, "findBy(['name'");
+    let find_by_hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            5,
+            uri,
+            find_by_position.0,
+            find_by_position.1,
+        ))
+        .await
+        .unwrap();
+    let find_by_hover = hover_markdown_value(&extract_result(find_by_hover));
+
+    assert!(
+        find_by_hover.contains("**Resolved returns:**")
+            && find_by_hover.contains("list<App\\Entity\\RequestStatus>")
+            && find_by_hover.contains(
+                "[`App\\Entity\\RequestStatus`](<file:///test/hover-callsite-doctrine.php#L"
+            ),
+        "expected repository findBy hover to show concrete list<RequestStatus> return, got: {}",
+        find_by_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_hover_doctrine_repository_extends_generic_binding() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

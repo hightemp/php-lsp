@@ -431,6 +431,12 @@ Current evidence:
   declarations/calls to exact indexed interface methods and inherited parent
   method overrides, including vendor-interface targets, without full workspace
   scans in the hover hot path.
+- `H-HOVER-CALLSITE-GENERIC-SPECIALIZATION-2026-06-03` reuses the existing
+  request-time call expression type resolver in hover, so generic
+  `class-string<T>` factories, conditional returns, Doctrine
+  `getRepository<T>()`, and repository `find`/`findOneBy`/`findBy` calls can
+  display concrete `Resolved returns` sections instead of only declared
+  `T`/`object`/`EntityRepository<T>` types.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

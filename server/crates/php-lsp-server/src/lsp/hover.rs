@@ -19,7 +19,14 @@ impl PhpLspBackend {
         tracing::debug!("hover: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position and local variable hover info inside a block so DashMap guard is dropped.
-        let (sym_at_pos, local_var_hover, shape_member_hover, file_symbols, source) = {
+        let (
+            sym_at_pos,
+            local_var_hover,
+            shape_member_hover,
+            call_site_return_type,
+            file_symbols,
+            source,
+        ) = {
             let parser = match self.open_files.get(&uri_str) {
                 Some(p) => p,
                 None => return Ok(None),
@@ -80,6 +87,8 @@ impl PhpLspBackend {
 
             let inferred_member_symbol = server_member_symbol_at_position(&ctx, pos.line, byte_col);
             let shape_member_hover = shape_member_access_info_at_position(&ctx, pos.line, byte_col);
+            let call_site_return_type =
+                hover_call_site_return_type_at_position(&ctx, pos.line, byte_col);
 
             // Find symbol at cursor position (with resolver for chains)
             let primary_sym_at_pos = symbol_at_position_with_request_cache(
@@ -127,6 +136,7 @@ impl PhpLspBackend {
                 sym_at_pos,
                 local_var_hover,
                 shape_member_hover,
+                call_site_return_type,
                 file_symbols,
                 source,
             )
@@ -266,6 +276,13 @@ impl PhpLspBackend {
                         ret,
                     );
                 }
+                append_hover_resolved_return_line(
+                    &mut content,
+                    &self.index,
+                    &hover_file_symbols,
+                    &sym,
+                    call_site_return_type.as_ref(),
+                );
             }
 
             // PHPDoc summary
@@ -668,6 +685,88 @@ fn hover_symbol_source_label(symbol: &php_lsp_types::SymbolInfo) -> String {
         return format!("{}:{line}", path.display());
     }
     format!("{}:{line}", symbol.uri)
+}
+
+fn hover_call_site_return_type_at_position(
+    ctx: &InlayHintContext<'_>,
+    line: u32,
+    byte_col: u32,
+) -> Option<IndexedExpressionTypeInfo> {
+    let point = tree_sitter::Point::new(line as usize, byte_col as usize);
+    let mut node = ctx
+        .tree
+        .root_node()
+        .descendant_for_point_range(point, point)?;
+    while !node.is_named() {
+        node = node.parent()?;
+    }
+
+    let point_range = (line, byte_col, line, byte_col);
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "function_call_expression"
+                | "member_call_expression"
+                | "nullsafe_member_call_expression"
+                | "scoped_call_expression"
+        ) {
+            if let Some(name_node) = call_target_name_node(candidate) {
+                if byte_range_contains(node_range_node(name_node), point_range) {
+                    return indexed_call_expression_type_info(ctx, candidate);
+                }
+            }
+        }
+        current = candidate.parent();
+    }
+
+    None
+}
+
+fn append_hover_resolved_return_line(
+    content: &mut String,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+    call_site_return_type: Option<&IndexedExpressionTypeInfo>,
+) {
+    let Some(info) = call_site_return_type else {
+        return;
+    };
+    if !hover_resolved_return_is_refinement(symbol, &info.type_info) {
+        return;
+    }
+
+    content.push('\n');
+    content.push_str("**Resolved returns:** ");
+    content.push_str(&type_info_raw_with_links(
+        index,
+        file_symbols,
+        &info.owner_fqn,
+        &info.uri,
+        &info.type_info,
+    ));
+    content.push('\n');
+}
+
+fn hover_resolved_return_is_refinement(
+    symbol: &php_lsp_types::SymbolInfo,
+    resolved: &php_lsp_types::TypeInfo,
+) -> bool {
+    if symbol.kind != php_lsp_types::PhpSymbolKind::Method
+        && symbol.kind != php_lsp_types::PhpSymbolKind::Function
+    {
+        return false;
+    }
+    let Some(declared) = symbol_effective_return_type(symbol) else {
+        return true;
+    };
+    normalize_hover_resolved_return_type(&declared)
+        != normalize_hover_resolved_return_type(resolved)
+}
+
+fn normalize_hover_resolved_return_type(type_info: &php_lsp_types::TypeInfo) -> String {
+    normalized_hover_relation_target(&type_info.to_string())
 }
 
 fn append_hover_framework_metadata_lines(
