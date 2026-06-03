@@ -3539,6 +3539,818 @@ final class ShapeController
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_twig_context_infers_symfony_globals_forms_and_form_errors() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-symfony-globals-forms-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    for dir in [
+        "src/Controller",
+        "src/Entity",
+        "src/Form",
+        "src/Symfony/Bundle/FrameworkBundle/Controller",
+        "src/Symfony/Component/Form",
+        "src/Symfony/Component/Security/Core/Exception",
+        "src/Symfony/Component/Security/Core/User",
+        "src/Symfony/Component/Security/Http/Authentication",
+        "templates/components",
+        "templates/form",
+        "templates/operator",
+        "templates/debt_suspension",
+        "templates/porting_request",
+        "templates/registration",
+        "templates/security",
+    ] {
+        fs::create_dir_all(tmp_root.join(dir)).unwrap();
+    }
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let user_path = tmp_root.join("src/Entity/User.php");
+    let registration_form_path = tmp_root.join("src/Form/RegistrationFormType.php");
+    let operator_form_path = tmp_root.join("src/Form/OperatorType.php");
+    let debt_form_path = tmp_root.join("src/Form/DebtSuspensionType.php");
+    let porting_form_path = tmp_root.join("src/Form/PortingRequestType.php");
+    let auth_exception_path =
+        tmp_root.join("src/Symfony/Component/Security/Core/Exception/AuthenticationException.php");
+    let form_error_path = tmp_root.join("src/Symfony/Component/Form/FormError.php");
+    let form_core_path = tmp_root.join("src/Symfony/Component/Form/Core.php");
+    let abstract_controller_path =
+        tmp_root.join("src/Symfony/Bundle/FrameworkBundle/Controller/AbstractController.php");
+    let user_interface_path =
+        tmp_root.join("src/Symfony/Component/Security/Core/User/UserInterface.php");
+    let auth_utils_path =
+        tmp_root.join("src/Symfony/Component/Security/Http/Authentication/AuthenticationUtils.php");
+    let registration_controller_path = tmp_root.join("src/Controller/RegistrationController.php");
+    let operator_controller_path = tmp_root.join("src/Controller/OperatorController.php");
+    let debt_controller_path = tmp_root.join("src/Controller/DebtSuspensionController.php");
+    let porting_controller_path = tmp_root.join("src/Controller/PortingRequestController.php");
+    let security_controller_path = tmp_root.join("src/Controller/SecurityController.php");
+    let base_twig_path = tmp_root.join("templates/base.html.twig");
+    let login_twig_path = tmp_root.join("templates/security/login.html.twig");
+    let form_theme_twig_path = tmp_root.join("templates/form/form_theme.html.twig");
+    let registration_twig_path = tmp_root.join("templates/registration/register.html.twig");
+    let operator_twig_path = tmp_root.join("templates/operator/new.html.twig");
+    let debt_twig_path = tmp_root.join("templates/debt_suspension/new.html.twig");
+    let porting_twig_path = tmp_root.join("templates/porting_request/new.html.twig");
+    let component_twig_path =
+        tmp_root.join("templates/components/subscriber_autocomplete.html.twig");
+
+    let user_uri = file_uri(&user_path);
+    let registration_form_uri = file_uri(&registration_form_path);
+    let operator_form_uri = file_uri(&operator_form_path);
+    let debt_form_uri = file_uri(&debt_form_path);
+    let porting_form_uri = file_uri(&porting_form_path);
+    let auth_exception_uri = file_uri(&auth_exception_path);
+    let form_error_uri = file_uri(&form_error_path);
+    let base_twig_uri = file_uri(&base_twig_path);
+    let login_twig_uri = file_uri(&login_twig_path);
+    let form_theme_twig_uri = file_uri(&form_theme_twig_path);
+    let registration_twig_uri = file_uri(&registration_twig_path);
+    let operator_twig_uri = file_uri(&operator_twig_path);
+    let debt_twig_uri = file_uri(&debt_twig_path);
+    let component_twig_uri = file_uri(&component_twig_path);
+
+    let user_interface_php = r#"<?php
+namespace Symfony\Component\Security\Core\User;
+
+interface UserInterface
+{
+    public function getUserIdentifier(): string;
+}
+"#;
+    let auth_exception_php = r#"<?php
+namespace Symfony\Component\Security\Core\Exception;
+
+class AuthenticationException
+{
+    public function getMessageKey(): string { return ''; }
+    public function getMessageData(): array { return []; }
+}
+"#;
+    let auth_utils_php = r#"<?php
+namespace Symfony\Component\Security\Http\Authentication;
+
+use Symfony\Component\Security\Core\Exception\AuthenticationException;
+
+class AuthenticationUtils
+{
+    public function getLastAuthenticationError(): ?AuthenticationException { return null; }
+    public function getLastUsername(): string { return ''; }
+}
+"#;
+    let form_core_php = r#"<?php
+namespace Symfony\Component\Form;
+
+abstract class AbstractType {}
+
+interface FormBuilderInterface
+{
+    public function add(string $child, ?string $type = null, array $options = []): static;
+}
+
+interface FormInterface
+{
+    public function createView(): FormView;
+}
+
+class FormView
+{
+    /**
+     * @var array{id: string, full_name: string, name: string, value: mixed, errors: list<FormError>}
+     */
+    public array $vars = [];
+
+    /**
+     * @var list<FormError>
+     */
+    public array $errors = [];
+}
+"#;
+    let form_error_php = r#"<?php
+namespace Symfony\Component\Form;
+
+class FormError
+{
+    public function getMessage(): string { return ''; }
+}
+"#;
+    let abstract_controller_php = r#"<?php
+namespace Symfony\Bundle\FrameworkBundle\Controller;
+
+use Symfony\Component\Form\FormInterface;
+
+abstract class AbstractController
+{
+    public function createForm(string $type, mixed $data = null, array $options = []): FormInterface {}
+    public function render(string $view, array $parameters = []): void {}
+}
+"#;
+    let user_php = r#"<?php
+namespace App\Entity;
+
+use Symfony\Component\Security\Core\User\UserInterface;
+
+class User implements UserInterface
+{
+    private ?int $id = null;
+    private ?string $email = null;
+    private array $roles = [];
+
+    public function getId(): ?int { return $this->id; }
+    public function getEmail(): ?string { return $this->email; }
+    public function getUserIdentifier(): string { return (string) $this->email; }
+    public function getRoles(): array { return $this->roles; }
+}
+"#;
+    let registration_form_php = r#"<?php
+namespace App\Form;
+
+use Symfony\Component\Form\AbstractType;
+use Symfony\Component\Form\FormBuilderInterface;
+
+class RegistrationFormType extends AbstractType
+{
+    public function buildForm(FormBuilderInterface $builder, array $options): void
+    {
+        $builder
+            ->add('email')
+            ->add('agreeTerms')
+            ->add('plainPassword');
+    }
+}
+"#;
+    let operator_form_php = r#"<?php
+namespace App\Form;
+
+use Symfony\Component\Form\AbstractType;
+use Symfony\Component\Form\FormBuilderInterface;
+
+class OperatorType extends AbstractType
+{
+    public function buildForm(FormBuilderInterface $builder, array $options): void
+    {
+        $builder
+            ->add('name')
+            ->add('inn')
+            ->add('mnc')
+            ->add('operatorCode')
+            ->add('isOwn');
+    }
+}
+"#;
+    let debt_form_php = r#"<?php
+namespace App\Form;
+
+use Symfony\Component\Form\AbstractType;
+use Symfony\Component\Form\FormBuilderInterface;
+
+class DebtSuspensionType extends AbstractType
+{
+    public function buildForm(FormBuilderInterface $builder, array $options): void
+    {
+        $builder
+            ->add('recipientOperator')
+            ->add('phoneNumbersInput')
+            ->add('repaymentType');
+    }
+}
+"#;
+    let porting_form_php = r#"<?php
+namespace App\Form;
+
+use Symfony\Component\Form\AbstractType;
+use Symfony\Component\Form\FormBuilderInterface;
+
+class PortingRequestType extends AbstractType
+{
+    public function buildForm(FormBuilderInterface $builder, array $options): void
+    {
+        $builder
+            ->add('subscriber')
+            ->add('requestedPortingDateTime')
+            ->add('requestType');
+    }
+}
+"#;
+    let registration_controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Entity\User;
+use App\Form\RegistrationFormType;
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+
+class RegistrationController extends AbstractController
+{
+    public function register(): void
+    {
+        $form = $this->createForm(RegistrationFormType::class, new User());
+        $this->render('registration/register.html.twig', [
+            'registrationForm' => $form,
+        ]);
+    }
+}
+"#;
+    let operator_controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Form\OperatorType;
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+
+class OperatorController extends AbstractController
+{
+    public function new(): void
+    {
+        $form = $this->createForm(OperatorType::class);
+        $this->render('operator/new.html.twig', ['form' => $form]);
+    }
+}
+"#;
+    let debt_controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Form\DebtSuspensionType;
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+
+class DebtSuspensionController extends AbstractController
+{
+    public function new(): void
+    {
+        $form = $this->createForm(DebtSuspensionType::class);
+        $this->render('debt_suspension/new.html.twig', ['form' => $form]);
+    }
+}
+"#;
+    let porting_controller_php = r#"<?php
+namespace App\Controller;
+
+use App\Form\PortingRequestType;
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+
+class PortingRequestController extends AbstractController
+{
+    public function new(): void
+    {
+        $form = $this->createForm(PortingRequestType::class);
+        $this->render('porting_request/new.html.twig', ['form' => $form]);
+    }
+}
+"#;
+    let security_controller_php = r#"<?php
+namespace App\Controller;
+
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+use Symfony\Component\Security\Http\Authentication\AuthenticationUtils;
+
+class SecurityController extends AbstractController
+{
+    public function login(AuthenticationUtils $authenticationUtils): void
+    {
+        $error = $authenticationUtils->getLastAuthenticationError();
+        $lastUsername = $authenticationUtils->getLastUsername();
+        $this->render('security/login.html.twig', [
+            'last_username' => $lastUsername,
+            'error' => $error,
+        ]);
+    }
+}
+"#;
+
+    let base_twig = r#"{{ app.current_route }}
+{{ app.user.id }}
+{{ app.user.email }}
+"#;
+    let login_twig = r#"{% if error %}
+{{ error.messageKey }}
+{% endif %}
+{% if app.user %}
+{{ app.user.userIdentifier }}
+{% endif %}
+"#;
+    let form_theme_twig = r#"{% block form_errors %}
+    {% if errors|length > 0 %}
+        {% for error in errors %}
+            {{ error.message }}
+        {% endfor %}
+    {% endif %}
+{% endblock %}
+"#;
+    let registration_completion_marker = "/*complete*/";
+    let registration_twig_with_marker = format!(
+        concat!(
+            "{{% for flash_error in app.flashes('verify_email_error') %}}{{{{ flash_error }}}}{{% endfor %}}\n",
+            "{{{{ registrationForm.{}email }}}}\n",
+            "{{{{ registrationForm.plainPassword }}}}\n",
+            "{{{{ registrationForm.agreeTerms }}}}\n",
+        ),
+        registration_completion_marker
+    );
+    let registration_prefix = registration_twig_with_marker[..registration_twig_with_marker
+        .find(registration_completion_marker)
+        .unwrap()]
+        .replace(registration_completion_marker, "");
+    let registration_twig =
+        registration_twig_with_marker.replace(registration_completion_marker, "");
+    let registration_completion_position =
+        utf16_position_for_offset(&registration_twig, registration_prefix.len());
+    let registration_email_definition_position =
+        utf16_position_after(&registration_twig, "registrationForm.e");
+    let registration_password_definition_position =
+        utf16_position_after(&registration_twig, "registrationForm.p");
+    let registration_agree_definition_position =
+        utf16_position_after(&registration_twig, "registrationForm.a");
+    let operator_twig = r#"{{ form.name }}
+{{ form.inn }}
+{{ form.mnc }}
+{{ form.operatorCode }}
+{{ form.isOwn }}
+"#;
+    let debt_twig = r#"{% if form.vars.errors|length > 0 %}
+    {% for error in form.vars.errors %}
+        {{ error.message }}
+    {% endfor %}
+{% endif %}
+{{ form.recipientOperator }}
+{{ form.repaymentType }}
+{{ form.phoneNumbersInput }}
+"#;
+    let porting_twig = r#"{% include 'components/subscriber_autocomplete.html.twig' with {
+    form_field: form.subscriber,
+    porting_date_field_id: form.requestedPortingDateTime.vars.id,
+    request_type_field_id: form.requestType.vars.id
+} only %}
+"#;
+    let component_twig = r#"{% set field_id = form_field.vars.id %}
+{% set field_name = form_field.vars.full_name %}
+{{ field_id }} {{ field_name }}
+"#;
+
+    for (path, source) in [
+        (&user_interface_path, user_interface_php),
+        (&auth_exception_path, auth_exception_php),
+        (&auth_utils_path, auth_utils_php),
+        (&form_core_path, form_core_php),
+        (&form_error_path, form_error_php),
+        (&abstract_controller_path, abstract_controller_php),
+        (&user_path, user_php),
+        (&registration_form_path, registration_form_php),
+        (&operator_form_path, operator_form_php),
+        (&debt_form_path, debt_form_php),
+        (&porting_form_path, porting_form_php),
+        (&registration_controller_path, registration_controller_php),
+        (&operator_controller_path, operator_controller_php),
+        (&debt_controller_path, debt_controller_php),
+        (&porting_controller_path, porting_controller_php),
+        (&security_controller_path, security_controller_php),
+    ] {
+        fs::write(path, source).unwrap();
+    }
+    for (path, source) in [
+        (&base_twig_path, base_twig),
+        (&login_twig_path, login_twig),
+        (&form_theme_twig_path, form_theme_twig),
+        (&registration_twig_path, registration_twig.as_str()),
+        (&operator_twig_path, operator_twig),
+        (&debt_twig_path, debt_twig),
+        (&porting_twig_path, porting_twig),
+        (&component_twig_path, component_twig),
+    ] {
+        fs::write(path, source).unwrap();
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+
+    for (uri, source) in [
+        (base_twig_uri.as_str(), base_twig),
+        (login_twig_uri.as_str(), login_twig),
+        (form_theme_twig_uri.as_str(), form_theme_twig),
+        (registration_twig_uri.as_str(), registration_twig.as_str()),
+        (operator_twig_uri.as_str(), operator_twig),
+        (debt_twig_uri.as_str(), debt_twig),
+        (component_twig_uri.as_str(), component_twig),
+    ] {
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification_with_language(uri, "twig", source))
+            .await
+            .unwrap();
+        let diagnostics =
+            next_publish_diagnostics(&mut notifications, uri, Duration::from_secs(2)).await;
+        assert_eq!(
+            diagnostics["diagnostics"].as_array().map(Vec::len),
+            Some(0),
+            "Symfony Twig fixture `{uri}` should stay diagnostic-clean, got: {}",
+            diagnostics
+        );
+    }
+
+    let app_route_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                2,
+                &base_twig_uri,
+                utf16_position_at(base_twig, "current_route").0,
+                utf16_position_at(base_twig, "current_route").1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        hover_markdown_value(&app_route_hover).contains("current_route"),
+        "expected app.current_route hover from Symfony app global, got: {}",
+        app_route_hover
+    );
+
+    for (request_id, uri, source, position, expected_uri) in [
+        (
+            3,
+            base_twig_uri.as_str(),
+            base_twig,
+            utf16_position_after(base_twig, "app.user.i"),
+            user_uri.as_str(),
+        ),
+        (
+            4,
+            base_twig_uri.as_str(),
+            base_twig,
+            utf16_position_after(base_twig, "app.user.e"),
+            user_uri.as_str(),
+        ),
+        (
+            5,
+            login_twig_uri.as_str(),
+            login_twig,
+            utf16_position_after(login_twig, "app.user.u"),
+            user_uri.as_str(),
+        ),
+        (
+            6,
+            login_twig_uri.as_str(),
+            login_twig,
+            utf16_position_after(login_twig, "error.m"),
+            auth_exception_uri.as_str(),
+        ),
+        (
+            7,
+            form_theme_twig_uri.as_str(),
+            form_theme_twig,
+            utf16_position_after(form_theme_twig, "error.m"),
+            form_error_uri.as_str(),
+        ),
+    ] {
+        let definition = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(definition_request(request_id, uri, position.0, position.1))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            definition.get("uri").and_then(|value| value.as_str()),
+            Some(expected_uri),
+            "expected Symfony Twig definition request {request_id} in `{source}` to resolve `{expected_uri}`, got: {}",
+            definition
+        );
+    }
+
+    let registration_completion = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(
+                8,
+                &registration_twig_uri,
+                registration_completion_position.0,
+                registration_completion_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let registration_labels: Vec<String> = completion_items_from_result(&registration_completion)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    for expected in ["email", "plainPassword", "agreeTerms"] {
+        assert!(
+            registration_labels.iter().any(|label| label == expected),
+            "expected registration form field completion `{expected}`, got: {:?}",
+            registration_labels
+        );
+    }
+
+    let source_position = |source: &str, needle: &str| {
+        let (line, character) = utf16_position_at(source, needle);
+        (line as u64, character as u64)
+    };
+    for (request_id, uri, position, expected_uri, expected_position) in [
+        (
+            9,
+            registration_twig_uri.as_str(),
+            registration_email_definition_position,
+            registration_form_uri.as_str(),
+            source_position(registration_form_php, "email"),
+        ),
+        (
+            10,
+            registration_twig_uri.as_str(),
+            registration_password_definition_position,
+            registration_form_uri.as_str(),
+            source_position(registration_form_php, "plainPassword"),
+        ),
+        (
+            11,
+            registration_twig_uri.as_str(),
+            registration_agree_definition_position,
+            registration_form_uri.as_str(),
+            source_position(registration_form_php, "agreeTerms"),
+        ),
+        (
+            12,
+            operator_twig_uri.as_str(),
+            utf16_position_after(operator_twig, "form.operatorC"),
+            operator_form_uri.as_str(),
+            source_position(operator_form_php, "operatorCode"),
+        ),
+        (
+            13,
+            operator_twig_uri.as_str(),
+            utf16_position_after(operator_twig, "form.is"),
+            operator_form_uri.as_str(),
+            source_position(operator_form_php, "isOwn"),
+        ),
+        (
+            14,
+            debt_twig_uri.as_str(),
+            utf16_position_after(debt_twig, "form.recipientO"),
+            debt_form_uri.as_str(),
+            source_position(debt_form_php, "recipientOperator"),
+        ),
+        (
+            15,
+            debt_twig_uri.as_str(),
+            utf16_position_after(debt_twig, "form.phone"),
+            debt_form_uri.as_str(),
+            source_position(debt_form_php, "phoneNumbersInput"),
+        ),
+        (
+            16,
+            component_twig_uri.as_str(),
+            utf16_position_after(component_twig, "vars.i"),
+            porting_form_uri.as_str(),
+            source_position(porting_form_php, "subscriber"),
+        ),
+    ] {
+        let definition = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(definition_request(request_id, uri, position.0, position.1))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            definition.get("uri").and_then(|value| value.as_str()),
+            Some(expected_uri),
+            "expected Symfony form field definition request {request_id} to resolve `{expected_uri}`, got: {}",
+            definition
+        );
+        assert_eq!(
+            definition["range"]["start"]["line"].as_u64(),
+            Some(expected_position.0),
+            "expected Symfony form field definition request {request_id} to jump to source line {}, got: {}",
+            expected_position.0,
+            definition
+        );
+        assert_eq!(
+            definition["range"]["start"]["character"].as_u64(),
+            Some(expected_position.1),
+            "expected Symfony form field definition request {request_id} to jump to source character {}, got: {}",
+            expected_position.1,
+            definition
+        );
+    }
+
+    let component_id_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                17,
+                &component_twig_uri,
+                utf16_position_at(component_twig, "id %}").0,
+                utf16_position_at(component_twig, "id %}").1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        hover_markdown_value(&component_id_hover).contains("string id"),
+        "expected component form_field.vars.id hover from FormView vars shape, got: {}",
+        component_id_hover
+    );
+
+    let form_theme_inlay = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(inlay_hint_request(
+                18,
+                &form_theme_twig_uri,
+                0,
+                0,
+                utf16_position_for_offset(form_theme_twig, form_theme_twig.len()).0,
+                utf16_position_for_offset(form_theme_twig, form_theme_twig.len()).1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let form_theme_hints = form_theme_inlay.as_array().cloned().unwrap_or_default();
+    let error_inlay_position = utf16_position_for_offset(
+        form_theme_twig,
+        form_theme_twig.find("error in").unwrap() + "error".len(),
+    );
+    assert!(
+        form_theme_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": FormError")
+                && hint["position"]["line"].as_u64() == Some(error_inlay_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(error_inlay_position.1 as u64)
+                && inlay_hint_has_label_part_location(hint, "FormError")
+        }),
+        "expected form theme foreach inlay hint to link FormError, got: {}",
+        form_theme_inlay
+    );
+
+    let component_inlay = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(inlay_hint_request(
+                19,
+                &component_twig_uri,
+                0,
+                0,
+                utf16_position_for_offset(component_twig, component_twig.len()).0,
+                utf16_position_for_offset(component_twig, component_twig.len()).1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let component_hints = component_inlay.as_array().cloned().unwrap_or_default();
+    let field_id_inlay_position = utf16_position_for_offset(
+        component_twig,
+        component_twig.find("field_id =").unwrap() + "field_id".len(),
+    );
+    assert!(
+        component_hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some(": string")
+                && hint["position"]["line"].as_u64() == Some(field_id_inlay_position.0 as u64)
+                && hint["position"]["character"].as_u64() == Some(field_id_inlay_position.1 as u64)
+        }),
+        "expected component field_id inlay hint from form_field.vars.id, got: {}",
+        component_inlay
+    );
+
+    let unsaved_registration_form_php = registration_form_php.replace(
+        "->add('plainPassword');",
+        "->add('plainPassword')\n            ->add('displayName');",
+    );
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            &registration_form_uri,
+            &unsaved_registration_form_php,
+        ))
+        .await
+        .unwrap();
+    let diagnostics = next_publish_diagnostics(
+        &mut notifications,
+        &registration_twig_uri,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(
+        diagnostics["diagnostics"].as_array().map(Vec::len),
+        Some(0),
+        "open unsaved Symfony FormType should refresh Twig context quietly, got: {}",
+        diagnostics
+    );
+    let refreshed_registration_completion = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(
+                20,
+                &registration_twig_uri,
+                registration_completion_position.0,
+                registration_completion_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    let refreshed_registration_labels: Vec<String> =
+        completion_items_from_result(&refreshed_registration_completion)
+            .iter()
+            .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+            .map(str::to_string)
+            .collect();
+    assert!(
+        refreshed_registration_labels
+            .iter()
+            .any(|label| label == "displayName"),
+        "expected open unsaved FormType field completion `displayName`, got: {:?}",
+        refreshed_registration_labels
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_twig_foreach_entity_collection_members_from_doctrine_target_entity() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();

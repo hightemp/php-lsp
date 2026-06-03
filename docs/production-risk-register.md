@@ -390,6 +390,11 @@ Current evidence:
   one-level `{% include ... with {...} %}` component context. Hover,
   completion, definition, and inlay hints now cover SFTP CSV DTO/service result
   fields and included autocomplete items such as `item.code`.
+- `H-TWIG-SYMFONY-GLOBALS-FORMS-2026-06-02` adds static Symfony Twig globals,
+  login/form-theme error context, and FormType-backed `FormView` field shapes.
+  Hover, completion, definition, and inlay hints now cover `app.current_route`,
+  `app.user.*`, `error.messageKey`, form errors, `form.field`, and included
+  component values such as `form_field.vars.id` without booting Symfony.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

@@ -8,6 +8,57 @@ use super::super::*;
 const TWIG_CONTEXT_PHP_FILE_SCAN_LIMIT: usize = 2048;
 const TWIG_CONTEXT_TEMPLATE_FILE_SCAN_LIMIT: usize = 2048;
 const OPEN_TWIG_CONTEXT_REFRESH_LIMIT: usize = 64;
+const SYMFONY_ABSTRACT_FORM_TYPE_FQN: &str = "Symfony\\Component\\Form\\AbstractType";
+const SYMFONY_FORM_ERROR_FQN: &str = "Symfony\\Component\\Form\\FormError";
+const SYMFONY_AUTHENTICATION_EXCEPTION_FQN: &str =
+    "Symfony\\Component\\Security\\Core\\Exception\\AuthenticationException";
+const SYMFONY_USER_INTERFACE_FQN: &str = "Symfony\\Component\\Security\\Core\\User\\UserInterface";
+
+#[derive(Debug, Clone)]
+struct TwigContextPhpSource {
+    uri: String,
+    source: String,
+    file_symbols: php_lsp_types::FileSymbols,
+}
+
+struct TwigContextPhpSourceResolver<'a> {
+    sources: &'a HashMap<String, TwigContextPhpSource>,
+    allow_disk_read: bool,
+}
+
+#[derive(Debug)]
+struct TwigContextResolvedPhpSource {
+    uri: String,
+    source: String,
+    file_symbols: Option<php_lsp_types::FileSymbols>,
+}
+
+impl TwigContextPhpSourceResolver<'_> {
+    fn resolve_symbol_source(
+        &self,
+        symbol: &php_lsp_types::SymbolInfo,
+    ) -> Option<TwigContextResolvedPhpSource> {
+        if let Some(open_source) = self.sources.get(&symbol.uri) {
+            return Some(TwigContextResolvedPhpSource {
+                uri: open_source.uri.clone(),
+                source: open_source.source.clone(),
+                file_symbols: Some(open_source.file_symbols.clone()),
+            });
+        }
+
+        if !self.allow_disk_read {
+            return None;
+        }
+
+        let path = uri_to_path(&symbol.uri)?;
+        let source = std::fs::read_to_string(path).ok()?;
+        Some(TwigContextResolvedPhpSource {
+            uri: symbol.uri.clone(),
+            source,
+            file_symbols: None,
+        })
+    }
+}
 
 pub(in crate::server) fn template_kind_for_document(
     uri_str: &str,
@@ -180,47 +231,33 @@ pub(in crate::server) fn collect_twig_context_php_files_recursive(
 
 fn collect_twig_render_context_types(
     template_name: &str,
-    source: &str,
-    source_uri: &str,
-    file_symbols: &php_lsp_types::FileSymbols,
-    index: Option<&WorkspaceIndex>,
+    ctx: &TwigShapeDefinitionContext<'_>,
     variables: &mut HashMap<String, String>,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
 ) {
     let mut offset = 0usize;
-    while let Some((_, name_end, open_paren)) = next_twig_render_call(source, offset) {
-        let Some(close_paren) = find_matching_delimiter(source, open_paren, '(', ')') else {
+    while let Some((_, name_end, open_paren)) = next_twig_render_call(ctx.source, offset) {
+        let Some(close_paren) = find_matching_delimiter(ctx.source, open_paren, '(', ')') else {
             offset = name_end;
             continue;
         };
         let args = split_top_level_spans(
-            source.get(open_paren + 1..close_paren).unwrap_or(""),
+            ctx.source.get(open_paren + 1..close_paren).unwrap_or(""),
             open_paren + 1,
         );
         if args.len() >= 2 {
-            let template_arg = trim_source_range(source, args[0].0, args[0].1);
-            let context_arg = trim_source_range(source, args[1].0, args[1].1);
-            if php_string_literal_value_at_range(source, template_arg.0, template_arg.1)
+            let template_arg = trim_source_range(ctx.source, args[0].0, args[0].1);
+            let context_arg = trim_source_range(ctx.source, args[1].0, args[1].1);
+            if php_string_literal_value_at_range(ctx.source, template_arg.0, template_arg.1)
                 .is_some_and(|name| normalize_twig_key(&name) == normalize_twig_key(template_name))
                 && !collect_twig_context_compact_types(
-                    source,
-                    source_uri,
+                    ctx,
                     context_arg,
-                    file_symbols,
-                    index,
                     variables,
                     shape_definitions,
                 )
             {
-                collect_twig_context_array_types(
-                    source,
-                    source_uri,
-                    context_arg,
-                    file_symbols,
-                    index,
-                    variables,
-                    shape_definitions,
-                );
+                collect_twig_context_array_types(ctx, context_arg, variables, shape_definitions);
             }
         }
         offset = close_paren + 1;
@@ -228,42 +265,33 @@ fn collect_twig_render_context_types(
 }
 
 fn collect_twig_context_compact_types(
-    source: &str,
-    source_uri: &str,
+    ctx: &TwigShapeDefinitionContext<'_>,
     range: (usize, usize),
-    file_symbols: &php_lsp_types::FileSymbols,
-    index: Option<&WorkspaceIndex>,
     variables: &mut HashMap<String, String>,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
 ) -> bool {
-    let (start, end) = trim_source_range(source, range.0, range.1);
-    let Some(value) = source.get(start..end).map(str::trim) else {
+    let (start, end) = trim_source_range(ctx.source, range.0, range.1);
+    let Some(value) = ctx.source.get(start..end).map(str::trim) else {
         return false;
     };
     if !value.starts_with("compact") {
         return false;
     }
-    let open = skip_ascii_ws_server(source, start + "compact".len());
-    if source.as_bytes().get(open) != Some(&b'(') {
+    let open = skip_ascii_ws_server(ctx.source, start + "compact".len());
+    if ctx.source.as_bytes().get(open) != Some(&b'(') {
         return false;
     }
-    let Some(close) = find_matching_delimiter(source, open, '(', ')') else {
+    let Some(close) = find_matching_delimiter(ctx.source, open, '(', ')') else {
         return false;
     };
     if close > end {
         return false;
     }
 
-    let shape_definition_ctx = TwigShapeDefinitionContext {
-        source,
-        source_uri,
-        file_symbols,
-        index,
-    };
     let mut found = false;
-    for arg in split_top_level_spans(source.get(open + 1..close).unwrap_or(""), open + 1) {
-        let arg = trim_source_range(source, arg.0, arg.1);
-        let Some(name) = php_string_literal_value_at_range(source, arg.0, arg.1) else {
+    for arg in split_top_level_spans(ctx.source.get(open + 1..close).unwrap_or(""), open + 1) {
+        let arg = trim_source_range(ctx.source, arg.0, arg.1);
+        let Some(name) = php_string_literal_value_at_range(ctx.source, arg.0, arg.1) else {
             continue;
         };
         if !is_template_variable_name(&name) {
@@ -272,19 +300,20 @@ fn collect_twig_context_compact_types(
         found = true;
         let mut visited_variables = HashSet::new();
         let type_text = infer_twig_context_assignment_value_type(
-            source,
+            ctx.source,
             start,
             &name,
-            file_symbols,
-            index,
+            ctx.file_symbols,
+            ctx.index,
+            ctx.php_sources,
             &mut visited_variables,
         )
-        .or_else(|| infer_twig_context_variable_type(source, start, &name, file_symbols))
+        .or_else(|| infer_twig_context_variable_type(ctx.source, start, &name, ctx.file_symbols))
         .unwrap_or_else(|| "mixed".to_string());
         merge_twig_context_variable_type(variables, name.clone(), type_text);
         let mut visited_variables = HashSet::new();
         let definitions = collect_twig_context_assignment_shape_definitions(
-            &shape_definition_ctx,
+            ctx,
             start,
             &name,
             TemplateShapeDefinitionTarget::Direct,
@@ -325,46 +354,44 @@ pub(in crate::server) fn next_twig_render_call(
 }
 
 fn collect_twig_context_array_types(
-    source: &str,
-    source_uri: &str,
+    ctx: &TwigShapeDefinitionContext<'_>,
     range: (usize, usize),
-    file_symbols: &php_lsp_types::FileSymbols,
-    index: Option<&WorkspaceIndex>,
     variables: &mut HashMap<String, String>,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
 ) {
     let (start, end) = range;
-    let Some((inner_start, inner_end)) = php_array_inner_range(source, start, end) else {
+    let Some((inner_start, inner_end)) = php_array_inner_range(ctx.source, start, end) else {
         return;
     };
     let spans = split_top_level_spans(
-        source.get(inner_start..inner_end).unwrap_or(""),
+        ctx.source.get(inner_start..inner_end).unwrap_or(""),
         inner_start,
     );
-    let shape_definition_ctx = TwigShapeDefinitionContext {
-        source,
-        source_uri,
-        file_symbols,
-        index,
-    };
     for span in spans {
-        let Some(arrow) = find_top_level_double_arrow(source, span.0, span.1) else {
+        let Some(arrow) = find_top_level_double_arrow(ctx.source, span.0, span.1) else {
             continue;
         };
-        let key_range = trim_source_range(source, span.0, arrow);
-        let value_range = trim_source_range(source, arrow + 2, span.1);
-        let Some(name) = php_string_literal_value_at_range(source, key_range.0, key_range.1) else {
+        let key_range = trim_source_range(ctx.source, span.0, arrow);
+        let value_range = trim_source_range(ctx.source, arrow + 2, span.1);
+        let Some(name) = php_string_literal_value_at_range(ctx.source, key_range.0, key_range.1)
+        else {
             continue;
         };
         if !is_template_variable_name(&name) {
             continue;
         }
-        let type_text = infer_twig_context_value_type(source, value_range, file_symbols, index)
-            .unwrap_or_else(|| "mixed".to_string());
+        let type_text = infer_twig_context_value_type(
+            ctx.source,
+            value_range,
+            ctx.file_symbols,
+            ctx.index,
+            ctx.php_sources,
+        )
+        .unwrap_or_else(|| "mixed".to_string());
         merge_twig_context_variable_type(variables, name.clone(), type_text);
         let mut visited_variables = HashSet::new();
         let definitions = collect_twig_context_value_shape_definitions(
-            &shape_definition_ctx,
+            ctx,
             value_range,
             TemplateShapeDefinitionTarget::Direct,
             &mut visited_variables,
@@ -456,6 +483,7 @@ struct TwigShapeDefinitionContext<'a> {
     source_uri: &'a str,
     file_symbols: &'a php_lsp_types::FileSymbols,
     index: Option<&'a WorkspaceIndex>,
+    php_sources: Option<&'a TwigContextPhpSourceResolver<'a>>,
 }
 
 fn collect_twig_context_value_shape_definitions(
@@ -475,6 +503,16 @@ fn collect_twig_context_value_shape_definitions(
         &[],
         &mut definitions,
     );
+
+    if let Some(found) = collect_twig_context_symfony_form_shape_definitions(
+        ctx,
+        (start, end),
+        default_target,
+        visited_variables,
+    ) {
+        definitions.extend(found);
+        return definitions;
+    }
 
     if let Some(variable_name) = simple_php_variable_name(value) {
         definitions.extend(collect_twig_context_assignment_shape_definitions(
@@ -688,6 +726,77 @@ fn collect_twig_context_member_access_shape_definitions(
         }
     }
     (!definitions.is_empty()).then_some(definitions)
+}
+
+fn collect_twig_context_symfony_form_shape_definitions(
+    ctx: &TwigShapeDefinitionContext<'_>,
+    range: (usize, usize),
+    default_target: TemplateShapeDefinitionTarget,
+    visited_variables: &mut HashSet<String>,
+) -> Option<Vec<TemplateShapeKeyDefinition>> {
+    let fields = twig_context_symfony_form_fields_for_value(
+        ctx.source,
+        range,
+        ctx.file_symbols,
+        ctx.index,
+        ctx.php_sources,
+        visited_variables,
+    )?;
+    Some(symfony_form_shape_definitions_from_fields(
+        &fields,
+        default_target,
+        &[],
+    ))
+}
+
+fn symfony_form_shape_definitions_from_fields(
+    fields: &SymfonyFormTypeFields,
+    target: TemplateShapeDefinitionTarget,
+    path_prefix: &[String],
+) -> Vec<TemplateShapeKeyDefinition> {
+    let mut definitions = Vec::new();
+    for field in &fields.fields {
+        for path in symfony_form_field_definition_paths(&field.name, path_prefix) {
+            if path.is_empty() {
+                continue;
+            }
+            if let Some(definition) = template_shape_key_definition_from_byte_range(
+                &fields.source,
+                &fields.source_uri,
+                target,
+                path,
+                field.key_range,
+            ) {
+                if !definitions.iter().any(|existing| existing == &definition) {
+                    definitions.push(definition);
+                }
+            }
+        }
+    }
+    definitions
+}
+
+fn symfony_form_field_definition_paths(
+    field_name: &str,
+    path_prefix: &[String],
+) -> Vec<Vec<String>> {
+    let mut base = path_prefix.to_vec();
+    base.push(php_lsp_types::normalize_shape_key_text(field_name));
+    let mut paths = vec![base.clone()];
+    for tail in [
+        vec!["vars"],
+        vec!["vars", "id"],
+        vec!["vars", "full_name"],
+        vec!["vars", "name"],
+        vec!["vars", "value"],
+        vec!["vars", "errors"],
+        vec!["errors"],
+    ] {
+        let mut path = base.clone();
+        path.extend(tail.into_iter().map(str::to_string));
+        paths.push(path);
+    }
+    paths
 }
 
 fn collect_symbol_type_shape_definitions(
@@ -1030,8 +1139,16 @@ fn infer_twig_context_value_type(
     range: (usize, usize),
     file_symbols: &php_lsp_types::FileSymbols,
     index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
 ) -> Option<String> {
-    infer_twig_context_value_type_inner(source, range, file_symbols, index, &mut HashSet::new())
+    infer_twig_context_value_type_inner(
+        source,
+        range,
+        file_symbols,
+        index,
+        php_sources,
+        &mut HashSet::new(),
+    )
 }
 
 fn infer_twig_context_value_type_inner(
@@ -1039,6 +1156,7 @@ fn infer_twig_context_value_type_inner(
     range: (usize, usize),
     file_symbols: &php_lsp_types::FileSymbols,
     index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
     visited_variables: &mut HashSet<String>,
 ) -> Option<String> {
     let (start, end) = trim_source_range(source, range.0, range.1);
@@ -1051,6 +1169,7 @@ fn infer_twig_context_value_type_inner(
         (start, end),
         file_symbols,
         index,
+        php_sources,
         visited_variables,
     ) {
         return twig_context_type_info_text(file_symbols, "", &type_info);
@@ -1064,6 +1183,17 @@ fn infer_twig_context_value_type_inner(
         }
     }
 
+    if let Some(type_text) = twig_context_symfony_form_value_type_text(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        php_sources,
+        visited_variables,
+    ) {
+        return Some(type_text);
+    }
+
     if let Some(variable_name) = simple_php_variable_name(value) {
         if let Some(type_text) = infer_twig_context_assignment_value_type(
             source,
@@ -1071,6 +1201,7 @@ fn infer_twig_context_value_type_inner(
             variable_name,
             file_symbols,
             index,
+            php_sources,
             visited_variables,
         ) {
             return Some(type_text);
@@ -1137,6 +1268,7 @@ fn infer_twig_context_literal_array_type_info(
     range: (usize, usize),
     file_symbols: &php_lsp_types::FileSymbols,
     index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
     visited_variables: &mut HashSet<String>,
 ) -> Option<php_lsp_types::TypeInfo> {
     let (inner_start, inner_end) = php_array_inner_range(source, range.0, range.1)?;
@@ -1167,6 +1299,7 @@ fn infer_twig_context_literal_array_type_info(
                     value_range,
                     file_symbols,
                     index,
+                    php_sources,
                     visited_variables,
                 )
                 .unwrap_or(php_lsp_types::TypeInfo::Mixed);
@@ -1184,6 +1317,7 @@ fn infer_twig_context_literal_array_type_info(
             span,
             file_symbols,
             index,
+            php_sources,
             visited_variables,
         )
         .unwrap_or(php_lsp_types::TypeInfo::Mixed);
@@ -1209,6 +1343,7 @@ fn infer_twig_context_value_type_info_for_shape(
     range: (usize, usize),
     file_symbols: &php_lsp_types::FileSymbols,
     index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
     visited_variables: &mut HashSet<String>,
 ) -> Option<php_lsp_types::TypeInfo> {
     let (start, end) = trim_source_range(source, range.0, range.1);
@@ -1233,6 +1368,7 @@ fn infer_twig_context_value_type_info_for_shape(
         (start, end),
         file_symbols,
         index,
+        php_sources,
         visited_variables,
     ) {
         return Some(type_info);
@@ -1242,6 +1378,16 @@ fn infer_twig_context_value_type_info_for_shape(
             resolve_twig_context_class_name(file_symbols, class_name),
         ));
     }
+    if let Some(type_text) = twig_context_symfony_form_value_type_text(
+        source,
+        (start, end),
+        file_symbols,
+        index,
+        php_sources,
+        visited_variables,
+    ) {
+        return twig_context_type_text_to_type_info(&type_text);
+    }
     if let Some(variable_name) = simple_php_variable_name(value) {
         let type_text = infer_twig_context_assignment_value_type(
             source,
@@ -1249,6 +1395,7 @@ fn infer_twig_context_value_type_info_for_shape(
             variable_name,
             file_symbols,
             index,
+            php_sources,
             visited_variables,
         )
         .or_else(|| infer_twig_context_variable_type(source, start, variable_name, file_symbols))?;
@@ -1301,6 +1448,7 @@ fn infer_twig_context_array_append_value_type(
     variable_name: &str,
     file_symbols: &php_lsp_types::FileSymbols,
     index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
     visited_variables: &mut HashSet<String>,
 ) -> Option<String> {
     let latest_assignment =
@@ -1323,6 +1471,7 @@ fn infer_twig_context_array_append_value_type(
                 range,
                 file_symbols,
                 index,
+                php_sources,
                 visited_variables,
             )
         })
@@ -1347,6 +1496,7 @@ fn infer_twig_context_assignment_value_type(
     variable_name: &str,
     file_symbols: &php_lsp_types::FileSymbols,
     index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
     visited_variables: &mut HashSet<String>,
 ) -> Option<String> {
     if !visited_variables.insert(variable_name.to_string()) {
@@ -1359,6 +1509,7 @@ fn infer_twig_context_assignment_value_type(
         variable_name,
         file_symbols,
         index,
+        php_sources,
         visited_variables,
     ) {
         Some(type_text)
@@ -1371,6 +1522,7 @@ fn infer_twig_context_assignment_value_type(
                 latest,
                 file_symbols,
                 index,
+                php_sources,
                 visited_variables,
             )?;
             if latest_type == "null" || twig_context_type_text_has_null(&latest_type) {
@@ -1856,6 +2008,7 @@ fn twig_context_expression_type_text(
             variable_name,
             file_symbols,
             index,
+            None,
             visited_variables,
         )
         .or_else(|| infer_twig_context_variable_type(source, start, variable_name, file_symbols));
@@ -1880,6 +2033,309 @@ fn twig_context_expression_type_text(
     }
     first_new_class_name(value)
         .map(|class_name| resolve_twig_context_class_name(file_symbols, class_name))
+}
+
+fn twig_context_symfony_form_value_type_text(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<String> {
+    let fields = twig_context_symfony_form_fields_for_value(
+        source,
+        range,
+        file_symbols,
+        index,
+        php_sources,
+        visited_variables,
+    )?;
+    Some(symfony_form_shape_type_text(
+        fields.fields.iter().map(|field| field.name.as_str()),
+    ))
+}
+
+fn twig_context_symfony_form_fields_for_value(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+    index: Option<&WorkspaceIndex>,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
+    visited_variables: &mut HashSet<String>,
+) -> Option<SymfonyFormTypeFields> {
+    let index = index?;
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    let value = source.get(start..end)?.trim();
+
+    if let Some(variable_name) = simple_php_variable_name(value) {
+        let visit_key = format!("symfony-form:{variable_name}");
+        if !visited_variables.insert(visit_key.clone()) {
+            return None;
+        }
+        let result =
+            latest_simple_variable_assignment_before(source, start, variable_name, file_symbols)
+                .and_then(|assignment| {
+                    twig_context_symfony_form_fields_for_value(
+                        source,
+                        assignment,
+                        file_symbols,
+                        Some(index),
+                        php_sources,
+                        visited_variables,
+                    )
+                });
+        visited_variables.remove(&visit_key);
+        return result;
+    }
+
+    let call = php_member_call_parts(source, start, end)?;
+    if call.method_name.eq_ignore_ascii_case("createView") {
+        return twig_context_symfony_form_fields_for_value(
+            source,
+            call.object_range,
+            file_symbols,
+            Some(index),
+            php_sources,
+            visited_variables,
+        );
+    }
+
+    let form_type_fqn =
+        twig_context_symfony_form_type_fqn_from_create_call(source, call, file_symbols)?;
+    symfony_form_type_fields(index, &form_type_fqn, php_sources)
+}
+
+fn twig_context_symfony_form_type_fqn_from_create_call(
+    source: &str,
+    call: PhpMemberCallParts<'_>,
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<String> {
+    let class_arg_index = match call.method_name.to_ascii_lowercase().as_str() {
+        "createform" => 0,
+        "createnamed" => 1,
+        _ => return None,
+    };
+    let args = split_top_level_spans(
+        source
+            .get(call.args_range.0..call.args_range.1)
+            .unwrap_or(""),
+        call.args_range.0,
+    );
+    let arg = args.get(class_arg_index).copied()?;
+    php_class_string_fqn_at_range(source, arg, file_symbols)
+}
+
+fn php_class_string_fqn_at_range(
+    source: &str,
+    range: (usize, usize),
+    file_symbols: &php_lsp_types::FileSymbols,
+) -> Option<String> {
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    let text = source.get(start..end)?.trim();
+    let suffix_start = text.to_ascii_lowercase().rfind("::class")?;
+    if suffix_start + "::class".len() != text.len() {
+        return None;
+    }
+    let class_name = text.get(..suffix_start)?.trim();
+    (!class_name.is_empty()).then(|| resolve_twig_context_class_name(file_symbols, class_name))
+}
+
+fn symfony_form_type_fields(
+    index: &WorkspaceIndex,
+    form_type_fqn: &str,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
+) -> Option<SymfonyFormTypeFields> {
+    let symbol = index.resolve_fqn(form_type_fqn)?;
+    if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class)
+        || !symfony_symbol_is_descendant_of(
+            index,
+            &symbol,
+            SYMFONY_ABSTRACT_FORM_TYPE_FQN,
+            &mut HashSet::new(),
+        )
+    {
+        return None;
+    }
+
+    let resolved_source =
+        resolve_twig_context_symbol_source(&symbol, php_sources, php_sources.is_none())?;
+    let source = resolved_source.source;
+    let source_uri = resolved_source.uri;
+    let build_form_fqn = format!("{form_type_fqn}::buildForm");
+    let open_build_form_range = resolved_source
+        .file_symbols
+        .as_ref()
+        .and_then(|file_symbols| {
+            file_symbols
+                .symbols
+                .iter()
+                .find(|candidate| {
+                    candidate.fqn == build_form_fqn
+                        && matches!(candidate.kind, php_lsp_types::PhpSymbolKind::Method)
+                })
+                .map(|candidate| candidate.range)
+        });
+    let open_class_range = resolved_source
+        .file_symbols
+        .as_ref()
+        .and_then(|file_symbols| {
+            file_symbols
+                .symbols
+                .iter()
+                .find(|candidate| {
+                    candidate.fqn == form_type_fqn
+                        && matches!(candidate.kind, php_lsp_types::PhpSymbolKind::Class)
+                })
+                .map(|candidate| candidate.range)
+        });
+    let scan_range = open_build_form_range
+        .or_else(|| {
+            index
+                .resolve_member(&build_form_fqn)
+                .map(|method| method.range)
+        })
+        .and_then(|range| {
+            let start = byte_offset_from_line_col(&source, range.0, range.1)?;
+            let end = byte_offset_from_line_col(&source, range.2, range.3)?;
+            Some((start, end))
+        })
+        .or_else(|| {
+            let range = open_class_range.unwrap_or(symbol.range);
+            let start = byte_offset_from_line_col(&source, range.0, range.1)?;
+            let end = byte_offset_from_line_col(&source, range.2, range.3)?;
+            Some((start, end))
+        })
+        .unwrap_or((0, source.len()));
+    let fields = symfony_form_fields_from_source(&source, scan_range);
+    Some(SymfonyFormTypeFields {
+        source_uri,
+        source,
+        fields,
+    })
+}
+
+fn resolve_twig_context_symbol_source(
+    symbol: &php_lsp_types::SymbolInfo,
+    php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
+    default_allow_disk_read: bool,
+) -> Option<TwigContextResolvedPhpSource> {
+    if let Some(resolver) = php_sources {
+        return resolver.resolve_symbol_source(symbol);
+    }
+
+    if !default_allow_disk_read {
+        return None;
+    }
+
+    let path = uri_to_path(&symbol.uri)?;
+    let source = std::fs::read_to_string(path).ok()?;
+    Some(TwigContextResolvedPhpSource {
+        uri: symbol.uri.clone(),
+        source,
+        file_symbols: None,
+    })
+}
+
+fn symfony_form_fields_from_source(source: &str, range: (usize, usize)) -> Vec<SymfonyFormField> {
+    let mut fields = Vec::<SymfonyFormField>::new();
+    let mut offset = range.0.min(source.len());
+    let scan_end = range.1.min(source.len());
+
+    while offset < scan_end {
+        let Some(relative) = source
+            .get(offset..scan_end)
+            .and_then(|text| text.find("->add"))
+        else {
+            break;
+        };
+        let add_start = offset + relative + "->".len();
+        let after_add = add_start + "add".len();
+        if source
+            .as_bytes()
+            .get(after_add)
+            .is_some_and(|byte| is_ident_byte(*byte))
+        {
+            offset = after_add;
+            continue;
+        }
+        let open = skip_ascii_ws_server(source, after_add);
+        if source.as_bytes().get(open) != Some(&b'(') {
+            offset = after_add;
+            continue;
+        }
+        let Some(close) = find_matching_delimiter(source, open, '(', ')') else {
+            break;
+        };
+        if close > scan_end {
+            break;
+        }
+        let args = split_top_level_spans(source.get(open + 1..close).unwrap_or(""), open + 1);
+        if let Some(first_arg) = args.first().copied() {
+            let first_arg = trim_source_range(source, first_arg.0, first_arg.1);
+            if php_string_literal_value_at_range(source, first_arg.0, first_arg.1).is_some() {
+                if let Some((name, key_start, key_end)) =
+                    shape_key_from_raw_range(source, first_arg.0, first_arg.1)
+                {
+                    if !name.is_empty() && !fields.iter().any(|field| field.name == name) {
+                        fields.push(SymfonyFormField {
+                            name,
+                            key_range: (key_start, key_end),
+                        });
+                    }
+                }
+            }
+        }
+        offset = close + 1;
+    }
+
+    fields
+}
+
+fn symfony_form_shape_type_text<'a>(field_names: impl IntoIterator<Item = &'a str>) -> String {
+    let field_type = symfony_form_field_type_text();
+    let mut parts = vec![
+        format!("vars: {}", symfony_form_vars_type_text()),
+        format!("errors: array<int, {SYMFONY_FORM_ERROR_FQN}>"),
+    ];
+    for field_name in field_names {
+        let key = twig_context_shape_key_text(field_name);
+        parts.push(format!("{key}: {field_type}"));
+    }
+    format!("object{{{}}}", parts.join(", "))
+}
+
+fn symfony_form_field_type_text() -> String {
+    format!(
+        "object{{vars: {}, errors: array<int, {SYMFONY_FORM_ERROR_FQN}>}}",
+        symfony_form_vars_type_text()
+    )
+}
+
+fn symfony_form_vars_type_text() -> String {
+    format!("array{{id: string, full_name: string, name: string, value: mixed, errors: array<int, {SYMFONY_FORM_ERROR_FQN}>}}")
+}
+
+fn symfony_symbol_is_descendant_of(
+    index: &WorkspaceIndex,
+    symbol: &php_lsp_types::SymbolInfo,
+    target_fqn: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(symbol.fqn.clone()) {
+        return false;
+    }
+
+    symbol
+        .extends
+        .iter()
+        .chain(symbol.implements.iter())
+        .any(|ancestor_fqn| {
+            fqn_eq(ancestor_fqn, target_fqn)
+                || index.resolve_fqn(ancestor_fqn).is_some_and(|ancestor| {
+                    symfony_symbol_is_descendant_of(index, &ancestor, target_fqn, visited)
+                })
+        })
 }
 
 fn twig_context_member_call_type_text(
@@ -2806,54 +3262,29 @@ async fn cached_twig_context_file_variables_for_state(
     template_name: &str,
     index: Arc<WorkspaceIndex>,
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
+    open_php_sources: HashMap<String, TwigContextPhpSource>,
 ) -> Vec<TwigContextFileVariables> {
     let key = TwigContextDiskCacheKey {
         root: root.to_path_buf(),
         template_name: template_name.to_string(),
     };
-    if let Some(files) = twig_context_disk_cache.lock().await.get(&key) {
-        return files;
+    let use_disk_cache = open_php_sources.is_empty();
+    if use_disk_cache {
+        if let Some(files) = twig_context_disk_cache.lock().await.get(&key) {
+            return files;
+        }
     }
 
     let root = root.to_path_buf();
     let template_name = template_name.to_string();
     let path_label = format!("{} ({})", root.display(), template_name);
     let files = match run_file_io_blocking("twig context scan", path_label, move || {
-        let mut result = Vec::new();
-        for path in collect_twig_context_php_files(&root, TWIG_CONTEXT_PHP_FILE_SCAN_LIMIT) {
-            let Ok(source_uri) = path_to_uri(&path) else {
-                continue;
-            };
-            let Ok(source) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let mut parser = FileParser::new();
-            parser.parse_full(&source);
-            let file_symbols = parser
-                .tree()
-                .map(|tree| extract_file_symbols(tree, &source, &source_uri))
-                .unwrap_or_default();
-            let mut variables = HashMap::new();
-            let mut shape_definitions = HashMap::new();
-            collect_twig_render_context_types(
-                &template_name,
-                &source,
-                &source_uri,
-                &file_symbols,
-                Some(&index),
-                &mut variables,
-                &mut shape_definitions,
-            );
-            if variables.is_empty() {
-                continue;
-            }
-            let variables = twig_context_variable_types_from_maps(variables, shape_definitions);
-            result.push(TwigContextFileVariables {
-                uri: source_uri,
-                variables,
-            });
-        }
-        result
+        collect_cached_twig_context_file_variables(
+            &root,
+            &template_name,
+            index.as_ref(),
+            &open_php_sources,
+        )
     })
     .await
     {
@@ -2864,11 +3295,64 @@ async fn cached_twig_context_file_variables_for_state(
         }
     };
 
-    twig_context_disk_cache
-        .lock()
-        .await
-        .insert(key, files.clone());
+    if use_disk_cache {
+        twig_context_disk_cache
+            .lock()
+            .await
+            .insert(key, files.clone());
+    }
     files
+}
+
+fn collect_cached_twig_context_file_variables(
+    root: &Path,
+    template_name: &str,
+    index: &WorkspaceIndex,
+    open_php_sources: &HashMap<String, TwigContextPhpSource>,
+) -> Vec<TwigContextFileVariables> {
+    let mut result = Vec::new();
+    let php_sources = TwigContextPhpSourceResolver {
+        sources: open_php_sources,
+        allow_disk_read: true,
+    };
+    for path in collect_twig_context_php_files(root, TWIG_CONTEXT_PHP_FILE_SCAN_LIMIT) {
+        let Ok(source_uri) = path_to_uri(&path) else {
+            continue;
+        };
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut parser = FileParser::new();
+        parser.parse_full(&source);
+        let file_symbols = parser
+            .tree()
+            .map(|tree| extract_file_symbols(tree, &source, &source_uri))
+            .unwrap_or_default();
+        let mut variables = HashMap::new();
+        let mut shape_definitions = HashMap::new();
+        let ctx = TwigShapeDefinitionContext {
+            source: &source,
+            source_uri: &source_uri,
+            file_symbols: &file_symbols,
+            index: Some(index),
+            php_sources: Some(&php_sources),
+        };
+        collect_twig_render_context_types(
+            template_name,
+            &ctx,
+            &mut variables,
+            &mut shape_definitions,
+        );
+        if variables.is_empty() {
+            continue;
+        }
+        let variables = twig_context_variable_types_from_maps(variables, shape_definitions);
+        result.push(TwigContextFileVariables {
+            uri: source_uri,
+            variables,
+        });
+    }
+    result
 }
 
 async fn direct_twig_variable_types_for_template_state(
@@ -2882,6 +3366,7 @@ async fn direct_twig_variable_types_for_template_state(
     let mut variables = HashMap::<String, String>::new();
     let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
     let mut open_php_uris = HashSet::<String>::new();
+    let mut open_php_sources = HashMap::<String, TwigContextPhpSource>::new();
 
     for entry in open_files.iter() {
         let source_uri = entry.key();
@@ -2904,15 +3389,63 @@ async fn direct_twig_variable_types_for_template_state(
                     .map(|tree| extract_file_symbols(tree, &source, source_uri.as_str()))
             })
             .unwrap_or_default();
-        collect_twig_render_context_types(
-            template_name,
-            &source,
-            source_uri,
-            &file_symbols,
-            Some(index.as_ref()),
-            &mut variables,
-            &mut shape_definitions,
+        open_php_sources.insert(
+            source_uri.to_string(),
+            TwigContextPhpSource {
+                uri: source_uri.to_string(),
+                source,
+                file_symbols,
+            },
         );
+    }
+
+    let open_php_sources_for_disk_scan = open_php_sources.clone();
+    if !open_php_sources.is_empty() {
+        let template_name_for_open = template_name.to_string();
+        let index_for_open = index.clone();
+        let path_label = format!("{} ({})", root.display(), template_name);
+        match run_file_io_blocking("open twig context scan", path_label, move || {
+            let mut variables = HashMap::<String, String>::new();
+            let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
+            let php_sources = TwigContextPhpSourceResolver {
+                sources: &open_php_sources,
+                allow_disk_read: true,
+            };
+            for source_file in open_php_sources.values() {
+                let ctx = TwigShapeDefinitionContext {
+                    source: &source_file.source,
+                    source_uri: &source_file.uri,
+                    file_symbols: &source_file.file_symbols,
+                    index: Some(index_for_open.as_ref()),
+                    php_sources: Some(&php_sources),
+                };
+                collect_twig_render_context_types(
+                    &template_name_for_open,
+                    &ctx,
+                    &mut variables,
+                    &mut shape_definitions,
+                );
+            }
+            (variables, shape_definitions)
+        })
+        .await
+        {
+            Ok((open_variables, open_shape_definitions)) => {
+                for (name, type_text) in open_variables {
+                    merge_twig_context_variable_type(&mut variables, name, type_text);
+                }
+                for (name, definitions) in open_shape_definitions {
+                    merge_twig_context_variable_shape_definitions(
+                        &mut shape_definitions,
+                        name,
+                        definitions,
+                    );
+                }
+            }
+            Err(message) => {
+                tracing::warn!("{}", message);
+            }
+        }
     }
 
     for file in cached_twig_context_file_variables_for_state(
@@ -2920,6 +3453,7 @@ async fn direct_twig_variable_types_for_template_state(
         template_name,
         index.clone(),
         twig_context_disk_cache,
+        open_php_sources_for_disk_scan,
     )
     .await
     {
@@ -2944,6 +3478,19 @@ struct TwigContextTemplateSource {
     template_name: String,
     source: String,
     include_with_ranges: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
+struct SymfonyFormTypeFields {
+    source_uri: String,
+    source: String,
+    fields: Vec<SymfonyFormField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymfonyFormField {
+    name: String,
+    key_range: (usize, usize),
 }
 
 async fn twig_include_variable_types_for_template_state(
@@ -3216,6 +3763,32 @@ fn collect_twig_include_with_variable_types(
             }
         }
 
+        if let Some((source_name, path)) =
+            twig_context_include_value_member_path(source, value_range)
+        {
+            if let Some(source_variable) = caller_by_name.get(source_name) {
+                if let Some(type_text) =
+                    twig_context_template_variable_member_type_text(source_variable, &path)
+                {
+                    let member_shape_definitions =
+                        twig_context_template_variable_member_shape_definitions(
+                            source_variable,
+                            &path,
+                        );
+                    merge_twig_context_template_variable_type(
+                        variables,
+                        shape_definitions,
+                        TemplateVariableType {
+                            name,
+                            type_text,
+                            shape_definitions: member_shape_definitions,
+                        },
+                    );
+                    continue;
+                }
+            }
+        }
+
         let type_text =
             twig_context_include_literal_type_text(source, value_range).unwrap_or("mixed");
         merge_twig_context_variable_type(variables, name, type_text.to_string());
@@ -3241,6 +3814,71 @@ fn twig_context_include_value_variable_name(source: &str, range: (usize, usize))
     (is_template_variable_name(name)
         && twig_context_include_literal_type_text(source, (start, end)).is_none())
     .then_some(name)
+}
+
+fn twig_context_include_value_member_path(
+    source: &str,
+    range: (usize, usize),
+) -> Option<(&str, Vec<String>)> {
+    let (start, end) = trim_source_range(source, range.0, range.1);
+    let base_end = find_top_level_token(source, start, end, b'|').unwrap_or(end);
+    let (start, end) = trim_source_range(source, start, base_end);
+    let root_end = scan_twig_context_identifier_end(source, start, end);
+    let root = source.get(start..root_end)?;
+    if !is_template_variable_name(root)
+        || twig_context_include_literal_type_text(source, (start, root_end)).is_some()
+    {
+        return None;
+    }
+
+    let mut path = Vec::new();
+    let mut offset = root_end;
+    while offset < end {
+        let next = skip_ascii_ws_server(source, offset);
+        if source.as_bytes().get(next) != Some(&b'.') {
+            return None;
+        }
+        let member_start = skip_ascii_ws_server(source, next + 1);
+        let member_end = scan_twig_context_identifier_end(source, member_start, end);
+        if member_end <= member_start {
+            return None;
+        }
+        let member = source.get(member_start..member_end)?;
+        path.push(php_lsp_types::normalize_shape_key_text(member));
+        offset = member_end;
+    }
+
+    (!path.is_empty()).then_some((root, path))
+}
+
+fn twig_context_template_variable_member_type_text(
+    variable: &TemplateVariableType,
+    path: &[String],
+) -> Option<String> {
+    let mut type_info = twig_context_type_text_to_type_info(&variable.type_text)?;
+    for key in path {
+        type_info = shape_attribute_type_info_for_access(&type_info, key, true)?;
+    }
+    Some(type_info.to_string())
+}
+
+fn twig_context_template_variable_member_shape_definitions(
+    variable: &TemplateVariableType,
+    path: &[String],
+) -> Vec<TemplateShapeKeyDefinition> {
+    variable
+        .shape_definitions
+        .iter()
+        .filter_map(|definition| {
+            let rest = definition.path.strip_prefix(path)?;
+            if rest.is_empty() {
+                return None;
+            }
+            let mut definition = definition.clone();
+            definition.path = rest.to_vec();
+            Some(definition)
+        })
+        .collect()
 }
 
 fn twig_context_include_literal_type_text(
@@ -3470,7 +4108,85 @@ async fn twig_variable_types_for_template_state(
         merge_twig_context_template_variable_type(&mut variables, &mut shape_definitions, variable);
     }
 
+    merge_symfony_twig_builtin_variable_types(
+        index.as_ref(),
+        &mut variables,
+        &mut shape_definitions,
+    );
+
     twig_context_variable_types_from_maps(variables, shape_definitions)
+}
+
+fn merge_symfony_twig_builtin_variable_types(
+    index: &WorkspaceIndex,
+    variables: &mut HashMap<String, String>,
+    shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
+) {
+    for variable in [
+        TemplateVariableType {
+            name: "app".to_string(),
+            type_text: symfony_twig_app_global_type_text(index),
+            shape_definitions: Vec::new(),
+        },
+        TemplateVariableType {
+            name: "error".to_string(),
+            type_text: format!("?{SYMFONY_AUTHENTICATION_EXCEPTION_FQN}"),
+            shape_definitions: Vec::new(),
+        },
+        TemplateVariableType {
+            name: "errors".to_string(),
+            type_text: format!("array<int, {SYMFONY_FORM_ERROR_FQN}>"),
+            shape_definitions: Vec::new(),
+        },
+    ] {
+        merge_twig_context_template_variable_type(variables, shape_definitions, variable);
+    }
+}
+
+fn symfony_twig_app_global_type_text(index: &WorkspaceIndex) -> String {
+    let user_type = symfony_user_class_fqn(index)
+        .map(|fqn| format!("?{fqn}"))
+        .unwrap_or_else(|| "mixed".to_string());
+    format!(
+        "object{{current_route: ?string, user: {user_type}, request: Symfony\\Component\\HttpFoundation\\Request}}"
+    )
+}
+
+fn symfony_user_class_fqn(index: &WorkspaceIndex) -> Option<String> {
+    let mut candidates = Vec::new();
+    for entry in index.types.iter() {
+        let symbol = entry.value();
+        if matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class)
+            && symfony_symbol_is_descendant_of(
+                index,
+                symbol,
+                SYMFONY_USER_INTERFACE_FQN,
+                &mut HashSet::new(),
+            )
+        {
+            candidates.push(symbol.fqn.clone());
+        }
+    }
+    candidates.sort_by(|left, right| {
+        symfony_user_class_score(left)
+            .cmp(&symfony_user_class_score(right))
+            .then_with(|| left.cmp(right))
+    });
+    candidates.into_iter().next()
+}
+
+fn symfony_user_class_score(fqn: &str) -> u8 {
+    if fqn == "App\\Entity\\User" {
+        0
+    } else if fqn.ends_with("\\Entity\\User") {
+        1
+    } else if fqn.ends_with("\\User") || fqn == "User" {
+        2
+    } else if fqn.starts_with("App\\") {
+        3
+    } else {
+        4
+    }
 }
 
 pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
@@ -3628,7 +4344,7 @@ mod tests {
         let file_symbols = php_lsp_types::FileSymbols::default();
 
         let type_text =
-            infer_twig_context_value_type(source, (0, source.len()), &file_symbols, None)
+            infer_twig_context_value_type(source, (0, source.len()), &file_symbols, None, None)
                 .expect("literal array shape type");
 
         assert_eq!(
@@ -3655,6 +4371,7 @@ mod tests {
             "items",
             &file_symbols,
             None,
+            None,
             &mut visited_variables,
         )
         .expect("append array shape type");
@@ -3676,7 +4393,7 @@ mod tests {
         let file_symbols = php_lsp_types::FileSymbols::default();
 
         let type_text =
-            infer_twig_context_value_type(source, (start, source.len()), &file_symbols, None)
+            infer_twig_context_value_type(source, (start, source.len()), &file_symbols, None, None)
                 .expect("reused variable shape type");
 
         assert_eq!(type_text, "array{first: MessageLog, second: MessageLog}");
@@ -3702,6 +4419,7 @@ mod tests {
             "items",
             &file_symbols,
             None,
+            None,
             &mut visited_variables,
         )
         .expect("append array shape type");
@@ -3726,6 +4444,7 @@ mod tests {
             value_start,
             "items",
             &file_symbols,
+            None,
             None,
             &mut visited_variables,
         )

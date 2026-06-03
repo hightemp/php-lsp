@@ -4561,7 +4561,7 @@ change.
   - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
   - Validation: final review after prior verifier findings reported no remaining issues.
 
-- [ ] **H-TWIG-SYMFONY-GLOBALS-FORMS-2026-06-02** Поддержать Symfony Twig globals, form fields и form errors
+- [x] **H-TWIG-SYMFONY-GLOBALS-FORMS-2026-06-02** Поддержать Symfony Twig globals, form fields и form errors *(done 2026-06-02)*
   - `security/login.html.twig:11` `error.messageKey` должен резолвиться как `AuthenticationException::getMessageKey()`.
   - `security/login.html.twig:16` `app.user.userIdentifier`, `base.html.twig:227` `app.user.id`, `base.html.twig:231` `app.user.email` должны резолвиться через `App\Entity\User`.
   - `base.html.twig:40` `app.current_route` должен давать useful hover для Symfony app global current route string.
@@ -4569,6 +4569,12 @@ change.
   - `registration/register.html.twig:23` `registrationForm.email`, `34` `registrationForm.plainPassword`, `45` `registrationForm.agreeTerms` должны резолвиться к form fields.
   - FormView fields: `debt_suspension/new.html.twig` `form.recipientOperator/repaymentType/phoneNumbersInput`, `operator/edit.html.twig` `form.name/inn/mnc/operatorCode`, `operator/new.html.twig` `form.mnc/operatorCode/isOwn`, request `new.html.twig` templates with `form.*` fields should not return `null`.
   - `components/subscriber_autocomplete.html.twig:13` `form_field.vars.id` should provide useful hover/definition.
+  - Implemented: static Symfony Twig fallback globals for `app`, login `error`, and form-theme `errors`; `app.user` prefers indexed security user classes.
+  - Implemented: `createForm(SomeType::class, ...)` render variables infer `FormType::buildForm()->add('field')` FormView field shapes with source-backed definitions and common `vars` keys.
+  - Implemented: include `with` member chains such as `form_field: form.subscriber` preserve field shape definitions in component templates, including unsaved open FormType edits while the controller is closed.
+  - Validation: `cargo test -p php-lsp-server lsp::templates::tests::` and `cargo test -p php-lsp-server --test e2e_templates -- --nocapture` passed.
+  - Validation: `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
+  - Validation: Verifier follow-up reported no remaining issues.
 
 - [ ] **H-TWIG-TEMPLATE-PATH-AND-ROUTE-DEFINITION-2026-06-02** Расширить Twig definition для template paths и route keys
   - `extends 'base.html.twig'` should jump to `templates/base.html.twig` in `debug/*.html.twig` and `registration/register.html.twig`.

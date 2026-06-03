@@ -438,7 +438,20 @@ without booting Symfony. Custom Doctrine repositories are resolved from indexed
 for this lookup. A bounded Twig include scan also handles one-level
 `{% include 'partial.html.twig' with {'items': items} %}` calls by evaluating
 the caller template's static render context and copying simple `with` object
-values into the included template. Render keys whose value type cannot be inferred still
+values and member chains such as `form_field: form.subscriber` into the
+included template.
+
+Symfony-specific static context is added without booting the framework.
+Fallback globals seed `app.current_route`, `app.user`, login `error`, and
+form-theme `errors`. `app.user` is typed as an indexed class that implements
+`Symfony\Component\Security\Core\User\UserInterface` when one is available.
+`createForm(SomeType::class, ...)` render values are expanded by reading the
+indexed `FormType::buildForm()` source and collecting `add('field')` calls.
+Those fields are exposed as `FormView`-like object-shape members with common
+`vars` keys such as `id`, `full_name`, and `errors`; source-backed definition
+metadata points back to the `add('field')` string literal.
+
+Render keys whose value type cannot be inferred still
 seed `mixed` variables in the virtual prelude so valid templates do not publish
 false undefined-variable diagnostics just because the server cannot infer a
 richer type. The context scanner combines open PHP/Twig files from memory with a
