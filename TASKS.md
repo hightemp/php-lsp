@@ -4686,11 +4686,17 @@ change.
   - Validation: `cargo test --all`, `cargo test -p php-lsp-server --test e2e_hover -- --nocapture`, parser use-scope tests, cache schema guard, `cargo clippy --all-targets --all -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
   - Validation: Verifier rerun reported no blocking findings after namespace-scoped import fix.
 
-- [ ] **H-HOVER-METHOD-IMPLEMENTS-OVERRIDES-2026-06-03** Показывать method-level implements/overrides links в hover
+- [x] **H-HOVER-METHOD-IMPLEMENTS-OVERRIDES-2026-06-03** Показывать method-level implements/overrides links в hover *(completed 2026-06-03)*
   - For interface implementations and inherited method overrides, add linked `Implements` / `Overrides` lines like PhpStorm shows for `ObjectManager::getRepository`.
   - Prefer exact hierarchy resolution from `WorkspaceIndex`; avoid expensive full-workspace scans in the hover hot path.
   - Handle vendor stubs and project classes consistently, including inherited Doctrine/Symfony methods.
   - Add e2e coverage for a class implementing an interface method, a child overriding a parent method, and a vendor-interface implementation.
+  - Implemented: method hover now adds linked `Implements` entries for exact indexed interface methods and linked `Overrides` entries for nearest inherited parent methods.
+  - Implemented: relation lookup walks only the owner type hierarchy and direct members from each indexed type's file, avoiding full workspace scans in the hover hot path.
+  - Tests: added e2e coverage for a child method that both implements an interface and overrides a parent method, plus a cross-file vendor interface implementation.
+  - Docs: updated README, LSP feature docs, architecture notes, and production risk register for method-level hover relations.
+  - Validation: `cargo test --all`, `cargo test -p php-lsp-server --test e2e_hover -- --nocapture`, `cargo clippy --all-targets --all -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+  - Validation: Verifier rerun reported no blocking findings.
 
 - [ ] **H-HOVER-CALLSITE-GENERIC-SPECIALIZATION-2026-06-03** Специализировать hover generic methods по receiver/call-site context
   - When hovering a generic method call such as `$this->em->getRepository(ReverseRequest::class)->findOneBy(...)`, show a call-site-specific return type such as `ReverseRequest|null` alongside the declared generic/stub type.

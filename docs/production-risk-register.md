@@ -427,6 +427,10 @@ Current evidence:
   including controller/action/entity/repository/association roles, rendered
   attributes, and linked Doctrine `repositoryClass` targets without
   request-time source reads.
+- `H-HOVER-METHOD-IMPLEMENTS-OVERRIDES-2026-06-03` adds hover links from method
+  declarations/calls to exact indexed interface methods and inherited parent
+  method overrides, including vendor-interface targets, without full workspace
+  scans in the hover hot path.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

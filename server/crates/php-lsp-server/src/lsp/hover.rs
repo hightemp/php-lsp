@@ -1104,6 +1104,7 @@ fn append_hover_relation_and_template_lines(
         owner_fqn,
         symbol,
     };
+    append_hover_method_relation_lines(content, index, symbol);
     append_hover_relation_line(
         content,
         "Extends",
@@ -1140,6 +1141,278 @@ struct HoverRelationContext<'a> {
     file_symbols: &'a php_lsp_types::FileSymbols,
     owner_fqn: &'a str,
     symbol: &'a php_lsp_types::SymbolInfo,
+}
+
+#[derive(Default)]
+struct HoverMethodRelations {
+    implements: Vec<php_lsp_types::SymbolInfo>,
+    overrides: Vec<php_lsp_types::SymbolInfo>,
+}
+
+fn append_hover_method_relation_lines(
+    content: &mut String,
+    index: &WorkspaceIndex,
+    symbol: &php_lsp_types::SymbolInfo,
+) {
+    let relations = hover_method_relations(index, symbol);
+    append_hover_method_relation_line(content, "Implements", &relations.implements);
+    append_hover_method_relation_line(content, "Overrides", &relations.overrides);
+}
+
+fn append_hover_method_relation_line(
+    content: &mut String,
+    label: &str,
+    targets: &[php_lsp_types::SymbolInfo],
+) {
+    if targets.is_empty() {
+        return;
+    }
+
+    let entries = targets
+        .iter()
+        .map(hover_method_relation_entry_markdown)
+        .collect::<Vec<_>>();
+    content.push('\n');
+    content.push_str("**");
+    content.push_str(label);
+    content.push_str(":** ");
+    content.push_str(&entries.join(", "));
+    content.push('\n');
+}
+
+fn hover_method_relation_entry_markdown(symbol: &php_lsp_types::SymbolInfo) -> String {
+    let destination = markdown_file_location_destination(symbol);
+    format!("[{}](<{}>)", markdown_code_span(&symbol.fqn), destination)
+}
+
+fn hover_method_relations(
+    index: &WorkspaceIndex,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> HoverMethodRelations {
+    if symbol.kind != php_lsp_types::PhpSymbolKind::Method {
+        return HoverMethodRelations::default();
+    }
+    let Some(owner_fqn) = symbol.parent_fqn.as_deref() else {
+        return HoverMethodRelations::default();
+    };
+    let Some(owner) = hover_index_type_symbol(index, owner_fqn) else {
+        return HoverMethodRelations::default();
+    };
+
+    let mut relations = HoverMethodRelations::default();
+    let mut seen_implements = std::collections::HashSet::new();
+    let mut seen_overrides = std::collections::HashSet::new();
+
+    collect_hover_method_interface_targets(
+        index,
+        &owner,
+        &symbol.name,
+        symbol,
+        &mut std::collections::HashSet::new(),
+        &mut seen_implements,
+        &mut relations.implements,
+    );
+    collect_hover_method_override_targets(
+        index,
+        &owner,
+        &symbol.name,
+        symbol,
+        &mut std::collections::HashSet::new(),
+        &mut seen_overrides,
+        &mut relations.overrides,
+    );
+
+    relations
+}
+
+fn collect_hover_method_interface_targets(
+    index: &WorkspaceIndex,
+    owner: &php_lsp_types::SymbolInfo,
+    method_name: &str,
+    current_symbol: &php_lsp_types::SymbolInfo,
+    visited_types: &mut std::collections::HashSet<String>,
+    seen_symbols: &mut std::collections::HashSet<String>,
+    targets: &mut Vec<php_lsp_types::SymbolInfo>,
+) {
+    if !visited_types.insert(normalized_hover_relation_target(&owner.fqn)) {
+        return;
+    }
+
+    for interface_fqn in &owner.implements {
+        collect_hover_interface_method_targets(
+            index,
+            interface_fqn,
+            method_name,
+            current_symbol,
+            visited_types,
+            seen_symbols,
+            targets,
+        );
+    }
+
+    for parent_fqn in &owner.extends {
+        if let Some(parent) = hover_index_type_symbol(index, parent_fqn) {
+            collect_hover_method_interface_targets(
+                index,
+                &parent,
+                method_name,
+                current_symbol,
+                visited_types,
+                seen_symbols,
+                targets,
+            );
+        }
+    }
+}
+
+fn collect_hover_interface_method_targets(
+    index: &WorkspaceIndex,
+    interface_fqn: &str,
+    method_name: &str,
+    current_symbol: &php_lsp_types::SymbolInfo,
+    visited_types: &mut std::collections::HashSet<String>,
+    seen_symbols: &mut std::collections::HashSet<String>,
+    targets: &mut Vec<php_lsp_types::SymbolInfo>,
+) {
+    let normalized = normalized_hover_relation_target(interface_fqn);
+    if !visited_types.insert(normalized) {
+        return;
+    }
+
+    if let Some(method) = hover_direct_method_for_type(index, interface_fqn, method_name) {
+        push_hover_method_relation_target(current_symbol, method, seen_symbols, targets);
+        return;
+    }
+
+    let Some(interface) = hover_index_type_symbol(index, interface_fqn) else {
+        return;
+    };
+    for parent_interface_fqn in interface.extends.iter().chain(interface.implements.iter()) {
+        collect_hover_interface_method_targets(
+            index,
+            parent_interface_fqn,
+            method_name,
+            current_symbol,
+            visited_types,
+            seen_symbols,
+            targets,
+        );
+    }
+}
+
+fn collect_hover_method_override_targets(
+    index: &WorkspaceIndex,
+    owner: &php_lsp_types::SymbolInfo,
+    method_name: &str,
+    current_symbol: &php_lsp_types::SymbolInfo,
+    visited_types: &mut std::collections::HashSet<String>,
+    seen_symbols: &mut std::collections::HashSet<String>,
+    targets: &mut Vec<php_lsp_types::SymbolInfo>,
+) {
+    for parent_fqn in &owner.extends {
+        collect_first_hover_parent_method_target(
+            index,
+            parent_fqn,
+            method_name,
+            current_symbol,
+            visited_types,
+            seen_symbols,
+            targets,
+        );
+    }
+}
+
+fn collect_first_hover_parent_method_target(
+    index: &WorkspaceIndex,
+    parent_fqn: &str,
+    method_name: &str,
+    current_symbol: &php_lsp_types::SymbolInfo,
+    visited_types: &mut std::collections::HashSet<String>,
+    seen_symbols: &mut std::collections::HashSet<String>,
+    targets: &mut Vec<php_lsp_types::SymbolInfo>,
+) -> bool {
+    let normalized = normalized_hover_relation_target(parent_fqn);
+    if !visited_types.insert(normalized) {
+        return false;
+    }
+
+    if let Some(method) = hover_direct_method_for_type(index, parent_fqn, method_name) {
+        push_hover_method_relation_target(current_symbol, method, seen_symbols, targets);
+        return true;
+    }
+
+    let Some(parent) = hover_index_type_symbol(index, parent_fqn) else {
+        return false;
+    };
+    for next_parent_fqn in &parent.extends {
+        if collect_first_hover_parent_method_target(
+            index,
+            next_parent_fqn,
+            method_name,
+            current_symbol,
+            visited_types,
+            seen_symbols,
+            targets,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn push_hover_method_relation_target(
+    current_symbol: &php_lsp_types::SymbolInfo,
+    target: php_lsp_types::SymbolInfo,
+    seen_symbols: &mut std::collections::HashSet<String>,
+    targets: &mut Vec<php_lsp_types::SymbolInfo>,
+) {
+    if target.fqn == current_symbol.fqn
+        && target.uri == current_symbol.uri
+        && target.selection_range == current_symbol.selection_range
+    {
+        return;
+    }
+    let key = format!(
+        "{}|{}|{:?}",
+        normalized_hover_relation_target(&target.fqn),
+        target.uri,
+        target.selection_range
+    );
+    if seen_symbols.insert(key) {
+        targets.push(target);
+    }
+}
+
+fn hover_direct_method_for_type(
+    index: &WorkspaceIndex,
+    type_fqn: &str,
+    method_name: &str,
+) -> Option<php_lsp_types::SymbolInfo> {
+    let type_symbol = hover_index_type_symbol(index, type_fqn)?;
+    let file_symbols = index.file_symbols.get(&type_symbol.uri)?;
+    file_symbols
+        .symbols
+        .iter()
+        .find(|candidate| {
+            candidate.kind == php_lsp_types::PhpSymbolKind::Method
+                && candidate.name == method_name
+                && candidate.parent_fqn.as_deref().is_some_and(|parent_fqn| {
+                    normalized_hover_relation_target(parent_fqn)
+                        == normalized_hover_relation_target(type_fqn)
+                })
+        })
+        .cloned()
+}
+
+fn hover_index_type_symbol(
+    index: &WorkspaceIndex,
+    type_fqn: &str,
+) -> Option<php_lsp_types::SymbolInfo> {
+    index
+        .types
+        .get(type_fqn.trim_start_matches('\\'))
+        .map(|symbol| symbol.value().as_ref().clone())
 }
 
 fn append_hover_relation_line(

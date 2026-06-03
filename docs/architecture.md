@@ -217,7 +217,7 @@ from the `vendor` cache namespace.
 
 | Feature area | LSP/server entry point | Parser/completion layer | Index/cache layer | Primary tests |
 |---|---|---|---|---|
-| Hover | `src/lsp/hover.rs`, shared parameter/type Markdown helpers in `src/lsp/completion_helpers.rs` | `resolve.rs`, PHPDoc helpers, indexed PHP 8 attribute extraction | `workspace.rs` symbol lookup plus `SymbolInfo` source ranges, attributes, relations, templates, and bindings | `tests/e2e_hover.rs` |
+| Hover | `src/lsp/hover.rs`, shared parameter/type Markdown helpers in `src/lsp/completion_helpers.rs` | `resolve.rs`, PHPDoc helpers, indexed PHP 8 attribute extraction | `workspace.rs` symbol lookup plus `SymbolInfo` source ranges, attributes, class/method relations, templates, and bindings | `tests/e2e_hover.rs` |
 | Definition/declaration/type definition | `src/lsp/definition.rs` | `resolve.rs` | `workspace.rs`, lazy vendor lookup | `tests/e2e_definition.rs` |
 | Completion | `src/lsp/completion.rs` | `php-lsp-completion/src/context.rs`, `provider.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + `tests/e2e_completion.rs` |
 | Signature help | `src/lsp/completion.rs` | call/member resolution helpers | `workspace.rs` signature lookup | `tests/e2e_completion.rs` |

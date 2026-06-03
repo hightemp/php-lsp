@@ -572,6 +572,215 @@ $repo = new UserRepository();
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_method_implements_and_overrides_links() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App\Contracts {
+class Request {}
+class Response {}
+interface Handler
+{
+    public function handle(Request $request): Response;
+}
+}
+
+namespace App\Service {
+use App\Contracts\Handler;
+use App\Contracts\Request;
+use App\Contracts\Response;
+
+class BaseHandler
+{
+    public function handle(Request $request): Response { return new Response(); }
+}
+
+final class ChildHandler extends BaseHandler implements Handler
+{
+    public function handle(Request $request): Response { return new Response(); }
+}
+
+$handler = new ChildHandler();
+$handler->handle(new Request());
+}
+"#;
+    let uri = "file:///test/hover-method-relations.php";
+    let position = utf16_position_at(code, "handle(new Request");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, position.0, position.1))
+        .await
+        .unwrap();
+    let hover = hover_markdown_value(&extract_result(hover));
+
+    assert!(
+        hover.contains("**Implements:**")
+            && hover.contains(&format!("[`App\\Contracts\\Handler::handle`](<{}#L", uri)),
+        "expected method-level implements link to interface declaration, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("**Overrides:**")
+            && hover.contains(&format!("[`App\\Service\\BaseHandler::handle`](<{}#L", uri)),
+        "expected method-level overrides link to parent method declaration, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_method_implements_vendor_interface_link() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-hover-method-relations-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    let vendor_dir = tmp_root.join("vendor/doctrine/persistence/src");
+    let src_dir = tmp_root.join("src");
+    fs::create_dir_all(&vendor_dir).unwrap();
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let vendor_path = vendor_dir.join("ObjectManager.php");
+    let app_path = src_dir.join("EntityManager.php");
+    let root_uri = php_lsp_types::uri::path_to_uri(&tmp_root).unwrap();
+    let vendor_uri = php_lsp_types::uri::path_to_uri(&vendor_path).unwrap();
+    let app_uri = php_lsp_types::uri::path_to_uri(&app_path).unwrap();
+
+    let vendor_php = r#"<?php
+namespace Doctrine\Persistence;
+
+interface ObjectRepository {}
+
+interface ObjectManager
+{
+    public function getRepository(string $className): ObjectRepository;
+}
+"#;
+    let app_php = r#"<?php
+namespace App;
+
+use Doctrine\Persistence\ObjectManager;
+use Doctrine\Persistence\ObjectRepository;
+
+class User {}
+
+final class EntityManager implements ObjectManager
+{
+    public function getRepository(string $className): ObjectRepository
+    {
+        throw new \RuntimeException();
+    }
+}
+
+function run(EntityManager $em): void
+{
+    $em->getRepository(User::class);
+}
+"#;
+    fs::write(&vendor_path, vendor_php).unwrap();
+    fs::write(&app_path, app_php).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&vendor_uri, vendor_php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&app_uri, app_php))
+        .await
+        .unwrap();
+
+    let position = utf16_position_at(app_php, "getRepository(User");
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, &app_uri, position.0, position.1))
+        .await
+        .unwrap();
+    let hover = hover_markdown_value(&extract_result(hover));
+
+    assert!(
+        hover.contains("**Implements:**")
+            && hover.contains(&format!(
+                "[`Doctrine\\Persistence\\ObjectManager::getRepository`](<{}#L",
+                vendor_uri
+            )),
+        "expected method-level implements link to vendor interface declaration, got: {}",
+        hover
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_hover_doctrine_repository_extends_generic_binding() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
