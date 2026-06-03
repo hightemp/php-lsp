@@ -410,6 +410,11 @@ Current evidence:
   through type-preserving `filter` expressions and adds focused inlay coverage
   for append-built context arrays and Doctrine repository `findAll()` context
   variables. Mixed foreach values remain suppressed as inlay hints.
+- `H-HOVER-PHPSTORM-LIKE-MARKDOWN-2026-06-03` makes PHP hover signatures more
+  PHP-like and multi-line for non-trivial callables, while parameter sections
+  now include scalar, array, mixed, untyped, nullable, defaulted, by-reference,
+  variadic, and PHPDoc-refined parameters with descriptions and class links
+  where resolvable.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request

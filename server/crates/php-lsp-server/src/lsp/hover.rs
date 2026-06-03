@@ -211,44 +211,10 @@ impl PhpLspBackend {
 
             // PHP code block with signature
             content.push_str("```php\n");
-            if let Some(ref sig) = sym.signature {
-                // Function/method signature
-                content.push_str(kind_label);
-                content.push(' ');
-                content.push_str(&sym.fqn);
-                content.push('(');
-                for (i, param) in sig.params.iter().enumerate() {
-                    if i > 0 {
-                        content.push_str(", ");
-                    }
-                    if let Some(ref t) = param.type_info {
-                        content.push_str(&t.to_string());
-                        content.push(' ');
-                    }
-                    if param.is_variadic {
-                        content.push_str("...");
-                    }
-                    if param.is_by_ref {
-                        content.push('&');
-                    }
-                    content.push('$');
-                    content.push_str(&param.name);
-                    if let Some(ref def) = param.default_value {
-                        content.push_str(" = ");
-                        content.push_str(def);
-                    }
-                }
-                content.push(')');
-                if let Some(ref ret) = sig.return_type {
-                    content.push_str(": ");
-                    content.push_str(&ret.to_string());
-                }
-            } else {
-                content.push_str(kind_label);
-                content.push(' ');
-                content.push_str(&sym.fqn);
-            }
+            append_hover_symbol_declaration(&mut content, &sym, kind_label);
             content.push_str("\n```\n");
+
+            let parsed_phpdoc = sym.doc_comment.as_deref().map(parse_phpdoc);
 
             if let Some(parent_fqn) = sym.parent_fqn.as_deref() {
                 append_class_fqn_link_line(
@@ -261,13 +227,18 @@ impl PhpLspBackend {
             }
 
             if let Some(ref sig) = sym.signature {
-                append_param_type_link_lines(
+                let phpdoc_params = parsed_phpdoc
+                    .as_ref()
+                    .map(|phpdoc| phpdoc.params.as_slice())
+                    .unwrap_or(&[]);
+                append_signature_parameter_lines(
                     &mut content,
                     &self.index,
                     &hover_file_symbols,
                     type_owner_fqn,
                     &sym.uri,
                     &sig.params,
+                    phpdoc_params,
                 );
                 if let Some(ref ret) = sig.return_type {
                     append_type_link_line(
@@ -283,37 +254,11 @@ impl PhpLspBackend {
             }
 
             // PHPDoc summary
-            if let Some(ref doc) = sym.doc_comment {
-                let phpdoc = parse_phpdoc(doc);
+            if let Some(phpdoc) = parsed_phpdoc.as_ref() {
                 if let Some(ref summary) = phpdoc.summary {
                     content.push_str("\n---\n\n");
                     content.push_str(summary);
                     content.push('\n');
-                }
-
-                // @param descriptions
-                if !phpdoc.params.is_empty() {
-                    content.push_str("\n**Parameters:**\n\n");
-                    for p in &phpdoc.params {
-                        content.push_str("- `$");
-                        content.push_str(&p.name);
-                        content.push('`');
-                        if let Some(ref t) = p.type_info {
-                            content.push_str(" — ");
-                            content.push_str(&type_info_raw_with_links(
-                                &self.index,
-                                &hover_file_symbols,
-                                type_owner_fqn,
-                                &sym.uri,
-                                t,
-                            ));
-                        }
-                        if let Some(ref desc) = p.description {
-                            content.push_str(" — ");
-                            content.push_str(desc);
-                        }
-                        content.push('\n');
-                    }
                 }
 
                 // @return
@@ -334,7 +279,7 @@ impl PhpLspBackend {
                     &hover_file_symbols,
                     type_owner_fqn,
                     &sym.uri,
-                    &phpdoc,
+                    phpdoc,
                 ) {
                     content.push('\n');
                     content.push_str(&section);
@@ -530,4 +475,104 @@ fn hover_symbol_type_owner_fqn(symbol: &php_lsp_types::SymbolInfo) -> &str {
         return symbol.fqn.as_str();
     }
     ""
+}
+
+fn append_hover_symbol_declaration(
+    content: &mut String,
+    symbol: &php_lsp_types::SymbolInfo,
+    kind_label: &str,
+) {
+    if let Some(signature) = symbol.signature.as_ref() {
+        content.push_str(&hover_signature_prefix(symbol, kind_label));
+        content.push(' ');
+        content.push_str(&symbol.fqn);
+        if signature.params.is_empty() {
+            content.push_str("()");
+        } else {
+            content.push_str("(\n");
+            for (index, param) in signature.params.iter().enumerate() {
+                content.push_str("    ");
+                content.push_str(&format_signature_param(param));
+                if index + 1 != signature.params.len() {
+                    content.push(',');
+                }
+                content.push('\n');
+            }
+            content.push(')');
+        }
+        if let Some(return_type) = signature.return_type.as_ref() {
+            content.push_str(": ");
+            content.push_str(&return_type.to_string());
+        }
+        return;
+    }
+
+    content.push_str(&hover_symbol_prefix(symbol, kind_label));
+    content.push(' ');
+    content.push_str(&symbol.fqn);
+}
+
+fn hover_signature_prefix(symbol: &php_lsp_types::SymbolInfo, kind_label: &str) -> String {
+    match symbol.kind {
+        php_lsp_types::PhpSymbolKind::Method => {
+            let mut parts = vec![hover_visibility_label(symbol.visibility)];
+            push_hover_member_modifiers(&mut parts, symbol);
+            parts.push("function");
+            parts.join(" ")
+        }
+        php_lsp_types::PhpSymbolKind::Function => "function".to_string(),
+        _ => hover_symbol_prefix(symbol, kind_label),
+    }
+}
+
+fn hover_symbol_prefix(symbol: &php_lsp_types::SymbolInfo, kind_label: &str) -> String {
+    let mut parts = Vec::new();
+    match symbol.kind {
+        php_lsp_types::PhpSymbolKind::Method
+        | php_lsp_types::PhpSymbolKind::Property
+        | php_lsp_types::PhpSymbolKind::ClassConstant => {
+            parts.push(hover_visibility_label(symbol.visibility));
+            push_hover_member_modifiers(&mut parts, symbol);
+        }
+        php_lsp_types::PhpSymbolKind::Class
+        | php_lsp_types::PhpSymbolKind::Interface
+        | php_lsp_types::PhpSymbolKind::Trait
+        | php_lsp_types::PhpSymbolKind::Enum => {
+            if symbol.modifiers.is_abstract {
+                parts.push("abstract");
+            }
+            if symbol.modifiers.is_final {
+                parts.push("final");
+            }
+            if symbol.modifiers.is_readonly {
+                parts.push("readonly");
+            }
+        }
+        _ => {}
+    }
+    parts.push(kind_label);
+    parts.join(" ")
+}
+
+fn push_hover_member_modifiers(parts: &mut Vec<&str>, symbol: &php_lsp_types::SymbolInfo) {
+    if symbol.modifiers.is_abstract {
+        parts.push("abstract");
+    }
+    if symbol.modifiers.is_final {
+        parts.push("final");
+    }
+    if symbol.modifiers.is_static {
+        parts.push("static");
+    }
+    if symbol.modifiers.is_readonly {
+        parts.push("readonly");
+    }
+}
+
+fn hover_visibility_label(visibility: php_lsp_types::Visibility) -> &'static str {
+    match visibility {
+        php_lsp_types::Visibility::Public => "public",
+        php_lsp_types::Visibility::Protected => "protected",
+        php_lsp_types::Visibility::Private => "private",
+    }
 }

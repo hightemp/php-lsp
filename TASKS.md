@@ -4614,3 +4614,16 @@ change.
   - Validation: `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`, `cargo test -p php-lsp-server template::tests:: -- --nocapture`, `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
   - Validation: real BDPn JSON-RPC check after indexing/diagnostics confirmed `debug/permissions.html.twig` simple `checks` and filtered `checks|filter(...)` both return `: array<string, mixed>` inlay hints.
   - Validation: Verifier reported no blockers or remaining remarks.
+
+- [x] **H-HOVER-PHPSTORM-LIKE-MARKDOWN-2026-06-03** Сделать PHP hover полезнее и ближе к PhpStorm *(completed 2026-06-03)*
+  - Improve class/function/method hover formatting, readability, and source/type sections.
+  - Show useful descriptions for classes and methods from PHPDoc summaries.
+  - Describe every signature parameter in hover, including scalar, array, mixed, untyped, nullable, variadic, by-ref, defaulted, and PHPDoc-only parameters, not only parameters with class links.
+  - Keep clickable class links in parameter type, return type, and Type sections near signatures where a definition is known.
+  - Add focused e2e coverage for hover Markdown formatting and full parameter rendering.
+  - Implemented: PHP hover now renders PHP-like declarations with visibility/modifiers and multi-line signatures for non-trivial callables.
+  - Implemented: hover parameter sections are built from the full signature and PHPDoc, preserving scalar, array, mixed, untyped, defaulted, by-reference, variadic, nullable class-linked, and PHPDoc-only parameters with descriptions.
+  - Implemented: PHPDoc virtual `@method` hover reuses the same complete parameter section and class-link rendering.
+  - Docs: updated README, LSP feature matrix, architecture ownership notes, and production risk register.
+  - Validation: `cargo test -p php-lsp-server --test e2e_hover -- --nocapture`, `cargo test -p php-lsp-server --tests`, `cargo fmt --all --check`, `git diff --check`, and `cargo clippy -p php-lsp-server --all-targets -- -D warnings` passed.
+  - Validation: Verifier reported no findings and reran the focused hover parameter/class-link checks.

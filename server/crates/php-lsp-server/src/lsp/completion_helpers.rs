@@ -306,13 +306,14 @@ pub(in crate::server) fn phpdoc_virtual_member_markdown_with_links(
                     return_type,
                 );
             }
-            append_param_type_link_lines(
+            append_signature_parameter_lines(
                 &mut content,
                 index,
                 file_symbols,
                 owner_fqn,
                 uri,
                 &member.params,
+                &[],
             );
         }
     }
@@ -1067,29 +1068,124 @@ pub(in crate::server) fn append_class_fqn_link_line(
     content.push('\n');
 }
 
-pub(in crate::server) fn append_param_type_link_lines(
+pub(in crate::server) fn append_signature_parameter_lines(
     content: &mut String,
     index: &WorkspaceIndex,
     file_symbols: &php_lsp_types::FileSymbols,
     owner_fqn: &str,
     uri: &str,
     params: &[php_lsp_types::ParamInfo],
+    phpdoc_params: &[php_lsp_types::PhpDocParam],
 ) {
-    let lines = params
-        .iter()
-        .filter_map(|param| {
-            let type_info = param.type_info.as_ref()?;
-            let links =
-                markdown_type_info_class_links(index, file_symbols, owner_fqn, uri, type_info)?;
-            Some(format!("- `${}`: {}", param.name, links))
-        })
-        .collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    let mut seen_names = Vec::new();
+
+    for param in params {
+        let phpdoc_param = phpdoc_params
+            .iter()
+            .find(|candidate| same_param_name(&candidate.name, &param.name));
+        lines.push(signature_parameter_markdown_line(
+            index,
+            file_symbols,
+            owner_fqn,
+            uri,
+            param,
+            phpdoc_param,
+        ));
+        seen_names.push(normalized_param_name(&param.name));
+    }
+
+    for phpdoc_param in phpdoc_params {
+        let name = normalized_param_name(&phpdoc_param.name);
+        if seen_names.iter().any(|seen| seen == &name) {
+            continue;
+        }
+        lines.push(phpdoc_parameter_markdown_line(
+            index,
+            file_symbols,
+            owner_fqn,
+            uri,
+            phpdoc_param,
+        ));
+    }
+
     if lines.is_empty() {
         return;
     }
-    content.push_str("\n**Parameter Types:**\n\n");
+    content.push_str("\n**Parameters:**\n\n");
     content.push_str(&lines.join("\n"));
     content.push('\n');
+}
+
+fn signature_parameter_markdown_line(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    param: &php_lsp_types::ParamInfo,
+    phpdoc_param: Option<&php_lsp_types::PhpDocParam>,
+) -> String {
+    let mut line = format!("- `{}`: ", format_signature_param(param));
+    let type_info = param
+        .type_info
+        .as_ref()
+        .or_else(|| phpdoc_param.and_then(|doc| doc.type_info.as_ref()));
+    line.push_str(&parameter_type_markdown(
+        index,
+        file_symbols,
+        owner_fqn,
+        uri,
+        type_info,
+    ));
+    if let Some(description) = phpdoc_param.and_then(|doc| doc.description.as_deref()) {
+        line.push_str(" — ");
+        line.push_str(description);
+    }
+    line
+}
+
+fn phpdoc_parameter_markdown_line(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    param: &php_lsp_types::PhpDocParam,
+) -> String {
+    let mut line = format!("- `${}`: ", normalized_param_name(&param.name));
+    line.push_str(&parameter_type_markdown(
+        index,
+        file_symbols,
+        owner_fqn,
+        uri,
+        param.type_info.as_ref(),
+    ));
+    if let Some(description) = param.description.as_deref() {
+        line.push_str(" — ");
+        line.push_str(description);
+    }
+    line
+}
+
+fn parameter_type_markdown(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: Option<&php_lsp_types::TypeInfo>,
+) -> String {
+    let Some(type_info) = type_info else {
+        return markdown_code_span("untyped");
+    };
+    markdown_type_info_class_links(index, file_symbols, owner_fqn, uri, type_info)
+        .unwrap_or_else(|| markdown_code_span(&type_info.to_string()))
+}
+
+fn same_param_name(left: &str, right: &str) -> bool {
+    normalized_param_name(left) == normalized_param_name(right)
+}
+
+fn normalized_param_name(name: &str) -> String {
+    name.trim_start_matches('$').to_string()
 }
 
 fn append_inline_type_links(

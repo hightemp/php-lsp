@@ -235,10 +235,11 @@ class Service {
         hover
     );
     assert!(
-        hover.contains("**Parameter Types:**")
-            && hover
-                .contains("- `$user`: [`User`](<file:///test/hover-signature-class-links.php#L4>)"),
-        "expected parameter class link in signature hover, got: {}",
+        hover.contains("**Parameters:**")
+            && hover.contains(
+                "- `User $user`: [`User`](<file:///test/hover-signature-class-links.php#L4>)"
+            ),
+        "expected linked parameter detail in signature hover, got: {}",
         hover
     );
     assert!(
@@ -246,6 +247,146 @@ class Service {
             "**Returns:** [`Response`](<file:///test/hover-signature-class-links.php#L5>)"
         ),
         "expected return class link in signature hover, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_parameters_section_includes_all_signature_params() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class DataRequest {}
+class Response {}
+
+class Service {
+    /**
+     * Configure request handling.
+     *
+     * @param DataRequest $request Current request entity
+     * @param array<string, mixed> $criteria Search criteria
+     * @param mixed $payload Raw payload
+     */
+    public function configure(
+        DataRequest $request,
+        &$counter,
+        $raw,
+        array $criteria = [],
+        mixed $payload = null,
+        ?Response $response = null,
+        string ...$tags
+    ): Response {
+        return new Response();
+    }
+}
+"#;
+    let uri = "file:///test/hover-rich-parameters.php";
+    let configure_position = utf16_position_at(code, "configure(");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            uri,
+            configure_position.0,
+            configure_position.1,
+        ))
+        .await
+        .unwrap();
+    let hover = hover_markdown_value(&extract_result(hover));
+
+    assert!(
+        hover.contains("```php\npublic function App\\Service::configure("),
+        "expected PHP-highlighted multiline function signature, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("Configure request handling."),
+        "expected PHPDoc summary in hover, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("**Parameters:**"),
+        "expected parameter section, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(
+            "- `DataRequest $request`: [`DataRequest`](<file:///test/hover-rich-parameters.php#L4>) — Current request entity"
+        ),
+        "expected class parameter with description, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("- `&$counter`: `untyped`"),
+        "expected by-reference untyped parameter, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("- `$raw`: `untyped`"),
+        "expected plain untyped parameter, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(
+            "- `array<string, mixed> $criteria = []`: `array<string, mixed>` — Search criteria"
+        ),
+        "expected PHPDoc-refined array parameter with description, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("- `mixed $payload = null`: `mixed` — Raw payload"),
+        "expected mixed parameter with description, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains(
+            "- `?Response $response = null`: ?[`Response`](<file:///test/hover-rich-parameters.php#L5>)"
+        ),
+        "expected nullable class parameter link, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("- `string ...$tags`: `string`"),
+        "expected variadic scalar parameter, got: {}",
         hover
     );
 
@@ -365,7 +506,7 @@ function demo(Supported $subject, User $fallback): void {
                 "**Returns:** [`App\\User`](<file:///test/hover-phpdoc-class-links.php#L4>)"
             )
             && method_hover.contains(
-                "- `$fallback`: [`User`](<file:///test/hover-phpdoc-class-links.php#L4>)"
+                "- `User $fallback`: [`User`](<file:///test/hover-phpdoc-class-links.php#L4>)"
             ),
         "expected virtual method type links, got: {}",
         method_hover
@@ -1391,7 +1532,7 @@ function parse(string $responseXml): void {
     );
     let method_hover = hover_markdown_value(&method_hover);
     assert!(
-        method_hover.contains("method SimpleXMLElement::registerXPathNamespace"),
+        method_hover.contains("public function SimpleXMLElement::registerXPathNamespace"),
         "expected method hover on SimpleXMLElement receiver, got: {}",
         method_hover
     );
@@ -1743,7 +1884,8 @@ function update(Order $order): void {
     let sku_hover_result = extract_result(sku_hover_response);
     let sku_hover = hover_markdown_value(&sku_hover_result);
     assert!(
-        sku_hover.contains("method App\\Entity\\OrderItem::sku") && sku_hover.contains(": string"),
+        sku_hover.contains("public function App\\Entity\\OrderItem::sku")
+            && sku_hover.contains(": string"),
         "expected method hover from Doctrine targetEntity foreach receiver, got: {}",
         sku_hover
     );
@@ -1763,7 +1905,7 @@ function update(Order $order): void {
     let get_status_hover_result = extract_result(get_status_hover_response);
     let get_status_hover = hover_markdown_value(&get_status_hover_result);
     assert!(
-        get_status_hover.contains("method App\\Entity\\OrderItem::getStatus")
+        get_status_hover.contains("public function App\\Entity\\OrderItem::getStatus")
             && get_status_hover.contains("?OrderStatus"),
         "expected nullable method hover from Doctrine targetEntity foreach receiver, got: {}",
         get_status_hover
