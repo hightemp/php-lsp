@@ -4651,12 +4651,22 @@ change.
   - Validation: `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
   - Validation: Verifier rerun reported no findings after constant coverage was added.
 
-- [ ] **H-HOVER-CLASS-RELATIONS-AND-TEMPLATES-2026-06-03** Показывать в hover class/interface relations, traits, templates и generic bindings
+- [x] **H-HOVER-CLASS-RELATIONS-AND-TEMPLATES-2026-06-03** Показывать в hover class/interface relations, traits, templates и generic bindings *(completed 2026-06-03)*
   - Use existing `SymbolInfo.extends`, `implements`, `traits`, `templates`, and `template_bindings` instead of reparsing source ad hoc.
   - Add linked sections matching the useful PhpStorm parts: `Extends`, `Implements`, `Uses`, `Templates`, and generic bindings from `@extends`, `@implements`, `@use`, `@mixin`.
   - Render template bounds and variance where available, e.g. `T of object`, covariant/contravariant template params.
   - Avoid duplicate lines when native `implements` and PHPDoc `@implements` point to the same target.
   - Add e2e coverage for Doctrine repository generics and ordinary PHP interfaces/traits.
+  - Implemented: indexed hover now renders `Extends`, `Implements`, `Uses`, and `Mixins` from `SymbolInfo.extends`, `implements`, `traits`, and PHPDoc `template_bindings`.
+  - Implemented: generic bindings from `@extends`, `@implements`, `@use`, and `@mixin` include linked targets and linked class args where resolvable.
+  - Implemented: template params render variance and bounds, including linked class bounds where resolvable.
+  - Implemented: native relation duplicates are suppressed when a PHPDoc generic binding refines the same target.
+  - Tests: added e2e coverage for ordinary PHP extends/implements/trait/mixin/template hover and Doctrine-style `ServiceEntityRepository<Entity>` hover.
+  - Docs: updated README, LSP feature matrix, architecture ownership notes, and production risk register.
+  - Validation: `cargo test -p php-lsp-server --test e2e_hover -- --nocapture` passed.
+  - Validation: `cargo test -p php-lsp-server --tests` passed.
+  - Validation: `cargo clippy -p php-lsp-server --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+  - Validation: Verifier reported no findings; residual risk is only that UI rendering was not manually checked in VS Code.
 
 - [ ] **H-HOVER-FRAMEWORK-ROLES-AND-ATTRIBUTES-2026-06-03** Добавить framework-aware role/attribute sections для Symfony и Doctrine hover
   - Show concise role metadata similar to PhpStorm, for example `Entity`, `Repository`, `Controller`, `FormType`, `Service`, when inferred from attributes, inheritance, implemented interfaces, or framework provider metadata.

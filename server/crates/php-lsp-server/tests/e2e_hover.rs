@@ -431,6 +431,238 @@ class Settings
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_class_relations_templates_and_generic_bindings() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace Vendor\Repository {
+class BaseRepository {}
+}
+
+namespace Vendor\Contracts {
+interface Auditable {}
+interface Traceable {}
+}
+
+namespace Vendor\Traits {
+trait Timestamped {}
+}
+
+namespace Vendor {
+class Builder {}
+}
+
+namespace App\Entity {
+class User {}
+}
+
+namespace App\Repository {
+
+use Vendor\Repository\BaseRepository;
+use Vendor\Contracts\Auditable;
+use Vendor\Contracts\Traceable;
+use Vendor\Traits\Timestamped;
+use Vendor\Builder;
+use App\Entity\User;
+
+/**
+ * Repository docs.
+ *
+ * @template-covariant TEntity of User
+ * @template TKey of int
+ * @extends BaseRepository<TEntity>
+ * @implements Auditable<User>
+ * @use Timestamped<TEntity>
+ * @mixin Builder<TEntity>
+ */
+class UserRepository extends BaseRepository implements Auditable, Traceable
+{
+    use Timestamped;
+}
+
+$repo = new UserRepository();
+}
+"#;
+    let uri = "file:///test/hover-class-relations.php";
+    let position = utf16_position_at(code, "UserRepository();");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, position.0, position.1))
+        .await
+        .unwrap();
+    let hover = hover_markdown_value(&extract_result(hover));
+
+    assert!(
+        hover.contains("**Extends:**")
+            && hover.contains("[`Vendor\\Repository\\BaseRepository`](<file:///test/hover-class-relations.php#L3>)&lt;`TEntity`&gt;"),
+        "expected generic @extends relation with linked target, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("**Implements:**")
+            && hover.contains("[`Vendor\\Contracts\\Auditable`](<file:///test/hover-class-relations.php#L7>)&lt;[`App\\Entity\\User`](<file:///test/hover-class-relations.php#L20>)&gt;")
+            && hover.contains("[`Vendor\\Contracts\\Traceable`](<file:///test/hover-class-relations.php#L8>)"),
+        "expected native and generic implements relations with links, got: {}",
+        hover
+    );
+    assert_eq!(
+        hover.matches("Vendor\\Contracts\\Auditable").count(),
+        1,
+        "native implements duplicate should be suppressed when @implements refines the same target, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("**Uses:**")
+            && hover.contains("[`Vendor\\Traits\\Timestamped`](<file:///test/hover-class-relations.php#L12>)&lt;`TEntity`&gt;"),
+        "expected generic @use relation with linked trait target, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("**Mixins:**")
+            && hover.contains("[`Vendor\\Builder`](<file:///test/hover-class-relations.php#L16>)&lt;`TEntity`&gt;"),
+        "expected generic @mixin relation with linked target, got: {}",
+        hover
+    );
+    assert!(
+        hover.contains("**Templates:**")
+            && hover.contains(
+                "- `covariant TEntity` of [`User`](<file:///test/hover-class-relations.php#L20>)"
+            )
+            && hover.contains("- `TKey` of `int`"),
+        "expected template variance and bounds in hover, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_hover_doctrine_repository_extends_generic_binding() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace Doctrine\Bundle\DoctrineBundle\Repository {
+/**
+ * @template TEntity of object
+ */
+class ServiceEntityRepository {}
+}
+
+namespace App\Entity {
+class DataRequest {}
+}
+
+namespace App\Repository {
+
+use App\Entity\DataRequest;
+use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+
+/**
+ * @extends ServiceEntityRepository<DataRequest>
+ */
+class DataRequestRepository extends ServiceEntityRepository {}
+
+$repo = new DataRequestRepository();
+}
+"#;
+    let uri = "file:///test/hover-doctrine-repository-generic.php";
+    let position = utf16_position_at(code, "DataRequestRepository();");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, position.0, position.1))
+        .await
+        .unwrap();
+    let hover = hover_markdown_value(&extract_result(hover));
+
+    assert!(
+        hover.contains("**Extends:**")
+            && hover.contains("[`Doctrine\\Bundle\\DoctrineBundle\\Repository\\ServiceEntityRepository`](<file:///test/hover-doctrine-repository-generic.php#L6>)&lt;[`App\\Entity\\DataRequest`](<file:///test/hover-doctrine-repository-generic.php#L10>)&gt;"),
+        "expected Doctrine repository generic @extends binding with entity link, got: {}",
+        hover
+    );
+    assert_eq!(
+        hover
+            .matches("Doctrine\\Bundle\\DoctrineBundle\\Repository\\ServiceEntityRepository")
+            .count(),
+        1,
+        "native extends duplicate should be suppressed when @extends refines the same target, got: {}",
+        hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_hover_parameters_section_includes_all_signature_params() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

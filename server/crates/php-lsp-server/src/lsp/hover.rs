@@ -227,6 +227,12 @@ impl PhpLspBackend {
                 );
             }
             append_hover_symbol_source_line(&mut content, &sym);
+            append_hover_relation_and_template_lines(
+                &mut content,
+                &self.index,
+                &hover_file_symbols,
+                &sym,
+            );
 
             if let Some(ref sig) = sym.signature {
                 let phpdoc_params = parsed_phpdoc
@@ -645,6 +651,225 @@ fn hover_symbol_source_label(symbol: &php_lsp_types::SymbolInfo) -> String {
         return format!("{}:{line}", path.display());
     }
     format!("{}:{line}", symbol.uri)
+}
+
+fn append_hover_relation_and_template_lines(
+    content: &mut String,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+) {
+    let owner_fqn = hover_symbol_type_owner_fqn(symbol);
+    let ctx = HoverRelationContext {
+        index,
+        file_symbols,
+        owner_fqn,
+        symbol,
+    };
+    append_hover_relation_line(
+        content,
+        "Extends",
+        &ctx,
+        &symbol.extends,
+        php_lsp_types::TemplateBindingKind::Extends,
+    );
+    append_hover_relation_line(
+        content,
+        "Implements",
+        &ctx,
+        &symbol.implements,
+        php_lsp_types::TemplateBindingKind::Implements,
+    );
+    append_hover_relation_line(
+        content,
+        "Uses",
+        &ctx,
+        &symbol.traits,
+        php_lsp_types::TemplateBindingKind::Use,
+    );
+    append_hover_relation_line(
+        content,
+        "Mixins",
+        &ctx,
+        &[],
+        php_lsp_types::TemplateBindingKind::Mixin,
+    );
+    append_hover_templates_section(content, index, file_symbols, owner_fqn, symbol);
+}
+
+struct HoverRelationContext<'a> {
+    index: &'a WorkspaceIndex,
+    file_symbols: &'a php_lsp_types::FileSymbols,
+    owner_fqn: &'a str,
+    symbol: &'a php_lsp_types::SymbolInfo,
+}
+
+fn append_hover_relation_line(
+    content: &mut String,
+    label: &str,
+    ctx: &HoverRelationContext<'_>,
+    native_targets: &[String],
+    binding_kind: php_lsp_types::TemplateBindingKind,
+) {
+    let binding_targets = ctx
+        .symbol
+        .template_bindings
+        .iter()
+        .filter(|binding| binding.kind == binding_kind)
+        .map(|binding| normalized_hover_relation_target(&binding.target))
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for binding in ctx
+        .symbol
+        .template_bindings
+        .iter()
+        .filter(|binding| binding.kind == binding_kind)
+    {
+        let key = hover_relation_entry_key(&binding.target, &binding.args);
+        if seen.insert(key) {
+            entries.push(hover_relation_entry_markdown(
+                ctx.index,
+                ctx.file_symbols,
+                ctx.owner_fqn,
+                ctx.symbol,
+                &binding.target,
+                &binding.args,
+            ));
+        }
+    }
+
+    for target in native_targets {
+        if binding_targets.contains(&normalized_hover_relation_target(target)) {
+            continue;
+        }
+        let key = hover_relation_entry_key(target, &[]);
+        if seen.insert(key) {
+            entries.push(hover_relation_entry_markdown(
+                ctx.index,
+                ctx.file_symbols,
+                ctx.owner_fqn,
+                ctx.symbol,
+                target,
+                &[],
+            ));
+        }
+    }
+
+    if entries.is_empty() {
+        return;
+    }
+
+    content.push('\n');
+    content.push_str("**");
+    content.push_str(label);
+    content.push_str(":** ");
+    content.push_str(&entries.join(", "));
+    content.push('\n');
+}
+
+fn hover_relation_entry_markdown(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+    target: &str,
+    args: &[php_lsp_types::TypeInfo],
+) -> String {
+    let mut entry = hover_type_info_markdown(
+        index,
+        file_symbols,
+        owner_fqn,
+        &symbol.uri,
+        &php_lsp_types::TypeInfo::Simple(target.to_string()),
+    );
+    if !args.is_empty() {
+        let args = args
+            .iter()
+            .map(|arg| hover_type_info_markdown(index, file_symbols, owner_fqn, &symbol.uri, arg))
+            .collect::<Vec<_>>()
+            .join(", ");
+        entry.push_str("&lt;");
+        entry.push_str(&args);
+        entry.push_str("&gt;");
+    }
+    entry
+}
+
+fn append_hover_templates_section(
+    content: &mut String,
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    symbol: &php_lsp_types::SymbolInfo,
+) {
+    if symbol.templates.is_empty() {
+        return;
+    }
+
+    let lines = symbol
+        .templates
+        .iter()
+        .map(|template| {
+            let mut label = String::new();
+            match template.variance {
+                php_lsp_types::TemplateVariance::Invariant => {}
+                php_lsp_types::TemplateVariance::Covariant => label.push_str("covariant "),
+                php_lsp_types::TemplateVariance::Contravariant => {
+                    label.push_str("contravariant ");
+                }
+            }
+            label.push_str(&template.name);
+            let mut line = format!("- {}", markdown_code_span(&label));
+            if let Some(bound) = template.bound.as_ref() {
+                line.push_str(" of ");
+                line.push_str(&hover_type_info_markdown(
+                    index,
+                    file_symbols,
+                    owner_fqn,
+                    &symbol.uri,
+                    bound,
+                ));
+            }
+            line
+        })
+        .collect::<Vec<_>>();
+
+    content.push_str("\n**Templates:**\n\n");
+    content.push_str(&lines.join("\n"));
+    content.push('\n');
+}
+
+fn hover_type_info_markdown(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> String {
+    markdown_type_info_class_links(index, file_symbols, owner_fqn, uri, type_info)
+        .unwrap_or_else(|| markdown_code_span(&type_info.to_string()))
+}
+
+fn hover_relation_entry_key(target: &str, args: &[php_lsp_types::TypeInfo]) -> String {
+    let mut key = normalized_hover_relation_target(target);
+    if !args.is_empty() {
+        key.push('<');
+        key.push_str(
+            &args
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        key.push('>');
+    }
+    key
+}
+
+fn normalized_hover_relation_target(target: &str) -> String {
+    target.trim_start_matches('\\').to_ascii_lowercase()
 }
 
 fn hover_signature_prefix(symbol: &php_lsp_types::SymbolInfo, kind_label: &str) -> String {

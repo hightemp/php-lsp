@@ -419,6 +419,9 @@ Current evidence:
   declarations source-like by moving FQNs out of the PHP code block and adding
   linked `Symbol` and `Source` metadata for PHP, vendor-path, and mapped Twig
   getter hovers.
+- `H-HOVER-CLASS-RELATIONS-AND-TEMPLATES-2026-06-03` surfaces indexed
+  `extends`, `implements`, trait uses, PHPDoc mixins, template params, and
+  generic bindings in hover without reparsing source in the request path.
 - `PHB-016` tightened PHPDoc literal parsing for scalar numeric forms while
   leaving unsupported or malformed forms as non-literal types.
 - `IE-045` fixture audit over `test-fixtures/lsp-cases` passed with no request
