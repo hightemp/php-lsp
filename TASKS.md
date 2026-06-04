@@ -4754,3 +4754,14 @@ change.
   - Avoid duplicate `Returns` when native return type and PHPDoc `@return` are equivalent; keep both only when PHPDoc refines native `mixed`/`object`/generic types.
   - Make long parameter lists and array-shape/generic types readable without relying on VS Code wrapping quirks.
   - Add snapshot-style e2e assertions for representative hover Markdown blocks.
+
+- [x] **H-DIAGNOSTICS-BDPN-DATAREQUESTCONTROLLER-FALSE-WARNINGS-2026-06-04** Исправить ложные warning diagnostics в `DataRequestController.php` *(done 2026-06-04)*
+  - Reproduce diagnostics on `/home/apanov/Projects/bdpn-ui/app/src/Controller/DataRequestController.php`.
+  - Identify which warnings are false positives and which resolver/index path causes them.
+  - Fix generically without hardcoding BDPn paths/classes.
+  - Add focused regression tests and update docs/TASKS if behavior or diagnostics architecture changes.
+  - Reproduced: initial CLI analyze reported 2 false warnings for `empty(...)` as `Unknown function: App\Controller\empty`.
+  - Implemented: parser semantic diagnostics now skip unqualified PHP language constructs that can use call-like syntax before function resolver/namespace fallback checks.
+  - Tests: added focused namespace regression coverage for `empty`, `isset`, `unset`, `eval`, `print`, `exit`, and `die`.
+  - Docs: updated architecture notes for language constructs in unknown-function diagnostics.
+  - Validation: focused parser regression test passed, CLI analyze on the BDPn `DataRequestController.php` now reports `diagnostics: 0`, and `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.

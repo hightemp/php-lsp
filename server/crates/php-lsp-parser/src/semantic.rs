@@ -52,6 +52,11 @@ const BUILTIN_TYPE_NAMES: &[&str] = &[
     "null", "void", "never", "mixed", "callable", "iterable", "true", "false", "resource",
 ];
 
+/// PHP language constructs may use call-like syntax but are not resolvable
+/// functions and should not produce unknown-function diagnostics.
+const LANGUAGE_CONSTRUCT_CALLS: &[&str] =
+    &["die", "empty", "eval", "exit", "isset", "print", "unset"];
+
 /// Extract semantic diagnostics from a file.
 ///
 /// `resolver` is called with a FQN to look up a symbol in the index.
@@ -352,6 +357,9 @@ fn check_function_call<F>(
         let nk = name_node.kind();
         if nk == "name" || nk == "qualified_name" || nk == "namespace_name" {
             let name = &source[name_node.byte_range()];
+            if is_language_construct_call(name) {
+                return;
+            }
 
             let fqn = resolve_function_name(name, file_symbols);
 
@@ -477,6 +485,13 @@ where
 
 fn is_unqualified_name(name: &str) -> bool {
     !name.starts_with('\\') && !name.contains('\\')
+}
+
+fn is_language_construct_call(name: &str) -> bool {
+    is_unqualified_name(name)
+        && LANGUAGE_CONSTRUCT_CALLS
+            .iter()
+            .any(|construct| name.eq_ignore_ascii_case(construct))
 }
 
 /// Whether we should check a class name against the index.
@@ -1687,6 +1702,34 @@ missing_helper();
         assert!(unknown_funcs[0]
             .message
             .contains("Unknown function: App\\missing_helper"));
+    }
+
+    #[test]
+    fn test_language_construct_calls_do_not_report_unknown_functions_in_namespace() {
+        let code = r#"<?php
+namespace App\Controller;
+
+$value = "code";
+empty($value);
+isset($value);
+unset($value);
+eval($value);
+print($value);
+exit($value);
+die($value);
+"#;
+        let diags = parse_and_check(code, |_fqn| None);
+
+        let unknown_funcs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.kind == SemanticDiagnosticKind::UnknownFunction)
+            .collect();
+
+        assert!(
+            unknown_funcs.is_empty(),
+            "Expected language constructs to avoid unknown function diagnostics, got: {:?}",
+            unknown_funcs
+        );
     }
 
     #[test]

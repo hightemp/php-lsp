@@ -645,7 +645,9 @@ Unknown function diagnostics use PHP's namespace fallback order. Explicitly
 qualified calls and `use function` aliases must resolve to the indexed symbol
 they name. Unqualified calls are checked against the current namespace first and
 then the global function table, which is where bundled PHP stubs expose built-in
-functions. A diagnostic is emitted only when those fallbacks do not resolve.
+functions. PHP language constructs that can use call-like syntax, such as
+`empty(...)`, are not treated as resolvable functions. A diagnostic is emitted
+only when those fallbacks do not resolve.
 
 Type compatibility diagnostics are intentionally approximate. They compare
 known literal/scalar values, class names, arrays, array/object shapes,
