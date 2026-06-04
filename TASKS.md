@@ -4906,13 +4906,22 @@ change.
   - Validation: `cargo test -p php-lsp-parser resolve -- --nocapture`, focused server regression, `cargo fmt --all --check`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` passed.
   - Docs: not updated; this is an internal diagnostics/type-resolution bugfix with no new user-facing feature or config.
 
-- [ ] **H-DIAGNOSTICS-COMPACT-STRING-VARIABLE-USAGE-2026-06-04** Treat `compact(...)` string arguments as variable reads
+- [x] **H-DIAGNOSTICS-COMPACT-STRING-VARIABLE-USAGE-2026-06-04** Treat `compact(...)` string arguments as variable reads *(done 2026-06-04)*
+  - Started 2026-06-04: reproduce BDPn false unused-variable warnings, teach semantic variable usage about PHP `compact(...)`, and add parser/server regression tests.
   - Reproduce BDPn `ExtendedServiceController` false unused-variable warnings for `$title`, `$fields`, and `$result`.
   - Mark `compact('title', 'fields', 'result')` and array/nested string forms supported by PHP as reads of the matching local variables.
   - Keep warnings for strings that do not correspond to declared variables if a separate undefined-variable diagnostic exists.
   - Add parser semantic tests for `compact` in namespaced and non-namespaced code.
   - Files:
     /home/apanov/Projects/bdpn-ui/app/src/Controller/ExtendedServiceController.php
+  - Implemented: parser semantic variable collection now treats PHP `compact(...)`/`\compact(...)` literal string arguments as synthetic reads of the corresponding local variables.
+  - Implemented: unqualified `compact(...)` uses PHP global-function fallback only when no `use function` import or known namespaced `compact` function shadows it.
+  - Implemented: nested array forms are traversed by value, dynamic variable-name arguments continue to be handled by the normal variable-read walker, and invalid/non-literal names are ignored instead of guessed.
+  - Validation: focused tests first reproduced the false unused/undefined behavior, then `cargo test -p php-lsp-parser compact -- --nocapture` passed with global, namespaced fallback, imported-function shadow, local-function shadow, nested-array, and undefined-variable cases.
+  - Validation: `cargo test -p php-lsp-parser semantic -- --nocapture` passed.
+  - Validation: BDPn `ExtendedServiceController.php` analyze now reports 0 diagnostics, removing the previous 27 `$title`/`$fields`/`$result` false unused-variable warnings.
+  - Validation: `cargo fmt --all --check`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` passed.
+  - Docs: not updated; this is an internal diagnostics bugfix with no new user-facing feature or config.
 
 - [ ] **H-DIAGNOSTICS-BOOLEAN-OPERATOR-RETURN-INFERENCE-2026-06-04** Infer comparison/logical expressions as `bool` for return diagnostics
   - Reproduce `Return type mismatch ... expected bool, got string` on a method returning `'' === $value || 1 === preg_match(...)`.

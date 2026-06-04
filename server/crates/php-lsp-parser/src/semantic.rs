@@ -857,7 +857,14 @@ fn check_variables_in_scope<F>(
     F: Fn(&str) -> Option<Arc<SymbolInfo>>,
 {
     let mut occurrences = Vec::new();
-    collect_variable_occurrences(scope, scope.id(), source, &mut occurrences);
+    collect_variable_occurrences(
+        scope,
+        scope.id(),
+        source,
+        file_symbols,
+        resolver,
+        &mut occurrences,
+    );
     report_variable_diagnostics(
         &occurrences,
         scope,
@@ -898,11 +905,17 @@ fn collect_variable_occurrences(
     node: tree_sitter::Node,
     scope_id: usize,
     source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &impl Fn(&str) -> Option<Arc<SymbolInfo>>,
     occurrences: &mut Vec<VariableOccurrence>,
 ) {
     if node.id() != scope_id && is_variable_scope(node) {
         collect_closure_use_reads(node, source, occurrences);
         return;
+    }
+
+    if is_builtin_compact_function_call(node, source, file_symbols, resolver) {
+        collect_compact_variable_reads(node, source, occurrences);
     }
 
     if node.kind() == "variable_name" && !is_non_local_variable_context(node) {
@@ -920,7 +933,7 @@ fn collect_variable_occurrences(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_variable_occurrences(child, scope_id, source, occurrences);
+        collect_variable_occurrences(child, scope_id, source, file_symbols, resolver, occurrences);
     }
 }
 
@@ -966,6 +979,216 @@ fn collect_variable_reads_in_node(
     for child in node.named_children(&mut cursor) {
         collect_variable_reads_in_node(child, source, occurrences);
     }
+}
+
+fn is_builtin_compact_function_call(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &impl Fn(&str) -> Option<Arc<SymbolInfo>>,
+) -> bool {
+    if node.kind() != "function_call_expression" {
+        return false;
+    }
+
+    let Some(function) = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))
+    else {
+        return false;
+    };
+
+    if function.kind() == "member_access_expression" {
+        return false;
+    }
+
+    let raw_name = source[function.byte_range()].trim();
+    if let Some(global_name) = raw_name.strip_prefix('\\') {
+        return !global_name.contains('\\') && global_name.eq_ignore_ascii_case("compact");
+    }
+
+    if !raw_name.eq_ignore_ascii_case("compact") {
+        return false;
+    }
+
+    let resolved_name = resolve_function_name(raw_name, file_symbols);
+    if resolved_name != raw_name {
+        return resolved_name == "compact";
+    }
+
+    if let Some(namespace) = &file_symbols.namespace {
+        let namespaced = format!("{}\\{}", namespace, raw_name);
+        if resolve_function_symbol(resolver, &namespaced).is_some() {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn collect_compact_variable_reads(
+    call: tree_sitter::Node,
+    source: &str,
+    occurrences: &mut Vec<VariableOccurrence>,
+) {
+    let Some(arguments) = call_arguments_node(call) else {
+        return;
+    };
+
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        let value = argument
+            .child_by_field_name("value")
+            .or_else(|| argument.named_child(0))
+            .unwrap_or(argument);
+        collect_compact_variable_reads_from_argument(value, source, occurrences);
+    }
+}
+
+fn call_arguments_node(call: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if let Some(arguments) = call.child_by_field_name("arguments") {
+        return Some(arguments);
+    }
+
+    let mut cursor = call.walk();
+    let arguments = call
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "arguments");
+    arguments
+}
+
+fn collect_compact_variable_reads_from_argument(
+    node: tree_sitter::Node,
+    source: &str,
+    occurrences: &mut Vec<VariableOccurrence>,
+) {
+    if let Some(name) = compact_variable_name_from_string_node(node, source) {
+        if !is_ignorable_variable(&name) {
+            occurrences.push(VariableOccurrence {
+                name,
+                range: node_range(&node),
+                start_byte: node.start_byte(),
+                declaration_kind: None,
+                null_coalesce_probe: false,
+            });
+        }
+        return;
+    }
+
+    if node.kind() == "array_element_initializer" {
+        if let Some(value) = node
+            .child_by_field_name("value")
+            .or_else(|| node.named_child(0))
+        {
+            collect_compact_variable_reads_from_argument(value, source, occurrences);
+        }
+        return;
+    }
+
+    if matches!(
+        node.kind(),
+        "array_creation_expression" | "parenthesized_expression"
+    ) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_compact_variable_reads_from_argument(child, source, occurrences);
+        }
+    }
+}
+
+fn compact_variable_name_from_string_node(node: tree_sitter::Node, source: &str) -> Option<String> {
+    if !matches!(node.kind(), "string" | "encapsed_string") {
+        return None;
+    }
+    if node.kind() == "encapsed_string" && node_has_descendant_kind(node, "variable_name") {
+        return None;
+    }
+
+    let value = static_php_string_literal_value(source[node.byte_range()].trim())?;
+    is_valid_compact_variable_name(&value).then(|| normalize_var_name(&value))
+}
+
+fn static_php_string_literal_value(raw: &str) -> Option<String> {
+    let mut chars = raw.char_indices();
+    let (first_idx, first) = chars.next()?;
+    let (quote_start, quote) = if matches!(first, 'b' | 'B') {
+        let (idx, ch) = chars.next()?;
+        (idx, ch)
+    } else {
+        (first_idx, first)
+    };
+
+    if !matches!(quote, '\'' | '"') || !raw.ends_with(quote) {
+        return None;
+    }
+
+    let content_start = quote_start + quote.len_utf8();
+    let content_end = raw.len().checked_sub(quote.len_utf8())?;
+    if content_start > content_end {
+        return None;
+    }
+
+    Some(unescape_static_php_string(
+        &raw[content_start..content_end],
+        quote,
+    ))
+}
+
+fn unescape_static_php_string(content: &str, quote: char) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        let Some(next) = chars.next() else {
+            out.push(ch);
+            break;
+        };
+
+        if next == '\\' || next == quote {
+            out.push(next);
+        } else {
+            out.push(ch);
+            out.push(next);
+        }
+    }
+
+    out
+}
+
+fn is_valid_compact_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    if first == '$' || !is_php_variable_name_start(first) {
+        return false;
+    }
+
+    chars.all(is_php_variable_name_continue)
+}
+
+fn is_php_variable_name_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic() || !ch.is_ascii()
+}
+
+fn is_php_variable_name_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric() || !ch.is_ascii()
+}
+
+fn node_has_descendant_kind(node: tree_sitter::Node, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == kind || node_has_descendant_kind(child, kind) {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_non_local_variable_context(node: tree_sitter::Node) -> bool {
@@ -1531,6 +1754,21 @@ mod tests {
             templates: vec![],
             template_bindings: vec![],
         })
+    }
+
+    fn variadic_param(name: &str) -> ParamInfo {
+        ParamInfo {
+            name: name.to_string(),
+            type_info: None,
+            default_value: None,
+            is_variadic: true,
+            is_by_ref: false,
+            is_promoted: false,
+        }
+    }
+
+    fn compact_function_resolver(fqn: &str) -> Option<Arc<SymbolInfo>> {
+        (fqn == "compact").then(|| function_symbol("compact", vec![variadic_param("var_name")]))
     }
 
     fn parse_and_check(
@@ -2207,6 +2445,155 @@ function run(): bool {
                     && d.message.contains("$maybeResult")
             }),
             "Null coalesce left operand should not be reported as undefined, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_compact_string_arguments_count_variables_as_reads() {
+        let code = r#"<?php
+function run(): array {
+    $title = 'Extended service';
+    $fields = [];
+    $result = null;
+    $names = ['extra'];
+
+    return compact('title', ['fields', ['result']], $names);
+}
+"#;
+        let diags = parse_and_check(code, compact_function_resolver);
+
+        for variable in ["$title", "$fields", "$result", "$names"] {
+            assert!(
+                !diags.iter().any(|d| {
+                    d.kind == SemanticDiagnosticKind::UnusedVariable && d.message.contains(variable)
+                }),
+                "`{variable}` should be counted as read by compact(...), got: {:?}",
+                diags
+            );
+        }
+    }
+
+    #[test]
+    fn test_namespaced_compact_string_arguments_count_variables_as_reads() {
+        let code = r#"<?php
+namespace App\Controller;
+
+function run(): array {
+    $title = 'Extended service';
+    $fields = [];
+    $result = null;
+
+    return compact('title', ['fields', ['result']]);
+}
+"#;
+        let diags = parse_and_check(code, compact_function_resolver);
+
+        for variable in ["$title", "$fields", "$result"] {
+            assert!(
+                !diags.iter().any(|d| {
+                    d.kind == SemanticDiagnosticKind::UnusedVariable && d.message.contains(variable)
+                }),
+                "`{variable}` should be counted as read by namespaced compact(...), got: {:?}",
+                diags
+            );
+        }
+    }
+
+    #[test]
+    fn test_global_compact_string_arguments_count_variables_as_reads() {
+        let code = r#"<?php
+namespace App\Controller;
+
+function run(): array {
+    $title = 'Extended service';
+
+    return \compact('title');
+}
+"#;
+        let diags = parse_and_check(code, compact_function_resolver);
+
+        assert!(
+            !diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedVariable && d.message.contains("$title")
+            }),
+            "`$title` should be counted as read by \\compact(...), got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_imported_compact_function_does_not_count_string_arguments_as_reads() {
+        let code = r#"<?php
+namespace App\Controller;
+
+use function Vendor\compact;
+
+function run(): array {
+    $title = 'Extended service';
+
+    return compact('title');
+}
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "Vendor\\compact" {
+                Some(function_symbol(fqn, vec![variadic_param("var_name")]))
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedVariable && d.message.contains("$title")
+            }),
+            "Imported non-builtin compact(...) should not read `$title`, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_namespaced_compact_function_does_not_count_string_arguments_as_reads() {
+        let code = r#"<?php
+namespace App\Controller;
+
+function compact(string ...$names): array
+{
+    return [];
+}
+
+function run(): array {
+    $title = 'Extended service';
+
+    return compact('title');
+}
+"#;
+        let diags = parse_and_check_with_file_resolver(code);
+
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UnusedVariable && d.message.contains("$title")
+            }),
+            "Namespaced non-builtin compact(...) should not read `$title`, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_compact_string_argument_can_report_undefined_variable() {
+        let code = r#"<?php
+function run(): array {
+    return compact('missing');
+}
+"#;
+        let diags = parse_and_check(code, compact_function_resolver);
+
+        assert!(
+            diags.iter().any(|d| {
+                d.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && d.message.contains("$missing")
+            }),
+            "Undefined compact(...) variables should still be reported, got: {:?}",
             diags
         );
     }
