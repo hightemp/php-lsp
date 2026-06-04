@@ -2537,11 +2537,50 @@ fn resolved_type_text_from_index(
         return resolved;
     }
 
-    if type_name.trim().starts_with('\\') || index.resolve_fqn(&resolved).is_some() {
+    if type_name.trim().starts_with('\\')
+        || index.resolve_fqn(&resolved).is_some()
+        || type_name_resolved_by_class_import(index, uri, type_name, &resolved)
+    {
         format!("\\{}", resolved.trim_start_matches('\\'))
     } else {
         resolved
     }
+}
+
+fn type_name_resolved_by_class_import(
+    index: &WorkspaceIndex,
+    uri: &str,
+    type_name: &str,
+    resolved: &str,
+) -> bool {
+    let type_name = type_name.trim().trim_start_matches('\\');
+    let Some(first_part) = type_name.split('\\').next().filter(|part| !part.is_empty()) else {
+        return false;
+    };
+    let resolved = resolved.trim_start_matches('\\');
+
+    index.file_symbols.get(uri).is_some_and(|file_symbols| {
+        file_symbols.use_statements.iter().any(|use_statement| {
+            if !matches!(use_statement.kind, php_lsp_types::UseKind::Class) {
+                return false;
+            }
+
+            let alias = use_statement.alias.as_deref().unwrap_or_else(|| {
+                use_statement
+                    .fqn
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(&use_statement.fqn)
+            });
+
+            let imported_fqn = use_statement.fqn.trim_start_matches('\\');
+            alias == first_part
+                && (resolved == imported_fqn
+                    || resolved
+                        .strip_prefix(imported_fqn)
+                        .is_some_and(|rest| rest.starts_with('\\')))
+        })
+    })
 }
 
 fn resolved_owner_type_text_from_index(index: &WorkspaceIndex, owner_fqn: &str) -> String {

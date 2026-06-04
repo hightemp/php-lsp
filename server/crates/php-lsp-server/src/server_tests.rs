@@ -1484,6 +1484,68 @@ class ImportedEntityHandler {
 }
 
 #[test]
+fn test_compute_diagnostics_does_not_double_qualify_imported_method_return_type() {
+    let repository_uri = "file:///src/Repository/FilesRepositoryInterface.php";
+    let service_uri = "file:///src/Service/FileService.php";
+    let repository_code = r#"<?php
+namespace App\Repository;
+
+use App\Entity\ImportedEntity;
+
+interface FilesRepositoryInterface {
+    public function findExisting(): ?ImportedEntity;
+}
+"#;
+    let service_code = r#"<?php
+namespace App\Service;
+
+use App\Entity\ImportedEntity;
+use App\Repository\FilesRepositoryInterface;
+
+final class FileService {
+    public function __construct(
+        private readonly FilesRepositoryInterface $filesRepository,
+    ) {}
+
+    public function run(): void
+    {
+        $existing = $this->filesRepository->findExisting();
+        $fileRecord = $existing ?? new ImportedEntity();
+        $fileRecord->setStatus('ready');
+    }
+}
+"#;
+
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(&index, repository_uri, repository_code);
+    let parser = parse_and_index_php_file(&index, service_uri, service_code);
+    assert_eq!(
+        super::lsp::completion_helpers::resolve_member_type_from_index(
+            &index,
+            "App\\Repository\\FilesRepositoryInterface",
+            "findExisting",
+        )
+        .as_deref(),
+        Some("?\\App\\Entity\\ImportedEntity")
+    );
+
+    let diagnostics = compute_diagnostics(
+        service_uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    assert_no_diagnostic_containing(
+        &messages,
+        "Unknown method: App\\Service\\App\\Entity\\ImportedEntity::setStatus",
+    );
+    assert_no_diagnostic_containing(&messages, "Unknown method:");
+}
+
+#[test]
 fn test_compute_diagnostics_resolves_members_from_conditional_interface_return_parent() {
     let vendor_uri = "file:///vendor/framework.php";
     let app_uri = "file:///src/Controller/DemoController.php";

@@ -4891,13 +4891,20 @@ change.
   - Validation: Verifier follow-up reported no blockers.
   - Docs: not updated; this is an internal diagnostics/type-resolution bugfix with no new user-facing feature or config.
 
-- [ ] **H-DIAGNOSTICS-IMPORTED-RETURN-TYPE-DOUBLE-QUALIFICATION-2026-06-04** Avoid re-relativizing already resolved imported return types
+- [x] **H-DIAGNOSTICS-IMPORTED-RETURN-TYPE-DOUBLE-QUALIFICATION-2026-06-04** Avoid re-relativizing already resolved imported return types *(done 2026-06-04)*
+  - Started 2026-06-04: reproducing BDPn imported repository return false positives and checking type text handoff between index-backed resolver and parser diagnostics.
   - Reproduce BDPn diagnostics such as `Unknown method: App\Service\App\Entity\PortingProcessFiles::setStatus`.
   - Use `PortingProcessFilesRepositoryInterface::findOneByPortingProcessAndEncFileName(...): ?PortingProcessFiles` as the representative shape: the declaring interface imports `App\Entity\PortingProcessFiles`, while the call site is in `App\Service`.
   - Preserve the declaring symbol's namespace/import context when carrying method return types to call-site member diagnostics.
   - Add tests that imported return types do not become `CurrentNamespace\App\Entity\...`.
   - Files:
     /home/apanov/Projects/bdpn-ui/app/src/Service/PortingProcessFileService.php
+  - Implemented: index-backed return type text now marks class imports from the declaring source as absolute even when the target class is not indexed yet.
+  - Implemented: parser variable inference stores already-resolved FQNs as absolute `TypeInfo` values, so `??`/union-style expression inference does not re-resolve them in the call-site namespace.
+  - Validation: regression test covers repository interface return `?ImportedEntity`, service-side `?? new ImportedEntity()`, and rejects `App\Service\App\Entity\...` unknown-member diagnostics.
+  - Validation: BDPn `PortingProcessFileService.php` analyze now reports 0 diagnostics; full BDPn `app/src` analyze reports no `App\Service\App\Entity`/`PortingProcessFiles` double-qualified member diagnostics.
+  - Validation: `cargo test -p php-lsp-parser resolve -- --nocapture`, focused server regression, `cargo fmt --all --check`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` passed.
+  - Docs: not updated; this is an internal diagnostics/type-resolution bugfix with no new user-facing feature or config.
 
 - [ ] **H-DIAGNOSTICS-COMPACT-STRING-VARIABLE-USAGE-2026-06-04** Treat `compact(...)` string arguments as variable reads
   - Reproduce BDPn `ExtendedServiceController` false unused-variable warnings for `$title`, `$fields`, and `$result`.

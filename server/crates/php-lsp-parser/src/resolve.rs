@@ -1615,6 +1615,22 @@ fn extract_type_name(type_node: Node, source: &str) -> Option<String> {
     }
 }
 
+fn resolved_fqn_type_info(resolved: &str) -> TypeInfo {
+    let resolved = resolved.trim();
+    if resolved.is_empty() {
+        return TypeInfo::Simple(String::new());
+    }
+
+    if !resolved.starts_with('\\')
+        && resolved.contains('\\')
+        && !is_builtin_non_object_type(resolved)
+    {
+        TypeInfo::Simple(format!("\\{resolved}"))
+    } else {
+        TypeInfo::Simple(resolved.to_string())
+    }
+}
+
 /// Scan a compound_statement for `$var = new ClassName()` before the usage point.
 fn find_variable_inference_before_usage(
     body: Node,
@@ -1708,7 +1724,7 @@ fn find_variable_inference_before_usage(
             } else if let Some(resolved) =
                 try_resolve_object_type(right, source, file_symbols, resolver, callable_resolver)
             {
-                let type_info = Some(TypeInfo::Simple(resolved.clone()));
+                let type_info = Some(resolved_fqn_type_info(&resolved));
                 inferred = Some((
                     stmt.start_byte(),
                     VariableInference {
@@ -1846,7 +1862,7 @@ fn find_nested_variable_inference_before_usage(
                         type_display: Some(resolved.clone()),
                         resolved_type_fqn: Some(resolved.clone()),
                         phpdoc_comment: None,
-                        type_info: Some(TypeInfo::Simple(resolved)),
+                        type_info: Some(resolved_fqn_type_info(&resolved)),
                     },
                 ));
             } else if let Some(type_info) =
@@ -1929,7 +1945,7 @@ fn instanceof_guard_inference(
         type_display: Some(class_name),
         resolved_type_fqn: Some(resolved.clone()),
         phpdoc_comment: None,
-        type_info: Some(TypeInfo::Simple(resolved)),
+        type_info: Some(resolved_fqn_type_info(&resolved)),
     })
 }
 
@@ -1960,7 +1976,7 @@ fn positive_instanceof_branch_inference(
         type_display: Some(class_name),
         resolved_type_fqn: Some(resolved.clone()),
         phpdoc_comment: None,
-        type_info: Some(TypeInfo::Simple(resolved)),
+        type_info: Some(resolved_fqn_type_info(&resolved)),
     })
 }
 
@@ -2301,7 +2317,7 @@ fn infer_variable_in_scope(
                                         file_symbols,
                                     );
                                     inferred.resolved_type_fqn = Some(resolved.clone());
-                                    inferred.type_info = Some(TypeInfo::Simple(resolved));
+                                    inferred.type_info = Some(resolved_fqn_type_info(&resolved));
                                 }
                             }
                             if inferred.type_info.is_none() {
