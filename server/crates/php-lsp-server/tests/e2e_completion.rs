@@ -1668,6 +1668,115 @@ function validate(object $object, mixed $method): void
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_static_stub_class_lists_constants_first() {
+    let stubs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
+    if !stubs_path.join("zip/zip.php").is_file() {
+        eprintln!(
+            "Skipping ZipArchive static completion test: zip stubs not initialized at {}",
+            stubs_path.display()
+        );
+        return;
+    }
+    let stubs_path = stubs_path.canonicalize().unwrap();
+
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-zip-static-completion-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&tmp_root).unwrap();
+    let root_uri = php_lsp_types::uri::path_to_uri(&tmp_root).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            Some(&root_uri),
+            Some(json!({
+                "stubsPath": stubs_path.to_string_lossy().to_string()
+            })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "stubsLoaded", Duration::from_secs(10)).await;
+
+    let code = "<?php\nfunction writeZip(): void\n{\n    \\ZipArchive::\n}\n";
+    let uri =
+        php_lsp_types::uri::path_to_uri(&tmp_root.join("ZipArchiveStaticCompletion.php")).unwrap();
+    let (line, character) = utf16_position_after(code, "\\ZipArchive::");
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(2, &uri, line, character))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let labels: Vec<String> = completion_items_from_result(&result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+
+    let create_pos = labels
+        .iter()
+        .position(|label| label == "CREATE")
+        .unwrap_or_else(|| panic!("expected ZipArchive::CREATE completion, got: {labels:?}"));
+    let overwrite_pos = labels
+        .iter()
+        .position(|label| label == "OVERWRITE")
+        .unwrap_or_else(|| panic!("expected ZipArchive::OVERWRITE completion, got: {labels:?}"));
+    let class_pos = labels
+        .iter()
+        .position(|label| label == "class")
+        .unwrap_or_else(|| panic!("expected ZipArchive::class completion, got: {labels:?}"));
+
+    assert!(
+        create_pos < class_pos && overwrite_pos < class_pos,
+        "ZipArchive class constants should sort before ::class, got: {labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label == "open" || label == "close"),
+        "instance methods should not appear in ZipArchive static completion, got: {labels:?}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_member_access_from_parenthesized_new_expression() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

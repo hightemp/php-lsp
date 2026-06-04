@@ -4900,3 +4900,22 @@ change.
   - Add tests for mixed scalar operands so boolean expressions do not inherit operand types.
   - Files:
     /home/apanov/Projects/bdpn-ui/app/src/Service/SftpCsv/SftpCsvArchivePreviewer.php
+
+- [x] **H-COMPLETION-STUB-STATIC-CONSTANT-ORDER-2026-06-04** Prioritize stub class constants in static autocomplete *(done 2026-06-04)*
+  - Reproduce `\ZipArchive::` completion with loaded phpstorm-stubs.
+  - Ensure class constants from extension stubs are available and sorted before methods for static access, with `::class` still present.
+  - Check static completion ordering generically, without hardcoding `ZipArchive`.
+  - Add unit/e2e coverage for stub static completion ordering.
+  - Implemented:
+    Static completion now ranks real class constants before `::class`, real methods, PHPDoc static virtual methods, and properties for all classes, including symbols loaded from stubs.
+  - Validation:
+    `cargo test -p php-lsp-completion test_static_completion_sorts_constants_before_methods_and_properties -- --nocapture`
+    `cargo test -p php-lsp-server --test e2e_completion test_completion_static_stub_class_lists_constants_first -- --nocapture`
+    `cargo test -p php-lsp-completion`
+    `cargo test -p php-lsp-server --test e2e_completion`
+    `cargo fmt --all --check`
+    `git diff --check`
+    `cargo clippy --all-targets -- -D warnings`
+    `cargo test --all`
+  - Docs:
+    No public configuration or user-facing documentation change needed.

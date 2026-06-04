@@ -273,6 +273,7 @@ fn add_phpdoc_virtual_member_completions(
                 &owner.fqn,
                 method,
                 member_prefix,
+                symbol_sort_rank(PhpSymbolKind::Method),
             ));
         }
 
@@ -313,6 +314,7 @@ fn add_phpdoc_static_virtual_method_completions(
                 &owner.fqn,
                 method,
                 member_prefix,
+                static_symbol_sort_rank(PhpSymbolKind::Method),
             ));
         }
     }
@@ -364,6 +366,7 @@ fn phpdoc_method_completion_item(
     owner_fqn: &str,
     method: &PhpDocMethod,
     member_prefix: &str,
+    sort_rank: &str,
 ) -> CompletionItem {
     let label = method.name.clone();
     CompletionItem {
@@ -372,7 +375,7 @@ fn phpdoc_method_completion_item(
         detail: Some(phpdoc_method_detail(method)),
         sort_text: Some(format!(
             "{}_{}_{}",
-            symbol_sort_rank(PhpSymbolKind::Method),
+            sort_rank,
             completion_prefix_rank(&label, Some(member_prefix)),
             label.to_ascii_lowercase()
         )),
@@ -501,7 +504,7 @@ fn class_pseudo_constant_completion_item(class_fqn: &str, member_prefix: &str) -
     };
     item.sort_text = Some(format!(
         "{}_{}_class",
-        symbol_sort_rank(PhpSymbolKind::ClassConstant),
+        static_class_pseudo_constant_sort_rank(),
         completion_prefix_rank(&item.label, Some(member_prefix))
     ));
     item
@@ -731,7 +734,7 @@ fn symbol_to_completion_item(
     };
     item.sort_text = Some(format!(
         "{}_{}_{}",
-        symbol_sort_rank(sym.kind),
+        completion_symbol_sort_rank(sym.kind, is_static_access),
         completion_prefix_rank(&item.label, member_prefix),
         item.label.to_ascii_lowercase()
     ));
@@ -805,6 +808,34 @@ fn symbol_sort_rank(kind: PhpSymbolKind) -> &'static str {
         }
         PhpSymbolKind::Namespace => "0500",
     }
+}
+
+fn completion_symbol_sort_rank(kind: PhpSymbolKind, is_static_access: bool) -> &'static str {
+    if is_static_access {
+        static_symbol_sort_rank(kind)
+    } else {
+        symbol_sort_rank(kind)
+    }
+}
+
+fn static_symbol_sort_rank(kind: PhpSymbolKind) -> &'static str {
+    match kind {
+        PhpSymbolKind::ClassConstant | PhpSymbolKind::GlobalConstant | PhpSymbolKind::EnumCase => {
+            "0100"
+        }
+        PhpSymbolKind::Method => "0200",
+        PhpSymbolKind::Property => "0201",
+        PhpSymbolKind::Function => "0300",
+        PhpSymbolKind::Class
+        | PhpSymbolKind::Interface
+        | PhpSymbolKind::Trait
+        | PhpSymbolKind::Enum => "0400",
+        PhpSymbolKind::Namespace => "0500",
+    }
+}
+
+fn static_class_pseudo_constant_sort_rank() -> &'static str {
+    "0101"
 }
 
 fn member_is_visible(
@@ -1642,6 +1673,75 @@ mod tests {
         assert!(
             !labels.contains(&"run"),
             "instance method should be hidden on `::`"
+        );
+    }
+
+    #[test]
+    fn test_static_completion_sorts_constants_before_methods_and_properties() {
+        let mut service = make_symbol(
+            "Service",
+            "App\\Service",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        );
+        service.doc_comment = Some("/**\n * @method static self zip()\n */".to_string());
+        let file_symbols = FileSymbols {
+            namespace: Some("App".to_string()),
+            use_statements: vec![],
+            symbols: vec![
+                service,
+                make_symbol(
+                    "make",
+                    "App\\Service::make",
+                    PhpSymbolKind::Method,
+                    Some("App\\Service"),
+                    Visibility::Public,
+                    true,
+                ),
+                make_symbol(
+                    "counter",
+                    "App\\Service::$counter",
+                    PhpSymbolKind::Property,
+                    Some("App\\Service"),
+                    Visibility::Public,
+                    true,
+                ),
+                make_symbol(
+                    "CREATE",
+                    "App\\Service::CREATE",
+                    PhpSymbolKind::ClassConstant,
+                    Some("App\\Service"),
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "OVERWRITE",
+                    "App\\Service::OVERWRITE",
+                    PhpSymbolKind::ClassConstant,
+                    Some("App\\Service"),
+                    Visibility::Public,
+                    false,
+                ),
+            ],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///test.php", file_symbols.clone());
+
+        let ctx = CompletionContext::StaticAccess {
+            class_expr: "Service".to_string(),
+            member_prefix: String::new(),
+            class_fqn: "App\\Service".to_string(),
+        };
+        let items = provide_completions(&ctx, &index, &file_symbols);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert_eq!(
+            &labels[..6],
+            &["CREATE", "OVERWRITE", "class", "make", "zip", "$counter"],
+            "static completion should put class constants before other static members: {labels:?}"
         );
     }
 
