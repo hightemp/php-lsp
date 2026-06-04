@@ -585,6 +585,9 @@ Parse concurrency is CPU-aware and capped to avoid unbounded memory growth.
 Stubs:
 
 - The client passes `stubsPath` for the bundled stubs directory.
+- CLI/source-checkout runs can discover `server/data/stubs` relative to
+  `server/target/{debug,release}` binaries when no bundled client path is
+  supplied.
 - The server loads configured extension directories from phpstorm-stubs. If the
   extension list is explicitly empty, stubs are treated as disabled by config.
 - Missing, non-directory, or uninitialized stubs paths are skipped and logged

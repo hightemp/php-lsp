@@ -3864,8 +3864,11 @@ fn infer_expression_type_info(
                 })
                 .or_else(|| {
                     resolver.and_then(|resolve_fn| {
-                        resolve_fn(&class_fqn, &format!("${}", &source[name.byte_range()]))
-                            .map(|type_text| type_info_from_type_text(&type_text))
+                        resolve_fn(&class_fqn, &format!("${}", &source[name.byte_range()])).map(
+                            |type_text| {
+                                type_info_from_type_text(&resolver_type_text_for_parser(&type_text))
+                            },
+                        )
                     })
                 })
         }
@@ -3885,8 +3888,9 @@ fn infer_expression_type_info(
                 })
                 .or_else(|| {
                     resolver.and_then(|resolve_fn| {
-                        resolve_fn(&class_fqn, &source[name.byte_range()])
-                            .map(|type_text| type_info_from_type_text(&type_text))
+                        resolve_fn(&class_fqn, &source[name.byte_range()]).map(|type_text| {
+                            type_info_from_type_text(&resolver_type_text_for_parser(&type_text))
+                        })
                     })
                 })
         }
@@ -5467,6 +5471,50 @@ function run(): void {
         )
         .expect("foreach value type should preserve generic resolver return args");
         assert_eq!(inferred, "App\\Entity\\User");
+    }
+
+    #[test]
+    fn test_resolve_foreach_value_from_resolver_generic_member_return_preserves_absolute_args() {
+        let code = r#"<?php
+namespace App\Soap\Inbound\Handler;
+
+use App\Entity\ReverseRequest;
+
+final class CompleteHandler {
+    public function update(ReverseRequest $reverseRequest): void {
+        foreach ($reverseRequest->getReversePortingNumbers() as $portingNumber) {
+            $portingNumber->getPhoneNumber();
+        }
+    }
+}
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+            (class_fqn == "App\\Entity\\ReverseRequest"
+                && member_name == "getReversePortingNumbers")
+                .then(|| {
+                    "Doctrine\\Common\\Collections\\Collection<int, App\\Entity\\ReversePortingNumber>"
+                        .to_string()
+                })
+        };
+        let (line, col) = find_line_col(code, "$portingNumber->getPhoneNumber");
+        let result = symbol_at_position_with_resolver(
+            tree,
+            code,
+            line,
+            col + "$portingNumber->".len() as u32,
+            &file_symbols,
+            Some(&resolver),
+        )
+        .expect("foreach value should resolve through normalized generic member return");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+        assert_eq!(
+            result.fqn,
+            "App\\Entity\\ReversePortingNumber::getPhoneNumber"
+        );
     }
 
     #[test]

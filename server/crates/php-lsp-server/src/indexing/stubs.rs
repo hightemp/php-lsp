@@ -38,27 +38,66 @@ pub(crate) fn candidate_stubs_paths(
     root: &Path,
     client_stubs_path: Option<PathBuf>,
 ) -> Vec<PathBuf> {
+    let current_exe = std::env::current_exe().ok();
+    candidate_stubs_paths_for_exe(root, client_stubs_path, current_exe.as_deref())
+}
+
+fn candidate_stubs_paths_for_exe(
+    root: &Path,
+    client_stubs_path: Option<PathBuf>,
+    exe: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut candidate_paths: Vec<PathBuf> = Vec::new();
 
     if let Some(path) = client_stubs_path {
+        push_candidate_path(&mut candidate_paths, path);
+    }
+
+    push_candidate_path(&mut candidate_paths, root.join("server/data/stubs"));
+
+    if let Some(dir) = exe.and_then(Path::parent) {
+        push_candidate_path(&mut candidate_paths, dir.join("data/stubs"));
+        push_candidate_path(&mut candidate_paths, dir.join("../stubs"));
+        push_candidate_path(&mut candidate_paths, dir.join("../../data/stubs"));
+    }
+
+    push_candidate_path(
+        &mut candidate_paths,
+        PathBuf::from("/usr/share/php-lsp/stubs"),
+    );
+    candidate_paths
+}
+
+fn push_candidate_path(candidate_paths: &mut Vec<PathBuf>, path: PathBuf) {
+    let path = path
+        .canonicalize()
+        .unwrap_or_else(|_| lexically_normalize_path(&path));
+    if !candidate_paths.iter().any(|candidate| candidate == &path) {
         candidate_paths.push(path);
     }
+}
 
-    candidate_paths.push(root.join("server/data/stubs"));
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidate_paths.push(dir.join("data/stubs"));
-            candidate_paths.push(
-                dir.join("../stubs")
-                    .canonicalize()
-                    .unwrap_or_else(|_| dir.join("../stubs")),
-            );
+fn lexically_normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
         }
     }
-
-    candidate_paths.push(PathBuf::from("/usr/share/php-lsp/stubs"));
-    candidate_paths
+    normalized
 }
 
 pub(crate) fn load_configured_stubs(
@@ -231,4 +270,67 @@ pub(crate) fn collect_stub_cache_sources(
     }
     sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     sources
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source_stubs_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs")
+    }
+
+    fn source_stubs_are_available(stubs_path: &Path) -> bool {
+        stubs_path.join("Core/Core.php").is_file()
+            && stubs_path.join("standard/standard_2.php").is_file()
+            && stubs_path.join("standard/standard_8.php").is_file()
+    }
+
+    #[test]
+    fn test_candidate_stubs_paths_include_source_checkout_stubs_from_target_binary() {
+        let root = Path::new("/tmp/project");
+        let exe = Path::new("/repo/php-lsp/server/target/debug/php-lsp");
+        let paths = candidate_stubs_paths_for_exe(root, None, Some(exe));
+
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == Path::new("/repo/php-lsp/server/data/stubs")),
+            "expected source checkout stubs path in {paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_load_configured_stubs_exposes_standard_builtin_functions_from_source_checkout() {
+        let stubs_path = source_stubs_path();
+        if !source_stubs_are_available(&stubs_path) {
+            eprintln!(
+                "Skipping server stubs smoke test: stubs not initialized at {}",
+                stubs_path.display()
+            );
+            return;
+        }
+
+        let index = WorkspaceIndex::new();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let loaded = load_configured_stubs(
+            &index,
+            &repo_root,
+            None,
+            Some(vec!["standard".to_string()]),
+            PhpVersion::DEFAULT,
+            true,
+        );
+
+        assert!(loaded > 0, "expected standard stubs to load");
+        for fqn in ["in_array", "sprintf"] {
+            let symbol = index
+                .resolve_fqn(fqn)
+                .unwrap_or_else(|| panic!("missing standard built-in function: {fqn}"));
+            assert!(
+                symbol.modifiers.is_builtin,
+                "standard function should be marked built-in: {fqn}"
+            );
+        }
+    }
 }

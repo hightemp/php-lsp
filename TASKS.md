@@ -4711,13 +4711,6 @@ change.
   - Validation: `cargo test -p php-lsp-server --test e2e_hover test_hover_callsite_ -- --nocapture`, `cargo test -p php-lsp-server --test e2e_hover -- --nocapture`, `cargo test --all`, `cargo clippy --all-targets --all -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
   - Validation: Verifier rerun after TASKS closure reported no blocking findings.
 
-- [ ] **H-HOVER-MARKDOWN-READABILITY-POLISH-2026-06-03** Довести визуальную структуру Markdown hover до устойчивого читаемого формата
-  - Normalize section order across indexed symbols, virtual PHPDoc members, framework virtual members, local variables, and Twig shape members.
-  - Prefer short labels and compact sections: declaration, role/relations, parameters, returns/type, docs, source.
-  - Avoid duplicate `Returns` when native return type and PHPDoc `@return` are equivalent; keep both only when PHPDoc refines native `mixed`/`object`/generic types.
-  - Make long parameter lists and array-shape/generic types readable without relying on VS Code wrapping quirks.
-  - Add snapshot-style e2e assertions for representative hover Markdown blocks.
-
 - [x] **H-COMPLETION-FOREACH-COLLECTION-MEMBER-DIDCHANGE-2026-06-03** Починить autocomplete/diagnostics для foreach collection element после редактирования *(done 2026-06-03)*
   - Reproduce `foreach ($request->getItems() as $item) { $item-> }` where the collection getter is typed as `Collection<int, Item>` or equivalent PHPDoc/generic type.
   - Ensure member completion on the foreach value variable resolves the iterable element type and returns entity methods/properties.
@@ -4743,3 +4736,21 @@ change.
   - Implemented: completion e2e now verifies autocomplete still works at `$portingNumber->` while diagnostics publish the tree-sitter syntax error.
   - Docs: updated README, LSP feature docs, architecture notes, and production risk register to describe the restored tree-sitter diagnostic behavior.
   - Validation: `cargo test -p php-lsp-parser diagnostics -- --nocapture`, `cargo test -p php-lsp-server --test e2e_completion test_completion_foreach_collection_value_after_did_change_incomplete_member_access -- --nocapture`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+
+- [x] **H-DIAGNOSTICS-BDPN-COMPLETEHANDLER-FALSE-WARNINGS-2026-06-04** Исправить ложные warning diagnostics в `CompleteHandler.php` *(done 2026-06-04)*
+  - Reproduce diagnostics on `/home/apanov/Projects/bdpn-ui/app/src/Soap/Inbound/Handler/CompleteHandler.php`.
+  - Identify which parser/semantic diagnostics are false positives after the tree-sitter diagnostics change.
+  - Fix without hardcoding BDPn paths/classes.
+  - Add focused regression tests and update docs/TASKS.
+  - Reproduced: initial CLI analyze reported 5 false warnings for `getPhoneNumber`, `setCurrentNumberStatus`, `in_array`, and `sprintf`.
+  - Implemented: resolver-provided generic member/property return types are normalized before parser-side type inference, preserving absolute generic arguments such as `App\Entity\ReversePortingNumber`.
+  - Implemented: source-checkout stubs discovery now checks `server/data/stubs` relative to `server/target/{debug,release}` binaries, so CLI analyze/fix can load PHP built-ins without a VS Code bundled stubs path.
+  - Docs: updated stubs configuration and architecture notes for source-checkout fallback discovery.
+  - Validation: focused parser/server regression tests passed, CLI analyze on the BDPn `CompleteHandler.php` now reports `diagnostics: 0`, and `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+
+- [ ] **H-HOVER-MARKDOWN-READABILITY-POLISH-2026-06-03** Довести визуальную структуру Markdown hover до устойчивого читаемого формата
+  - Normalize section order across indexed symbols, virtual PHPDoc members, framework virtual members, local variables, and Twig shape members.
+  - Prefer short labels and compact sections: declaration, role/relations, parameters, returns/type, docs, source.
+  - Avoid duplicate `Returns` when native return type and PHPDoc `@return` are equivalent; keep both only when PHPDoc refines native `mixed`/`object`/generic types.
+  - Make long parameter lists and array-shape/generic types readable without relying on VS Code wrapping quirks.
+  - Add snapshot-style e2e assertions for representative hover Markdown blocks.

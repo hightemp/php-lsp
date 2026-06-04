@@ -154,6 +154,12 @@ The VS Code extension passes the bundled `client/stubs` directory to the
 server automatically. A project or global config can override the source path
 with `[stubs].path`.
 
+When the server is run directly from the Rust workspace, fallback discovery also
+checks the source checkout `server/data/stubs` directory relative to
+`server/target/{debug,release}` binaries. This keeps CLI `analyze`/`fix` runs
+from reporting PHP built-ins as unknown solely because no VS Code bundled stubs
+path was provided.
+
 `[stubs].extensions` has three distinct states:
 
 - Omitted: use the bundled default extension set.
