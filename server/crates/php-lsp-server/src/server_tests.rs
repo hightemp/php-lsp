@@ -1484,6 +1484,91 @@ class ImportedEntityHandler {
 }
 
 #[test]
+fn test_compute_diagnostics_resolves_members_from_conditional_interface_return_parent() {
+    let vendor_uri = "file:///vendor/framework.php";
+    let app_uri = "file:///src/Controller/DemoController.php";
+    let vendor_code = r#"<?php
+namespace Vendor\Form;
+
+interface BaseForm {
+    public function handleRequest(mixed $request = null): static;
+    public function isSubmitted(): bool;
+    public function get(string $name): self;
+    public function addError(FormError $error): static;
+}
+
+interface FlowForm extends BaseForm {
+    public function moveNext(): void;
+}
+
+interface FlowType {}
+final class FormError {}
+
+namespace Vendor\Framework;
+
+use Vendor\Form\BaseForm;
+use Vendor\Form\FlowForm;
+use Vendor\Form\FlowType;
+
+abstract class AbstractController {
+    /**
+     * @return ($type is class-string<FlowType> ? FlowForm : BaseForm)
+     */
+    protected function createForm(string $type, mixed $data = null, array $options = []): BaseForm
+    {
+    }
+}
+"#;
+    let app_code = r#"<?php
+namespace App\Controller;
+
+use Vendor\Form\FormError;
+use Vendor\Form\FlowType;
+use Vendor\Framework\AbstractController;
+
+final class DemoType implements FlowType {}
+
+final class DemoController extends AbstractController {
+    public function run(mixed $request): void
+    {
+        $form = $this->createForm(DemoType::class);
+        $form->handleRequest($request);
+        if ($form->isSubmitted()) {
+            $form->get('field')->addError(new FormError());
+        }
+    }
+}
+"#;
+
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(&index, vendor_uri, vendor_code);
+    let parser = parse_and_index_php_file(&index, app_uri, app_code);
+
+    let diagnostics = compute_diagnostics(
+        app_uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    for unexpected in [
+        "Unknown method: FlowForm::handleRequest",
+        "Unknown method: FlowForm::isSubmitted",
+        "Unknown method: FlowForm::get",
+        "Unknown method: FlowForm::addError",
+        "Unknown method: Vendor\\Form\\FlowForm::handleRequest",
+        "Unknown method: Vendor\\Form\\FlowForm::isSubmitted",
+        "Unknown method: Vendor\\Form\\FlowForm::get",
+        "Unknown method: Vendor\\Form\\FlowForm::addError",
+    ] {
+        assert_no_diagnostic_containing(&messages, unexpected);
+    }
+    assert_no_diagnostic_containing(&messages, "Unknown method:");
+}
+
+#[test]
 fn test_compute_diagnostics_allows_nullsafe_member_access() {
     let uri = "file:///nullsafe-members.php";
     let code = r#"<?php

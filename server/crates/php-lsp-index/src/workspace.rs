@@ -1473,6 +1473,48 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_member_inherited_through_interface_extends_chain() {
+        let index = WorkspaceIndex::new();
+
+        let mut base_interface = make_class("BaseForm", "Vendor\\BaseForm", "file:///base.php");
+        base_interface.kind = PhpSymbolKind::Interface;
+        let base_method = make_method("handleRequest", "Vendor\\BaseForm", "file:///base.php");
+        index.update_file(
+            "file:///base.php",
+            FileSymbols {
+                namespace: Some("Vendor".to_string()),
+                use_statements: vec![],
+                symbols: vec![base_interface, base_method],
+                ..Default::default()
+            },
+        );
+
+        let mut flow_interface = make_class("FlowForm", "Vendor\\FlowForm", "file:///flow.php");
+        flow_interface.kind = PhpSymbolKind::Interface;
+        flow_interface.extends = vec!["Vendor\\BaseForm".to_string()];
+        index.update_file(
+            "file:///flow.php",
+            FileSymbols {
+                namespace: Some("Vendor".to_string()),
+                use_statements: vec![],
+                symbols: vec![flow_interface],
+                ..Default::default()
+            },
+        );
+
+        let found = index
+            .resolve_fqn("Vendor\\FlowForm::handleRequest")
+            .expect("interface should inherit members through extends");
+        assert_eq!(found.fqn, "Vendor\\BaseForm::handleRequest");
+
+        let members = index.get_members("Vendor\\FlowForm");
+        assert!(
+            members.iter().any(|member| member.name == "handleRequest"),
+            "interface-extended method should be included in get_members"
+        );
+    }
+
+    #[test]
     fn test_resolve_trait_member() {
         let index = WorkspaceIndex::new();
 

@@ -2493,11 +2493,24 @@ pub(in crate::server) fn type_info_resolved_text_from_index(
             type_info_resolved_text_from_index(index, owner_fqn, uri, inner)
                 .map(|inner| format!("class-string<{inner}>"))
         }
+        php_lsp_types::TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => {
+            let target = type_info_resolved_text_from_index(index, owner_fqn, uri, target)
+                .unwrap_or_else(|| target.to_string());
+            let if_type = type_info_resolved_text_from_index(index, owner_fqn, uri, if_type)
+                .unwrap_or_else(|| if_type.to_string());
+            let else_type = type_info_resolved_text_from_index(index, owner_fqn, uri, else_type)
+                .unwrap_or_else(|| else_type.to_string());
+            Some(format!("({subject} is {target} ? {if_type} : {else_type})"))
+        }
         php_lsp_types::TypeInfo::ClassString(None)
         | php_lsp_types::TypeInfo::ArrayShape(_)
         | php_lsp_types::TypeInfo::ObjectShape(_)
         | php_lsp_types::TypeInfo::Callable { .. }
-        | php_lsp_types::TypeInfo::Conditional { .. }
         | php_lsp_types::TypeInfo::Parent_
         | php_lsp_types::TypeInfo::LiteralString(_)
         | php_lsp_types::TypeInfo::LiteralInt(_)

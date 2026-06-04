@@ -4868,7 +4868,8 @@ change.
   - Resolved by `H-DIAGNOSTICS-GLOBAL-EXTENSION-FUNCTION-FALLBACK-2026-06-04`: default stubs now discover and load the `zip` extension automatically.
   - Validation: BDPn `app/src` full analyze no longer reports `ZipArchive` method, constant, or property diagnostics.
 
-- [ ] **H-DIAGNOSTICS-INHERITED-INTERFACE-MEMBERS-FORMFLOW-2026-06-04** Resolve methods inherited through interface extends chains
+- [x] **H-DIAGNOSTICS-INHERITED-INTERFACE-MEMBERS-FORMFLOW-2026-06-04** Resolve methods inherited through interface extends chains *(done 2026-06-04)*
+  - Started 2026-06-04: checking BDPn `FormFlowInterface` false member diagnostics and shared workspace member hierarchy traversal.
   - Reproduce BDPn `Symfony\Component\Form\Flow\FormFlowInterface` warnings for `handleRequest`, `isSubmitted`, `isValid`, `get`, and `addError`.
   - Verify member lookup traverses `interface A extends B` the same way it traverses class inheritance/implements relationships.
   - Add generic tests with a vendor-like interface extending another interface that declares the called methods.
@@ -4883,6 +4884,12 @@ change.
     /home/apanov/Projects/bdpn-ui/app/src/Controller/RouteUpdateRequestController.php
     /home/apanov/Projects/bdpn-ui/app/src/Controller/TechWindowRequestController.php
     /home/apanov/Projects/bdpn-ui/app/src/Controller/UserController.php
+  - Implemented: conditional PHPDoc return types are now rendered with branch/target class names resolved in the declaring symbol context before parser-side object inference.
+  - Implemented: added regression coverage for interface `extends` member lookup and for vendor-like conditional `createForm()` return diagnostics where a derived interface inherits form methods from its parent interface.
+  - Validation: focused regression tests passed; BDPn `DebtSuspensionController.php` analyze reports 0 diagnostics; full BDPn `app/src` analyze reports no `FormFlowInterface`/form-method false member diagnostics.
+  - Validation: `cargo fmt --all --check`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` passed.
+  - Validation: Verifier follow-up reported no blockers.
+  - Docs: not updated; this is an internal diagnostics/type-resolution bugfix with no new user-facing feature or config.
 
 - [ ] **H-DIAGNOSTICS-IMPORTED-RETURN-TYPE-DOUBLE-QUALIFICATION-2026-06-04** Avoid re-relativizing already resolved imported return types
   - Reproduce BDPn diagnostics such as `Unknown method: App\Service\App\Entity\PortingProcessFiles::setStatus`.
