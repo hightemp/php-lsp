@@ -2378,6 +2378,73 @@ function run(Box $box): void {
 }
 
 #[test]
+fn test_compute_diagnostics_allows_callable_template_parameter_arguments() {
+    let uri = "file:///input-bag-template-default.php";
+    let code = r#"<?php
+namespace Symfony\Component\HttpFoundation;
+
+/**
+ * @template TInput of string|int|float|bool|null
+ */
+final class InputBag {
+    /**
+     * @template TDefault of string|int|float|bool|null
+     * @param TDefault $default
+     * @return TDefault|TInput
+     */
+    public function get(string $key, mixed $default = null): string|int|float|bool|null {
+        return null;
+    }
+}
+
+namespace App;
+
+use Symfony\Component\HttpFoundation\InputBag;
+
+function run(InputBag $bag): void {
+    $bag->get('reject_custom_code', '');
+    $bag->get('invalid_default', []);
+}
+"#;
+
+    let mut parser = FileParser::new();
+    parser.parse_full(code);
+
+    let index = WorkspaceIndex::new();
+    let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+    index.update_file(uri, symbols);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("argument $default") && message.contains("got string")),
+        "callable template bound should accept string defaults, got: {:?}",
+        messages
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message.contains(
+                "Type mismatch for Symfony\\Component\\HttpFoundation\\InputBag::get argument $default",
+            ) && message.contains("expected string|int|float|bool|null, got array")
+        }),
+        "callable template bound should reject array defaults, got: {:?}",
+        messages
+    );
+}
+
+#[test]
 fn test_compute_diagnostics_allows_phpdoc_array_suffix_argument_type() {
     let uri = "file:///phpdoc-array-suffix.php";
     let code = r#"<?php

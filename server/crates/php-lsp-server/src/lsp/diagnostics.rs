@@ -2255,6 +2255,9 @@ pub(in crate::server) fn check_call_argument_types(
             continue;
         };
 
+        let substituted_expected =
+            type_info_with_callable_template_bounds(expected, callable, index);
+        let expected = substituted_expected.as_ref().unwrap_or(expected);
         if !type_info_accepts_inferred_type(expected, &actual, expected_file_symbols, index) {
             diagnostics.push(diagnostic_at_byte_range(
                 actual.range,
@@ -2794,6 +2797,213 @@ pub(in crate::server) fn type_info_accepts_inferred_type(
         | php_lsp_types::TypeInfo::Static_
         | php_lsp_types::TypeInfo::Parent_ => true,
         php_lsp_types::TypeInfo::Void | php_lsp_types::TypeInfo::Never => false,
+    }
+}
+
+pub(in crate::server) fn type_info_with_callable_template_bounds(
+    type_info: &php_lsp_types::TypeInfo,
+    callable: &php_lsp_types::SymbolInfo,
+    index: &WorkspaceIndex,
+) -> Option<php_lsp_types::TypeInfo> {
+    let mut template_bounds: Vec<(String, Option<php_lsp_types::TypeInfo>)> = callable
+        .templates
+        .iter()
+        .map(|template| (template.name.clone(), template.bound.clone()))
+        .collect();
+
+    if let Some(parent_fqn) = callable.parent_fqn.as_deref() {
+        if let Some(parent) = index.resolve_fqn(parent_fqn) {
+            template_bounds.extend(
+                parent
+                    .templates
+                    .iter()
+                    .map(|template| (template.name.clone(), template.bound.clone())),
+            );
+        }
+    }
+
+    substitute_callable_template_bounds(type_info, &template_bounds)
+}
+
+fn substitute_callable_template_bounds(
+    type_info: &php_lsp_types::TypeInfo,
+    template_bounds: &[(String, Option<php_lsp_types::TypeInfo>)],
+) -> Option<php_lsp_types::TypeInfo> {
+    if template_bounds.is_empty() {
+        return None;
+    }
+
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            let name = name.trim_start_matches('\\');
+            template_bounds
+                .iter()
+                .find(|(template, _)| template == name)
+                .map(|(_, bound)| bound.clone().unwrap_or(php_lsp_types::TypeInfo::Mixed))
+        }
+        php_lsp_types::TypeInfo::Generic { base, args } => {
+            if let Some((_, bound)) = template_bounds
+                .iter()
+                .find(|(template, _)| template == base)
+            {
+                return Some(bound.clone().unwrap_or(php_lsp_types::TypeInfo::Mixed));
+            }
+
+            let mut changed = false;
+            let args = args
+                .iter()
+                .map(|arg| {
+                    substitute_callable_template_bounds(arg, template_bounds).map_or_else(
+                        || arg.clone(),
+                        |substituted| {
+                            changed = true;
+                            substituted
+                        },
+                    )
+                })
+                .collect();
+
+            changed.then_some(php_lsp_types::TypeInfo::Generic {
+                base: base.clone(),
+                args,
+            })
+        }
+        php_lsp_types::TypeInfo::ArrayShape(items)
+        | php_lsp_types::TypeInfo::ObjectShape(items) => {
+            let mut changed = false;
+            let items = items
+                .iter()
+                .map(|item| {
+                    substitute_callable_template_bounds(&item.value, template_bounds).map_or_else(
+                        || item.clone(),
+                        |value| {
+                            changed = true;
+                            php_lsp_types::ArrayShapeItem {
+                                key: item.key.clone(),
+                                optional: item.optional,
+                                value,
+                            }
+                        },
+                    )
+                })
+                .collect();
+
+            changed.then_some(match type_info {
+                php_lsp_types::TypeInfo::ArrayShape(_) => {
+                    php_lsp_types::TypeInfo::ArrayShape(items)
+                }
+                _ => php_lsp_types::TypeInfo::ObjectShape(items),
+            })
+        }
+        php_lsp_types::TypeInfo::Callable {
+            params,
+            return_type,
+        } => {
+            let mut changed = false;
+            let params = params
+                .iter()
+                .map(|param| {
+                    substitute_callable_template_bounds(param, template_bounds).map_or_else(
+                        || param.clone(),
+                        |substituted| {
+                            changed = true;
+                            substituted
+                        },
+                    )
+                })
+                .collect();
+            let return_type = return_type.as_ref().map(|return_type| {
+                substitute_callable_template_bounds(return_type, template_bounds).map_or_else(
+                    || return_type.clone(),
+                    |substituted| {
+                        changed = true;
+                        Box::new(substituted)
+                    },
+                )
+            });
+
+            changed.then_some(php_lsp_types::TypeInfo::Callable {
+                params,
+                return_type,
+            })
+        }
+        php_lsp_types::TypeInfo::ClassString(inner) => inner.as_ref().and_then(|inner| {
+            substitute_callable_template_bounds(inner, template_bounds)
+                .map(|inner| php_lsp_types::TypeInfo::ClassString(Some(Box::new(inner))))
+        }),
+        php_lsp_types::TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => {
+            let mut changed = false;
+            let target = substitute_callable_template_bounds(target, template_bounds).map_or_else(
+                || target.clone(),
+                |substituted| {
+                    changed = true;
+                    Box::new(substituted)
+                },
+            );
+            let if_type = substitute_callable_template_bounds(if_type, template_bounds)
+                .map_or_else(
+                    || if_type.clone(),
+                    |substituted| {
+                        changed = true;
+                        Box::new(substituted)
+                    },
+                );
+            let else_type = substitute_callable_template_bounds(else_type, template_bounds)
+                .map_or_else(
+                    || else_type.clone(),
+                    |substituted| {
+                        changed = true;
+                        Box::new(substituted)
+                    },
+                );
+
+            changed.then_some(php_lsp_types::TypeInfo::Conditional {
+                subject: subject.clone(),
+                target,
+                if_type,
+                else_type,
+            })
+        }
+        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
+            let mut changed = false;
+            let types = types
+                .iter()
+                .map(|type_info| {
+                    substitute_callable_template_bounds(type_info, template_bounds).map_or_else(
+                        || type_info.clone(),
+                        |substituted| {
+                            changed = true;
+                            substituted
+                        },
+                    )
+                })
+                .collect();
+
+            changed.then_some(match type_info {
+                php_lsp_types::TypeInfo::Union(_) => php_lsp_types::TypeInfo::Union(types),
+                _ => php_lsp_types::TypeInfo::Intersection(types),
+            })
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            substitute_callable_template_bounds(inner, template_bounds)
+                .map(|inner| php_lsp_types::TypeInfo::Nullable(Box::new(inner)))
+        }
+        php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull
+        | php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed
+        | php_lsp_types::TypeInfo::Self_
+        | php_lsp_types::TypeInfo::Static_
+        | php_lsp_types::TypeInfo::Parent_ => None,
     }
 }
 

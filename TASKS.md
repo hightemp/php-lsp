@@ -4765,3 +4765,14 @@ change.
   - Tests: added focused namespace regression coverage for `empty`, `isset`, `unset`, `eval`, `print`, `exit`, and `die`.
   - Docs: updated architecture notes for language constructs in unknown-function diagnostics.
   - Validation: focused parser regression test passed, CLI analyze on the BDPn `DataRequestController.php` now reports `diagnostics: 0`, and `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+
+- [x] **H-DIAGNOSTICS-SYMFONY-INPUTBAG-GET-DEFAULT-TEMPLATE-2026-06-04** Исправить ложный type mismatch для `InputBag::get($key, '')` *(done 2026-06-04)*
+  - Reproduce the VS Code warning `Type mismatch for Symfony\Component\HttpFoundation\InputBag::get argument $default: expected TDefault, got string` on BDPn `DataRequestController.php`.
+  - Identify whether the mismatch comes from template parameter compatibility, indexed vendor signature metadata, or call-site type inference.
+  - Fix generically for Symfony/vendor generic default-parameter patterns without hardcoding BDPn controller paths.
+  - Add focused regression tests and update docs/TASKS if diagnostics behavior changes.
+  - Identified: Symfony `InputBag::get` declares method-level `@template TDefault of string|int|float|bool|null` and `@param TDefault $default`; type compatibility compared the argument against the raw template name instead of its bound.
+  - Implemented: argument type compatibility now substitutes callable/owner template parameters with their declared bounds before comparison; unbounded templates degrade to `mixed`.
+  - Tests: added regression coverage that `InputBag`-style `TDefault` accepts a string default but still rejects an array default against the scalar bound.
+  - Docs: updated architecture notes for template-bound handling in type compatibility diagnostics.
+  - Validation: focused server regression test passed, CLI analyze on the BDPn `DataRequestController.php` reports `diagnostics: 0`, and `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.

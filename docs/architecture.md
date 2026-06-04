@@ -652,8 +652,11 @@ only when those fallbacks do not resolve.
 Type compatibility diagnostics are intentionally approximate. They compare
 known literal/scalar values, class names, arrays, array/object shapes,
 class-string/callable types, and unions where enough local information is
-available; intersections and relative `self`/`static`/`parent` types are treated
-optimistically to avoid false positives without whole-program type flow.
+available. Function and method template parameters are checked against their
+declared bounds when available, and unbounded templates are treated as
+unknown/mixed at the call site. Intersections and relative
+`self`/`static`/`parent` types are treated optimistically to avoid false
+positives without whole-program type flow.
 Override diagnostics apply incremental PHP variance rules: parameters may widen
 class types, returns may narrow class types, and PHPDoc/native refinements are
 handled conservatively rather than as a full PHPStan/Psalm type lattice.
