@@ -2442,10 +2442,7 @@ pub(in crate::server) fn type_info_resolved_text_from_index(
             if is_builtin_type_name(name) {
                 return Some(name.trim_start_matches('\\').to_string());
             }
-            Some(
-                simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, name)
-                    .unwrap_or_else(|| name.trim_start_matches('\\').to_string()),
-            )
+            Some(resolved_type_text_from_index(index, owner_fqn, uri, name))
         }
         php_lsp_types::TypeInfo::Generic { base, args } => {
             let base = base.trim();
@@ -2455,8 +2452,7 @@ pub(in crate::server) fn type_info_resolved_text_from_index(
             let base_text = if is_builtin_type_name(base) {
                 base.trim_start_matches('\\').to_string()
             } else {
-                simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, base)
-                    .unwrap_or_else(|| base.trim_start_matches('\\').to_string())
+                resolved_type_text_from_index(index, owner_fqn, uri, base)
             };
             let arg_texts = args
                 .iter()
@@ -2491,7 +2487,7 @@ pub(in crate::server) fn type_info_resolved_text_from_index(
             (!parts.is_empty()).then(|| parts.join("&"))
         }
         php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
-            (!owner_fqn.is_empty()).then(|| owner_fqn.trim_start_matches('\\').to_string())
+            (!owner_fqn.is_empty()).then(|| resolved_owner_type_text_from_index(index, owner_fqn))
         }
         php_lsp_types::TypeInfo::ClassString(Some(inner)) => {
             type_info_resolved_text_from_index(index, owner_fqn, uri, inner)
@@ -2511,6 +2507,40 @@ pub(in crate::server) fn type_info_resolved_text_from_index(
         | php_lsp_types::TypeInfo::Void
         | php_lsp_types::TypeInfo::Never
         | php_lsp_types::TypeInfo::Mixed => Some(type_info.to_string()),
+    }
+}
+
+fn resolved_type_text_from_index(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    type_name: &str,
+) -> String {
+    let raw = type_name.trim().trim_start_matches('\\');
+    let resolved = simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, type_name)
+        .unwrap_or_else(|| raw.to_string());
+
+    if resolved.is_empty() {
+        return resolved;
+    }
+
+    if type_name.trim().starts_with('\\') || index.resolve_fqn(&resolved).is_some() {
+        format!("\\{}", resolved.trim_start_matches('\\'))
+    } else {
+        resolved
+    }
+}
+
+fn resolved_owner_type_text_from_index(index: &WorkspaceIndex, owner_fqn: &str) -> String {
+    let owner_fqn = owner_fqn.trim().trim_start_matches('\\');
+    if owner_fqn.is_empty() {
+        return String::new();
+    }
+
+    if index.resolve_fqn(owner_fqn).is_some() {
+        format!("\\{owner_fqn}")
+    } else {
+        owner_fqn.to_string()
     }
 }
 

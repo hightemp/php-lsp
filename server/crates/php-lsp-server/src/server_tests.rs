@@ -3048,6 +3048,80 @@ function status(\SimpleXMLElement $result): void {
 }
 
 #[test]
+fn test_compute_diagnostics_resolves_global_simplexml_stub_types_in_namespaced_files() {
+    let stub_uri = "phpstub://SimpleXML/SimpleXML.php";
+    let stub_code = r#"<?php
+class SimpleXMLElement {
+    /** @return static */
+    private function __get($name) {}
+    public function registerXPathNamespace(string $prefix, string $namespace): bool { return true; }
+    /** @return static[]|false|null */
+    public function xpath(string $expression): array|false|null { return []; }
+    public function attributes(?string $namespaceOrPrefix = null, bool $isPrefix = false): ?static { return $this; }
+    public function children(?string $namespaceOrPrefix = null, bool $isPrefix = false): ?static { return $this; }
+    public function getNamespaces(bool $recursive = false): array { return []; }
+}
+
+function simplexml_load_string(string $data): SimpleXMLElement|false { return new SimpleXMLElement(); }
+"#;
+    let uri = "file:///namespaced-simplexml-diagnostics.php";
+    let code = r#"<?php
+namespace App\Soap\Outbound;
+
+final class Box {}
+
+function parse(string $responseXml): void {
+    $xml = simplexml_load_string($responseXml);
+    if ($xml === false) {
+        return;
+    }
+
+    $xml->registerXPathNamespace('x', 'urn:test');
+    $nodes = $xml->xpath('//x:item');
+    foreach ($nodes ?: [] as $item) {
+        /** @var \SimpleXMLElement $item */
+        $code = (string) $item->Code;
+        $techStart = (string) $item->TechStart;
+        $attrs = $item->attributes();
+        $children = $item->children();
+        $namespaces = $item->getNamespaces();
+    }
+
+    $box = new Box();
+    $box->missingProp;
+}
+"#;
+
+    let index = WorkspaceIndex::new();
+    let _stub_parser = parse_and_index_php_file(&index, stub_uri, stub_code);
+    let parser = parse_and_index_php_file(&index, uri, code);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    assert!(
+        !messages.iter().any(|message| {
+            (message.starts_with("Unknown method: ") || message.starts_with("Unknown property: "))
+                && message.contains("SimpleXMLElement::")
+        }),
+        "SimpleXMLElement methods and dynamic properties should resolve, got: {:?}",
+        messages
+    );
+
+    assert!(
+        messages.contains(&"Unknown property: App\\Soap\\Outbound\\Box::$missingProp".to_string()),
+        "ordinary unknown properties should still be reported, got: {:?}",
+        messages
+    );
+}
+
+#[test]
 fn test_compute_diagnostics_accepts_non_empty_string_literals() {
     let uri = "file:///non-empty-string-literal.php";
     let code = r#"<?php

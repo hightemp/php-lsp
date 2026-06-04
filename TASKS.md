@@ -4829,11 +4829,17 @@ change.
   - Verifier follow-up fixed: full-stubs bundling, recursive stub-file loading, `vendor` exclusion, stable nested-stub URIs, and no synchronous workspace-cache stub discovery were all addressed before completion.
   - Verifier: repeated review returned GO with no blocking or non-blocking findings after the fixes.
 
-- [ ] **H-DIAGNOSTICS-SIMPLEXML-ABSOLUTE-TYPE-AND-DYNAMIC-PROPERTIES-2026-06-04** Fix `SimpleXMLElement` false member/property diagnostics
+- [x] **H-DIAGNOSTICS-SIMPLEXML-ABSOLUTE-TYPE-AND-DYNAMIC-PROPERTIES-2026-06-04** Fix `SimpleXMLElement` false member/property diagnostics *(done 2026-06-04)*
+  - Started 2026-06-04: confirmed the real BDPn failure path still emits namespaced `App\...\SimpleXMLElement` unknown method/property diagnostics even though the bundled SimpleXML stub is available.
   - Reproduce BDPn `@var \SimpleXMLElement` cases that become `App\Soap\Outbound\SimpleXMLElement` or `App\Service\SimpleXMLElement`.
   - Preserve absolute/global PHPDoc and native class names through member/type diagnostics, including leading `\SimpleXMLElement`.
   - Ensure indexed `SimpleXMLElement` methods such as `registerXPathNamespace`, `xpath`, `attributes`, `children`, and `getNamespaces` are visible.
   - Suppress or model dynamic XML child property access on `SimpleXMLElement`, e.g. `$result->Code`, `$item->TechStart`, without suppressing ordinary unknown properties on normal classes.
+  - Implemented: index-backed resolver type text now marks resolved class-like names and `self`/`static` owner substitutions as absolute for the parser resolver, while leaving builtins and unresolved aliases/templates unchanged.
+  - Tests: added diagnostics regression for namespaced PHP files consuming global SimpleXML stubs, including `simplexml_load_string(): SimpleXMLElement|false`, `xpath(): static[]|false|null`, `attributes(): ?static`, dynamic XML child properties, and an ordinary unknown property control.
+  - Validation: focused SimpleXML diagnostics tests, existing SimpleXML hover/inlay e2e, `cargo fmt --all --check`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` passed.
+  - Validation: BDPn focused analyze for `GetOperatorByNumberService.php`, `ListTechWindowsService.php`, and `CheckPortingDateService.php` now reports 0 diagnostics; full `/home/apanov/Projects/bdpn-ui/app/src` analyze reports no `SimpleXMLElement` diagnostics.
+  - Docs: not updated; this is an internal diagnostics bugfix with no new user-facing configuration or feature surface.
   - Files:
     /home/apanov/Projects/bdpn-ui/app/src/Service/NpExtendedProcessor.php
     /home/apanov/Projects/bdpn-ui/app/src/Service/PublicKeyService.php
