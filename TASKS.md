@@ -4776,3 +4776,127 @@ change.
   - Tests: added regression coverage that `InputBag`-style `TDefault` accepts a string default but still rejects an array default against the scalar bound.
   - Docs: updated architecture notes for template-bound handling in type compatibility diagnostics.
   - Validation: focused server regression test passed, CLI analyze on the BDPn `DataRequestController.php` reports `diagnostics: 0`, and `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+
+- [x] **H-DIAGNOSTICS-BDPN-CDBHANDLER-UPDATENUMBERSTATUSES-2026-06-04** Проверить diagnostic на вызове `updateNumberStatuses(...)` в `CdbHandler.php` *(done 2026-06-04)*
+  - Inspect `/home/apanov/Projects/bdpn-ui/app/src/Soap/Inbound/Handler/CdbHandler.php` around `$this->updateNumberStatuses($portingRequest, $statusStr, $beginTimeStr)`.
+  - Compare the call-site argument types with the method signature and PHPDoc/native declarations.
+  - Run CLI analyze for the file and decide whether the reported issue is a real code issue or an LSP false positive.
+  - Result: CLI analyze reports `Unknown method: App\Soap\Inbound\Handler\CdbHandler::updateNumberStatuses` at the call site and `Unused parameter: $portingRequest` in `handleDonorProcess`.
+  - Conclusion: `updateNumberStatuses` is implemented in `CdbConfirmHandler`, but it is not declared in the `CdbHandler` contract; this is a real design/contract warning rather than a BDPn-specific LSP false positive.
+
+- [x] **H-DIAGNOSTICS-BDPN-SRC-AUDIT-2026-06-04** Прогнать `php-lsp analyze` по всему `/home/apanov/Projects/bdpn-ui/app/src` и собрать ложные срабатывания *(done 2026-06-04)*
+  - Run CLI diagnostics on the whole BDPn `app/src` tree with `/home/apanov/Projects/bdpn-ui/app` as project root.
+  - Group diagnostics by rule/message and inspect representative call sites instead of treating every warning as an LSP bug.
+  - Add follow-up TASKS entries for confirmed or strongly suspected generic false positives; keep real BDPn code issues out of the LSP backlog.
+  - Do not hardcode BDPn classes, paths, methods, or framework names into fixes discovered by this audit.
+  - Validation: `cargo run -p php-lsp-server -- analyze /home/apanov/Projects/bdpn-ui/app/src --project-root /home/apanov/Projects/bdpn-ui/app --severity all --format json` analyzed 266 files and reported 283 diagnostics: 169 member warnings, 46 unknown-function warnings, 38 unused-variable warnings, 26 unused-parameter warnings, 3 partial-analysis info diagnostics, and 1 type-compatibility warning.
+  - Confirmed false-positive clusters: namespaced global extension functions (`libxml_*`, `posix_*`) 46 diagnostics; `SimpleXMLElement` native class/member/property handling 86 diagnostics; `ZipArchive` native class members/constants/properties 20 diagnostics; inherited `FormFlowInterface` methods from `FormInterface` 49 diagnostics; double-qualified imported return type `App\Service\App\Entity\PortingProcessFiles` 6 diagnostics; `compact(...)` string variable usage 27 diagnostics; boolean `||` return inference 1 diagnostic.
+  - Not filed as LSP false-positive tasks: missing BDPn methods such as `PortingRequestFiles::setFileSize`, `EmailNotifier::send*`, `PortingProcessWorkflowService::createProcessesForPortingRequest`, and `CdbHandler::updateNumberStatuses`; `Doctrine\ORM\Configuration::getAttributes`; most unused-parameter/unused-variable diagnostics outside `compact(...)`.
+
+- [x] **H-DIAGNOSTICS-GLOBAL-EXTENSION-FUNCTION-FALLBACK-2026-06-04** Resolve unqualified global PHP extension functions inside namespaces *(done 2026-06-04)*
+  - Reproduce with BDPn diagnostics such as `Unknown function: App\Soap\Outbound\libxml_clear_errors`, `App\Controller\posix_geteuid`, and `App\Service\Util\libxml_get_errors`.
+  - Ensure unknown-function diagnostics resolve unqualified calls in namespaces against indexed global function stubs before reporting a namespaced fallback warning.
+  - Cover extension stubs that already exist in `server/data/stubs`, including `libxml` and `posix`.
+  - Scope update: default stubs should load all available phpstorm-stubs extension directories instead of requiring repeated manual additions to `DEFAULT_EXTENSIONS`.
+  - Add parser/server regression tests for namespaced calls to global functions without hardcoding the BDPn namespaces.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/DebugController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/MessageLogController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Service/NpExtendedProcessor.php
+    /home/apanov/Projects/bdpn-ui/app/src/Service/PublicKeyService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Service/Util/EncryptionService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Service/Util/XmlValidator.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/BaseOutbound.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/BaseTimerService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckPortingAvailabilityService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckPortingDateByContractDateService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckPortingDateChangeService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckPortingDateService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckRejectionReasonsService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/GetBusyTimeSlotsByCodeService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/GetOperatorByNumberService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/GetPublicKeyByCodeService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/ListTechWindowsService.php
+  - Implemented: default stubs now discover every available phpstorm-stubs extension directory containing PHP stub files from the selected stubs root instead of relying only on the short fallback `DEFAULT_EXTENSIONS` list.
+  - Implemented: `vendor`, `meta`, `tests`, dot-directories, and directories without PHP files are excluded from discovery; nested extension stub files are loaded recursively and keep stable relative `phpstub://` URIs.
+  - Implemented: `scripts/bundle-stubs.sh` now bundles all real phpstorm-stubs extension directories, so the VS Code package does not lag behind server-side discovery.
+  - Implemented: workspace cache config records the default as a discovery sentinel without scanning stub directories from async workspace-cache paths; stubs cache config/hash is built from the actual discovered extension set at stub-load time.
+  - Implemented: stubs cache configuration/hash uses the same discovered extension set, while explicit `extensions = []` still disables stubs and explicit non-empty lists still load only the requested directories.
+  - Tests: added discovery coverage for source stubs, vendor-skip coverage, recursive nested-stub loading coverage, path-aware nested-stub URI coverage, cache-config sentinel coverage, and a server regression that loads default stubs, resolves `libxml_*`/`posix_*`, and verifies namespaced unqualified calls do not produce unknown-function diagnostics.
+  - Docs: updated README, configuration docs, architecture notes, and production baseline for all-available-stubs default behavior and the larger bundled stubs set.
+  - Validation: BDPn `app/src` full analyze now reports 0 `php-lsp.unknownFunction` diagnostics, no `ZipArchive`/`libxml_`/`posix_get` diagnostics, and total diagnostics dropped from 283 to 225.
+  - Validation: `./scripts/bundle-stubs.sh` bundled 194 extensions; `bash -n scripts/bundle-stubs.sh`, `cargo test -p php-lsp-index stubs -- --nocapture`, `cargo test -p php-lsp-server indexing::stubs -- --nocapture`, `cargo test -p php-lsp-server test_workspace_cache_config_preserves_stub_configuration_without_discovery -- --nocapture`, `cargo test -p php-lsp-server test_effective_stub_extensions_for_path_discovers_available_stub_dirs -- --nocapture`, `cargo test -p php-lsp-server indexing::stubs::tests::test_default_stubs_expose_global_extension_functions_in_namespaces -- --nocapture`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, `cargo fmt --all --check`, `npm run lint`, `npm run build`, and `git diff --check` passed.
+  - Verifier follow-up fixed: full-stubs bundling, recursive stub-file loading, `vendor` exclusion, stable nested-stub URIs, and no synchronous workspace-cache stub discovery were all addressed before completion.
+  - Verifier: repeated review returned GO with no blocking or non-blocking findings after the fixes.
+
+- [ ] **H-DIAGNOSTICS-SIMPLEXML-ABSOLUTE-TYPE-AND-DYNAMIC-PROPERTIES-2026-06-04** Fix `SimpleXMLElement` false member/property diagnostics
+  - Reproduce BDPn `@var \SimpleXMLElement` cases that become `App\Soap\Outbound\SimpleXMLElement` or `App\Service\SimpleXMLElement`.
+  - Preserve absolute/global PHPDoc and native class names through member/type diagnostics, including leading `\SimpleXMLElement`.
+  - Ensure indexed `SimpleXMLElement` methods such as `registerXPathNamespace`, `xpath`, `attributes`, `children`, and `getNamespaces` are visible.
+  - Suppress or model dynamic XML child property access on `SimpleXMLElement`, e.g. `$result->Code`, `$item->TechStart`, without suppressing ordinary unknown properties on normal classes.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Service/NpExtendedProcessor.php
+    /home/apanov/Projects/bdpn-ui/app/src/Service/PublicKeyService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/BaseOutbound.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckPortingAvailabilityService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckPortingDateByContractDateService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckPortingDateChangeService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckPortingDateService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/CheckRejectionReasonsService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/GetBusyTimeSlotsByCodeService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/GetOperatorByNumberService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/GetPublicKeyByCodeService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/ListTechWindowsService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Soap/Outbound/NpTimerService.php
+
+- [x] **H-DIAGNOSTICS-ZIPARCHIVE-STUB-MEMBER-INDEXING-2026-06-04** Fix missing `ZipArchive` methods/constants/properties from extension stubs *(done 2026-06-04)*
+  - Reproduce BDPn diagnostics for `\ZipArchive::open`, `close`, `addFile`, `extractTo`, `getStream`, `getNameIndex`, `$numFiles`, `CREATE`, and `OVERWRITE`.
+  - Verify why `server/data/stubs/zip/zip.php` class members/constants are not available to diagnostics even though the stub file declares them.
+  - Fix stub parsing/indexing generically for native extension classes, including phpstorm-stub attributes such as `#[LanguageLevelTypeAware(...)]`.
+  - Add regression tests that fail if only the class symbol is indexed but methods/constants/properties are missing.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/SftpManagerController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Service/PortingProcessFileService.php
+    /home/apanov/Projects/bdpn-ui/app/src/Service/SftpCsv/SftpCsvArchivePreviewer.php
+    /home/apanov/Projects/bdpn-ui/app/src/Service/Util/EncryptionService.php
+  - Resolved by `H-DIAGNOSTICS-GLOBAL-EXTENSION-FUNCTION-FALLBACK-2026-06-04`: default stubs now discover and load the `zip` extension automatically.
+  - Validation: BDPn `app/src` full analyze no longer reports `ZipArchive` method, constant, or property diagnostics.
+
+- [ ] **H-DIAGNOSTICS-INHERITED-INTERFACE-MEMBERS-FORMFLOW-2026-06-04** Resolve methods inherited through interface extends chains
+  - Reproduce BDPn `Symfony\Component\Form\Flow\FormFlowInterface` warnings for `handleRequest`, `isSubmitted`, `isValid`, `get`, and `addError`.
+  - Verify member lookup traverses `interface A extends B` the same way it traverses class inheritance/implements relationships.
+  - Add generic tests with a vendor-like interface extending another interface that declares the called methods.
+  - Ensure the fix benefits hover/definition/completion member lookup if they share the same hierarchy resolver.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/DebtSuspensionController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/OperatorController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/PortingRequestController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/RegistrationController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/ReturnRequestController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/ReverseRequestController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/RouteUpdateRequestController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/TechWindowRequestController.php
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/UserController.php
+
+- [ ] **H-DIAGNOSTICS-IMPORTED-RETURN-TYPE-DOUBLE-QUALIFICATION-2026-06-04** Avoid re-relativizing already resolved imported return types
+  - Reproduce BDPn diagnostics such as `Unknown method: App\Service\App\Entity\PortingProcessFiles::setStatus`.
+  - Use `PortingProcessFilesRepositoryInterface::findOneByPortingProcessAndEncFileName(...): ?PortingProcessFiles` as the representative shape: the declaring interface imports `App\Entity\PortingProcessFiles`, while the call site is in `App\Service`.
+  - Preserve the declaring symbol's namespace/import context when carrying method return types to call-site member diagnostics.
+  - Add tests that imported return types do not become `CurrentNamespace\App\Entity\...`.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Service/PortingProcessFileService.php
+
+- [ ] **H-DIAGNOSTICS-COMPACT-STRING-VARIABLE-USAGE-2026-06-04** Treat `compact(...)` string arguments as variable reads
+  - Reproduce BDPn `ExtendedServiceController` false unused-variable warnings for `$title`, `$fields`, and `$result`.
+  - Mark `compact('title', 'fields', 'result')` and array/nested string forms supported by PHP as reads of the matching local variables.
+  - Keep warnings for strings that do not correspond to declared variables if a separate undefined-variable diagnostic exists.
+  - Add parser semantic tests for `compact` in namespaced and non-namespaced code.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/ExtendedServiceController.php
+
+- [ ] **H-DIAGNOSTICS-BOOLEAN-OPERATOR-RETURN-INFERENCE-2026-06-04** Infer comparison/logical expressions as `bool` for return diagnostics
+  - Reproduce `Return type mismatch ... expected bool, got string` on a method returning `'' === $value || 1 === preg_match(...)`.
+  - Ensure strict/equality comparisons and logical operators (`&&`, `||`, `and`, `or`, `xor`, `!`) infer `bool` in return type compatibility.
+  - Add tests for mixed scalar operands so boolean expressions do not inherit operand types.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Service/SftpCsv/SftpCsvArchivePreviewer.php

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copy phpstorm-stubs into the extension bundle.
-# Only copies the stub extensions that are enabled by default.
+# Copies every real stub extension directory used by the default server config.
 #
 # Usage:
 #   ./scripts/bundle-stubs.sh
@@ -17,15 +17,17 @@ if [[ ! -d "$STUBS_SRC" ]]; then
     exit 1
 fi
 
-# Default extensions to bundle (matches package.json defaults)
-DEFAULT_EXTENSIONS=(
-    Core SPL standard pcre date json
-    mbstring ctype tokenizer dom SimpleXML
-    PDO curl filter hash session
-    soap Reflection intl fileinfo openssl phar
-    random xml xmlreader xmlwriter zip zlib
-    bcmath gd iconv mysqli sodium
-)
+is_stub_extension_dir() {
+    local dir="$1"
+    local name
+    name="$(basename "$dir")"
+
+    if [[ "$name" == .* || "$name" == "meta" || "$name" == "tests" || "$name" == "vendor" ]]; then
+        return 1
+    fi
+
+    [[ -n "$(find "$dir" -type f -name '*.php' -print -quit)" ]]
+}
 
 echo "=== Bundling phpstorm-stubs ==="
 
@@ -35,15 +37,13 @@ rm -rf "$STUBS_DEST"
 mkdir -p "$STUBS_DEST"
 
 COUNT=0
-for ext in "${DEFAULT_EXTENSIONS[@]}"; do
-    SRC_DIR="$STUBS_SRC/$ext"
-    if [[ -d "$SRC_DIR" ]]; then
+while IFS= read -r -d '' SRC_DIR; do
+    if is_stub_extension_dir "$SRC_DIR"; then
+        ext="$(basename "$SRC_DIR")"
         cp -r "$SRC_DIR" "$STUBS_DEST/$ext"
         COUNT=$((COUNT + 1))
-    else
-        echo "  skip: $ext (not found)"
     fi
-done
+done < <(find "$STUBS_SRC" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
 
 # Copy meta files needed by the loader
 for f in PhpStormStubsMap.php; do

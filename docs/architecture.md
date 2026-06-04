@@ -588,8 +588,10 @@ Stubs:
 - CLI/source-checkout runs can discover `server/data/stubs` relative to
   `server/target/{debug,release}` binaries when no bundled client path is
   supplied.
-- The server loads configured extension directories from phpstorm-stubs. If the
-  extension list is explicitly empty, stubs are treated as disabled by config.
+- The server loads configured extension directories from phpstorm-stubs. If no
+  extension list is configured, it discovers and loads every available
+  extension directory containing PHP stubs. If the extension list is explicitly
+  empty, stubs are treated as disabled by config.
 - Missing, non-directory, or uninitialized stubs paths are skipped and logged
   separately from intentional stubs disablement.
 - Stub symbols are marked as built-in.

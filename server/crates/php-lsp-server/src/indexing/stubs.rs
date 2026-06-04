@@ -112,8 +112,10 @@ pub(crate) fn load_configured_stubs(
         remove_stub_symbols(index);
     }
 
-    let extensions = effective_stub_extensions(stub_extensions.as_deref());
-    if extensions.is_empty() {
+    if stub_extensions
+        .as_deref()
+        .is_some_and(|extensions| extensions.is_empty())
+    {
         tracing::info!("phpstorm-stubs disabled by config: stub extensions list is empty");
         return 0;
     }
@@ -136,10 +138,16 @@ pub(crate) fn load_configured_stubs(
         }
 
         tracing::info!("Loading phpstorm-stubs from {}", stubs_path.display());
+        let extensions =
+            effective_stub_extensions_for_path(&stubs_path, stub_extensions.as_deref());
+        if extensions.is_empty() {
+            tracing::info!("phpstorm-stubs disabled by config: stub extensions list is empty");
+            return 0;
+        }
         let cache_sources = collect_stub_cache_sources(&stubs_path, &extensions);
         let cache_path = cache::cache_file_path_for_namespace(root, CacheNamespace::Stubs);
         let cache_config =
-            stubs_index_cache_config(&stubs_path, php_version, stub_extensions.as_deref());
+            stubs_index_cache_config_for_extensions(&stubs_path, php_version, extensions.clone());
         let stub_php_version = stubs::StubPhpVersion {
             major: php_version.major,
             minor: php_version.minor,
@@ -162,6 +170,7 @@ pub(crate) fn load_configured_stubs(
             };
             if stubs::load_stub_file_for_php_version(
                 index,
+                &stubs_path,
                 ext_name,
                 &source.path,
                 Some(stub_php_version),
@@ -257,14 +266,20 @@ pub(crate) fn collect_stub_cache_sources(
     let mut sources = Vec::new();
     for extension in extensions {
         for path in stubs::collect_extension_stub_files(stubs_path, extension) {
-            let file_name = path
-                .file_name()
-                .map(|name| name.to_string_lossy())
-                .unwrap_or_default();
+            let relative_path = path
+                .strip_prefix(stubs_path)
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| {
+                    let file_name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_default();
+                    format!("{}/{}", extension, file_name)
+                });
             sources.push(CacheSourceFile::new(
                 path.clone(),
-                stubs::stub_file_uri(extension, &path),
-                format!("{}/{}", extension, file_name),
+                stubs::stub_file_uri(stubs_path, extension, &path),
+                relative_path,
             ));
         }
     }
@@ -275,6 +290,9 @@ pub(crate) fn collect_stub_cache_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use php_lsp_parser::parser::FileParser;
+    use php_lsp_parser::semantic::{extract_semantic_diagnostics, SemanticDiagnosticKind};
+    use php_lsp_parser::symbols::extract_file_symbols;
 
     fn source_stubs_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs")
@@ -332,5 +350,69 @@ mod tests {
                 "standard function should be marked built-in: {fqn}"
             );
         }
+    }
+
+    #[test]
+    fn test_default_stubs_expose_global_extension_functions_in_namespaces() {
+        let stubs_path = source_stubs_path();
+        if !source_stubs_are_available(&stubs_path)
+            || !stubs_path.join("libxml/libxml.php").is_file()
+            || !stubs_path.join("posix/posix.php").is_file()
+        {
+            eprintln!(
+                "Skipping server stubs smoke test: libxml/posix stubs not initialized at {}",
+                stubs_path.display()
+            );
+            return;
+        }
+
+        let index = WorkspaceIndex::new();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let loaded =
+            load_configured_stubs(&index, &repo_root, None, None, PhpVersion::DEFAULT, true);
+
+        assert!(loaded > 0, "expected default stubs to load");
+        for fqn in ["libxml_clear_errors", "libxml_get_errors", "posix_geteuid"] {
+            let symbol = index
+                .resolve_fqn(fqn)
+                .unwrap_or_else(|| panic!("missing default extension function: {fqn}"));
+            assert!(
+                symbol.modifiers.is_builtin,
+                "extension function should be marked built-in: {fqn}"
+            );
+        }
+        for fqn in ["ZipArchive", "ZipArchive::open", "ZipArchive::CREATE"] {
+            let symbol = index
+                .resolve_fqn(fqn)
+                .unwrap_or_else(|| panic!("missing default extension symbol: {fqn}"));
+            assert!(
+                symbol.modifiers.is_builtin,
+                "extension symbol should be marked built-in: {fqn}"
+            );
+        }
+
+        let code = r#"<?php
+namespace App\Controller;
+
+libxml_clear_errors();
+libxml_get_errors();
+posix_geteuid();
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().expect("test PHP should parse");
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let diagnostics =
+            extract_semantic_diagnostics(tree, code, &file_symbols, |fqn| index.resolve_fqn(fqn));
+        let unknown_functions: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::UnknownFunction)
+            .collect();
+
+        assert!(
+            unknown_functions.is_empty(),
+            "default global extension stubs should satisfy namespaced unqualified calls, got: {:?}",
+            unknown_functions
+        );
     }
 }

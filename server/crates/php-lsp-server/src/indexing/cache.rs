@@ -8,15 +8,16 @@
 use super::super::*;
 use std::time::UNIX_EPOCH;
 
+const DISCOVER_ALL_AVAILABLE_STUBS_CACHE_LABEL: &str = "__discover_all_available_stubs__";
+
 pub(crate) fn workspace_index_cache_config(
-    root: Option<&Path>,
+    _root: Option<&Path>,
     php_version: PhpVersion,
     include_paths: &[PathBuf],
     exclude_paths: &[PathBuf],
     stub_extensions: Option<&[String]>,
     client_stubs_path: Option<&Path>,
 ) -> IndexCacheConfig {
-    let root = root.unwrap_or_else(|| Path::new(""));
     IndexCacheConfig {
         namespace: CacheNamespace::Workspace,
         php_lsp_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -29,15 +30,15 @@ pub(crate) fn workspace_index_cache_config(
             .iter()
             .map(|path| cache_path_label(path))
             .collect(),
-        stub_extensions: effective_stub_extensions(stub_extensions),
-        stubs_hash: stubs_cache_hash(root, client_stubs_path, stub_extensions),
+        stub_extensions: workspace_stub_extensions_for_cache(stub_extensions),
+        stubs_hash: workspace_stubs_cache_hash(stub_extensions, client_stubs_path),
     }
 }
 
-pub(crate) fn stubs_index_cache_config(
+pub(crate) fn stubs_index_cache_config_for_extensions(
     stubs_path: &Path,
     php_version: PhpVersion,
-    stub_extensions: Option<&[String]>,
+    extensions: Vec<String>,
 ) -> IndexCacheConfig {
     IndexCacheConfig {
         namespace: CacheNamespace::Stubs,
@@ -45,8 +46,8 @@ pub(crate) fn stubs_index_cache_config(
         php_version: php_version_label(php_version),
         include_paths: vec![cache_path_label(stubs_path)],
         exclude_paths: Vec::new(),
-        stub_extensions: effective_stub_extensions(stub_extensions),
-        stubs_hash: stubs_cache_hash_for_path(stubs_path, stub_extensions),
+        stubs_hash: stubs_cache_hash_for_path_with_extensions(stubs_path, &extensions),
+        stub_extensions: extensions,
     }
 }
 
@@ -83,36 +84,59 @@ pub(crate) fn effective_stub_extensions(stub_extensions: Option<&[String]>) -> V
     }
 }
 
-pub(crate) fn stubs_cache_hash(
-    root: &Path,
-    client_stubs_path: Option<&Path>,
+pub(crate) fn effective_stub_extensions_for_path(
+    stubs_path: &Path,
     stub_extensions: Option<&[String]>,
+) -> Vec<String> {
+    if stub_extensions.is_some() {
+        return effective_stub_extensions(stub_extensions);
+    }
+
+    let discovered = stubs::discover_stub_extensions(stubs_path);
+    if discovered.is_empty() {
+        effective_stub_extensions(None)
+    } else {
+        discovered
+    }
+}
+
+fn workspace_stub_extensions_for_cache(stub_extensions: Option<&[String]>) -> Vec<String> {
+    match stub_extensions {
+        Some(extensions) => extensions.to_vec(),
+        None => vec![DISCOVER_ALL_AVAILABLE_STUBS_CACHE_LABEL.to_string()],
+    }
+}
+
+fn workspace_stubs_cache_hash(
+    stub_extensions: Option<&[String]>,
+    client_stubs_path: Option<&Path>,
 ) -> u64 {
-    let extensions = effective_stub_extensions(stub_extensions);
-    if extensions.is_empty() {
-        return cache::stable_hash_strings(["stubs-cache-v1", "disabled"]);
+    let mut parts = vec!["workspace-stubs-config-v1".to_string()];
+    match stub_extensions {
+        Some([]) => {
+            parts.push("extensions=disabled".to_string());
+        }
+        Some(extensions) => {
+            for extension in extensions {
+                parts.push(format!("extension={extension}"));
+            }
+        }
+        None => {
+            parts.push("extensions=discover-all-available".to_string());
+        }
     }
-
-    let client_stubs_path = client_stubs_path.map(Path::to_path_buf);
-    if let Some(stubs_root) = candidate_stubs_paths(root, client_stubs_path)
-        .into_iter()
-        .find(|path| path.is_dir())
-    {
-        return stubs_cache_hash_for_path(&stubs_root, stub_extensions);
-    }
-
-    let mut parts = vec!["stubs-cache-v1".to_string(), "root=missing".to_string()];
-    for extension in extensions {
-        parts.push(format!("extension={}:unknown", extension));
+    if let Some(path) = client_stubs_path {
+        parts.push(format!("client-stubs-path={}", cache_path_label(path)));
+    } else {
+        parts.push("client-stubs-path=auto".to_string());
     }
     cache::stable_hash_strings(parts.iter().map(String::as_str))
 }
 
-pub(crate) fn stubs_cache_hash_for_path(
+pub(crate) fn stubs_cache_hash_for_path_with_extensions(
     stubs_root: &Path,
-    stub_extensions: Option<&[String]>,
+    extensions: &[String],
 ) -> u64 {
-    let extensions = effective_stub_extensions(stub_extensions);
     if extensions.is_empty() {
         return cache::stable_hash_strings(["stubs-cache-v1", "disabled"]);
     }
@@ -127,9 +151,9 @@ pub(crate) fn stubs_cache_hash_for_path(
     }
 
     for extension in extensions {
-        let path = stubs_root.join(&extension);
+        let path = stubs_root.join(extension);
         if path.exists() {
-            push_metadata_hash_part(&mut parts, "extension", &extension, &path);
+            push_metadata_hash_part(&mut parts, "extension", extension, &path);
         } else {
             parts.push(format!("extension={}:missing", extension));
         }

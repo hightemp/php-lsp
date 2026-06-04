@@ -282,7 +282,7 @@ Runtime environment:
 | `phpLsp.serverPath` | `""` | Custom server binary path. Empty uses the bundled binary, then falls back to `php-lsp` from `PATH` if the bundled binary is missing. |
 | `phpLsp.includePaths` | `[]` | Additional relative or absolute directories/files to include in workspace indexing. |
 | `phpLsp.excludePaths` | `[]` | Relative or absolute directories/files to exclude from workspace indexing. |
-| `phpLsp.stubs.extensions` | Common extensions | PHP stub extension set to index from the bundled stubs. Leave unset for defaults; set `[]` to disable stubs. |
+| `phpLsp.stubs.extensions` | All available stubs | PHP stub extension set to index from the bundled stubs. Leave unset to discover all extension directories; set `[]` to disable stubs. |
 | `phpLsp.composer.enabled` | `true` | Enable `composer.json` autoload indexing. |
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
 | `phpLsp.diagnostics.mode` | `basic-semantic` | `off`, `syntax-only`, or `basic-semantic`. |

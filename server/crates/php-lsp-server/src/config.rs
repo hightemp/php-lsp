@@ -32,7 +32,7 @@ include = []
 exclude = []
 
 [stubs]
-# Omit `extensions` to use bundled defaults. Set `extensions = []` to disable stubs.
+# Omit `extensions` to discover all available stub extension directories. Set `extensions = []` to disable stubs.
 # extensions = ["Core", "standard", "SPL"]
 # path = "/absolute/path/to/phpstorm-stubs"
 

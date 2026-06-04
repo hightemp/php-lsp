@@ -109,7 +109,7 @@ Package input refresh:
 | Command | Result |
 |---------|--------|
 | `./scripts/build-server.sh` | pass, `client/bin/linux-x64/php-lsp` size 9.3M |
-| `./scripts/bundle-stubs.sh` | pass, 31 bundled stub extensions, 3.5M |
+| `./scripts/bundle-stubs.sh` | pass, 194 bundled stub extensions, 12M |
 | `npx @vscode/vsce package --no-dependencies -o ../target/php-lsp-profile/ht-php-lsp-ie045.vsix` | pass, 99 files, 4.73 MB |
 | `PHP_LSP_VSIX_PLATFORMS=linux-x64 scripts/smoke-vsix.sh target/php-lsp-profile/ht-php-lsp-ie045.vsix` | pass, package and CLI smoke |
 
@@ -430,7 +430,7 @@ Result:
 | Check | Result |
 |-------|--------|
 | Host server build | pass, `client/bin/linux-x64/php-lsp` size 7.6M |
-| Stubs bundle | pass, 31 extensions, 3.5M |
+| Stubs bundle | pass, 194 extensions, 12M |
 | Client build | pass |
 | Host VSIX package | pass, `/tmp/ht-php-lsp-pv011.vsix`, 3.99M |
 | Host VSIX smoke | pass with `PHP_LSP_VSIX_PLATFORMS=linux-x64` |

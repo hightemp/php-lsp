@@ -847,11 +847,10 @@ fn test_cache_configs_use_separate_namespaces() {
     let root = Path::new("/tmp/project");
     let workspace_config =
         workspace_index_cache_config(Some(root), PhpVersion::DEFAULT, &[], &[], None, None);
-    let stub_extensions = ["Core".to_string()];
-    let stubs_config = stubs_index_cache_config(
+    let stubs_config = stubs_index_cache_config_for_extensions(
         Path::new("/tmp/project/stubs"),
         PhpVersion::DEFAULT,
-        Some(&stub_extensions),
+        vec!["Core".to_string()],
     );
     let vendor_config = vendor_index_cache_config(root, PhpVersion::DEFAULT, &[]);
 
@@ -860,6 +859,38 @@ fn test_cache_configs_use_separate_namespaces() {
     assert_eq!(vendor_config.namespace, CacheNamespace::Vendor);
     assert_ne!(workspace_config.config_hash(), stubs_config.config_hash());
     assert_ne!(workspace_config.config_hash(), vendor_config.config_hash());
+}
+
+#[test]
+fn test_workspace_cache_config_preserves_stub_configuration_without_discovery() {
+    let root = Path::new("/definitely/missing/project");
+    let stubs_path = Path::new("/definitely/missing/stubs");
+    let default_config = workspace_index_cache_config(
+        Some(root),
+        PhpVersion::DEFAULT,
+        &[],
+        &[],
+        None,
+        Some(stubs_path),
+    );
+
+    assert_eq!(
+        default_config.stub_extensions,
+        vec!["__discover_all_available_stubs__".to_string()]
+    );
+
+    let disabled: Vec<String> = Vec::new();
+    let disabled_config = workspace_index_cache_config(
+        Some(root),
+        PhpVersion::DEFAULT,
+        &[],
+        &[],
+        Some(&disabled),
+        Some(stubs_path),
+    );
+
+    assert!(disabled_config.stub_extensions.is_empty());
+    assert_ne!(default_config.config_hash(), disabled_config.config_hash());
 }
 
 #[test]
@@ -873,6 +904,31 @@ fn test_effective_stub_extensions_distinguishes_defaults_from_explicit_empty() {
     assert_eq!(
         effective_stub_extensions(Some(&custom)),
         vec!["Core".to_string()]
+    );
+}
+
+#[test]
+fn test_effective_stub_extensions_for_path_discovers_available_stub_dirs() {
+    let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
+    if !stubs_path.join("Core/Core.php").is_file() {
+        eprintln!(
+            "Skipping stubs discovery test: stubs not initialized at {}",
+            stubs_path.display()
+        );
+        return;
+    }
+
+    let extensions = effective_stub_extensions_for_path(&stubs_path, None);
+
+    assert!(extensions.contains(&"Core".to_string()));
+    assert!(extensions.contains(&"standard".to_string()));
+    assert!(extensions.contains(&"libxml".to_string()));
+    assert!(extensions.contains(&"posix".to_string()));
+    assert!(
+        !extensions
+            .iter()
+            .any(|extension| extension.starts_with('.')),
+        "metadata directories should not be loaded as stubs extensions: {extensions:?}"
     );
 }
 

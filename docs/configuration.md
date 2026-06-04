@@ -162,7 +162,8 @@ path was provided.
 
 `[stubs].extensions` has three distinct states:
 
-- Omitted: use the bundled default extension set.
+- Omitted: load all available phpstorm-stubs extension directories from the
+  selected stubs root.
 - Non-empty array: load only the listed phpstorm-stubs extension directories.
 - Empty array: disable stubs intentionally.
 

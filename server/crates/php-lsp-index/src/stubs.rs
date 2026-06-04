@@ -15,12 +15,15 @@ use std::path::{Path, PathBuf};
 
 pub use php_lsp_parser::symbols::PhpSymbolExtractionVersion as StubPhpVersion;
 
-/// Default extensions that are always loaded (common PHP extensions).
+/// Fallback extension list used when a stubs directory is not available to
+/// inspect. Normal server loading discovers all available stub extension
+/// directories with [`discover_stub_extensions`].
 pub const DEFAULT_EXTENSIONS: &[&str] = &[
     "Core",
     "standard",
     "date",
     "json",
+    "libxml",
     "pcre",
     "SPL",
     "mbstring",
@@ -45,9 +48,12 @@ pub const DEFAULT_EXTENSIONS: &[&str] = &[
     "gd",
     "iconv",
     "mysqli",
+    "posix",
     "sodium",
     "exif",
 ];
+
+const NON_EXTENSION_DIRS: &[&str] = &["meta", "tests", "vendor"];
 
 /// Load phpstorm-stubs for the given extensions into the workspace index.
 ///
@@ -78,7 +84,9 @@ pub fn load_stubs_for_php_version(
         }
 
         for file_path in &php_files {
-            if load_stub_file_for_php_version(index, ext_name, file_path, php_version).is_some() {
+            if load_stub_file_for_php_version(index, stubs_path, ext_name, file_path, php_version)
+                .is_some()
+            {
                 loaded_files += 1;
             }
         }
@@ -88,15 +96,60 @@ pub fn load_stubs_for_php_version(
 }
 
 /// Build the stable pseudo-URI used for a phpstorm-stubs file.
-pub fn stub_file_uri(ext_name: &str, file_path: &Path) -> String {
+pub fn stub_file_uri(stubs_path: &Path, ext_name: &str, file_path: &Path) -> String {
+    let relative_path = relative_stub_file_path(stubs_path, ext_name, file_path);
     format!(
         "phpstub://{}/{}",
         ext_name,
-        file_path.file_name().unwrap_or_default().to_string_lossy()
+        relative_path.to_string_lossy().replace('\\', "/")
     )
 }
 
-/// Collect all .php files from a stubs extension directory (non-recursive).
+fn relative_stub_file_path(stubs_path: &Path, ext_name: &str, file_path: &Path) -> PathBuf {
+    let extension_root = stubs_path.join(ext_name);
+    if let Ok(relative) = file_path.strip_prefix(&extension_root) {
+        if !relative.as_os_str().is_empty() {
+            return relative.to_path_buf();
+        }
+    }
+
+    file_path.file_name().map(PathBuf::from).unwrap_or_default()
+}
+
+/// Discover extension directory names available in a phpstorm-stubs root.
+///
+/// Only top-level directories containing PHP files are returned; repository
+/// metadata, tests, vendor tooling, and phpstorm-meta folders are intentionally ignored.
+pub fn discover_stub_extensions(stubs_path: &Path) -> Vec<String> {
+    let mut extensions = Vec::new();
+    let Ok(entries) = std::fs::read_dir(stubs_path) else {
+        return extensions;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || NON_EXTENSION_DIRS.contains(&name) {
+            continue;
+        }
+        if collect_stub_files(&path).is_empty() {
+            continue;
+        }
+
+        extensions.push(name.to_string());
+    }
+
+    extensions.sort();
+    extensions
+}
+
+/// Collect all .php files from a stubs extension directory recursively.
 pub fn collect_extension_stub_files(stubs_path: &Path, ext_name: &str) -> Vec<PathBuf> {
     collect_stub_files(&stubs_path.join(ext_name))
 }
@@ -105,12 +158,18 @@ pub fn collect_extension_stub_files(stubs_path: &Path, ext_name: &str) -> Vec<Pa
 ///
 /// Returns the number of symbols in the parsed file, or `None` if the file could
 /// not be read or parsed.
-pub fn load_stub_file(index: &WorkspaceIndex, ext_name: &str, file_path: &Path) -> Option<usize> {
-    load_stub_file_for_php_version(index, ext_name, file_path, None)
+pub fn load_stub_file(
+    index: &WorkspaceIndex,
+    stubs_path: &Path,
+    ext_name: &str,
+    file_path: &Path,
+) -> Option<usize> {
+    load_stub_file_for_php_version(index, stubs_path, ext_name, file_path, None)
 }
 
 pub fn load_stub_file_for_php_version(
     index: &WorkspaceIndex,
+    stubs_path: &Path,
     ext_name: &str,
     file_path: &Path,
     php_version: Option<PhpSymbolExtractionVersion>,
@@ -121,7 +180,7 @@ pub fn load_stub_file_for_php_version(
             parser.parse_full(&source);
 
             let tree = parser.tree()?;
-            let uri = stub_file_uri(ext_name, file_path);
+            let uri = stub_file_uri(stubs_path, ext_name, file_path);
             let mut file_symbols = if let Some(php_version) = php_version {
                 extract_file_symbols_for_php_version(tree, &source, &uri, php_version)
             } else {
@@ -156,17 +215,27 @@ pub fn load_stub_file_for_php_version(
     }
 }
 
-/// Collect all .php files from a stubs extension directory (non-recursive).
+/// Collect all .php files from a directory recursively.
 fn collect_stub_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    let mut pending = vec![dir.to_path_buf()];
+
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("php") {
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("php") {
                 files.push(path);
             }
         }
     }
+
+    files.sort();
     files
 }
 
@@ -181,6 +250,99 @@ mod tests {
         assert!(DEFAULT_EXTENSIONS.contains(&"Core"));
         assert!(DEFAULT_EXTENSIONS.contains(&"standard"));
         assert!(DEFAULT_EXTENSIONS.contains(&"PDO"));
+    }
+
+    #[test]
+    fn test_discover_stub_extensions_uses_available_php_stub_dirs() {
+        let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
+        if !stubs_are_available(&stubs_path) {
+            eprintln!(
+                "Skipping stubs discovery test: stubs not initialized at {}",
+                stubs_path.display()
+            );
+            return;
+        }
+
+        let extensions = discover_stub_extensions(&stubs_path);
+        assert!(extensions.contains(&"Core".to_string()));
+        assert!(extensions.contains(&"standard".to_string()));
+        assert!(extensions.contains(&"libxml".to_string()));
+        assert!(extensions.contains(&"posix".to_string()));
+        assert!(extensions.contains(&"zip".to_string()));
+        assert!(
+            !extensions
+                .iter()
+                .any(|extension| extension.starts_with('.')),
+            "metadata directories should not be treated as stub extensions: {extensions:?}"
+        );
+        for skipped in ["tests", "meta", "vendor"] {
+            assert!(
+                !extensions.iter().any(|extension| extension == skipped),
+                "non-extension directory should not be treated as stub extension: {skipped}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_discover_stub_extensions_skips_vendor_even_with_php_files() {
+        let root =
+            std::env::temp_dir().join(format!("php-lsp-stub-discovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Core")).expect("create Core stubs dir");
+        std::fs::write(
+            root.join("Core/Core.php"),
+            "<?php function strlen(string $s): int;",
+        )
+        .expect("write Core stub");
+        std::fs::create_dir_all(root.join("vendor/acme/package")).expect("create vendor dir");
+        std::fs::write(
+            root.join("vendor/acme/package/Helper.php"),
+            "<?php function should_not_be_builtin(): void;",
+        )
+        .expect("write vendor PHP file");
+
+        let extensions = discover_stub_extensions(&root);
+
+        assert_eq!(extensions, vec!["Core".to_string()]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_collect_extension_stub_files_recurses_and_uri_preserves_relative_path() {
+        let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
+        if !stubs_path.join("snappy/snappy/snappy.php").is_file() {
+            eprintln!(
+                "Skipping recursive stubs test: nested snappy stub not initialized at {}",
+                stubs_path.display()
+            );
+            return;
+        }
+
+        let files = collect_extension_stub_files(&stubs_path, "snappy");
+        let nested = stubs_path.join("snappy/snappy/snappy.php");
+
+        assert!(
+            files.iter().any(|file| file == &nested),
+            "expected recursive stub collection to include {nested:?}, got {files:?}"
+        );
+        assert_eq!(
+            stub_file_uri(&stubs_path, "snappy", &nested),
+            "phpstub://snappy/snappy/snappy.php"
+        );
+    }
+
+    #[test]
+    fn test_stub_file_uri_uses_stubs_root_not_first_matching_path_component() {
+        let stubs_path = std::env::temp_dir()
+            .join("snappy")
+            .join("project")
+            .join("server/data/stubs");
+        let nested = stubs_path.join("snappy/snappy/snappy.php");
+
+        assert_eq!(
+            stub_file_uri(&stubs_path, "snappy", &nested),
+            "phpstub://snappy/snappy/snappy.php"
+        );
     }
 
     fn stubs_are_available(stubs_path: &Path) -> bool {
