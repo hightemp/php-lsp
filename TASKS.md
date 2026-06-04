@@ -4717,3 +4717,29 @@ change.
   - Avoid duplicate `Returns` when native return type and PHPDoc `@return` are equivalent; keep both only when PHPDoc refines native `mixed`/`object`/generic types.
   - Make long parameter lists and array-shape/generic types readable without relying on VS Code wrapping quirks.
   - Add snapshot-style e2e assertions for representative hover Markdown blocks.
+
+- [x] **H-COMPLETION-FOREACH-COLLECTION-MEMBER-DIDCHANGE-2026-06-03** Починить autocomplete/diagnostics для foreach collection element после редактирования *(done 2026-06-03)*
+  - Reproduce `foreach ($request->getItems() as $item) { $item-> }` where the collection getter is typed as `Collection<int, Item>` or equivalent PHPDoc/generic type.
+  - Ensure member completion on the foreach value variable resolves the iterable element type and returns entity methods/properties.
+  - Ensure incomplete trailing member access used to trigger completion is not reported as a stale/incorrect member diagnostic after `didChange`.
+  - Keep the fix generic; do not hardcode BDPn class names or paths.
+  - Add focused e2e coverage for completion and diagnostics on an open edited file.
+  - Implemented: parser-side same-file member inference now prefers more-specific PHPDoc return/property types over weaker native types and resolves those PHPDoc names relative to the declaring symbol.
+  - Implemented: completion preserves generic collection return text for foreach inference and member-call chains, while member-chain traversal converts nullable/generic type text back to an object FQN before the next lookup.
+  - Implemented: parser resolver return text is split between generic-preserving type inference and object-FQN member lookup, including plain function calls such as `foreach (loadUsers() as $user)`.
+  - Updated by `H-DIAGNOSTICS-TREE-SITTER-ERROR-CLASSIFICATION-2026-06-04`: one-line dangling `$object->` / `$object?->` syntax nodes are reported as tree-sitter syntax diagnostics; completion still works at those incomplete positions.
+  - Regression: Twig property-style hover still prefers real indexed PHP properties when they exist and falls back to getter aliases only when no backing property is resolved.
+  - Tests: added e2e coverage for completion after `didChange` on an incomplete foreach member access, indexed namespace-relative/alias-qualified PHPDoc generic collection returns, plain function generic resolver returns, and parser diagnostics coverage for dangling member access used as a completion trigger.
+  - Docs: updated README, LSP feature matrix, architecture notes, and production risk register.
+  - Validation: after fixing the Verifier finding for plain function generic returns, `cargo test -p php-lsp-parser`, `cargo test -p php-lsp-server --test e2e_completion -- --nocapture`, `cargo test -p php-lsp-server --test e2e_templates -- --nocapture`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.
+  - Validation: Verifier rerun reported no blocking findings; residual risk is limited to exotic PHPDoc forms such as `self/static` inside generic return arguments.
+
+- [x] **H-DIAGNOSTICS-TREE-SITTER-ERROR-CLASSIFICATION-2026-06-04** Убрать dangling-member hardcode из parser diagnostics *(done 2026-06-04)*
+  - Remove `is_dangling_member_access_error`; syntax diagnostics should be based on tree-sitter structural error signals, not text suffix special cases.
+  - Keep collecting both `ERROR` nodes and `MISSING` nodes with UTF-16 LSP ranges.
+  - Replace the old dangling member suppression regression with coverage that `$object->` is reported as a normal tree-sitter syntax error.
+  - Revisit completion-time transient diagnostic suppression separately if needed at the LSP/server layer.
+  - Implemented: parser diagnostics now uses `node.is_error()` and `node.is_missing()` through a single tree-sitter error-message helper; the text-suffix dangling-member exception was removed.
+  - Implemented: completion e2e now verifies autocomplete still works at `$portingNumber->` while diagnostics publish the tree-sitter syntax error.
+  - Docs: updated README, LSP feature docs, architecture notes, and production risk register to describe the restored tree-sitter diagnostic behavior.
+  - Validation: `cargo test -p php-lsp-parser diagnostics -- --nocapture`, `cargo test -p php-lsp-server --test e2e_completion test_completion_foreach_collection_value_after_did_change_incomplete_member_access -- --nocapture`, `cargo test --all`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` passed.

@@ -579,7 +579,7 @@ impl PhpLspBackend {
                         || (sym.parent_fqn.as_deref() == Some(class_fqn)
                             && (sym.name == member_name || sym.name == bare_name))
                     {
-                        symbol_return_type_fqn(&self.index, class_fqn, sym)
+                        symbol_return_type_text_from_index(&self.index, class_fqn, sym)
                     } else {
                         None
                     }
@@ -649,7 +649,7 @@ impl PhpLspBackend {
                         })
                     })?;
                 let signature = symbol.signature.as_ref()?;
-                let return_type = signature.return_type.as_ref()?;
+                let return_type = symbol_effective_return_type(&symbol)?;
                 let arguments = completion_call_arguments_by_param(
                     member_text,
                     signature,
@@ -664,12 +664,12 @@ impl PhpLspBackend {
                 let substitutions =
                     call_site_template_substitutions(&arguments, signature, &template_names);
                 let resolved = resolve_call_site_type_info(
-                    return_type,
+                    &return_type,
                     &arguments,
                     &template_names,
                     &substitutions,
                 );
-                type_info_fqn_from_index(&self.index, class_fqn, &symbol.uri, &resolved)
+                type_info_resolved_text_from_index(&self.index, class_fqn, &symbol.uri, &resolved)
             },
         )
     }
@@ -709,6 +709,9 @@ impl PhpLspBackend {
                             Some(source),
                             type_cache,
                         )
+                        .and_then(|type_text| {
+                            completion_member_type_text_to_object_fqn(&self.index, &type_text)
+                        })
                     },
                 ) {
                     return Some(class_fqn);
@@ -788,6 +791,7 @@ impl PhpLspBackend {
                         Some(source),
                         type_cache,
                     )
+                    .map(|type_text| completion_member_type_text_for_parser(&type_text))
                 };
                 let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
                     resolve_callable_parameter_type_from_index(&self.index, file_symbols, ctx)
@@ -890,6 +894,12 @@ impl PhpLspBackend {
                                     Some(source),
                                     type_cache,
                                 )
+                                .and_then(|type_text| {
+                                    completion_member_type_text_to_object_fqn(
+                                        &self.index,
+                                        &type_text,
+                                    )
+                                })
                             },
                         )
                     })?
@@ -917,7 +927,7 @@ impl PhpLspBackend {
                     } else {
                         format!("${}", member_name)
                     };
-                    class_fqn = if is_method_call {
+                    let member_type_text = if is_method_call {
                         self.resolve_completion_member_call_type(
                             &class_fqn,
                             &lookup_name,
@@ -945,6 +955,8 @@ impl PhpLspBackend {
                             type_cache,
                         )?
                     };
+                    class_fqn =
+                        completion_member_type_text_to_object_fqn(&self.index, &member_type_text)?;
                 }
 
                 Some(class_fqn)
@@ -971,6 +983,7 @@ impl PhpLspBackend {
                         Some(ctx.source),
                         ctx.type_cache,
                     )
+                    .map(|type_text| completion_member_type_text_for_parser(&type_text))
                 };
                 let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
                     resolve_callable_parameter_type_from_index(
@@ -1037,6 +1050,66 @@ impl PhpLspBackend {
                 items.push(item);
             }
         }
+    }
+}
+
+fn completion_member_type_text_to_object_fqn(
+    index: &WorkspaceIndex,
+    type_text: &str,
+) -> Option<String> {
+    let type_info = parse_phpdoc(&format!("/** @var {type_text} */")).var_type?;
+    type_info_fqn_from_index(index, "", "", &type_info)
+}
+
+fn completion_member_type_text_for_parser(type_text: &str) -> String {
+    let Some(type_info) = parse_phpdoc(&format!("/** @var {type_text} */")).var_type else {
+        return type_text.to_string();
+    };
+    completion_type_info_text_for_parser(&type_info)
+}
+
+fn completion_type_info_text_for_parser(type_info: &php_lsp_types::TypeInfo) -> String {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            let name = name.trim();
+            if !is_builtin_type_name(name) && name.contains('\\') {
+                format!("\\{}", name.trim_start_matches('\\'))
+            } else {
+                name.to_string()
+            }
+        }
+        php_lsp_types::TypeInfo::Generic { base, args } => {
+            let base = completion_type_info_text_for_parser(&php_lsp_types::TypeInfo::Simple(
+                base.clone(),
+            ));
+            let args = args
+                .iter()
+                .map(completion_type_info_text_for_parser)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{base}<{args}>")
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            format!("?{}", completion_type_info_text_for_parser(inner))
+        }
+        php_lsp_types::TypeInfo::Union(types) => types
+            .iter()
+            .map(completion_type_info_text_for_parser)
+            .collect::<Vec<_>>()
+            .join("|"),
+        php_lsp_types::TypeInfo::Intersection(types) => types
+            .iter()
+            .map(completion_type_info_text_for_parser)
+            .collect::<Vec<_>>()
+            .join("&"),
+        php_lsp_types::TypeInfo::ClassString(Some(inner)) => {
+            format!(
+                "class-string<{}>",
+                completion_type_info_text_for_parser(inner)
+            )
+        }
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => type_info.to_string(),
+        _ => type_info.to_string(),
     }
 }
 

@@ -33,7 +33,8 @@ phpstorm-stubs support.
   properties, and member calls.
 - Best-effort PHPDoc template metadata, PHPStan/Psalm type aliases and imported
   aliases, and inherited generic member type substitution for common repository
-  and collection patterns.
+  and collection patterns, including foreach values from PHPDoc-generic
+  collection returns.
 - Call-site inference for PHPStan/Psalm conditional return types and
   `class-string<T>` factory/service-locator patterns in hover, completion
   chains, local variable type inlay hints, and Doctrine
@@ -66,7 +67,8 @@ phpstorm-stubs support.
 - Completion for classes, interfaces, traits, enums, functions, constants,
   methods, properties, variables, namespaces, keywords, snippets, PHPDoc virtual
   members, shape keys/properties, framework string keys, template paths, and
-  auto-import edits.
+  auto-import edits; incomplete one-line `$object->` expressions remain usable
+  for completion while tree-sitter diagnostics still report the incomplete PHP.
 - Completion resolve enriches PHPDoc virtual member completions.
 - Signature help for functions, methods, constructors, and active parameter
   tracking.

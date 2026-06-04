@@ -163,13 +163,14 @@ impl PhpLspBackend {
                 }
             }
         };
-        let symbol_info = symbol_info.or_else(|| {
-            template_document
-                .as_ref()
-                .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig)
-                .then(|| twig_property_accessor_method_for_symbol(&self.index, &sym_at_pos))
-                .flatten()
-        });
+        let twig_accessor_symbol = template_document
+            .as_ref()
+            .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig)
+            .then(|| twig_property_accessor_method_for_symbol(&self.index, &sym_at_pos))
+            .flatten();
+        let twig_accessor_alias = (symbol_info.is_none() && twig_accessor_symbol.is_some())
+            .then(|| sym_at_pos.name.trim_start_matches('$').to_string());
+        let symbol_info = symbol_info.or(twig_accessor_symbol);
 
         let virtual_member = if symbol_info.is_none() {
             phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)
@@ -228,6 +229,11 @@ impl PhpLspBackend {
             let parsed_phpdoc = sym.doc_comment.as_deref().map(parse_phpdoc);
 
             append_hover_symbol_identity_line(&mut content, &sym);
+            if let Some(alias) = twig_accessor_alias.as_deref() {
+                content.push_str("\n**Twig property:** `");
+                content.push_str(alias);
+                content.push_str("`\n");
+            }
             if let Some(parent_fqn) = sym.parent_fqn.as_deref() {
                 append_class_fqn_link_line(
                     &mut content,

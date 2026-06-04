@@ -5,7 +5,8 @@ means the server implements the LSP method, but the behavior is intentionally
 limited, performance-sensitive on large workspaces, or delegated to external
 tools.
 
-Latest acceptance refresh: 2026-05-28 (`IE-045`). The feature matrix reflects
+Latest acceptance refresh: 2026-06-04
+(`H-DIAGNOSTICS-TREE-SITTER-ERROR-CLASSIFICATION-2026-06-04`). The feature matrix reflects
 the IDE intelligence milestone after PHPDoc/type inference, framework provider,
 Blade-like document, and Symfony/Twig document work. Performance evidence lives
 in `docs/production-baseline.md`.
@@ -92,12 +93,12 @@ client-visible LSP behavior and known limits.
 
 | LSP feature | Status | Notes |
 |---|---|---|
-| Diagnostics: syntax | Supported | Tree-sitter syntax errors. |
+| Diagnostics: syntax | Supported | Tree-sitter syntax errors from `ERROR` nodes and `MISSING` nodes. One-line dangling member access such as `$object->` or `$object?->` is still reported as incomplete PHP; completion handles those edit states separately. |
 | Diagnostics: built-in semantic | Supported | Unknown symbols, unused code, duplicate symbols, member access, type compatibility, override signatures, PHP-version checks. Unqualified function calls follow current-namespace then global/built-in fallback before reporting unknown functions. PHPDoc numeric literal parsing covers the supported scalar integer/float forms, but type compatibility and override variance checks remain conservative approximations rather than full PHPStan/Psalm parity. Without Composer/vendor metadata, external framework symbols can be reported as unknown; highly dynamic framework members such as some Eloquent relation APIs remain best-effort. |
 | Diagnostics: PHPStan | Partial | Optional external command, timeout-bound, JSON output required. |
 | Diagnostics: Psalm | Partial | Optional external command, timeout-bound, JSON output required. |
 | `textDocument/hover` | Supported | Symbols, source-like PHP declarations/signatures, linked FQN and source-file metadata for indexed symbols, linked class relations (`Extends`, `Implements`, `Uses`, `Mixins`), method-level `Implements`/`Overrides` links for interface implementations and inherited overrides, PHPDoc template/generic bindings, template variance and bounds, indexed PHP 8 attributes above declarations, Symfony/Doctrine framework role metadata, Doctrine `repositoryClass` links, complete signature parameter sections with scalar/array/mixed/untyped/default/by-ref/variadic parameters, PHPDoc parameter descriptions, types, variables, deprecation, PHPDoc virtual members, clickable class links in resolvable type sections, expanded indexed PHPDoc type aliases, local file-level PHPDoc shape aliases, call-site `class-string<T>` / conditional return inference, Doctrine `getRepository<T>()` and repository `find`/`findOneBy`/`findBy` concrete return sections, closure callback parameter inference from `callable(...)` signatures, and mapped Blade/Twig expression hovers where virtual PHP can resolve the symbol. |
-| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, `use` FQN insertion, prefix-ranked namespace candidates, expanded member signature aliases, shape keys/properties from PHPDoc, local file-level shape aliases, and literal arrays, read/write-aware PHPDoc virtual properties, static PHPDoc virtual methods, framework string keys, Blade/Twig expression completions, Twig template path completions, callback parameter member chains, and member chains after `class-string<T>` factory calls. |
+| `textDocument/completion` | Supported | Classes, interfaces, traits, enums, functions, constants, members, variables, namespaces, keywords, snippets, auto-import edits, `use` FQN insertion, prefix-ranked namespace candidates, expanded member signature aliases, shape keys/properties from PHPDoc, local file-level shape aliases, and literal arrays, read/write-aware PHPDoc virtual properties, static PHPDoc virtual methods, framework string keys, Blade/Twig expression completions, Twig template path completions, callback parameter member chains, foreach values from PHPDoc-generic collection returns, and member chains after `class-string<T>` factory calls. |
 | `completionItem/resolve` | Supported | Enriches PHPDoc virtual member completions, including parsed `@method` parameters/defaults when available. |
 | `textDocument/signatureHelp` | Supported | Functions, methods, constructors, and active parameter tracking. |
 | `textDocument/inlayHint` | Supported | Argument labels, inferred PHPDoc parameter/return hints, and useful inferred local variable type hints for assignments, foreach key/value variables, `class-string<T>` factories, callback parameters, and conditional returns. |

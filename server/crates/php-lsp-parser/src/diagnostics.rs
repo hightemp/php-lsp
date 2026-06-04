@@ -13,7 +13,7 @@ pub fn extract_syntax_errors(tree: &tree_sitter::Tree, source: &str) -> Vec<Diag
 }
 
 fn collect_errors(node: Node, utf16_index: &Utf16LineIndex, diagnostics: &mut Vec<Diagnostic>) {
-    if node.is_error() {
+    if let Some(message) = tree_sitter_error_message(node) {
         let start = node.start_position();
         let end = node.end_position();
         diagnostics.push(Diagnostic {
@@ -29,27 +29,7 @@ fn collect_errors(node: Node, utf16_index: &Utf16LineIndex, diagnostics: &mut Ve
             },
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("php-lsp".to_string()),
-            message: "Syntax error".to_string(),
-            ..Default::default()
-        });
-    } else if node.is_missing() {
-        let start = node.start_position();
-        let end = node.end_position();
-        let kind = node.kind();
-        diagnostics.push(Diagnostic {
-            range: Range {
-                start: Position::new(
-                    start.row as u32,
-                    utf16_index.byte_col_to_utf16(start.row as u32, start.column as u32),
-                ),
-                end: Position::new(
-                    end.row as u32,
-                    utf16_index.byte_col_to_utf16(end.row as u32, end.column as u32),
-                ),
-            },
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("php-lsp".to_string()),
-            message: format!("Missing {}", kind),
+            message,
             ..Default::default()
         });
     }
@@ -58,6 +38,16 @@ fn collect_errors(node: Node, utf16_index: &Utf16LineIndex, diagnostics: &mut Ve
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_errors(child, utf16_index, diagnostics);
+    }
+}
+
+fn tree_sitter_error_message(node: Node) -> Option<String> {
+    if node.is_error() {
+        Some("Syntax error".to_string())
+    } else if node.is_missing() {
+        Some(format!("Missing {}", node.kind()))
+    } else {
+        None
     }
 }
 
@@ -86,6 +76,21 @@ mod tests {
         assert!(!diags.is_empty());
         assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(diags[0].source.as_deref(), Some("php-lsp"));
+    }
+
+    #[test]
+    fn test_dangling_member_access_is_tree_sitter_syntax_error() {
+        let mut parser = FileParser::new();
+        parser.parse_full("<?php\nfunction demo(object $item): void {\n    $item->\n}\n");
+
+        let tree = parser.tree().unwrap();
+        let diags = extract_syntax_errors(tree, &parser.source());
+        assert!(
+            diags
+                .iter()
+                .any(|diag| diag.message == "Syntax error" || diag.message.starts_with("Missing ")),
+            "dangling member access should be reported from tree-sitter errors: {diags:?}"
+        );
     }
 
     #[test]

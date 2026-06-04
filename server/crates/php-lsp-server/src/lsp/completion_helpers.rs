@@ -2295,7 +2295,7 @@ pub(in crate::server) fn resolve_member_type_from_index(
         }
     };
 
-    symbol_return_type_fqn(index, class_fqn, &sym)
+    symbol_return_type_text_from_index(index, class_fqn, &sym)
         .or_else(|| symbol_effective_return_type(&sym).map(|type_info| type_info.to_string()))
 }
 
@@ -2361,7 +2361,7 @@ pub(in crate::server) fn resolve_function_return_type_from_index(
     if sym.kind != php_lsp_types::PhpSymbolKind::Function {
         return None;
     }
-    symbol_return_type_fqn(index, "", &sym)
+    symbol_return_type_text_from_index(index, &sym.fqn, &sym)
 }
 
 pub(in crate::server) fn symbol_return_type_fqn(
@@ -2373,6 +2373,21 @@ pub(in crate::server) fn symbol_return_type_fqn(
     tracing::debug!("resolve_member_type: {} -> return type '{}'", sym.fqn, ret);
 
     type_info_fqn_from_index(index, owner_fqn, &sym.uri, &ret)
+}
+
+pub(in crate::server) fn symbol_return_type_text_from_index(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    sym: &php_lsp_types::SymbolInfo,
+) -> Option<String> {
+    let ret = symbol_effective_return_type(sym)?;
+    tracing::debug!(
+        "resolve_member_type: {} -> return type text '{}'",
+        sym.fqn,
+        ret
+    );
+
+    type_info_resolved_text_from_index(index, owner_fqn, &sym.uri, &ret)
 }
 
 pub(in crate::server) fn type_info_fqn_from_index(
@@ -2409,6 +2424,93 @@ pub(in crate::server) fn type_info_fqn_from_index(
             type_info_fqn_from_index(index, owner_fqn, uri, inner)
         }
         _ => None,
+    }
+}
+
+pub(in crate::server) fn type_info_resolved_text_from_index(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> Option<String> {
+    match type_info {
+        php_lsp_types::TypeInfo::Simple(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            if is_builtin_type_name(name) {
+                return Some(name.trim_start_matches('\\').to_string());
+            }
+            Some(
+                simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, name)
+                    .unwrap_or_else(|| name.trim_start_matches('\\').to_string()),
+            )
+        }
+        php_lsp_types::TypeInfo::Generic { base, args } => {
+            let base = base.trim();
+            if base.is_empty() {
+                return None;
+            }
+            let base_text = if is_builtin_type_name(base) {
+                base.trim_start_matches('\\').to_string()
+            } else {
+                simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, base)
+                    .unwrap_or_else(|| base.trim_start_matches('\\').to_string())
+            };
+            let arg_texts = args
+                .iter()
+                .map(|arg| {
+                    type_info_resolved_text_from_index(index, owner_fqn, uri, arg)
+                        .unwrap_or_else(|| arg.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("{base_text}<{arg_texts}>"))
+        }
+        php_lsp_types::TypeInfo::Nullable(inner) => {
+            type_info_resolved_text_from_index(index, owner_fqn, uri, inner)
+                .map(|inner| format!("?{inner}"))
+        }
+        php_lsp_types::TypeInfo::Union(types) => {
+            let parts = types
+                .iter()
+                .filter_map(|type_info| {
+                    type_info_resolved_text_from_index(index, owner_fqn, uri, type_info)
+                })
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join("|"))
+        }
+        php_lsp_types::TypeInfo::Intersection(types) => {
+            let parts = types
+                .iter()
+                .filter_map(|type_info| {
+                    type_info_resolved_text_from_index(index, owner_fqn, uri, type_info)
+                })
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join("&"))
+        }
+        php_lsp_types::TypeInfo::Self_ | php_lsp_types::TypeInfo::Static_ => {
+            (!owner_fqn.is_empty()).then(|| owner_fqn.trim_start_matches('\\').to_string())
+        }
+        php_lsp_types::TypeInfo::ClassString(Some(inner)) => {
+            type_info_resolved_text_from_index(index, owner_fqn, uri, inner)
+                .map(|inner| format!("class-string<{inner}>"))
+        }
+        php_lsp_types::TypeInfo::ClassString(None)
+        | php_lsp_types::TypeInfo::ArrayShape(_)
+        | php_lsp_types::TypeInfo::ObjectShape(_)
+        | php_lsp_types::TypeInfo::Callable { .. }
+        | php_lsp_types::TypeInfo::Conditional { .. }
+        | php_lsp_types::TypeInfo::Parent_
+        | php_lsp_types::TypeInfo::LiteralString(_)
+        | php_lsp_types::TypeInfo::LiteralInt(_)
+        | php_lsp_types::TypeInfo::LiteralFloat(_)
+        | php_lsp_types::TypeInfo::LiteralBool(_)
+        | php_lsp_types::TypeInfo::LiteralNull
+        | php_lsp_types::TypeInfo::Void
+        | php_lsp_types::TypeInfo::Never
+        | php_lsp_types::TypeInfo::Mixed => Some(type_info.to_string()),
     }
 }
 

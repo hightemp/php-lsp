@@ -269,6 +269,13 @@ quoted strings, booleans, null, decimal/binary/octal/hex integers with numeric
 separators, and decimal or scientific floats. Unsupported or malformed numeric
 forms remain plain type names rather than guessed literals.
 
+Member-return inference prefers a more specific PHPDoc return type over a
+wider native return type when both are available, for example
+`@return Collection<int, Item>` on a method declared as `: Collection`.
+Parser-side same-file inference resolves those PHPDoc class names relative to
+the declaring symbol before foreach value completion uses them, so an open
+edited file and an indexed cross-file call follow the same type path.
+
 ## Startup Flow
 
 1. VS Code activates on PHP files or a workspace containing `composer.json`.
@@ -608,7 +615,7 @@ Diagnostics are controlled by `phpLsp.diagnostics.mode`:
 | Mode | Behavior |
 |---|---|
 | `off` | No php-lsp diagnostics. |
-| `syntax-only` | Tree-sitter syntax diagnostics, plus conservative Twig syntax diagnostics for Twig documents. |
+| `syntax-only` | Tree-sitter syntax diagnostics, plus conservative Twig syntax diagnostics for Twig documents. One-line dangling `$object->` / `$object?->` edits remain syntax diagnostics; completion must tolerate those incomplete edit states separately. |
 | `basic-semantic` | Syntax plus built-in semantic diagnostics. |
 
 Built-in semantic diagnostics include unknown symbols, unused imports/variables,

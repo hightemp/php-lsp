@@ -5001,7 +5001,7 @@ final class PortingRequestController
         (
             4,
             porting_number_id_member_hover_position,
-            "getId",
+            "PortingNumber::$id",
             number_uri.as_str(),
         ),
         (

@@ -344,6 +344,11 @@ Current evidence:
   `callable(...)` signatures, generic collection callback signatures,
   `array_map`-style helper signatures, and `Generator<TKey,TValue>` foreach
   key/value inference.
+- `H-COMPLETION-FOREACH-COLLECTION-MEMBER-DIDCHANGE-2026-06-03` keeps
+  foreach member completion working after `didChange` for methods whose native
+  return is a collection and whose PHPDoc refines the value type, while
+  preserving tree-sitter syntax diagnostics for incomplete one-line
+  `$object->` edits.
 - `PV-012` fixed a real Symfony false positive for promoted constructor
   properties accessed through a `self`-typed parameter
   (`withDefaults(self $defaults)` then `$defaults->objectManager`).

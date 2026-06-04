@@ -50,7 +50,8 @@ impl Drop for ObjectTypeResolveDepthGuard {
 /// For properties: `member_name` includes `$` prefix (e.g., `"$timer"`).
 /// For methods: `member_name` is the method name (e.g., `"start"`).
 ///
-/// Returns the resolved type FQN (e.g., `"App\\TimerService"`) or None.
+/// Returns resolved type text (for example, `"App\\TimerService"` or
+/// `"Collection<int, App\\Entity\\User>"`) or None.
 pub type MemberTypeResolver<'a> = &'a dyn Fn(&str, &str) -> Option<String>;
 
 /// Context for resolving the expected type of an untyped closure/arrow-function
@@ -1191,7 +1192,7 @@ fn try_resolve_object_type_inner<'a>(
     let kind = object_node.kind();
     match kind {
         "function_call_expression" => {
-            try_resolve_function_call_return_type(object_node, source, file_symbols, resolver)
+            try_resolve_function_call_object_fqn(object_node, source, file_symbols, resolver)
         }
         // Direct: new Foo()
         "object_creation_expression" => {
@@ -1270,17 +1271,15 @@ fn try_resolve_object_type_inner<'a>(
             let property_fqn_dollar = format!("{}::${}", class_fqn, prop_name);
             for sym in &file_symbols.symbols {
                 if sym.fqn == property_fqn_dollar {
-                    if let Some(ref sig) = sym.signature {
-                        if let Some(ref ret) = sig.return_type {
-                            if let Some(resolved) = resolve_symbol_type_info_to_object_fqn(
-                                ret,
-                                &class_fqn,
-                                object_node,
-                                source,
-                                file_symbols,
-                            ) {
-                                return Some(resolved);
-                            }
+                    if let Some(ret) = symbol_effective_type_info(sym, file_symbols) {
+                        if let Some(resolved) = resolve_symbol_type_info_to_object_fqn(
+                            &ret,
+                            &class_fqn,
+                            object_node,
+                            source,
+                            file_symbols,
+                        ) {
+                            return Some(resolved);
                         }
                     }
                     break;
@@ -1321,17 +1320,15 @@ fn try_resolve_object_type_inner<'a>(
             let method_fqn = format!("{}::{}", class_fqn, method_name);
             for sym in &file_symbols.symbols {
                 if sym.fqn == method_fqn {
-                    if let Some(ref sig) = sym.signature {
-                        if let Some(ref ret) = sig.return_type {
-                            if let Some(resolved) = resolve_symbol_type_info_to_object_fqn(
-                                ret,
-                                &class_fqn,
-                                object_node,
-                                source,
-                                file_symbols,
-                            ) {
-                                return Some(resolved);
-                            }
+                    if let Some(ret) = symbol_effective_type_info(sym, file_symbols) {
+                        if let Some(resolved) = resolve_symbol_type_info_to_object_fqn(
+                            &ret,
+                            &class_fqn,
+                            object_node,
+                            source,
+                            file_symbols,
+                        ) {
+                            return Some(resolved);
                         }
                     }
                     break;
@@ -3091,6 +3088,272 @@ fn resolve_symbol_type_info_to_object_fqn(
     }
 }
 
+fn symbol_effective_type_info(symbol: &SymbolInfo, file_symbols: &FileSymbols) -> Option<TypeInfo> {
+    let native = symbol
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.return_type.as_ref());
+    let phpdoc = symbol.doc_comment.as_deref().and_then(|doc| {
+        let parsed = parse_phpdoc(doc);
+        if symbol.kind == php_lsp_types::PhpSymbolKind::Property {
+            parsed.var_type
+        } else {
+            parsed.return_type
+        }
+    });
+
+    match (native, phpdoc) {
+        (Some(native), Some(phpdoc))
+            if parser_type_info_specificity_score(&phpdoc)
+                > parser_type_info_specificity_score(native) =>
+        {
+            Some(resolve_type_info_relative_to_symbol(
+                &phpdoc,
+                symbol,
+                file_symbols,
+            ))
+        }
+        (Some(native), _) => Some(resolve_type_info_relative_to_symbol(
+            native,
+            symbol,
+            file_symbols,
+        )),
+        (None, Some(phpdoc)) => Some(resolve_type_info_relative_to_symbol(
+            &phpdoc,
+            symbol,
+            file_symbols,
+        )),
+        (None, None) => None,
+    }
+}
+
+fn resolve_type_info_relative_to_symbol(
+    type_info: &TypeInfo,
+    symbol: &SymbolInfo,
+    file_symbols: &FileSymbols,
+) -> TypeInfo {
+    match type_info {
+        TypeInfo::Simple(name) => TypeInfo::Simple(resolve_type_name_relative_to_symbol(
+            name,
+            symbol,
+            file_symbols,
+        )),
+        TypeInfo::Generic { base, args } => TypeInfo::Generic {
+            base: resolve_type_name_relative_to_symbol(base, symbol, file_symbols),
+            args: args
+                .iter()
+                .map(|arg| resolve_type_info_relative_to_symbol(arg, symbol, file_symbols))
+                .collect(),
+        },
+        TypeInfo::Nullable(inner) => TypeInfo::Nullable(Box::new(
+            resolve_type_info_relative_to_symbol(inner, symbol, file_symbols),
+        )),
+        TypeInfo::Union(types) => TypeInfo::Union(
+            types
+                .iter()
+                .map(|ty| resolve_type_info_relative_to_symbol(ty, symbol, file_symbols))
+                .collect(),
+        ),
+        TypeInfo::Intersection(types) => TypeInfo::Intersection(
+            types
+                .iter()
+                .map(|ty| resolve_type_info_relative_to_symbol(ty, symbol, file_symbols))
+                .collect(),
+        ),
+        TypeInfo::ClassString(Some(inner)) => TypeInfo::ClassString(Some(Box::new(
+            resolve_type_info_relative_to_symbol(inner, symbol, file_symbols),
+        ))),
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => TypeInfo::Conditional {
+            subject: subject.clone(),
+            target: Box::new(resolve_type_info_relative_to_symbol(
+                target,
+                symbol,
+                file_symbols,
+            )),
+            if_type: Box::new(resolve_type_info_relative_to_symbol(
+                if_type,
+                symbol,
+                file_symbols,
+            )),
+            else_type: Box::new(resolve_type_info_relative_to_symbol(
+                else_type,
+                symbol,
+                file_symbols,
+            )),
+        },
+        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: resolve_type_info_relative_to_symbol(&item.value, symbol, file_symbols),
+                })
+                .collect(),
+        ),
+        TypeInfo::ObjectShape(items) => TypeInfo::ObjectShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: resolve_type_info_relative_to_symbol(&item.value, symbol, file_symbols),
+                })
+                .collect(),
+        ),
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => TypeInfo::Callable {
+            params: params
+                .iter()
+                .map(|param| resolve_type_info_relative_to_symbol(param, symbol, file_symbols))
+                .collect(),
+            return_type: return_type.as_ref().map(|return_type| {
+                Box::new(resolve_type_info_relative_to_symbol(
+                    return_type,
+                    symbol,
+                    file_symbols,
+                ))
+            }),
+        },
+        TypeInfo::Self_ | TypeInfo::Static_ | TypeInfo::Parent_ => type_info.clone(),
+        TypeInfo::ClassString(None)
+        | TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed => type_info.clone(),
+    }
+}
+
+fn resolve_type_name_relative_to_symbol(
+    type_name: &str,
+    symbol: &SymbolInfo,
+    file_symbols: &FileSymbols,
+) -> String {
+    let type_name = type_name.trim();
+    if type_name.is_empty()
+        || type_name.starts_with('\\')
+        || is_builtin_non_object_type(type_name)
+        || matches!(type_name, "$this" | "self" | "static" | "parent")
+    {
+        return type_name.to_string();
+    }
+    let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&symbol.fqn);
+    let owner_namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
+    let (first_part, rest) = type_name
+        .split_once('\\')
+        .map_or((type_name, None), |(first, rest)| (first, Some(rest)));
+    if let Some(namespace) = owner_namespace {
+        for use_stmt in &file_symbols.use_statements {
+            if use_stmt.kind != UseKind::Class || use_stmt.namespace.as_deref() != Some(namespace) {
+                continue;
+            }
+            let alias = use_stmt
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+            if alias == first_part {
+                let mut resolved = use_stmt.fqn.trim_start_matches('\\').to_string();
+                if let Some(rest) = rest {
+                    resolved.push('\\');
+                    resolved.push_str(rest);
+                }
+                return format!("\\{resolved}");
+            }
+        }
+
+        if type_name.contains('\\') {
+            let namespace_root = namespace.split('\\').next().unwrap_or(namespace);
+            if first_part == namespace_root {
+                return format!("\\{}", type_name.trim_start_matches('\\'));
+            }
+        }
+
+        return format!("\\{namespace}\\{type_name}");
+    }
+
+    if type_name.contains('\\') {
+        format!("\\{}", type_name.trim_start_matches('\\'))
+    } else {
+        type_name.to_string()
+    }
+}
+
+fn parser_type_info_specificity_score(type_info: &TypeInfo) -> usize {
+    match type_info {
+        TypeInfo::Mixed | TypeInfo::Void | TypeInfo::Never | TypeInfo::LiteralNull => 0,
+        TypeInfo::Simple(name) => {
+            if is_builtin_non_object_type(name) {
+                1
+            } else {
+                3
+            }
+        }
+        TypeInfo::Self_ | TypeInfo::Static_ | TypeInfo::Parent_ => 3,
+        TypeInfo::Nullable(inner) => parser_type_info_specificity_score(inner),
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            types.iter().map(parser_type_info_specificity_score).sum()
+        }
+        TypeInfo::Generic { args, .. } => {
+            4 + args
+                .iter()
+                .map(parser_type_info_specificity_score)
+                .sum::<usize>()
+        }
+        TypeInfo::ArrayShape(items) => {
+            5 + items
+                .iter()
+                .map(|item| parser_type_info_specificity_score(&item.value))
+                .sum::<usize>()
+        }
+        TypeInfo::ObjectShape(items) => {
+            5 + items
+                .iter()
+                .map(|item| parser_type_info_specificity_score(&item.value))
+                .sum::<usize>()
+        }
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => {
+            3 + params
+                .iter()
+                .map(parser_type_info_specificity_score)
+                .sum::<usize>()
+                + return_type
+                    .as_ref()
+                    .map(|return_type| parser_type_info_specificity_score(return_type))
+                    .unwrap_or_default()
+        }
+        TypeInfo::ClassString(inner) => {
+            3 + inner
+                .as_ref()
+                .map(|inner| parser_type_info_specificity_score(inner))
+                .unwrap_or_default()
+        }
+        TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_) => 2,
+        TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => {
+            3 + parser_type_info_specificity_score(if_type)
+                + parser_type_info_specificity_score(else_type)
+        }
+    }
+}
+
 fn try_resolve_function_call_return_type(
     node: Node,
     source: &str,
@@ -3112,13 +3375,179 @@ fn try_resolve_function_call_return_type(
                 return None;
             }
             let resolved = resolve_function_name(raw_name, file_symbols);
-            resolve_fn("", &resolved).or_else(|| {
+            let resolved_type_text = |function_name: &str| {
+                resolve_fn("", function_name)
+                    .map(|type_text| resolver_type_text_for_parser(&type_text))
+            };
+            resolved_type_text(&resolved).or_else(|| {
                 (!raw_name.starts_with('\\') && !raw_name.contains('\\') && resolved != raw_name)
-                    .then(|| resolve_fn("", raw_name))
+                    .then(|| resolved_type_text(raw_name))
                     .flatten()
             })
         }
         _ => None,
+    }
+}
+
+fn try_resolve_function_call_object_fqn(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<String> {
+    let type_text = try_resolve_function_call_return_type(node, source, file_symbols, resolver)?;
+    resolver_type_text_to_object_fqn(&type_text, node, source, file_symbols)
+}
+
+fn resolver_type_text_to_object_fqn(
+    type_text: &str,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    let type_info = type_info_from_type_text(type_text);
+    resolver_type_info_to_object_fqn(&type_info, context_node, source, file_symbols)
+}
+
+fn resolver_type_text_for_parser(type_text: &str) -> String {
+    resolver_type_info_for_parser(&type_info_from_type_text(type_text)).to_string()
+}
+
+fn resolver_type_info_for_parser(type_info: &TypeInfo) -> TypeInfo {
+    match type_info {
+        TypeInfo::Simple(name) => TypeInfo::Simple(resolver_type_name_for_parser(name)),
+        TypeInfo::Generic { base, args } => TypeInfo::Generic {
+            base: resolver_type_name_for_parser(base),
+            args: args.iter().map(resolver_type_info_for_parser).collect(),
+        },
+        TypeInfo::Nullable(inner) => {
+            TypeInfo::Nullable(Box::new(resolver_type_info_for_parser(inner)))
+        }
+        TypeInfo::Union(types) => {
+            TypeInfo::Union(types.iter().map(resolver_type_info_for_parser).collect())
+        }
+        TypeInfo::Intersection(types) => {
+            TypeInfo::Intersection(types.iter().map(resolver_type_info_for_parser).collect())
+        }
+        TypeInfo::ClassString(Some(inner)) => {
+            TypeInfo::ClassString(Some(Box::new(resolver_type_info_for_parser(inner))))
+        }
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => TypeInfo::Conditional {
+            subject: subject.clone(),
+            target: Box::new(resolver_type_info_for_parser(target)),
+            if_type: Box::new(resolver_type_info_for_parser(if_type)),
+            else_type: Box::new(resolver_type_info_for_parser(else_type)),
+        },
+        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: resolver_type_info_for_parser(&item.value),
+                })
+                .collect(),
+        ),
+        TypeInfo::ObjectShape(items) => TypeInfo::ObjectShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: resolver_type_info_for_parser(&item.value),
+                })
+                .collect(),
+        ),
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => TypeInfo::Callable {
+            params: params.iter().map(resolver_type_info_for_parser).collect(),
+            return_type: return_type
+                .as_ref()
+                .map(|return_type| Box::new(resolver_type_info_for_parser(return_type))),
+        },
+        TypeInfo::Self_
+        | TypeInfo::Static_
+        | TypeInfo::Parent_
+        | TypeInfo::ClassString(None)
+        | TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed => type_info.clone(),
+    }
+}
+
+fn resolver_type_name_for_parser(name: &str) -> String {
+    let name = name.trim();
+    if !name.starts_with('\\') && name.contains('\\') && !is_builtin_non_object_type(name) {
+        format!("\\{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+fn resolver_type_info_to_object_fqn(
+    type_info: &TypeInfo,
+    context_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<String> {
+    match type_info {
+        TypeInfo::Simple(name) => {
+            if is_builtin_non_object_type(name) {
+                None
+            } else if name.starts_with('\\') || name.contains('\\') {
+                Some(name.trim_start_matches('\\').to_string())
+            } else {
+                Some(resolve_class_name(name, file_symbols))
+            }
+        }
+        TypeInfo::Nullable(inner) => {
+            resolver_type_info_to_object_fqn(inner, context_node, source, file_symbols)
+        }
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types.iter().find_map(|ty| {
+            resolver_type_info_to_object_fqn(ty, context_node, source, file_symbols)
+        }),
+        TypeInfo::Self_ | TypeInfo::Static_ => {
+            find_parent_class_fqn(context_node, source, file_symbols)
+        }
+        TypeInfo::Generic { base, .. } => {
+            if is_builtin_non_object_type(base) {
+                None
+            } else if base.starts_with('\\') || base.contains('\\') {
+                Some(base.trim_start_matches('\\').to_string())
+            } else {
+                Some(resolve_class_name(base, file_symbols))
+            }
+        }
+        TypeInfo::Conditional {
+            if_type, else_type, ..
+        } => resolver_type_info_to_object_fqn(if_type, context_node, source, file_symbols).or_else(
+            || resolver_type_info_to_object_fqn(else_type, context_node, source, file_symbols),
+        ),
+        TypeInfo::ClassString(_)
+        | TypeInfo::ArrayShape(_)
+        | TypeInfo::ObjectShape(_)
+        | TypeInfo::Callable { .. }
+        | TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed
+        | TypeInfo::Parent_ => None,
     }
 }
 
@@ -3430,7 +3859,7 @@ fn infer_expression_type_info(
                 .iter()
                 .find_map(|sym| {
                     (sym.fqn == prop_fqn)
-                        .then(|| sym.signature.as_ref()?.return_type.clone())
+                        .then(|| symbol_effective_type_info(sym, file_symbols))
                         .flatten()
                 })
                 .or_else(|| {
@@ -3451,7 +3880,7 @@ fn infer_expression_type_info(
                 .iter()
                 .find_map(|sym| {
                     (sym.fqn == method_fqn)
-                        .then(|| sym.signature.as_ref()?.return_type.clone())
+                        .then(|| symbol_effective_type_info(sym, file_symbols))
                         .flatten()
                 })
                 .or_else(|| {
@@ -3706,10 +4135,7 @@ fn foreach_variable_inference(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableInference> {
-    if stmt.kind() != "foreach_statement"
-        || usage_start < stmt.start_byte()
-        || usage_start > stmt.end_byte()
-    {
+    if stmt.kind() != "foreach_statement" || usage_start < stmt.start_byte() {
         return None;
     }
 
@@ -4984,6 +5410,66 @@ class Outer {
     }
 
     #[test]
+    fn test_resolve_method_call_on_function_return_with_nullable_resolver_type_text() {
+        let code = r#"<?php
+namespace App\Controller;
+
+class Handler {
+    public function run(): void {
+        makeUser()->getName();
+    }
+}
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+            (class_fqn.is_empty() && member_name == "App\\Controller\\makeUser")
+                .then(|| "?App\\Entity\\User".to_string())
+        };
+        let (line, col) = find_line_col(code, "getName");
+        let result =
+            symbol_at_position_with_resolver(tree, code, line, col, &file_symbols, Some(&resolver))
+                .expect("method call should resolve through normalized resolver type text");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+        assert_eq!(result.fqn, "App\\Entity\\User::getName");
+    }
+
+    #[test]
+    fn test_infer_foreach_value_from_resolver_generic_function_return_preserves_args() {
+        let code = r#"<?php
+namespace App\Controller;
+
+function run(): void {
+    foreach (loadUsers() as $user) {
+        $user;
+    }
+}
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
+            (class_fqn.is_empty() && member_name == "App\\Controller\\loadUsers")
+                .then(|| "App\\Support\\Collection<int, App\\Entity\\User>".to_string())
+        };
+        let (line, col) = find_line_col(code, "$user;");
+        let inferred = infer_variable_type_at_position_with_resolver(
+            tree,
+            code,
+            &file_symbols,
+            line,
+            col,
+            "$user",
+            &resolver,
+        )
+        .expect("foreach value type should preserve generic resolver return args");
+        assert_eq!(inferred, "App\\Entity\\User");
+    }
+
+    #[test]
     fn test_infer_variable_type_from_fully_qualified_new_expression() {
         let code = r#"<?php
 namespace App;
@@ -5307,9 +5793,63 @@ function run(): void {
     }
 }
 "#;
-        let (line, col) = find_line_col(code, "getName");
+        let (line, col) = find_line_col(code, "$user->getName");
+        let col = col + "$user->".len() as u32;
         let result = parse_and_resolve(code, line, col).expect("foreach value should resolve");
         assert_eq!(result.fqn, "App\\Entity\\User::getName");
+        assert_eq!(result.ref_kind, RefKind::MethodCall);
+    }
+
+    #[test]
+    fn test_resolve_foreach_value_from_phpdoc_generic_namespace_relative_method_return() {
+        let code = r#"<?php
+namespace App;
+
+class Repository {
+    /** @return array<int, Entity\User> */
+    public function users(): array { return []; }
+}
+
+function run(Repository $repository): void {
+    foreach ($repository->users() as $user) {
+        $user;
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "$user;");
+        let inferred = parse_and_infer_var_type_at(code, line, col, "$user")
+            .expect("foreach value type should be inferred");
+        assert_eq!(inferred, "App\\Entity\\User");
+    }
+
+    #[test]
+    fn test_resolve_foreach_value_from_phpdoc_generic_alias_qualified_method_return() {
+        let code = r#"<?php
+namespace App\Models {
+    class User {
+        public function getName(): string { return ''; }
+    }
+}
+
+namespace App {
+    use App\Models as Model;
+
+    class Repository {
+        /** @return array<int, Model\User> */
+        public function users(): array { return []; }
+    }
+
+    function run(Repository $repository): void {
+        foreach ($repository->users() as $user) {
+            $user->getName();
+        }
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "$user->getName");
+        let col = col + "$user->".len() as u32;
+        let result = parse_and_resolve(code, line, col).expect("foreach value should resolve");
+        assert_eq!(result.fqn, "App\\Models\\User::getName");
         assert_eq!(result.ref_kind, RefKind::MethodCall);
     }
 

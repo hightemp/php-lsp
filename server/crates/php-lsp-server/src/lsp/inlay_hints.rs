@@ -3344,12 +3344,14 @@ pub(in crate::server) fn simple_type_fqn_from_owner_or_index(
     type_name: &str,
 ) -> Option<String> {
     let type_name = type_name.trim();
-    if type_name.is_empty()
-        || type_name.starts_with('\\')
-        || type_name.contains('\\')
-        || is_builtin_type_name(type_name)
-    {
+    if type_name.is_empty() || type_name.starts_with('\\') || is_builtin_type_name(type_name) {
         return simple_type_fqn_from_index(index, uri, type_name);
+    }
+
+    if type_name.contains('\\') {
+        return Some(resolve_qualified_type_fqn_from_owner_or_index(
+            index, owner_fqn, uri, type_name,
+        ));
     }
 
     if let Some((owner_namespace, _)) = owner_fqn.rsplit_once('\\') {
@@ -3360,6 +3362,59 @@ pub(in crate::server) fn simple_type_fqn_from_owner_or_index(
     }
 
     simple_type_fqn_from_index(index, uri, type_name)
+}
+
+fn resolve_qualified_type_fqn_from_owner_or_index(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    type_name: &str,
+) -> String {
+    let raw = type_name.trim_start_matches('\\');
+    if index.resolve_fqn(raw).is_some() {
+        return raw.to_string();
+    }
+
+    let Some((owner_namespace, _)) = owner_fqn.rsplit_once('\\') else {
+        return raw.to_string();
+    };
+    let (first_part, rest) = raw.split_once('\\').unwrap_or((raw, ""));
+
+    if let Some(file_symbols) = index.file_symbols.get(uri) {
+        for use_statement in &file_symbols.use_statements {
+            if use_statement.kind != php_lsp_types::UseKind::Class
+                || use_statement.namespace.as_deref() != Some(owner_namespace)
+            {
+                continue;
+            }
+
+            let alias = use_statement.alias.as_deref().unwrap_or_else(|| {
+                use_statement
+                    .fqn
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(use_statement.fqn.as_str())
+            });
+            if alias == first_part {
+                let mut resolved = use_statement.fqn.trim_start_matches('\\').to_string();
+                if !rest.is_empty() {
+                    resolved.push('\\');
+                    resolved.push_str(rest);
+                }
+                return resolved;
+            }
+        }
+    }
+
+    let namespace_root = owner_namespace
+        .split('\\')
+        .next()
+        .unwrap_or(owner_namespace);
+    if first_part == namespace_root {
+        return raw.to_string();
+    }
+
+    format!("{owner_namespace}\\{raw}")
 }
 
 pub(in crate::server) fn is_explicit_local_variable_type_hint(

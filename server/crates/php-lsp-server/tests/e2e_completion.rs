@@ -912,6 +912,310 @@ function run(): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_foreach_collection_value_after_did_change_incomplete_member_access() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let valid_code = r#"<?php
+namespace Doctrine\Common\Collections {
+    interface Collection {}
+}
+
+namespace App\Entity {
+    use Doctrine\Common\Collections\Collection;
+
+    class ReversePortingNumber {
+        public function getPhoneNumber(): string { return ''; }
+        public function setCurrentNumberStatus(NumberStatus $status): static { return $status instanceof NumberStatus ? $this : $this; }
+    }
+
+    class NumberStatus {}
+
+    class ReverseRequest {
+        /**
+         * @return Collection<int, ReversePortingNumber>
+         */
+        public function getReversePortingNumbers(): Collection {}
+    }
+}
+
+namespace App\Soap\Inbound\Handler {
+    use App\Entity\NumberStatus;
+    use App\Entity\ReverseRequest;
+
+    final class CompleteHandler {
+        public function updateReverseRequestForComplete(ReverseRequest $reverseRequest, NumberStatus $numberStatus): void {
+            foreach ($reverseRequest->getReversePortingNumbers() as $portingNumber) {
+                $portingNumber->setCurrentNumberStatus($numberStatus);
+            }
+        }
+    }
+}
+"#;
+    let changed_code = valid_code.replace(
+        "                $portingNumber->setCurrentNumberStatus($numberStatus);",
+        "                $portingNumber->",
+    );
+    let uri = "file:///test/foreach-collection-didchange-completion.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, valid_code))
+        .await
+        .unwrap();
+    let initial_diagnostics =
+        next_publish_diagnostics(&mut notifications, uri, Duration::from_secs(2)).await;
+    assert_eq!(
+        initial_diagnostics
+            .get("diagnostics")
+            .and_then(|diagnostics| diagnostics.as_array())
+            .map(Vec::len),
+        Some(0),
+        "valid fixture should not publish diagnostics: {initial_diagnostics}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(uri, 2, &changed_code))
+        .await
+        .unwrap();
+
+    let completion_position = utf16_position_after(&changed_code, "$portingNumber->");
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            2,
+            uri,
+            completion_position.0,
+            completion_position.1,
+        ))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let labels: Vec<String> = completion_items_from_result(&result)
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+        .map(str::to_string)
+        .collect();
+
+    assert!(
+        labels.iter().any(|label| label == "getPhoneNumber"),
+        "expected foreach value completion to include entity methods after didChange, got: {labels:?}; result: {result}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label == "setCurrentNumberStatus"),
+        "expected foreach value completion to include all entity methods after didChange, got: {labels:?}; result: {result}"
+    );
+
+    let changed_diagnostics =
+        next_publish_diagnostics(&mut notifications, uri, Duration::from_secs(2)).await;
+    let diagnostic_messages = published_diagnostic_messages(&changed_diagnostics);
+    assert!(
+        diagnostic_messages
+            .iter()
+            .any(|message| message.contains("Syntax error") || message.contains("Missing")),
+        "dangling member access should still be reported as tree-sitter syntax diagnostics, got: {diagnostic_messages:?}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_completion_foreach_collection_value_from_indexed_qualified_phpdoc_return() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-indexed-qualified-collection-completion-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src/Controller")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Entity")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Repository")).unwrap();
+    fs::create_dir_all(tmp_root.join("src/Support")).unwrap();
+
+    let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
+    let root_uri = file_uri(&tmp_root);
+    let collection_path = tmp_root.join("src/Support/Collection.php");
+    let entity_path = tmp_root.join("src/Entity/User.php");
+    let repository_path = tmp_root.join("src/Repository/UserRepository.php");
+    let controller_path = tmp_root.join("src/Controller/UserController.php");
+    let controller_uri = file_uri(&controller_path);
+
+    fs::write(
+        &collection_path,
+        r#"<?php
+namespace App\Support;
+
+interface Collection {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &entity_path,
+        r#"<?php
+namespace App\Entity;
+
+final class User
+{
+    public function getName(): string { return ''; }
+    public function getEmail(): string { return ''; }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &repository_path,
+        r#"<?php
+namespace App;
+
+use App\Entity as Model;
+use App\Support\Collection;
+
+final class UserRepository
+{
+    /** @return Collection<int, Entity\User> */
+    public function namespaceUsers(): Collection {}
+
+    /** @return Collection<int, Model\User> */
+    public function aliasUsers(): Collection {}
+}
+"#,
+    )
+    .unwrap();
+
+    let marker_absolute = "/*absolute*/";
+    let marker_alias = "/*alias*/";
+    let controller_with_markers = format!(
+        r#"<?php
+namespace App\Controller;
+
+use App\UserRepository;
+
+final class UserController
+{{
+    public function show(UserRepository $repository): void
+    {{
+        foreach ($repository->namespaceUsers() as $namespaceUser) {{
+            $namespaceUser->{marker_absolute}getName();
+        }}
+        foreach ($repository->aliasUsers() as $aliasUser) {{
+            $aliasUser->{marker_alias}getName();
+        }}
+    }}
+}}
+"#
+    );
+    let controller_code = controller_with_markers
+        .replace(marker_absolute, "")
+        .replace(marker_alias, "");
+    let absolute_position = utf16_position_after(&controller_code, "$namespaceUser->");
+    let alias_position = utf16_position_after(&controller_code, "$aliasUser->");
+    fs::write(&controller_path, &controller_code).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&controller_uri, &controller_code))
+        .await
+        .unwrap();
+
+    for (request_id, position, label) in [
+        (2, absolute_position, "namespace-relative generic return"),
+        (3, alias_position, "alias-qualified generic return"),
+    ] {
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(
+                request_id,
+                &controller_uri,
+                position.0,
+                position.1,
+            ))
+            .await
+            .unwrap();
+        let result = extract_result(response);
+        let labels: Vec<String> = completion_items_from_result(&result)
+            .iter()
+            .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            labels.iter().any(|candidate| candidate == "getName")
+                && labels.iter().any(|candidate| candidate == "getEmail"),
+            "expected completion from indexed {label} to resolve User methods, got: {labels:?}; result: {result}"
+        );
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_member_access_from_this_property_chain() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -1037,16 +1341,18 @@ class BaseFactory {
 
 class ChildFactory extends BaseFactory {
     public static function makeSelf(): SelfProduct { return new SelfProduct(); }
+    public static function makeNullableSelf(): ?SelfProduct { return new SelfProduct(); }
     public static function makeStatic(): StaticProduct { return new StaticProduct(); }
 
     public function run(): void {
         self::makeSelf()->/*self*/;
+        self::makeNullableSelf()->/*nullable*/;
         static::makeStatic()->/*static*/;
         parent::makeParent()->/*parent*/;
     }
 }
 "#;
-    let markers = ["/*self*/", "/*static*/", "/*parent*/"];
+    let markers = ["/*self*/", "/*nullable*/", "/*static*/", "/*parent*/"];
     let marker_position = |marker: &str| -> (u32, u32) {
         let marker_offset = code_with_markers
             .find(marker)
@@ -1076,8 +1382,9 @@ class ChildFactory extends BaseFactory {
 
     for (request_id, marker, expected_label) in [
         (2, "/*self*/", "selfOnly"),
-        (3, "/*static*/", "staticOnly"),
-        (4, "/*parent*/", "parentOnly"),
+        (3, "/*nullable*/", "selfOnly"),
+        (4, "/*static*/", "staticOnly"),
+        (5, "/*parent*/", "parentOnly"),
     ] {
         let (line, character) = marker_position(marker);
         let resp = service
