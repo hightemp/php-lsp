@@ -4978,3 +4978,527 @@ change.
   - Validation: `cargo fmt --all --check`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` passed.
   - Validation: Verifier follow-up reported GO; residual risks are limited to untyped declared relation-name properties, non-literal `::class` precision, and hover/completion not yet using the new function-signature resolver path.
   - Docs: not updated; this is an internal diagnostics/type-resolution bugfix with no new user-facing feature or config.
+
+- [x] **H-DIAGNOSTICS-MONICA-FALSE-POSITIVE-AUDIT-2026-06-05** Audit php-lsp diagnostics on Monica for false positives *(done 2026-06-05)*
+  - Started 2026-06-05: run `php-lsp analyze` on `/home/apanov/ForTesting/monica`, inspect reported diagnostics against Monica source code, and append concrete false-positive tasks with `Files:` lists.
+  - Findings: full project analyze crashes with stack overflow; large directory analyzes also timeout, so diagnostics were collected by release-binary subdirectory scans.
+  - Findings: collected 968 diagnostics from completed scans and grouped repeatable false positives into follow-up tasks below.
+  - Validation: confirmed representative source cases against Monica code and vendor Composer packages (`thecodingmachine/safe`, PHPUnit, Carbon, Laravel framework, Socialite, Monolog).
+  - Scan gaps: `app/`, `app/Domains`, `tests`, `app/Domains/Contact/Dav`, `app/Domains/Contact/ManageContact`, `app/Domains/Contact/ManageReminders`, `app/Domains/Vault/ManageCalendar`, `app/Domains/Vault/ManageJournals`, and `tests/Unit` timed out; `/home/apanov/ForTesting/monica` root, `database`, and `database/migrations` crashed with stack overflow.
+
+- [ ] **H-ANALYZE-MONICA-DIRECTORY-STACK-OVERFLOW-AND-TIMEOUT-2026-06-05** Fix stack overflow/timeouts when analyzing Monica directories
+  - Full Monica project analyze aborts with `thread main has overflowed its stack`; `database` and `database/migrations` reproduce the crash.
+  - Large directory targets time out before JSON output, forcing subdirectory scans and leaving gaps in project-level diagnostics coverage.
+  - Reproduce with release binary: `target/release/php-lsp analyze /home/apanov/ForTesting/monica --project-root /home/apanov/ForTesting/monica --severity all --format json`.
+  - Files:
+    /home/apanov/ForTesting/monica
+    /home/apanov/ForTesting/monica/app
+    /home/apanov/ForTesting/monica/app/Domains
+    /home/apanov/ForTesting/monica/app/Domains/Contact/Dav
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContact
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageReminders
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageCalendar
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageJournals
+    /home/apanov/ForTesting/monica/database
+    /home/apanov/ForTesting/monica/database/migrations
+    /home/apanov/ForTesting/monica/tests
+    /home/apanov/ForTesting/monica/tests/Unit
+
+- [ ] **H-DIAGNOSTICS-MONICA-LARAVEL-RESPONSE-REDIRECT-HELPERS-2026-06-05** Resolve Laravel `response()`/`redirect()` helper return types for controller diagnostics
+  - False positives include `Unknown method: Illuminate\\Http\\Response::json` for `response()->json(...)` and `Unknown method: Illuminate\\Http\\RedirectResponse::route` for `redirect()->route(...)`.
+  - Representative checks: `app/Traits/JsonRespondController.php:40` and `app/Actions/AttemptToAuthenticateSocialite.php:205-206` use standard Laravel helper/factory behavior.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
+    /home/apanov/ForTesting/monica/app/Actions/Fortify/RedirectIfTwoFactorAuthenticatable.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageAvatar/Web/Controllers/ModuleAvatarController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageCalls/Web/Controllers/ContactModuleCallController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactAddresses/Web/Controllers/ContactModuleAddressController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactFeed/Web/Controllers/ContactFeedController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Web/Controllers/ContactImportantDatesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactInformation/Web/Controllers/ContactInformationController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageDocuments/Web/Controllers/ContactModuleDocumentController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Web/Controllers/ContactGoalController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Web/Controllers/ContactModuleGoalController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Web/Controllers/ContactModuleStreakController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/Controllers/ContactModuleGroupController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/Controllers/GroupController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageJobInformation/Web/Controllers/ContactModuleJobInformationController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLabels/Web/Controllers/ContactModuleLabelController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleLifeEventController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ToggleLifeEventController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ToggleTimelineEventController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Web/Controllers/ContactModuleLoanController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Web/Controllers/ContactModuleToggleLoanController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageMoodTrackingEvents/Web/Controllers/ContactMoodTrackingEventsController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageNotes/Web/Controllers/ContactModuleNoteController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePets/Web/Controllers/ContactModulePetController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePhotos/Web/Controllers/ContactModulePhotoController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageQuickFacts/Web/Controllers/ContactQuickFactController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageQuickFacts/Web/Controllers/ContactQuickFactToggleController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageRelationships/Web/Controllers/ContactRelationshipsController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageReligion/Web/Controllers/ContactModuleReligionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageTasks/Web/Controllers/ContactModuleTaskController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/CancelAccount/Web/Controllers/CancelAccountController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageAddressTypes/Web/Controllers/PersonalizeAddressTypeController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCallReasons/Web/Controllers/PersonalizeCallReasonTypesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCallReasons/Web/Controllers/PersonalizeCallReasonsController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageContactInformationTypes/Web/Controllers/PersonalizeContatInformationTypesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCurrencies/Web/Controllers/CurrencyController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCurrencies/Web/Controllers/PersonalizeCurrencyController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGenders/Web/Controllers/ManageGenderController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftOccasions/Web/Controllers/PersonalizeGiftOccasionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftOccasions/Web/Controllers/PersonalizeGiftOccasionsPositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftStates/Web/Controllers/PersonalizeGiftStateController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftStates/Web/Controllers/PersonalizeGiftStatesPositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Web/Controllers/PersonalizeGroupTypeController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Web/Controllers/PersonalizeGroupTypePositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Web/Controllers/PersonalizeGroupTypeRoleController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Web/Controllers/PersonalizeGroupTypeRolePositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/NotificationsController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/NotificationsTestController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/NotificationsToggleController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramNotificationsController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePetCategories/Web/Controllers/PersonalizePetCategoriesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Web/Controllers/PersonalizePostTemplateController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Web/Controllers/PersonalizePostTemplatePositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Web/Controllers/PersonalizePostTemplateSectionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Web/Controllers/PersonalizePostTemplateSectionPositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePronouns/Web/Controllers/PersonalizePronounController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageRelationshipTypes/Web/Controllers/PersonalizeRelationshipController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageRelationshipTypes/Web/Controllers/PersonalizeRelationshipTypeController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageReligion/Web/Controllers/PersonalizeReligionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageReligion/Web/Controllers/PersonalizeReligionsPositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Web/Controllers/PersonalizeTemplatePageModulesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Web/Controllers/PersonalizeTemplatePageModulesPositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Web/Controllers/PersonalizeTemplatePagePositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Web/Controllers/PersonalizeTemplatePagesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Web/Controllers/PersonalizeTemplatesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesDateFormatController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesDistanceFormatController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesHelpController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesLocaleController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesMapsPreferenceController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesNameOrderController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesNumberFormatController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesTimezoneController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUsers/Web/Controllers/UserController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageFiles/Web/Controllers/VaultFileController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricContactController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultDefaultTabOnDashboardController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultFeedController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsContactImportantDateTypeController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsLabelController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsLifeEventCategoriesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsLifeEventCategoriesPositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsLifeEventTypesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsLifeEventTypesPositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsMoodTrackingParameterController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsMoodTrackingParameterPositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsQuickFactTemplateController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsQuickFactTemplatePositionController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsTagController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsTemplateController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsUserController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/Search/Web/Controllers/VaultContactSearchController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/Search/Web/Controllers/VaultMostConsultedContactsController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/Search/Web/Controllers/VaultSearchController.php
+    /home/apanov/ForTesting/monica/app/Http/Controllers/Auth/AcceptInvitationController.php
+    /home/apanov/ForTesting/monica/app/Http/Controllers/Profile/UserTokenController.php
+    /home/apanov/ForTesting/monica/app/Traits/JsonRespondController.php
+
+- [ ] **H-DIAGNOSTICS-MONICA-ELOQUENT-RELATION-BUILDER-AND-COLLECTION-2026-06-05** Resolve Eloquent relation builder forwarding and relation virtual property collection types
+  - False positives include relation methods such as `HasMany::findOrFail`, `orderBy`, `withCount`, `map`, `firstWhere`, `BelongsToMany::where`, and relation properties left as `HasMany`/`MorphTo` instead of related model or collection types.
+  - Representative checks: `calls()->findOrFail(...)` should return `Call`, `templates()->get()->sortByCollator(...)` should use collection macros, and `$item->feedable` should not remain `MorphTo` for property diagnostics.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
+    /home/apanov/ForTesting/monica/app/Console/Commands/Local/SetupDummyAccount.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageAvatar/Services/UpdatePhotoAsAvatar.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageCalls/Services/CreateCall.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageCalls/Services/UpdateCall.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageCalls/Web/ViewHelpers/ModuleCallsViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactAddresses/Services/AssociateAddressToContact.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedAddress.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedContactInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedGoal.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedLabelAssigned.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedMoodTrackingEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedNote.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedPet.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Dav/ImportCalendarContactImportantDates.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Dav/ImportImportantDates.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Web/ViewHelpers/ContactImportantDatesViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Web/ViewHelpers/ModuleImportantDatesViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactInformation/Dav/ExportContactInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageDocuments/Services/DestroyFile.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageDocuments/Web/ViewHelpers/ModuleDocumentsViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Services/DestroyGoal.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Dav/ImportGroup.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Dav/ImportMembers.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Services/AddContactToGroup.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupEditViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/ModuleGroupsViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageJobInformation/Services/UpdateJobInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageJobInformation/Web/ViewHelpers/ModuleCompanyViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLabels/Services/AssignLabel.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLabels/Web/ViewHelpers/ModuleLabelViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Services/CreateLifeEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Services/ToggleLifeEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Web/ViewHelpers/ModuleLifeEventViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Services/CreateLoan.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Web/ViewHelpers/ModuleLoanViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/CreateMoodTrackingEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/UpdateMoodTrackingEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageNotes/Services/CreateNote.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageNotes/Web/ViewHelpers/ModuleNotesViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePets/Services/CreatePet.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePets/Services/UpdatePet.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePhotos/Web/ViewHelpers/ModulePhotosViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePronouns/Services/SetPronoun.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageQuickFacts/Services/CreateQuickFact.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageRelationships/Services/SetRelationship.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageRelationships/Services/UnsetRelationship.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageRelationships/Web/ViewHelpers/ContactRelationshipsCreateViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageRelationships/Web/ViewHelpers/ModuleFamilySummaryViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageReligion/Services/UpdateReligion.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageReligion/Web/ViewHelpers/ModuleReligionViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageTasks/Dav/ImportContactTask.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageTasks/Web/ViewHelpers/ModuleContactTasksViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/CancelAccount/Services/CancelAccount.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageAddressTypes/Services/DestroyAddressType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageAddressTypes/Services/UpdateAddressType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageAddressTypes/Web/ViewHelpers/PersonalizeAddressTypeIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCallReasons/Services/CreateCallReason.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCallReasons/Services/DestroyCallReason.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCallReasons/Services/UpdateCallReason.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCallReasons/Services/UpdateCallReasonType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCallReasons/Web/ViewHelpers/PersonalizeCallReasonsIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageContactInformationTypes/Services/DestroyContactInformationType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageContactInformationTypes/Services/UpdateContactInformationType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageContactInformationTypes/Web/ViewHelpers/PersonalizeContactInformationTypeIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCurrencies/Web/ViewHelpers/CurrencyIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageCurrencies/Web/ViewHelpers/PersonalizeCurrencyIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGenders/Services/DestroyGender.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGenders/Services/UpdateGender.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGenders/Web/ViewHelpers/ManageGenderIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftOccasions/Services/CreateGiftOccasion.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftOccasions/Services/DestroyGiftOccasion.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftOccasions/Services/UpdateGiftOccasionPosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftOccasions/Web/ViewHelpers/PersonalizeGiftOccasionViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftStates/Services/CreateGiftState.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftStates/Services/DestroyGiftState.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftStates/Services/UpdateGiftStatePosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGiftStates/Web/ViewHelpers/PersonalizeGiftStateViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Services/CreateGroupType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Services/CreateGroupTypeRole.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Services/DestroyGroupType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Services/DestroyGroupTypeRole.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Services/UpdateGroupTypePosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Services/UpdateGroupTypeRole.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Services/UpdateGroupTypeRolePosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageGroupTypes/Web/ViewHelpers/PersonalizeGroupTypeViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Services/DestroyUserNotificationChannel.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Services/ScheduleAllContactRemindersForNotificationChannel.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Services/ToggleUserNotificationChannel.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Web/ViewHelpers/NotificationsIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Web/ViewHelpers/NotificationsLogIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePetCategories/Services/DestroyPetCategory.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePetCategories/Services/UpdatePetCategory.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePetCategories/Web/ViewHelpers/PersonalizePetCategoriesIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Services/CreatePostTemplate.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Services/CreatePostTemplateSection.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Services/DestroyPostTemplateSection.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Services/UpdatePostTemplatePosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Services/UpdatePostTemplateSection.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Services/UpdatePostTemplateSectionPosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePostTemplates/Web/ViewHelpers/PersonalizePostTemplateViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePronouns/Services/DestroyPronoun.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePronouns/Services/UpdatePronoun.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManagePronouns/Web/ViewHelpers/PersonalizePronounIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageRelationshipTypes/Services/CreateRelationshipType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageRelationshipTypes/Services/DestroyRelationshipType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageRelationshipTypes/Services/UpdateRelationshipGroupType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageRelationshipTypes/Services/UpdateRelationshipType.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageRelationshipTypes/Web/ViewHelpers/PersonalizeRelationshipIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageReligion/Services/CreateReligion.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageReligion/Services/DestroyReligion.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageReligion/Services/UpdateReligionPosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageReligion/Web/ViewHelpers/PersonalizeReligionViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageStorage/Web/ViewHelpers/StorageIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Services/AssociateModuleToTemplatePage.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Services/CreateTemplatePage.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Services/DestroyModule.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Services/DestroyTemplatePage.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Services/RemoveModuleFromTemplatePage.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Services/UpdateModulePosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Services/UpdateTemplatePage.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Services/UpdateTemplatePagePosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Web/ViewHelpers/PersonalizeTemplateIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Web/ViewHelpers/PersonalizeTemplatePageShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Web/ViewHelpers/PersonalizeTemplateShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUsers/Services/DestroyUser.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageAddresses/Services/CreateAddress.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageCompanies/Web/ViewHelpers/CompanyIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageCompanies/Web/ViewHelpers/CompanyViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageFiles/Web/ViewHelpers/VaultFileIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageLifeMetrics/Services/DestroyLifeMetric.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageLifeMetrics/Services/UpdateLifeMetric.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageLifeMetrics/Web/ViewHelpers/VaultLifeMetricsViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportAddressIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportImportantDateSummaryIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportMoodTrackingEventIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageTasks/Web/ViewHelpers/VaultTasksIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Services/CreateVault.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultReminderIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultImportantDateTypes/Services/DestroyContactImportantDateType.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultImportantDateTypes/Services/UpdateContactImportantDateType.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultImportantDateTypes/Web/ViewHelpers/VaultImportantDateTypesViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/ChangeVaultAccess.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/CreateLifeEventCategory.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/CreateLifeEventType.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/CreateMoodTrackingParameter.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/CreateQuickFactTemplate.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/DestroyLifeEventCategory.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/DestroyLifeEventType.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUser.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateLabel.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateLifeEventCategory.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateLifeEventCategoryPosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateLifeEventType.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateLifeEventTypePosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateMoodTrackingParameter.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateMoodTrackingParameterPosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateQuickFactTemplate.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateQuickFactTemplatePosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/UpdateTag.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Web/ViewHelpers/VaultSettingsIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Helpers/ContactImportantDateHelper.php
+    /home/apanov/ForTesting/monica/app/Helpers/GoalHelper.php
+    /home/apanov/ForTesting/monica/app/Helpers/SliceOfLifeHelper.php
+    /home/apanov/ForTesting/monica/app/Helpers/StorageHelper.php
+    /home/apanov/ForTesting/monica/app/Models/Contact.php
+    /home/apanov/ForTesting/monica/app/Models/ContactImportantDate.php
+    /home/apanov/ForTesting/monica/app/Models/Vault.php
+    /home/apanov/ForTesting/monica/app/Services/BaseService.php
+    /home/apanov/ForTesting/monica/tests/Feature/Controllers/Auth/SocialiteCallbackControllerTest.php
+
+- [ ] **H-DIAGNOSTICS-MONICA-LARAVEL-OPTIONAL-TRETURN-2026-06-05** Specialize Laravel `optional(...)` generic/proxy return types instead of leaking `TReturn` into current namespaces
+  - False positives include `Unknown property: App\\...\\TReturn::$...` and `Unknown method: App\\...\\TReturn::...` after `optional($value)->property` and `optional($value)->method()`.
+  - Representative checks: `optional($user)->two_factor_secret`, `optional($importantDate)->id`, and `optional($signature)->getSignature()` should use the wrapped value type or nullable proxy behavior.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
+    /home/apanov/ForTesting/monica/app/Actions/Fortify/RedirectIfTwoFactorAuthenticatable.php
+    /home/apanov/ForTesting/monica/app/Actions/Fortify/TwoFactorChallengeView.php
+    /home/apanov/ForTesting/monica/app/Actions/Jetstream/UserProfile.php
+    /home/apanov/ForTesting/monica/app/Console/Commands/Local/SetupDummyAccount.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/Dav/ServiceUrlQuery.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Dav/ExportCalendarImportantDates.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Dav/ExportImportantDates.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Dav/ImportCalendarContactImportantDates.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Dav/ImportImportantDates.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Dav/ImportGroup.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Services/AddContactToGroup.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/ModuleGroupsViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Web/Controllers/ContactModuleLoanController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Web/ViewHelpers/ModuleLoanViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageTasks/Dav/ImportContactTask.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Web/ViewHelpers/PersonalizeTemplatePageShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Helpers/ScoutHelper.php
+    /home/apanov/ForTesting/monica/app/Helpers/StorageHelper.php
+    /home/apanov/ForTesting/monica/app/Http/Middleware/HandleInertiaRequests.php
+    /home/apanov/ForTesting/monica/app/Models/Post.php
+    /home/apanov/ForTesting/monica/app/Providers/AppServiceProvider.php
+
+- [ ] **H-DIAGNOSTICS-MONICA-COMPOSER-AUTOLOAD-FILES-CLASSMAP-DEV-VENDOR-2026-06-05** Index Composer autoload files/classmap and dev-vendor symbols for namespaced diagnostics
+  - False positives include `Safe\\*` functions/classes from `thecodingmachine/safe` Composer `autoload.files`/`classmap`, PHPUnit attributes/classes in tests, and installed optional Laravel packages in config files.
+  - Representative checks: `Safe\\parse_url`, `Safe\\Exceptions\\UrlException`, `PHPUnit\\Framework\\Attributes\\Test`, `Laravel\\Pulse\\Recorders`, `Laravel\\Telescope\\Watchers`, and `Knuckles\\Scribe\\Extracting\\Strategies` exist in vendor/composer.lock.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Console/Commands/Local/MonicaLocalize.php
+    /home/apanov/ForTesting/monica/app/Console/Commands/SetupDocumentation.php
+    /home/apanov/ForTesting/monica/app/Console/Commands/WaitForDb.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Jobs/PushVCard.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/AddressBookGetter.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/Dav/ServiceUrlQuery.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageReports/Web/Controllers/ReportAddressesCitiesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageReports/Web/Controllers/ReportAddressesCountriesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportAddressIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Helpers/WallpaperHelper.php
+    /home/apanov/ForTesting/monica/app/Helpers/helpers.php
+    /home/apanov/ForTesting/monica/app/Models/MultiAvatar.php
+    /home/apanov/ForTesting/monica/app/Providers/AppServiceProvider.php
+    /home/apanov/ForTesting/monica/bootstrap/app.php
+    /home/apanov/ForTesting/monica/config/pulse.php
+    /home/apanov/ForTesting/monica/config/scribe.php
+    /home/apanov/ForTesting/monica/config/telescope.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/ApiTokenPermissionsTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/AuthenticationTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/BrowserSessionsTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/CreateApiTokenTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/DeleteApiTokenTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/EmailVerificationTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/PasswordConfirmationTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/PasswordResetTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/ProfileInformationTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/RegistrationTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/TwoFactorAuthenticationSettingsTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/UpdatePasswordTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Controllers/Profile/UserTokenControllerTest.php
+    /home/apanov/ForTesting/monica/tests/Helpers/GuzzleMock.php
+
+- [ ] **H-DIAGNOSTICS-MONICA-CARBON-STATIC-TRAIT-METHODS-2026-06-05** Resolve Carbon static trait/interface methods and Laravel `now()` helper return type
+  - False positives include `Instance method called statically: Carbon\\Carbon::now`, `CarbonImmutable::now`, and `Unknown method: Illuminate\\Support\\Carbon::addMinutes` after Laravel `now()`.
+  - Representative check: `vendor/nesbot/carbon/src/Carbon/Traits/Creator.php` declares `public static function now(...)`; `now()->addMinutes(...)` should infer Carbon-compatible instance methods.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Console/Commands/Local/SetupDummyAccount.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageAvatar/Services/DestroyAvatar.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageAvatar/Services/UpdatePhotoAsAvatar.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageCalls/Services/CreateCall.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageCalls/Services/DestroyCall.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageCalls/Services/UpdateCall.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactAddresses/Services/AssociateAddressToContact.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactAddresses/Services/RemoveAddressFromContact.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Services/CreateContactImportantDate.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Services/DestroyContactImportantDate.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Services/UpdateContactImportantDate.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactImportantDates/Web/Controllers/ContactImportantDatesController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactInformation/Services/CreateContactInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactInformation/Services/DestroyContactInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactInformation/Services/UpdateContactInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageDocuments/Services/DestroyFile.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Services/CreateGoal.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Services/DestroyGoal.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Services/ToggleStreak.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Services/UpdateGoal.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Web/ViewHelpers/GoalShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Web/ViewHelpers/ModuleGoalsViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Services/AddContactToGroup.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Services/RemoveContactFromGroup.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageJobInformation/Services/ResetJobInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageJobInformation/Services/UpdateJobInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLabels/Services/AssignLabel.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLabels/Services/RemoveLabel.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Services/CreateLifeEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Services/UpdateLifeEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Web/ViewHelpers/ModuleLifeEventViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Services/CreateLoan.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Services/DestroyLoan.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Services/ToggleLoan.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Services/UpdateLoan.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLoans/Web/ViewHelpers/ModuleLoanViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/CreateMoodTrackingEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/DestroyMoodTrackingEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/UpdateMoodTrackingEvent.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageNotes/Services/CreateNote.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageNotes/Services/DestroyNote.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageNotes/Services/UpdateNote.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePets/Services/CreatePet.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePets/Services/DestroyPet.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePets/Services/UpdatePet.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePronouns/Services/RemovePronoun.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManagePronouns/Services/SetPronoun.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageRelationships/Services/SetRelationship.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageRelationships/Services/UnsetRelationship.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageReligion/Services/UpdateReligion.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageTasks/Dav/ImportContactTask.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageTasks/Services/CreateContactTask.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageTasks/Services/DestroyContactTask.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageTasks/Services/ToggleContactTask.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageTasks/Services/UpdateContactTask.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Services/ScheduleAllContactRemindersForNotificationChannel.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Services/SendTestEmail.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageNotificationChannels/Services/VerifyUserNotificationChannelEmailAddress.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUserPreferences/Web/ViewHelpers/UserPreferencesIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageUsers/Services/AcceptInvitation.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricContactController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageLifeMetrics/Web/ViewHelpers/VaultLifeMetricsViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageReports/Web/Controllers/ReportMoodTrackingEventController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportImportantDateSummaryIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultReminderIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Helpers/DateHelper.php
+    /home/apanov/ForTesting/monica/app/Logging/CleanLogs.php
+    /home/apanov/ForTesting/monica/app/Notifications/ReminderTriggered.php
+    /home/apanov/ForTesting/monica/database/factories/Instance/CronFactory.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/EmailVerificationTest.php
+
+- [ ] **H-DIAGNOSTICS-MONICA-NESTED-CLOSURE-RETURN-CONTEXT-2026-06-05** Do not check nested closure returns against the enclosing function return type
+  - False positives include return-type mismatches inside closures passed to `Attribute::make(get: ...)`, Eloquent factory `state(...)`, and collection callbacks such as `map`, `filter`, and `mapToGroups`.
+  - Representative checks: `Contact::age(): Attribute` has getter closure returning nullable scalar values; `UserFactory::unverified()` returns `$this->state(fn (...) => array)` but the closure array is not the method return.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPushMissed.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGoals/Web/ViewHelpers/ModuleGoalsViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupIndexViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultContactSearchViewHelper.php
+    /home/apanov/ForTesting/monica/app/Http/Middleware/HandleInertiaRequests.php
+    /home/apanov/ForTesting/monica/app/Models/Contact.php
+    /home/apanov/ForTesting/monica/app/Models/ContactInformation.php
+    /home/apanov/ForTesting/monica/app/Models/TimelineEvent.php
+    /home/apanov/ForTesting/monica/database/factories/UserFactory.php
+
+- [ ] **H-DIAGNOSTICS-MONICA-ARRAY-KEY-ALIAS-COMPATIBILITY-2026-06-05** Treat `array-key` as `int|string` in argument compatibility checks
+  - False positives include `Type mismatch for Illuminate\\Support\\Collection::get argument $key: expected array-key, got string`.
+  - Representative check: `Collection<array-key, ...>::get("modified")` is valid because `string` is a subtype of `array-key`.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPushMissed.php
+
+- [ ] **H-DIAGNOSTICS-MONICA-DYNAMIC-MACROS-MAGIC-PROPERTIES-AND-NARROWING-2026-06-05** Support Laravel macros, magic properties, backed enum properties, and `instanceof` narrowing used in Monica
+  - False positives include app-defined macros (`Http::getDnsRecord`, `Str::markdownExternalLink`, `Collection::sortByCollator`), Laravel/Webauthn facade dynamic methods, Faker magic properties, `Monolog\\Level::$value`, interface `@property`, and Socialite concrete-user properties after `instanceof` narrowing.
+  - Representative checks: macros are registered in `AppServiceProvider`, `Monolog\\Level` is a backed enum, `App\\Logging\\Loggable` has `@property`, and Socialite OAuth user classes declare public token properties.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
+    /home/apanov/ForTesting/monica/app/Console/Commands/Local/SetupDummyAccount.php
+    /home/apanov/ForTesting/monica/app/Console/Scheduling/Schedule.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/Dav/DavClient.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/Dav/ServiceUrlQuery.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageContactAddresses/Web/ViewHelpers/ModuleContactAddressesViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleLifeEventController.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php
+    /home/apanov/ForTesting/monica/app/Domains/Settings/ManageTemplates/Services/UpdateModulePosition.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageLifeMetrics/Web/ViewHelpers/VaultLifeMetricsViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php
+    /home/apanov/ForTesting/monica/app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php
+    /home/apanov/ForTesting/monica/app/Exceptions/Handler.php
+    /home/apanov/ForTesting/monica/app/Http/Controllers/Auth/SocialiteCallbackController.php
+    /home/apanov/ForTesting/monica/app/Http/Middleware/EnsureDavRequestsAreStateful.php
+    /home/apanov/ForTesting/monica/app/Http/Middleware/HandleInertiaRequests.php
+    /home/apanov/ForTesting/monica/app/Listeners/WebauthnAuthenticateListener.php
+    /home/apanov/ForTesting/monica/app/Logging/LoggingHandler.php
+    /home/apanov/ForTesting/monica/app/Models/Account.php
+    /home/apanov/ForTesting/monica/app/Models/Contact.php
+    /home/apanov/ForTesting/monica/app/Models/ContactReminder.php
+    /home/apanov/ForTesting/monica/app/Models/Currency.php
+    /home/apanov/ForTesting/monica/app/Models/User.php
+    /home/apanov/ForTesting/monica/app/Models/UserNotificationChannel.php
+    /home/apanov/ForTesting/monica/app/Models/Vault.php
+    /home/apanov/ForTesting/monica/app/Providers/AppServiceProvider.php
+    /home/apanov/ForTesting/monica/database/factories/AddressBookSubscriptionFactory.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/EmailVerificationTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Auth/PasswordConfirmationTest.php
+    /home/apanov/ForTesting/monica/tests/Feature/Controllers/Auth/LoginControllerTest.php
+
+- [ ] **H-DIAGNOSTICS-MONICA-PHP-METHOD-CASE-INSENSITIVE-LOOKUP-2026-06-05** Resolve PHP method names case-insensitively for diagnostics
+  - False positives include `Unknown method: App\\Domains\\Contact\\DavClient\\Services\\Utils\\Dav\\DavClient::propfind` while the class declares `propFind(...)`.
+  - PHP method calls are case-insensitive, so diagnostics/definition/completion member matching should not reject only by casing.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/AddressBookGetter.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/Dav/DavClient.php
