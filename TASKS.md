@@ -5114,7 +5114,10 @@ change.
     /home/apanov/ForTesting/monica/app/Http/Controllers/Profile/UserTokenController.php
     /home/apanov/ForTesting/monica/app/Traits/JsonRespondController.php
 
-- [ ] **H-DIAGNOSTICS-MONICA-ELOQUENT-RELATION-BUILDER-AND-COLLECTION-2026-06-05** Resolve Eloquent relation builder forwarding and relation virtual property collection types
+- [x] **H-DIAGNOSTICS-MONICA-ELOQUENT-RELATION-BUILDER-AND-COLLECTION-2026-06-05** Resolve Eloquent relation builder forwarding and relation virtual property collection types *(done 2026-06-05)*
+  - Started: 2026-06-05
+  - Implemented: Preserved generic Eloquent relation receiver types through parser resolution, forwarded indexed/lazy relation builder methods with related-model return specialization, inferred relation virtual property collection/model types, and added AST-aware Laravel Collection macro discovery for Support/Eloquent collections.
+  - Validation: `cargo test -p php-lsp-server laravel_ -- --nocapture`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, Serena diagnostics on changed Rust files, `git diff --check`, Verifier GO.
   - False positives include relation methods such as `HasMany::findOrFail`, `orderBy`, `withCount`, `map`, `firstWhere`, `BelongsToMany::where`, and relation properties left as `HasMany`/`MorphTo` instead of related model or collection types.
   - Representative checks: `calls()->findOrFail(...)` should return `Call`, `templates()->get()->sortByCollator(...)` should use collection macros, and `$item->feedable` should not remain `MorphTo` for property diagnostics.
   - Files:

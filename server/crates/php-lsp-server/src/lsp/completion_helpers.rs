@@ -189,7 +189,16 @@ pub(in crate::server) fn framework_virtual_member_type_fqn(
         .map(|symbol| symbol.uri.as_str())
         .or(source_uri)
         .unwrap_or("");
-    type_info_fqn_from_index(index, class_fqn, uri, type_info)
+    let owner_fqn = type_resolution_owner_fqn(class_fqn);
+    type_info_resolved_text_from_index(index, &owner_fqn, uri, type_info)
+}
+
+fn type_resolution_owner_fqn(owner_fqn: &str) -> String {
+    let owner_fqn = owner_fqn.trim().trim_start_matches('\\');
+    owner_fqn
+        .split_once('<')
+        .map(|(base, _)| base.trim_start_matches('\\').to_string())
+        .unwrap_or_else(|| owner_fqn.to_string())
 }
 
 pub(in crate::server) fn phpdoc_property_tag(

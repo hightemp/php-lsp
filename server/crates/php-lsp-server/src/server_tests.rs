@@ -2860,6 +2860,154 @@ class Job {
 }
 
 #[test]
+fn test_compute_diagnostics_allows_laravel_relation_builder_forwarding_and_morph_properties() {
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(
+        &index,
+        "file:///laravel.php",
+        r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+class Model {
+    public function hasMany(string $class): Relations\HasMany
+    {
+        return new Relations\HasMany();
+    }
+
+    public function morphTo(): Relations\MorphTo
+    {
+        return new Relations\MorphTo();
+    }
+
+    public function __get(string $key): mixed {}
+}
+
+/**
+ * @template TKey
+ * @template TModel
+ */
+class Collection {
+    public function sortByCollator(string $field): self {}
+}
+
+/**
+ * @template TModel
+ */
+class Builder {
+    public function orderBy(string $column, string $direction = 'asc'): self {}
+    public function whereNull(string $column): self {}
+
+    /**
+     * @return Collection<int, TModel>
+     */
+    public function get() {}
+
+    /**
+     * @return TModel
+     */
+    public function findOrFail($id) {}
+
+    /**
+     * @return TModel|null
+     */
+    public function firstWhere(string $column, $value = null) {}
+}
+
+namespace Illuminate\Database\Eloquent\Relations;
+
+class Relation {}
+class HasMany extends Relation {}
+class MorphTo extends Relation {}
+"#,
+    );
+    parse_and_index_php_file(
+        &index,
+        "file:///models.php",
+        r#"<?php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\MorphTo;
+
+class Contact extends Model {
+    /**
+     * @return HasMany<Call, $this>
+     */
+    public function calls(): HasMany
+    {
+        return $this->hasMany(Call::class);
+    }
+}
+
+class Call extends Model {
+    public string $name;
+}
+
+class FeedItem extends Model {
+    public function feedable(): MorphTo
+    {
+        return $this->morphTo();
+    }
+}
+"#,
+    );
+
+    let uri = "file:///relation-consumer.php";
+    let code = r#"<?php
+namespace App\Service;
+
+use App\Models\Contact;
+use App\Models\FeedItem;
+
+class RelationConsumer {
+    public function run(Contact $contact, FeedItem $item): void
+    {
+        $contact->calls()
+            ->orderBy('name')
+            ->whereNull('archived_at')
+            ->get()
+            ->sortByCollator('name');
+
+        $call = $contact->calls()->findOrFail(1);
+        echo $call->name;
+
+        $first = $contact->calls()->firstWhere('name', 'demo');
+        if ($first) {
+            echo $first->name;
+        }
+
+        $feedable = $item->feedable;
+        echo $feedable->name;
+    }
+}
+"#;
+    let parser = parse_and_index_php_file(&index, uri, code);
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    for unexpected in [
+        "Unknown method: Illuminate\\Database\\Eloquent\\Relations\\HasMany::orderBy",
+        "Unknown method: Illuminate\\Database\\Eloquent\\Relations\\HasMany::whereNull",
+        "Unknown method: Illuminate\\Database\\Eloquent\\Relations\\HasMany::findOrFail",
+        "Unknown method: Illuminate\\Database\\Eloquent\\Relations\\HasMany::firstWhere",
+        "Unknown method: Illuminate\\Database\\Eloquent\\Collection::sortByCollator",
+        "Unknown property: TModel::$name",
+        "Unknown property: App\\Models\\Call::$name",
+        "Unknown property: Illuminate\\Database\\Eloquent\\Relations\\MorphTo::$name",
+        "Unknown property: Illuminate\\Database\\Eloquent\\Model::$name",
+    ] {
+        assert_no_diagnostic_containing(&messages, unexpected);
+    }
+}
+
+#[test]
 fn test_compute_diagnostics_prefers_declared_property_over_laravel_relation_virtual_property() {
     let index = WorkspaceIndex::new();
     parse_and_index_php_file(

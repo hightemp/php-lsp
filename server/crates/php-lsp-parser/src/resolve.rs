@@ -1375,7 +1375,16 @@ fn try_resolve_object_type_inner<'a>(
             // Fallback: use the cross-file resolver for inherited properties
             if let Some(ref resolve_fn) = resolver {
                 let member_name = format!("${}", prop_name);
-                if let Some(type_text) = resolve_fn(&class_fqn, &member_name) {
+                let resolver_owner = resolver_owner_type_text_for_object(
+                    obj_field,
+                    &class_fqn,
+                    source,
+                    file_symbols,
+                    resolver,
+                    callable_resolver,
+                )
+                .unwrap_or_else(|| class_fqn.trim_start_matches('\\').to_string());
+                if let Some(type_text) = resolve_fn(&resolver_owner, &member_name) {
                     if let Some(type_fqn) = resolve_object_fqn_from_member_type_text(
                         &type_text,
                         object_node,
@@ -1425,7 +1434,16 @@ fn try_resolve_object_type_inner<'a>(
 
             // Fallback: use the cross-file resolver to get the method's return type
             if let Some(ref resolve_fn) = resolver {
-                if let Some(type_text) = resolve_fn(&class_fqn, method_name) {
+                let resolver_owner = resolver_owner_type_text_for_object(
+                    obj_field,
+                    &class_fqn,
+                    source,
+                    file_symbols,
+                    resolver,
+                    callable_resolver,
+                )
+                .unwrap_or_else(|| class_fqn.trim_start_matches('\\').to_string());
+                if let Some(type_text) = resolve_fn(&resolver_owner, method_name) {
                     if let Some(type_fqn) = resolve_object_fqn_from_member_type_text(
                         &type_text,
                         object_node,
@@ -1515,6 +1533,40 @@ fn resolve_object_fqn_from_member_type_text(
 ) -> Option<String> {
     let type_info = type_info_from_type_text(type_text);
     object_fqn_from_resolved_member_type_info(&type_info, context_node, source, file_symbols)
+}
+
+fn resolver_owner_type_text_for_object(
+    object_node: Node,
+    class_fqn: &str,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<String> {
+    let type_info = infer_expression_type_info(
+        object_node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )?;
+    if !type_info_has_generic_base_fqn(&type_info, class_fqn) {
+        return None;
+    }
+
+    Some(resolver_type_info_for_parser(&type_info).to_string())
+}
+
+fn type_info_has_generic_base_fqn(type_info: &TypeInfo, class_fqn: &str) -> bool {
+    let class_fqn = class_fqn.trim_start_matches('\\');
+    match type_info {
+        TypeInfo::Generic { base, .. } => base.trim_start_matches('\\') == class_fqn,
+        TypeInfo::Nullable(inner) => type_info_has_generic_base_fqn(inner, class_fqn),
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
+            .iter()
+            .any(|type_info| type_info_has_generic_base_fqn(type_info, class_fqn)),
+        _ => false,
+    }
 }
 
 fn object_fqn_from_resolved_member_type_info(
@@ -4271,11 +4323,19 @@ fn infer_expression_type_info(
                 })
                 .or_else(|| {
                     resolver.and_then(|resolve_fn| {
-                        resolve_fn(&class_fqn, &format!("${}", &source[name.byte_range()])).map(
-                            |type_text| {
-                                type_info_from_type_text(&resolver_type_text_for_parser(&type_text))
-                            },
+                        let resolver_owner = resolver_owner_type_text_for_object(
+                            object,
+                            &class_fqn,
+                            source,
+                            file_symbols,
+                            resolver,
+                            callable_resolver,
                         )
+                        .unwrap_or_else(|| class_fqn.trim_start_matches('\\').to_string());
+                        resolve_fn(&resolver_owner, &format!("${}", &source[name.byte_range()]))
+                            .map(|type_text| {
+                                type_info_from_type_text(&resolver_type_text_for_parser(&type_text))
+                            })
                     })
                 })
         }
@@ -4301,7 +4361,16 @@ fn infer_expression_type_info(
                 })
                 .or_else(|| {
                     resolver.and_then(|resolve_fn| {
-                        resolve_fn(&class_fqn, &source[name.byte_range()]).map(|type_text| {
+                        let resolver_owner = resolver_owner_type_text_for_object(
+                            object,
+                            &class_fqn,
+                            source,
+                            file_symbols,
+                            resolver,
+                            callable_resolver,
+                        )
+                        .unwrap_or_else(|| class_fqn.trim_start_matches('\\').to_string());
+                        resolve_fn(&resolver_owner, &source[name.byte_range()]).map(|type_text| {
                             type_info_from_type_text(&resolver_type_text_for_parser(&type_text))
                         })
                     })
