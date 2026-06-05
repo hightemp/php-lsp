@@ -2671,10 +2671,6 @@ pub(in crate::server) fn infer_expression_type(
     let kind = node.kind();
     let range = node_range_node(node);
 
-    if kind.contains("conditional") || raw.contains(" ? ") {
-        return None;
-    }
-
     if kind == "object_creation_expression" {
         let class_node = object_creation_class_node(node)?;
         let class_name = source[class_node.byte_range()].trim();
@@ -2684,6 +2680,18 @@ pub(in crate::server) fn infer_expression_type(
             comparable: fqn,
             range,
         });
+    }
+
+    if expression_is_spaceship_operator_expression(node, source) {
+        return Some(inferred_builtin_type("int", range));
+    }
+
+    if expression_is_boolean_operator_expression(node, source) {
+        return Some(inferred_builtin_type("bool", range));
+    }
+
+    if kind.contains("conditional") || raw.contains(" ? ") {
+        return None;
     }
 
     if lower == "null" {
@@ -2732,7 +2740,7 @@ pub(in crate::server) fn normalized_expression_node(
                 };
                 node = inner;
             }
-            "parenthesized_expression" | "unary_op_expression" => {
+            "parenthesized_expression" => {
                 let Some(inner) = node.named_child(0) else {
                     return node;
                 };
@@ -2741,6 +2749,60 @@ pub(in crate::server) fn normalized_expression_node(
             _ => return node,
         }
     }
+}
+
+fn expression_is_boolean_operator_expression(node: tree_sitter::Node, source: &str) -> bool {
+    match node.kind() {
+        "unary_op_expression" => source[node.byte_range()].trim_start().starts_with('!'),
+        "binary_expression" => {
+            binary_root_operator_kind(node, source) == Some(ReturnOperatorKind::Boolean)
+        }
+        _ => false,
+    }
+}
+
+fn expression_is_spaceship_operator_expression(node: tree_sitter::Node, source: &str) -> bool {
+    node.kind() == "binary_expression"
+        && binary_root_operator_kind(node, source) == Some(ReturnOperatorKind::Spaceship)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReturnOperatorKind {
+    Boolean,
+    Spaceship,
+}
+
+fn binary_root_operator_kind(node: tree_sitter::Node, source: &str) -> Option<ReturnOperatorKind> {
+    let operator = binary_root_operator_text(node, source)?;
+    if operator == "<=>" {
+        return Some(ReturnOperatorKind::Spaceship);
+    }
+    if matches!(
+        operator,
+        "===" | "!==" | "==" | "!=" | "<>" | "<=" | ">=" | "&&" | "||" | "<" | ">"
+    ) || matches!(
+        operator.to_ascii_lowercase().as_str(),
+        "and" | "or" | "xor" | "instanceof"
+    ) {
+        return Some(ReturnOperatorKind::Boolean);
+    }
+
+    None
+}
+
+fn binary_root_operator_text<'a>(node: tree_sitter::Node, source: &'a str) -> Option<&'a str> {
+    let left = node
+        .child_by_field_name("left")
+        .or_else(|| node.named_child(0))?;
+    let right = node
+        .child_by_field_name("right")
+        .or_else(|| node.named_child(1))?;
+    if left.end_byte() > right.start_byte() {
+        return None;
+    }
+    source
+        .get(left.end_byte()..right.start_byte())
+        .map(str::trim)
 }
 
 pub(in crate::server) fn inferred_builtin_type(

@@ -4923,12 +4923,21 @@ change.
   - Validation: `cargo fmt --all --check`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` passed.
   - Docs: not updated; this is an internal diagnostics bugfix with no new user-facing feature or config.
 
-- [ ] **H-DIAGNOSTICS-BOOLEAN-OPERATOR-RETURN-INFERENCE-2026-06-04** Infer comparison/logical expressions as `bool` for return diagnostics
+- [x] **H-DIAGNOSTICS-BOOLEAN-OPERATOR-RETURN-INFERENCE-2026-06-04** Infer comparison/logical expressions as `bool` for return diagnostics *(done 2026-06-04)*
+  - Started 2026-06-04: reproduce the BDPn return-type false positive, teach return inference that comparison/logical expressions are boolean, and add focused regression tests.
   - Reproduce `Return type mismatch ... expected bool, got string` on a method returning `'' === $value || 1 === preg_match(...)`.
   - Ensure strict/equality comparisons and logical operators (`&&`, `||`, `and`, `or`, `xor`, `!`) infer `bool` in return type compatibility.
   - Add tests for mixed scalar operands so boolean expressions do not inherit operand types.
   - Files:
     /home/apanov/Projects/bdpn-ui/app/src/Service/SftpCsv/SftpCsvArchivePreviewer.php
+  - Implemented: return-expression diagnostics now classify the root comparison/logical `binary_expression` operator as `bool` before literal/numeric fallback can inherit an operand type, including expressions whose operands contain ternaries.
+  - Implemented: unary `!` expressions are preserved for diagnostics inference and classified as `bool`; numeric unary expressions still use the existing signed-number inference path.
+  - Implemented: PHP spaceship `<=>` is kept separate from boolean comparisons and inferred as `int`, so it is not accepted as a `bool` return unless it is inside a root logical expression.
+  - Implemented: `instanceof` is classified as a boolean-returning binary expression for return diagnostics.
+  - Validation: focused regression first reproduced `expected bool, got string`, then `cargo test -p php-lsp-server test_compute_diagnostics_infers_boolean_operator_return_expressions -- --nocapture` passed with `===`, `&&`, `and`/`or`/`xor`, `!`, `instanceof`, ternary operands, plain `<=>` as `int`, and `1 <=> 2 || false` as root-logical `bool`.
+  - Validation: BDPn `SftpCsvArchivePreviewer.php` analyze now reports 0 diagnostics.
+  - Validation: `cargo fmt --all --check`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` passed.
+  - Docs: not updated; this is an internal diagnostics bugfix with no new user-facing feature or config.
 
 - [x] **H-COMPLETION-STUB-STATIC-CONSTANT-ORDER-2026-06-04** Prioritize stub class constants in static autocomplete *(done 2026-06-04)*
   - Reproduce `\ZipArchive::` completion with loaded phpstorm-stubs.

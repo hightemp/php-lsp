@@ -2581,6 +2581,127 @@ function run(Box $box): void {
 }
 
 #[test]
+fn test_compute_diagnostics_infers_boolean_operator_return_expressions() {
+    let uri = "file:///boolean-operator-returns.php";
+    let code = r#"<?php
+function preg_match(string $pattern, string $subject): int {
+    if ('' === $pattern || '' === $subject) {
+        return 0;
+    }
+
+    return 1;
+}
+
+namespace App;
+
+class Foo {}
+
+function rowCountMatches(string $value): bool {
+    return '' === $value || 1 === \preg_match('/^\d+$/', $value);
+}
+
+function strictComparisonAsString(string $value): string {
+    return '' === $value;
+}
+
+function logicalAndAsString(bool $left, bool $right): string {
+    return $left && $right;
+}
+
+function logicalKeywordAsString(bool $left, bool $right, bool $extra): string {
+    return (($left and $right) or ($extra xor !$left));
+}
+
+function negationAsString(bool $value): string {
+    return !$value;
+}
+
+function comparisonWithTernaryOperandAsBool(bool $condition): bool {
+    return ($condition ? 1 : 2) === 1;
+}
+
+function negationWithTernaryOperandAsBool(bool $condition): bool {
+    return !($condition ? true : false);
+}
+
+function spaceshipWithinLogicalAsBool(): bool {
+    return 1 <=> 2 || false;
+}
+
+function spaceshipWithTernaryOperandAsInt(bool $condition): int {
+    return ($condition ? 1 : 2) <=> 1;
+}
+
+function spaceshipAsBool(string $left, string $right): bool {
+    return $left <=> $right;
+}
+
+function spaceshipAsString(string $left, string $right): string {
+    return $left <=> $right;
+}
+
+function instanceofAsBool(object $value): bool {
+    return $value instanceof Foo;
+}
+
+function instanceofAsString(object $value): string {
+    return $value instanceof Foo;
+}
+"#;
+
+    let mut parser = FileParser::new();
+    parser.parse_full(code);
+
+    let index = WorkspaceIndex::new();
+    let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+    index.update_file(uri, symbols);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    for unexpected in [
+        "Return type mismatch in App\\rowCountMatches",
+        "Return type mismatch in App\\comparisonWithTernaryOperandAsBool",
+        "Return type mismatch in App\\negationWithTernaryOperandAsBool",
+        "Return type mismatch in App\\spaceshipWithinLogicalAsBool",
+        "Return type mismatch in App\\spaceshipWithTernaryOperandAsInt",
+        "Return type mismatch in App\\instanceofAsBool",
+    ] {
+        assert!(
+            !messages.iter().any(|message| message.contains(unexpected)),
+            "bool return expression with mixed scalar operands should be accepted, got: {:?}",
+            messages
+        );
+    }
+
+    for expected in [
+        "Return type mismatch in App\\strictComparisonAsString: expected string, got bool",
+        "Return type mismatch in App\\logicalAndAsString: expected string, got bool",
+        "Return type mismatch in App\\logicalKeywordAsString: expected string, got bool",
+        "Return type mismatch in App\\negationAsString: expected string, got bool",
+        "Return type mismatch in App\\spaceshipAsBool: expected bool, got int",
+        "Return type mismatch in App\\spaceshipAsString: expected string, got int",
+        "Return type mismatch in App\\instanceofAsString: expected string, got bool",
+    ] {
+        assert!(
+            messages.contains(&expected),
+            "Expected `{}` in diagnostics, got: {:?}",
+            expected,
+            messages
+        );
+    }
+}
+
+#[test]
 fn test_compute_diagnostics_allows_callable_template_parameter_arguments() {
     let uri = "file:///input-bag-template-default.php";
     let code = r#"<?php
