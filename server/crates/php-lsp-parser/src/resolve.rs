@@ -3598,27 +3598,73 @@ fn conditional_subject_argument_type(
 ) -> Option<TypeInfo> {
     let subject_name = subject.trim().trim_start_matches('$');
     let arguments = call_arguments(call_node, source);
-    let argument = arguments
+    if let Some(argument) = arguments
         .iter()
         .find(|arg| arg.name.as_deref() == Some(subject_name))
-        .or_else(|| {
-            let parameter_index = signature?
-                .params
-                .iter()
-                .position(|param| param.name == subject_name)?;
-            arguments
-                .iter()
-                .filter(|arg| arg.name.is_none())
-                .nth(parameter_index)
-        })?;
+    {
+        return infer_expression_type_info(
+            argument.value_node,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        );
+    }
 
-    infer_expression_type_info(
-        argument.value_node,
-        source,
-        file_symbols,
-        resolver,
-        callable_resolver,
-    )
+    let signature = signature?;
+    let parameter_index = signature
+        .params
+        .iter()
+        .position(|param| param.name == subject_name)?;
+    if let Some(argument) = arguments
+        .iter()
+        .filter(|arg| arg.name.is_none())
+        .nth(parameter_index)
+    {
+        return infer_expression_type_info(
+            argument.value_node,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        );
+    }
+
+    signature
+        .params
+        .get(parameter_index)?
+        .default_value
+        .as_deref()
+        .and_then(infer_default_value_type_info)
+}
+
+fn infer_default_value_type_info(default_value: &str) -> Option<TypeInfo> {
+    let text = default_value.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.eq_ignore_ascii_case("null") {
+        return Some(TypeInfo::LiteralNull);
+    }
+    if text.eq_ignore_ascii_case("true") {
+        return Some(TypeInfo::LiteralBool(true));
+    }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(TypeInfo::LiteralBool(false));
+    }
+    if text.starts_with(['\'', '"']) {
+        return Some(TypeInfo::Simple("string".to_string()));
+    }
+    if matches!(text, "[]" | "array()") {
+        return Some(TypeInfo::Simple("array".to_string()));
+    }
+    if text.parse::<i64>().is_ok() {
+        return Some(TypeInfo::Simple("int".to_string()));
+    }
+    if text.parse::<f64>().is_ok() {
+        return Some(TypeInfo::Simple("float".to_string()));
+    }
+    None
 }
 
 fn conditional_template_names(type_info: &TypeInfo) -> HashSet<String> {
@@ -5474,6 +5520,12 @@ mod tests {
         }
     }
 
+    fn defaulted_test_param(name: &str, default_value: &str) -> php_lsp_types::ParamInfo {
+        let mut param = test_param(name);
+        param.default_value = Some(default_value.to_string());
+        param
+    }
+
     fn parse_and_find_var_def(code: &str, line: u32, col: u32) -> Option<(u32, u32, u32, u32)> {
         let mut parser = FileParser::new();
         parser.parse_full(code);
@@ -5761,6 +5813,106 @@ helper('service', Backend::class)->ping();
 
         assert_eq!(resolved.ref_kind, RefKind::MethodCall);
         assert_eq!(resolved.fqn, "App\\Backend::ping");
+    }
+
+    #[test]
+    fn test_conditional_return_uses_defaulted_subject_argument_when_omitted() {
+        let response_signature = Signature {
+            params: vec![defaulted_test_param("content", "null")],
+            return_type: None,
+        };
+        let redirect_signature = Signature {
+            params: vec![defaulted_test_param("to", "null")],
+            return_type: None,
+        };
+        let function_resolver = |function_name: &str| -> Option<ResolvedFunctionType> {
+            match function_name {
+                "App\\response" => Some(ResolvedFunctionType::with_signature(
+                    "($content is null ? App\\ResponseFactory : App\\Response)",
+                    Some(response_signature.clone()),
+                )),
+                "App\\redirect" => Some(ResolvedFunctionType::with_signature(
+                    "($to is null ? App\\Redirector : App\\RedirectResponse)",
+                    Some(redirect_signature.clone()),
+                )),
+                _ => None,
+            }
+        };
+
+        let code = r#"<?php
+namespace App;
+class JsonResponse {}
+class ResponseFactory { public function json(): JsonResponse {} }
+class Response { public function setContent(string $content): void {} }
+class RedirectResponse { public function with(string $key, mixed $value): self {} }
+class Redirector { public function route(string $name): RedirectResponse {} }
+
+response()->json();
+response('ok')->setContent('ok');
+redirect()->route('home');
+redirect('/home')->with('status', 'ok');
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+
+        let (line, col) = find_line_col(code, "json");
+        let response_factory_method = symbol_at_position_with_full_resolvers(
+            tree,
+            code,
+            line,
+            col,
+            &file_symbols,
+            None,
+            None,
+            Some(&function_resolver),
+        )
+        .expect("response() should resolve through the default null conditional branch");
+        assert_eq!(response_factory_method.fqn, "App\\ResponseFactory::json");
+
+        let (line, col) = find_line_col(code, "setContent");
+        let response_method = symbol_at_position_with_full_resolvers(
+            tree,
+            code,
+            line,
+            col,
+            &file_symbols,
+            None,
+            None,
+            Some(&function_resolver),
+        )
+        .expect("response('ok') should resolve through the non-null conditional branch");
+        assert_eq!(response_method.fqn, "App\\Response::setContent");
+
+        let (line, col) = find_line_col(code, "route");
+        let redirector_method = symbol_at_position_with_full_resolvers(
+            tree,
+            code,
+            line,
+            col,
+            &file_symbols,
+            None,
+            None,
+            Some(&function_resolver),
+        )
+        .expect("redirect() should resolve through the default null conditional branch");
+        assert_eq!(redirector_method.fqn, "App\\Redirector::route");
+
+        let (line, col) = find_line_col(code, "with");
+        let redirect_response_method = symbol_at_position_with_full_resolvers(
+            tree,
+            code,
+            line,
+            col,
+            &file_symbols,
+            None,
+            None,
+            Some(&function_resolver),
+        )
+        .expect("redirect('/home') should resolve through the non-null conditional branch");
+        assert_eq!(redirect_response_method.fqn, "App\\RedirectResponse::with");
     }
 
     #[test]

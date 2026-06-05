@@ -5004,7 +5004,10 @@ change.
     /home/apanov/ForTesting/monica/tests
     /home/apanov/ForTesting/monica/tests/Unit
 
-- [ ] **H-DIAGNOSTICS-MONICA-LARAVEL-RESPONSE-REDIRECT-HELPERS-2026-06-05** Resolve Laravel `response()`/`redirect()` helper return types for controller diagnostics
+- [x] **H-DIAGNOSTICS-MONICA-LARAVEL-RESPONSE-REDIRECT-HELPERS-2026-06-05** Resolve Laravel `response()`/`redirect()` helper return types for controller diagnostics *(done 2026-06-05)*
+  - Started: 2026-06-05
+  - Implemented: conditional return type resolution now uses omitted optional parameter default values, so helpers typed as `($arg is null ? A : B)` resolve the default branch without framework-specific hardcode.
+  - Validation: `cargo fmt --all --check`; `cargo test -p php-lsp-parser`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; Monica analyzer checks for `app/Traits/JsonRespondController.php` and `app/Actions/AttemptToAuthenticateSocialite.php`; Verifier GO.
   - False positives include `Unknown method: Illuminate\\Http\\Response::json` for `response()->json(...)` and `Unknown method: Illuminate\\Http\\RedirectResponse::route` for `redirect()->route(...)`.
   - Representative checks: `app/Traits/JsonRespondController.php:40` and `app/Actions/AttemptToAuthenticateSocialite.php:205-206` use standard Laravel helper/factory behavior.
   - Files:
