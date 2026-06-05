@@ -4957,3 +4957,24 @@ change.
     `cargo test --all`
   - Docs:
     No public configuration or user-facing documentation change needed.
+
+- [x] **H-DIAGNOSTICS-LARAVEL-HELPER-CONDITIONAL-AND-RELATION-PROPERTY-2026-06-05** Resolve Laravel helper conditional returns and relation virtual property chains *(done 2026-06-05)*
+  - Started 2026-06-05: reproduce Monica false warnings around Laravel helpers/relation properties, inspect helper PHPDoc and Eloquent relation virtual-property inference, and add generic regression coverage.
+  - Reproduce `app(CardDAVBackend::class)->withUser(...)` false warning in Monica `DeleteLocalVCard.php`.
+  - Reproduce relation/collection-chain false warning in Monica `GetMultipleVCard.php`.
+  - Specialize helper conditional returns such as `($abstract is class-string<T> ? T : mixed)` from call-site arguments.
+  - Prefer framework/PHPDoc virtual property types for property-style diagnostics before method return fallback can capture relation accessors.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Jobs/DeleteLocalVCard.php
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Jobs/GetMultipleVCard.php
+  - Implemented: parser-side function-call return inference now specializes conditional PHPDoc returns from class-string call-site arguments, so `app(Foo::class)` resolves to `Foo` instead of raw template `T`.
+  - Implemented: expression inference now treats `Foo::class` as `class-string<Foo>` for generic/conditional PHPDoc matching.
+  - Implemented: diagnostics member type resolution now keeps declared properties ahead of virtual properties, then lets framework/PHPDoc virtual properties win before a same-name method return type can capture an Eloquent relation accessor.
+  - Implemented: Laravel framework provider now exposes single-model relation accessors such as `BelongsTo<Vault, $this>` as read-only virtual properties typed as the related model, while avoiding model typing for multi-model relations.
+  - Implemented: conditional return specialization uses function signature parameter order for positional arguments and avoids specializing unknown positional subjects into template class names.
+  - Validation: focused regressions passed for `app(Backend::class)->withUser(...)` and `$subscription->vault->account_id`.
+  - Validation: verifier follow-up regressions passed for conditional subject parameter position and declared-property precedence over Laravel relation virtual properties.
+  - Validation: Monica analyze reports 0 diagnostics for both listed files.
+  - Validation: `cargo fmt --all --check`, `git diff --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` passed.
+  - Validation: Verifier follow-up reported GO; residual risks are limited to untyped declared relation-name properties, non-literal `::class` precision, and hover/completion not yet using the new function-signature resolver path.
+  - Docs: not updated; this is an internal diagnostics/type-resolution bugfix with no new user-facing feature or config.

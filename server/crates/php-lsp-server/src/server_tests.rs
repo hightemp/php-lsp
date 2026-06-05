@@ -182,6 +182,15 @@ fn assert_no_diagnostic_containing(messages: &[String], unexpected: &str) {
     );
 }
 
+fn assert_diagnostic_containing(messages: &[String], expected: &str) {
+    assert!(
+        messages.iter().any(|message| message.contains(expected)),
+        "Expected `{}` in diagnostics, got: {:?}",
+        expected,
+        messages
+    );
+}
+
 fn inferred_expr(display: &str, comparable: &str) -> InferredExprType {
     InferredExprType {
         display: display.to_string(),
@@ -2699,6 +2708,233 @@ function instanceofAsString(object $value): string {
             messages
         );
     }
+}
+
+#[test]
+fn test_compute_diagnostics_specializes_class_string_conditional_helper_returns() {
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(
+        &index,
+        "file:///helpers.php",
+        r#"<?php
+/**
+ * @template TClass of object
+ * @param string|class-string<TClass>|null $abstract
+ * @return ($abstract is class-string<TClass> ? TClass : mixed)
+ */
+function app($abstract = null) {}
+"#,
+    );
+    parse_and_index_php_file(
+        &index,
+        "file:///service.php",
+        r#"<?php
+namespace App\Service;
+
+class User {}
+
+class Backend {
+    public function withUser(User $user): self
+    {
+        return $this;
+    }
+}
+"#,
+    );
+
+    let uri = "file:///job.php";
+    let code = r#"<?php
+namespace App\Jobs;
+
+use App\Service\Backend;
+use App\Service\User;
+
+function run(User $user): void
+{
+    app(Backend::class)->withUser($user);
+}
+"#;
+    let parser = parse_and_index_php_file(&index, uri, code);
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert!(
+        !messages.iter().any(|message| message.contains("withUser")),
+        "`app(Backend::class)` should resolve to Backend at the call site, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn test_compute_diagnostics_uses_laravel_relation_virtual_property_type_in_chains() {
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(
+        &index,
+        "file:///laravel.php",
+        r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+class Model {
+    public function belongsTo(string $class): Relations\BelongsTo
+    {
+        return new Relations\BelongsTo();
+    }
+}
+
+namespace Illuminate\Database\Eloquent\Relations;
+
+class BelongsTo {}
+"#,
+    );
+    parse_and_index_php_file(
+        &index,
+        "file:///models.php",
+        r#"<?php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class Vault {
+    public string $account_id;
+}
+
+class AddressBookSubscription extends Model {
+    /**
+     * @return BelongsTo<Vault, $this>
+     */
+    public function vault(): BelongsTo
+    {
+        return $this->belongsTo(Vault::class);
+    }
+}
+"#,
+    );
+
+    let uri = "file:///job.php";
+    let code = r#"<?php
+namespace App\Jobs;
+
+use App\Models\AddressBookSubscription;
+
+class Job {
+    public function __construct(private AddressBookSubscription $subscription) {}
+
+    public function run(): string
+    {
+        return $this->subscription->vault->account_id;
+    }
+}
+"#;
+    let parser = parse_and_index_php_file(&index, uri, code);
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    assert!(
+        !messages.iter().any(|message| {
+            message.contains("Unknown property")
+                && (message.contains("BelongsTo::$account_id")
+                    || message.contains("Vault::$account_id"))
+        }),
+        "Laravel relation property chain should resolve through the related model, got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn test_compute_diagnostics_prefers_declared_property_over_laravel_relation_virtual_property() {
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(
+        &index,
+        "file:///laravel.php",
+        r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+class Model {}
+
+namespace Illuminate\Database\Eloquent\Relations;
+
+class BelongsTo {}
+"#,
+    );
+    parse_and_index_php_file(
+        &index,
+        "file:///models.php",
+        r#"<?php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class DeclaredVault {
+    public function declaredOnly(): void {}
+}
+
+class RelationVault {
+    public function relationOnly(): void {}
+}
+
+class AddressBookSubscription extends Model {
+    public DeclaredVault $vault;
+
+    /**
+     * @return BelongsTo<RelationVault, $this>
+     */
+    public function vault(): BelongsTo
+    {
+        return new BelongsTo();
+    }
+}
+"#,
+    );
+
+    let uri = "file:///job.php";
+    let code = r#"<?php
+namespace App\Jobs;
+
+use App\Models\AddressBookSubscription;
+
+class Job {
+    public function __construct(private AddressBookSubscription $subscription) {}
+
+    public function run(): void
+    {
+        $this->subscription->vault->relationOnly();
+    }
+}
+"#;
+    let parser = parse_and_index_php_file(&index, uri, code);
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    assert_diagnostic_containing(
+        &messages,
+        "Unknown method: App\\Models\\DeclaredVault::relationOnly",
+    );
 }
 
 #[test]

@@ -1,6 +1,9 @@
 //! Diagnostics LSP handlers extracted from `server.rs`.
 
 use super::super::*;
+use php_lsp_parser::resolve::{
+    symbol_at_position_with_full_resolvers, FunctionTypeResolver, ResolvedFunctionType,
+};
 use tracing::Instrument;
 
 fn build_analyzer_shell_command(template: &str, file_path: &Path) -> String {
@@ -1204,12 +1207,23 @@ pub(in crate::server) fn check_member_access_node(
             (0, 0, 0, 0),
             "member-type",
             format!("{class_fqn}::{member_name}"),
-            || resolve_member_type_from_index(index, class_fqn, member_name),
+            || {
+                resolve_diagnostic_member_type(
+                    index,
+                    class_fqn,
+                    member_name,
+                    uri_str,
+                    file_symbols,
+                    source,
+                )
+            },
         )
     };
     let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
         resolve_callable_parameter_type_from_index(index, file_symbols, ctx)
     };
+    let function_type_resolver =
+        |function_name: &str| resolve_function_type_from_index(index, function_name);
     let Some(sym_at_pos) = symbol_at_position_with_request_cache(
         type_cache,
         tree,
@@ -1220,6 +1234,7 @@ pub(in crate::server) fn check_member_access_node(
         "diagnostic-member-access",
         Some(&member_type_resolver),
         Some(&callable_param_resolver),
+        Some(&function_type_resolver),
     ) else {
         return;
     };
@@ -1447,6 +1462,78 @@ pub(in crate::server) fn phpunit_testcase_factory_return_type(
         }
         _ => None,
     }
+}
+
+fn resolve_diagnostic_member_type(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+    uri_str: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    source: &str,
+) -> Option<String> {
+    if class_fqn.is_empty() {
+        return resolve_member_type_from_index(index, class_fqn, member_name);
+    }
+
+    let virtual_property_type = || {
+        framework_virtual_member_type_fqn(
+            index,
+            class_fqn,
+            member_name,
+            Some(uri_str),
+            Some(file_symbols),
+            Some(source),
+        )
+        .or_else(|| phpdoc_virtual_property_type_fqn(index, class_fqn, member_name))
+    };
+
+    if member_name.starts_with('$') {
+        resolve_declared_property_type_from_index(index, class_fqn, member_name)
+            .or_else(virtual_property_type)
+            .or_else(|| resolve_member_type_from_index(index, class_fqn, member_name))
+    } else {
+        resolve_member_type_from_index(index, class_fqn, member_name).or_else(virtual_property_type)
+    }
+}
+
+fn resolve_declared_property_type_from_index(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+) -> Option<String> {
+    let bare_name = member_name.trim_start_matches('$');
+    index
+        .get_members(class_fqn)
+        .into_iter()
+        .find(|sym| {
+            sym.kind == php_lsp_types::PhpSymbolKind::Property
+                && sym.parent_fqn.as_deref() == Some(class_fqn)
+                && (sym.name == member_name || sym.name == bare_name)
+        })
+        .or_else(|| {
+            index.get_members(class_fqn).into_iter().find(|sym| {
+                sym.kind == php_lsp_types::PhpSymbolKind::Property
+                    && (sym.name == member_name || sym.name == bare_name)
+            })
+        })
+        .and_then(|sym| symbol_return_type_text_from_index(index, class_fqn, &sym))
+}
+
+fn resolve_function_type_from_index(
+    index: &WorkspaceIndex,
+    function_fqn: &str,
+) -> Option<ResolvedFunctionType> {
+    let sym = index.resolve_fqn(function_fqn).or_else(|| {
+        function_fqn
+            .rsplit_once('\\')
+            .and_then(|(_, short_name)| index.resolve_fqn(short_name))
+    })?;
+    if sym.kind != php_lsp_types::PhpSymbolKind::Function {
+        return None;
+    }
+    symbol_return_type_text_from_index(index, &sym.fqn, &sym)
+        .map(|type_text| ResolvedFunctionType::with_signature(type_text, sym.signature.clone()))
 }
 
 pub(in crate::server) fn phpunit_test_double_api_method(member_name: &str) -> bool {
@@ -2434,6 +2521,7 @@ pub(in crate::server) fn symbol_at_position_with_request_cache(
     expected_context: &'static str,
     member_type_resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<SymbolAtPosition> {
     type_cache.cached_symbol(
         line,
@@ -2441,7 +2529,7 @@ pub(in crate::server) fn symbol_at_position_with_request_cache(
         "symbol-at-position",
         expected_context,
         || {
-            symbol_at_position_with_resolvers(
+            symbol_at_position_with_full_resolvers(
                 tree,
                 source,
                 line,
@@ -2449,6 +2537,7 @@ pub(in crate::server) fn symbol_at_position_with_request_cache(
                 file_symbols,
                 member_type_resolver,
                 callable_resolver,
+                function_resolver,
             )
         },
     )
@@ -2485,6 +2574,7 @@ pub(in crate::server) fn resolve_reference_symbol_at_node_cached(
         "reference-symbol",
         Some(&member_type_resolver),
         Some(&callable_param_resolver),
+        None,
     )?;
     let resolved = resolve_symbol_at_position_from_index(index, &sym_at_pos)?;
     Some((sym_at_pos, resolved))

@@ -54,6 +54,30 @@ impl Drop for ObjectTypeResolveDepthGuard {
 /// `"Collection<int, App\\Entity\\User>"`) or None.
 pub type MemberTypeResolver<'a> = &'a dyn Fn(&str, &str) -> Option<String>;
 
+#[derive(Debug, Clone)]
+pub struct ResolvedFunctionType {
+    pub type_text: String,
+    pub signature: Option<Signature>,
+}
+
+impl ResolvedFunctionType {
+    pub fn new(type_text: impl Into<String>) -> Self {
+        Self {
+            type_text: type_text.into(),
+            signature: None,
+        }
+    }
+
+    pub fn with_signature(type_text: impl Into<String>, signature: Option<Signature>) -> Self {
+        Self {
+            type_text: type_text.into(),
+            signature,
+        }
+    }
+}
+
+pub type FunctionTypeResolver<'a> = &'a dyn Fn(&str) -> Option<ResolvedFunctionType>;
+
 /// Context for resolving the expected type of an untyped closure/arrow-function
 /// parameter from the callable parameter at the call site.
 #[derive(Debug, Clone)]
@@ -184,13 +208,45 @@ pub fn symbol_at_position_with_resolvers(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<SymbolAtPosition> {
+    symbol_at_position_with_full_resolvers(
+        tree,
+        source,
+        line,
+        character,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        None,
+    )
+}
+
+/// Find the symbol at the given position, with optional cross-file type,
+/// callable-parameter, and function-signature resolvers.
+#[allow(clippy::too_many_arguments)]
+pub fn symbol_at_position_with_full_resolvers(
+    tree: &Tree,
+    source: &str,
+    line: u32,
+    character: u32,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
+) -> Option<SymbolAtPosition> {
     let root = tree.root_node();
     let point = Point::new(line as usize, character as usize);
 
     // Find the most specific node at the position
     let node = find_node_at_point(root, point)?;
 
-    resolve_node(node, source, file_symbols, resolver, callable_resolver)
+    resolve_node(
+        node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        function_resolver,
+    )
 }
 
 /// Find local variable definition range for the variable under cursor.
@@ -592,9 +648,14 @@ fn find_all_property_assignment_types(
         // Check expression_statement for property assignment
         if child.kind() == "expression_statement" {
             if let Some(rhs) = property_assignment_rhs(child, prop_name, source) {
-                if let Some(resolved) =
-                    try_resolve_object_type(rhs, source, file_symbols, resolver, callable_resolver)
-                {
+                if let Some(resolved) = try_resolve_object_type(
+                    rhs,
+                    source,
+                    file_symbols,
+                    resolver,
+                    callable_resolver,
+                    None,
+                ) {
                     if !results.contains(&resolved) {
                         results.push(resolved);
                     }
@@ -742,6 +803,7 @@ fn resolve_node(
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<SymbolAtPosition> {
     let parent = node.parent()?;
     let node_text = &source[node.byte_range()];
@@ -765,7 +827,14 @@ fn resolve_node(
                     format!("${}", node_text)
                 };
                 let class_fqn = object_field.and_then(|o| {
-                    try_resolve_object_type(o, source, file_symbols, resolver, callable_resolver)
+                    try_resolve_object_type(
+                        o,
+                        source,
+                        file_symbols,
+                        resolver,
+                        callable_resolver,
+                        function_resolver,
+                    )
                 });
                 let fqn = if let Some(ref cls) = class_fqn {
                     format!("{}::{}", cls, property_name)
@@ -795,7 +864,14 @@ fn resolve_node(
                 let object_text = object_field.map(|o| source[o.byte_range()].to_string());
                 // Try to resolve object type to build a proper FQN
                 let class_fqn = object_field.and_then(|o| {
-                    try_resolve_object_type(o, source, file_symbols, resolver, callable_resolver)
+                    try_resolve_object_type(
+                        o,
+                        source,
+                        file_symbols,
+                        resolver,
+                        callable_resolver,
+                        function_resolver,
+                    )
                 });
                 let fqn = if let Some(ref cls) = class_fqn {
                     format!("{}::{}", cls, node_text)
@@ -907,6 +983,7 @@ fn resolve_node(
                                 file_symbols,
                                 resolver,
                                 callable_resolver,
+                                function_resolver,
                             )
                         });
                         let fqn = if let Some(ref cls) = class_fqn {
@@ -1171,6 +1248,7 @@ fn try_resolve_object_type<'a>(
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<String> {
     let _depth_guard = ObjectTypeResolveDepthGuard::enter()?;
     try_resolve_object_type_inner(
@@ -1179,6 +1257,7 @@ fn try_resolve_object_type<'a>(
         file_symbols,
         resolver,
         callable_resolver,
+        function_resolver,
     )
 }
 
@@ -1188,12 +1267,18 @@ fn try_resolve_object_type_inner<'a>(
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<String> {
     let kind = object_node.kind();
     match kind {
-        "function_call_expression" => {
-            try_resolve_function_call_object_fqn(object_node, source, file_symbols, resolver)
-        }
+        "function_call_expression" => try_resolve_function_call_object_fqn(
+            object_node,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+            function_resolver,
+        ),
         // Direct: new Foo()
         "object_creation_expression" => {
             // The class name is a named child with kind "name" or "qualified_name"
@@ -1223,6 +1308,7 @@ fn try_resolve_object_type_inner<'a>(
                         file_symbols,
                         resolver,
                         callable_resolver,
+                        function_resolver,
                     ) {
                         return Some(resolved);
                     }
@@ -1265,6 +1351,7 @@ fn try_resolve_object_type_inner<'a>(
                 file_symbols,
                 resolver,
                 callable_resolver,
+                function_resolver,
             )?;
 
             // Look up the property in the file's symbols to get its type
@@ -1314,6 +1401,7 @@ fn try_resolve_object_type_inner<'a>(
                 file_symbols,
                 resolver,
                 callable_resolver,
+                function_resolver,
             )?;
 
             // First: look up the method's return type in the current file's symbols
@@ -1721,9 +1809,14 @@ fn find_variable_inference_before_usage(
                         type_info: Some(type_info),
                     },
                 ));
-            } else if let Some(resolved) =
-                try_resolve_object_type(right, source, file_symbols, resolver, callable_resolver)
-            {
+            } else if let Some(resolved) = try_resolve_object_type(
+                right,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+                None,
+            ) {
                 let type_info = Some(resolved_fqn_type_info(&resolved));
                 inferred = Some((
                     stmt.start_byte(),
@@ -1853,9 +1946,14 @@ fn find_nested_variable_inference_before_usage(
                         type_info: Some(type_info),
                     },
                 ));
-            } else if let Some(resolved) =
-                try_resolve_object_type(right, source, file_symbols, resolver, callable_resolver)
-            {
+            } else if let Some(resolved) = try_resolve_object_type(
+                right,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+                None,
+            ) {
                 inferred = Some((
                     child.start_byte(),
                     VariableInference {
@@ -2580,6 +2678,7 @@ fn callable_target_for_call(
                         file_symbols,
                         resolver,
                         callable_resolver,
+                        None,
                     )
                 })?;
             Some((
@@ -3375,12 +3474,18 @@ fn try_resolve_function_call_return_type(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
-) -> Option<String> {
-    let resolve_fn = resolver?;
+    function_resolver: Option<FunctionTypeResolver<'_>>,
+) -> Option<ResolvedFunctionType> {
     match node.kind() {
         "parenthesized_expression" => (0..node.named_child_count()).find_map(|i| {
             let child = node.named_child(i)?;
-            try_resolve_function_call_return_type(child, source, file_symbols, resolver)
+            try_resolve_function_call_return_type(
+                child,
+                source,
+                file_symbols,
+                resolver,
+                function_resolver,
+            )
         }),
         "function_call_expression" => {
             let function = node
@@ -3391,13 +3496,24 @@ fn try_resolve_function_call_return_type(
                 return None;
             }
             let resolved = resolve_function_name(raw_name, file_symbols);
-            let resolved_type_text = |function_name: &str| {
-                resolve_fn("", function_name)
-                    .map(|type_text| resolver_type_text_for_parser(&type_text))
+            let resolved_type = |function_name: &str| {
+                function_resolver
+                    .and_then(|resolve_fn| resolve_fn(function_name))
+                    .map(|mut resolved| {
+                        resolved.type_text = resolver_type_text_for_parser(&resolved.type_text);
+                        resolved
+                    })
+                    .or_else(|| {
+                        resolver
+                            .and_then(|resolve_fn| resolve_fn("", function_name))
+                            .map(|type_text| {
+                                ResolvedFunctionType::new(resolver_type_text_for_parser(&type_text))
+                            })
+                    })
             };
-            resolved_type_text(&resolved).or_else(|| {
+            resolved_type(&resolved).or_else(|| {
                 (!raw_name.starts_with('\\') && !raw_name.contains('\\') && resolved != raw_name)
-                    .then(|| resolved_type_text(raw_name))
+                    .then(|| resolved_type(raw_name))
                     .flatten()
             })
         }
@@ -3405,24 +3521,237 @@ fn try_resolve_function_call_return_type(
     }
 }
 
+fn try_resolve_function_call_return_type_info(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let resolved = try_resolve_function_call_return_type(
+        node,
+        source,
+        file_symbols,
+        resolver,
+        function_resolver,
+    )?;
+    let type_info = type_info_from_type_text(&resolved.type_text);
+    Some(resolve_function_call_return_type_at_call_site(
+        &type_info,
+        resolved.signature.as_ref(),
+        node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    ))
+}
+
+fn resolve_function_call_return_type_at_call_site(
+    type_info: &TypeInfo,
+    signature: Option<&Signature>,
+    call_node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> TypeInfo {
+    match type_info {
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => {
+            let Some(actual) = conditional_subject_argument_type(
+                call_node,
+                subject,
+                signature,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            ) else {
+                return (**else_type).clone();
+            };
+            let template_names = conditional_template_names(type_info);
+            let mut substitutions = HashMap::new();
+            if type_pattern_matches_actual(target, &actual, &template_names, &mut substitutions) {
+                substitute_type_info(if_type, &substitutions)
+            } else {
+                substitute_type_info(else_type, &substitutions)
+            }
+        }
+        _ => type_info.clone(),
+    }
+}
+
+fn conditional_subject_argument_type(
+    call_node: Node,
+    subject: &str,
+    signature: Option<&Signature>,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let subject_name = subject.trim().trim_start_matches('$');
+    let arguments = call_arguments(call_node, source);
+    let argument = arguments
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(subject_name))
+        .or_else(|| {
+            let parameter_index = signature?
+                .params
+                .iter()
+                .position(|param| param.name == subject_name)?;
+            arguments
+                .iter()
+                .filter(|arg| arg.name.is_none())
+                .nth(parameter_index)
+        })?;
+
+    infer_expression_type_info(
+        argument.value_node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )
+}
+
+fn conditional_template_names(type_info: &TypeInfo) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_conditional_template_names(type_info, &mut names);
+    names
+}
+
+fn collect_conditional_template_names(type_info: &TypeInfo, names: &mut HashSet<String>) {
+    match type_info {
+        TypeInfo::ClassString(Some(inner)) => collect_template_name_leaf(inner, names),
+        TypeInfo::Conditional {
+            target,
+            if_type,
+            else_type,
+            ..
+        } => {
+            collect_conditional_template_names(target, names);
+            collect_conditional_template_names(if_type, names);
+            collect_conditional_template_names(else_type, names);
+        }
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            for ty in types {
+                collect_conditional_template_names(ty, names);
+            }
+        }
+        TypeInfo::Nullable(inner) => collect_conditional_template_names(inner, names),
+        _ => {}
+    }
+}
+
+fn collect_template_name_leaf(type_info: &TypeInfo, names: &mut HashSet<String>) {
+    if let TypeInfo::Simple(name) = type_info {
+        if !is_builtin_non_object_type(name) && !name.contains('\\') {
+            names.insert(name.clone());
+        }
+    }
+}
+
+fn type_pattern_matches_actual(
+    pattern: &TypeInfo,
+    actual: &TypeInfo,
+    template_names: &HashSet<String>,
+    substitutions: &mut HashMap<String, TypeInfo>,
+) -> bool {
+    match (pattern, actual) {
+        (TypeInfo::Mixed, _) => true,
+        (TypeInfo::Simple(name), actual) if template_names.contains(name) => {
+            substitutions
+                .entry(name.clone())
+                .or_insert_with(|| actual.clone());
+            true
+        }
+        (TypeInfo::Simple(expected), TypeInfo::Simple(actual)) => same_type_name(expected, actual),
+        (TypeInfo::ClassString(Some(pattern_inner)), TypeInfo::ClassString(Some(actual_inner))) => {
+            type_pattern_matches_actual(pattern_inner, actual_inner, template_names, substitutions)
+        }
+        (TypeInfo::ClassString(None), TypeInfo::ClassString(_)) => true,
+        (
+            TypeInfo::Generic {
+                base: expected_base,
+                args: expected_args,
+            },
+            TypeInfo::Generic {
+                base: actual_base,
+                args: actual_args,
+            },
+        ) if same_type_name(expected_base, actual_base)
+            && expected_args.len() == actual_args.len() =>
+        {
+            expected_args
+                .iter()
+                .zip(actual_args.iter())
+                .all(|(expected_arg, actual_arg)| {
+                    type_pattern_matches_actual(
+                        expected_arg,
+                        actual_arg,
+                        template_names,
+                        substitutions,
+                    )
+                })
+        }
+        (TypeInfo::Union(types), actual) => types.iter().any(|type_info| {
+            let mut branch_substitutions = substitutions.clone();
+            let matches = type_pattern_matches_actual(
+                type_info,
+                actual,
+                template_names,
+                &mut branch_substitutions,
+            );
+            if matches {
+                *substitutions = branch_substitutions;
+            }
+            matches
+        }),
+        (TypeInfo::Intersection(types), actual) => types.iter().all(|type_info| {
+            type_pattern_matches_actual(type_info, actual, template_names, substitutions)
+        }),
+        (TypeInfo::Nullable(_), TypeInfo::LiteralNull) => true,
+        (TypeInfo::Nullable(inner), actual) => {
+            type_pattern_matches_actual(inner, actual, template_names, substitutions)
+        }
+        (TypeInfo::LiteralString(expected), TypeInfo::LiteralString(actual))
+        | (TypeInfo::LiteralInt(expected), TypeInfo::LiteralInt(actual))
+        | (TypeInfo::LiteralFloat(expected), TypeInfo::LiteralFloat(actual)) => expected == actual,
+        (TypeInfo::LiteralBool(expected), TypeInfo::LiteralBool(actual)) => expected == actual,
+        (TypeInfo::LiteralNull, TypeInfo::LiteralNull) => true,
+        _ => false,
+    }
+}
+
+fn same_type_name(left: &str, right: &str) -> bool {
+    left.trim_start_matches('\\')
+        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
+}
+
 fn try_resolve_function_call_object_fqn(
     node: Node,
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<String> {
-    let type_text = try_resolve_function_call_return_type(node, source, file_symbols, resolver)?;
-    resolver_type_text_to_object_fqn(&type_text, node, source, file_symbols)
-}
-
-fn resolver_type_text_to_object_fqn(
-    type_text: &str,
-    context_node: Node,
-    source: &str,
-    file_symbols: &FileSymbols,
-) -> Option<String> {
-    let type_info = type_info_from_type_text(type_text);
-    resolver_type_info_to_object_fqn(&type_info, context_node, source, file_symbols)
+    let type_info = try_resolve_function_call_return_type_info(
+        node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        function_resolver,
+    )?;
+    resolver_type_info_to_object_fqn(&type_info, node, source, file_symbols)
 }
 
 fn resolver_type_text_for_parser(type_text: &str) -> String {
@@ -3608,8 +3937,14 @@ fn infer_function_call_type_info(
                 args: vec![value_type],
             })
         }
-        _ => try_resolve_function_call_return_type(node, source, file_symbols, resolver)
-            .map(|type_text| type_info_from_type_text(&type_text)),
+        _ => try_resolve_function_call_return_type_info(
+            node,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+            None,
+        ),
     }
 }
 
@@ -3809,6 +4144,10 @@ fn infer_expression_type_info(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
+    if let Some(class_string) = class_string_type_info_from_expression(node, source, file_symbols) {
+        return Some(class_string);
+    }
+
     match node.kind() {
         "parenthesized_expression" => {
             for i in 0..node.named_child_count() {
@@ -3867,8 +4206,14 @@ fn infer_expression_type_info(
         "member_access_expression" | "nullsafe_member_access_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
-            let class_fqn =
-                try_resolve_object_type(object, source, file_symbols, resolver, callable_resolver)?;
+            let class_fqn = try_resolve_object_type(
+                object,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+                None,
+            )?;
             let prop_fqn = format!("{}::${}", class_fqn, &source[name.byte_range()]);
             file_symbols
                 .symbols
@@ -3891,8 +4236,14 @@ fn infer_expression_type_info(
         "member_call_expression" | "nullsafe_member_call_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
-            let class_fqn =
-                try_resolve_object_type(object, source, file_symbols, resolver, callable_resolver)?;
+            let class_fqn = try_resolve_object_type(
+                object,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+                None,
+            )?;
             let method_fqn = format!("{}::{}", class_fqn, &source[name.byte_range()]);
             file_symbols
                 .symbols
@@ -3926,6 +4277,23 @@ fn infer_expression_type_info(
         }
         _ => None,
     }
+}
+
+fn class_string_type_info_from_expression(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+) -> Option<TypeInfo> {
+    let raw = source.get(node.byte_range())?.trim();
+    let class_name = raw.strip_suffix("::class")?.trim();
+    if class_name.is_empty() {
+        return None;
+    }
+    Some(TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple(
+        resolve_class_name(class_name, file_symbols)
+            .trim_start_matches('\\')
+            .to_string(),
+    )))))
 }
 
 fn infer_literal_array_shape_type(
@@ -5095,6 +5463,17 @@ mod tests {
         symbol_at_position(tree, code, line, col, &file_symbols)
     }
 
+    fn test_param(name: &str) -> php_lsp_types::ParamInfo {
+        php_lsp_types::ParamInfo {
+            name: name.to_string(),
+            type_info: None,
+            default_value: None,
+            is_variadic: false,
+            is_by_ref: false,
+            is_promoted: false,
+        }
+    }
+
     fn parse_and_find_var_def(code: &str, line: u32, col: u32) -> Option<(u32, u32, u32, u32)> {
         let mut parser = FileParser::new();
         parser.parse_full(code);
@@ -5316,6 +5695,72 @@ class UserRepository {
         assert_eq!(sym.name, "increment");
         assert_eq!(sym.ref_kind, RefKind::MethodCall);
         assert_eq!(sym.fqn, "App\\Foo::increment");
+    }
+
+    #[test]
+    fn test_conditional_return_uses_subject_parameter_position_for_positional_arguments() {
+        let signature = Signature {
+            params: vec![test_param("prefix"), test_param("abstract")],
+            return_type: None,
+        };
+        let function_resolver = |function_name: &str| -> Option<ResolvedFunctionType> {
+            (function_name == "App\\helper").then(|| {
+                ResolvedFunctionType::with_signature(
+                    "($abstract is class-string<TClass> ? TClass : mixed)",
+                    Some(signature.clone()),
+                )
+            })
+        };
+
+        let unresolved_code = r#"<?php
+namespace App;
+class Backend {}
+helper(Backend::class)->ping();
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(unresolved_code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, unresolved_code, "file:///test.php");
+        let (line, col) = find_line_col(unresolved_code, "ping");
+        let unresolved = symbol_at_position_with_full_resolvers(
+            tree,
+            unresolved_code,
+            line,
+            col,
+            &file_symbols,
+            None,
+            None,
+            Some(&function_resolver),
+        )
+        .expect("method symbol should be produced even when receiver type is unresolved");
+
+        assert_eq!(unresolved.ref_kind, RefKind::MethodCall);
+        assert_eq!(unresolved.fqn, "ping");
+
+        let resolved_code = r#"<?php
+namespace App;
+class Backend {}
+helper('service', Backend::class)->ping();
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(resolved_code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, resolved_code, "file:///test.php");
+        let (line, col) = find_line_col(resolved_code, "ping");
+        let resolved = symbol_at_position_with_full_resolvers(
+            tree,
+            resolved_code,
+            line,
+            col,
+            &file_symbols,
+            None,
+            None,
+            Some(&function_resolver),
+        )
+        .expect("second positional argument should match the conditional subject");
+
+        assert_eq!(resolved.ref_kind, RefKind::MethodCall);
+        assert_eq!(resolved.fqn, "App\\Backend::ping");
     }
 
     #[test]

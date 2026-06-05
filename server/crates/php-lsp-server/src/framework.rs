@@ -847,6 +847,7 @@ fn laravel_model_virtual_properties(
         collect_phpdoc_properties(ctx, &owner, &mut properties, &mut seen);
         collect_laravel_accessor_properties(ctx, &owner, &mut properties, &mut seen);
         collect_laravel_source_properties(ctx, &owner, &mut properties, &mut seen);
+        collect_laravel_relation_properties(ctx, &owner, &mut properties, &mut seen);
         collect_laravel_relation_count_properties(ctx, &owner, &mut properties, &mut seen);
     }
 
@@ -1024,7 +1025,40 @@ fn collect_laravel_source_properties(
 struct LaravelRelation {
     name: String,
     related_model: Option<String>,
+    property_type: Option<TypeInfo>,
     source: Option<VirtualMemberSource>,
+}
+
+fn collect_laravel_relation_properties(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &std::sync::Arc<SymbolInfo>,
+    properties: &mut Vec<VirtualMember>,
+    seen: &mut HashMap<VirtualMemberIdentity, usize>,
+) {
+    for relation in laravel_model_relations_for_owner(ctx, owner) {
+        let Some(property_type) = relation.property_type else {
+            continue;
+        };
+        let detail = relation
+            .related_model
+            .as_ref()
+            .map(|model| {
+                format!(
+                    "Laravel relation property for {} ({})",
+                    relation.name, model
+                )
+            })
+            .unwrap_or_else(|| format!("Laravel relation property for {}", relation.name));
+        let mut member = laravel_property_from_source(
+            owner,
+            &relation.name,
+            Some(property_type),
+            detail,
+            relation.source,
+        );
+        member.access = Some(PhpDocPropertyAccess::ReadOnly);
+        push_laravel_property(properties, seen, member);
+    }
 }
 
 fn collect_laravel_relation_count_properties(
@@ -1085,10 +1119,28 @@ fn laravel_relation_from_method(
         .signature
         .as_ref()
         .and_then(|signature| signature.return_type.as_ref());
+    let phpdoc_return_type = method
+        .doc_comment
+        .as_deref()
+        .and_then(|doc| parse_phpdoc(doc).return_type);
     let related_from_return = return_type
         .and_then(|type_info| laravel_relation_related_model_from_type_info(ctx, owner, type_info));
-    let returns_relation =
-        return_type.is_some_and(|type_info| is_laravel_relation_type_info(ctx, owner, type_info));
+    let related_from_phpdoc = phpdoc_return_type
+        .as_ref()
+        .and_then(|type_info| laravel_relation_related_model_from_type_info(ctx, owner, type_info));
+    let property_type = phpdoc_return_type
+        .as_ref()
+        .and_then(|type_info| laravel_relation_property_type_from_type_info(ctx, owner, type_info))
+        .or_else(|| {
+            return_type.and_then(|type_info| {
+                laravel_relation_property_type_from_type_info(ctx, owner, type_info)
+            })
+        });
+    let returns_relation = return_type
+        .is_some_and(|type_info| is_laravel_relation_type_info(ctx, owner, type_info))
+        || phpdoc_return_type
+            .as_ref()
+            .is_some_and(|type_info| is_laravel_relation_type_info(ctx, owner, type_info));
     let related_from_source = laravel_relation_related_model_from_source(ctx, owner, method);
 
     if !returns_relation && related_from_source.is_none() {
@@ -1097,9 +1149,39 @@ fn laravel_relation_from_method(
 
     Some(LaravelRelation {
         name: method.name.clone(),
-        related_model: related_from_return.or(related_from_source),
+        related_model: related_from_phpdoc
+            .or(related_from_return)
+            .or(related_from_source),
+        property_type,
         source: property_source_range(method),
     })
+}
+
+fn laravel_relation_property_type_from_type_info(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &SymbolInfo,
+    type_info: &TypeInfo,
+) -> Option<TypeInfo> {
+    match type_info {
+        TypeInfo::Generic { base, args }
+            if resolve_type_name_to_fqn(ctx, owner, base)
+                .as_deref()
+                .is_some_and(|fqn| is_laravel_single_model_relation_fqn(ctx, fqn)) =>
+        {
+            args.iter()
+                .find_map(|arg| type_info_to_fqn(ctx, owner, arg))
+                .map(TypeInfo::Simple)
+        }
+        TypeInfo::Nullable(inner) => {
+            laravel_relation_property_type_from_type_info(ctx, owner, inner)
+        }
+        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
+            types.iter().find_map(|type_info| {
+                laravel_relation_property_type_from_type_info(ctx, owner, type_info)
+            })
+        }
+        _ => None,
+    }
 }
 
 fn laravel_relation_related_model_from_type_info(
@@ -1167,6 +1249,24 @@ fn is_laravel_relation_fqn(ctx: &FrameworkProviderContext<'_>, fqn: &str) -> boo
                 | "MorphTo"
                 | "MorphToMany"
                 | "MorphedByMany"
+        )
+}
+
+fn is_laravel_single_model_relation_fqn(ctx: &FrameworkProviderContext<'_>, fqn: &str) -> bool {
+    ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\BelongsTo")
+        || ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\HasOne")
+        || ctx.class_is_or_extends(
+            fqn,
+            "Illuminate\\Database\\Eloquent\\Relations\\HasOneThrough",
+        )
+        || ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\MorphOne")
+        || ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\MorphTo")
+        || matches!(
+            fqn.trim_start_matches('\\')
+                .rsplit('\\')
+                .next()
+                .unwrap_or(fqn),
+            "BelongsTo" | "HasOne" | "HasOneThrough" | "MorphOne" | "MorphTo"
         )
 }
 

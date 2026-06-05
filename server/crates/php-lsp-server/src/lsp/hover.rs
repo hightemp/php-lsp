@@ -101,6 +101,7 @@ impl PhpLspBackend {
                 "hover",
                 Some(&resolver),
                 Some(&callable_param_resolver),
+                None,
             );
             let sym_at_pos = match primary_sym_at_pos {
                 Some(s)
