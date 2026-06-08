@@ -1399,6 +1399,36 @@ fn test_type_compatibility_approximation_rules_are_explicit() {
         &file_symbols,
         &index
     ));
+
+    let array_key = TypeInfo::Simple("array-key".to_string());
+    for actual in [
+        inferred_expr("array-key", "array-key"),
+        inferred_expr("string", "string"),
+        inferred_expr("string", "'modified'"),
+        inferred_expr("non-empty-string", "non-empty-string"),
+        inferred_expr("numeric-string", "numeric-string"),
+        inferred_expr("class-string", "class-string"),
+        inferred_expr("int", "int"),
+        inferred_expr("int", "0"),
+        inferred_expr("positive-int", "positive-int"),
+    ] {
+        assert!(
+            type_info_accepts_inferred_type(&array_key, &actual, &file_symbols, &index),
+            "array-key should accept {:?}",
+            actual
+        );
+    }
+    for actual in [
+        inferred_expr("bool", "true"),
+        inferred_expr("null", "null"),
+        inferred_expr("float", "1.5"),
+    ] {
+        assert!(
+            !type_info_accepts_inferred_type(&array_key, &actual, &file_symbols, &index),
+            "array-key should reject {:?}",
+            actual
+        );
+    }
 }
 
 #[test]
@@ -2812,6 +2842,62 @@ function run(Box $box): void {
             messages
         );
     }
+}
+
+#[test]
+fn test_compute_diagnostics_allows_array_key_alias_arguments() {
+    let uri = "file:///array-key-arguments.php";
+    let code = r#"<?php
+namespace App;
+
+/**
+ * @template TKey of array-key
+ */
+class Collection {
+    /**
+     * @param TKey $key
+     */
+    public function get($key): mixed
+    {
+        return null;
+    }
+}
+
+function run(Collection $collection): void {
+    $collection->get('modified');
+    $collection->get(0);
+    $collection->get(true);
+}
+"#;
+
+    let mut parser = FileParser::new();
+    parser.parse_full(code);
+
+    let index = WorkspaceIndex::new();
+    let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+    index.update_file(uri, symbols);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    assert_no_diagnostic_containing(
+        &messages,
+        "Type mismatch for App\\Collection::get argument $key: expected array-key, got string",
+    );
+    assert_no_diagnostic_containing(
+        &messages,
+        "Type mismatch for App\\Collection::get argument $key: expected array-key, got int",
+    );
+    assert_diagnostic_containing(
+        &messages,
+        "Type mismatch for App\\Collection::get argument $key: expected array-key, got true",
+    );
 }
 
 #[test]

@@ -3232,6 +3232,27 @@ pub(in crate::server) fn simple_type_accepts_inferred_type(
             actual_lower == "literal-string"
                 || inferred_string_literal_inner(&actual.comparable).is_some()
         }
+        "array-key" => {
+            matches!(
+                actual_lower.as_str(),
+                "array-key"
+                    | "int"
+                    | "integer"
+                    | "positive-int"
+                    | "negative-int"
+                    | "non-negative-int"
+                    | "non-positive-int"
+                    | "non-zero-int"
+                    | "string"
+                    | "non-empty-string"
+                    | "literal-string"
+                    | "numeric-string"
+                    | "class-string"
+            ) || actual_lower.parse::<i64>().is_ok()
+                || actual_display_lower == "string"
+                || actual_display_lower == "int"
+                || inferred_string_literal_inner(&actual.comparable).is_some()
+        }
         "int" => actual_lower == "int" || actual_lower.parse::<i64>().is_ok(),
         "positive-int" => actual_lower.parse::<i64>().is_ok_and(|value| value > 0),
         "negative-int" => actual_lower.parse::<i64>().is_ok_and(|value| value < 0),

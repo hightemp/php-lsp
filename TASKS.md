@@ -5471,9 +5471,12 @@ change.
     /home/apanov/ForTesting/monica/app/Models/TimelineEvent.php
     /home/apanov/ForTesting/monica/database/factories/UserFactory.php
 
-- [ ] **H-DIAGNOSTICS-MONICA-ARRAY-KEY-ALIAS-COMPATIBILITY-2026-06-05** Treat `array-key` as `int|string` in argument compatibility checks
+- [x] **H-DIAGNOSTICS-MONICA-ARRAY-KEY-ALIAS-COMPATIBILITY-2026-06-05** Treat `array-key` as `int|string` in argument compatibility checks *(done 2026-06-08)*
   - False positives include `Type mismatch for Illuminate\\Support\\Collection::get argument $key: expected array-key, got string`.
   - Representative check: `Collection<array-key, ...>::get("modified")` is valid because `string` is a subtype of `array-key`.
+  - Started: 2026-06-08; reproduce Monica `Collection::get` false positives, update generic type compatibility so `array-key` accepts `int|string`, add focused diagnostics regression, and validate against representative Monica paths.
+  - Implemented: diagnostics type compatibility now treats `array-key` as an alias for string-like and int-like inferred values, including literals and common PHPDoc refinements.
+  - Validation: `cargo fmt --all --check`; `git diff --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; Monica representative analyze checks for `PrepareJobsContactPush.php` and `PrepareJobsContactPushMissed.php`; Verifier subagent `GO`.
   - Files:
     /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php
     /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPushMissed.php
