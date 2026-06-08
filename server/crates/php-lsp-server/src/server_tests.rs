@@ -1679,6 +1679,94 @@ class Demo {
 }
 
 #[test]
+fn test_compute_diagnostics_allows_laravel_optional_proxy_member_access() {
+    let optional_uri = "file:///laravel-optional-helper.php";
+    let optional_code = r#"<?php
+namespace Illuminate\Support;
+
+class Optional {}
+"#;
+    let helper_uri = "file:///laravel-helpers.php";
+    let helper_code = r#"<?php
+/**
+ * @template TValue
+ * @template TReturn
+ * @param TValue $value
+ * @param (callable(TValue): TReturn)|null $callback
+ * @return ($callback is null ? \Illuminate\Support\Optional : TReturn)
+ */
+function optional($value = null, ?callable $callback = null) {}
+"#;
+    let uri = "file:///laravel-optional-proxy.php";
+    let code = r#"<?php
+namespace App;
+
+class ExpireDate {
+    public function getTimestamp(): int {
+        return 0;
+    }
+}
+
+class Signature {
+    public function getSignature(): string {
+        return '';
+    }
+
+    public function getExpire(): ?ExpireDate {
+        return null;
+    }
+}
+
+class User {
+    public string $two_factor_secret;
+    public ?string $two_factor_confirmed_at;
+}
+
+function run(?User $user, ?Signature $signature): void {
+    optional($user)->two_factor_secret;
+    optional($user)->two_factor_confirmed_at;
+    optional($signature)->getSignature();
+    optional(optional($signature)->getExpire())->getTimestamp();
+
+    $localSignature = true ? new Signature() : null;
+    optional($localSignature)->getSignature();
+    optional(optional($localSignature)->getExpire())->getTimestamp();
+}
+"#;
+
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(&index, optional_uri, optional_code);
+    parse_and_index_php_file(&index, helper_uri, helper_code);
+    let parser = parse_and_index_php_file(&index, uri, code);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    for unexpected in [
+        "Unknown property: Illuminate\\Support\\Optional::$two_factor_secret",
+        "Unknown property: App\\User::$two_factor_secret",
+        "Unknown property: Illuminate\\Support\\Optional::$two_factor_confirmed_at",
+        "Unknown property: App\\User::$two_factor_confirmed_at",
+        "Unknown method: Illuminate\\Support\\Optional::getSignature",
+        "Unknown method: App\\Signature::getSignature",
+        "Unknown method: Illuminate\\Support\\Optional::getTimestamp",
+        "Unknown method: App\\ExpireDate::getTimestamp",
+        "Unknown property: App\\TReturn::$two_factor_secret",
+        "Unknown property: App\\TReturn::$two_factor_confirmed_at",
+        "Unknown method: App\\TReturn::getSignature",
+        "Unknown method: App\\TReturn::getTimestamp",
+    ] {
+        assert_no_diagnostic_containing(&messages, unexpected);
+    }
+}
+
+#[test]
 fn test_compute_diagnostics_skips_members_on_unindexed_imported_types() {
     let uri = "file:///external-client.php";
     let code = r#"<?php

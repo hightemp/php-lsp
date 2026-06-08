@@ -5298,9 +5298,12 @@ change.
     /home/apanov/ForTesting/monica/app/Services/BaseService.php
     /home/apanov/ForTesting/monica/tests/Feature/Controllers/Auth/SocialiteCallbackControllerTest.php
 
-- [ ] **H-DIAGNOSTICS-MONICA-LARAVEL-OPTIONAL-TRETURN-2026-06-05** Specialize Laravel `optional(...)` generic/proxy return types instead of leaking `TReturn` into current namespaces
+- [x] **H-DIAGNOSTICS-MONICA-LARAVEL-OPTIONAL-TRETURN-2026-06-05** Specialize Laravel `optional(...)` generic/proxy return types instead of leaking `TReturn` into current namespaces *(done 2026-06-05)*
   - False positives include `Unknown property: App\\...\\TReturn::$...` and `Unknown method: App\\...\\TReturn::...` after `optional($value)->property` and `optional($value)->method()`.
   - Representative checks: `optional($user)->two_factor_secret`, `optional($importantDate)->id`, and `optional($signature)->getSignature()` should use the wrapped value type or nullable proxy behavior.
+  - Started: 2026-06-05; inspect Laravel `optional()` return specialization, reproduce Monica diagnostics, add regression coverage, and validate with targeted Monica files.
+  - Implemented: specialized verified global Laravel `optional()` no-callback/null-callback member access to use the wrapped value type, propagated function resolvers through nested expression inference, preserved local/imported function shadowing, and covered mixed-case function calls plus multibyte callback expressions.
+  - Validation: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, `cargo build -p php-lsp-server`, Serena diagnostics, Verifier GO, and CLI `php-lsp analyze` checks on representative Monica files.
   - Files:
     /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
     /home/apanov/ForTesting/monica/app/Actions/Fortify/RedirectIfTwoFactorAuthenticatable.php

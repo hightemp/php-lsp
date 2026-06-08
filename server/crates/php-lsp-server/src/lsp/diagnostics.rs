@@ -1532,8 +1532,10 @@ fn resolve_function_type_from_index(
     if sym.kind != php_lsp_types::PhpSymbolKind::Function {
         return None;
     }
-    symbol_return_type_text_from_index(index, &sym.fqn, &sym)
-        .map(|type_text| ResolvedFunctionType::with_signature(type_text, sym.signature.clone()))
+    symbol_return_type_text_from_index(index, &sym.fqn, &sym).map(|type_text| {
+        ResolvedFunctionType::with_signature(type_text, sym.signature.clone())
+            .with_symbol_fqn(sym.fqn.clone())
+    })
 }
 
 pub(in crate::server) fn phpunit_test_double_api_method(member_name: &str) -> bool {

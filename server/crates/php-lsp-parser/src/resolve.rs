@@ -58,6 +58,7 @@ pub type MemberTypeResolver<'a> = &'a dyn Fn(&str, &str) -> Option<String>;
 pub struct ResolvedFunctionType {
     pub type_text: String,
     pub signature: Option<Signature>,
+    pub symbol_fqn: Option<String>,
 }
 
 impl ResolvedFunctionType {
@@ -65,6 +66,7 @@ impl ResolvedFunctionType {
         Self {
             type_text: type_text.into(),
             signature: None,
+            symbol_fqn: None,
         }
     }
 
@@ -72,7 +74,13 @@ impl ResolvedFunctionType {
         Self {
             type_text: type_text.into(),
             signature,
+            symbol_fqn: None,
         }
+    }
+
+    pub fn with_symbol_fqn(mut self, symbol_fqn: impl Into<String>) -> Self {
+        self.symbol_fqn = Some(symbol_fqn.into());
+        self
     }
 }
 
@@ -1382,6 +1390,7 @@ fn try_resolve_object_type_inner<'a>(
                     file_symbols,
                     resolver,
                     callable_resolver,
+                    function_resolver,
                 )
                 .unwrap_or_else(|| class_fqn.trim_start_matches('\\').to_string());
                 if let Some(type_text) = resolve_fn(&resolver_owner, &member_name) {
@@ -1441,6 +1450,7 @@ fn try_resolve_object_type_inner<'a>(
                     file_symbols,
                     resolver,
                     callable_resolver,
+                    function_resolver,
                 )
                 .unwrap_or_else(|| class_fqn.trim_start_matches('\\').to_string());
                 if let Some(type_text) = resolve_fn(&resolver_owner, method_name) {
@@ -1510,12 +1520,13 @@ fn try_resolve_object_type_inner<'a>(
             let key_text = object_node
                 .named_child(1)
                 .map(|node| source[node.byte_range()].trim().to_string());
-            let base_type = infer_expression_type_info(
+            let base_type = infer_expression_type_info_with_function_resolver(
                 base,
                 source,
                 file_symbols,
                 resolver,
                 callable_resolver,
+                function_resolver,
             )?;
             let value_type = iterable_value_type_info(&base_type, key_text.as_deref())?;
             resolve_phpdoc_var_type(&value_type, object_node, source, file_symbols)
@@ -1542,13 +1553,15 @@ fn resolver_owner_type_text_for_object(
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<String> {
-    let type_info = infer_expression_type_info(
+    let type_info = infer_expression_type_info_with_function_resolver(
         object_node,
         source,
         file_symbols,
         resolver,
         callable_resolver,
+        function_resolver,
     )?;
     if !type_info_has_generic_base_fqn(&type_info, class_fqn) {
         return None;
@@ -2547,6 +2560,11 @@ fn call_arguments<'tree>(call_node: Node<'tree>, source: &str) -> Vec<CallArgume
             result.push(CallArgument {
                 value_node: argument_value_node(child).unwrap_or(child),
                 name: argument_name(child, source),
+            });
+        } else {
+            result.push(CallArgument {
+                value_node: child,
+                name: None,
             });
         }
     }
@@ -3841,6 +3859,17 @@ fn try_resolve_function_call_object_fqn(
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
     function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<String> {
+    if let Some(wrapped_fqn) = try_resolve_laravel_optional_proxy_object_fqn(
+        node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        function_resolver,
+    ) {
+        return Some(wrapped_fqn);
+    }
+
     let type_info = try_resolve_function_call_return_type_info(
         node,
         source,
@@ -3850,6 +3879,260 @@ fn try_resolve_function_call_object_fqn(
         function_resolver,
     )?;
     resolver_type_info_to_object_fqn(&type_info, node, source, file_symbols)
+}
+
+fn try_resolve_laravel_optional_proxy_object_fqn(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
+) -> Option<String> {
+    if !function_call_is_laravel_optional(node, source, file_symbols, function_resolver) {
+        return None;
+    }
+
+    let value_arg = laravel_optional_proxy_value_argument(node, source)?;
+    let value_type = infer_expression_type_info_with_function_resolver(
+        value_arg,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        function_resolver,
+    )?;
+    resolver_type_info_to_object_fqn(&value_type, value_arg, source, file_symbols)
+}
+
+fn function_call_is_laravel_optional(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
+) -> bool {
+    let Some(function) = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))
+    else {
+        return false;
+    };
+    if function.kind() == "member_access_expression" {
+        return false;
+    }
+
+    let raw_name = source[function.byte_range()].trim();
+    let simple_name = raw_name.trim_start_matches('\\');
+    if !simple_name.eq_ignore_ascii_case("optional") || simple_name.contains('\\') {
+        return false;
+    }
+
+    if raw_name.starts_with('\\') {
+        return resolves_global_laravel_optional_function(function_resolver);
+    }
+
+    if let Some(import) = function_import_for_alias(file_symbols, "optional") {
+        return import
+            .trim_start_matches('\\')
+            .eq_ignore_ascii_case("optional")
+            && resolves_global_laravel_optional_function(function_resolver);
+    }
+
+    let resolved = resolve_function_name(raw_name, file_symbols);
+    if !fqn_eq_ignore_ascii_case(&resolved, raw_name) {
+        if file_symbols.symbols.iter().any(|sym| {
+            sym.kind == php_lsp_types::PhpSymbolKind::Function
+                && fqn_eq_ignore_ascii_case(&sym.fqn, &resolved)
+        }) {
+            return false;
+        }
+
+        let Some(resolve_fn) = function_resolver else {
+            return false;
+        };
+        if resolve_fn(&resolved).is_some_and(|resolved_type| {
+            resolved_function_symbol_matches(&resolved_type, &resolved)
+        }) {
+            return false;
+        }
+        return resolve_fn("optional")
+            .as_ref()
+            .is_some_and(resolved_function_type_is_global_laravel_optional);
+    }
+
+    resolves_global_laravel_optional_function(function_resolver)
+}
+
+fn function_import_for_alias<'a>(file_symbols: &'a FileSymbols, alias: &str) -> Option<&'a str> {
+    file_symbols.use_statements.iter().find_map(|use_stmt| {
+        if use_stmt.kind != UseKind::Function {
+            return None;
+        }
+        let use_alias = use_stmt
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+        use_alias
+            .eq_ignore_ascii_case(alias)
+            .then_some(use_stmt.fqn.as_str())
+    })
+}
+
+fn resolves_global_laravel_optional_function(
+    function_resolver: Option<FunctionTypeResolver<'_>>,
+) -> bool {
+    let Some(resolve_fn) = function_resolver else {
+        return false;
+    };
+    resolve_fn("optional")
+        .as_ref()
+        .is_some_and(resolved_function_type_is_global_laravel_optional)
+}
+
+fn resolved_function_type_is_global_laravel_optional(resolved: &ResolvedFunctionType) -> bool {
+    if !resolved_function_symbol_matches(resolved, "optional") {
+        return false;
+    }
+
+    resolved
+        .type_text
+        .trim_start_matches('\\')
+        .contains("Illuminate\\Support\\Optional")
+}
+
+fn resolved_function_symbol_matches(resolved: &ResolvedFunctionType, expected_fqn: &str) -> bool {
+    resolved
+        .symbol_fqn
+        .as_deref()
+        .is_some_and(|actual| fqn_eq_ignore_ascii_case(actual, expected_fqn))
+}
+
+fn fqn_eq_ignore_ascii_case(left: &str, right: &str) -> bool {
+    left.trim_start_matches('\\')
+        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
+}
+
+fn laravel_optional_proxy_value_argument<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if laravel_optional_has_non_null_callback_argument(node, source) {
+        return None;
+    }
+
+    let arguments = call_arguments(node, source);
+    let mut value_arg = None;
+    let mut first_positional_arg = None;
+
+    for argument in &arguments {
+        match argument.name.as_deref() {
+            Some("value") => value_arg = Some(argument.value_node),
+            Some(_) => {}
+            None => {
+                first_positional_arg.get_or_insert(argument.value_node);
+            }
+        }
+    }
+
+    value_arg.or(first_positional_arg)
+}
+
+fn laravel_optional_has_non_null_callback_argument(node: Node, source: &str) -> bool {
+    let arguments = if let Some(arguments) = node.child_by_field_name("arguments") {
+        arguments
+    } else {
+        let mut cursor = node.walk();
+        let found = node
+            .children(&mut cursor)
+            .find(|child| child.kind() == "arguments");
+        let Some(arguments) = found else {
+            return false;
+        };
+        arguments
+    };
+    let arguments_text = source[arguments.byte_range()]
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    let parts = split_top_level_text(arguments_text, ',');
+    let mut positional_index = 0usize;
+
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = named_argument_text(part) {
+            if name == "callback" && !argument_text_is_null_literal(value) {
+                return true;
+            }
+            continue;
+        }
+
+        if positional_index == 1 && !argument_text_is_null_literal(part) {
+            return true;
+        }
+        positional_index += 1;
+    }
+
+    false
+}
+
+fn named_argument_text(part: &str) -> Option<(&str, &str)> {
+    let colon = find_top_level_text(part, ":")?;
+    let name = part[..colon].trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+
+    Some((name, &part[colon + 1..]))
+}
+
+fn argument_text_is_null_literal(text: &str) -> bool {
+    let mut index = skip_ws_and_php_comments(text, 0);
+    let bytes = text.as_bytes();
+    let null_len = "null".len();
+    if bytes.len().saturating_sub(index) < null_len
+        || !bytes[index..index + null_len].eq_ignore_ascii_case(b"null")
+    {
+        return false;
+    }
+    index += null_len;
+    if text[index..]
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    index = skip_ws_and_php_comments(text, index);
+    index == text.len()
+}
+
+fn skip_ws_and_php_comments(text: &str, mut index: usize) -> usize {
+    loop {
+        while index < text.len() && text.as_bytes()[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if text[index..].starts_with("/*") {
+            index = text[index + 2..]
+                .find("*/")
+                .map(|offset| index + 2 + offset + 2)
+                .unwrap_or(text.len());
+            continue;
+        }
+        if text[index..].starts_with("//") || text[index..].starts_with('#') {
+            index = text[index..]
+                .find('\n')
+                .map(|offset| index + offset + 1)
+                .unwrap_or(text.len());
+            continue;
+        }
+        return index;
+    }
 }
 
 fn resolver_type_text_for_parser(type_text: &str) -> String {
@@ -4000,17 +4283,19 @@ fn infer_function_call_type_info(
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
     let short_name = function_call_short_name(node, source)?;
     match short_name.as_str() {
         "array_keys" => {
             let first_arg = call_arguments(node, source).first()?.value_node;
-            let array_type = infer_expression_type_info(
+            let array_type = infer_expression_type_info_with_function_resolver(
                 first_arg,
                 source,
                 file_symbols,
                 resolver,
                 callable_resolver,
+                function_resolver,
             )?;
             let key_type = iterable_key_type_info(&array_type)
                 .map(|type_info| array_key_compatible_type_info(&type_info))
@@ -4022,12 +4307,13 @@ fn infer_function_call_type_info(
         }
         "array_values" => {
             let first_arg = call_arguments(node, source).first()?.value_node;
-            let array_type = infer_expression_type_info(
+            let array_type = infer_expression_type_info_with_function_resolver(
                 first_arg,
                 source,
                 file_symbols,
                 resolver,
                 callable_resolver,
+                function_resolver,
             )?;
             let value_type = iterable_value_type_info(&array_type, None)?;
             Some(TypeInfo::Generic {
@@ -4041,7 +4327,7 @@ fn infer_function_call_type_info(
             file_symbols,
             resolver,
             callable_resolver,
-            None,
+            function_resolver,
         ),
     }
 }
@@ -4099,6 +4385,7 @@ fn infer_binary_expression_type_info(
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
     let text = source[node.byte_range()].trim();
     find_top_level_text(text, "??")?;
@@ -4111,12 +4398,26 @@ fn infer_binary_expression_type_info(
         .or_else(|| node.named_child(1));
     let left_type = left
         .and_then(|left| {
-            infer_expression_type_info(left, source, file_symbols, resolver, callable_resolver)
+            infer_expression_type_info_with_function_resolver(
+                left,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+                function_resolver,
+            )
         })
         .and_then(|type_info| type_info_without_null(&type_info));
     let right_type = right
         .and_then(|right| {
-            infer_expression_type_info(right, source, file_symbols, resolver, callable_resolver)
+            infer_expression_type_info_with_function_resolver(
+                right,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+                function_resolver,
+            )
         })
         .or_else(|| right.and_then(|right| infer_literal_expression_type_info(right, source)));
 
@@ -4242,6 +4543,24 @@ fn infer_expression_type_info(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
+    infer_expression_type_info_with_function_resolver(
+        node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        None,
+    )
+}
+
+fn infer_expression_type_info_with_function_resolver(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
+) -> Option<TypeInfo> {
     if let Some(class_string) = class_string_type_info_from_expression(node, source, file_symbols) {
         return Some(class_string);
     }
@@ -4250,12 +4569,13 @@ fn infer_expression_type_info(
         "parenthesized_expression" => {
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
-                    if let Some(type_info) = infer_expression_type_info(
+                    if let Some(type_info) = infer_expression_type_info_with_function_resolver(
                         child,
                         source,
                         file_symbols,
                         resolver,
                         callable_resolver,
+                        function_resolver,
                     ) {
                         return Some(type_info);
                     }
@@ -4290,16 +4610,33 @@ fn infer_expression_type_info(
             }
             None
         }
-        "function_call_expression" => {
-            infer_function_call_type_info(node, source, file_symbols, resolver, callable_resolver)
+        "function_call_expression" => infer_function_call_type_info(
+            node,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+            function_resolver,
+        ),
+        "scoped_call_expression" => {
+            infer_scoped_call_expression_type_info(node, source, file_symbols, resolver)
         }
         "cast_expression" => infer_cast_expression_type_info(node, source),
+        "conditional_expression" => infer_conditional_expression_type_info(
+            node,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+            function_resolver,
+        ),
         "binary_expression" => infer_binary_expression_type_info(
             node,
             source,
             file_symbols,
             resolver,
             callable_resolver,
+            function_resolver,
         ),
         "member_access_expression" | "nullsafe_member_access_expression" => {
             let object = node.child_by_field_name("object")?;
@@ -4310,7 +4647,7 @@ fn infer_expression_type_info(
                 file_symbols,
                 resolver,
                 callable_resolver,
-                None,
+                function_resolver,
             )?;
             let prop_fqn = format!("{}::${}", class_fqn, &source[name.byte_range()]);
             file_symbols
@@ -4330,6 +4667,7 @@ fn infer_expression_type_info(
                             file_symbols,
                             resolver,
                             callable_resolver,
+                            function_resolver,
                         )
                         .unwrap_or_else(|| class_fqn.trim_start_matches('\\').to_string());
                         resolve_fn(&resolver_owner, &format!("${}", &source[name.byte_range()]))
@@ -4348,7 +4686,7 @@ fn infer_expression_type_info(
                 file_symbols,
                 resolver,
                 callable_resolver,
-                None,
+                function_resolver,
             )?;
             let method_fqn = format!("{}::{}", class_fqn, &source[name.byte_range()]);
             file_symbols
@@ -4368,6 +4706,7 @@ fn infer_expression_type_info(
                             file_symbols,
                             resolver,
                             callable_resolver,
+                            function_resolver,
                         )
                         .unwrap_or_else(|| class_fqn.trim_start_matches('\\').to_string());
                         resolve_fn(&resolver_owner, &source[name.byte_range()]).map(|type_text| {
@@ -4381,17 +4720,225 @@ fn infer_expression_type_info(
             let key_text = node
                 .named_child(1)
                 .map(|node| source[node.byte_range()].trim().to_string());
-            let base_type = infer_expression_type_info(
+            let base_type = infer_expression_type_info_with_function_resolver(
                 base,
                 source,
                 file_symbols,
                 resolver,
                 callable_resolver,
+                function_resolver,
             )?;
             iterable_value_type_info(&base_type, key_text.as_deref())
         }
         _ => None,
     }
+}
+
+fn infer_scoped_call_expression_type_info(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let scope = node.child_by_field_name("scope")?;
+    let name = node.child_by_field_name("name")?;
+    let class_fqn =
+        resolve_scope_class_name(&source[scope.byte_range()], node, source, file_symbols);
+    if class_fqn.is_empty() || matches!(class_fqn.as_str(), "self" | "static" | "parent") {
+        return None;
+    }
+
+    let method_name = source[name.byte_range()].trim();
+    let method_fqn = format!("{class_fqn}::{method_name}");
+    if let Some(symbol) = file_symbols
+        .symbols
+        .iter()
+        .find(|sym| sym.fqn == method_fqn)
+    {
+        let return_type = symbol_effective_type_info(symbol, file_symbols)?;
+        let return_type = resolve_type_info_relative_to_symbol(&return_type, symbol, file_symbols);
+        return Some(scope_return_type_info_for_owner(&return_type, &class_fqn));
+    }
+
+    resolver
+        .and_then(|resolve_fn| resolve_fn(&class_fqn, method_name))
+        .map(|type_text| type_info_from_type_text(&resolver_type_text_for_parser(&type_text)))
+        .map(|return_type| scope_return_type_info_for_owner(&return_type, &class_fqn))
+}
+
+fn scope_return_type_info_for_owner(type_info: &TypeInfo, owner_fqn: &str) -> TypeInfo {
+    if let Some(preferred) = prefer_top_level_scope_return_type_info(type_info, owner_fqn) {
+        return preferred;
+    }
+
+    substitute_scope_type_info(type_info, owner_fqn)
+}
+
+fn prefer_top_level_scope_return_type_info(
+    type_info: &TypeInfo,
+    owner_fqn: &str,
+) -> Option<TypeInfo> {
+    let owner = TypeInfo::Simple(owner_fqn.trim_start_matches('\\').to_string());
+    match type_info {
+        TypeInfo::Self_ | TypeInfo::Static_ => Some(owner),
+        TypeInfo::Simple(name) if matches!(name.as_str(), "$this" | "self" | "static") => {
+            Some(owner)
+        }
+        TypeInfo::Nullable(inner) => prefer_top_level_scope_return_type_info(inner, owner_fqn)
+            .map(|inner| TypeInfo::Nullable(Box::new(inner))),
+        TypeInfo::Union(types) => {
+            if !types
+                .iter()
+                .any(|ty| prefer_top_level_scope_return_type_info(ty, owner_fqn).is_some())
+            {
+                return None;
+            }
+            let mut preferred = vec![owner];
+            if types.iter().any(|ty| matches!(ty, TypeInfo::LiteralNull)) {
+                preferred.push(TypeInfo::LiteralNull);
+            }
+            Some(merge_type_infos(preferred))
+        }
+        _ => None,
+    }
+}
+
+fn substitute_scope_type_info(type_info: &TypeInfo, owner_fqn: &str) -> TypeInfo {
+    match type_info {
+        TypeInfo::Self_ | TypeInfo::Static_ => {
+            TypeInfo::Simple(owner_fqn.trim_start_matches('\\').to_string())
+        }
+        TypeInfo::Simple(name) if matches!(name.as_str(), "$this" | "self" | "static") => {
+            TypeInfo::Simple(owner_fqn.trim_start_matches('\\').to_string())
+        }
+        TypeInfo::Generic { base, args } => TypeInfo::Generic {
+            base: if matches!(base.as_str(), "$this" | "self" | "static") {
+                owner_fqn.trim_start_matches('\\').to_string()
+            } else {
+                base.clone()
+            },
+            args: args
+                .iter()
+                .map(|arg| substitute_scope_type_info(arg, owner_fqn))
+                .collect(),
+        },
+        TypeInfo::Nullable(inner) => {
+            TypeInfo::Nullable(Box::new(substitute_scope_type_info(inner, owner_fqn)))
+        }
+        TypeInfo::Union(types) => TypeInfo::Union(
+            types
+                .iter()
+                .map(|ty| substitute_scope_type_info(ty, owner_fqn))
+                .collect(),
+        ),
+        TypeInfo::Intersection(types) => TypeInfo::Intersection(
+            types
+                .iter()
+                .map(|ty| substitute_scope_type_info(ty, owner_fqn))
+                .collect(),
+        ),
+        TypeInfo::ClassString(Some(inner)) => {
+            TypeInfo::ClassString(Some(Box::new(substitute_scope_type_info(inner, owner_fqn))))
+        }
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => TypeInfo::Conditional {
+            subject: subject.clone(),
+            target: Box::new(substitute_scope_type_info(target, owner_fqn)),
+            if_type: Box::new(substitute_scope_type_info(if_type, owner_fqn)),
+            else_type: Box::new(substitute_scope_type_info(else_type, owner_fqn)),
+        },
+        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: substitute_scope_type_info(&item.value, owner_fqn),
+                })
+                .collect(),
+        ),
+        TypeInfo::ObjectShape(items) => TypeInfo::ObjectShape(
+            items
+                .iter()
+                .map(|item| php_lsp_types::ArrayShapeItem {
+                    key: item.key.clone(),
+                    optional: item.optional,
+                    value: substitute_scope_type_info(&item.value, owner_fqn),
+                })
+                .collect(),
+        ),
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => TypeInfo::Callable {
+            params: params
+                .iter()
+                .map(|param| substitute_scope_type_info(param, owner_fqn))
+                .collect(),
+            return_type: return_type
+                .as_ref()
+                .map(|return_type| Box::new(substitute_scope_type_info(return_type, owner_fqn))),
+        },
+        TypeInfo::Parent_
+        | TypeInfo::ClassString(None)
+        | TypeInfo::LiteralString(_)
+        | TypeInfo::LiteralInt(_)
+        | TypeInfo::LiteralFloat(_)
+        | TypeInfo::LiteralBool(_)
+        | TypeInfo::LiteralNull
+        | TypeInfo::Void
+        | TypeInfo::Never
+        | TypeInfo::Mixed
+        | TypeInfo::Simple(_) => type_info.clone(),
+    }
+}
+
+fn infer_conditional_expression_type_info(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let child_count = node.named_child_count();
+    if child_count < 3 {
+        return None;
+    }
+
+    let truthy = node
+        .child_by_field_name("consequence")
+        .or_else(|| node.child_by_field_name("if_true"))
+        .or_else(|| node.named_child(child_count - 2))?;
+    let falsy = node
+        .child_by_field_name("alternative")
+        .or_else(|| node.child_by_field_name("if_false"))
+        .or_else(|| node.named_child(child_count - 1))?;
+    if truthy.id() == falsy.id() {
+        return None;
+    }
+
+    let truthy_type = infer_expression_type_info_with_function_resolver(
+        truthy,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        function_resolver,
+    );
+    let falsy_type = infer_expression_type_info_with_function_resolver(
+        falsy,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        function_resolver,
+    );
+    merge_optional_type_infos(truthy_type, falsy_type)
 }
 
 fn class_string_type_info_from_expression(
@@ -5578,6 +6125,35 @@ mod tests {
         symbol_at_position(tree, code, line, col, &file_symbols)
     }
 
+    fn parse_and_resolve_with_laravel_optional(
+        code: &str,
+        line: u32,
+        col: u32,
+    ) -> Option<SymbolAtPosition> {
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let function_resolver = |function_name: &str| -> Option<ResolvedFunctionType> {
+            (function_name == "optional").then(|| {
+                ResolvedFunctionType::new(
+                    "($callback is null ? \\Illuminate\\Support\\Optional : mixed)",
+                )
+                .with_symbol_fqn("optional")
+            })
+        };
+        symbol_at_position_with_full_resolvers(
+            tree,
+            code,
+            line,
+            col,
+            &file_symbols,
+            None,
+            None,
+            Some(&function_resolver),
+        )
+    }
+
     fn test_param(name: &str) -> php_lsp_types::ParamInfo {
         php_lsp_types::ParamInfo {
             name: name.to_string(),
@@ -6120,6 +6696,243 @@ class Handler {
                 .expect("method call should resolve through normalized resolver type text");
         assert_eq!(result.ref_kind, RefKind::MethodCall);
         assert_eq!(result.fqn, "App\\Entity\\User::getName");
+    }
+
+    #[test]
+    fn test_laravel_optional_proxy_resolves_wrapped_property_and_method_chain() {
+        let code = r#"<?php
+namespace App;
+
+class Profile {
+    public function touch(): void {}
+}
+
+class User {
+    public string $two_factor_secret;
+    public function profile(): Profile {
+        return new Profile();
+    }
+}
+
+function run(?User $user): void {
+    optional($user)->two_factor_secret;
+    Optional($user)->two_factor_secret;
+    optional(value: $user)->two_factor_secret;
+    optional($user, null)->two_factor_secret;
+    optional($user, /* no callback */ null)->two_factor_secret;
+    optional($user, null /* no callback */)->two_factor_secret;
+    optional($user)->profile()->touch();
+}
+"#;
+
+        let (line, col) = find_line_col(code, "optional($user)->two_factor_secret");
+        let col = col + "optional($user)->".len() as u32;
+        let property = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("optional($user)->property should resolve on wrapped object");
+        assert_eq!(property.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(property.fqn, "App\\User::$two_factor_secret");
+
+        let (line, col) = find_line_col(code, "Optional($user)->two_factor_secret");
+        let col = col + "Optional($user)->".len() as u32;
+        let mixed_case_property = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("Optional($user)->property should resolve on the Laravel helper");
+        assert_eq!(mixed_case_property.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(mixed_case_property.fqn, "App\\User::$two_factor_secret");
+
+        let (line, col) = find_line_col(code, "value: $user)->two_factor_secret");
+        let col = col + "value: $user)->".len() as u32;
+        let named_property = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("optional(value: $user)->property should resolve on wrapped object");
+        assert_eq!(named_property.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(named_property.fqn, "App\\User::$two_factor_secret");
+
+        let (line, col) = find_line_col(code, "$user, null)->two_factor_secret");
+        let col = col + "$user, null)->".len() as u32;
+        let null_callback_property = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("optional($user, null)->property should resolve on wrapped object");
+        assert_eq!(null_callback_property.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(null_callback_property.fqn, "App\\User::$two_factor_secret");
+
+        let (line, col) = find_line_col(code, "$user, /* no callback */ null)->two_factor_secret");
+        let col = col + "$user, /* no callback */ null)->".len() as u32;
+        let leading_comment_null_callback_property =
+            parse_and_resolve_with_laravel_optional(code, line, col)
+                .expect("optional($user, /*...*/ null)->property should resolve");
+        assert_eq!(
+            leading_comment_null_callback_property.fqn,
+            "App\\User::$two_factor_secret"
+        );
+
+        let (line, col) = find_line_col(code, "$user, null /* no callback */)->two_factor_secret");
+        let col = col + "$user, null /* no callback */)->".len() as u32;
+        let trailing_comment_null_callback_property =
+            parse_and_resolve_with_laravel_optional(code, line, col)
+                .expect("optional($user, null /*...*/)->property should resolve");
+        assert_eq!(
+            trailing_comment_null_callback_property.fqn,
+            "App\\User::$two_factor_secret"
+        );
+
+        let (line, col) = find_line_col(code, "touch()");
+        let chained_method = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("method chain after optional($user) should resolve through wrapped object");
+        assert_eq!(chained_method.ref_kind, RefKind::MethodCall);
+        assert_eq!(chained_method.fqn, "App\\Profile::touch");
+    }
+
+    #[test]
+    fn test_laravel_optional_proxy_does_not_unwrap_when_callback_is_present() {
+        let code = r#"<?php
+namespace App;
+
+class User {
+    public string $two_factor_secret;
+}
+
+function run(?User $user): void {
+    optional($user, fn (User $value) => $value)->two_factor_secret;
+    optional($user, $колбэк)->two_factor_secret;
+}
+"#;
+
+        let (line, col) = find_line_col(
+            code,
+            "optional($user, fn (User $value) => $value)->two_factor_secret",
+        );
+        let col = col + "optional($user, fn (User $value) => $value)->".len() as u32;
+        let resolved = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("unresolved property reference should still be detected");
+        assert_eq!(resolved.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(resolved.fqn, "$two_factor_secret");
+
+        let (line, col) = find_line_col(code, "optional($user, $колбэк)->two_factor_secret");
+        let col = col + "optional($user, $колбэк)->".len() as u32;
+        let multibyte_callback = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("multibyte callback argument should not panic or unwrap optional");
+        assert_eq!(multibyte_callback.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(multibyte_callback.fqn, "$two_factor_secret");
+    }
+
+    #[test]
+    fn test_laravel_optional_proxy_does_not_unwrap_shadowed_optional_function() {
+        let local_code = r#"<?php
+namespace App;
+
+class User {
+    public string $two_factor_secret;
+}
+
+function optional($value) {
+    return $value;
+}
+
+function run(?User $user): void {
+    optional($user)->two_factor_secret;
+}
+"#;
+        let (line, col) = find_line_col(local_code, "optional($user)->two_factor_secret");
+        let col = col + "optional($user)->".len() as u32;
+        let local = parse_and_resolve_with_laravel_optional(local_code, line, col)
+            .expect("shadowed optional property reference should still be detected");
+        assert_eq!(local.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(local.fqn, "$two_factor_secret");
+
+        let imported_code = r#"<?php
+namespace App;
+
+use function Vendor\Optional;
+
+class User {
+    public string $two_factor_secret;
+}
+
+function run(?User $user): void {
+    optional($user)->two_factor_secret;
+    Optional($user)->two_factor_secret;
+}
+"#;
+        let (line, col) = find_line_col(imported_code, "optional($user)->two_factor_secret");
+        let col = col + "optional($user)->".len() as u32;
+        let imported = parse_and_resolve_with_laravel_optional(imported_code, line, col)
+            .expect("imported optional property reference should still be detected");
+        assert_eq!(imported.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(imported.fqn, "$two_factor_secret");
+
+        let (line, col) = find_line_col(imported_code, "Optional($user)->two_factor_secret");
+        let col = col + "Optional($user)->".len() as u32;
+        let imported_mixed_case = parse_and_resolve_with_laravel_optional(imported_code, line, col)
+            .expect("case-insensitive imported optional should still shadow Laravel optional");
+        assert_eq!(imported_mixed_case.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(imported_mixed_case.fqn, "$two_factor_secret");
+    }
+
+    #[test]
+    fn test_laravel_optional_proxy_resolves_wrapped_ternary_assignment() {
+        let code = r#"<?php
+namespace App;
+
+class ExpireDate {
+    public function getTimestamp(): int {
+        return 0;
+    }
+}
+
+class Signature {
+    public function getSignature(): string {
+        return '';
+    }
+
+    public function getExpire(): ?ExpireDate {
+        return null;
+    }
+}
+
+function run(): void {
+    $signature = true ? new Signature() : null;
+    optional($signature)->getSignature();
+    optional(optional($signature)->getExpire())->getTimestamp();
+}
+"#;
+
+        let (line, col) = find_line_col(code, "getSignature");
+        let signature_method = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("optional($signature)->getSignature should resolve after ternary assignment");
+        assert_eq!(signature_method.ref_kind, RefKind::MethodCall);
+        assert_eq!(signature_method.fqn, "App\\Signature::getSignature");
+
+        let (line, col) = find_line_col(code, ")->getTimestamp");
+        let col = col + ")->".len() as u32;
+        let expire_method = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("nested optional()->getExpire()->getTimestamp should resolve after ternary");
+        assert_eq!(expire_method.ref_kind, RefKind::MethodCall);
+        assert_eq!(expire_method.fqn, "App\\ExpireDate::getTimestamp");
+    }
+
+    #[test]
+    fn test_laravel_optional_proxy_resolves_wrapped_static_finder_assignment() {
+        let code = r#"<?php
+namespace App;
+
+class User {
+    public string $two_factor_secret;
+
+    public static function find(int $id): ?static {
+        return null;
+    }
+}
+
+function run(): void {
+    $user = User::find(1);
+    optional($user)->two_factor_secret;
+}
+"#;
+
+        let (line, col) = find_line_col(code, "optional($user)->two_factor_secret");
+        let col = col + "optional($user)->".len() as u32;
+        let property = parse_and_resolve_with_laravel_optional(code, line, col)
+            .expect("optional(User::find())->property should resolve through ?static");
+        assert_eq!(property.ref_kind, RefKind::PropertyAccess);
+        assert_eq!(property.fqn, "App\\User::$two_factor_secret");
     }
 
     #[test]
