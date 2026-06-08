@@ -3,9 +3,10 @@ use crate::server::{
     diagnostic_budget_config_from_settings, discover_workspace_root_config,
     lazy_resolvable_diagnostic_fqn, load_configured_stubs, load_effective_configuration_settings,
     normalize_config_paths, parse_vendor_autoload_map, path_is_excluded,
-    resolve_vendor_paths_from_map, workspace_index_directories, DiagnosticBudgetConfig,
+    resolve_vendor_paths_from_map, vendor_autoload_file_paths_from_map,
+    vendor_namespace_exists_from_map, workspace_index_directories, DiagnosticBudgetConfig,
     DiagnosticSeverityConfig, DiagnosticsMode, DiagnosticsRuntimeConfig, PhpVersion,
-    VendorAutoloadMap, VENDOR_PRELOAD_ENTRYPOINT_LIMIT,
+    VendorAutoloadMap,
 };
 use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -687,15 +688,10 @@ fn preload_analyze_vendor_entrypoints(
     runtime_config: &AnalyzeRuntimeConfig,
     vendor_map: &VendorAutoloadMap,
 ) {
-    for file_path in vendor_map
-        .files
-        .iter()
-        .take(VENDOR_PRELOAD_ENTRYPOINT_LIMIT)
+    for file_path in
+        vendor_autoload_file_paths_from_map(vendor_map, project_root, &runtime_config.exclude_paths)
     {
-        if path_is_excluded(file_path, project_root, &runtime_config.exclude_paths) {
-            continue;
-        }
-        parse_and_index_analyze_php_file(index, file_path);
+        parse_and_index_analyze_php_file(index, &file_path);
     }
 }
 
@@ -738,8 +734,17 @@ fn filter_analyze_lazy_resolved_symbol_diagnostics(
     for diagnostic in diagnostics {
         if diagnostic.source.as_deref() == Some("php-lsp") {
             if let Some(fqn) = lazy_resolvable_diagnostic_fqn(&diagnostic.message) {
+                let unresolved_use_statement =
+                    diagnostic.message.starts_with("Unresolved use statement: ");
                 analyze_index_class_dependencies(context, &fqn);
                 if context.index.resolve_fqn(&fqn).is_some() {
+                    continue;
+                }
+                if unresolved_use_statement
+                    && context
+                        .vendor_map
+                        .is_some_and(|map| vendor_namespace_exists_from_map(&fqn, map))
+                {
                     continue;
                 }
             }
@@ -1169,6 +1174,119 @@ mod tests {
             root.display().to_string(),
             "--severity".to_string(),
             "all".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ]);
+
+        assert_eq!(
+            result.exit_code, 0,
+            "stdout: {}\nstderr: {}",
+            result.stdout, result.stderr
+        );
+        let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(value["summary"]["diagnostics"], 0, "{}", result.stdout);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn analyze_resolves_vendor_autoload_files_classmap_and_namespaces() {
+        let root = temp_dir("vendor-autoload-files-classmap");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/thecodingmachine/safe/generated")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/thecodingmachine/safe/generated/8.4")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/phpunit/phpunit/src/Metadata")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/laravel/pulse/src/Recorders")).unwrap();
+
+        std::fs::write(
+            root.join("composer.json"),
+            r#"{
+                "autoload": {
+                    "psr-4": {
+                        "App\\": "src/"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut safe_files = Vec::new();
+        for index in 0..16 {
+            let relative = format!("generated/preload-{index}.php");
+            std::fs::write(
+                root.join("vendor/thecodingmachine/safe").join(&relative),
+                "<?php\nnamespace Safe;\n",
+            )
+            .unwrap();
+            safe_files.push(relative);
+        }
+        safe_files.push("generated/json.php".to_string());
+
+        std::fs::write(
+            root.join("vendor/thecodingmachine/safe/generated/json.php"),
+            "<?php\nif (PHP_VERSION_ID >= 80400) { require_once __DIR__ . '/8.4/json.php'; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/thecodingmachine/safe/generated/8.4/json.php"),
+            "<?php\nnamespace Safe;\nfunction json_decode(string $json) { return \\json_decode($json); }\nfunction json_encode($value): string { return \\json_encode($value); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/phpunit/phpunit/src/Metadata/Test.php"),
+            "<?php\nnamespace PHPUnit\\Framework\\Attributes;\nfinal class Test {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/laravel/pulse/src/Recorders/SlowRequests.php"),
+            "<?php\nnamespace Laravel\\Pulse\\Recorders;\nfinal class SlowRequests {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/composer/installed.json"),
+            serde_json::json!({
+                "packages": [
+                    {
+                        "name": "thecodingmachine/safe",
+                        "install-path": "../thecodingmachine/safe",
+                        "autoload": {
+                            "files": safe_files
+                        }
+                    },
+                    {
+                        "name": "phpunit/phpunit",
+                        "install-path": "../phpunit/phpunit",
+                        "autoload": {
+                            "classmap": ["src/"]
+                        }
+                    },
+                    {
+                        "name": "laravel/pulse",
+                        "install-path": "../laravel/pulse",
+                        "autoload": {
+                            "psr-4": {
+                                "Laravel\\Pulse\\": "src/"
+                            }
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Demo.php"),
+            "<?php\nnamespace App;\nuse PHPUnit\\Framework\\Attributes\\Test;\nuse Laravel\\Pulse\\Recorders;\n#[Test]\nfinal class Demo { public function run(): void { \\Safe\\json_decode('{}'); \\Safe\\json_encode([]); Recorders\\SlowRequests::class; } }\n",
+        )
+        .unwrap();
+
+        let result = run_analyze_cli(vec![
+            "src/Demo.php".to_string(),
+            "--project-root".to_string(),
+            root.display().to_string(),
+            "--severity".to_string(),
+            "warning".to_string(),
             "--format".to_string(),
             "json".to_string(),
         ]);

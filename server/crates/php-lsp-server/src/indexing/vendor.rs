@@ -95,6 +95,9 @@ pub(crate) fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutol
         if let Some(autoload) = pkg.get("autoload") {
             append_vendor_autoload(&mut map, &pkg_dir, autoload);
         }
+        if let Some(autoload) = pkg.get("autoload-dev") {
+            append_vendor_autoload(&mut map, &pkg_dir, autoload);
+        }
     }
 
     Some(map)
@@ -145,7 +148,15 @@ pub(in crate::server) fn append_vendor_autoload(
     if let Some(files) = autoload.get("files").and_then(|value| value.as_array()) {
         for file in files {
             if let Some(file_path) = file.as_str() {
-                map.files.push(pkg_dir.join(file_path));
+                push_unique_path(&mut map.files, pkg_dir.join(file_path));
+            }
+        }
+    }
+
+    if let Some(classmap) = autoload.get("classmap").and_then(|value| value.as_array()) {
+        for path in classmap {
+            if let Some(path) = path.as_str() {
+                push_unique_path(&mut map.classmap, pkg_dir.join(path));
             }
         }
     }
@@ -165,9 +176,10 @@ pub(crate) fn resolve_vendor_paths_from_map(
     fqn: &str,
     map: &VendorAutoloadMap,
 ) -> Option<Vec<PathBuf>> {
+    let normalized_fqn = fqn.trim_start_matches('\\');
     let mut paths = Vec::new();
     for mapping in &map.psr4 {
-        let Some(relative) = fqn.strip_prefix(mapping.prefix.as_str()) else {
+        let Some(relative) = normalized_fqn.strip_prefix(mapping.prefix.as_str()) else {
             continue;
         };
         let relative_path = relative.replace('\\', "/") + ".php";
@@ -175,12 +187,212 @@ pub(crate) fn resolve_vendor_paths_from_map(
             push_unique_path(&mut paths, directory.join(&relative_path));
         }
     }
+    for path in classmap_candidate_paths_for_fqn(normalized_fqn, map) {
+        push_unique_path(&mut paths, path);
+    }
 
     if paths.is_empty() {
         None
     } else {
         Some(paths)
     }
+}
+
+pub(crate) fn vendor_autoload_file_paths_from_map(
+    map: &VendorAutoloadMap,
+    project_root: &Path,
+    exclude_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for file_path in &map.files {
+        push_vendor_autoload_file_and_static_includes(
+            file_path,
+            project_root,
+            exclude_paths,
+            &mut paths,
+            0,
+        );
+    }
+    paths
+}
+
+pub(in crate::server) async fn vendor_autoload_file_paths_from_map_blocking(
+    map: VendorAutoloadMap,
+    project_root: PathBuf,
+    exclude_paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let path_label = project_root.display().to_string();
+    match run_file_io_blocking(
+        "vendor autoload file discovery",
+        path_label.clone(),
+        move || vendor_autoload_file_paths_from_map(&map, &project_root, &exclude_paths),
+    )
+    .await
+    {
+        Ok(paths) => paths,
+        Err(message) => {
+            tracing::warn!(
+                "Vendor autoload file discovery failed for {}: {}",
+                path_label,
+                message
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn push_vendor_autoload_file_and_static_includes(
+    file_path: &Path,
+    project_root: &Path,
+    exclude_paths: &[PathBuf],
+    paths: &mut Vec<PathBuf>,
+    depth: usize,
+) {
+    const MAX_STATIC_INCLUDE_DEPTH: usize = 8;
+
+    if depth > MAX_STATIC_INCLUDE_DEPTH
+        || !is_php_file_path(file_path)
+        || path_is_excluded(file_path, project_root, exclude_paths)
+    {
+        return;
+    }
+
+    let already_seen = paths.iter().any(|path| path == file_path);
+    push_unique_path(paths, file_path.to_path_buf());
+    if already_seen || !file_path.is_file() {
+        return;
+    }
+
+    for include_path in static_php_include_target_paths_for_file(file_path) {
+        push_vendor_autoload_file_and_static_includes(
+            &include_path,
+            project_root,
+            exclude_paths,
+            paths,
+            depth + 1,
+        );
+    }
+}
+
+fn static_php_include_target_paths_for_file(file_path: &Path) -> Vec<PathBuf> {
+    let Ok(source) = std::fs::read_to_string(file_path) else {
+        return Vec::new();
+    };
+
+    let mut parser = FileParser::new();
+    parser.parse_full(&source);
+    let Some(tree) = parser.tree() else {
+        return Vec::new();
+    };
+
+    static_php_include_target_paths_for_source(&source, tree, file_path)
+}
+
+pub(crate) fn vendor_namespace_exists_from_map(fqn: &str, map: &VendorAutoloadMap) -> bool {
+    let normalized_fqn = fqn.trim_matches('\\');
+    if normalized_fqn.is_empty() {
+        return false;
+    }
+
+    for mapping in &map.psr4 {
+        let prefix = mapping.prefix.trim_matches('\\');
+        if prefix.is_empty() {
+            continue;
+        }
+
+        let relative = if normalized_fqn == prefix {
+            ""
+        } else if let Some(relative) = normalized_fqn.strip_prefix(prefix) {
+            let Some(relative) = relative.strip_prefix('\\') else {
+                continue;
+            };
+            relative
+        } else {
+            continue;
+        };
+
+        let relative_path = relative.replace('\\', "/");
+        for directory in &mapping.directories {
+            let namespace_dir = if relative_path.is_empty() {
+                directory.clone()
+            } else {
+                directory.join(&relative_path)
+            };
+            if namespace_dir.is_dir() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn classmap_candidate_paths_for_fqn(fqn: &str, map: &VendorAutoloadMap) -> Vec<PathBuf> {
+    let class_basename = fqn.rsplit('\\').next().unwrap_or(fqn);
+    let mut matching = Vec::new();
+    let mut fallback = Vec::new();
+
+    for path in &map.classmap {
+        collect_classmap_php_files(path, class_basename, &mut matching, &mut fallback);
+    }
+
+    matching.extend(fallback);
+    matching
+}
+
+fn collect_classmap_php_files(
+    path: &Path,
+    class_basename: &str,
+    matching: &mut Vec<PathBuf>,
+    fallback: &mut Vec<PathBuf>,
+) {
+    if path.is_file() {
+        push_classmap_candidate(path, class_basename, matching, fallback);
+        return;
+    }
+
+    if !path.is_dir() {
+        return;
+    }
+
+    let mut entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    entries.sort();
+
+    for entry in entries {
+        collect_classmap_php_files(&entry, class_basename, matching, fallback);
+    }
+}
+
+fn push_classmap_candidate(
+    path: &Path,
+    class_basename: &str,
+    matching: &mut Vec<PathBuf>,
+    fallback: &mut Vec<PathBuf>,
+) {
+    if !is_php_file_path(path) {
+        return;
+    }
+
+    let stem_matches = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case(class_basename));
+    if stem_matches {
+        push_unique_path(matching, path.to_path_buf());
+    } else {
+        push_unique_path(fallback, path.to_path_buf());
+    }
+}
+
+fn is_php_file_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
 }
 
 pub(in crate::server) async fn cached_vendor_autoload_map(
@@ -217,6 +429,41 @@ pub(in crate::server) fn resolve_vendor_paths(
 }
 
 impl PhpLspBackend {
+    pub(in crate::server) async fn vendor_namespace_exists_lazy(&self, fqn: &str) -> bool {
+        let index_vendor = *self.index_vendor.lock().await;
+        if !index_vendor {
+            return false;
+        }
+
+        let mut configs = self.workspace_configs.lock().await.clone();
+        if configs.is_empty() {
+            let root = self.workspace_root.lock().await.clone();
+            let namespace_map = self.namespace_map.lock().await.clone();
+            if let Some(root) = root {
+                configs.push(WorkspaceRootConfig {
+                    root,
+                    namespace_map,
+                });
+            }
+        }
+
+        for config in configs {
+            let vendor_dir = config.root.join("vendor");
+            if !vendor_dir.is_dir() {
+                continue;
+            }
+            if let Some(vendor_map) =
+                cached_vendor_autoload_map(&self.vendor_autoload_cache, &vendor_dir).await
+            {
+                if vendor_namespace_exists_from_map(fqn, &vendor_map) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     pub(in crate::server) async fn resolve_fqn_lazy(
         &self,
         fqn: &str,

@@ -1002,6 +1002,18 @@ fn test_vendor_autoload_map_parses_psr4_and_files() {
     let vendor_dir = tmp.join("vendor");
     let composer_dir = vendor_dir.join("composer");
     std::fs::create_dir_all(&composer_dir).unwrap();
+    std::fs::create_dir_all(vendor_dir.join("acme/library/classmap/Metadata")).unwrap();
+    std::fs::create_dir_all(vendor_dir.join("acme/library/generated/Support")).unwrap();
+    std::fs::write(
+        vendor_dir.join("acme/library/classmap/Metadata/Test.php"),
+        "<?php\nnamespace Acme\\Library\\Metadata;\nclass Test {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vendor_dir.join("acme/library/classmap/legacy.php"),
+        "<?php\nnamespace Acme\\Library\\Legacy;\nclass OddClass {}\n",
+    )
+    .unwrap();
 
     let installed_json = serde_json::json!({
         "packages": [
@@ -1012,7 +1024,11 @@ fn test_vendor_autoload_map_parses_psr4_and_files() {
                     "psr-4": {
                         "Acme\\Library\\": ["src/", "generated/"]
                     },
-                    "files": ["bootstrap.php"]
+                    "files": ["bootstrap.php"],
+                    "classmap": ["classmap/"]
+                },
+                "autoload-dev": {
+                    "files": ["dev-bootstrap.php"]
                 }
             }
         ]
@@ -1025,8 +1041,12 @@ fn test_vendor_autoload_map_parses_psr4_and_files() {
 
     let map = parse_vendor_autoload_map(&vendor_dir).unwrap();
     let paths = resolve_vendor_paths_from_map("Acme\\Library\\Http\\Client", &map).unwrap();
+    let classmap_paths = resolve_vendor_paths_from_map("Acme\\Library\\Metadata\\Test", &map)
+        .expect("classmap paths");
+    let mixed_psr4_classmap_paths =
+        resolve_vendor_paths_from_map("Acme\\Library\\Legacy\\OddClass", &map)
+            .expect("mixed PSR-4 and classmap paths");
 
-    assert_eq!(paths.len(), 2);
     assert!(
         paths
             .iter()
@@ -1040,6 +1060,31 @@ fn test_vendor_autoload_map_parses_psr4_and_files() {
             .any(|path| path.to_string_lossy().ends_with("bootstrap.php")),
         "Expected autoload file path, got: {:?}",
         map.files
+    );
+    assert!(
+        vendor_autoload_file_paths_from_map(&map, &tmp, &[])
+            .iter()
+            .any(|path| path.to_string_lossy().ends_with("dev-bootstrap.php")),
+        "Expected autoload-dev file path, got: {:?}",
+        map.files
+    );
+    assert!(
+        classmap_paths.iter().any(|path| path
+            .to_string_lossy()
+            .ends_with("classmap/Metadata/Test.php")),
+        "Expected classmap path, got: {:?}",
+        classmap_paths
+    );
+    assert!(
+        mixed_psr4_classmap_paths
+            .iter()
+            .any(|path| path.to_string_lossy().ends_with("classmap/legacy.php")),
+        "Expected non-basename classmap path even with PSR-4 candidates, got: {:?}",
+        mixed_psr4_classmap_paths
+    );
+    assert!(
+        vendor_namespace_exists_from_map("Acme\\Library\\Support", &map),
+        "Expected PSR-4 namespace directory to be detected"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

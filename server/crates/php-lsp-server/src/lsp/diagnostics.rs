@@ -4150,7 +4150,12 @@ impl PhpLspBackend {
         for diagnostic in diagnostics {
             if diagnostic.source.as_deref() == Some("php-lsp") {
                 if let Some(fqn) = lazy_resolvable_diagnostic_fqn(&diagnostic.message) {
+                    let unresolved_use_statement =
+                        diagnostic.message.starts_with("Unresolved use statement: ");
                     if self.resolve_fqn_lazy(&fqn).await.is_some() {
+                        continue;
+                    }
+                    if unresolved_use_statement && self.vendor_namespace_exists_lazy(&fqn).await {
                         continue;
                     }
                 }

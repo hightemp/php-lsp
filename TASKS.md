@@ -5331,9 +5331,12 @@ change.
     /home/apanov/ForTesting/monica/app/Models/Post.php
     /home/apanov/ForTesting/monica/app/Providers/AppServiceProvider.php
 
-- [ ] **H-DIAGNOSTICS-MONICA-COMPOSER-AUTOLOAD-FILES-CLASSMAP-DEV-VENDOR-2026-06-05** Index Composer autoload files/classmap and dev-vendor symbols for namespaced diagnostics
+- [x] **H-DIAGNOSTICS-MONICA-COMPOSER-AUTOLOAD-FILES-CLASSMAP-DEV-VENDOR-2026-06-05** Index Composer autoload files/classmap and dev-vendor symbols for namespaced diagnostics *(done 2026-06-08)*
   - False positives include `Safe\\*` functions/classes from `thecodingmachine/safe` Composer `autoload.files`/`classmap`, PHPUnit attributes/classes in tests, and installed optional Laravel packages in config files.
   - Representative checks: `Safe\\parse_url`, `Safe\\Exceptions\\UrlException`, `PHPUnit\\Framework\\Attributes\\Test`, `Laravel\\Pulse\\Recorders`, `Laravel\\Telescope\\Watchers`, and `Knuckles\\Scribe\\Extracting\\Strategies` exist in vendor/composer.lock.
+  - Started: 2026-06-08; inspect Composer autoload metadata handling, reproduce Monica diagnostics, add regression coverage for files/classmap/dev-vendor symbols, and validate against representative Monica paths.
+  - Implemented: Composer vendor metadata now indexes every `autoload.files` entry, follows static include/require chains from those autoload files via the shared document-link resolver, parses `autoload-dev`, resolves classmap directories as lazy vendor candidates, and suppresses namespace-only unresolved-use diagnostics when PSR-4 vendor metadata points to an existing namespace directory.
+  - Validation: `cargo fmt --all --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; Monica checks for `MonicaLocalize.php`, `AuthenticationTest.php`, and `config/pulse.php`; Verifier subagent GO.
   - Files:
     /home/apanov/ForTesting/monica/app/Console/Commands/Local/MonicaLocalize.php
     /home/apanov/ForTesting/monica/app/Console/Commands/SetupDocumentation.php

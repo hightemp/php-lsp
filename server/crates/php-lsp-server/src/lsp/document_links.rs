@@ -239,6 +239,48 @@ fn collect_document_links(
     }
 }
 
+fn collect_static_php_include_target_paths(
+    node: tree_sitter::Node,
+    source: &str,
+    file_path: &Path,
+    file_dir: &Path,
+    paths: &mut Vec<PathBuf>,
+) {
+    if is_document_link_include_expression(node.kind()) {
+        if let Some(expression) = node.named_child(0) {
+            if let Some(target_path) =
+                document_link_target_path(source, expression, file_path, file_dir)
+            {
+                push_unique_path(paths, target_path);
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_static_php_include_target_paths(child, source, file_path, file_dir, paths);
+    }
+}
+
+pub(crate) fn static_php_include_target_paths_for_source(
+    source: &str,
+    tree: &tree_sitter::Tree,
+    file_path: &Path,
+) -> Vec<PathBuf> {
+    let Some(file_dir) = file_path.parent() else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    collect_static_php_include_target_paths(
+        tree.root_node(),
+        source,
+        file_path,
+        file_dir,
+        &mut paths,
+    );
+    paths
+}
+
 fn document_links_for_source(
     source: &str,
     tree: &tree_sitter::Tree,

@@ -1488,14 +1488,20 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
     else {
         return 0;
     };
-    if autoload.files.is_empty() {
+    let entrypoint_files = vendor_autoload_file_paths_from_map_blocking(
+        autoload,
+        root.to_path_buf(),
+        exclude_paths.to_vec(),
+    )
+    .await;
+    if entrypoint_files.is_empty() {
         return 0;
     }
 
     let cache_config = vendor_index_cache_config(root, php_version, exclude_paths);
     let mut loaded = 0;
-    for file_path in autoload.files.iter().take(VENDOR_PRELOAD_ENTRYPOINT_LIMIT) {
-        if !file_path.is_file() || path_is_excluded(file_path, root, exclude_paths) {
+    for file_path in entrypoint_files {
+        if !file_path.is_file() {
             continue;
         }
 
@@ -1514,7 +1520,7 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
             )
             .await
         {
-            touch_vendor_file_lru(&index, vendor_file_lru, file_path).await;
+            touch_vendor_file_lru(&index, vendor_file_lru, &file_path).await;
             loaded += 1;
         }
     }

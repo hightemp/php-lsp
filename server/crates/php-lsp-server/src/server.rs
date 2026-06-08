@@ -78,7 +78,10 @@ use indexing::cache::*;
 pub(crate) use indexing::stubs::load_configured_stubs;
 use indexing::stubs::*;
 use indexing::vendor::*;
-pub(crate) use indexing::vendor::{parse_vendor_autoload_map, resolve_vendor_paths_from_map};
+pub(crate) use indexing::vendor::{
+    parse_vendor_autoload_map, resolve_vendor_paths_from_map, vendor_autoload_file_paths_from_map,
+    vendor_namespace_exists_from_map,
+};
 use indexing::workspace::*;
 pub(crate) use indexing::workspace::{
     collect_php_files, discover_workspace_root_config, load_effective_configuration_settings,
@@ -93,6 +96,7 @@ use lsp::diagnostics::*;
 pub(crate) use lsp::diagnostics::{
     compute_diagnostics_with_runtime_config, lazy_resolvable_diagnostic_fqn,
 };
+pub(crate) use lsp::document_links::static_php_include_target_paths_for_source;
 use lsp::document_symbols::*;
 use lsp::external_command::*;
 use lsp::inlay_hints::*;
@@ -954,7 +958,6 @@ pub(crate) struct WorkspaceRootConfig {
 const VENDOR_FILE_LRU_CAPACITY: usize = 512;
 const FRAMEWORK_STRING_KEY_CACHE_CAPACITY: usize = 32;
 const TWIG_CONTEXT_DISK_CACHE_CAPACITY: usize = 64;
-pub(crate) const VENDOR_PRELOAD_ENTRYPOINT_LIMIT: usize = 16;
 const MAX_INDEXING_PARSE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -967,6 +970,7 @@ pub(crate) struct VendorPsr4Mapping {
 pub(crate) struct VendorAutoloadMap {
     psr4: Vec<VendorPsr4Mapping>,
     pub(crate) files: Vec<PathBuf>,
+    pub(crate) classmap: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
