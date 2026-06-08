@@ -1,11 +1,11 @@
-[semantic-search-mcp]
+[mcp_servers.semantic-search-mcp]
 command = "uvx"
 args = ["semantic-search-mcp"]
 enabled = true
 startup_timeout_sec = 20
 tool_timeout_sec = 60
 
-[codegraph]
+[mcp_servers.codegraph]
 command = "codegraph"
 args = ["serve", "--mcp"]
 enabled = true
