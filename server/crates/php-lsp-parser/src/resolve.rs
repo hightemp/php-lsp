@@ -2119,28 +2119,55 @@ fn positive_instanceof_branch_inference(
     source: &str,
     file_symbols: &FileSymbols,
 ) -> Option<VariableInference> {
-    if stmt.kind() != "if_statement" {
-        return None;
+    if matches!(stmt.kind(), "if_statement" | "else_if_clause") {
+        if let Some(body) = stmt.child_by_field_name("body") {
+            if usage_start >= body.start_byte() && usage_start <= body.end_byte() {
+                let condition = if_condition_node(stmt)?;
+                if let Some(class_name) =
+                    positive_instanceof_class_for_var(condition, source, var_name)
+                {
+                    let resolved = resolve_class_name(&class_name, file_symbols);
+                    return Some(VariableInference {
+                        type_display: Some(class_name),
+                        resolved_type_fqn: Some(resolved.clone()),
+                        phpdoc_comment: None,
+                        type_info: Some(resolved_fqn_type_info(&resolved)),
+                    });
+                }
+            }
+        }
     }
 
-    let body = stmt.child_by_field_name("body")?;
-    if usage_start < body.start_byte() || usage_start > body.end_byte() {
-        return None;
+    let mut cursor = stmt.walk();
+    for child in stmt.named_children(&mut cursor) {
+        if usage_start >= child.start_byte() && usage_start <= child.end_byte() {
+            return positive_instanceof_branch_inference(
+                child,
+                var_name,
+                usage_start,
+                source,
+                file_symbols,
+            );
+        }
     }
 
-    let condition = if_condition_text(stmt, source)?;
-    if !positive_instanceof_guard_for_var(condition, var_name) {
-        return None;
+    None
+}
+
+fn if_condition_node(stmt: Node) -> Option<Node> {
+    if let Some(condition) = stmt.child_by_field_name("condition") {
+        return Some(condition);
     }
 
-    let class_name = class_name_after_instanceof(condition)?;
-    let resolved = resolve_class_name(&class_name, file_symbols);
-    Some(VariableInference {
-        type_display: Some(class_name),
-        resolved_type_fqn: Some(resolved.clone()),
-        phpdoc_comment: None,
-        type_info: Some(resolved_fqn_type_info(&resolved)),
-    })
+    let body_start = stmt
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or(stmt.end_byte());
+    let mut cursor = stmt.walk();
+    stmt.named_children(&mut cursor)
+        .filter(|child| child.end_byte() <= body_start)
+        .filter(|child| !matches!(child.kind(), "else_clause" | "else_if_clause"))
+        .max_by_key(|child| child.start_byte())
 }
 
 fn if_condition_text<'a>(stmt: Node, source: &'a str) -> Option<&'a str> {
@@ -2168,10 +2195,82 @@ fn negative_instanceof_guard_for_var(condition: &str, var_name: &str) -> bool {
         || compact.starts_with(&format!("!({}instanceof", var_name))
 }
 
-fn positive_instanceof_guard_for_var(condition: &str, var_name: &str) -> bool {
-    let compact: String = condition.chars().filter(|ch| !ch.is_whitespace()).collect();
-    compact.starts_with(&format!("{}instanceof", var_name))
-        || compact.starts_with(&format!("({}instanceof", var_name))
+fn positive_instanceof_class_for_var(
+    condition: Node,
+    source: &str,
+    var_name: &str,
+) -> Option<String> {
+    let condition = unwrap_parenthesized_condition(condition);
+    if condition.kind() == "binary_expression"
+        && matches!(
+            binary_operator_text(condition, source),
+            Some("&&") | Some("and")
+        )
+    {
+        let left = condition
+            .child_by_field_name("left")
+            .or_else(|| condition.named_child(0))?;
+        let right = condition
+            .child_by_field_name("right")
+            .or_else(|| condition.named_child(1))?;
+        return positive_instanceof_class_for_var(left, source, var_name)
+            .or_else(|| positive_instanceof_class_for_var(right, source, var_name));
+    }
+
+    positive_instanceof_expression_class_for_var(condition, source, var_name)
+}
+
+fn unwrap_parenthesized_condition(mut node: Node) -> Node {
+    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+        if let Some(child) = node.named_child(0) {
+            node = child;
+        } else {
+            break;
+        }
+    }
+    node
+}
+
+fn positive_instanceof_expression_class_for_var(
+    node: Node,
+    source: &str,
+    var_name: &str,
+) -> Option<String> {
+    match node.kind() {
+        "instanceof_expression" => {}
+        "binary_expression"
+            if binary_operator_text(node, source)
+                .is_some_and(|operator| operator.eq_ignore_ascii_case("instanceof")) => {}
+        _ => return None,
+    }
+
+    let left = node
+        .child_by_field_name("left")
+        .or_else(|| node.named_child(0))?;
+    if source.get(left.byte_range()).map(str::trim) != Some(var_name) {
+        return None;
+    }
+
+    let right = node
+        .child_by_field_name("right")
+        .or_else(|| node.named_child(1))?;
+    let class_name = source.get(right.byte_range())?.trim();
+    (!class_name.is_empty()).then(|| class_name.to_string())
+}
+
+fn binary_operator_text<'a>(node: Node, source: &'a str) -> Option<&'a str> {
+    let left = node
+        .child_by_field_name("left")
+        .or_else(|| node.named_child(0))?;
+    let right = node
+        .child_by_field_name("right")
+        .or_else(|| node.named_child(1))?;
+    if left.end_byte() > right.start_byte() {
+        return None;
+    }
+    source
+        .get(left.end_byte()..right.start_byte())
+        .map(str::trim)
 }
 
 fn if_then_branch_exits(stmt: Node, source: &str) -> bool {
@@ -7795,6 +7894,95 @@ class UserRepository {
         let (line, col) = find_line_col(code, "setPassword");
         let result = parse_and_infer_var_type_at(code, line, col, "$user");
         assert_eq!(result.as_deref(), Some("App\\Entity\\User"));
+    }
+
+    #[test]
+    fn test_infer_variable_type_inside_positive_elseif_instanceof_branch() {
+        let code = r#"<?php
+namespace App\Repository;
+
+use App\Entity\OAuth1User;
+use App\Entity\OAuth2User;
+use App\Contracts\SocialiteUser;
+
+class UserRepository {
+    public function createToken(SocialiteUser $socialite): void {
+        if ($socialite instanceof OAuth1User) {
+            $socialite->tokenSecret;
+        } elseif ($socialite instanceof OAuth2User) {
+            $socialite->refreshToken;
+        }
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "refreshToken");
+        let result = parse_and_infer_var_type_at(code, line, col, "$socialite");
+        assert_eq!(result.as_deref(), Some("App\\Entity\\OAuth2User"));
+    }
+
+    #[test]
+    fn test_infer_variable_type_inside_positive_instanceof_conjunction_branch() {
+        let code = r#"<?php
+namespace App\Repository;
+
+use App\Entity\AbstractProvider;
+use App\Contracts\Provider;
+
+class UserRepository {
+    public function configure(Provider $provider, bool $enabled): void {
+        if ($enabled && $provider instanceof AbstractProvider) {
+            $provider->setHttpClient();
+        }
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "setHttpClient");
+        let result = parse_and_infer_var_type_at(code, line, col, "$provider");
+        assert_eq!(result.as_deref(), Some("App\\Entity\\AbstractProvider"));
+    }
+
+    #[test]
+    fn test_positive_instanceof_narrowing_ignores_negated_condition_branch() {
+        let code = r#"<?php
+namespace App\Repository;
+
+use App\Entity\OAuth2User;
+use App\Contracts\SocialiteUser;
+
+class UserRepository {
+    public function createToken(SocialiteUser $socialite): void {
+        if (!($socialite instanceof OAuth2User)) {
+            $socialite->refreshToken;
+        }
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "refreshToken");
+        let result = parse_and_infer_var_type_at(code, line, col, "$socialite");
+        assert_ne!(result.as_deref(), Some("App\\Entity\\OAuth2User"));
+    }
+
+    #[test]
+    fn test_positive_instanceof_narrowing_ignores_nested_call_argument() {
+        let code = r#"<?php
+namespace App\Repository;
+
+use App\Entity\OAuth2User;
+use App\Contracts\SocialiteUser;
+
+function accepts(bool $value): bool { return $value; }
+
+class UserRepository {
+    public function createToken(SocialiteUser $socialite): void {
+        if (accepts($socialite instanceof OAuth2User)) {
+            $socialite->refreshToken;
+        }
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "refreshToken");
+        let result = parse_and_infer_var_type_at(code, line, col, "$socialite");
+        assert_ne!(result.as_deref(), Some("App\\Entity\\OAuth2User"));
     }
 
     #[test]

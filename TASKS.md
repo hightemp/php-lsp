@@ -5481,9 +5481,12 @@ change.
     /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php
     /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPushMissed.php
 
-- [ ] **H-DIAGNOSTICS-MONICA-DYNAMIC-MACROS-MAGIC-PROPERTIES-AND-NARROWING-2026-06-05** Support Laravel macros, magic properties, backed enum properties, and `instanceof` narrowing used in Monica
+- [x] **H-DIAGNOSTICS-MONICA-DYNAMIC-MACROS-MAGIC-PROPERTIES-AND-NARROWING-2026-06-05** Support Laravel macros, magic properties, backed enum properties, and `instanceof` narrowing used in Monica *(done 2026-06-08)*
   - False positives include app-defined macros (`Http::getDnsRecord`, `Str::markdownExternalLink`, `Collection::sortByCollator`), Laravel/Webauthn facade dynamic methods, Faker magic properties, `Monolog\\Level::$value`, interface `@property`, and Socialite concrete-user properties after `instanceof` narrowing.
   - Representative checks: macros are registered in `AppServiceProvider`, `Monolog\\Level` is a backed enum, `App\\Logging\\Loggable` has `@property`, and Socialite OAuth user classes declare public token properties.
+  - Started: 2026-06-08; reproduce Monica false positives, support dynamic macro/magic-property diagnostics without hardcoded app symbols, improve backed enum `$value` and `instanceof` narrowing, add focused regressions, and validate against the listed Monica files.
+  - Implemented: indexed readable PHPDoc `@property` members and enum synthetic `name`/backed `value` properties; constrained enum diagnostics to indexed enum data; added top-level positive `instanceof` narrowing for `elseif`/`&&`; added Laravel macro/facade/Optional/Faker dynamic member handling; made lazy property diagnostics kind-safe.
+  - Validation: `cargo fmt --all --check`; `git diff --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; Monica analyze representatives: `LoggingHandler.php`, `AppServiceProvider.php`, `AttemptToAuthenticateSocialite.php`, `Schedule.php` clean, `ServiceUrlQuery.php` only unrelated unused `$e`; Verifier GO.
   - Files:
     /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
     /home/apanov/ForTesting/monica/app/Console/Commands/Local/SetupDummyAccount.php

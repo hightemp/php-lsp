@@ -525,7 +525,19 @@ fn extract_class_like(
         extract_class_body(body, source, uri, result, &fqn, php_version);
     }
 
+    if kind == PhpSymbolKind::Enum {
+        extract_enum_builtin_properties(node, source, uri, result, &fqn, name_node, body_node);
+    }
+
     if let (Some(doc), Some(doc_node)) = (doc_comment.as_deref(), doc_comment_node) {
+        extract_phpdoc_virtual_properties(
+            doc,
+            uri,
+            result,
+            &fqn,
+            node_range(name_node),
+            doc_node.start_position(),
+        );
         extract_phpdoc_virtual_methods(
             doc,
             uri,
@@ -534,6 +546,66 @@ fn extract_class_like(
             node_range(name_node),
             doc_node.start_position(),
         );
+    }
+}
+
+fn extract_phpdoc_virtual_properties(
+    doc_comment: &str,
+    uri: &str,
+    result: &mut FileSymbols,
+    parent_fqn: &str,
+    fallback_range: (u32, u32, u32, u32),
+    doc_start: tree_sitter::Point,
+) {
+    let phpdoc = crate::phpdoc::parse_phpdoc(doc_comment);
+    let template_names: HashSet<String> = phpdoc
+        .templates
+        .iter()
+        .map(|template| template.name.clone())
+        .collect();
+
+    for property in phpdoc.properties {
+        if !property.access.is_readable() {
+            continue;
+        }
+        if result.symbols.iter().any(|symbol| {
+            symbol.kind == PhpSymbolKind::Property
+                && symbol.parent_fqn.as_deref() == Some(parent_fqn)
+                && symbol.name == property.name
+        }) {
+            continue;
+        }
+
+        let property_range = phpdoc_property_name_range(doc_comment, &property.name, doc_start)
+            .unwrap_or(fallback_range);
+        let type_info = property
+            .type_info
+            .clone()
+            .map(|type_info| resolve_template_type_info_in_file(type_info, result, &template_names))
+            .unwrap_or(TypeInfo::Mixed);
+
+        result.symbols.push(SymbolInfo {
+            name: property.name.clone(),
+            fqn: format!("{}::${}", parent_fqn, property.name),
+            kind: PhpSymbolKind::Property,
+            uri: uri.to_string(),
+            range: property_range,
+            selection_range: property_range,
+            visibility: Visibility::Public,
+            modifiers: SymbolModifiers::default(),
+            attributes: vec![],
+            doc_comment: Some(doc_comment.to_string()),
+            signature: Some(Signature {
+                params: vec![],
+                return_type: Some(type_info),
+            }),
+            parent_fqn: Some(parent_fqn.to_string()),
+            extends: vec![],
+            implements: vec![],
+            traits: vec![],
+            templates: vec![],
+            template_bindings: vec![],
+        });
     }
 }
 
@@ -596,6 +668,95 @@ fn extract_phpdoc_virtual_methods(
     }
 }
 
+fn extract_enum_builtin_properties(
+    node: Node,
+    source: &str,
+    uri: &str,
+    result: &mut FileSymbols,
+    parent_fqn: &str,
+    name_node: Node,
+    body_node: Option<Node>,
+) {
+    let fallback_range = node_range(name_node);
+    push_enum_builtin_property(
+        result,
+        uri,
+        parent_fqn,
+        "name",
+        TypeInfo::Simple("string".to_string()),
+        fallback_range,
+    );
+
+    let Some(body) = body_node else {
+        return;
+    };
+    let header = source
+        .get(node.start_byte()..body.start_byte())
+        .unwrap_or_default();
+    let Some((_, backing_type_text)) = header.rsplit_once(':') else {
+        return;
+    };
+    let backing_type = backing_type_text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    if backing_type.is_empty() {
+        return;
+    }
+
+    push_enum_builtin_property(
+        result,
+        uri,
+        parent_fqn,
+        "value",
+        TypeInfo::Simple(backing_type.to_string()),
+        fallback_range,
+    );
+}
+
+fn push_enum_builtin_property(
+    result: &mut FileSymbols,
+    uri: &str,
+    parent_fqn: &str,
+    name: &str,
+    type_info: TypeInfo,
+    fallback_range: (u32, u32, u32, u32),
+) {
+    if result.symbols.iter().any(|symbol| {
+        symbol.kind == PhpSymbolKind::Property
+            && symbol.parent_fqn.as_deref() == Some(parent_fqn)
+            && symbol.name == name
+    }) {
+        return;
+    }
+
+    result.symbols.push(SymbolInfo {
+        name: name.to_string(),
+        fqn: format!("{}::${}", parent_fqn, name),
+        kind: PhpSymbolKind::Property,
+        uri: uri.to_string(),
+        range: fallback_range,
+        selection_range: fallback_range,
+        visibility: Visibility::Public,
+        modifiers: SymbolModifiers {
+            is_readonly: true,
+            ..SymbolModifiers::default()
+        },
+        attributes: vec![],
+        doc_comment: None,
+        signature: Some(Signature {
+            params: vec![],
+            return_type: Some(type_info),
+        }),
+        parent_fqn: Some(parent_fqn.to_string()),
+        extends: vec![],
+        implements: vec![],
+        traits: vec![],
+        templates: vec![],
+        template_bindings: vec![],
+    });
+}
+
 fn phpdoc_method_name_range(
     doc_comment: &str,
     method_name: &str,
@@ -623,6 +784,34 @@ fn phpdoc_method_name_range(
             }
             search_from = name_start + method_name.len();
         }
+    }
+
+    None
+}
+
+fn phpdoc_property_name_range(
+    doc_comment: &str,
+    property_name: &str,
+    doc_start: tree_sitter::Point,
+) -> Option<(u32, u32, u32, u32)> {
+    for (line_idx, raw_line) in doc_comment.lines().enumerate() {
+        if !raw_line.contains("@property") {
+            continue;
+        }
+
+        let needle = format!("${property_name}");
+        let Some(name_start) = raw_line.find(&needle) else {
+            continue;
+        };
+        let line = doc_start.row as u32 + line_idx as u32;
+        let line_base_col = if line_idx == 0 {
+            doc_start.column as u32
+        } else {
+            0
+        };
+        let start_col = line_base_col + name_start as u32 + 1;
+        let end_col = start_col + property_name.len() as u32;
+        return Some((line, start_col, line, end_col));
     }
 
     None
@@ -1994,6 +2183,39 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_enum_builtin_properties() {
+        let syms = parse_and_extract(
+            "<?php\nnamespace App;\ninterface HasCode {}\nenum Level: int implements HasCode { case Info = 200; }\n",
+        );
+        let name = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\Level::$name")
+            .expect("enum name property should be extracted");
+        assert!(name.modifiers.is_readonly);
+        assert!(matches!(
+            name.signature
+                .as_ref()
+                .and_then(|sig| sig.return_type.as_ref()),
+            Some(TypeInfo::Simple(value)) if value == "string"
+        ));
+
+        let value = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\Level::$value")
+            .expect("backed enum value property should be extracted");
+        assert!(value.modifiers.is_readonly);
+        assert!(matches!(
+            value
+                .signature
+                .as_ref()
+                .and_then(|sig| sig.return_type.as_ref()),
+            Some(TypeInfo::Simple(value)) if value == "int"
+        ));
+    }
+
+    #[test]
     fn test_extract_function() {
         let syms = parse_and_extract(
             "<?php\nnamespace Utils;\nfunction helper(int $x, string $y = 'default'): bool { return true; }\n",
@@ -2865,5 +3087,43 @@ interface Helper {}
             .find(|s| s.kind == PhpSymbolKind::Method && s.fqn == "App\\Helper::make")
             .expect("@method static make should be emitted as a method symbol");
         assert!(make.modifiers.is_static);
+    }
+
+    #[test]
+    fn test_phpdoc_property_tags_emit_virtual_property_symbols() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App;
+
+/**
+ * @property int $current_logid
+ * @property-read string $id
+ * @property-write string $secret
+ */
+interface Loggable {}
+"#,
+        );
+
+        let current_logid = syms
+            .symbols
+            .iter()
+            .find(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\Loggable::$current_logid")
+            .expect("@property current_logid should be emitted as a property symbol");
+        assert!(matches!(
+            current_logid
+                .signature
+                .as_ref()
+                .and_then(|sig| sig.return_type.as_ref()),
+            Some(TypeInfo::Simple(value)) if value == "int"
+        ));
+
+        assert!(syms
+            .symbols
+            .iter()
+            .any(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\Loggable::$id"));
+        assert!(!syms
+            .symbols
+            .iter()
+            .any(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\Loggable::$secret"));
     }
 }

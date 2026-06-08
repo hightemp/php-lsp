@@ -1419,6 +1419,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn analyze_lazy_resolves_vendor_enum_property_diagnostics() {
+        let root = temp_dir("vendor-enum-property-diagnostics");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/monolog/monolog/src/Monolog")).unwrap();
+
+        std::fs::write(
+            root.join("composer.json"),
+            r#"{
+                "autoload": {
+                    "psr-4": {
+                        "App\\": "src/"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/composer/installed.json"),
+            serde_json::json!({
+                "packages": [
+                    {
+                        "name": "monolog/monolog",
+                        "install-path": "../monolog/monolog",
+                        "autoload": {
+                            "psr-4": {
+                                "Monolog\\": "src/Monolog/"
+                            }
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/monolog/monolog/src/Monolog/LogRecord.php"),
+            "<?php\nnamespace Monolog;\nclass LogRecord { public Level $level; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/monolog/monolog/src/Monolog/Level.php"),
+            "<?php\nnamespace Monolog;\nenum Level: int { case Debug = 100; public function getName(): string { return 'debug'; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Demo.php"),
+            "<?php\nnamespace App;\nuse Monolog\\LogRecord;\nfinal class Demo { public function run(LogRecord $record): int { return $record->level->value; } }\n",
+        )
+        .unwrap();
+
+        let result = run_analyze_cli(vec![
+            "src/Demo.php".to_string(),
+            "--project-root".to_string(),
+            root.display().to_string(),
+            "--severity".to_string(),
+            "warning".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ]);
+
+        assert_eq!(
+            result.exit_code, 0,
+            "stdout: {}\nstderr: {}",
+            result.stdout, result.stderr
+        );
+        let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(value["summary"]["diagnostics"], 0, "{}", result.stdout);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "php-lsp-analyze-{label}-{}",

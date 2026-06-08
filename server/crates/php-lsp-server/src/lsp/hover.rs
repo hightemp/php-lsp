@@ -273,9 +273,14 @@ impl PhpLspBackend {
                     phpdoc_params,
                 );
                 if let Some(ref ret) = sig.return_type {
+                    let type_label = if sym.kind == php_lsp_types::PhpSymbolKind::Property {
+                        "Type"
+                    } else {
+                        "Returns"
+                    };
                     append_type_link_line(
                         &mut content,
-                        "Returns",
+                        type_label,
                         &self.index,
                         &hover_file_symbols,
                         type_owner_fqn,

@@ -200,6 +200,34 @@ fn inferred_expr(display: &str, comparable: &str) -> InferredExprType {
 }
 
 #[test]
+fn test_lazy_resolved_property_diagnostic_requires_property_symbol_kind() {
+    let uri = "file:///lazy-property-kind.php";
+    let code = r#"<?php
+namespace App;
+class Foo {
+    public function value(): int { return 1; }
+}
+"#;
+
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(&index, uri, code);
+
+    assert!(
+        !lazy_resolved_symbol_diagnostic_is_satisfied(
+            &index,
+            "Unknown property: App\\Foo::$value",
+            "App\\Foo::$value",
+        ),
+        "a method with the same bare name must not satisfy an unknown property diagnostic"
+    );
+    assert!(lazy_resolved_symbol_diagnostic_is_satisfied(
+        &index,
+        "Unknown method: App\\Foo::value",
+        "App\\Foo::value",
+    ));
+}
+
+#[test]
 fn test_request_type_cache_reuses_same_expression_context() {
     let cache = RequestTypeCache::new("file:///test.php", Some(7));
     let calls = Cell::new(0usize);
@@ -1839,6 +1867,118 @@ function run(?User $user, ?Signature $signature): void {
     ] {
         assert_no_diagnostic_containing(&messages, unexpected);
     }
+}
+
+#[test]
+fn test_compute_diagnostics_allows_dynamic_macros_magic_properties_and_narrowing() {
+    let uri = "file:///dynamic-macros-magic-properties.php";
+    let code = r#"<?php
+namespace Illuminate\Support;
+class Str {
+    public static function macro(string $name, callable $callback): void {}
+}
+class Optional {}
+
+namespace Illuminate\Support\Facades;
+class Facade {}
+class URL extends \Illuminate\Support\Facades\Facade {}
+
+namespace Faker;
+class Generator {}
+
+namespace Vendor;
+enum Level: int { case Info = 200; }
+
+namespace App;
+
+use Faker\Generator;
+use Illuminate\Support\Facades\URL;
+use Illuminate\Support\Optional;
+use Illuminate\Support\Str;
+
+/**
+ * @property int $current_logid
+ */
+interface Loggable {}
+
+enum Level: int { case Info = 200; }
+enum Status { case Open; }
+
+interface SocialiteUser {}
+class OAuth1User implements SocialiteUser {
+    public string $tokenSecret;
+}
+class OAuth2User implements SocialiteUser {
+    public string $refreshToken;
+}
+class CronEvent {
+    public function isDue(): bool { return true; }
+}
+class Service {}
+
+function run(
+    Optional $optional,
+    Generator $faker,
+    Loggable $loggable,
+    Level $level,
+    Status $status,
+    \Vendor\Level $vendorLevel,
+    Service $service,
+    SocialiteUser $socialite,
+    CronEvent $event,
+    string $frequency
+): void {
+    Str::macro('markdownExternalLink', function (string $text): string { return $text; });
+    Str::markdownExternalLink('hello');
+    URL::forceRootUrl('https://example.test');
+    $optional->id;
+    $faker->firstName;
+    $faker->sentence();
+    $loggable->current_logid;
+    $level->value;
+    $status->value;
+    $vendorLevel->value;
+    $service->value;
+
+    if ($socialite instanceof OAuth1User) {
+        $socialite->tokenSecret;
+    } elseif ($socialite instanceof OAuth2User) {
+        $socialite->refreshToken;
+    }
+
+    $event->{$frequency}();
+}
+"#;
+
+    let index = WorkspaceIndex::new();
+    let parser = parse_and_index_php_file(&index, uri, code);
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    for unexpected in [
+        "Unknown method: Illuminate\\Support\\Str::markdownExternalLink",
+        "Unknown method: Illuminate\\Support\\Facades\\URL::forceRootUrl",
+        "Unknown property: Illuminate\\Support\\Optional::$id",
+        "Unknown property: Faker\\Generator::$firstName",
+        "Unknown method: Faker\\Generator::sentence",
+        "Unknown property: App\\Loggable::$current_logid",
+        "Unknown property: App\\Level::$value",
+        "Unknown property: Vendor\\Level::$value",
+        "Unknown property: App\\SocialiteUser::$refreshToken",
+        "Unknown method: App\\CronEvent::$frequency",
+    ] {
+        assert_no_diagnostic_containing(&messages, unexpected);
+    }
+
+    assert_diagnostic_containing(&messages, "Unknown property: App\\Service::$value");
+    assert_diagnostic_containing(&messages, "Unknown property: App\\Status::$value");
+    assert_no_diagnostic_containing(&messages, "Unknown method:");
 }
 
 #[test]

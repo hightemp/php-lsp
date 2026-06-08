@@ -672,6 +672,48 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
         let is_relation = relation_base_fqn.is_some();
         let is_collection = is_laravel_collection(ctx, &query.owner_fqn);
         let is_builder = is_laravel_builder(ctx, &query.owner_fqn);
+        let is_facade = is_laravel_facade(ctx, &query.owner_fqn);
+        let is_optional = is_laravel_optional(&query.owner_fqn);
+        let is_faker_generator = is_faker_generator(ctx, &query.owner_fqn);
+
+        if query.kind == VirtualMemberKind::Method {
+            if !is_collection && is_laravel_macroable(ctx, &query.owner_fqn) {
+                if let Some(macro_member) = laravel_registered_macro_virtual_method(
+                    ctx,
+                    &query.owner_fqn,
+                    &query.member_name,
+                ) {
+                    return vec![macro_member];
+                }
+            }
+            if is_facade {
+                return vec![VirtualMember::synthetic(
+                    self.id(),
+                    &query.owner_fqn,
+                    &query.member_name,
+                    query.kind,
+                    "Laravel facade dynamic dispatch",
+                )];
+            }
+        }
+
+        if matches!(
+            query.kind,
+            VirtualMemberKind::Method | VirtualMemberKind::Property
+        ) && (is_optional || is_faker_generator)
+        {
+            return vec![VirtualMember::synthetic(
+                self.id(),
+                &query.owner_fqn,
+                &query.member_name,
+                query.kind,
+                if is_optional {
+                    "Laravel Optional dynamic forwarding"
+                } else {
+                    "Faker generator dynamic formatter"
+                },
+            )];
+        }
 
         let accepted = match query.kind {
             VirtualMemberKind::Method if is_relation => {
@@ -911,6 +953,52 @@ fn is_laravel_collection(ctx: &FrameworkProviderContext<'_>, class_fqn: &str) ->
         || ctx.class_is_or_extends(&class_fqn, "Illuminate\\Database\\Eloquent\\Collection")
 }
 
+fn is_laravel_facade(ctx: &FrameworkProviderContext<'_>, class_fqn: &str) -> bool {
+    let class_fqn = laravel_type_text_base_name(class_fqn).unwrap_or_else(|| class_fqn.to_string());
+    ctx.class_is_or_extends(&class_fqn, "Illuminate\\Support\\Facades\\Facade")
+}
+
+fn is_laravel_optional(class_fqn: &str) -> bool {
+    let class_fqn = laravel_type_text_base_name(class_fqn).unwrap_or_else(|| class_fqn.to_string());
+    fqn_matches(&class_fqn, "Illuminate\\Support\\Optional")
+}
+
+fn is_faker_generator(ctx: &FrameworkProviderContext<'_>, class_fqn: &str) -> bool {
+    let class_fqn = laravel_type_text_base_name(class_fqn).unwrap_or_else(|| class_fqn.to_string());
+    fqn_matches(&class_fqn, "Faker\\Generator")
+        || ctx.class_is_or_extends(&class_fqn, "Faker\\Generator")
+}
+
+fn is_laravel_macroable(ctx: &FrameworkProviderContext<'_>, class_fqn: &str) -> bool {
+    let class_fqn = laravel_type_text_base_name(class_fqn).unwrap_or_else(|| class_fqn.to_string());
+    ctx.index
+        .resolve_member(&format!("{}::macro", class_fqn.trim_start_matches('\\')))
+        .is_some_and(|symbol| symbol.kind == PhpSymbolKind::Method)
+}
+
+fn laravel_registered_macro_virtual_method(
+    ctx: &FrameworkProviderContext<'_>,
+    owner_fqn: &str,
+    member_name: &str,
+) -> Option<VirtualMember> {
+    let owner_base =
+        laravel_type_text_base_name(owner_fqn).unwrap_or_else(|| owner_fqn.to_string());
+    let source = laravel_macro_source(ctx, member_name, &|scope_fqn| {
+        fqn_matches(scope_fqn, &owner_base)
+    })?;
+    let mut member = VirtualMember::synthetic(
+        LARAVEL_ELOQUENT_PROVIDER.id(),
+        owner_fqn,
+        member_name,
+        VirtualMemberKind::Method,
+        "Laravel registered macro",
+    );
+    member.type_info = laravel_type_info_from_text(owner_fqn)
+        .or_else(|| laravel_type_text_base_name(owner_fqn).map(TypeInfo::Simple));
+    member.sources.push(source);
+    Some(member)
+}
+
 fn laravel_collection_macro_virtual_method(
     ctx: &FrameworkProviderContext<'_>,
     owner_fqn: &str,
@@ -934,9 +1022,17 @@ fn laravel_collection_macro_source(
     ctx: &FrameworkProviderContext<'_>,
     member_name: &str,
 ) -> Option<VirtualMemberSource> {
+    laravel_macro_source(ctx, member_name, &laravel_collection_macro_target_fqn)
+}
+
+fn laravel_macro_source(
+    ctx: &FrameworkProviderContext<'_>,
+    member_name: &str,
+    scope_matches: &dyn Fn(&str) -> bool,
+) -> Option<VirtualMemberSource> {
     if let (Some(source), Some(file_symbols)) = (ctx.source, ctx.file_symbols) {
         if let Some((start_offset, end_offset)) =
-            laravel_collection_macro_range(source, file_symbols, member_name)
+            laravel_macro_range(source, file_symbols, member_name, scope_matches)
         {
             let start = line_col_for_offset(source, start_offset);
             let end = line_col_for_offset(source, end_offset);
@@ -962,7 +1058,7 @@ fn laravel_collection_macro_source(
             continue;
         };
         let Some((start_offset, end_offset)) =
-            laravel_collection_macro_range(&source, entry.value(), member_name)
+            laravel_macro_range(&source, entry.value(), member_name, scope_matches)
         else {
             continue;
         };
@@ -977,10 +1073,11 @@ fn laravel_collection_macro_source(
     None
 }
 
-fn laravel_collection_macro_range(
+fn laravel_macro_range(
     source: &str,
     file_symbols: &FileSymbols,
     member_name: &str,
+    scope_matches: &dyn Fn(&str) -> bool,
 ) -> Option<(usize, usize)> {
     let mut parser = FileParser::new();
     parser.parse_full(source);
@@ -989,7 +1086,7 @@ fn laravel_collection_macro_range(
 
     while let Some(node) = stack.pop() {
         if let Some(range) =
-            laravel_collection_macro_call_range(source, file_symbols, node, member_name)
+            laravel_macro_call_range(source, file_symbols, node, member_name, scope_matches)
         {
             return Some(range);
         }
@@ -1001,11 +1098,12 @@ fn laravel_collection_macro_range(
     None
 }
 
-fn laravel_collection_macro_call_range(
+fn laravel_macro_call_range(
     source: &str,
     file_symbols: &FileSymbols,
     node: Node<'_>,
     member_name: &str,
+    scope_matches: &dyn Fn(&str) -> bool,
 ) -> Option<(usize, usize)> {
     if node.kind() != "scoped_call_expression" {
         return None;
@@ -1016,7 +1114,7 @@ fn laravel_collection_macro_call_range(
     if source.get(name.byte_range())? != "macro" {
         return None;
     }
-    if !laravel_collection_macro_scope_is_laravel_collection(source, file_symbols, scope) {
+    if !laravel_macro_scope_matches(source, file_symbols, scope, scope_matches) {
         return None;
     }
 
@@ -1030,10 +1128,11 @@ fn laravel_collection_macro_call_range(
     Some((scope.start_byte(), name.end_byte()))
 }
 
-fn laravel_collection_macro_scope_is_laravel_collection(
+fn laravel_macro_scope_matches(
     source: &str,
     file_symbols: &FileSymbols,
     scope: Node<'_>,
+    scope_matches: &dyn Fn(&str) -> bool,
 ) -> bool {
     let Some(scope_text) = source.get(scope.byte_range()).map(str::trim) else {
         return false;
@@ -1042,27 +1141,25 @@ fn laravel_collection_macro_scope_is_laravel_collection(
         return false;
     }
 
-    if scope_text.starts_with('\\')
-        && laravel_collection_macro_target_fqn(scope_text.trim_start_matches('\\'))
-    {
+    if scope_text.starts_with('\\') && scope_matches(scope_text.trim_start_matches('\\')) {
         return true;
     }
 
     let namespace = namespace_for_offset(source, file_symbols, scope.start_byte());
     if scope_text.contains('\\') {
-        if namespace.is_none() && laravel_collection_macro_target_fqn(scope_text) {
+        if namespace.is_none() && scope_matches(scope_text) {
             return true;
         }
         if let Some(namespace) = namespace.as_deref() {
             let namespaced_fqn = format!("{namespace}\\{scope_text}");
-            return laravel_collection_macro_target_fqn(&namespaced_fqn);
+            return scope_matches(&namespaced_fqn);
         }
         return false;
     }
 
     if let Some(namespace) = namespace.as_deref() {
         let namespaced_fqn = format!("{namespace}\\{scope_text}");
-        if laravel_collection_macro_target_fqn(&namespaced_fqn) {
+        if scope_matches(&namespaced_fqn) {
             return true;
         }
     }
@@ -1070,7 +1167,7 @@ fn laravel_collection_macro_scope_is_laravel_collection(
     file_symbols.use_statements.iter().any(|use_stmt| {
         use_stmt.kind == UseKind::Class
             && use_stmt.namespace.as_deref() == namespace.as_deref()
-            && laravel_collection_macro_target_fqn(&use_stmt.fqn)
+            && scope_matches(&use_stmt.fqn)
             && use_stmt
                 .alias
                 .as_deref()
@@ -3207,6 +3304,7 @@ fn is_laravel_eloquent_dynamic_method(member_name: &str) -> bool {
                 | "findorfail"
                 | "findmany"
                 | "first"
+                | "firstwhere"
                 | "firstorfail"
                 | "firstornew"
                 | "firstorcreate"
@@ -4102,6 +4200,11 @@ mod tests {
                 member_name: "whereEmail".to_string(),
                 kind: VirtualMemberKind::Method,
             },
+            VirtualMemberQuery {
+                owner_fqn: "App\\Models\\User".to_string(),
+                member_name: "firstWhere".to_string(),
+                kind: VirtualMemberKind::Method,
+            },
         ] {
             assert!(
                 cache.has_virtual_member(&registry, &ctx, &query),
@@ -4892,6 +4995,122 @@ class AppServiceProvider
             .sources
             .iter()
             .any(|source| matches!(source, VirtualMemberSource::SourceRange { .. })));
+    }
+
+    #[test]
+    fn laravel_registered_macros_are_virtual_methods_on_exact_target() {
+        let uri = "file:///laravel-str-macro.php";
+        let source = r#"<?php
+namespace Illuminate\Support;
+class Str {
+    public static function macro(string $name, callable $callback): void {}
+}
+
+namespace App\Providers;
+
+use Illuminate\Support\Str;
+
+class AppServiceProvider
+{
+    public function boot(): void
+    {
+        Str::macro('markdownExternalLink', function (string $text): string {
+            return $text;
+        });
+    }
+}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        let file_symbols = extract_file_symbols(parser.tree().unwrap(), source, uri);
+        let index = WorkspaceIndex::new();
+        index.update_file(uri, file_symbols.clone());
+
+        let registry = default_framework_provider_registry();
+        let ctx = FrameworkProviderContext::new(&index)
+            .with_source_uri(Some(uri))
+            .with_file(Some(&file_symbols), Some(source));
+
+        let members = registry.virtual_members(
+            &ctx,
+            &VirtualMemberQuery {
+                owner_fqn: "Illuminate\\Support\\Str".to_string(),
+                member_name: "markdownExternalLink".to_string(),
+                kind: VirtualMemberKind::Method,
+            },
+        );
+        assert_eq!(members.len(), 1);
+        assert!(members[0]
+            .sources
+            .iter()
+            .any(|source| matches!(source, VirtualMemberSource::SourceRange { .. })));
+
+        let unrelated = registry.virtual_members(
+            &ctx,
+            &VirtualMemberQuery {
+                owner_fqn: "Illuminate\\Support\\Collection".to_string(),
+                member_name: "markdownExternalLink".to_string(),
+                kind: VirtualMemberKind::Method,
+            },
+        );
+        assert!(unrelated.is_empty());
+    }
+
+    #[test]
+    fn laravel_facades_optional_and_faker_expose_dynamic_members() {
+        let uri = "file:///laravel-dynamic-members.php";
+        let source = r#"<?php
+namespace Illuminate\Support\Facades;
+class Facade {}
+class URL extends Facade {}
+
+namespace Illuminate\Support;
+class Optional {}
+
+namespace Faker;
+class Generator {}
+"#;
+
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        let file_symbols = extract_file_symbols(parser.tree().unwrap(), source, uri);
+        let index = WorkspaceIndex::new();
+        index.update_file(uri, file_symbols.clone());
+
+        let registry = default_framework_provider_registry();
+        let ctx = FrameworkProviderContext::new(&index)
+            .with_source_uri(Some(uri))
+            .with_file(Some(&file_symbols), Some(source));
+
+        for query in [
+            VirtualMemberQuery {
+                owner_fqn: "Illuminate\\Support\\Facades\\URL".to_string(),
+                member_name: "forceRootUrl".to_string(),
+                kind: VirtualMemberKind::Method,
+            },
+            VirtualMemberQuery {
+                owner_fqn: "Illuminate\\Support\\Optional".to_string(),
+                member_name: "$id".to_string(),
+                kind: VirtualMemberKind::Property,
+            },
+            VirtualMemberQuery {
+                owner_fqn: "Faker\\Generator".to_string(),
+                member_name: "$firstName".to_string(),
+                kind: VirtualMemberKind::Property,
+            },
+            VirtualMemberQuery {
+                owner_fqn: "Faker\\Generator".to_string(),
+                member_name: "sentence".to_string(),
+                kind: VirtualMemberKind::Method,
+            },
+        ] {
+            assert!(
+                !registry.virtual_members(&ctx, &query).is_empty(),
+                "expected dynamic member for {:?}",
+                query
+            );
+        }
     }
 
     #[test]

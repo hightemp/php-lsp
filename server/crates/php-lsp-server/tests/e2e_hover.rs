@@ -2009,8 +2009,9 @@ function demo(Supported $subject, User $fallback): void {
     let owner_hover = hover_markdown_value(&extract_result(owner_hover));
     assert!(
         owner_hover.contains("@property User $owner")
-            && owner_hover
-                .contains("**Type:** [`User`](<file:///test/hover-phpdoc-class-links.php#L4>)"),
+            && owner_hover.contains(
+                "**Type:** [`App\\User`](<file:///test/hover-phpdoc-class-links.php#L4>)"
+            ),
         "expected virtual property type link, got: {}",
         owner_hover
     );

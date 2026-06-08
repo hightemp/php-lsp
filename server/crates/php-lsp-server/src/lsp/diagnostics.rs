@@ -1581,6 +1581,10 @@ pub(in crate::server) fn is_dynamic_member_access(
         return true;
     }
 
+    if sym_at_pos.ref_kind == RefKind::MethodCall && member_name.starts_with('$') {
+        return true;
+    }
+
     if class_has_unindexed_ancestor(index, class_fqn, &mut Vec::new()) {
         return true;
     }
@@ -1620,12 +1624,32 @@ pub(in crate::server) fn is_dynamic_member_access(
         return true;
     }
 
+    is_enum_builtin_property_access(index, class_fqn, member_name)
+}
+
+fn is_enum_builtin_property_access(
+    index: &WorkspaceIndex,
+    class_fqn: &str,
+    member_name: &str,
+) -> bool {
     let bare_member_name = member_name.strip_prefix('$').unwrap_or(member_name);
-    matches!(bare_member_name, "name" | "value")
-        && index
-            .types
-            .get(class_fqn.trim_start_matches('\\'))
-            .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
+    if !matches!(bare_member_name, "name" | "value") {
+        return false;
+    }
+
+    let class_fqn = class_fqn.trim_start_matches('\\');
+    if !index
+        .types
+        .get(class_fqn)
+        .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
+    {
+        return false;
+    }
+
+    bare_member_name == "name"
+        || index
+            .resolve_member(&format!("{class_fqn}::$value"))
+            .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Property)
 }
 
 pub(in crate::server) fn class_has_magic_get(index: &WorkspaceIndex, class_fqn: &str) -> bool {
@@ -1825,6 +1849,7 @@ pub(crate) fn lazy_resolvable_diagnostic_fqn(message: &str) -> Option<String> {
         "Unresolved use statement: ",
         "Unknown class: ",
         "Unknown method: ",
+        "Unknown property: ",
         "Unknown class constant: ",
     ] {
         if let Some(fqn) = message.strip_prefix(prefix) {
@@ -1843,13 +1868,33 @@ pub(crate) fn lazy_resolved_symbol_diagnostic_is_satisfied(
     message: &str,
     fqn: &str,
 ) -> bool {
+    let Some((class_fqn, member_name)) = fqn.rsplit_once("::") else {
+        return index.resolve_fqn(fqn).is_some();
+    };
+
+    if message.starts_with("Unknown property: ") {
+        return resolve_member_on_class_for_ref_kind(
+            index,
+            class_fqn,
+            member_name,
+            RefKind::PropertyAccess,
+            Some(fqn),
+        )
+        .or_else(|| {
+            resolve_member_on_class_for_ref_kind(
+                index,
+                class_fqn,
+                member_name,
+                RefKind::StaticPropertyAccess,
+                Some(fqn),
+            )
+        })
+        .is_some();
+    }
+
     if index.resolve_fqn(fqn).is_some() {
         return true;
     }
-
-    let Some((class_fqn, member_name)) = fqn.rsplit_once("::") else {
-        return false;
-    };
 
     let ref_kind = if message.starts_with("Unknown method: ") {
         RefKind::MethodCall
