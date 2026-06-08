@@ -95,6 +95,7 @@ pub(crate) use lsp::diagnostics::compute_diagnostics_with_config;
 use lsp::diagnostics::*;
 pub(crate) use lsp::diagnostics::{
     compute_diagnostics_with_runtime_config, lazy_resolvable_diagnostic_fqn,
+    lazy_resolved_symbol_diagnostic_is_satisfied,
 };
 pub(crate) use lsp::document_links::static_php_include_target_paths_for_source;
 use lsp::document_symbols::*;

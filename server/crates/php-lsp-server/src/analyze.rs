@@ -1,12 +1,12 @@
 use crate::server::{
     collect_php_files, compute_diagnostics_with_runtime_config,
     diagnostic_budget_config_from_settings, discover_workspace_root_config,
-    lazy_resolvable_diagnostic_fqn, load_configured_stubs, load_effective_configuration_settings,
-    normalize_config_paths, parse_vendor_autoload_map, path_is_excluded,
-    resolve_vendor_paths_from_map, vendor_autoload_file_paths_from_map,
-    vendor_namespace_exists_from_map, workspace_index_directories, DiagnosticBudgetConfig,
-    DiagnosticSeverityConfig, DiagnosticsMode, DiagnosticsRuntimeConfig, PhpVersion,
-    VendorAutoloadMap,
+    lazy_resolvable_diagnostic_fqn, lazy_resolved_symbol_diagnostic_is_satisfied,
+    load_configured_stubs, load_effective_configuration_settings, normalize_config_paths,
+    parse_vendor_autoload_map, path_is_excluded, resolve_vendor_paths_from_map,
+    vendor_autoload_file_paths_from_map, vendor_namespace_exists_from_map,
+    workspace_index_directories, DiagnosticBudgetConfig, DiagnosticSeverityConfig, DiagnosticsMode,
+    DiagnosticsRuntimeConfig, PhpVersion, VendorAutoloadMap,
 };
 use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -737,7 +737,11 @@ fn filter_analyze_lazy_resolved_symbol_diagnostics(
                 let unresolved_use_statement =
                     diagnostic.message.starts_with("Unresolved use statement: ");
                 analyze_index_class_dependencies(context, &fqn);
-                if context.index.resolve_fqn(&fqn).is_some() {
+                if lazy_resolved_symbol_diagnostic_is_satisfied(
+                    context.index,
+                    &diagnostic.message,
+                    &fqn,
+                ) {
                     continue;
                 }
                 if unresolved_use_statement
@@ -1278,6 +1282,119 @@ mod tests {
         std::fs::write(
             root.join("src/Demo.php"),
             "<?php\nnamespace App;\nuse PHPUnit\\Framework\\Attributes\\Test;\nuse Laravel\\Pulse\\Recorders;\n#[Test]\nfinal class Demo { public function run(): void { \\Safe\\json_decode('{}'); \\Safe\\json_encode([]); Recorders\\SlowRequests::class; } }\n",
+        )
+        .unwrap();
+
+        let result = run_analyze_cli(vec![
+            "src/Demo.php".to_string(),
+            "--project-root".to_string(),
+            root.display().to_string(),
+            "--severity".to_string(),
+            "warning".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ]);
+
+        assert_eq!(
+            result.exit_code, 0,
+            "stdout: {}\nstderr: {}",
+            result.stdout, result.stderr
+        );
+        let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(value["summary"]["diagnostics"], 0, "{}", result.stdout);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn analyze_resolves_carbon_static_trait_methods_and_laravel_now_helper_return() {
+        let root = temp_dir("carbon-static-trait-methods");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/nesbot/carbon/src/Carbon/Traits")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/laravel/framework/src/Illuminate/Foundation"))
+            .unwrap();
+        std::fs::create_dir_all(root.join("vendor/laravel/framework/src/Illuminate/Support"))
+            .unwrap();
+
+        std::fs::write(
+            root.join("composer.json"),
+            r#"{
+                "autoload": {
+                    "psr-4": {
+                        "App\\": "src/"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/composer/installed.json"),
+            serde_json::json!({
+                "packages": [
+                    {
+                        "name": "nesbot/carbon",
+                        "install-path": "../nesbot/carbon",
+                        "autoload": {
+                            "psr-4": {
+                                "Carbon\\": "src/Carbon/"
+                            }
+                        }
+                    },
+                    {
+                        "name": "laravel/framework",
+                        "install-path": "../laravel/framework",
+                        "autoload": {
+                            "psr-4": {
+                                "Illuminate\\": "src/Illuminate/"
+                            },
+                            "files": ["src/Illuminate/Foundation/helpers.php"]
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("vendor/nesbot/carbon/src/Carbon/CarbonInterface.php"),
+            "<?php\nnamespace Carbon;\ninterface CarbonInterface { public static function now(): static; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/nesbot/carbon/src/Carbon/Traits/Creator.php"),
+            "<?php\nnamespace Carbon\\Traits;\ntrait Creator { public static function now(): static { return new static(); } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/nesbot/carbon/src/Carbon/Traits/Date.php"),
+            "<?php\nnamespace Carbon\\Traits;\nuse Carbon\\CarbonInterface;\n/**\n * @method CarbonInterface addMinutes(int|float $value = 1) Add minutes.\n */\ntrait Date { use Creator; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/nesbot/carbon/src/Carbon/Carbon.php"),
+            "<?php\nnamespace Carbon;\nuse Carbon\\Traits\\Date;\n/**\n * @method bool isSameYear(\\DateTimeInterface|string $date) Checks if same year. If null passed, compare to now (with the same timezone).\n * @method $this addMinutes(int|float $value = 1) Add minutes.\n */\nclass Carbon extends \\DateTime implements CarbonInterface { use Date; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/nesbot/carbon/src/Carbon/CarbonImmutable.php"),
+            "<?php\nnamespace Carbon;\nuse Carbon\\Traits\\Date;\n/**\n * @method CarbonImmutable addMinutes(int|float $value = 1) Add minutes.\n */\nclass CarbonImmutable extends \\DateTimeImmutable implements CarbonInterface { use Date; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/laravel/framework/src/Illuminate/Support/Carbon.php"),
+            "<?php\nnamespace Illuminate\\Support;\nuse Carbon\\Carbon as BaseCarbon;\nclass Carbon extends BaseCarbon {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vendor/laravel/framework/src/Illuminate/Foundation/helpers.php"),
+            "<?php\nif (! function_exists('now')) { function now($tz = null): \\Illuminate\\Support\\Carbon { return new \\Illuminate\\Support\\Carbon(); } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Demo.php"),
+            "<?php\nnamespace App;\nuse Carbon\\Carbon;\nuse Carbon\\CarbonImmutable;\nfinal class Demo { public function run(): void { Carbon::now()->addMinutes(5); CarbonImmutable::now()->addMinutes(5); now()->addMinutes(5); } }\n",
         )
         .unwrap();
 

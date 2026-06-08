@@ -417,18 +417,9 @@ fn parse_method_tag(rest: &str, doc: &mut PhpDoc) {
     };
 
     // Format: [ReturnType] name([params]) [description]
-    // Simple parsing: find method name (word before '(')
-    let paren_pos = match find_last_top_level_open_paren(rest) {
-        Some(pos) => pos,
+    let (paren_pos, close_paren, return_type, name) = match find_method_signature_parens(rest) {
+        Some(parts) => parts,
         None => return,
-    };
-
-    let Some((return_type, name)) = split_method_return_and_name(rest[..paren_pos].trim()) else {
-        return;
-    };
-
-    let Some(close_paren) = find_matching_paren(rest, paren_pos) else {
-        return;
     };
     let params_body = &rest[paren_pos + 1..close_paren];
     let params = parse_method_params(params_body);
@@ -550,8 +541,7 @@ fn split_method_return_and_name(before_paren: &str) -> Option<(Option<TypeInfo>,
     Some((return_type, name))
 }
 
-fn find_last_top_level_open_paren(s: &str) -> Option<usize> {
-    let mut result = None;
+fn find_method_signature_parens(s: &str) -> Option<(usize, usize, Option<TypeInfo>, String)> {
     let mut paren_depth = 0usize;
     let mut angle_depth = 0usize;
     let mut bracket_depth = 0usize;
@@ -578,7 +568,17 @@ fn find_last_top_level_open_paren(s: &str) -> Option<usize> {
 
         let nested = paren_depth > 0 || angle_depth > 0 || bracket_depth > 0 || brace_depth > 0;
         if ch == '(' && !nested {
-            result = Some(idx);
+            if let Some((return_type, name)) = split_method_return_and_name(s[..idx].trim()) {
+                if let Some(close_paren) = find_matching_paren(s, idx) {
+                    let after = s[close_paren + 1..].trim_start();
+                    // `callable(A): B handle()` has a top-level callable `(` before
+                    // the actual method signature. Do not treat callable parameter
+                    // lists as method declarations.
+                    if !after.starts_with(':') {
+                        return Some((idx, close_paren, return_type, name));
+                    }
+                }
+            }
         }
 
         match ch {
@@ -594,7 +594,7 @@ fn find_last_top_level_open_paren(s: &str) -> Option<usize> {
         }
     }
 
-    result
+    None
 }
 
 fn consume_type_expr(rest: &str) -> Option<usize> {
@@ -1720,6 +1720,24 @@ mod tests {
             method.params[3].type_info.as_ref().map(ToString::to_string),
             Some("array<string, int>".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_method_ignores_parentheses_in_description() {
+        let doc = parse_phpdoc(
+            "/**\n * @method bool isSameYear(DateTimeInterface|string $date) Checks if the date is in the same year. If null passed, compare to now (with the same timezone).\n */",
+        );
+
+        assert_eq!(doc.methods.len(), 1);
+        let method = &doc.methods[0];
+        assert_eq!(method.name, "isSameYear");
+        assert!(!method.is_static);
+        assert_eq!(
+            method.return_type,
+            Some(TypeInfo::Simple("bool".to_string()))
+        );
+        assert_eq!(method.params.len(), 1);
+        assert_eq!(method.params[0].name, "date");
     }
 
     #[test]

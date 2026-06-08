@@ -1838,6 +1838,31 @@ pub(crate) fn lazy_resolvable_diagnostic_fqn(message: &str) -> Option<String> {
     None
 }
 
+pub(crate) fn lazy_resolved_symbol_diagnostic_is_satisfied(
+    index: &WorkspaceIndex,
+    message: &str,
+    fqn: &str,
+) -> bool {
+    if index.resolve_fqn(fqn).is_some() {
+        return true;
+    }
+
+    let Some((class_fqn, member_name)) = fqn.rsplit_once("::") else {
+        return false;
+    };
+
+    let ref_kind = if message.starts_with("Unknown method: ") {
+        RefKind::MethodCall
+    } else if message.starts_with("Unknown class constant: ") {
+        RefKind::ClassConstant
+    } else {
+        return false;
+    };
+
+    resolve_member_on_class_for_ref_kind(index, class_fqn, member_name, ref_kind, Some(fqn))
+        .is_some()
+}
+
 pub(in crate::server) fn static_instance_misuse_message(
     node_kind: &str,
     sym_at_pos: &SymbolAtPosition,
@@ -4153,6 +4178,13 @@ impl PhpLspBackend {
                     let unresolved_use_statement =
                         diagnostic.message.starts_with("Unresolved use statement: ");
                     if self.resolve_fqn_lazy(&fqn).await.is_some() {
+                        continue;
+                    }
+                    if lazy_resolved_symbol_diagnostic_is_satisfied(
+                        &self.index,
+                        &diagnostic.message,
+                        &fqn,
+                    ) {
                         continue;
                     }
                     if unresolved_use_statement && self.vendor_namespace_exists_lazy(&fqn).await {

@@ -5370,9 +5370,12 @@ change.
     /home/apanov/ForTesting/monica/tests/Feature/Controllers/Profile/UserTokenControllerTest.php
     /home/apanov/ForTesting/monica/tests/Helpers/GuzzleMock.php
 
-- [ ] **H-DIAGNOSTICS-MONICA-CARBON-STATIC-TRAIT-METHODS-2026-06-05** Resolve Carbon static trait/interface methods and Laravel `now()` helper return type
+- [x] **H-DIAGNOSTICS-MONICA-CARBON-STATIC-TRAIT-METHODS-2026-06-05** Resolve Carbon static trait/interface methods and Laravel `now()` helper return type *(done 2026-06-08)*
   - False positives include `Instance method called statically: Carbon\\Carbon::now`, `CarbonImmutable::now`, and `Unknown method: Illuminate\\Support\\Carbon::addMinutes` after Laravel `now()`.
   - Representative check: `vendor/nesbot/carbon/src/Carbon/Traits/Creator.php` declares `public static function now(...)`; `now()->addMinutes(...)` should infer Carbon-compatible instance methods.
+  - Started: 2026-06-08; reproduce Carbon static trait/member diagnostics in Monica, inspect trait/interface member resolution and Laravel helper return inference, add focused regression tests, and validate against representative Monica paths.
+  - Implemented: parse PHPDoc `@method` signatures without treating parentheses in descriptions as method signatures; use hierarchy-aware member resolution when lazy-indexed diagnostics are rechecked by the LSP server and analyze CLI.
+  - Validation: `cargo fmt --all --check`; `git diff --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; Monica representative analyze checks for `SetupDummyAccount.php`, `VaultLifeMetricsViewHelper.php`, and `EmailVerificationTest.php`; Verifier subagent `GO`.
   - Files:
     /home/apanov/ForTesting/monica/app/Console/Commands/Local/SetupDummyAccount.php
     /home/apanov/ForTesting/monica/app/Domains/Contact/ManageAvatar/Services/DestroyAvatar.php
