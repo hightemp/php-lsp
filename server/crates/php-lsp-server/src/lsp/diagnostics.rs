@@ -2103,6 +2103,20 @@ pub(in crate::server) fn node_inside_anonymous_class_body(
     false
 }
 
+fn return_statement_inside_nested_closure_scope(node: tree_sitter::Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "arrow_function" | "anonymous_function" | "anonymous_function_creation_expression" => {
+                return true;
+            }
+            "method_declaration" | "function_definition" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::server) struct InferredExprType {
     pub(in crate::server) display: String,
@@ -2395,6 +2409,9 @@ pub(in crate::server) fn check_return_type_compatibility(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if node_inside_anonymous_class_body(node, source) {
+        return;
+    }
+    if return_statement_inside_nested_closure_scope(node) {
         return;
     }
 

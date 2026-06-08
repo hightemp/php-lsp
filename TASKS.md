@@ -5451,9 +5451,12 @@ change.
     /home/apanov/ForTesting/monica/database/factories/Instance/CronFactory.php
     /home/apanov/ForTesting/monica/tests/Feature/Auth/EmailVerificationTest.php
 
-- [ ] **H-DIAGNOSTICS-MONICA-NESTED-CLOSURE-RETURN-CONTEXT-2026-06-05** Do not check nested closure returns against the enclosing function return type
+- [x] **H-DIAGNOSTICS-MONICA-NESTED-CLOSURE-RETURN-CONTEXT-2026-06-05** Do not check nested closure returns against the enclosing function return type *(done 2026-06-08)*
   - False positives include return-type mismatches inside closures passed to `Attribute::make(get: ...)`, Eloquent factory `state(...)`, and collection callbacks such as `map`, `filter`, and `mapToGroups`.
   - Representative checks: `Contact::age(): Attribute` has getter closure returning nullable scalar values; `UserFactory::unverified()` returns `$this->state(fn (...) => array)` but the closure array is not the method return.
+  - Started: 2026-06-08; reproduce nested closure return diagnostics in Monica, isolate return-type context tracking, add regression coverage for anonymous functions/arrow functions inside typed methods, and validate against representative Monica paths.
+  - Implemented: return-type diagnostics now stop at nested anonymous/arrow-function scopes instead of checking those returns against the enclosing named method/function.
+  - Validation: `cargo fmt --all --check`; `git diff --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; Monica representative analyze checks for `Contact.php`, `UserFactory.php`, `VaultShowViewHelper.php`, `ContactInformation.php`, `TimelineEvent.php`, and `GroupIndexViewHelper.php`; Verifier subagent `GO`.
   - Files:
     /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php
     /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPushMissed.php

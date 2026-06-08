@@ -2321,6 +2321,98 @@ final class Factory
     }
 }
 
+#[test]
+fn test_compute_diagnostics_skips_nested_closure_returns_for_enclosing_return_type() {
+    let uri = "file:///nested-closure-returns.php";
+    let code = r#"<?php
+namespace App\Tests;
+
+class Attribute {
+    public static function make(callable $get): self
+    {
+        return new self();
+    }
+}
+
+class Factory {}
+
+class Model
+{
+    public function name(): Attribute
+    {
+        return Attribute::make(
+            get: function ($value) {
+                if ($value) {
+                    return null;
+                }
+
+                return ['label' => 'Ada'];
+            }
+        );
+    }
+
+    public function unverified(): Factory
+    {
+        return $this->state(function (array $attributes) {
+            return [
+                'email_verified_at' => null,
+            ];
+        });
+    }
+
+    public function broken(): Factory
+    {
+        return ['not' => 'a factory'];
+    }
+
+    private function state(callable $callback): Factory
+    {
+        return new Factory();
+    }
+}
+"#;
+
+    let mut parser = FileParser::new();
+    parser.parse_full(code);
+
+    let index = WorkspaceIndex::new();
+    let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+    index.update_file(uri, symbols);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+
+    for unexpected in [
+        "Return type mismatch in App\\Tests\\Model::name: expected Attribute, got null",
+        "Return type mismatch in App\\Tests\\Model::name: expected Attribute, got array",
+        "Return type mismatch in App\\Tests\\Model::unverified: expected Factory, got array",
+    ] {
+        assert!(
+            !messages.iter().any(|message| message.contains(unexpected)),
+            "Did not expect `{}` in diagnostics, got: {:?}",
+            unexpected,
+            messages
+        );
+    }
+
+    let expected = "Return type mismatch in App\\Tests\\Model::broken: expected Factory, got array";
+    assert!(
+        messages.iter().any(|message| message.contains(expected)),
+        "Expected `{}` in diagnostics, got: {:?}",
+        expected,
+        messages
+    );
+}
+
 fn compute_member_heavy_diagnostics(diagnostic_budget: DiagnosticBudgetConfig) -> Vec<Diagnostic> {
     let uri = "file:///large-member-heavy.php";
     let mut code = String::from(
