@@ -786,6 +786,7 @@ fn is_inside_class_reference_context(start: Node) -> bool {
                     | "base_clause"
                     | "class_interface_clause"
                     | "type_list"
+                    | "use_declaration"
                     | "class_constant_access_expression"
                     | "scoped_call_expression"
                     | "scoped_property_access_expression"
@@ -5875,6 +5876,7 @@ fn is_constant_reference_context(parent_kind: &str) -> bool {
             | "nullsafe_member_call_expression"
             | "namespace_use_clause"
             | "namespace_definition"
+            | "use_declaration"
     )
 }
 
@@ -6412,6 +6414,40 @@ mod tests {
         let sym = result.unwrap();
         assert_eq!(sym.fqn, "App\\Service\\UserService::__construct");
         assert_eq!(sym.ref_kind, RefKind::Constructor);
+    }
+
+    #[test]
+    fn test_resolve_trait_use_clause_name_with_import_alias() {
+        let code = r#"<?php
+namespace App\Jobs;
+
+use Illuminate\Bus\Batchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Bus\Queueable;
+use Illuminate\Queue\SerializesModels;
+
+class DeleteMultipleVCard
+{
+    use Batchable, InteractsWithQueue, Queueable, SerializesModels;
+}
+"#;
+        let cases = [
+            ("Batchable,", "Illuminate\\Bus\\Batchable"),
+            (
+                "InteractsWithQueue,",
+                "Illuminate\\Queue\\InteractsWithQueue",
+            ),
+            ("Queueable,", "Illuminate\\Bus\\Queueable"),
+            ("SerializesModels;", "Illuminate\\Queue\\SerializesModels"),
+        ];
+
+        for (needle, expected_fqn) in cases {
+            let (line, col) = find_line_col(code, needle);
+            let sym = parse_and_resolve(code, line, col).expect("trait use name should resolve");
+
+            assert_eq!(sym.ref_kind, RefKind::ClassName);
+            assert_eq!(sym.fqn, expected_fqn);
+        }
     }
 
     #[test]

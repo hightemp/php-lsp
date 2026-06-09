@@ -5567,3 +5567,10 @@ change.
   - Files:
     /home/apanov/Projects/bdpn-ui/app/src/Controller/DebtSuspensionController.php
     /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
+
+- [x] **H-HOVER-DEFINITION-TRAIT-USE-CLAUSE-2026-06-09** Resolve hover and go-to-definition for class trait-use clauses *(done 2026-06-09)*
+  - Started: 2026-06-09; reproduce missing hover/definition on `use Batchable, InteractsWithQueue, Queueable, SerializesModels;` inside a class body, fix symbol lookup for trait-use names without hardcoding framework traits, and add regression coverage.
+  - Implemented: parser symbol resolution now treats class-body trait `use_declaration` names as class references instead of global constants, preserving import-alias resolution for hover and go-to-definition.
+  - Validation: `cargo fmt --all --check`; `cargo clippy --all-targets -- -D warnings`; focused parser and LSP e2e tests; `cargo test --all`; `make install`; installed extension stdio smoke on Monica `DeleteMultipleVCard.php` returns `trait Batchable` hover and vendor `Batchable.php` definition.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Jobs/DeleteMultipleVCard.php

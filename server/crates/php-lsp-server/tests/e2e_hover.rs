@@ -781,6 +781,184 @@ function run(EntityManager $em): void
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_hover_and_definition_on_vendor_trait_use_clause() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-trait-use-hover-definition-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let app_dir = tmp_root.join("app/Domains/Contact/DavClient/Jobs");
+    let bus_dir = tmp_root.join("vendor/illuminate/bus");
+    let queue_dir = tmp_root.join("vendor/illuminate/queue");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::create_dir_all(&bus_dir).unwrap();
+    fs::create_dir_all(&queue_dir).unwrap();
+
+    fs::write(
+        tmp_root.join("composer.json"),
+        r#"{
+  "autoload": {
+    "psr-4": {
+      "App\\": "app/",
+      "Illuminate\\Bus\\": "vendor/illuminate/bus/",
+      "Illuminate\\Queue\\": "vendor/illuminate/queue/"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let batchable_path = bus_dir.join("Batchable.php");
+    let queueable_path = bus_dir.join("Queueable.php");
+    let interacts_path = queue_dir.join("InteractsWithQueue.php");
+    let serializes_path = queue_dir.join("SerializesModels.php");
+    fs::write(
+        &batchable_path,
+        r#"<?php
+namespace Illuminate\Bus;
+
+trait Batchable
+{
+    public function batching(): bool { return false; }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &queueable_path,
+        r#"<?php
+namespace Illuminate\Bus;
+
+trait Queueable {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &interacts_path,
+        r#"<?php
+namespace Illuminate\Queue;
+
+trait InteractsWithQueue {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &serializes_path,
+        r#"<?php
+namespace Illuminate\Queue;
+
+trait SerializesModels {}
+"#,
+    )
+    .unwrap();
+
+    let app_path = app_dir.join("DeleteMultipleVCard.php");
+    let app_php = r#"<?php
+namespace App\Domains\Contact\DavClient\Jobs;
+
+use Illuminate\Bus\Batchable;
+use Illuminate\Bus\Queueable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+
+class DeleteMultipleVCard
+{
+    use Batchable, InteractsWithQueue, Queueable, SerializesModels;
+}
+"#;
+    fs::write(&app_path, app_php).unwrap();
+
+    let root_uri = php_lsp_types::uri::path_to_uri(&tmp_root).unwrap();
+    let app_uri = php_lsp_types::uri::path_to_uri(&app_path).unwrap();
+    let batchable_uri = php_lsp_types::uri::path_to_uri(&batchable_path).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&app_uri, app_php))
+        .await
+        .unwrap();
+
+    let trait_position = utf16_position_at(app_php, "Batchable,");
+    let hover = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            2,
+            &app_uri,
+            trait_position.0,
+            trait_position.1,
+        ))
+        .await
+        .unwrap();
+    let hover = hover_markdown_value(&extract_result(hover));
+    assert!(
+        hover.contains("trait Batchable")
+            && hover.contains("Illuminate\\Bus\\Batchable")
+            && hover.contains(&batchable_uri),
+        "hover on class trait-use should resolve vendor trait source, got: {}",
+        hover
+    );
+
+    let definition = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            3,
+            &app_uri,
+            trait_position.0,
+            trait_position.1,
+        ))
+        .await
+        .unwrap();
+    let definition = extract_result(definition);
+    let target_uri = definition
+        .get("uri")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        target_uri, batchable_uri,
+        "definition on class trait-use should point to Batchable trait"
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_hover_callsite_generic_resolved_returns() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
