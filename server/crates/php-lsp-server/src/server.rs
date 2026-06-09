@@ -2142,7 +2142,6 @@ impl PhpLspBackend {
                             &open_files,
                             &uri_str,
                             &vendor_lazy_context,
-                            DiagnosticDependencyPreResolveMode::ClassHierarchy,
                         )
                         .await;
                     }
@@ -2159,6 +2158,15 @@ impl PhpLspBackend {
                             diags,
                             diagnostics_config.mode == DiagnosticsMode::Off,
                         );
+                    } else if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+                        && index_vendor
+                    {
+                        diags = filter_lazy_resolved_symbol_diagnostics_with_context(
+                            &reindex_index,
+                            &vendor_lazy_context,
+                            diags,
+                        )
+                        .await;
                     }
                     if reindex_document_versions
                         .get(&uri_str)

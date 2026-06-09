@@ -5558,3 +5558,12 @@ change.
   - Validation: `cargo fmt --all --check`; focused `cargo test -p php-lsp-server --test e2e_diagnostics test_post_index_diagnostics_preresolve_vendor_imports_for_open_files -- --nocapture`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; `git diff --check`; `make install`; installed extension binary analyze for Monica and bdpn reports `No diagnostics found`; installed LSP JSON-RPC smoke for Monica publishes `DIAG count=0`.
   - Files:
     /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
+
+- [x] **H-DIAGNOSTICS-INITIALIZED-EARLY-INDEXING-GUARD-2026-06-09** Mark workspace indexing active before stub/config loading *(done 2026-06-09)*
+  - False positives: files opened immediately after VS Code `initialized` can run semantic diagnostics before the workspace indexing guard is active, then publish stale unresolved vendor imports after indexing becomes ready.
+  - Started: 2026-06-09; reproduce the early `initialized` race for bdpn-ui and Monica, move the indexing guard to cover discovery/stub loading, add regression coverage for immediate `didOpen`, and validate with installed LSP smoke checks.
+  - Implemented: `initialized` now marks workspace indexing active before client logging, stubs loading, and Composer root discovery; immediate open-file diagnostics stay syntax-only while setup/indexing is active; post-index open-file diagnostics use lightweight import pre-resolve plus targeted lazy filtering for concrete unresolved diagnostics instead of broad vendor dependency walks.
+  - Validation: `cargo fmt --all --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test -p php-lsp-server --test e2e_diagnostics -- --nocapture`; `cargo test --all`; `git diff --check`; `make install`; installed extension binary `analyze` for bdpn-ui and Monica reports `No diagnostics found`; installed stdio LSP smoke for immediate `initialized` + `didOpen` publishes early `DIAG count=0` and clean post-ready diagnostics for both listed files.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/DebtSuspensionController.php
+    /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php

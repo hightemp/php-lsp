@@ -8,6 +8,9 @@ use tracing::Instrument;
 impl PhpLspBackend {
     pub(crate) async fn lsp_initialized(&self, _params: InitializedParams) {
         tracing::info!("php-lsp: initialized");
+        let indexing_run_state = self.indexing_run.clone();
+        let indexing_token = self.start_indexing_run().await;
+
         self.client
             .log_message(MessageType::INFO, "php-lsp server initialized")
             .await;
@@ -33,6 +36,7 @@ impl PhpLspBackend {
                 }),
             )
             .await;
+            finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
             return;
         }
 
@@ -149,8 +153,6 @@ impl PhpLspBackend {
             vendor_autoload_cache: vendor_autoload_cache.clone(),
             vendor_file_lru: vendor_file_lru.clone(),
         };
-        let indexing_run_state = self.indexing_run.clone();
-        let indexing_token = self.start_indexing_run().await;
         tokio::spawn(async move {
             for config in &configs {
                 if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
@@ -239,7 +241,6 @@ impl PhpLspBackend {
                             &open_files,
                             &uri_str,
                             &vendor_lazy_context,
-                            DiagnosticDependencyPreResolveMode::ClassHierarchy,
                         )
                         .await;
                     }
@@ -256,6 +257,15 @@ impl PhpLspBackend {
                             diags,
                             diagnostics_config.mode == DiagnosticsMode::Off,
                         );
+                    } else if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+                        && index_vendor
+                    {
+                        diags = filter_lazy_resolved_symbol_diagnostics_with_context(
+                            &reindex_index,
+                            &vendor_lazy_context,
+                            diags,
+                        )
+                        .await;
                     }
                     if reindex_document_versions
                         .get(&uri_str)

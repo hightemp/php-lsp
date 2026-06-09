@@ -2,6 +2,8 @@ mod support;
 
 use php_lsp_types::uri::path_to_uri;
 use support::*;
+use tower_lsp::ls_types::{DidOpenTextDocumentParams, InitializedParams, TextDocumentItem, Uri};
+use tower_lsp::LanguageServer;
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_open_file_diagnostics_are_syntax_only_while_workspace_indexing_runs() {
@@ -103,6 +105,94 @@ final class ActiveDiagnostics
         "semantic diagnostics should resume after indexing is ready, got: {:?}",
         after_indexing_messages
     );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_immediate_did_open_diagnostics_are_guarded_during_initialized_setup() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-initialized-early-diagnostics-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    let src_dir = tmp_root.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(
+        tmp_root.join("composer.json"),
+        r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+    )
+    .unwrap();
+
+    let app_path = src_dir.join("ImmediateOpen.php");
+    let app_uri = path_to_uri(&app_path).unwrap();
+    let app_code = r#"<?php
+namespace App;
+
+use Vendor\Pkg\Service;
+
+final class ImmediateOpen
+{
+    public function handle(Service $service): void {}
+}
+"#;
+    fs::write(&app_path, app_code).unwrap();
+
+    let root_uri = path_to_uri(&tmp_root).unwrap();
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+
+    let backend = service.inner();
+    let open_params = DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: app_uri.parse::<Uri>().unwrap(),
+            language_id: "php".to_string(),
+            version: 1,
+            text: app_code.to_string(),
+        },
+    };
+    let (_, _) = tokio::join!(
+        backend.initialized(InitializedParams {}),
+        backend.did_open(open_params)
+    );
+
+    let early_diagnostics =
+        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(3)).await;
+    let early_messages = published_diagnostic_messages(&early_diagnostics);
+    assert!(
+        !early_messages
+            .iter()
+            .any(|message| message.contains("Vendor\\Pkg\\Service")),
+        "diagnostics published during initialized setup should not report unresolved symbols, got: {:?}",
+        early_messages
+    );
+
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
 
     service
         .ready()

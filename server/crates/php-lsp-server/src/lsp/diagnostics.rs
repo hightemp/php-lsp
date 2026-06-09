@@ -513,18 +513,11 @@ pub(in crate::server) async fn compute_open_file_diagnostics(
     .await
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::server) enum DiagnosticDependencyPreResolveMode {
-    ClassHierarchy,
-    FullDependencies,
-}
-
 pub(in crate::server) async fn preresolve_open_file_diagnostic_dependencies(
     index: &WorkspaceIndex,
     open_files: &DashMap<String, FileParser>,
     uri_str: &str,
     vendor_context: &VendorLazyIndexContext,
-    mode: DiagnosticDependencyPreResolveMode,
 ) {
     let use_statement_fqns = index
         .file_symbols
@@ -561,16 +554,71 @@ pub(in crate::server) async fn preresolve_open_file_diagnostic_dependencies(
             continue;
         }
 
-        match mode {
-            DiagnosticDependencyPreResolveMode::ClassHierarchy => {
-                lazy_index_class_with_context(vendor_context, &fqn).await;
-                lazy_index_parents_with_context(vendor_context, &fqn, 0).await;
-            }
-            DiagnosticDependencyPreResolveMode::FullDependencies => {
-                lazy_index_class_dependencies_with_context(vendor_context, &fqn).await;
+        lazy_index_class_with_context(vendor_context, &fqn).await;
+    }
+}
+
+fn lazy_diagnostic_class_fqn(fqn: &str) -> &str {
+    let fqn = fqn.trim_start_matches('\\');
+    fqn.rsplit_once("::")
+        .map(|(class_fqn, _)| class_fqn)
+        .unwrap_or(fqn)
+}
+
+async fn vendor_namespace_exists_with_context(
+    vendor_context: &VendorLazyIndexContext,
+    fqn: &str,
+) -> bool {
+    if !vendor_context.index_vendor {
+        return false;
+    }
+
+    for config in &vendor_context.workspace_configs {
+        let vendor_dir = config.root.join("vendor");
+        if !vendor_dir.is_dir() {
+            continue;
+        }
+        if let Some(vendor_map) =
+            cached_vendor_autoload_map(&vendor_context.vendor_autoload_cache, &vendor_dir).await
+        {
+            if vendor_namespace_exists_from_map(fqn, &vendor_map) {
+                return true;
             }
         }
     }
+
+    false
+}
+
+pub(in crate::server) async fn filter_lazy_resolved_symbol_diagnostics_with_context(
+    index: &WorkspaceIndex,
+    vendor_context: &VendorLazyIndexContext,
+    diagnostics: Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
+    let mut filtered = Vec::with_capacity(diagnostics.len());
+
+    for diagnostic in diagnostics {
+        if diagnostic.source.as_deref() == Some("php-lsp") {
+            if let Some(fqn) = lazy_resolvable_diagnostic_fqn(&diagnostic.message) {
+                let unresolved_use_statement =
+                    diagnostic.message.starts_with("Unresolved use statement: ");
+                let class_fqn = lazy_diagnostic_class_fqn(&fqn);
+                lazy_index_class_with_context(vendor_context, class_fqn).await;
+                lazy_index_parents_with_context(vendor_context, class_fqn, 0).await;
+                if lazy_resolved_symbol_diagnostic_is_satisfied(index, &diagnostic.message, &fqn) {
+                    continue;
+                }
+                if unresolved_use_statement
+                    && vendor_namespace_exists_with_context(vendor_context, &fqn).await
+                {
+                    continue;
+                }
+            }
+        }
+        filtered.push(diagnostic);
+    }
+
+    filtered
 }
 
 pub(in crate::server) async fn compute_source_diagnostics_blocking(
@@ -4218,7 +4266,6 @@ impl PhpLspBackend {
                 &self.open_files,
                 &uri_str,
                 &vendor_context,
-                DiagnosticDependencyPreResolveMode::FullDependencies,
             )
             .await;
         }
