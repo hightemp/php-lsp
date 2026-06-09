@@ -5528,3 +5528,18 @@ change.
   - Files:
     /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/AddressBookGetter.php
     /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Services/Utils/Dav/DavClient.php
+
+- [x] **H-DIAGNOSTICS-PACKAGED-STUBS-PATH-2026-06-09** Resolve bundled stubs from packaged VS Code binary layout *(done 2026-06-09)*
+  - False positives include `Unknown function: App\\Actions\\is_null` when running the packaged extension binary against Monica; the same source checkout binary reports no diagnostics.
+  - Root cause: CLI/server candidate stubs path discovery for `/extension/bin/linux-x64/php-lsp` misses `/extension/stubs` unless VS Code passes `bundledStubsPath`.
+  - Implemented: packaged binary stubs discovery now includes the VS Code extension layout `/extension/bin/<platform>/php-lsp` -> `/extension/stubs`, and the installed extension binary was rebuilt/replaced.
+  - Validation: `cargo fmt --all --check`; `git diff --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; installed extension binary analyze for `AttemptToAuthenticateSocialite.php` reports `No diagnostics found`; Verifier subagent `GO`.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
+
+- [x] **H-COMPLETION-PHPDOC-PROPERTY-DETAIL-REGRESSION-2026-06-09** Keep PHPDoc virtual property completion details property-shaped *(done 2026-06-09)*
+  - Regression: indexed PHPDoc virtual properties can be emitted through the generic symbol completion path and displayed as callable details like `(): int` instead of `@property-read int`.
+  - Implemented: generic symbol completion now formats properties as property types, preserves PHPDoc virtual property access tags, applies PHPDoc read/write access filtering to indexed virtual properties, and rejects rename/prepareRename for resolved PHPDoc virtual members.
+  - Validation: `cargo test -p php-lsp-server --test e2e_completion test_phpdoc_fixture_hover_completion_definition_and_diagnostics`; `cargo test -p php-lsp-completion test_member_completion_includes_phpdoc_virtual_members`; `cargo test --all`; Verifier subagent `GO`.
+  - Files:
+    /home/apanov/Projects/php-lsp/server/crates/php-lsp-server/tests/e2e_completion.rs

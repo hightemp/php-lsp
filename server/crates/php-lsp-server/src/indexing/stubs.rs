@@ -58,6 +58,7 @@ fn candidate_stubs_paths_for_exe(
     if let Some(dir) = exe.and_then(Path::parent) {
         push_candidate_path(&mut candidate_paths, dir.join("data/stubs"));
         push_candidate_path(&mut candidate_paths, dir.join("../stubs"));
+        push_candidate_path(&mut candidate_paths, dir.join("../../stubs"));
         push_candidate_path(&mut candidate_paths, dir.join("../../data/stubs"));
     }
 
@@ -315,6 +316,22 @@ mod tests {
                 .iter()
                 .any(|path| path == Path::new("/repo/php-lsp/server/data/stubs")),
             "expected source checkout stubs path in {paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_candidate_stubs_paths_include_packaged_extension_stubs_from_platform_binary() {
+        let root = Path::new("/tmp/project");
+        let exe = Path::new(
+            "/home/user/.vscode/extensions/hightemp.ht-php-lsp-0.6.0/bin/linux-x64/php-lsp",
+        );
+        let paths = candidate_stubs_paths_for_exe(root, None, Some(exe));
+
+        assert!(
+            paths.iter().any(|path| {
+                path == Path::new("/home/user/.vscode/extensions/hightemp.ht-php-lsp-0.6.0/stubs")
+            }),
+            "expected packaged extension stubs path in {paths:?}"
         );
     }
 

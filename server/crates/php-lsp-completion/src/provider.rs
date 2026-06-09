@@ -228,6 +228,11 @@ fn provide_member_completions(
             if !member_is_visible(&member, object_expr == "$this", current_class_fqn) {
                 continue;
             }
+            if let Some(property_access) = phpdoc_property_access_for_symbol(&member) {
+                if !phpdoc_property_matches_access(property_access, access_mode) {
+                    continue;
+                }
+            }
 
             items.push(symbol_to_completion_item(
                 &member,
@@ -689,27 +694,7 @@ fn symbol_to_completion_item(
 ) -> CompletionItem {
     let kind = symbol_kind_to_completion_kind(sym.kind);
 
-    let detail = sym.signature.as_ref().map(|sig| {
-        let params_str: Vec<String> = sig
-            .params
-            .iter()
-            .map(|p| {
-                let mut s = String::new();
-                if let Some(ref t) = p.type_info {
-                    s.push_str(&t.to_string());
-                    s.push(' ');
-                }
-                s.push('$');
-                s.push_str(&p.name);
-                s
-            })
-            .collect();
-        let mut detail = format!("({})", params_str.join(", "));
-        if let Some(ref ret) = sig.return_type {
-            detail.push_str(&format!(": {}", ret));
-        }
-        detail
-    });
+    let detail = symbol_completion_detail(sym);
 
     let label =
         if sym.kind == PhpSymbolKind::Property && is_static_access && !sym.name.starts_with('$') {
@@ -749,6 +734,70 @@ fn symbol_to_completion_item(
         _ => None,
     };
     item
+}
+
+fn symbol_completion_detail(sym: &SymbolInfo) -> Option<String> {
+    if sym.kind == PhpSymbolKind::Property {
+        return property_symbol_completion_detail(sym);
+    }
+
+    sym.signature.as_ref().map(|sig| {
+        let params_str: Vec<String> = sig
+            .params
+            .iter()
+            .map(|p| {
+                let mut s = String::new();
+                if let Some(ref t) = p.type_info {
+                    s.push_str(&t.to_string());
+                    s.push(' ');
+                }
+                s.push('$');
+                s.push_str(&p.name);
+                s
+            })
+            .collect();
+        let mut detail = format!("({})", params_str.join(", "));
+        if let Some(ref ret) = sig.return_type {
+            detail.push_str(&format!(": {}", ret));
+        }
+        detail
+    })
+}
+
+fn property_symbol_completion_detail(sym: &SymbolInfo) -> Option<String> {
+    let property_name = sym.name.trim_start_matches('$');
+    if let Some(ref doc_comment) = sym.doc_comment {
+        let phpdoc = parse_phpdoc(doc_comment);
+        if let Some(property) = phpdoc
+            .properties
+            .iter()
+            .find(|property| property.name == property_name)
+        {
+            let access = phpdoc_property_tag(property.access);
+            return Some(match &property.type_info {
+                Some(type_info) => format!("{} {}", access, type_info),
+                None => access.to_string(),
+            });
+        }
+    }
+
+    sym.signature
+        .as_ref()
+        .and_then(|sig| sig.return_type.as_ref())
+        .map(|return_type| return_type.to_string())
+}
+
+fn phpdoc_property_access_for_symbol(sym: &SymbolInfo) -> Option<PhpDocPropertyAccess> {
+    if sym.kind != PhpSymbolKind::Property {
+        return None;
+    }
+    let property_name = sym.name.trim_start_matches('$');
+    let phpdoc = parse_phpdoc(sym.doc_comment.as_ref()?);
+    phpdoc
+        .properties
+        .iter()
+        .find(|property| property.name == property_name)
+        .map(|property| property.access)
 }
 
 fn completion_prefix_rank(label: &str, member_prefix: Option<&str>) -> &'static str {

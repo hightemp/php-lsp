@@ -92,9 +92,10 @@ impl PhpLspBackend {
         }
 
         let resolved_for_rename = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
-        if resolved_for_rename.is_none()
-            && phpdoc_virtual_member_for_symbol(&self.index, &sym).is_some()
-        {
+        let phpdoc_virtual_member = phpdoc_virtual_member_for_symbol(&self.index, &sym);
+        if phpdoc_virtual_member.as_ref().is_some_and(|member| {
+            should_reject_phpdoc_virtual_member_rename(&resolved_for_rename, member)
+        }) {
             return Err(tower_lsp::jsonrpc::Error::invalid_params(
                 "Cannot rename PHPDoc virtual members",
             ));
@@ -269,9 +270,10 @@ impl PhpLspBackend {
 
                 // Don't rename built-in or PHPDoc virtual symbols
                 let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
-                if resolved.is_none()
-                    && phpdoc_virtual_member_for_symbol(&self.index, &sym).is_some()
-                {
+                let phpdoc_virtual_member = phpdoc_virtual_member_for_symbol(&self.index, &sym);
+                if phpdoc_virtual_member.as_ref().is_some_and(|member| {
+                    should_reject_phpdoc_virtual_member_rename(&resolved, member)
+                }) {
                     return Ok(None);
                 }
                 if resolved.is_none()
@@ -558,6 +560,35 @@ fn is_member_ref_kind(kind: RefKind) -> bool {
             | RefKind::StaticPropertyAccess
             | RefKind::ClassConstant
     )
+}
+
+fn should_reject_phpdoc_virtual_member_rename(
+    resolved: &Option<Arc<php_lsp_types::SymbolInfo>>,
+    member: &PhpDocVirtualMember,
+) -> bool {
+    match resolved.as_deref() {
+        Some(symbol) => resolved_symbol_is_phpdoc_virtual_member(symbol, member),
+        None => true,
+    }
+}
+
+fn resolved_symbol_is_phpdoc_virtual_member(
+    symbol: &php_lsp_types::SymbolInfo,
+    member: &PhpDocVirtualMember,
+) -> bool {
+    let expected_kind = match member.kind {
+        PhpDocVirtualMemberKind::Property => php_lsp_types::PhpSymbolKind::Property,
+        PhpDocVirtualMemberKind::Method => php_lsp_types::PhpSymbolKind::Method,
+    };
+    if symbol.kind != expected_kind
+        || symbol.parent_fqn.as_deref() != Some(member.owner.fqn.as_str())
+    {
+        return false;
+    }
+
+    let symbol_name = symbol.name.trim_start_matches('$');
+    symbol_name == member.name.trim_start_matches('$')
+        && symbol.doc_comment.as_deref() == member.owner.doc_comment.as_deref()
 }
 
 #[cfg(test)]
