@@ -13,6 +13,10 @@ use std::{
 type TemplateSubstitutions = HashMap<String, TypeInfo>;
 const MAX_TYPE_ALIAS_EXPANSION_DEPTH: usize = 32;
 
+fn member_kind_matches(kind: PhpSymbolKind, expected_kinds: Option<&[PhpSymbolKind]>) -> bool {
+    expected_kinds.is_none_or(|kinds| kinds.contains(&kind))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TypeAliasScope {
     Class(String),
@@ -191,6 +195,24 @@ impl WorkspaceIndex {
             class_fqn,
             member_name,
             fqn,
+            None,
+            &mut HashSet::new(),
+            &TemplateSubstitutions::new(),
+        )
+    }
+
+    /// Resolve a `Class::member` FQN to a member symbol of one of the expected kinds.
+    pub fn resolve_member_matching_kinds(
+        &self,
+        fqn: &str,
+        expected_kinds: &[PhpSymbolKind],
+    ) -> Option<Arc<SymbolInfo>> {
+        let (class_fqn, member_name) = fqn.rsplit_once("::")?;
+        self.resolve_member_in_hierarchy(
+            class_fqn,
+            member_name,
+            fqn,
+            Some(expected_kinds),
             &mut HashSet::new(),
             &TemplateSubstitutions::new(),
         )
@@ -203,6 +225,7 @@ impl WorkspaceIndex {
         class_fqn: &str,
         member_name: &str,
         original_fqn: &str,
+        expected_kinds: Option<&[PhpSymbolKind]>,
         visited: &mut HashSet<String>,
         substitutions: &TemplateSubstitutions,
     ) -> Option<Arc<SymbolInfo>> {
@@ -212,16 +235,17 @@ impl WorkspaceIndex {
 
         let members = self.get_direct_members(class_fqn);
         // Prefer exact FQN match first
-        if let Some(sym) = members.iter().find(|m| m.fqn == original_fqn) {
-            return Some(self.materialize_symbol(sym.clone(), substitutions));
-        }
-        // Fallback: match by name (for cases where caller doesn't know exact FQN form)
-        // Property names in SymbolInfo are stored without '$' prefix, so strip it for comparison
-        let bare_name = member_name.strip_prefix('$').unwrap_or(member_name);
         if let Some(sym) = members
             .iter()
-            .find(|m| m.name == member_name || m.name == bare_name)
+            .find(|m| m.fqn == original_fqn && member_kind_matches(m.kind, expected_kinds))
         {
+            return Some(self.materialize_symbol(sym.clone(), substitutions));
+        }
+        // Fallback: match by PHP member lookup semantics.
+        if let Some(sym) = members.iter().find(|member| {
+            member_kind_matches(member.kind, expected_kinds)
+                && member.matches_member_lookup_name(member_name)
+        }) {
             return Some(self.materialize_symbol(sym.clone(), substitutions));
         }
 
@@ -235,6 +259,7 @@ impl WorkspaceIndex {
                     trait_fqn,
                     member_name,
                     original_fqn,
+                    expected_kinds,
                     visited,
                     &edge_substitutions,
                 ) {
@@ -254,6 +279,7 @@ impl WorkspaceIndex {
                     mixin_fqn,
                     member_name,
                     original_fqn,
+                    expected_kinds,
                     visited,
                     &edge_substitutions,
                 ) {
@@ -268,6 +294,7 @@ impl WorkspaceIndex {
                     parent_fqn,
                     member_name,
                     original_fqn,
+                    expected_kinds,
                     visited,
                     &edge_substitutions,
                 ) {
@@ -282,6 +309,7 @@ impl WorkspaceIndex {
                     iface_fqn,
                     member_name,
                     original_fqn,
+                    expected_kinds,
                     visited,
                     &edge_substitutions,
                 ) {
@@ -1376,6 +1404,71 @@ mod tests {
 
         // Non-existent member should return None
         assert!(index.resolve_fqn("App\\Foo::nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_resolve_method_names_case_insensitively_only() {
+        let index = WorkspaceIndex::new();
+        let uri = "file:///test.php";
+        let class_sym = make_class("Foo", "App\\Foo", uri);
+        let method_sym = make_method("propFind", "App\\Foo", uri);
+        let mut conflicting_property_sym = make_method("propfind", "App\\Foo", uri);
+        conflicting_property_sym.kind = PhpSymbolKind::Property;
+        conflicting_property_sym.fqn = "App\\Foo::$propfind".to_string();
+        let mut property_sym = make_method("PortingNumber", "App\\Foo", uri);
+        property_sym.kind = PhpSymbolKind::Property;
+        property_sym.fqn = "App\\Foo::$PortingNumber".to_string();
+        let mut constant_sym = make_method("STATE_READY", "App\\Foo", uri);
+        constant_sym.kind = PhpSymbolKind::ClassConstant;
+        constant_sym.fqn = "App\\Foo::STATE_READY".to_string();
+
+        index.update_file(
+            uri,
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                use_statements: vec![],
+                symbols: vec![
+                    class_sym,
+                    conflicting_property_sym,
+                    method_sym,
+                    property_sym,
+                    constant_sym,
+                ],
+                ..Default::default()
+            },
+        );
+
+        let found = index
+            .resolve_member_matching_kinds("App\\Foo::propfind", &[PhpSymbolKind::Method])
+            .expect("PHP method lookup should ignore ASCII case");
+        assert_eq!(found.name, "propFind");
+        assert_eq!(found.kind, PhpSymbolKind::Method);
+
+        assert!(
+            index
+                .resolve_member_matching_kinds("App\\Foo::$propfind", &[PhpSymbolKind::Property])
+                .is_some(),
+            "Kind-aware lookup should still find the exact property"
+        );
+
+        assert!(
+            index
+                .resolve_member_matching_kinds(
+                    "App\\Foo::$portingnumber",
+                    &[PhpSymbolKind::Property]
+                )
+                .is_none(),
+            "PHP property lookup must remain case-sensitive"
+        );
+        assert!(
+            index
+                .resolve_member_matching_kinds(
+                    "App\\Foo::state_ready",
+                    &[PhpSymbolKind::ClassConstant],
+                )
+                .is_none(),
+            "PHP class constant lookup must remain case-sensitive"
+        );
     }
 
     #[test]

@@ -5520,7 +5520,9 @@ change.
     /home/apanov/ForTesting/monica/tests/Feature/Auth/PasswordConfirmationTest.php
     /home/apanov/ForTesting/monica/tests/Feature/Controllers/Auth/LoginControllerTest.php
 
-- [ ] **H-DIAGNOSTICS-MONICA-PHP-METHOD-CASE-INSENSITIVE-LOOKUP-2026-06-05** Resolve PHP method names case-insensitively for diagnostics
+- [x] **H-DIAGNOSTICS-MONICA-PHP-METHOD-CASE-INSENSITIVE-LOOKUP-2026-06-05** Resolve PHP method names case-insensitively for diagnostics *(done 2026-06-08)*
+  - Implemented: PHP method member lookup now matches ASCII case-insensitively while property/class-constant lookup remains case-sensitive; kind-aware member resolution prevents wrong-kind symbols from blocking valid methods.
+  - Validation: `cargo fmt --all --check`; `git diff --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; Monica `AddressBookGetter.php` analyze reports only existing `Unused variable: $e`, not `Unknown method ...::propfind`; Verifier GO.
   - False positives include `Unknown method: App\\Domains\\Contact\\DavClient\\Services\\Utils\\Dav\\DavClient::propfind` while the class declares `propFind(...)`.
   - PHP method calls are case-insensitive, so diagnostics/definition/completion member matching should not reject only by casing.
   - Files:

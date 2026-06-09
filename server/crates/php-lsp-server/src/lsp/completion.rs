@@ -573,13 +573,17 @@ impl PhpLspBackend {
         self.resolve_member_type(class_fqn, member_name)
             .or_else(|| {
                 let member_fqn = format!("{}::{}", class_fqn, member_name);
-                let bare_name = member_name.strip_prefix('$').unwrap_or(member_name);
+                let expected_kind = completion_member_type_lookup_kind(member_name);
                 file_symbols.symbols.iter().find_map(|sym| {
                     if sym.fqn == member_fqn
                         || (sym.parent_fqn.as_deref() == Some(class_fqn)
-                            && (sym.name == member_name || sym.name == bare_name))
+                            && sym.matches_member_lookup_name(member_name))
                     {
-                        symbol_return_type_text_from_index(&self.index, class_fqn, sym)
+                        if sym.kind == expected_kind {
+                            symbol_return_type_text_from_index(&self.index, class_fqn, sym)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -595,7 +599,12 @@ impl PhpLspBackend {
                     source,
                 )
             })
-            .or_else(|| phpdoc_virtual_property_type_fqn(&self.index, class_fqn, member_name))
+            .or_else(|| {
+                member_name
+                    .starts_with('$')
+                    .then(|| phpdoc_virtual_property_type_fqn(&self.index, class_fqn, member_name))
+                    .flatten()
+            })
     }
 
     pub(in crate::server) fn resolve_completion_member_type_cached(
@@ -638,16 +647,21 @@ impl PhpLspBackend {
             || {
                 let symbol = self
                     .index
-                    .resolve_member(&format!("{}::{}", class_fqn, member_name))
+                    .resolve_member_matching_kinds(
+                        &format!("{}::{}", class_fqn, member_name),
+                        &[php_lsp_types::PhpSymbolKind::Method],
+                    )
                     .or_else(|| {
                         let member_fqn = format!("{}::{}", class_fqn, member_name);
                         file_symbols.symbols.iter().find_map(|sym| {
-                            (sym.fqn == member_fqn
+                            ((sym.fqn == member_fqn
                                 || (sym.parent_fqn.as_deref() == Some(class_fqn)
-                                    && sym.name == member_name))
+                                    && sym.matches_member_lookup_name(member_name)))
+                                && sym.kind == php_lsp_types::PhpSymbolKind::Method)
                                 .then(|| Arc::new(sym.clone()))
                         })
-                    })?;
+                    })
+                    .filter(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Method)?;
                 let signature = symbol.signature.as_ref()?;
                 let return_type = symbol_effective_return_type(&symbol)?;
                 let arguments = completion_call_arguments_by_param(
@@ -1226,6 +1240,14 @@ fn twig_completion_prefix_rank(label: &str, prefix: &str) -> &'static str {
         "0100"
     } else {
         "1000"
+    }
+}
+
+fn completion_member_type_lookup_kind(member_name: &str) -> php_lsp_types::PhpSymbolKind {
+    if member_name.starts_with('$') {
+        php_lsp_types::PhpSymbolKind::Property
+    } else {
+        php_lsp_types::PhpSymbolKind::Method
     }
 }
 

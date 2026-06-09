@@ -2060,8 +2060,11 @@ pub(crate) fn member_method_name_exists(
     method_name: &str,
 ) -> bool {
     index
-        .resolve_member(&format!("{}::{}", class_fqn, method_name))
-        .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Method)
+        .resolve_member_matching_kinds(
+            &format!("{}::{}", class_fqn, method_name),
+            &[php_lsp_types::PhpSymbolKind::Method],
+        )
+        .is_some()
 }
 
 pub(crate) fn property_type_info(

@@ -129,6 +129,7 @@ pub fn find_references_in_file(
                 source,
                 file_symbols,
                 target_fqn,
+                target_kind,
                 include_declaration,
                 &mut results,
             );
@@ -1005,6 +1006,7 @@ fn find_member_references(
     source: &str,
     file_symbols: &FileSymbols,
     target_fqn: &str,
+    target_kind: PhpSymbolKind,
     include_declaration: bool,
     results: &mut Vec<ReferenceLocation>,
 ) {
@@ -1025,7 +1027,15 @@ fn find_member_references(
         }
     }
 
-    walk_for_member_refs(root, source, file_symbols, target_fqn, member_name, results);
+    walk_for_member_refs(
+        root,
+        source,
+        file_symbols,
+        target_fqn,
+        member_name,
+        target_kind,
+        results,
+    );
 }
 
 /// Walk CST for member access references.
@@ -1035,18 +1045,19 @@ fn walk_for_member_refs(
     _file_symbols: &FileSymbols,
     target_fqn: &str,
     member_name: &str,
+    target_kind: PhpSymbolKind,
     results: &mut Vec<ReferenceLocation>,
 ) {
     let kind = node.kind();
-    let is_property_target = member_name.starts_with('$');
-    let normalized_member_name = member_name.strip_prefix('$').unwrap_or(member_name);
 
     match kind {
         // $obj->property (and callable-like member access without invocation)
-        "member_access_expression" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            if target_kind != PhpSymbolKind::Property {
+                // Method targets must not match property-access syntax.
+            } else if let Some(name_node) = node.child_by_field_name("name") {
                 let text = &source[name_node.byte_range()];
-                if text == normalized_member_name {
+                if member_reference_name_matches(text, member_name, target_kind) {
                     let start = name_node.start_position();
                     let end = name_node.end_position();
                     results.push(ReferenceLocation {
@@ -1062,12 +1073,12 @@ fn walk_for_member_refs(
         }
 
         // $obj->method()
-        "member_call_expression" => {
-            if is_property_target {
-                // Property target should not match method calls with the same short name.
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            if target_kind != PhpSymbolKind::Method {
+                // Property targets should not match method calls with the same short name.
             } else if let Some(name_node) = node.child_by_field_name("name") {
                 let text = &source[name_node.byte_range()];
-                if text == member_name {
+                if member_reference_name_matches(text, member_name, target_kind) {
                     let start = name_node.start_position();
                     let end = name_node.end_position();
                     results.push(ReferenceLocation {
@@ -1084,11 +1095,11 @@ fn walk_for_member_refs(
 
         // ClassName::method()
         "scoped_call_expression" => {
-            if is_property_target {
-                // Property target should not match scoped method calls.
+            if target_kind != PhpSymbolKind::Method {
+                // Constant/property targets should not match scoped method calls.
             } else if let Some(name_node) = node.child_by_field_name("name") {
                 let text = &source[name_node.byte_range()];
-                if text == member_name {
+                if member_reference_name_matches(text, member_name, target_kind) {
                     // For scoped access, also check that the scope resolves to the right class
                     if let Some(scope_node) = node.child_by_field_name("scope") {
                         let scope_text = &source[scope_node.byte_range()];
@@ -1120,9 +1131,16 @@ fn walk_for_member_refs(
         "scoped_property_access_expression" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let text = &source[name_node.byte_range()];
-                let matches_member =
-                    text == member_name || (!is_property_target && text == normalized_member_name);
-                if matches_member {
+                let syntax_matches_target = match target_kind {
+                    PhpSymbolKind::Property => text.starts_with('$'),
+                    PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase => {
+                        !text.starts_with('$')
+                    }
+                    _ => false,
+                };
+                if syntax_matches_target
+                    && member_reference_name_matches(text, member_name, target_kind)
+                {
                     // For scoped access, also check that the scope resolves to the right class
                     if let Some(scope_node) = node.child_by_field_name("scope") {
                         let scope_text = &source[scope_node.byte_range()];
@@ -1152,13 +1170,16 @@ fn walk_for_member_refs(
 
         // self::CONST / ClassName::CONST
         "class_constant_access_expression" => {
-            if is_property_target {
-                // Property target should not match class constant access.
+            if !matches!(
+                target_kind,
+                PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase
+            ) {
+                // Method/property targets should not match class constant access.
             } else if let (Some(scope_node), Some(name_node)) =
                 (node.named_child(0), node.named_child(1))
             {
                 let text = &source[name_node.byte_range()];
-                if text == member_name {
+                if member_reference_name_matches(text, member_name, target_kind) {
                     let scope_text = &source[scope_node.byte_range()];
                     let scope_fqn = resolve_name_to_fqn(scope_text, _file_symbols);
                     let expected_class = &target_fqn[..target_fqn.rfind("::").unwrap_or(0)];
@@ -1194,8 +1215,24 @@ fn walk_for_member_refs(
             _file_symbols,
             target_fqn,
             member_name,
+            target_kind,
             results,
         );
+    }
+}
+
+fn member_reference_name_matches(
+    reference_member: &str,
+    target_member: &str,
+    target_kind: PhpSymbolKind,
+) -> bool {
+    match target_kind {
+        PhpSymbolKind::Method => reference_member.eq_ignore_ascii_case(target_member),
+        PhpSymbolKind::Property => {
+            reference_member.trim_start_matches('$') == target_member.trim_start_matches('$')
+        }
+        PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase => reference_member == target_member,
+        _ => false,
     }
 }
 
@@ -1518,6 +1555,32 @@ Foo::bar();
         let refs = find_refs(code, "App\\Foo::bar", PhpSymbolKind::Method);
         // declaration + 1 call = 2
         assert!(!refs.is_empty(), "Should find at least 1 reference");
+    }
+
+    #[test]
+    fn test_find_method_references_case_insensitively() {
+        let code = r#"<?php
+namespace App;
+
+class Foo {
+    public static function propFind() {}
+
+    public function run(): void {
+        self::propfind();
+        $this->PROPFIND();
+        $this->propFind;
+    }
+}
+
+Foo::PROPFIND();
+"#;
+        let refs = find_refs(code, "App\\Foo::propFind", PhpSymbolKind::Method);
+
+        assert_eq!(
+            refs.len(),
+            4,
+            "Method references should include declaration and differently-cased calls, but not property access"
+        );
     }
 
     #[test]

@@ -227,6 +227,122 @@ class Foo {
     ));
 }
 
+#[tokio::test]
+async fn test_lazy_resolution_filters_member_kind_after_case_insensitive_method_lookup() {
+    let uri = "file:///lazy-member-kind.php";
+    let code = r#"<?php
+namespace App;
+class Foo {
+    public string $stateready;
+    public function stateReady(): void {}
+}
+"#;
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    parse_and_index_php_file(&backend.index, uri, code);
+
+    let non_lazy_method = backend
+        .resolve_fqn_with_fallback("App\\Foo::stateready", RefKind::MethodCall)
+        .expect("non-lazy method lookup should ignore ASCII case");
+    assert_eq!(
+        (non_lazy_method.kind, non_lazy_method.name.as_str()),
+        (php_lsp_types::PhpSymbolKind::Method, "stateReady"),
+        "non-lazy method lookup must skip same-named properties"
+    );
+    assert!(
+        backend
+            .resolve_fqn_with_fallback("App\\Foo::stateready", RefKind::ClassConstant)
+            .is_none(),
+        "non-lazy method lookup must not satisfy class constant lookup"
+    );
+    let lazy_method = backend
+        .resolve_fqn_lazy_with_fallback("App\\Foo::stateready", RefKind::MethodCall)
+        .await
+        .expect("method lookup should ignore ASCII case");
+    assert_eq!(
+        (lazy_method.kind, lazy_method.name.as_str()),
+        (php_lsp_types::PhpSymbolKind::Method, "stateReady"),
+        "lazy method lookup must skip same-named properties"
+    );
+    assert!(
+        backend
+            .resolve_fqn_lazy_with_fallback("App\\Foo::stateready", RefKind::ClassConstant)
+            .await
+            .is_none(),
+        "case-insensitive method lookup must not satisfy class constant lookup"
+    );
+    assert!(
+        !lazy_resolved_symbol_diagnostic_is_satisfied(
+            &backend.index,
+            "Unknown class constant: App\\Foo::stateready",
+            "App\\Foo::stateready",
+        ),
+        "method with same name must not satisfy unknown class constant diagnostic"
+    );
+}
+
+#[test]
+fn test_member_type_lookup_is_kind_aware_after_case_insensitive_methods() {
+    let uri = "file:///member-type-kind.php";
+    let code = r#"<?php
+namespace App;
+
+class Result {}
+class PropertyResult {}
+class MethodResult {}
+
+class Foo {
+    public PropertyResult $stateready;
+    public function stateReady(): MethodResult { return new MethodResult(); }
+}
+
+class Bar {
+    public Result $onlyProp;
+}
+"#;
+
+    let index = WorkspaceIndex::new();
+    parse_and_index_php_file(&index, uri, code);
+
+    assert_eq!(
+        super::lsp::completion_helpers::resolve_member_type_from_index(
+            &index,
+            "App\\Foo",
+            "stateready",
+        )
+        .as_deref(),
+        Some("\\App\\MethodResult"),
+        "method type lookup should ignore ASCII case"
+    );
+    assert_eq!(
+        super::lsp::completion_helpers::resolve_member_type_from_index(
+            &index,
+            "App\\Foo",
+            "$stateready",
+        )
+        .as_deref(),
+        Some("\\App\\PropertyResult"),
+        "method type lookup must not use a same-named property"
+    );
+    assert!(
+        super::lsp::completion_helpers::resolve_member_type_from_index(
+            &index,
+            "App\\Foo",
+            "$stateReady",
+        )
+        .is_none(),
+        "property type lookup must remain case-sensitive"
+    );
+    assert!(
+        super::lsp::completion_helpers::resolve_member_type_from_index(
+            &index, "App\\Bar", "onlyProp",
+        )
+        .is_none(),
+        "method type lookup must not use a same-named property"
+    );
+}
+
 #[test]
 fn test_request_type_cache_reuses_same_expression_context() {
     let cache = RequestTypeCache::new("file:///test.php", Some(7));
@@ -1561,7 +1677,7 @@ use App\Domain\ImportedEntity;
 class ImportedEntityHandler {
     private function handle(ImportedEntity $entity): void
     {
-        $result = $entity->existingMethod();
+        $result = $entity->existingmethod();
         $entity->missingMethod($result);
     }
 }
@@ -1589,8 +1705,8 @@ class ImportedEntityHandler {
         messages
     );
     assert!(
-        !messages.contains(&"Unknown method: App\\Domain\\ImportedEntity::existingMethod"),
-        "Existing imported method must not be reported as unknown: {:?}",
+        !messages.contains(&"Unknown method: App\\Domain\\ImportedEntity::existingmethod"),
+        "Existing imported method must resolve case-insensitively: {:?}",
         messages
     );
 }
@@ -4050,7 +4166,7 @@ final class EmailVerifier
 
     public function handle(Request $request): void
     {
-        $this->helper->validateEmailConfirmationFromRequest($request, '1', 'a@example.com');
+        $this->helper->validateemailconfirmationfromrequest($request, '1', 'a@example.com');
     }
 }
 "#;
@@ -4069,7 +4185,7 @@ final class EmailVerifier
 
     assert_no_diagnostic_containing(
             &messages,
-            "Unknown method: SymfonyCasts\\Bundle\\VerifyEmail\\VerifyEmailHelperInterface::validateEmailConfirmationFromRequest",
+            "Unknown method: SymfonyCasts\\Bundle\\VerifyEmail\\VerifyEmailHelperInterface::validateemailconfirmationfromrequest",
         );
 }
 

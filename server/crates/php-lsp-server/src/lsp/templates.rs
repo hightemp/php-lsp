@@ -676,12 +676,11 @@ fn collect_twig_context_member_call_shape_definitions(
     let mut definitions = Vec::new();
     for receiver_fqn in twig_context_candidate_type_fqns(&receiver_type) {
         let method_fqn = format!("{receiver_fqn}::{}", call.method_name);
-        let Some(symbol) = index.resolve_member(&method_fqn) else {
+        let Some(symbol) = index
+            .resolve_member_matching_kinds(&method_fqn, &[php_lsp_types::PhpSymbolKind::Method])
+        else {
             continue;
         };
-        if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Method) {
-            continue;
-        }
         if let Some(return_type) = symbol_effective_return_type(&symbol) {
             definitions.extend(collect_symbol_type_shape_definitions(
                 index,
@@ -715,12 +714,12 @@ fn collect_twig_context_member_access_shape_definitions(
     let mut definitions = Vec::new();
     for receiver_fqn in twig_context_candidate_type_fqns(&receiver_type) {
         let property_fqn = format!("{receiver_fqn}::${}", access.member_name);
-        let Some(symbol) = index.resolve_member(&property_fqn) else {
+        let Some(symbol) = index.resolve_member_matching_kinds(
+            &property_fqn,
+            &[php_lsp_types::PhpSymbolKind::Property],
+        ) else {
             continue;
         };
-        if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Property) {
-            continue;
-        }
         if let Some(property_type) = symbol_effective_return_type(&symbol) {
             definitions.extend(collect_symbol_type_shape_definitions(
                 index,
@@ -2449,7 +2448,10 @@ fn symfony_form_type_fields(
     let scan_range = open_build_form_range
         .or_else(|| {
             index
-                .resolve_member(&build_form_fqn)
+                .resolve_member_matching_kinds(
+                    &build_form_fqn,
+                    &[php_lsp_types::PhpSymbolKind::Method],
+                )
                 .map(|method| method.range)
         })
         .and_then(|range| {
@@ -2623,12 +2625,11 @@ fn twig_context_member_call_type_text(
         }
 
         let method_fqn = format!("{receiver_fqn}::{}", call.method_name);
-        let Some(symbol) = index.resolve_member(&method_fqn) else {
+        let Some(symbol) = index
+            .resolve_member_matching_kinds(&method_fqn, &[php_lsp_types::PhpSymbolKind::Method])
+        else {
             continue;
         };
-        if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Method) {
-            continue;
-        }
         if let Some(return_type) = symbol_effective_return_type(&symbol) {
             return twig_context_type_info_text_for_symbol(
                 index,
@@ -2662,12 +2663,12 @@ fn twig_context_member_access_type_text(
     )?;
     for receiver_fqn in twig_context_candidate_type_fqns(&receiver_type) {
         let property_fqn = format!("{receiver_fqn}::${}", access.member_name);
-        let Some(symbol) = index.resolve_member(&property_fqn) else {
+        let Some(symbol) = index.resolve_member_matching_kinds(
+            &property_fqn,
+            &[php_lsp_types::PhpSymbolKind::Property],
+        ) else {
             continue;
         };
-        if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Property) {
-            continue;
-        }
         if let Some(property_type) = symbol_effective_return_type(&symbol) {
             return twig_context_type_info_text_for_symbol(
                 index,
@@ -2884,7 +2885,9 @@ fn twig_context_repository_member_call_type_text(
     let entity_fqn = doctrine_repository_entity_from_type_text(index, repository_fqn)?;
 
     let method_fqn = format!("{repository_fqn}::{method_name}");
-    if let Some(symbol) = index.resolve_member(&method_fqn) {
+    if let Some(symbol) =
+        index.resolve_member_matching_kinds(&method_fqn, &[php_lsp_types::PhpSymbolKind::Method])
+    {
         if let Some(return_type) = symbol_effective_return_type(&symbol) {
             if let Some(value_type) = iterable_value_type_info(&return_type, None) {
                 let item_type = twig_context_type_info_text_for_symbol(
@@ -3000,7 +3003,9 @@ fn twig_context_repository_method_paginated_item_type(
     fallback_entity_fqn: &str,
 ) -> Option<String> {
     let method_fqn = format!("{repository_fqn}::{method_name}");
-    if let Some(symbol) = index.resolve_fqn(&method_fqn) {
+    if let Some(symbol) =
+        index.resolve_member_matching_kinds(&method_fqn, &[php_lsp_types::PhpSymbolKind::Method])
+    {
         if let Some(return_type) = symbol_effective_return_type(&symbol) {
             if let Some(value_type) = iterable_value_type_info(&return_type, None) {
                 return twig_context_type_info_text_for_symbol(

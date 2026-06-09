@@ -898,8 +898,10 @@ pub(in crate::server) fn server_member_call_symbol(
         &receiver_type.type_info,
     )?;
     let method_fqn = format!("{receiver_fqn}::{method_name}");
-    let symbol = ctx.index.resolve_fqn(&method_fqn)?;
-    (symbol.kind == php_lsp_types::PhpSymbolKind::Method).then_some((receiver_fqn, symbol))
+    let symbol = ctx
+        .index
+        .resolve_member_matching_kinds(&method_fqn, &[php_lsp_types::PhpSymbolKind::Method])?;
+    Some((receiver_fqn, symbol))
 }
 
 pub(in crate::server) fn server_member_symbol_at_position(
@@ -1318,18 +1320,18 @@ pub(in crate::server) fn doctrine_repository_call_type_info(
 
     if let Some(repository_fqn) = doctrine_repository_class_for_entity(ctx, &entity_fqn) {
         let method_fqn = format!("{repository_fqn}::{method_name}");
-        if let Some(symbol) = ctx.index.resolve_fqn(&method_fqn) {
-            if symbol.kind == php_lsp_types::PhpSymbolKind::Method {
-                let return_type = symbol_effective_return_type(&symbol)?;
-                let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&repository_fqn);
-                let type_info =
-                    resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
-                return Some(IndexedExpressionTypeInfo {
-                    type_info,
-                    owner_fqn: owner_fqn.to_string(),
-                    uri: symbol.uri.clone(),
-                });
-            }
+        if let Some(symbol) = ctx
+            .index
+            .resolve_member_matching_kinds(&method_fqn, &[php_lsp_types::PhpSymbolKind::Method])
+        {
+            let return_type = symbol_effective_return_type(&symbol)?;
+            let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&repository_fqn);
+            let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
+            return Some(IndexedExpressionTypeInfo {
+                type_info,
+                owner_fqn: owner_fqn.to_string(),
+                uri: symbol.uri.clone(),
+            });
         }
     }
 
@@ -1706,12 +1708,13 @@ pub(in crate::server) fn doctrine_collection_item_type_from_mutators(
         .unwrap_or(current_file_symbols);
 
     for candidate in collection_mutator_method_candidates(collection_suffix) {
-        let Some(symbol) = index.resolve_fqn(&format!("{owner_fqn}::{candidate}")) else {
+        let Some(symbol) = index.resolve_member_matching_kinds(
+            &format!("{owner_fqn}::{candidate}"),
+            &[php_lsp_types::PhpSymbolKind::Method],
+        ) else {
             continue;
         };
-        if symbol.kind != php_lsp_types::PhpSymbolKind::Method
-            || symbol.parent_fqn.as_deref() != Some(owner_fqn)
-        {
+        if symbol.parent_fqn.as_deref() != Some(owner_fqn) {
             continue;
         }
         let Some(signature) = symbol.signature.as_ref() else {
@@ -3810,10 +3813,8 @@ pub(in crate::server) fn magic_property_hover_markdown(
     }
     let (class_fqn, member_name) = sym_at_pos.fqn.rsplit_once("::")?;
     let getter_fqn = format!("{class_fqn}::__get");
-    let getter = index.resolve_fqn(&getter_fqn)?;
-    if getter.kind != php_lsp_types::PhpSymbolKind::Method {
-        return None;
-    }
+    let getter = index
+        .resolve_member_matching_kinds(&getter_fqn, &[php_lsp_types::PhpSymbolKind::Method])?;
     let return_type = symbol_effective_return_type(&getter)?;
     if !is_explicit_local_variable_type_hint(&return_type) {
         return None;

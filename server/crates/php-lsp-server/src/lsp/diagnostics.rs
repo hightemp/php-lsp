@@ -690,6 +690,10 @@ fn member_names_match(
         return reference_member.trim_start_matches('$') == target_member.trim_start_matches('$');
     }
 
+    if target_kind == php_lsp_types::PhpSymbolKind::Method {
+        return reference_member.eq_ignore_ascii_case(target_member);
+    }
+
     reference_member == target_member
 }
 
@@ -1648,14 +1652,20 @@ fn is_enum_builtin_property_access(
 
     bare_member_name == "name"
         || index
-            .resolve_member(&format!("{class_fqn}::$value"))
-            .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Property)
+            .resolve_member_matching_kinds(
+                &format!("{class_fqn}::$value"),
+                &[php_lsp_types::PhpSymbolKind::Property],
+            )
+            .is_some()
 }
 
 pub(in crate::server) fn class_has_magic_get(index: &WorkspaceIndex, class_fqn: &str) -> bool {
     index
-        .resolve_fqn(&format!("{}::__get", class_fqn.trim_start_matches('\\')))
-        .is_some_and(|symbol| symbol.kind == php_lsp_types::PhpSymbolKind::Method)
+        .resolve_member_matching_kinds(
+            &format!("{}::__get", class_fqn.trim_start_matches('\\')),
+            &[php_lsp_types::PhpSymbolKind::Method],
+        )
+        .is_some()
 }
 
 pub(in crate::server) fn is_missing_parent_constructor_call(sym_at_pos: &SymbolAtPosition) -> bool {
@@ -1824,12 +1834,10 @@ pub(in crate::server) fn resolve_member_on_class_for_ref_kind(
     ref_kind: RefKind,
     exact_fqn: Option<&str>,
 ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
-    let bare_name = member_name.strip_prefix('$').unwrap_or(member_name);
     index.get_members(class_fqn).into_iter().find(|sym| {
         symbol_kind_matches_ref_kind(sym, ref_kind)
             && (exact_fqn.is_some_and(|fqn| sym.fqn == fqn)
-                || sym.name == member_name
-                || sym.name == bare_name)
+                || sym.matches_member_lookup_name(member_name))
     })
 }
 
@@ -1863,6 +1871,20 @@ pub(crate) fn lazy_resolvable_diagnostic_fqn(message: &str) -> Option<String> {
     None
 }
 
+fn lazy_resolvable_diagnostic_ref_kind(message: &str) -> Option<RefKind> {
+    if message.starts_with("Unknown class: ") {
+        Some(RefKind::ClassName)
+    } else if message.starts_with("Unknown method: ") {
+        Some(RefKind::MethodCall)
+    } else if message.starts_with("Unknown property: ") {
+        Some(RefKind::PropertyAccess)
+    } else if message.starts_with("Unknown class constant: ") {
+        Some(RefKind::ClassConstant)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn lazy_resolved_symbol_diagnostic_is_satisfied(
     index: &WorkspaceIndex,
     message: &str,
@@ -1892,16 +1914,12 @@ pub(crate) fn lazy_resolved_symbol_diagnostic_is_satisfied(
         .is_some();
     }
 
-    if index.resolve_fqn(fqn).is_some() {
-        return true;
-    }
-
     let ref_kind = if message.starts_with("Unknown method: ") {
         RefKind::MethodCall
     } else if message.starts_with("Unknown class constant: ") {
         RefKind::ClassConstant
     } else {
-        return false;
+        return index.resolve_fqn(fqn).is_some();
     };
 
     resolve_member_on_class_for_ref_kind(index, class_fqn, member_name, ref_kind, Some(fqn))
@@ -4260,7 +4278,18 @@ impl PhpLspBackend {
                 if let Some(fqn) = lazy_resolvable_diagnostic_fqn(&diagnostic.message) {
                     let unresolved_use_statement =
                         diagnostic.message.starts_with("Unresolved use statement: ");
-                    if self.resolve_fqn_lazy(&fqn).await.is_some() {
+                    let lazily_resolved = if unresolved_use_statement {
+                        self.resolve_fqn_lazy(&fqn).await.is_some()
+                    } else if let Some(ref_kind) =
+                        lazy_resolvable_diagnostic_ref_kind(&diagnostic.message)
+                    {
+                        self.resolve_fqn_lazy_with_fallback(&fqn, ref_kind)
+                            .await
+                            .is_some()
+                    } else {
+                        self.resolve_fqn_lazy(&fqn).await.is_some()
+                    };
+                    if lazily_resolved {
                         continue;
                     }
                     if lazy_resolved_symbol_diagnostic_is_satisfied(

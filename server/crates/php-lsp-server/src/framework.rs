@@ -972,8 +972,11 @@ fn is_faker_generator(ctx: &FrameworkProviderContext<'_>, class_fqn: &str) -> bo
 fn is_laravel_macroable(ctx: &FrameworkProviderContext<'_>, class_fqn: &str) -> bool {
     let class_fqn = laravel_type_text_base_name(class_fqn).unwrap_or_else(|| class_fqn.to_string());
     ctx.index
-        .resolve_member(&format!("{}::macro", class_fqn.trim_start_matches('\\')))
-        .is_some_and(|symbol| symbol.kind == PhpSymbolKind::Method)
+        .resolve_member_matching_kinds(
+            &format!("{}::macro", class_fqn.trim_start_matches('\\')),
+            &[PhpSymbolKind::Method],
+        )
+        .is_some()
 }
 
 fn laravel_registered_macro_virtual_method(

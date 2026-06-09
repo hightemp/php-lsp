@@ -422,6 +422,24 @@ pub struct SymbolInfo {
     pub template_bindings: Vec<TemplateBinding>,
 }
 
+impl SymbolInfo {
+    /// Match a PHP class member lookup name against this symbol.
+    ///
+    /// PHP method names are case-insensitive. Properties and class constants
+    /// remain case-sensitive; property lookups may include the `$` prefix while
+    /// extracted property symbols store the bare name.
+    pub fn matches_member_lookup_name(&self, member_name: &str) -> bool {
+        match self.kind {
+            PhpSymbolKind::Method => self.name.eq_ignore_ascii_case(member_name),
+            PhpSymbolKind::Property => {
+                let bare_name = member_name.strip_prefix('$').unwrap_or(member_name);
+                self.name == member_name || self.name == bare_name
+            }
+            _ => self.name == member_name,
+        }
+    }
+}
+
 /// A use statement in a PHP file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UseStatement {

@@ -80,7 +80,7 @@ pub(in crate::server) fn phpdoc_virtual_member(
                 if let Some(method) = phpdoc
                     .methods
                     .into_iter()
-                    .find(|method| method.name == member_name)
+                    .find(|method| method.name.eq_ignore_ascii_case(member_name))
                 {
                     return Some(PhpDocVirtualMember {
                         owner,
@@ -2296,7 +2296,8 @@ pub(in crate::server) fn resolve_member_type_from_index(
     let member_fqn = format!("{}::{}", class_fqn, member_name);
     tracing::debug!("resolve_member_type: looking up {}", member_fqn);
 
-    let sym = match index.resolve_fqn(&member_fqn) {
+    let expected_kind = symbol_kind_for_member_type_lookup(member_name);
+    let sym = match index.resolve_member_matching_kinds(&member_fqn, &[expected_kind]) {
         Some(s) => s,
         None => {
             tracing::debug!("resolve_member_type: {} not found in index", member_fqn);
@@ -2306,6 +2307,14 @@ pub(in crate::server) fn resolve_member_type_from_index(
 
     symbol_return_type_text_from_index(index, class_fqn, &sym)
         .or_else(|| symbol_effective_return_type(&sym).map(|type_info| type_info.to_string()))
+}
+
+fn symbol_kind_for_member_type_lookup(member_name: &str) -> php_lsp_types::PhpSymbolKind {
+    if member_name.starts_with('$') {
+        php_lsp_types::PhpSymbolKind::Property
+    } else {
+        php_lsp_types::PhpSymbolKind::Method
+    }
 }
 
 pub(in crate::server) fn twig_property_accessor_method_for_alias(
@@ -2326,7 +2335,8 @@ pub(in crate::server) fn twig_property_accessor_method_for_alias(
 
     ["get", "is", "has"].into_iter().find_map(|prefix| {
         let method_fqn = format!("{class_fqn}::{prefix}{suffix}");
-        let symbol = index.resolve_fqn(&method_fqn)?;
+        let symbol = index
+            .resolve_member_matching_kinds(&method_fqn, &[php_lsp_types::PhpSymbolKind::Method])?;
         twig_method_symbol_can_be_property_accessor(&symbol).then_some(symbol)
     })
 }
