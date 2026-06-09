@@ -370,6 +370,49 @@ impl OperationCancellationToken {
     }
 }
 
+async fn finish_indexing_run_state(
+    indexing_run: &Arc<Mutex<Option<OperationCancellationToken>>>,
+    token: &OperationCancellationToken,
+) {
+    let mut current = indexing_run.lock().await;
+    if current.as_ref().is_some_and(|active| active.is_same(token)) {
+        *current = None;
+    }
+}
+
+async fn finish_indexing_run_if_cancelled(
+    indexing_run: &Arc<Mutex<Option<OperationCancellationToken>>>,
+    token: &OperationCancellationToken,
+) -> bool {
+    if token.is_cancelled() {
+        finish_indexing_run_state(indexing_run, token).await;
+        true
+    } else {
+        false
+    }
+}
+
+async fn indexing_run_is_active(
+    indexing_run: &Arc<Mutex<Option<OperationCancellationToken>>>,
+) -> bool {
+    indexing_run
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|token| !token.is_cancelled())
+}
+
+fn diagnostics_mode_for_indexing_state(
+    mode: DiagnosticsMode,
+    indexing_active: bool,
+) -> DiagnosticsMode {
+    if indexing_active && mode == DiagnosticsMode::BasicSemantic {
+        DiagnosticsMode::SyntaxOnly
+    } else {
+        mode
+    }
+}
+
 impl tower_lsp::ls_types::notification::Notification for PhpLspIndexingStatusNotification {
     type Params = serde_json::Value;
 
@@ -1435,16 +1478,11 @@ impl PhpLspBackend {
         let template_documents = self.template_documents.clone();
         let document_versions = self.document_versions.clone();
         let index = self.index.clone();
+        let indexing_run = self.indexing_run.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let diagnostic_budget = *self.diagnostic_budget.lock().await;
         let php_version = *self.php_version.lock().await;
-        let diagnostics_config = DiagnosticsRuntimeConfig {
-            mode: diagnostics_mode,
-            severity: diagnostic_severity,
-            budget: diagnostic_budget,
-            php_version,
-        };
         let debounce = Duration::from_millis(DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS);
         let task_uri_str = uri_str.clone();
 
@@ -1455,6 +1493,15 @@ impl PhpLspBackend {
                 return;
             }
 
+            let indexing_active = indexing_run_is_active(&indexing_run).await;
+            let effective_diagnostics_mode =
+                diagnostics_mode_for_indexing_state(diagnostics_mode, indexing_active);
+            let mut diagnostics_config = DiagnosticsRuntimeConfig {
+                mode: effective_diagnostics_mode,
+                severity: diagnostic_severity,
+                budget: diagnostic_budget,
+                php_version,
+            };
             let template_document = template_documents
                 .get(&task_uri_str)
                 .map(|template| template.value().clone());
@@ -1466,7 +1513,7 @@ impl PhpLspBackend {
                 Some(version),
             )
             .await;
-            if let Some(template) = template_document {
+            if let Some(template) = &template_document {
                 diagnostics = template.map_diagnostics_to_original(
                     diagnostics,
                     diagnostics_config.mode == DiagnosticsMode::Off,
@@ -1474,6 +1521,30 @@ impl PhpLspBackend {
             }
 
             if document_versions.get(&task_uri_str).map(|current| *current) == Some(version) {
+                if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+                    && indexing_run_is_active(&indexing_run).await
+                {
+                    diagnostics_config.mode = DiagnosticsMode::SyntaxOnly;
+                    diagnostics = compute_open_file_diagnostics(
+                        &task_uri_str,
+                        &open_files,
+                        &index,
+                        diagnostics_config,
+                        Some(version),
+                    )
+                    .await;
+                    if let Some(template) = &template_document {
+                        diagnostics = template.map_diagnostics_to_original(
+                            diagnostics,
+                            diagnostics_config.mode == DiagnosticsMode::Off,
+                        );
+                    }
+                }
+
+                if document_versions.get(&task_uri_str).map(|current| *current) != Some(version) {
+                    return;
+                }
+
                 let publish_started = Instant::now();
                 let publish_span = tracing::debug_span!(
                     "diagnostics.publish",
@@ -1482,6 +1553,15 @@ impl PhpLspBackend {
                     duration_ms = tracing::field::Empty,
                 );
                 async {
+                    if document_versions.get(&task_uri_str).map(|current| *current) != Some(version)
+                    {
+                        return;
+                    }
+                    if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+                        && indexing_run_is_active(&indexing_run).await
+                    {
+                        return;
+                    }
                     client
                         .publish_diagnostics(uri, diagnostics, Some(version))
                         .await;
@@ -1961,10 +2041,20 @@ impl PhpLspBackend {
             cache_config,
             work_done_progress_supported,
         };
+        let vendor_lazy_context = VendorLazyIndexContext {
+            index: index.clone(),
+            workspace_configs: configs.clone(),
+            exclude_paths: indexing_options.exclude_paths.clone(),
+            php_version,
+            index_vendor,
+            vendor_autoload_cache: vendor_autoload_cache.clone(),
+            vendor_file_lru: vendor_file_lru.clone(),
+        };
+        let indexing_run_state = self.indexing_run.clone();
         let indexing_token = self.start_indexing_run().await;
         tokio::spawn(async move {
             for config in &configs {
-                if indexing_token.is_cancelled() {
+                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                     return;
                 }
                 if let Err(e) = index_workspace(
@@ -1993,9 +2083,10 @@ impl PhpLspBackend {
                             format!("Workspace reindexing failed: {}", e),
                         )
                         .await;
+                    finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
                     return;
                 }
-                if indexing_token.is_cancelled() {
+                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                     return;
                 }
 
@@ -2012,9 +2103,11 @@ impl PhpLspBackend {
                 }
             }
 
-            if indexing_token.is_cancelled() {
+            if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                 return;
             }
+            finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
+
             let workspace_roots: Vec<PathBuf> =
                 configs.iter().map(|config| config.root.clone()).collect();
             twig_context_disk_cache.lock().await.clear();
@@ -2027,7 +2120,7 @@ impl PhpLspBackend {
                 &semantic_tokens_cache,
             )
             .await;
-            if indexing_token.is_cancelled() {
+            if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                 return;
             }
             let open_file_uris: Vec<String> =
@@ -2040,6 +2133,19 @@ impl PhpLspBackend {
                     let template_document = template_documents
                         .get(&uri_str)
                         .map(|template| template.value().clone());
+                    if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+                        && template_document.is_none()
+                        && index_vendor
+                    {
+                        preresolve_open_file_diagnostic_dependencies(
+                            &reindex_index,
+                            &open_files,
+                            &uri_str,
+                            &vendor_lazy_context,
+                            DiagnosticDependencyPreResolveMode::ClassHierarchy,
+                        )
+                        .await;
+                    }
                     let mut diags = compute_open_file_diagnostics(
                         &uri_str,
                         &open_files,
@@ -2158,10 +2264,6 @@ impl PhpLspBackend {
         }
 
         self.workspace_root.lock().await.clone()
-    }
-
-    async fn touch_vendor_file_lru(&self, file_path: &Path) {
-        touch_vendor_file_lru(&self.index, &self.vendor_file_lru, file_path).await;
     }
 }
 

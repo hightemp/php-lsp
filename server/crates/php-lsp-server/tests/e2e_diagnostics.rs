@@ -1,6 +1,258 @@
 mod support;
 
+use php_lsp_types::uri::path_to_uri;
 use support::*;
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_open_file_diagnostics_are_syntax_only_while_workspace_indexing_runs() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-indexing-diagnostics-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    let src_dir = tmp_root.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(
+        tmp_root.join("composer.json"),
+        r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+    )
+    .unwrap();
+
+    let app_path = src_dir.join("ActiveDiagnostics.php");
+    let app_uri = path_to_uri(&app_path).unwrap();
+    let app_code = r#"<?php
+namespace App;
+
+use Vendor\Pkg\Service;
+
+final class ActiveDiagnostics
+{
+    public function handle(Service $service): void {}
+}
+"#;
+    fs::write(&app_path, app_code).unwrap();
+
+    for file_index in 0..480 {
+        let mut code = format!("<?php\nnamespace App\\Generated{};\n", file_index);
+        for class_index in 0..12 {
+            code.push_str(&format!(
+                "final class Generated{}_{class_index} {{ public function method{class_index}(): void {{}} }}\n",
+                file_index
+            ));
+        }
+        fs::write(src_dir.join(format!("Generated{file_index}.php")), code).unwrap();
+    }
+
+    let root_uri = path_to_uri(&tmp_root).unwrap();
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "indexing", Duration::from_secs(3)).await;
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&app_uri, app_code))
+        .await
+        .unwrap();
+
+    let during_indexing =
+        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(3)).await;
+    let during_indexing_messages = published_diagnostic_messages(&during_indexing);
+    assert!(
+        !during_indexing_messages
+            .iter()
+            .any(|message| message.contains("Vendor\\Pkg\\Service")),
+        "diagnostics published during workspace indexing should not report unresolved symbols, got: {:?}",
+        during_indexing_messages
+    );
+
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
+    let after_indexing =
+        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(3)).await;
+    let after_indexing_messages = published_diagnostic_messages(&after_indexing);
+    assert!(
+        after_indexing_messages
+            .iter()
+            .any(|message| message.contains("Unresolved use statement: Vendor\\Pkg\\Service")),
+        "semantic diagnostics should resume after indexing is ready, got: {:?}",
+        after_indexing_messages
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_post_index_diagnostics_preresolve_vendor_imports_for_open_files() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-post-index-vendor-diagnostics-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    let src_dir = tmp_root.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(
+        tmp_root.join("composer.json"),
+        r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+    )
+    .unwrap();
+
+    let service_path = tmp_root.join("vendor/acme/pkg/src/Service.php");
+    fs::create_dir_all(service_path.parent().unwrap()).unwrap();
+    fs::write(
+        &service_path,
+        "<?php\nnamespace Vendor\\Pkg;\nfinal class Service extends BaseService {}\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp_root.join("vendor/acme/pkg/src/BaseService.php"),
+        "<?php\nnamespace Vendor\\Pkg;\nabstract class BaseService { public function inherited(): void {} }\n",
+    )
+    .unwrap();
+    let installed_json = tmp_root.join("vendor/composer/installed.json");
+    fs::create_dir_all(installed_json.parent().unwrap()).unwrap();
+    fs::write(
+        &installed_json,
+        r#"{"packages":[{"name":"acme/pkg","install-path":"acme/pkg","autoload":{"psr-4":{"Vendor\\Pkg\\":"src/"}}}]}"#,
+    )
+    .unwrap();
+
+    let app_path = src_dir.join("UsesVendor.php");
+    let app_uri = path_to_uri(&app_path).unwrap();
+    let app_code = r#"<?php
+namespace App;
+
+use Vendor\Pkg\Service;
+
+final class UsesVendor
+{
+    public function handle(Service $service): void
+    {
+        $service->inherited();
+    }
+}
+"#;
+    fs::write(&app_path, app_code).unwrap();
+
+    for file_index in 0..240 {
+        let mut code = format!("<?php\nnamespace App\\Generated{};\n", file_index);
+        for class_index in 0..12 {
+            code.push_str(&format!(
+                "final class Generated{}_{class_index} {{ public function method{class_index}(): void {{}} }}\n",
+                file_index
+            ));
+        }
+        fs::write(src_dir.join(format!("Generated{file_index}.php")), code).unwrap();
+    }
+
+    let root_uri = path_to_uri(&tmp_root).unwrap();
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "indexing", Duration::from_secs(3)).await;
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&app_uri, app_code))
+        .await
+        .unwrap();
+    let during_indexing =
+        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(3)).await;
+    let during_indexing_messages = published_diagnostic_messages(&during_indexing);
+    assert!(
+        !during_indexing_messages
+            .iter()
+            .any(|message| message.contains("Vendor\\Pkg\\Service")),
+        "diagnostics during indexing should be syntax-only, got: {:?}",
+        during_indexing_messages
+    );
+
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
+    let after_indexing =
+        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(5)).await;
+    let after_indexing_messages = published_diagnostic_messages(&after_indexing);
+    assert!(
+        !after_indexing_messages
+            .iter()
+            .any(|message| message.contains("Vendor\\Pkg\\Service")),
+        "post-index diagnostics should lazy-resolve vendor imports for open files, got: {:?}",
+        after_indexing_messages
+    );
+    assert!(
+        !after_indexing_messages
+            .iter()
+            .any(|message| message.contains("inherited")),
+        "post-index diagnostics should lazy-resolve inherited vendor members for open files, got: {:?}",
+        after_indexing_messages
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_root);
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_composer_vendor_metadata_watch_refreshes_unresolved_use_diagnostics() {

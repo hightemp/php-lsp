@@ -86,6 +86,17 @@ impl VendorFileLru {
     }
 }
 
+#[derive(Clone)]
+pub(in crate::server) struct VendorLazyIndexContext {
+    pub(in crate::server) index: Arc<WorkspaceIndex>,
+    pub(in crate::server) workspace_configs: Vec<WorkspaceRootConfig>,
+    pub(in crate::server) exclude_paths: Vec<PathBuf>,
+    pub(in crate::server) php_version: PhpVersion,
+    pub(in crate::server) index_vendor: bool,
+    pub(in crate::server) vendor_autoload_cache: Arc<Mutex<VendorAutoloadCache>>,
+    pub(in crate::server) vendor_file_lru: Arc<Mutex<VendorFileLru>>,
+}
+
 pub(crate) fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutoloadMap> {
     let installed_json = vendor_dir.join("composer/installed.json");
     if !installed_json.exists() {
@@ -131,6 +142,168 @@ pub(in crate::server) async fn parse_vendor_autoload_map_blocking(
     .await
     .ok()
     .flatten()
+}
+
+pub(in crate::server) async fn lazy_index_class_with_context(
+    context: &VendorLazyIndexContext,
+    class_fqn: &str,
+) -> bool {
+    let requested_class_fqn = class_fqn.trim_start_matches('\\');
+    if context.index.types.contains_key(requested_class_fqn) {
+        return false;
+    }
+
+    for config in &context.workspace_configs {
+        let mut all_paths = config
+            .namespace_map
+            .as_ref()
+            .map(|ns_map| ns_map.resolve_class_to_paths(requested_class_fqn))
+            .unwrap_or_default();
+
+        let vendor_dir = config.root.join("vendor");
+        if context.index_vendor && vendor_dir.is_dir() && all_paths.is_empty() {
+            if let Some(vendor_map) =
+                cached_vendor_autoload_map(&context.vendor_autoload_cache, &vendor_dir).await
+            {
+                if let Some(vendor_paths) =
+                    resolve_vendor_paths_from_map(requested_class_fqn, &vendor_map)
+                {
+                    all_paths.extend(vendor_paths);
+                }
+            }
+        }
+
+        for path in &all_paths {
+            let abs = if path.is_absolute() {
+                path.clone()
+            } else {
+                config.root.join(path)
+            };
+
+            if path_is_excluded(&abs, &config.root, &context.exclude_paths) {
+                continue;
+            }
+
+            let is_vendor_file = abs.starts_with(config.root.join("vendor"));
+            let vendor_cache_config = is_vendor_file.then(|| {
+                vendor_index_cache_config(&config.root, context.php_version, &context.exclude_paths)
+            });
+            if let Some(cache_config) = vendor_cache_config.as_ref() {
+                if load_cached_vendor_file_blocking(
+                    context.index.clone(),
+                    config.root.clone(),
+                    abs.clone(),
+                    cache_config.clone(),
+                )
+                .await
+                {
+                    touch_vendor_file_lru(&context.index, &context.vendor_file_lru, &abs).await;
+                    tracing::debug!("Lazy-indexed vendor file from cache: {}", abs.display());
+                    if context.index.types.contains_key(requested_class_fqn) {
+                        return true;
+                    }
+                    tracing::debug!(
+                        "Lazy vendor cache file {} did not contain requested class {}",
+                        abs.display(),
+                        requested_class_fqn
+                    );
+                    continue;
+                }
+            }
+
+            if parse_and_index_php_file_blocking(
+                context.index.clone(),
+                abs.clone(),
+                "lazy PHP file index",
+            )
+            .await
+            {
+                if is_vendor_file {
+                    touch_vendor_file_lru(&context.index, &context.vendor_file_lru, &abs).await;
+                }
+                tracing::debug!("Lazy-indexed file: {}", abs.display());
+                if context.index.types.contains_key(requested_class_fqn) {
+                    if is_vendor_file {
+                        if let Some(cache_config) = vendor_cache_config {
+                            save_vendor_index_cache_blocking(
+                                context.index.clone(),
+                                config.root.clone(),
+                                cache_config,
+                            )
+                            .await;
+                        }
+                    }
+                    return true;
+                }
+                tracing::debug!(
+                    "Lazy-indexed file {} did not contain requested class {}",
+                    abs.display(),
+                    requested_class_fqn
+                );
+            }
+        }
+    }
+
+    false
+}
+
+pub(in crate::server) fn lazy_index_parents_with_context<'a>(
+    context: &'a VendorLazyIndexContext,
+    class_fqn: &'a str,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        const MAX_DEPTH: usize = 10;
+        if depth >= MAX_DEPTH {
+            return;
+        }
+
+        let parent_fqns: Vec<String> = if let Some(sym) = context.index.types.get(class_fqn) {
+            sym.extends
+                .iter()
+                .chain(sym.implements.iter())
+                .chain(sym.traits.iter())
+                .cloned()
+                .collect()
+        } else {
+            return;
+        };
+
+        for parent_fqn in parent_fqns {
+            lazy_index_class_with_context(context, &parent_fqn).await;
+            lazy_index_parents_with_context(context, &parent_fqn, depth + 1).await;
+        }
+    })
+}
+
+pub(in crate::server) async fn lazy_index_member_return_types_with_context(
+    context: &VendorLazyIndexContext,
+    class_fqn: &str,
+) {
+    let return_fqns: Vec<String> = context
+        .index
+        .get_members(class_fqn)
+        .into_iter()
+        .filter_map(|sym| {
+            let owner_fqn = sym.parent_fqn.as_deref().unwrap_or(class_fqn);
+            symbol_return_type_fqn(&context.index, owner_fqn, &sym)
+        })
+        .filter(|fqn| fqn.contains('\\') && !context.index.types.contains_key(fqn.as_str()))
+        .collect();
+
+    for return_fqn in return_fqns {
+        lazy_index_class_with_context(context, &return_fqn).await;
+        lazy_index_parents_with_context(context, &return_fqn, 0).await;
+    }
+}
+
+pub(in crate::server) async fn lazy_index_class_dependencies_with_context(
+    context: &VendorLazyIndexContext,
+    class_fqn: &str,
+) {
+    lazy_index_class_with_context(context, class_fqn).await;
+    lazy_index_parents_with_context(context, class_fqn, 0).await;
+    lazy_index_member_return_types_with_context(context, class_fqn).await;
 }
 
 pub(in crate::server) fn append_vendor_autoload(
@@ -447,6 +620,33 @@ pub(in crate::server) fn resolve_vendor_paths(
 }
 
 impl PhpLspBackend {
+    pub(in crate::server) async fn vendor_lazy_index_context(&self) -> VendorLazyIndexContext {
+        let mut workspace_configs = self.workspace_configs.lock().await.clone();
+        let exclude_paths = self.exclude_paths.lock().await.clone();
+        let php_version = *self.php_version.lock().await;
+        let index_vendor = *self.index_vendor.lock().await;
+        if workspace_configs.is_empty() {
+            let root = self.workspace_root.lock().await.clone();
+            let namespace_map = self.namespace_map.lock().await.clone();
+            if let Some(root) = root {
+                workspace_configs.push(WorkspaceRootConfig {
+                    root,
+                    namespace_map,
+                });
+            }
+        }
+
+        VendorLazyIndexContext {
+            index: self.index.clone(),
+            workspace_configs,
+            exclude_paths,
+            php_version,
+            index_vendor,
+            vendor_autoload_cache: self.vendor_autoload_cache.clone(),
+            vendor_file_lru: self.vendor_file_lru.clone(),
+        }
+    }
+
     pub(in crate::server) async fn vendor_namespace_exists_lazy(&self, fqn: &str) -> bool {
         let index_vendor = *self.index_vendor.lock().await;
         if !index_vendor {
@@ -531,176 +731,13 @@ impl PhpLspBackend {
     /// Lazy-index a single class FQN by finding its file via PSR-4/vendor mappings.
     /// Returns true only when the requested class is present in the index after loading.
     pub(in crate::server) async fn lazy_index_class(&self, class_fqn: &str) -> bool {
-        let requested_class_fqn = class_fqn.trim_start_matches('\\');
-        // Skip if already in the index
-        if self.index.types.contains_key(requested_class_fqn) {
-            return false;
-        }
-
-        let index_vendor = *self.index_vendor.lock().await;
-        let mut configs = self.workspace_configs.lock().await.clone();
-        let exclude_paths = self.exclude_paths.lock().await.clone();
-        let php_version = *self.php_version.lock().await;
-        if configs.is_empty() {
-            let root = self.workspace_root.lock().await.clone();
-            let namespace_map = self.namespace_map.lock().await.clone();
-            if let Some(root) = root {
-                configs.push(WorkspaceRootConfig {
-                    root,
-                    namespace_map,
-                });
-            }
-        }
-
-        for config in configs {
-            let mut all_paths = config
-                .namespace_map
-                .as_ref()
-                .map(|ns_map| ns_map.resolve_class_to_paths(requested_class_fqn))
-                .unwrap_or_default();
-
-            let vendor_dir = config.root.join("vendor");
-            if index_vendor && vendor_dir.is_dir() && all_paths.is_empty() {
-                if let Some(vendor_map) =
-                    cached_vendor_autoload_map(&self.vendor_autoload_cache, &vendor_dir).await
-                {
-                    if let Some(vendor_paths) =
-                        resolve_vendor_paths_from_map(requested_class_fqn, &vendor_map)
-                    {
-                        all_paths.extend(vendor_paths);
-                    }
-                }
-            }
-
-            for path in &all_paths {
-                let abs = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    config.root.join(path)
-                };
-
-                if path_is_excluded(&abs, &config.root, &exclude_paths) {
-                    continue;
-                }
-
-                let is_vendor_file = abs.starts_with(config.root.join("vendor"));
-                let vendor_cache_config = is_vendor_file
-                    .then(|| vendor_index_cache_config(&config.root, php_version, &exclude_paths));
-                if let Some(cache_config) = vendor_cache_config.as_ref() {
-                    if load_cached_vendor_file_blocking(
-                        self.index.clone(),
-                        config.root.clone(),
-                        abs.clone(),
-                        cache_config.clone(),
-                    )
-                    .await
-                    {
-                        self.touch_vendor_file_lru(&abs).await;
-                        tracing::debug!("Lazy-indexed vendor file from cache: {}", abs.display());
-                        if self.index.types.contains_key(requested_class_fqn) {
-                            return true;
-                        }
-                        tracing::debug!(
-                            "Lazy vendor cache file {} did not contain requested class {}",
-                            abs.display(),
-                            requested_class_fqn
-                        );
-                        continue;
-                    }
-                }
-
-                if parse_and_index_php_file_blocking(
-                    self.index.clone(),
-                    abs.clone(),
-                    "lazy PHP file index",
-                )
-                .await
-                {
-                    if is_vendor_file {
-                        self.touch_vendor_file_lru(&abs).await;
-                    }
-                    tracing::debug!("Lazy-indexed file: {}", abs.display());
-                    if self.index.types.contains_key(requested_class_fqn) {
-                        if is_vendor_file {
-                            if let Some(cache_config) = vendor_cache_config {
-                                save_vendor_index_cache_blocking(
-                                    self.index.clone(),
-                                    config.root.clone(),
-                                    cache_config,
-                                )
-                                .await;
-                            }
-                        }
-                        return true;
-                    }
-                    tracing::debug!(
-                        "Lazy-indexed file {} did not contain requested class {}",
-                        abs.display(),
-                        requested_class_fqn
-                    );
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Recursively lazy-index parent classes (extends + implements) up to a depth limit.
-    pub(in crate::server) fn lazy_index_parents<'a>(
-        &'a self,
-        class_fqn: &'a str,
-        depth: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            const MAX_DEPTH: usize = 10;
-            if depth >= MAX_DEPTH {
-                return;
-            }
-
-            // Get the class from the index to read its extends/implements
-            let parent_fqns: Vec<String> = if let Some(sym) = self.index.types.get(class_fqn) {
-                sym.extends
-                    .iter()
-                    .chain(sym.implements.iter())
-                    .chain(sym.traits.iter())
-                    .cloned()
-                    .collect()
-            } else {
-                return;
-            };
-
-            for parent_fqn in parent_fqns {
-                // Lazy-index the parent class file
-                self.lazy_index_class(&parent_fqn).await;
-                // Recurse into the parent's parents
-                self.lazy_index_parents(&parent_fqn, depth + 1).await;
-            }
-        })
-    }
-
-    /// Lazy-index simple class return types from already-indexed members.
-    pub(in crate::server) async fn lazy_index_member_return_types(&self, class_fqn: &str) {
-        let return_fqns: Vec<String> = self
-            .index
-            .get_members(class_fqn)
-            .into_iter()
-            .filter_map(|sym| {
-                let owner_fqn = sym.parent_fqn.as_deref().unwrap_or(class_fqn);
-                symbol_return_type_fqn(&self.index, owner_fqn, &sym)
-            })
-            .filter(|fqn| fqn.contains('\\') && !self.index.types.contains_key(fqn.as_str()))
-            .collect();
-
-        for return_fqn in return_fqns {
-            self.lazy_index_class(&return_fqn).await;
-            self.lazy_index_parents(&return_fqn, 0).await;
-        }
+        let context = self.vendor_lazy_index_context().await;
+        lazy_index_class_with_context(&context, class_fqn).await
     }
 
     pub(in crate::server) async fn lazy_index_class_dependencies(&self, class_fqn: &str) {
-        self.lazy_index_class(class_fqn).await;
-        self.lazy_index_parents(class_fqn, 0).await;
-        self.lazy_index_member_return_types(class_fqn).await;
+        let context = self.vendor_lazy_index_context().await;
+        lazy_index_class_dependencies_with_context(&context, class_fqn).await;
     }
 
     /// Resolve symbol from index with fallback for global built-ins.

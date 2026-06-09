@@ -5543,3 +5543,18 @@ change.
   - Validation: `cargo test -p php-lsp-server --test e2e_completion test_phpdoc_fixture_hover_completion_definition_and_diagnostics`; `cargo test -p php-lsp-completion test_member_completion_includes_phpdoc_virtual_members`; `cargo test --all`; Verifier subagent `GO`.
   - Files:
     /home/apanov/Projects/php-lsp/server/crates/php-lsp-server/tests/e2e_completion.rs
+
+- [x] **H-DIAGNOSTICS-VSCODE-WORKSPACE-VENDOR-ROOTS-2026-06-09** Fix unresolved vendor imports in VS Code diagnostics *(done 2026-06-09)*
+  - False positives: VS Code diagnostics report unresolved Composer/vendor imports for Symfony/Doctrine/Knp in bdpn-ui and Laravel/Symfony/Socialite in Monica, while file-level CLI analysis with explicit project roots can resolve them.
+  - Implemented: active workspace indexing is now tracked and cleared across initialize, reindex, workspace-folder changes, and cancellation paths; publishDiagnostics downgrades to syntax-only while indexing is active and rechecks before publishing to avoid stale semantic warning races; semantic diagnostics resume after indexing completes.
+  - Validation: `cargo fmt --all --check`; `git diff --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; `make install`; installed extension binary analyze for both listed files reports `No diagnostics found`; Verifier subagent `GO`.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/DebtSuspensionController.php
+    /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php
+
+- [x] **H-DIAGNOSTICS-VSCODE-MONICA-VENDOR-LSP-2026-06-09** Resolve Monica vendor imports in VS Code LSP sessions *(done 2026-06-09)*
+  - False positives: Monica still reports unresolved Laravel/Symfony/Socialite vendor imports in VS Code after indexing, while the installed CLI analyzer with `--project-root /home/apanov/ForTesting/monica` reports no diagnostics.
+  - Implemented: post-index open-file diagnostics now pre-resolve Composer/vendor imports through a shared lazy vendor context before republishing; ordinary `publishDiagnostics` keeps full dependency pre-resolve, while post-index republish uses class hierarchy pre-resolve to avoid stale unresolved imports without recursively loading broad vendor return-type graphs.
+  - Validation: `cargo fmt --all --check`; focused `cargo test -p php-lsp-server --test e2e_diagnostics test_post_index_diagnostics_preresolve_vendor_imports_for_open_files -- --nocapture`; `cargo clippy --all-targets -- -D warnings`; `cargo test --all`; `git diff --check`; `make install`; installed extension binary analyze for Monica and bdpn reports `No diagnostics found`; installed LSP JSON-RPC smoke for Monica publishes `DIAG count=0`.
+  - Files:
+    /home/apanov/ForTesting/monica/app/Actions/AttemptToAuthenticateSocialite.php

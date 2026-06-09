@@ -140,10 +140,20 @@ impl PhpLspBackend {
             cache_config,
             work_done_progress_supported,
         };
+        let vendor_lazy_context = VendorLazyIndexContext {
+            index: index.clone(),
+            workspace_configs: configs.clone(),
+            exclude_paths: indexing_options.exclude_paths.clone(),
+            php_version,
+            index_vendor,
+            vendor_autoload_cache: vendor_autoload_cache.clone(),
+            vendor_file_lru: vendor_file_lru.clone(),
+        };
+        let indexing_run_state = self.indexing_run.clone();
         let indexing_token = self.start_indexing_run().await;
         tokio::spawn(async move {
             for config in &configs {
-                if indexing_token.is_cancelled() {
+                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                     return;
                 }
                 if let Err(e) = index_workspace(
@@ -169,9 +179,10 @@ impl PhpLspBackend {
                     client
                         .log_message(MessageType::ERROR, format!("Indexing failed: {}", e))
                         .await;
+                    finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
                     return;
                 }
-                if indexing_token.is_cancelled() {
+                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                     return;
                 }
 
@@ -189,9 +200,11 @@ impl PhpLspBackend {
             }
 
             // Re-publish diagnostics for all open files now that the index is populated.
-            if indexing_token.is_cancelled() {
+            if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                 return;
             }
+            finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
+
             let workspace_roots: Vec<PathBuf> =
                 configs.iter().map(|config| config.root.clone()).collect();
             twig_context_disk_cache.lock().await.clear();
@@ -204,7 +217,7 @@ impl PhpLspBackend {
                 &semantic_tokens_cache,
             )
             .await;
-            if indexing_token.is_cancelled() {
+            if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                 return;
             }
             let open_file_uris: Vec<String> =
@@ -217,6 +230,19 @@ impl PhpLspBackend {
                     let template_document = template_documents
                         .get(&uri_str)
                         .map(|template| template.value().clone());
+                    if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+                        && template_document.is_none()
+                        && index_vendor
+                    {
+                        preresolve_open_file_diagnostic_dependencies(
+                            &reindex_index,
+                            &open_files,
+                            &uri_str,
+                            &vendor_lazy_context,
+                            DiagnosticDependencyPreResolveMode::ClassHierarchy,
+                        )
+                        .await;
+                    }
                     let mut diags = compute_open_file_diagnostics(
                         &uri_str,
                         &open_files,
@@ -375,10 +401,11 @@ impl PhpLspBackend {
             cache_config,
             work_done_progress_supported,
         };
+        let indexing_run_state = self.indexing_run.clone();
         let indexing_token = self.start_indexing_run().await;
         tokio::spawn(async move {
             for config in &added_configs {
-                if indexing_token.is_cancelled() {
+                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                     return;
                 }
                 if let Err(e) = index_workspace(
@@ -409,7 +436,7 @@ impl PhpLspBackend {
                         .await;
                     continue;
                 }
-                if indexing_token.is_cancelled() {
+                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                     return;
                 }
 
@@ -425,6 +452,7 @@ impl PhpLspBackend {
                     .await;
                 }
             }
+            finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
         });
     }
 

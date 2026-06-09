@@ -513,6 +513,66 @@ pub(in crate::server) async fn compute_open_file_diagnostics(
     .await
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::server) enum DiagnosticDependencyPreResolveMode {
+    ClassHierarchy,
+    FullDependencies,
+}
+
+pub(in crate::server) async fn preresolve_open_file_diagnostic_dependencies(
+    index: &WorkspaceIndex,
+    open_files: &DashMap<String, FileParser>,
+    uri_str: &str,
+    vendor_context: &VendorLazyIndexContext,
+    mode: DiagnosticDependencyPreResolveMode,
+) {
+    let use_statement_fqns = index
+        .file_symbols
+        .get(uri_str)
+        .map(|fs| {
+            fs.use_statements
+                .iter()
+                .filter(|u| u.kind == php_lsp_types::UseKind::Class)
+                .filter(|u| u.fqn.contains('\\'))
+                .map(|u| u.fqn.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let alias_fqns = if let Some(parser) = open_files.get(uri_str) {
+        if let Some(tree) = parser.tree() {
+            let source = parser.source();
+            index
+                .file_symbols
+                .get(uri_str)
+                .map(|fs| collect_aliased_class_fqns(tree, &source, &fs))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for fqn in use_statement_fqns.into_iter().chain(alias_fqns) {
+        let fqn = fqn.trim_start_matches('\\').to_string();
+        if !seen.insert(fqn.clone()) {
+            continue;
+        }
+
+        match mode {
+            DiagnosticDependencyPreResolveMode::ClassHierarchy => {
+                lazy_index_class_with_context(vendor_context, &fqn).await;
+                lazy_index_parents_with_context(vendor_context, &fqn, 0).await;
+            }
+            DiagnosticDependencyPreResolveMode::FullDependencies => {
+                lazy_index_class_dependencies_with_context(vendor_context, &fqn).await;
+            }
+        }
+    }
+}
+
 pub(in crate::server) async fn compute_source_diagnostics_blocking(
     uri_str: String,
     source: String,
@@ -4141,56 +4201,33 @@ impl PhpLspBackend {
         let template_document = self.template_document(&uri_str);
         let version = self.current_document_version(&uri_str);
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let indexing_active = indexing_run_is_active(&self.indexing_run).await;
+        let mut effective_diagnostics_mode =
+            diagnostics_mode_for_indexing_state(diagnostics_mode, indexing_active);
         let should_preresolve_dependencies = template_document.is_none()
             && diagnostics_mode == DiagnosticsMode::BasicSemantic
+            && !indexing_active
             && *self.index_vendor.lock().await;
 
         // Pre-resolve use statements via lazy indexing so that vendor classes
         // are available for the synchronous `compute_diagnostics` resolver.
         if should_preresolve_dependencies {
-            if let Some(fs) = self.index.file_symbols.get(&uri_str) {
-                let fqns_to_resolve: Vec<String> = fs
-                    .use_statements
-                    .iter()
-                    .filter(|u| u.kind == php_lsp_types::UseKind::Class)
-                    .filter(|u| u.fqn.contains('\\'))
-                    .map(|u| u.fqn.clone())
-                    .collect();
-                drop(fs); // release DashMap ref before async calls
-                for fqn in fqns_to_resolve {
-                    self.lazy_index_class_dependencies(&fqn).await;
-                }
-            }
-        }
-
-        // Also pre-resolve: class FQNs from aliased qualified names used in code.
-        // e.g. `use Symfony\...\Constraints as Assert;` → `new Assert\NotBlank`
-        // → need to lazily index `Symfony\...\Constraints\NotBlank`.
-        if should_preresolve_dependencies {
-            let alias_fqns = if let Some(parser) = self.open_files.get(&uri_str) {
-                if let Some(tree) = parser.tree() {
-                    let source = parser.source();
-                    self.index
-                        .file_symbols
-                        .get(&uri_str)
-                        .map(|fs| collect_aliased_class_fqns(tree, &source, &fs))
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-            for fqn in alias_fqns {
-                self.lazy_index_class_dependencies(&fqn).await;
-            }
+            let vendor_context = self.vendor_lazy_index_context().await;
+            preresolve_open_file_diagnostic_dependencies(
+                &self.index,
+                &self.open_files,
+                &uri_str,
+                &vendor_context,
+                DiagnosticDependencyPreResolveMode::FullDependencies,
+            )
+            .await;
         }
 
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let diagnostic_budget = *self.diagnostic_budget.lock().await;
         let php_version = *self.php_version.lock().await;
-        let diagnostics_config = DiagnosticsRuntimeConfig {
-            mode: diagnostics_mode,
+        let mut diagnostics_config = DiagnosticsRuntimeConfig {
+            mode: effective_diagnostics_mode,
             severity: diagnostic_severity,
             budget: diagnostic_budget,
             php_version,
@@ -4204,12 +4241,34 @@ impl PhpLspBackend {
         )
         .await;
         if let Some(template) = &template_document {
-            diagnostics = template
-                .map_diagnostics_to_original(diagnostics, diagnostics_mode == DiagnosticsMode::Off);
+            diagnostics = template.map_diagnostics_to_original(
+                diagnostics,
+                effective_diagnostics_mode == DiagnosticsMode::Off,
+            );
         } else if should_preresolve_dependencies {
             diagnostics = self
                 .filter_lazy_resolved_symbol_diagnostics(diagnostics)
                 .await;
+        }
+        if effective_diagnostics_mode == DiagnosticsMode::BasicSemantic
+            && indexing_run_is_active(&self.indexing_run).await
+        {
+            effective_diagnostics_mode = DiagnosticsMode::SyntaxOnly;
+            diagnostics_config.mode = effective_diagnostics_mode;
+            diagnostics = compute_open_file_diagnostics(
+                &uri_str,
+                &self.open_files,
+                &self.index,
+                diagnostics_config,
+                version,
+            )
+            .await;
+            if let Some(template) = &template_document {
+                diagnostics = template.map_diagnostics_to_original(
+                    diagnostics,
+                    effective_diagnostics_mode == DiagnosticsMode::Off,
+                );
+            }
         }
 
         let has_syntax_errors = diagnostics.iter().any(|diagnostic| {
@@ -4217,7 +4276,7 @@ impl PhpLspBackend {
                 && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
         });
         if template_document.is_none()
-            && diagnostics_mode == DiagnosticsMode::BasicSemantic
+            && effective_diagnostics_mode == DiagnosticsMode::BasicSemantic
             && !has_syntax_errors
         {
             let analyzer_token = self.start_analyzer_run(&uri_str).await;
@@ -4249,6 +4308,35 @@ impl PhpLspBackend {
             );
             return;
         }
+        if effective_diagnostics_mode == DiagnosticsMode::BasicSemantic
+            && indexing_run_is_active(&self.indexing_run).await
+        {
+            effective_diagnostics_mode = DiagnosticsMode::SyntaxOnly;
+            diagnostics_config.mode = effective_diagnostics_mode;
+            diagnostics = compute_open_file_diagnostics(
+                &uri_str,
+                &self.open_files,
+                &self.index,
+                diagnostics_config,
+                version,
+            )
+            .await;
+            if let Some(template) = &template_document {
+                diagnostics = template.map_diagnostics_to_original(
+                    diagnostics,
+                    effective_diagnostics_mode == DiagnosticsMode::Off,
+                );
+            }
+            if self.current_document_version(&uri_str) != version {
+                tracing::debug!(
+                    "Skipping stale diagnostics for {}: computed for version {:?}, current {:?}",
+                    uri_str,
+                    version,
+                    self.current_document_version(&uri_str)
+                );
+                return;
+            }
+        }
 
         let publish_started = Instant::now();
         let publish_span = tracing::debug_span!(
@@ -4258,6 +4346,14 @@ impl PhpLspBackend {
             duration_ms = tracing::field::Empty,
         );
         async {
+            if self.current_document_version(&uri_str) != version {
+                return;
+            }
+            if effective_diagnostics_mode == DiagnosticsMode::BasicSemantic
+                && indexing_run_is_active(&self.indexing_run).await
+            {
+                return;
+            }
             self.client
                 .publish_diagnostics(uri.clone(), diagnostics, version)
                 .await;
