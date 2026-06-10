@@ -4,6 +4,9 @@ use crate::template::TemplateShapeDefinitionTarget;
 
 use super::super::*;
 
+const DECLARATION_SCOPE_END_HINT_MIN_LINES: u32 = 2;
+const LARGE_SCOPE_END_HINT_MIN_LINES: u32 = 8;
+
 impl PhpLspBackend {
     pub(crate) async fn lsp_inlay_hint(
         &self,
@@ -180,6 +183,7 @@ pub(in crate::server) fn inlay_hints(
 
     collect_call_argument_inlay_hints(&ctx, tree.root_node(), &mut hints);
     collect_local_variable_type_inlay_hints(&ctx, tree.root_node(), &mut hints);
+    collect_scope_end_inlay_hints(&ctx, tree.root_node(), &mut hints);
     collect_phpdoc_parameter_type_inlay_hints(
         tree.root_node(),
         source,
@@ -221,6 +225,158 @@ pub(in crate::server) struct InlayHintContext<'a> {
     pub(in crate::server) requested_range: (u32, u32, u32, u32),
     pub(in crate::server) allow_twig_property_accessors: bool,
     pub(in crate::server) allow_blocking_file_io: bool,
+}
+
+pub(in crate::server) fn collect_scope_end_inlay_hints(
+    ctx: &InlayHintContext<'_>,
+    node: tree_sitter::Node,
+    hints: &mut Vec<InlayHint>,
+) {
+    if let Some(hint) = scope_end_inlay_hint(ctx, node) {
+        hints.push(hint);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_scope_end_inlay_hints(ctx, child, hints);
+    }
+}
+
+fn scope_end_inlay_hint(ctx: &InlayHintContext<'_>, node: tree_sitter::Node) -> Option<InlayHint> {
+    let (scope_node, closing_node) = scope_end_hint_nodes(node)?;
+    let min_lines = scope_end_hint_min_lines(scope_node.kind())?;
+    let closing_brace = closing_brace_byte_for_node(closing_node, ctx.source)?;
+    let hint_byte = closing_brace + 1;
+    let (line, byte_col) = line_col_for_byte_offset(ctx.source, hint_byte);
+    let point_range = (line, byte_col, line, byte_col);
+    if !byte_ranges_overlap(point_range, ctx.requested_range) {
+        return None;
+    }
+
+    let start_line = scope_node.start_position().row as u32;
+    if line.saturating_sub(start_line) < min_lines {
+        return None;
+    }
+
+    let label = scope_end_hint_label(scope_node, ctx.source)?;
+    Some(InlayHint {
+        position: Position::new(line, ctx.utf16_index.byte_col_to_utf16(line, byte_col)),
+        label: InlayHintLabel::String(label.clone()),
+        kind: None,
+        text_edits: None,
+        tooltip: Some(InlayHintTooltip::String(format!("End of {label}"))),
+        padding_left: Some(true),
+        padding_right: Some(false),
+        data: None,
+    })
+}
+
+fn scope_end_hint_nodes(node: tree_sitter::Node) -> Option<(tree_sitter::Node, tree_sitter::Node)> {
+    if node.kind() == "compound_statement" {
+        let parent = node.parent()?;
+        if scope_end_hint_min_lines(parent.kind()).is_some() {
+            return Some((parent, node));
+        }
+        return None;
+    }
+
+    if is_class_like_scope_node(node.kind()) {
+        return Some((node, node));
+    }
+
+    None
+}
+
+fn scope_end_hint_min_lines(kind: &str) -> Option<u32> {
+    match kind {
+        "function_definition"
+        | "method_declaration"
+        | "anonymous_function"
+        | "anonymous_function_creation_expression" => Some(DECLARATION_SCOPE_END_HINT_MIN_LINES),
+        "class_declaration"
+        | "interface_declaration"
+        | "trait_declaration"
+        | "enum_declaration" => Some(LARGE_SCOPE_END_HINT_MIN_LINES),
+        "if_statement" | "else_if_clause" | "else_clause" | "foreach_statement"
+        | "for_statement" | "while_statement" | "do_statement" | "switch_statement"
+        | "try_statement" | "catch_clause" | "finally_clause" => {
+            Some(LARGE_SCOPE_END_HINT_MIN_LINES)
+        }
+        _ => None,
+    }
+}
+
+fn is_class_like_scope_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration"
+    )
+}
+
+fn closing_brace_byte_for_node(node: tree_sitter::Node, source: &str) -> Option<usize> {
+    let start = node.start_byte();
+    let text = source.get(start..node.end_byte())?;
+    text.rfind('}').map(|relative| start + relative)
+}
+
+fn scope_end_hint_label(scope_node: tree_sitter::Node, source: &str) -> Option<String> {
+    match scope_node.kind() {
+        "method_declaration" => {
+            let name = declaration_name(scope_node, source)?;
+            if let Some(class_name) = containing_class_like_name(scope_node, source) {
+                Some(format!("{class_name}::{name}()"))
+            } else {
+                Some(format!("method {name}()"))
+            }
+        }
+        "function_definition" => {
+            let name = declaration_name(scope_node, source)?;
+            Some(format!("function {name}()"))
+        }
+        "anonymous_function" | "anonymous_function_creation_expression" => Some("closure".into()),
+        "class_declaration" => {
+            declaration_name(scope_node, source).map(|name| format!("class {name}"))
+        }
+        "interface_declaration" => {
+            declaration_name(scope_node, source).map(|name| format!("interface {name}"))
+        }
+        "trait_declaration" => {
+            declaration_name(scope_node, source).map(|name| format!("trait {name}"))
+        }
+        "enum_declaration" => {
+            declaration_name(scope_node, source).map(|name| format!("enum {name}"))
+        }
+        "if_statement" => Some("if".into()),
+        "else_if_clause" => Some("elseif".into()),
+        "else_clause" => Some("else".into()),
+        "foreach_statement" => Some("foreach".into()),
+        "for_statement" => Some("for".into()),
+        "while_statement" => Some("while".into()),
+        "do_statement" => Some("do".into()),
+        "switch_statement" => Some("switch".into()),
+        "try_statement" => Some("try".into()),
+        "catch_clause" => Some("catch".into()),
+        "finally_clause" => Some("finally".into()),
+        _ => None,
+    }
+}
+
+fn declaration_name(node: tree_sitter::Node, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|name| source.get(name.byte_range()))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn containing_class_like_name(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if is_class_like_scope_node(parent.kind()) {
+            return declaration_name(parent, source);
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 pub(in crate::server) fn collect_call_argument_inlay_hints(

@@ -2889,6 +2889,117 @@ function run(Formatter $formatter): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_inlay_hints_for_methods_and_large_scopes() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+class ScopeDemo
+{
+    public function process(array $items): void
+    {
+        if (count($items) > 0) {
+            $first = 1;
+            $second = 2;
+            $third = 3;
+            $fourth = 4;
+            $fifth = 5;
+            $sixth = 6;
+            $seventh = 7;
+            $eighth = 8;
+        }
+    }
+}
+
+function helper(): void
+{
+    $value = 1;
+    while ($value < 2) {
+        $value++;
+    }
+}
+"#;
+    let uri = "file:///test/scope-end-inlay-hints.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 27, 0))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let hints = result.as_array().expect("expected inlay hint array");
+    let labels: Vec<String> = hints.iter().filter_map(inlay_hint_label_text).collect();
+
+    for expected in [
+        "ScopeDemo::process()",
+        "class ScopeDemo",
+        "function helper()",
+        "if",
+    ] {
+        assert!(
+            labels.iter().any(|label| label == expected),
+            "expected scope hint `{}` in labels, got: {:?}",
+            expected,
+            labels
+        );
+    }
+    assert!(
+        !labels.iter().any(|label| label == "while"),
+        "short while block should not produce noisy scope hint, got: {:?}",
+        labels
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            inlay_hint_label_text(hint).as_deref() == Some("ScopeDemo::process()")
+                && hint.get("kind").is_none()
+                && hint
+                    .get("tooltip")
+                    .and_then(|tooltip| tooltip.as_str())
+                    .is_some_and(|tooltip| tooltip == "End of ScopeDemo::process()")
+        }),
+        "method scope hint should be an untyped end-of-scope hint with tooltip: {}",
+        result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_inlay_hints_for_local_variable_types() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

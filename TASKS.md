@@ -5574,3 +5574,8 @@ change.
   - Validation: `cargo fmt --all --check`; `cargo clippy --all-targets -- -D warnings`; focused parser and LSP e2e tests; `cargo test --all`; `make install`; installed extension stdio smoke on Monica `DeleteMultipleVCard.php` returns `trait Batchable` hover and vendor `Batchable.php` definition.
   - Files:
     /home/apanov/ForTesting/monica/app/Domains/Contact/DavClient/Jobs/DeleteMultipleVCard.php
+
+- [x] **H-INLAY-SCOPE-END-HINTS-2026-06-10** Add inlay hints for methods and large scopes *(done 2026-06-10)*
+  - Started: 2026-06-10; add end-of-scope inlay hints for PHP methods/functions and sufficiently large control scopes, matching the editor workflow shown in VS Code without hardcoded project-specific cases.
+  - Implemented: added parser-backed end-of-scope inlay hints for methods/functions/classes and large control blocks, plus LSP e2e coverage and README feature docs.
+  - Validation: `cargo fmt --all --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test -p php-lsp-server --test e2e_hover test_inlay_hints_for_methods_and_large_scopes -- --nocapture`; `cargo test --all`; `git diff --check`; `make install`.
