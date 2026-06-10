@@ -5579,3 +5579,8 @@ change.
   - Started: 2026-06-10; add end-of-scope inlay hints for PHP methods/functions and sufficiently large control scopes, matching the editor workflow shown in VS Code without hardcoded project-specific cases.
   - Implemented: added parser-backed end-of-scope inlay hints for methods/functions/classes and large control blocks, plus LSP e2e coverage and README feature docs.
   - Validation: `cargo fmt --all --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test -p php-lsp-server --test e2e_hover test_inlay_hints_for_methods_and_large_scopes -- --nocapture`; `cargo test --all`; `git diff --check`; `make install`.
+
+- [x] **REL-070-VERSION-SYNC-2026-06-10** Sync project version metadata to 0.7.0 *(done 2026-06-10)*
+  - Started: 2026-06-10; update Rust workspace/package metadata, VS Code extension metadata, lockfiles, current docs, and version-sensitive tests from `0.6.0` to `0.7.0`.
+  - Implemented: synchronized Rust workspace packages, Cargo.lock, VS Code extension package metadata, package-lock, current project docs, cache schema fixture metadata, and packaged-extension path tests to `0.7.0`.
+  - Validation: `cargo fmt --all --check`; `cargo metadata --locked --format-version 1 --no-deps`; `npm run lint && npm run build`; focused cache/stubs tests; `cargo test --all`; `cargo clippy --all-targets -- -D warnings`; `git diff --check`; `make install`; `client/bin/linux-x64/php-lsp --version`.

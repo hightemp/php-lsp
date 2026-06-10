@@ -2,7 +2,7 @@
   "name": "ht-php-lsp",
   "displayName": "PHP Language Server",
   "description": "PHP language support powered by hightemp (Rust)",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "hightemp",
   "author": {
     "email": "hightemp.unknown@gmail.com",

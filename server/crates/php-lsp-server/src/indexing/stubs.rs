@@ -323,13 +323,13 @@ mod tests {
     fn test_candidate_stubs_paths_include_packaged_extension_stubs_from_platform_binary() {
         let root = Path::new("/tmp/project");
         let exe = Path::new(
-            "/home/user/.vscode/extensions/hightemp.ht-php-lsp-0.6.0/bin/linux-x64/php-lsp",
+            "/home/user/.vscode/extensions/hightemp.ht-php-lsp-0.7.0/bin/linux-x64/php-lsp",
         );
         let paths = candidate_stubs_paths_for_exe(root, None, Some(exe));
 
         assert!(
             paths.iter().any(|path| {
-                path == Path::new("/home/user/.vscode/extensions/hightemp.ht-php-lsp-0.6.0/stubs")
+                path == Path::new("/home/user/.vscode/extensions/hightemp.ht-php-lsp-0.7.0/stubs")
             }),
             "expected packaged extension stubs path in {paths:?}"
         );

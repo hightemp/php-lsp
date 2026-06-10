@@ -1,7 +1,7 @@
 # Production Baseline
 
 Latest acceptance refresh: 2026-05-28
-Current project version: `0.6.0`
+Current project version: `0.7.0`
 Latest checked revision: `a7308f3` + working tree acceptance updates
 
 ## Initial Baseline
@@ -77,7 +77,7 @@ Scope: final acceptance after the IDE intelligence milestone through
 `IE-044A`, including PHPDoc/type inference, framework providers, Blade-like
 documents, and Symfony/Twig documents.
 Git revision: `a7308f3` + working tree acceptance updates
-Package version: `0.6.0`
+Package version: `0.7.0`
 
 Validation commands:
 

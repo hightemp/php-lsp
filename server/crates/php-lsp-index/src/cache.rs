@@ -644,7 +644,7 @@ mod tests {
 
     const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 20;
     const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3263;
-    const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x4da2_f324_127f_8758;
+    const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x5b93_7117_674b_b711;
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -745,7 +745,7 @@ mod tests {
         IndexCache {
             schema_version: CACHE_SCHEMA_VERSION,
             namespace: CacheNamespace::Workspace.as_str().to_string(),
-            php_lsp_version: "0.6.0".to_string(),
+            php_lsp_version: "0.7.0".to_string(),
             workspace_root: "/tmp/php-lsp-cache-schema".to_string(),
             config_hash: 0x0123_4567_89ab_cdef,
             stubs_hash: 0xfedc_ba98_7654_3210,
