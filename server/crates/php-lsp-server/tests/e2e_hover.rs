@@ -2926,6 +2926,55 @@ class ScopeDemo
             $sixth = 6;
             $seventh = 7;
             $eighth = 8;
+        } else {
+            $fallbackFirst = 1;
+            $fallbackSecond = 2;
+            $fallbackThird = 3;
+            $fallbackFourth = 4;
+            $fallbackFifth = 5;
+            $fallbackSixth = 6;
+            $fallbackSeventh = 7;
+            $fallbackEighth = 8;
+        }
+
+        foreach ($this->veryLongIterableFactory($items, $this->fallbackItems(), $this->archivedItems(), $this->externalItems(), $this->finalItems()) as $key => $value) {
+            $loopFirst = $key;
+            $loopSecond = $value;
+            $loopThird = $items;
+            $loopFourth = $loopFirst;
+            $loopFifth = $loopSecond;
+            $loopSixth = $loopThird;
+            $loopSeventh = $loopFourth;
+            $loopEighth = $loopFifth;
+        }
+
+        try {
+            $tryFirst = 1;
+            $trySecond = 2;
+            $tryThird = 3;
+            $tryFourth = 4;
+            $tryFifth = 5;
+            $trySixth = 6;
+            $trySeventh = 7;
+            $tryEighth = 8;
+        } catch (\Throwable $exception) {
+            $catchFirst = 1;
+            $catchSecond = 2;
+            $catchThird = 3;
+            $catchFourth = 4;
+            $catchFifth = 5;
+            $catchSixth = 6;
+            $catchSeventh = 7;
+            $catchEighth = 8;
+        } finally {
+            $finallyFirst = 1;
+            $finallySecond = 2;
+            $finallyThird = 3;
+            $finallyFourth = 4;
+            $finallyFifth = 5;
+            $finallySixth = 6;
+            $finallySeventh = 7;
+            $finallyEighth = 8;
         }
     }
 }
@@ -2952,7 +3001,7 @@ function helper(): void
         .ready()
         .await
         .unwrap()
-        .call(inlay_hint_request(2, uri, 0, 0, 27, 0))
+        .call(inlay_hint_request(2, uri, 0, 0, 90, 0))
         .await
         .unwrap();
     let result = extract_result(response);
@@ -2963,7 +3012,7 @@ function helper(): void
         "ScopeDemo::process()",
         "class ScopeDemo",
         "function helper()",
-        "if",
+        "if (count($items) > 0)",
     ] {
         assert!(
             labels.iter().any(|label| label == expected),
@@ -2972,8 +3021,27 @@ function helper(): void
             labels
         );
     }
+    let foreach_label = labels
+        .iter()
+        .find(|label| label.starts_with("foreach ($this->veryLongIterableFactory("))
+        .expect("expected truncated foreach header scope hint");
     assert!(
-        !labels.iter().any(|label| label == "while"),
+        foreach_label.contains("...") && foreach_label.ends_with("as $key => $value)"),
+        "expected foreach hint to preserve header start and loop variables, got: {foreach_label}"
+    );
+    assert!(
+        foreach_label.chars().count() <= 96,
+        "foreach hint should be truncated to a compact label, got: {foreach_label}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|label| matches!(label.as_str(), "else" | "try" | "catch" | "finally")),
+        "expression-less and try/catch/finally blocks should not produce scope hints, got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|label| label.starts_with("while")),
         "short while block should not produce noisy scope hint, got: {:?}",
         labels
     );

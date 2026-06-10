@@ -5584,3 +5584,8 @@ change.
   - Started: 2026-06-10; update Rust workspace/package metadata, VS Code extension metadata, lockfiles, current docs, and version-sensitive tests from `0.6.0` to `0.7.0`.
   - Implemented: synchronized Rust workspace packages, Cargo.lock, VS Code extension package metadata, package-lock, current project docs, cache schema fixture metadata, and packaged-extension path tests to `0.7.0`.
   - Validation: `cargo fmt --all --check`; `cargo metadata --locked --format-version 1 --no-deps`; `npm run lint && npm run build`; focused cache/stubs tests; `cargo test --all`; `cargo clippy --all-targets -- -D warnings`; `git diff --check`; `make install`; `client/bin/linux-x64/php-lsp --version`.
+
+- [x] **H-INLAY-SCOPE-END-HINTS-EXPRESSION-LABELS-2026-06-10** Use expression labels for large scope hints *(done 2026-06-10)*
+  - Started: 2026-06-10; remove noisy end-of-scope inlay hints for `try`, `catch`, `finally`, and expression-less control scopes, while showing truncated header expressions for large `if`, `elseif`, `foreach`, `for`, `while`, and `switch` scopes.
+  - Implemented: large control scope hints now use normalized header labels with middle truncation; expression-less `else` and `try`/`catch`/`finally` blocks no longer emit end-of-scope hints.
+  - Validation: `cargo fmt --all --check`; `cargo test -p php-lsp-server --test e2e_hover test_inlay_hints_for_methods_and_large_scopes -- --nocapture`; `cargo test --all`; `cargo clippy --all-targets -- -D warnings`; `git diff --check`; `make install`.

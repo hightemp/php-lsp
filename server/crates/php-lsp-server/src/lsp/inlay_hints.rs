@@ -6,6 +6,7 @@ use super::super::*;
 
 const DECLARATION_SCOPE_END_HINT_MIN_LINES: u32 = 2;
 const LARGE_SCOPE_END_HINT_MIN_LINES: u32 = 8;
+const CONTROL_SCOPE_END_HINT_MAX_CHARS: usize = 96;
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_inlay_hint(
@@ -297,11 +298,8 @@ fn scope_end_hint_min_lines(kind: &str) -> Option<u32> {
         | "interface_declaration"
         | "trait_declaration"
         | "enum_declaration" => Some(LARGE_SCOPE_END_HINT_MIN_LINES),
-        "if_statement" | "else_if_clause" | "else_clause" | "foreach_statement"
-        | "for_statement" | "while_statement" | "do_statement" | "switch_statement"
-        | "try_statement" | "catch_clause" | "finally_clause" => {
-            Some(LARGE_SCOPE_END_HINT_MIN_LINES)
-        }
+        "if_statement" | "else_if_clause" | "foreach_statement" | "for_statement"
+        | "while_statement" | "switch_statement" => Some(LARGE_SCOPE_END_HINT_MIN_LINES),
         _ => None,
     }
 }
@@ -346,19 +344,52 @@ fn scope_end_hint_label(scope_node: tree_sitter::Node, source: &str) -> Option<S
         "enum_declaration" => {
             declaration_name(scope_node, source).map(|name| format!("enum {name}"))
         }
-        "if_statement" => Some("if".into()),
-        "else_if_clause" => Some("elseif".into()),
-        "else_clause" => Some("else".into()),
-        "foreach_statement" => Some("foreach".into()),
-        "for_statement" => Some("for".into()),
-        "while_statement" => Some("while".into()),
-        "do_statement" => Some("do".into()),
-        "switch_statement" => Some("switch".into()),
-        "try_statement" => Some("try".into()),
-        "catch_clause" => Some("catch".into()),
-        "finally_clause" => Some("finally".into()),
+        "if_statement" | "else_if_clause" | "foreach_statement" | "for_statement"
+        | "while_statement" | "switch_statement" => {
+            control_scope_end_hint_label(scope_node, source)
+        }
         _ => None,
     }
+}
+
+fn control_scope_end_hint_label(scope_node: tree_sitter::Node, source: &str) -> Option<String> {
+    let body = scope_node.child_by_field_name("body")?;
+    let header = source.get(scope_node.start_byte()..body.start_byte())?;
+    let normalized = normalize_scope_hint_text(header);
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(truncate_scope_hint_label(
+        &normalized,
+        CONTROL_SCOPE_END_HINT_MAX_CHARS,
+    ))
+}
+
+fn normalize_scope_hint_text(text: &str) -> String {
+    let trimmed = text.trim();
+    let header = trimmed.strip_suffix(':').unwrap_or(trimmed);
+    header.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_scope_hint_label(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let available = max_chars.saturating_sub(3);
+    let head_chars = (available * 2) / 3;
+    let tail_chars = available.saturating_sub(head_chars);
+    let head = text.chars().take(head_chars).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}...{tail}")
 }
 
 fn declaration_name(node: tree_sitter::Node, source: &str) -> Option<String> {
