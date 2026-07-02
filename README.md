@@ -175,9 +175,10 @@ phpstorm-stubs support.
 
 ## Known Limitations
 
-- Production validation was refreshed on 2026-05-28 after the IDE intelligence
-  milestone. It measures a primary 10k-file Symfony workspace and two
-  additional Laravel-like workspaces. Remaining GA work is tracked in
+- The latest large-workspace production baseline remains the 2026-05-28 IDE
+  intelligence refresh. It measures a primary 10k-file Symfony workspace and
+  two additional Laravel-like workspaces. Later per-feature behavior is tracked
+  in `docs/lsp-features.md`; remaining risk/watch items are tracked in
   `docs/production-risk-register.md` and `docs/production-baseline.md`.
 - Workspace, stub, and lazy vendor file symbols are cached in separate disk
   namespaces with mtime, size, and content-hash validation. Lazy vendor files
@@ -192,8 +193,8 @@ phpstorm-stubs support.
   primary large-workspace indexing baseline is measured in
   `docs/production-baseline.md`.
 - Heavy references/rename requests, background indexing, and external analyzers
-  have cancellation coverage; some other heavy requests remain benchmark watch
-  items.
+  have cancellation coverage; incoming call hierarchy and reference-count code
+  lenses can still scan indexed files and remain benchmark watch items.
 - Rapid `didChange` bursts still refresh parser/index state on each accepted
   edit, while diagnostics are debounced and version-checked.
 - Built-in stubs are configurable and version-filtered for supported
@@ -211,52 +212,23 @@ phpstorm-stubs support.
   If Composer/vendor metadata is absent, external framework classes can be
   reported as unknown; dynamic framework APIs such as some Eloquent relation
   members are best-effort.
-- Template support is conservative. Blade-like and Twig documents are not full
-  template-engine implementations; diagnostics are best-effort and published
-  only for a small allowlist of exact source-mapped expression errors plus
-  conservative Twig delimiter/block syntax errors; generated virtual PHP,
-  incomplete/magic properties, and uncertain ranges stay suppressed. Complex
-  Twig expressions such as filters, tests,
-  `in`, functions, macros, ternaries, null coalescing, and dynamic/bracket
-  attribute access are explicit best-effort backlog items; their full expression
-  semantics are skipped rather than mapped to misleading PHP, while simple
-  member chains and root variables inside those expressions can still be
-  source-mapped for hover/completion/definition. Type-preserving Twig filters
-  such as `slice` and `filter` keep the base collection available for foreach
-  hover/completion/definition/inlay inference. Twig object completion also
-  offers getter-derived property-style labels such as `id` for `getId()`.
-  Definition can still navigate static Twig template-path literals that exist
-  under `templates/`, including HTML attribute values, and Symfony `path()` /
-  `url()` route keys backed by PHP 8 `#[Route(name: ...)]` attributes.
-  Twig `foreach` over Doctrine entity collections exposed through
-  property-style access can infer item hover/completion/definition/inlay types
-  from indexed ORM `targetEntity` property metadata and `add*/remove*`
-  collection mutator signatures. Twig attribute access over PHPDoc and inferred
-  array shapes can expose shape-key hover, completion, source-backed definition,
-  and inlay types for patterns such as `row.messageLog`, nested
-  `config_params.sftp.port`, and local `{% set message_log = row.messageLog %}`
-  variables. Shape-key definitions point at the PHPDoc shape key or literal
-  array key when the static context scanner has that source range. Twig context
-  variables are inferred from static `render(..., [...])` call sites and
-  literal-template helpers whose next argument is a context array, including
-  `new Class()`, arrays of new objects, typed controller parameter variables,
-  nullable locals assigned conditionally before render, indexed
-  `$this->service->method()` return types, iterable repository method results,
-  literal nested array shapes, `$items[] = [...]` append-built shapes, common
-  `array_values` / `array_filter` / `array_map` / `explode` / `preg_split`
-  list pipelines, `compact('name')` variables, Doctrine magic `find*` /
-  `findOneBy*` repository results, and Knp-style paginator variables backed by
-  Doctrine repository/query-builder sources. One-level Twig `{% include ... with {...}
-  %}` calls can pass those inferred caller variables into component templates,
-  so included partials can resolve foreach item hover/completion/definition and
-  inlay hints without hardcoded template names.
-  Custom Doctrine repositories can be resolved from indexed
-  `@extends ServiceEntityRepository<Entity>` PHPDoc or ORM `repositoryClass`
-  attributes without synchronous request-time source reads;
-  render keys whose value type cannot be inferred are still seeded as `mixed`
-  to avoid false undefined-variable diagnostics. Open Twig documents refresh
-  those inferred context types after relevant PHP controller/render changes and
-  workspace reindex events.
+- Template support is conservative. Blade-like and Twig documents use virtual
+  PHP plus source maps, not full template-engine implementations. Diagnostics
+  are best-effort and published only for exact source-mapped expression errors
+  plus conservative Twig delimiter/block syntax errors; generated virtual PHP,
+  incomplete/magic properties, uncertain ranges, runtime template inheritance,
+  macros/extensions, and framework container execution stay suppressed. Full
+  Twig semantics for filters, tests, `in`, functions, macros, ternaries, null
+  coalescing, and dynamic/bracket attribute access remain unsupported, but safe
+  subexpressions are source-mapped where possible for hover, completion,
+  definition, and inlay hints. Current supported Twig cases include simple
+  member/root variables inside otherwise unsupported expressions,
+  type-preserving `slice`/`filter` foreach inference, getter-backed
+  property-style labels, static template-path and route-key navigation, static
+  render-context inference, one-level include context, Doctrine collection
+  items, Symfony form/app globals, PHPDoc/literal shape keys, and open-template
+  context refresh after relevant PHP changes. See `docs/lsp-features.md` for
+  the exact supported template surface.
 - Diagnostics are optimized for editor feedback: file changes publish fast
   in-process diagnostics, while full diagnostics and optional external analyzer
   runs are used on open/save and reconfiguration.

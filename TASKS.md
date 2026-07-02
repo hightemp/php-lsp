@@ -5589,3 +5589,8 @@ change.
   - Started: 2026-06-10; remove noisy end-of-scope inlay hints for `try`, `catch`, `finally`, and expression-less control scopes, while showing truncated header expressions for large `if`, `elseif`, `foreach`, `for`, `while`, and `switch` scopes.
   - Implemented: large control scope hints now use normalized header labels with middle truncation; expression-less `else` and `try`/`catch`/`finally` blocks no longer emit end-of-scope hints.
   - Validation: `cargo fmt --all --check`; `cargo test -p php-lsp-server --test e2e_hover test_inlay_hints_for_methods_and_large_scopes -- --nocapture`; `cargo test --all`; `cargo clippy --all-targets -- -D warnings`; `git diff --check`; `make install`.
+
+- [x] **DOC-README-KNOWN-LIMITATIONS-AUDIT-2026-07-02** Refresh README Known Limitations *(done 2026-07-02)*
+  - Started: 2026-07-02; audit README `Known Limitations` against current implemented LSP capabilities and tests, then remove or narrow outdated limitations without overstating support.
+  - Implemented: README `Known Limitations` now points large-workspace baseline vs per-feature docs separately, names the remaining heavy-request watch areas, and replaces the stale long Twig backlog wording with a concise partial-template limitation plus supported-case summary.
+  - Validation: `git diff --check`.
