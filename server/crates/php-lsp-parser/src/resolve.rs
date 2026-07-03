@@ -1835,6 +1835,7 @@ fn find_variable_inference_before_usage(
         if let Some(array_write_info) = array_write_inference_for_var(
             stmt,
             var_name,
+            usage_start,
             source,
             file_symbols,
             resolver,
@@ -1989,6 +1990,7 @@ fn find_nested_variable_inference_before_usage(
         } else if let Some(array_write_info) = array_write_inference_for_var(
             child,
             var_name,
+            usage_start,
             source,
             file_symbols,
             resolver,
@@ -2316,6 +2318,7 @@ fn assignment_rhs_for_var<'a>(stmt: Node<'a>, var_name: &str, source: &str) -> O
 fn array_write_inference_for_var(
     stmt: Node,
     var_name: &str,
+    usage_start: usize,
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
@@ -2332,6 +2335,10 @@ fn array_write_inference_for_var(
 
     let left = expr.child_by_field_name("left")?;
     let right = expr.child_by_field_name("right")?;
+    if right.end_byte() > usage_start {
+        return None;
+    }
+
     let (base, key) = subscript_assignment_base_and_key(left)?;
     if normalize_var_name(&source[base.byte_range()]) != var_name {
         return None;
@@ -7636,6 +7643,36 @@ function run(array $numbers): void {
 
         assert_eq!(info.variable_name, "$phoneNumber");
         assert_eq!(info.type_display.as_deref(), Some("string"));
+    }
+
+    #[test]
+    fn test_array_write_rhs_self_reference_hover_does_not_recurse() {
+        let code = r#"<?php
+function run(array $subscribers, array $phoneNumbers): void {
+    foreach ($subscribers as &$subscriber) {
+        $subscriber['phoneNumbers'] = array_column($phoneNumbers, 'phoneNumber');
+        if ('Company' === $subscriber['type'] && $subscriber['organizationName']) {
+            $subscriber['displayName'] = $subscriber['organizationName'];
+        } else {
+            $subscriber['displayName'] = trim(\sprintf(
+                '%s %s %s',
+                $subscriber['lastName'] ?? '',
+                $subscriber['firstName'] ?? '',
+                $subscriber['patronymic'] ?? ''
+            ));
+        }
+    }
+}
+"#;
+        let (line, col) = find_line_col(code, "$subscriber['lastName']");
+        let info = parse_and_variable_hover_info(code, line, col + 2)
+            .expect("array-offset RHS self reference should infer without recursion");
+
+        assert_eq!(info.variable_name, "$subscriber");
+        assert!(
+            info.type_display.as_deref().is_some(),
+            "expected a usable type display for array-offset self reference"
+        );
     }
 
     #[test]

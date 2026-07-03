@@ -4084,6 +4084,128 @@ function handleRegionChangeRequestComplete(array $numbers): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_inlay_hints_array_write_rhs_self_reference_does_not_recurse() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+function normalizeSubscribers(array $subscribers, array $phoneNumbers): void {
+    foreach ($subscribers as &$subscriber) {
+        $subscriber['phoneNumbers'] = array_column($phoneNumbers, 'phoneNumber');
+        if ('Company' === /*hover*/$subscriber['type'] && $subscriber['organizationName']) {
+            $subscriber['displayName'] = $subscriber['organizationName'];
+        } else {
+            $subscriber['displayName'] = trim(\sprintf(
+                '%s %s %s',
+                /*rhs*/$subscriber['lastName'] ?? '',
+                $subscriber['firstName'] ?? '',
+                $subscriber['patronymic'] ?? ''
+            ));
+        }
+    }
+}
+"#;
+    let markers = ["/*hover*/", "/*rhs*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers
+            .find(marker)
+            .expect("test code should contain marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for marker in markers {
+            prefix = prefix.replace(marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = (prefix.len() - line_start) as u32;
+        (line, character)
+    };
+    let (hover_line, hover_character) = marker_position("/*hover*/");
+    let hover_character = hover_character + 2;
+    let (rhs_line, rhs_character) = marker_position("/*rhs*/");
+    let rhs_character = rhs_character + 2;
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/array-write-rhs-self-reference.php";
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 0, 0, 18, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    inlay_result
+        .as_array()
+        .expect("expected inlay hint array without stack overflow");
+
+    let hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, hover_line, hover_character))
+        .await
+        .unwrap();
+    let hover_result = extract_result(hover_response);
+    let hover = hover_markdown_value(&hover_result);
+    assert!(
+        hover.contains("$subscriber"),
+        "expected hover for array-offset variable, got: {}",
+        hover
+    );
+
+    let rhs_hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(4, uri, rhs_line, rhs_character))
+        .await
+        .unwrap();
+    let rhs_hover_result = extract_result(rhs_hover_response);
+    let rhs_hover = hover_markdown_value(&rhs_hover_result);
+    assert!(
+        rhs_hover.contains("$subscriber"),
+        "expected hover for array-offset RHS self reference, got: {}",
+        rhs_hover
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_callback_parameter_inference_from_indexed_signatures() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

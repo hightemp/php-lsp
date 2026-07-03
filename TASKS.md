@@ -5594,3 +5594,10 @@ change.
   - Started: 2026-07-02; audit README `Known Limitations` against current implemented LSP capabilities and tests, then remove or narrow outdated limitations without overstating support.
   - Implemented: README `Known Limitations` now points large-workspace baseline vs per-feature docs separately, names the remaining heavy-request watch areas, and replaces the stale long Twig backlog wording with a concise partial-template limitation plus supported-case summary.
   - Validation: `git diff --check`.
+
+- [x] **H-HOVER-ARRAY-SHAPE-OFFSET-CRASH-2026-07-03** Fix inlay/hover crash on array-offset local variables *(done 2026-07-03)*
+  - Started: 2026-07-03; reproduce the VS Code crash reported while hovering `/home/apanov/Projects/bdpn-ui/app/src/Controller/SubscriberController.php` at `$subscriber['type']`, trace it to recursive `textDocument/inlayHint` type inference for `$subscriber[...]` inside a current array-write RHS, fix without project-specific hardcoding, and add regression coverage.
+  - Implemented: array-write variable inference now ignores an assignment RHS that has not completed before the current usage position, including nested flow scans; added parser and LSP e2e regressions covering `$subscriber['displayName'] = ... $subscriber['lastName'] ...`.
+  - Validation: `cargo fmt --all --check`; `git diff --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test -p php-lsp-parser array_write`; `cargo test -p php-lsp-server --test e2e_hover array_write`; `cargo test --all`; `make install`; Verifier subagent GO.
+  - Files:
+    /home/apanov/Projects/bdpn-ui/app/src/Controller/SubscriberController.php
