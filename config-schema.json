@@ -24,6 +24,23 @@
           "type": "string",
           "enum": ["off", "syntax-only", "basic-semantic"]
         },
+        "memberTypeNodeBudget": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 512,
+          "description": "Maximum relevant AST nodes inspected by member/type diagnostics. Set to 0 to disable the budget cap."
+        },
+        "memberTypeBudget": {
+          "type": "integer",
+          "minimum": 0,
+          "deprecated": true,
+          "description": "Legacy alias for memberTypeNodeBudget."
+        },
+        "partialAnalysisDiagnostic": {
+          "type": "boolean",
+          "default": true,
+          "description": "Publish an informational diagnostic when member/type diagnostics are skipped because the node budget was exceeded."
+        },
         "severity": {
           "$ref": "#/$defs/diagnosticSeverity"
         },
