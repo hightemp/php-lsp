@@ -91,6 +91,87 @@ function run(ServiceLocator $locator): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_blade_signature_help_maps_original_position_to_atomic_virtual_snapshot() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let php_uri = "file:///test/template-signature-formatter.php";
+    let blade_uri = "file:///test/template-signature.blade.php";
+    let php = r#"<?php
+class Formatter {
+    public function format(string $value, int $repeat = 1): string { return $value; }
+}
+"#;
+    let blade = "<span>{{ (new Formatter())->format('x', 2) }}</span>\n";
+    let position = utf16_position_after(blade, "format('x', ");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(php_uri, php))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            blade_uri, "blade", blade,
+        ))
+        .await
+        .unwrap();
+
+    let result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(signature_help_request(2, blade_uri, position.0, position.1))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| {
+                label.contains("Formatter::format(string $value, int $repeat = 1): string")
+            }),
+        "expected Blade signature help from the mapped virtual snapshot, got: {result}"
+    );
+    assert_eq!(
+        result["activeParameter"].as_u64(),
+        Some(1),
+        "second Blade call argument should be active: {result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_blade_template_virtual_php_hover_completion_diagnostics_and_tokens() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
@@ -113,7 +194,7 @@ async fn test_blade_template_virtual_php_hover_completion_diagnostics_and_tokens
             .join("resources/views/show.blade.php")
             .to_string_lossy()
     );
-    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let root_uri = php_lsp_types::uri::path_to_uri(&tmp_root).unwrap();
     let php_code = "<?php\nclass User { public function getName(): string { return ''; } }\n";
     let completion_marker = "/*complete*/";
     let blade_with_marker = format!(
@@ -259,7 +340,7 @@ async fn test_blade_template_reports_safe_mapped_expression_diagnostics() {
 
     let php_path = tmp_root.join("app/User.php");
     let blade_path = tmp_root.join("resources/views/show.blade.php");
-    let root_uri = format!("file://{}", tmp_root.to_string_lossy());
+    let root_uri = php_lsp_types::uri::path_to_uri(&tmp_root).unwrap();
     let php_uri = format!("file://{}", php_path.to_string_lossy());
     let blade_uri = format!("file://{}", blade_path.to_string_lossy());
     let php_code = "<?php\nclass User { public function getName(): string { return ''; } }\n";
@@ -6601,6 +6682,374 @@ final class PortingProcessController
         }),
         "expected Twig subscriber foreach inlay hint with class link, got: {}",
         porting_result
+    );
+
+    let _ = fs::remove_dir_all(&tmp_root);
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_immediate_twig_change_is_not_overwritten_by_did_open() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+
+    let uri = "file:///test/immediate-change.html.twig";
+    let open = service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            uri,
+            "twig",
+            "{{ true }}\n",
+        ));
+    let change = service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(uri, 2, "{% if true %}\n"));
+    let (open_response, change_response) = futures::join!(open, change);
+    assert!(open_response.unwrap().is_none());
+    assert!(change_response.unwrap().is_none());
+
+    let diagnostics = {
+        let started = std::time::Instant::now();
+        loop {
+            let remaining = Duration::from_secs(2)
+                .checked_sub(started.elapsed())
+                .expect("timed out waiting for changed Twig diagnostics");
+            let diagnostics = next_publish_diagnostics(&mut notifications, uri, remaining).await;
+            if diagnostics["version"].as_i64() == Some(2) {
+                break diagnostics;
+            }
+        }
+    };
+    assert_eq!(
+        diagnostics["version"].as_i64(),
+        Some(2),
+        "diagnostics must describe the changed document: {}",
+        diagnostics
+    );
+    assert!(
+        published_diagnostic_messages(&diagnostics)
+            .iter()
+            .any(|message| message.contains("Unclosed Twig `if` block")),
+        "didOpen must not restore the original Twig source: {}",
+        diagnostics
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_blade_and_twig_type_definition_and_implementation_map_template_positions() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-template-type-definition-implementation-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(tmp_root.join("src")).unwrap();
+    fs::create_dir_all(tmp_root.join("resources/views")).unwrap();
+    fs::create_dir_all(tmp_root.join("templates")).unwrap();
+
+    let root_uri = php_lsp_types::uri::path_to_uri(&tmp_root).unwrap();
+    let php_path = tmp_root.join("src/TemplateTypes.php");
+    // The Blade language id creates a virtual template document even with a
+    // generic PHP suffix. The open snapshot remains authoritative when the
+    // watched-file event arrives; virtual symbols must not enter the global index.
+    let blade_path = tmp_root.join("resources/views/show.php");
+    let twig_path = tmp_root.join("templates/show.html.twig");
+    let php_uri = php_lsp_types::uri::path_to_uri(&php_path).unwrap();
+    let blade_uri = php_lsp_types::uri::path_to_uri(&blade_path).unwrap();
+    let twig_uri = php_lsp_types::uri::path_to_uri(&twig_path).unwrap();
+
+    let php_code = r#"<?php
+namespace App;
+
+interface Contract
+{
+    public function run(): string;
+}
+
+final class Worker implements Contract
+{
+    public function run(): string
+    {
+        return 'done';
+    }
+}
+
+final class User
+{
+    public string $name = '';
+    public function getName(): string { return $this->name; }
+}
+
+final class TemplateController
+{
+    public function show(Contract $contract): void
+    {
+        $this->render('show.html.twig', [
+            'user' => new User(),
+            'contract' => $contract,
+        ]);
+    }
+}
+"#;
+    let blade = concat!(
+        "<section>😀 {{ (new \\App\\User())->getName() }}</section>\n",
+        "<section>{{ (new \\App\\Contract())->run() }}</section>\n",
+        "@if((function () { class TemplateLocalUser { public function name(): string { return 'local'; } } interface TemplateLocalContract { public function run(): string; } final class TemplateLocalWorker implements TemplateLocalContract { public function run(): string { return 'local'; } } return true; })())\n",
+        "@endif\n",
+        "<section>{{ (new \\TemplateLocalUser())->name() }}</section>\n",
+        "<section>{{ (new \\TemplateLocalContract())->run() }}</section>\n",
+    );
+    let twig = "<h1>😀 {{ user.name }}</h1>\n<p>{{ contract.run() }}</p>\n";
+    let blade_type_position = utf16_position_after(blade, "\\App\\Us");
+    let blade_implementation_position = utf16_position_after(blade, "\\App\\Cont");
+    let twig_type_position = utf16_position_after(twig, "us");
+    let twig_implementation_position = utf16_position_after(twig, "contract.r");
+    let blade_local_type_usage_offset = blade.rfind("\\TemplateLocalUser").unwrap();
+    let blade_local_type_position = utf16_position_for_offset(
+        blade,
+        blade_local_type_usage_offset + "\\TemplateLocalUs".len(),
+    );
+    let blade_local_implementation_usage_offset = blade.rfind("\\TemplateLocalContract").unwrap();
+    let blade_local_implementation_position = utf16_position_for_offset(
+        blade,
+        blade_local_implementation_usage_offset + "\\TemplateLocalCont".len(),
+    );
+    let blade_local_user_target = utf16_position_at(blade, "TemplateLocalUser {");
+    let blade_local_worker_target = utf16_position_at(blade, "TemplateLocalWorker implements");
+    let user_line = utf16_position_at(php_code, "final class User").0;
+    let worker_class_line = utf16_position_at(php_code, "final class Worker").0;
+    let worker_offset = php_code.find("final class Worker").unwrap();
+    let worker_method_offset = worker_offset
+        + php_code[worker_offset..]
+            .find("public function run")
+            .unwrap();
+    let worker_method_line = utf16_position_for_offset(php_code, worker_method_offset).0;
+
+    fs::write(&php_path, php_code).unwrap();
+    fs::write(&blade_path, blade).unwrap();
+    fs::write(&twig_path, twig).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(&php_uri, php_code))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(
+            &blade_uri, "blade", blade,
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification_with_language(&twig_uri, "twig", twig))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(&blade_uri, 2)]))
+        .await
+        .unwrap();
+
+    let blade_type = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(type_definition_request(
+                2,
+                &blade_uri,
+                blade_type_position.0,
+                blade_type_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(blade_type["uri"].as_str(), Some(php_uri.as_str()));
+    assert_eq!(
+        blade_type["range"]["start"]["line"].as_u64(),
+        Some(user_line as u64),
+        "Blade typeDefinition should resolve User from the original template position, got: {blade_type}"
+    );
+
+    let blade_implementation = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(implementation_request(
+                3,
+                &blade_uri,
+                blade_implementation_position.0,
+                blade_implementation_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        blade_implementation
+            .as_array()
+            .is_some_and(|locations| locations.iter().any(|location| {
+                location["uri"].as_str() == Some(php_uri.as_str())
+                    && location["range"]["start"]["line"].as_u64()
+                        == Some(worker_class_line as u64)
+            })),
+        "Blade implementation should resolve Worker from the original template position, got: {blade_implementation}"
+    );
+
+    let twig_type = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(type_definition_request(
+                4,
+                &twig_uri,
+                twig_type_position.0,
+                twig_type_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(twig_type["uri"].as_str(), Some(php_uri.as_str()));
+    assert_eq!(
+        twig_type["range"]["start"]["line"].as_u64(),
+        Some(user_line as u64),
+        "Twig typeDefinition should resolve User from the original template position, got: {twig_type}"
+    );
+
+    let twig_implementation = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(implementation_request(
+                5,
+                &twig_uri,
+                twig_implementation_position.0,
+                twig_implementation_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        twig_implementation
+            .as_array()
+            .is_some_and(|locations| locations.iter().any(|location| {
+                location["uri"].as_str() == Some(php_uri.as_str())
+                    && location["range"]["start"]["line"].as_u64()
+                        == Some(worker_method_line as u64)
+            })),
+        "Twig implementation should resolve Worker::run from the original template position, got: {twig_implementation}"
+    );
+
+    let blade_local_type = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(type_definition_request(
+                6,
+                &blade_uri,
+                blade_local_type_position.0,
+                blade_local_type_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        blade_local_type["uri"].as_str(),
+        Some(blade_uri.as_str()),
+        "same-template Blade typeDefinition must retain the original template URI: {blade_local_type}"
+    );
+    assert_eq!(
+        (
+            blade_local_type["range"]["start"]["line"].as_u64(),
+            blade_local_type["range"]["start"]["character"].as_u64(),
+        ),
+        (
+            Some(blade_local_user_target.0 as u64),
+            Some(blade_local_user_target.1 as u64),
+        ),
+        "same-template Blade typeDefinition target must map from virtual PHP to the original template: {blade_local_type}"
+    );
+
+    let blade_local_implementation = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(implementation_request(
+                7,
+                &blade_uri,
+                blade_local_implementation_position.0,
+                blade_local_implementation_position.1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        blade_local_implementation
+            .as_array()
+            .is_some_and(|locations| locations.iter().any(|location| {
+                location["uri"].as_str() == Some(blade_uri.as_str())
+                    && location["range"]["start"]["line"].as_u64()
+                        == Some(blade_local_worker_target.0 as u64)
+                    && location["range"]["start"]["character"].as_u64()
+                        == Some(blade_local_worker_target.1 as u64)
+            })),
+        "same-template Blade implementation target must map from virtual PHP to the original template: {blade_local_implementation}"
     );
 
     let _ = fs::remove_dir_all(&tmp_root);

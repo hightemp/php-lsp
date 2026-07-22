@@ -38,25 +38,64 @@ fn extract_file_symbols_with_php_version(
     let root = tree.root_node();
     extract_file_level_phpdoc_aliases(root, source, &mut result);
 
-    // Walk top-level children of program node.
-    // Handle namespace-without-braces by tracking current namespace.
-    let mut current_ns: Option<String> = None;
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        match child.kind() {
-            "namespace_definition" => {
-                // Extract namespace name from the namespace_name child
-                let ns_name = find_namespace_name(child, source);
-                if let Some(ns) = &ns_name {
-                    result.namespace = Some(ns.clone());
-                }
-                current_ns = ns_name.clone();
+    let mut root_cursor = root.walk();
+    let children: Vec<Node<'_>> = root.children(&mut root_cursor).collect();
+    let has_namespace_declarations = children.iter().any(|child| {
+        child.kind() == "namespace_definition"
+            && crate::resolve::namespace_relative_function_call(*child, source).is_none()
+    });
 
-                // If namespace has braces, recurse into body
+    if !has_namespace_declarations {
+        result.namespace_scopes.push(NamespaceScope {
+            namespace: None,
+            range: node_range(root),
+        });
+    }
+
+    // Handle both bracketed namespace bodies and unbracketed namespace
+    // sections. An unbracketed section extends to the next namespace
+    // declaration (or EOF), not merely to the declaration's semicolon.
+    let mut current_ns: Option<String> = None;
+    for (index, child) in children.iter().copied().enumerate() {
+        match child.kind() {
+            "namespace_definition"
+                if crate::resolve::namespace_relative_function_call(child, source).is_none() =>
+            {
+                let ns_name = find_namespace_name(child, source);
+                result.namespace = ns_name.clone();
+
                 if let Some(body) = child.child_by_field_name("body") {
+                    result.namespace_scopes.push(NamespaceScope {
+                        namespace: ns_name.clone(),
+                        range: node_range(child),
+                    });
                     extract_children(body, source, uri, &mut result, &ns_name, php_version);
+                    current_ns = None;
+                } else {
+                    let end = children[index + 1..]
+                        .iter()
+                        .find(|candidate| {
+                            candidate.kind() == "namespace_definition"
+                                && crate::resolve::namespace_relative_function_call(
+                                    **candidate,
+                                    source,
+                                )
+                                .is_none()
+                        })
+                        .map(|candidate| candidate.start_position())
+                        .unwrap_or_else(|| root.end_position());
+                    let start = child.start_position();
+                    result.namespace_scopes.push(NamespaceScope {
+                        namespace: ns_name.clone(),
+                        range: (
+                            start.row as u32,
+                            start.column as u32,
+                            end.row as u32,
+                            end.column as u32,
+                        ),
+                    });
+                    current_ns = ns_name;
                 }
-                // If no body — namespace applies to rest of file (current_ns is set)
             }
             _ => {
                 extract_from_node(child, source, uri, &mut result, &current_ns, php_version);
@@ -220,15 +259,15 @@ fn extract_use_statements(
     result: &mut FileSymbols,
     current_ns: &Option<String>,
 ) {
-    // Determine use kind (function/const/normal)
-    let kind = determine_use_kind(node, source);
+    let declaration_kind = determine_use_kind(node, source);
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "namespace_use_clause" {
-            extract_single_use_clause(child, source, result, kind, current_ns);
+            let clause_kind = use_clause_kind(child, source).unwrap_or(declaration_kind);
+            extract_single_use_clause(child, source, result, clause_kind, current_ns);
         } else if child.kind() == "namespace_use_group" {
-            extract_use_group(child, node, source, result, kind, current_ns);
+            extract_use_group(child, node, source, result, declaration_kind, current_ns);
         }
     }
 }
@@ -286,46 +325,59 @@ fn extract_use_group(
     parent: Node,
     source: &str,
     result: &mut FileSymbols,
-    kind: UseKind,
+    declaration_kind: UseKind,
     current_ns: &Option<String>,
 ) {
-    // Get prefix from parent
+    // tree-sitter exposes the group prefix as the declaration's
+    // `namespace_name` child (the group itself only contains clauses).
+    let mut parent_cursor = parent.walk();
     let prefix = parent
-        .child_by_field_name("prefix")
-        .map(|n| node_text(n, source).to_string())
+        .named_children(&mut parent_cursor)
+        .find(|child| child.kind() == "namespace_name")
+        .map(|node| node_text(node, source).trim_matches('\\').to_string())
         .unwrap_or_default();
 
     let mut cursor = group.walk();
-    for child in group.children(&mut cursor) {
-        if child.kind() == "namespace_use_clause" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, source);
-                let fqn = if prefix.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{}\\{}", prefix, name)
-                };
-                let alias = child
-                    .child_by_field_name("alias")
-                    .map(|n| node_text(n, source).to_string());
-
-                let sp = child.start_position();
-                let ep = child.end_position();
-                let range = (
-                    sp.row as u32,
-                    sp.column as u32,
-                    ep.row as u32,
-                    ep.column as u32,
-                );
-                result.use_statements.push(UseStatement {
-                    fqn,
-                    alias,
-                    kind,
-                    namespace: current_ns.clone(),
-                    range,
-                });
-            }
+    for clause in group.named_children(&mut cursor) {
+        if clause.kind() != "namespace_use_clause" {
+            continue;
         }
+
+        let alias_node = clause.child_by_field_name("alias");
+        let mut clause_cursor = clause.walk();
+        let name_node = clause.named_children(&mut clause_cursor).find(|child| {
+            Some(child.id()) != alias_node.map(|alias| alias.id())
+                && matches!(child.kind(), "name" | "qualified_name")
+        });
+        let Some(name_node) = name_node else {
+            continue;
+        };
+
+        let name = node_text(name_node, source).trim_matches('\\');
+        let fqn = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}\\{name}")
+        };
+        let alias = alias_node.map(|node| node_text(node, source).to_string());
+        let kind = use_clause_kind(clause, source).unwrap_or(declaration_kind);
+
+        result.use_statements.push(UseStatement {
+            fqn,
+            alias,
+            kind,
+            namespace: current_ns.clone(),
+            range: node_range(clause),
+        });
+    }
+}
+
+fn use_clause_kind(clause: Node, source: &str) -> Option<UseKind> {
+    let type_node = clause.child_by_field_name("type")?;
+    match node_text(type_node, source).to_ascii_lowercase().as_str() {
+        "function" => Some(UseKind::Function),
+        "const" => Some(UseKind::Constant),
+        _ => None,
     }
 }
 
@@ -467,6 +519,10 @@ fn extract_class_like(
     };
     let name = node_text(name_node, source).to_string();
     let fqn = make_fqn(current_ns, &name);
+    let start = node.start_position();
+    let resolution_symbols = result
+        .scoped_at_byte_position(start.row as u32, start.column as u32)
+        .into_owned();
 
     let modifiers = extract_modifiers(node, source);
     let attributes = attribute_groups_for_node(node, source);
@@ -475,11 +531,12 @@ fn extract_class_like(
         .as_ref()
         .map(|doc_node| node_text(*doc_node, source).to_string());
     let templates = phpdoc_templates(doc_comment.as_deref());
-    let mut template_bindings = phpdoc_template_bindings(doc_comment.as_deref(), result);
+    let mut template_bindings =
+        phpdoc_template_bindings(doc_comment.as_deref(), &resolution_symbols);
     if let Some(repository_name) =
         doctrine_repository_class_name_from_attribute_text(&attribute_prefix_for_node(node, source))
     {
-        let repository_fqn = resolve_class_name_in_file(&repository_name, result)
+        let repository_fqn = resolve_class_name_in_file(&repository_name, &resolution_symbols)
             .trim_start_matches('\\')
             .to_string();
         if !repository_fqn.is_empty() {
@@ -492,11 +549,11 @@ fn extract_class_like(
     }
 
     // Extract extends (base_clause) and implements (class_interface_clause)
-    let extends_fqns = extract_base_clause(node, source, result);
-    let implements_fqns = extract_interface_clause(node, source, result);
+    let extends_fqns = extract_base_clause(node, source, &resolution_symbols);
+    let implements_fqns = extract_interface_clause(node, source, &resolution_symbols);
     let body_node = class_body_node(node);
     let trait_fqns = body_node
-        .map(|body| extract_trait_use_clauses(body, source, result))
+        .map(|body| extract_trait_use_clauses(body, source, &resolution_symbols))
         .unwrap_or_default();
 
     let sym = SymbolInfo {
@@ -628,7 +685,7 @@ fn extract_phpdoc_virtual_methods(
         if result.symbols.iter().any(|symbol| {
             symbol.kind == PhpSymbolKind::Method
                 && symbol.parent_fqn.as_deref() == Some(parent_fqn)
-                && symbol.name == method.name
+                && symbol.name.eq_ignore_ascii_case(&method.name)
         }) {
             continue;
         }
@@ -2358,6 +2415,106 @@ use App\Attribute\Route as LocalRoute;
             syms.use_statements[1].namespace.as_deref(),
             Some("App\\Api")
         );
+    }
+
+    #[test]
+    fn test_extract_mixed_group_use_clause_kinds_prefixes_and_aliases() {
+        let syms = parse_and_extract(
+            r#"<?php
+use Vendor\Package\{
+    Thing as Alias,
+    function helper as DoWork,
+    const FLAG as LocalFlag
+};
+use function Vendor\Functions\{first, second as Other};
+"#,
+        );
+
+        let imports: Vec<(&str, Option<&str>, UseKind)> = syms
+            .use_statements
+            .iter()
+            .map(|statement| {
+                (
+                    statement.fqn.as_str(),
+                    statement.alias.as_deref(),
+                    statement.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            imports,
+            vec![
+                ("Vendor\\Package\\Thing", Some("Alias"), UseKind::Class),
+                ("Vendor\\Package\\helper", Some("DoWork"), UseKind::Function,),
+                (
+                    "Vendor\\Package\\FLAG",
+                    Some("LocalFlag"),
+                    UseKind::Constant,
+                ),
+                ("Vendor\\Functions\\first", None, UseKind::Function),
+                (
+                    "Vendor\\Functions\\second",
+                    Some("Other"),
+                    UseKind::Function,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unbracketed_namespace_scopes_limit_repeated_aliases() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace First;
+use Vendor\First\Service as Shared;
+new Shared();
+
+namespace Second;
+use Vendor\Second\Service as Shared;
+new Shared();
+"#,
+        );
+
+        assert_eq!(syms.namespace_scopes.len(), 2);
+        let first = syms.scoped_at_byte_position(3, 4);
+        assert_eq!(first.namespace.as_deref(), Some("First"));
+        assert_eq!(first.use_statements.len(), 1);
+        assert_eq!(first.use_statements[0].fqn, "Vendor\\First\\Service");
+
+        let second = syms.scoped_at_byte_position(7, 4);
+        assert_eq!(second.namespace.as_deref(), Some("Second"));
+        assert_eq!(second.use_statements.len(), 1);
+        assert_eq!(second.use_statements[0].fqn, "Vendor\\Second\\Service");
+    }
+
+    #[test]
+    fn test_repeated_same_namespace_blocks_isolate_aliases_during_extraction() {
+        let syms = parse_and_extract(
+            r#"<?php
+namespace App {
+    use Vendor\First\BaseType as SharedBase;
+    class FirstChild extends SharedBase {}
+}
+namespace App {
+    use Vendor\Second\BaseType as SharedBase;
+    class SecondChild extends SharedBase {}
+}
+"#,
+        );
+
+        let first = syms
+            .symbols
+            .iter()
+            .find(|symbol| symbol.fqn == r"App\FirstChild")
+            .expect("first class should be extracted");
+        assert_eq!(first.extends, vec![r"Vendor\First\BaseType"]);
+
+        let second = syms
+            .symbols
+            .iter()
+            .find(|symbol| symbol.fqn == r"App\SecondChild")
+            .expect("second class should be extracted");
+        assert_eq!(second.extends, vec![r"Vendor\Second\BaseType"]);
     }
 
     #[test]

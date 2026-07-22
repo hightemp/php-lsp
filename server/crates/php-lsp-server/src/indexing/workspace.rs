@@ -3,7 +3,129 @@
 use crate::util::uri::path_to_uri;
 
 use super::super::*;
-use tracing::Instrument;
+
+struct RenamedOpenDocument {
+    parser: FileParser,
+    template: Option<TemplateDocument>,
+    state: OpenDocumentState,
+}
+
+struct RenamedOpenDocumentCommitContext<'a> {
+    open_files: &'a DashMap<String, FileParser>,
+    template_documents: &'a DashMap<String, TemplateDocument>,
+    document_versions: &'a DashMap<String, OpenDocumentState>,
+    closed_document_reload_tokens: &'a DashMap<String, u64>,
+    uri_str: &'a str,
+}
+
+fn commit_renamed_open_document_with_hook<F>(
+    ctx: RenamedOpenDocumentCommitContext<'_>,
+    document: RenamedOpenDocument,
+    before_parser_publish: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    let dashmap::mapref::entry::Entry::Vacant(open_entry) =
+        ctx.open_files.entry(ctx.uri_str.to_string())
+    else {
+        // A concurrent didOpen at the destination owns the newer document.
+        return false;
+    };
+
+    match document.template {
+        Some(template) => {
+            ctx.template_documents
+                .insert(ctx.uri_str.to_string(), template);
+        }
+        None => {
+            ctx.template_documents.remove(ctx.uri_str);
+        }
+    }
+    ctx.document_versions
+        .insert(ctx.uri_str.to_string(), document.state);
+    ctx.closed_document_reload_tokens.remove(ctx.uri_str);
+    before_parser_publish();
+
+    // The vacant entry retains the destination shard lock until all companion
+    // state has been staged, so snapshot readers cannot observe a partial move.
+    open_entry.insert(document.parser);
+    true
+}
+
+#[derive(Clone, Copy)]
+struct DiskPhpIndexCommitContext<'a> {
+    open_files: &'a DashMap<String, FileParser>,
+    template_documents: &'a DashMap<String, TemplateDocument>,
+    document_versions: &'a DashMap<String, OpenDocumentState>,
+    index: &'a WorkspaceIndex,
+    uri_str: &'a str,
+}
+
+fn commit_disk_php_index_if_closed_with_hook<F>(
+    ctx: DiskPhpIndexCommitContext<'_>,
+    file_symbols: Option<php_lsp_types::FileSymbols>,
+    references: Vec<php_lsp_types::SymbolReference>,
+    before_index_commit: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    let dashmap::mapref::entry::Entry::Vacant(_open_entry) =
+        ctx.open_files.entry(ctx.uri_str.to_string())
+    else {
+        return false;
+    };
+    if ctx.template_documents.contains_key(ctx.uri_str)
+        || ctx.document_versions.contains_key(ctx.uri_str)
+    {
+        return false;
+    }
+
+    before_index_commit();
+    if let Some(file_symbols) = file_symbols {
+        ctx.index
+            .update_file_with_references(ctx.uri_str, file_symbols, references);
+    } else {
+        ctx.index.remove_file(ctx.uri_str);
+    }
+    true
+}
+
+fn commit_disk_php_index_if_closed(
+    ctx: DiskPhpIndexCommitContext<'_>,
+    file_symbols: Option<php_lsp_types::FileSymbols>,
+    references: Vec<php_lsp_types::SymbolReference>,
+) -> bool {
+    commit_disk_php_index_if_closed_with_hook(ctx, file_symbols, references, || {})
+}
+
+fn commit_workspace_disk_file_preserving_open(
+    ctx: DiskPhpIndexCommitContext<'_>,
+    file_symbols: php_lsp_types::FileSymbols,
+    references: Vec<php_lsp_types::SymbolReference>,
+) {
+    if commit_disk_php_index_if_closed(ctx, Some(file_symbols), references) {
+        return;
+    }
+    if let Some(snapshot) = open_document_snapshot_from_state(
+        ctx.open_files,
+        ctx.template_documents,
+        ctx.document_versions,
+        ctx.uri_str,
+    ) {
+        commit_open_document_index_snapshot_if_current(
+            OpenDocumentIndexCommitContext {
+                open_files: ctx.open_files,
+                template_documents: ctx.template_documents,
+                document_versions: ctx.document_versions,
+                index: ctx.index,
+                uri_str: ctx.uri_str,
+            },
+            &snapshot,
+        );
+    }
+}
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_initialized(&self, _params: InitializedParams) {
@@ -113,8 +235,8 @@ impl PhpLspBackend {
         let twig_context_disk_cache = self.twig_context_disk_cache.clone();
         let semantic_tokens_cache = self.semantic_tokens_cache.clone();
         let reindex_document_versions = self.document_versions.clone();
+        let diagnostics_publisher = self.diagnostics_publisher.clone();
         let reindex_index = self.index.clone();
-        let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let diagnostic_budget = *self.diagnostic_budget.lock().await;
@@ -160,7 +282,12 @@ impl PhpLspBackend {
                 }
                 if let Err(e) = index_workspace(
                     &client,
-                    &index,
+                    WorkspaceLiveIndexContext {
+                        index: &index,
+                        open_files: &open_files,
+                        template_documents: &template_documents,
+                        document_versions: &reindex_document_versions,
+                    },
                     &config.root,
                     config.namespace_map.as_ref(),
                     &indexing_options,
@@ -210,14 +337,15 @@ impl PhpLspBackend {
             let workspace_roots: Vec<PathBuf> =
                 configs.iter().map(|config| config.root.clone()).collect();
             twig_context_disk_cache.lock().await.clear();
-            refresh_open_twig_contexts_for_state(
-                &open_files,
-                &template_documents,
-                &reindex_index,
-                &workspace_roots,
-                &twig_context_disk_cache,
-                &semantic_tokens_cache,
-            )
+            refresh_open_twig_contexts_for_state(OpenTwigContextRefreshState {
+                open_files: &open_files,
+                template_documents: &template_documents,
+                document_versions: &reindex_document_versions,
+                index: &reindex_index,
+                workspace_roots: &workspace_roots,
+                twig_context_disk_cache: &twig_context_disk_cache,
+                semantic_tokens_cache: &semantic_tokens_cache,
+            })
             .await;
             if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                 return;
@@ -225,34 +353,49 @@ impl PhpLspBackend {
             let open_file_uris: Vec<String> =
                 open_files.iter().map(|entry| entry.key().clone()).collect();
             for uri_str in open_file_uris {
+                let Some(snapshot) = open_document_snapshot_from_state(
+                    &open_files,
+                    &template_documents,
+                    &reindex_document_versions,
+                    &uri_str,
+                ) else {
+                    continue;
+                };
+                commit_open_document_index_snapshot_if_current(
+                    OpenDocumentIndexCommitContext {
+                        open_files: &open_files,
+                        template_documents: &template_documents,
+                        document_versions: &reindex_document_versions,
+                        index: &reindex_index,
+                        uri_str: &uri_str,
+                    },
+                    &snapshot,
+                );
                 if let Ok(uri) = uri_str.parse::<Uri>() {
-                    let version = reindex_document_versions
-                        .get(&uri_str)
-                        .map(|current| *current);
-                    let template_document = template_documents
-                        .get(&uri_str)
-                        .map(|template| template.value().clone());
+                    let document_state = snapshot.document_state;
+                    let version = document_state.map(|state| state.version);
+                    let template_document = snapshot.template_document.clone();
                     if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
                         && template_document.is_none()
                         && index_vendor
                     {
                         preresolve_open_file_diagnostic_dependencies(
-                            &reindex_index,
-                            &open_files,
-                            &uri_str,
+                            &snapshot.tree,
+                            &snapshot.source,
+                            &snapshot.file_symbols,
                             &vendor_lazy_context,
                         )
                         .await;
                     }
-                    let mut diags = compute_open_file_diagnostics(
-                        &uri_str,
-                        &open_files,
-                        &reindex_index,
+                    let mut diags = compute_source_diagnostics_blocking(
+                        uri_str.clone(),
+                        snapshot.source.clone(),
+                        reindex_index.clone(),
                         diagnostics_config,
                         version,
                     )
                     .await;
-                    if let Some(template) = template_document {
+                    if let Some(template) = &template_document {
                         diags = template.map_diagnostics_to_original(
                             diags,
                             diagnostics_config.mode == DiagnosticsMode::Off,
@@ -267,28 +410,15 @@ impl PhpLspBackend {
                         )
                         .await;
                     }
-                    if reindex_document_versions
-                        .get(&uri_str)
-                        .map(|current| *current)
-                        == version
-                    {
-                        let publish_started = Instant::now();
-                        let publish_span = tracing::debug_span!(
-                            "diagnostics.publish",
-                            uri = %uri_str,
-                            version = ?version,
-                            duration_ms = tracing::field::Empty,
-                        );
-                        async {
-                            reindex_client
-                                .publish_diagnostics(uri, diags, version)
-                                .await;
-                        }
-                        .instrument(publish_span.clone())
-                        .await;
-                        publish_span
-                            .record("duration_ms", publish_started.elapsed().as_millis() as u64);
-                    }
+                    diagnostics_publisher.publish(DiagnosticPublishRequest {
+                        uri,
+                        diagnostics: diags,
+                        version,
+                        expected_state: document_state,
+                        expected_template: template_document,
+                        require_idle_index: diagnostics_config.mode
+                            == DiagnosticsMode::BasicSemantic,
+                    });
                 }
             }
         });
@@ -330,7 +460,13 @@ impl PhpLspBackend {
             *self.workspace_root.lock().await = first_root;
             *self.namespace_map.lock().await = first_namespace_map;
 
-            let removed_files = remove_indexed_files_under_roots(&self.index, &removed_roots);
+            let removed_files = remove_indexed_files_under_roots(
+                &self.index,
+                &self.open_files,
+                &self.template_documents,
+                &self.document_versions,
+                &removed_roots,
+            );
             self.client
                 .log_message(
                     MessageType::INFO,
@@ -388,6 +524,9 @@ impl PhpLspBackend {
 
         let client = self.client.clone();
         let index = self.index.clone();
+        let open_files = self.open_files.clone();
+        let template_documents = self.template_documents.clone();
+        let document_versions = self.document_versions.clone();
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let include_paths = self.include_paths.lock().await.clone();
         let exclude_paths = self.exclude_paths.lock().await.clone();
@@ -420,7 +559,12 @@ impl PhpLspBackend {
                 }
                 if let Err(e) = index_workspace(
                     &client,
-                    &index,
+                    WorkspaceLiveIndexContext {
+                        index: &index,
+                        open_files: &open_files,
+                        template_documents: &template_documents,
+                        document_versions: &document_versions,
+                    },
                     &config.root,
                     config.namespace_map.as_ref(),
                     &indexing_options,
@@ -593,6 +737,415 @@ pub(in crate::server) fn resolve_config_path(root: &Path, path: &Path) -> PathBu
         normalize_path(path)
     } else {
         normalize_path(&root.join(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    fn parsed_document(
+        uri: &str,
+        source: &str,
+    ) -> (
+        FileParser,
+        php_lsp_types::FileSymbols,
+        Vec<php_lsp_types::SymbolReference>,
+    ) {
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        let tree = parser.tree().expect("parsed PHP tree");
+        let file_symbols = extract_file_symbols(tree, source, uri);
+        let references = collect_symbol_references_in_file(tree, source, &file_symbols);
+        (parser, file_symbols, references)
+    }
+
+    fn indexed_symbol_names(index: &WorkspaceIndex, uri: &str) -> Vec<String> {
+        index
+            .file_symbols
+            .get(uri)
+            .map(|symbols| {
+                symbols
+                    .symbols
+                    .iter()
+                    .map(|symbol| symbol.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn publish_open_php_document(
+        open_files: &DashMap<String, FileParser>,
+        template_documents: &DashMap<String, TemplateDocument>,
+        document_versions: &DashMap<String, OpenDocumentState>,
+        index: &WorkspaceIndex,
+        uri: &str,
+        source: &str,
+        state: OpenDocumentState,
+    ) {
+        publish_open_php_document_with_hook(
+            open_files,
+            template_documents,
+            document_versions,
+            index,
+            uri,
+            source,
+            state,
+            || {},
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_open_php_document_with_hook<F>(
+        open_files: &DashMap<String, FileParser>,
+        template_documents: &DashMap<String, TemplateDocument>,
+        document_versions: &DashMap<String, OpenDocumentState>,
+        index: &WorkspaceIndex,
+        uri: &str,
+        source: &str,
+        state: OpenDocumentState,
+        before_parser_publish: F,
+    ) where
+        F: FnOnce(),
+    {
+        let (parser, file_symbols, references) = parsed_document(uri, source);
+        match open_files.entry(uri.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                template_documents.remove(uri);
+                document_versions.insert(uri.to_string(), state);
+                index.update_file_with_references(uri, file_symbols, references);
+                before_parser_publish();
+                entry.insert(parser);
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                template_documents.remove(uri);
+                document_versions.insert(uri.to_string(), state);
+                index.update_file_with_references(uri, file_symbols, references);
+                before_parser_publish();
+                entry.insert(parser);
+            }
+        }
+    }
+
+    #[test]
+    fn open_php_index_and_parser_commit_has_no_reader_gap() {
+        let uri = "file:///open-commit-race.php";
+        let old_source = "<?php function oldName(): void {}";
+        let new_source = "<?php function newName(): void {}";
+        let open_files = Arc::new(DashMap::new());
+        let template_documents = Arc::new(DashMap::new());
+        let document_versions = Arc::new(DashMap::new());
+        let index = Arc::new(WorkspaceIndex::new());
+
+        publish_open_php_document(
+            &open_files,
+            &template_documents,
+            &document_versions,
+            &index,
+            uri,
+            old_source,
+            OpenDocumentState {
+                version: 1,
+                generation: 51,
+            },
+        );
+
+        let writer_open_files = Arc::clone(&open_files);
+        let writer_templates = Arc::clone(&template_documents);
+        let writer_versions = Arc::clone(&document_versions);
+        let writer_index = Arc::clone(&index);
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            publish_open_php_document_with_hook(
+                &writer_open_files,
+                &writer_templates,
+                &writer_versions,
+                &writer_index,
+                uri,
+                new_source,
+                OpenDocumentState {
+                    version: 2,
+                    generation: 51,
+                },
+                || {
+                    staged_tx.send(()).expect("report staged PHP commit");
+                    release_rx.recv().expect("release staged PHP commit");
+                },
+            );
+        });
+
+        staged_rx.recv().expect("PHP index and state are staged");
+        let reader_open_files = Arc::clone(&open_files);
+        let reader_templates = Arc::clone(&template_documents);
+        let reader_versions = Arc::clone(&document_versions);
+        let reader_index = Arc::clone(&index);
+        let (index_tx, index_rx) = mpsc::channel();
+        let (open_lock_tx, open_lock_rx) = mpsc::channel();
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let indexed_names = indexed_symbol_names(&reader_index, uri);
+            index_tx
+                .send(indexed_names.clone())
+                .expect("return staged index symbols");
+            let snapshot = open_document_snapshot_from_state_with_lock_hook(
+                &reader_open_files,
+                &reader_templates,
+                &reader_versions,
+                uri,
+                || {
+                    open_lock_tx
+                        .send(())
+                        .expect("report acquired open-document lock");
+                },
+            )
+            .expect("open PHP snapshot");
+            let snapshot_names = snapshot
+                .file_symbols
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.clone())
+                .collect::<Vec<_>>();
+            snapshot_tx
+                .send((
+                    indexed_names,
+                    snapshot.source,
+                    snapshot_names,
+                    snapshot.document_state,
+                ))
+                .expect("return PHP snapshot");
+        });
+
+        assert_eq!(
+            index_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reader captured staged index"),
+            vec!["newName"]
+        );
+        assert!(
+            open_lock_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "source snapshot must wait while the new index is staged"
+        );
+
+        release_tx.send(()).expect("release PHP commit");
+        writer.join().expect("PHP writer joined");
+        open_lock_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot acquired committed parser");
+        let (indexed_names, source, snapshot_names, state) = snapshot_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot after PHP commit");
+        reader.join().expect("PHP reader joined");
+
+        assert_eq!(indexed_names, vec!["newName"]);
+        assert_eq!(source, new_source);
+        assert_eq!(snapshot_names, vec!["newName"]);
+        assert_eq!(
+            state,
+            Some(OpenDocumentState {
+                version: 2,
+                generation: 51,
+            })
+        );
+    }
+
+    #[test]
+    fn renamed_template_publish_is_atomic_for_snapshot_readers() {
+        let uri = "file:///renamed.blade.php";
+        let open_files = Arc::new(DashMap::new());
+        let template_documents = Arc::new(DashMap::new());
+        let document_versions = Arc::new(DashMap::new());
+        let reload_tokens = Arc::new(DashMap::new());
+        reload_tokens.insert(uri.to_string(), 17);
+
+        let template = preprocess_blade_template("{{ $renamed }}");
+        let mut parser = FileParser::new();
+        parser.parse_full(template.virtual_source());
+        let state = OpenDocumentState {
+            version: 4,
+            generation: 23,
+        };
+
+        let writer_open_files = Arc::clone(&open_files);
+        let writer_templates = Arc::clone(&template_documents);
+        let writer_versions = Arc::clone(&document_versions);
+        let writer_reload_tokens = Arc::clone(&reload_tokens);
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            commit_renamed_open_document_with_hook(
+                RenamedOpenDocumentCommitContext {
+                    open_files: &writer_open_files,
+                    template_documents: &writer_templates,
+                    document_versions: &writer_versions,
+                    closed_document_reload_tokens: &writer_reload_tokens,
+                    uri_str: uri,
+                },
+                RenamedOpenDocument {
+                    parser,
+                    template: Some(template),
+                    state,
+                },
+                || {
+                    staged_tx.send(()).expect("report staged rename");
+                    release_rx.recv().expect("release staged rename");
+                },
+            )
+        });
+
+        staged_rx.recv().expect("rename reached staged state");
+        let reader_open_files = Arc::clone(&open_files);
+        let reader_templates = Arc::clone(&template_documents);
+        let reader_versions = Arc::clone(&document_versions);
+        let (reader_started_tx, reader_started_rx) = mpsc::channel();
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            reader_started_tx.send(()).expect("reader started");
+            let snapshot = open_document_snapshot_from_state(
+                &reader_open_files,
+                &reader_templates,
+                &reader_versions,
+                uri,
+            )
+            .map(|snapshot| {
+                (
+                    snapshot.source,
+                    snapshot
+                        .template_document
+                        .map(|template| template.original_source().to_string()),
+                    snapshot.document_state,
+                )
+            });
+            snapshot_tx.send(snapshot).expect("return snapshot");
+        });
+
+        reader_started_rx.recv().expect("reader attempted snapshot");
+        assert!(
+            snapshot_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "snapshot reader must wait while companion state is staged"
+        );
+        release_tx.send(()).expect("release rename commit");
+
+        assert!(writer.join().expect("rename writer joined"));
+        let (source, original_source, actual_state) = snapshot_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot after rename commit")
+            .expect("open snapshot");
+        reader.join().expect("snapshot reader joined");
+
+        assert!(source.contains("$renamed"));
+        assert_eq!(original_source.as_deref(), Some("{{ $renamed }}"));
+        assert_eq!(actual_state, Some(state));
+        assert!(!reload_tokens.contains_key(uri));
+    }
+
+    #[test]
+    fn stale_open_reindex_snapshot_cannot_overwrite_a_newer_change() {
+        let uri = "file:///watched-race.php";
+        let open_files = DashMap::new();
+        let template_documents = DashMap::new();
+        let document_versions = DashMap::new();
+        let index = WorkspaceIndex::new();
+        let old_state = OpenDocumentState {
+            version: 1,
+            generation: 31,
+        };
+        publish_open_php_document(
+            &open_files,
+            &template_documents,
+            &document_versions,
+            &index,
+            uri,
+            "<?php function oldName(): void {}",
+            old_state,
+        );
+        let stale_snapshot = open_document_snapshot_from_state(
+            &open_files,
+            &template_documents,
+            &document_versions,
+            uri,
+        )
+        .expect("old open snapshot");
+
+        publish_open_php_document(
+            &open_files,
+            &template_documents,
+            &document_versions,
+            &index,
+            uri,
+            "<?php function newName(): void {}",
+            OpenDocumentState {
+                version: 2,
+                generation: 32,
+            },
+        );
+        assert!(!commit_open_document_index_snapshot_if_current(
+            OpenDocumentIndexCommitContext {
+                open_files: &open_files,
+                template_documents: &template_documents,
+                document_versions: &document_versions,
+                index: &index,
+                uri_str: uri,
+            },
+            &stale_snapshot,
+        ));
+
+        assert_eq!(indexed_symbol_names(&index, uri), vec!["newName"]);
+    }
+
+    #[test]
+    fn delayed_workspace_disk_index_never_overwrites_an_unsaved_open_document() {
+        let uri = "file:///workspace-race.php";
+        let open_files = Arc::new(DashMap::new());
+        let template_documents = Arc::new(DashMap::new());
+        let document_versions = Arc::new(DashMap::new());
+        let index = Arc::new(WorkspaceIndex::new());
+        let (_, disk_symbols, disk_references) =
+            parsed_document(uri, "<?php function savedName(): void {}");
+
+        let disk_open_files = Arc::clone(&open_files);
+        let disk_templates = Arc::clone(&template_documents);
+        let disk_versions = Arc::clone(&document_versions);
+        let disk_index = Arc::clone(&index);
+        let (parsed_tx, parsed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let disk_writer = std::thread::spawn(move || {
+            parsed_tx.send(()).expect("disk parse completed");
+            release_rx.recv().expect("release disk indexing");
+            commit_workspace_disk_file_preserving_open(
+                DiskPhpIndexCommitContext {
+                    open_files: &disk_open_files,
+                    template_documents: &disk_templates,
+                    document_versions: &disk_versions,
+                    index: &disk_index,
+                    uri_str: uri,
+                },
+                disk_symbols,
+                disk_references,
+            );
+        });
+
+        parsed_rx.recv().expect("delayed disk parse");
+        publish_open_php_document(
+            &open_files,
+            &template_documents,
+            &document_versions,
+            &index,
+            uri,
+            "<?php function unsavedName(): void {}",
+            OpenDocumentState {
+                version: 7,
+                generation: 41,
+            },
+        );
+        release_tx.send(()).expect("release disk writer");
+        disk_writer.join().expect("disk writer joined");
+
+        assert_eq!(indexed_symbol_names(&index, uri), vec!["unsavedName"]);
     }
 }
 
@@ -1125,6 +1678,9 @@ pub(in crate::server) fn dedup_workspace_configs(
 
 pub(in crate::server) fn remove_indexed_files_under_roots(
     index: &WorkspaceIndex,
+    open_files: &DashMap<String, FileParser>,
+    template_documents: &DashMap<String, TemplateDocument>,
+    document_versions: &DashMap<String, OpenDocumentState>,
     roots: &[PathBuf],
 ) -> usize {
     let uris: Vec<String> = index
@@ -1139,9 +1695,17 @@ pub(in crate::server) fn remove_indexed_files_under_roots(
         })
         .collect();
 
-    let removed = uris.len();
+    let mut removed = 0;
     for uri in uris {
+        let dashmap::mapref::entry::Entry::Vacant(_open_entry) = open_files.entry(uri.clone())
+        else {
+            continue;
+        };
+        if template_documents.contains_key(&uri) || document_versions.contains_key(&uri) {
+            continue;
+        }
         index.remove_file(&uri);
+        removed += 1;
     }
 
     removed
@@ -1149,6 +1713,9 @@ pub(in crate::server) fn remove_indexed_files_under_roots(
 
 pub(in crate::server) fn remove_indexed_file_symbols(
     index: &WorkspaceIndex,
+    open_files: &DashMap<String, FileParser>,
+    template_documents: &DashMap<String, TemplateDocument>,
+    document_versions: &DashMap<String, OpenDocumentState>,
     roots: &[PathBuf],
 ) -> usize {
     let uris: Vec<String> = index
@@ -1163,9 +1730,17 @@ pub(in crate::server) fn remove_indexed_file_symbols(
         .map(|entry| entry.key().clone())
         .collect();
 
-    let removed = uris.len();
+    let mut removed = 0;
     for uri in uris {
+        let dashmap::mapref::entry::Entry::Vacant(_open_entry) = open_files.entry(uri.clone())
+        else {
+            continue;
+        };
+        if template_documents.contains_key(&uri) || document_versions.contains_key(&uri) {
+            continue;
+        }
         index.remove_file(&uri);
+        removed += 1;
     }
 
     removed
@@ -1579,7 +2154,7 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
 /// Scans PHP files in the workspace and adds their symbols to the index.
 pub(in crate::server) async fn index_workspace(
     client: &Client,
-    index: &WorkspaceIndex,
+    live: WorkspaceLiveIndexContext<'_>,
     root: &Path,
     namespace_map: Option<&NamespaceMap>,
     options: &WorkspaceIndexingOptions,
@@ -1671,8 +2246,45 @@ pub(in crate::server) async fn index_workspace(
     tracing::info!("Indexing {} PHP files", total);
 
     let cache_path = cache::cache_file_path(root);
-    let cache_report =
-        cache::load_valid_cached_files(index, &cache_path, root, &all_files, &options.cache_config);
+    // Keep disk/cache data separate from the live index so an unsaved open
+    // document is never overwritten, even transiently, during indexing.
+    let disk_index = WorkspaceIndex::new();
+    let cache_report = cache::load_valid_cached_files(
+        &disk_index,
+        &cache_path,
+        root,
+        &all_files,
+        &options.cache_config,
+    );
+    let cached_uris: Vec<String> = disk_index
+        .file_symbols
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    for uri_str in cached_uris {
+        let Some(file_symbols) = disk_index
+            .file_symbols
+            .get(&uri_str)
+            .map(|symbols| symbols.value().clone())
+        else {
+            continue;
+        };
+        commit_workspace_disk_file_preserving_open(
+            DiskPhpIndexCommitContext {
+                open_files: live.open_files,
+                template_documents: live.template_documents,
+                document_versions: live.document_versions,
+                index: live.index,
+                uri_str: &uri_str,
+            },
+            file_symbols,
+            disk_index
+                .file_references
+                .get(&uri_str)
+                .map(|references| references.value().clone())
+                .unwrap_or_default(),
+        );
+    }
     if cancellation.is_cancelled() {
         tracing::debug!(
             "Workspace indexing cancelled after cache load: {}",
@@ -1779,7 +2391,22 @@ pub(in crate::server) async fn index_workspace(
         };
 
         if let Some(file_symbols) = parsed.file_symbols {
-            index.update_file_with_references(&parsed.uri, file_symbols, parsed.references);
+            disk_index.update_file_with_references(
+                &parsed.uri,
+                file_symbols.clone(),
+                parsed.references.clone(),
+            );
+            commit_workspace_disk_file_preserving_open(
+                DiskPhpIndexCommitContext {
+                    open_files: live.open_files,
+                    template_documents: live.template_documents,
+                    document_versions: live.document_versions,
+                    index: live.index,
+                    uri_str: &parsed.uri,
+                },
+                file_symbols,
+                parsed.references,
+            );
             indexed_symbols += parsed.symbol_count;
 
             if parsed.symbol_count > 0 {
@@ -1858,7 +2485,7 @@ pub(in crate::server) async fn index_workspace(
     }
 
     let cache_to_save =
-        cache::build_cache_from_index(index, root, &all_files, &options.cache_config);
+        cache::build_cache_from_index(&disk_index, root, &all_files, &options.cache_config);
     if let Err(e) = cache::save_cache_atomic(&cache_path, &cache_to_save) {
         tracing::warn!(
             "Failed to save workspace index cache at {}: {}",
@@ -1935,9 +2562,32 @@ impl PhpLspBackend {
         }
         let refresh_twig_contexts = !is_blade_template_uri(&uri_str);
         if is_blade_template_uri(&uri_str) {
-            self.index.remove_file(&uri_str);
+            let committed = if let Some(snapshot) = self.open_document_snapshot(&uri_str) {
+                commit_open_document_index_snapshot_if_current(
+                    OpenDocumentIndexCommitContext {
+                        open_files: &self.open_files,
+                        template_documents: &self.template_documents,
+                        document_versions: &self.document_versions,
+                        index: &self.index,
+                        uri_str: &uri_str,
+                    },
+                    &snapshot,
+                )
+            } else {
+                commit_disk_php_index_if_closed(
+                    DiskPhpIndexCommitContext {
+                        open_files: &self.open_files,
+                        template_documents: &self.template_documents,
+                        document_versions: &self.document_versions,
+                        index: &self.index,
+                        uri_str: &uri_str,
+                    },
+                    None,
+                    Vec::new(),
+                )
+            };
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
-            if self.template_documents.contains_key(&uri_str) {
+            if committed && self.open_document_snapshot(&uri_str).is_some() {
                 self.publish_diagnostics(uri).await;
             }
             return;
@@ -1951,25 +2601,33 @@ impl PhpLspBackend {
                 return;
             }
             if self.path_is_excluded_by_config(&path).await {
-                self.index.remove_file(&uri_str);
+                commit_disk_php_index_if_closed(
+                    DiskPhpIndexCommitContext {
+                        open_files: &self.open_files,
+                        template_documents: &self.template_documents,
+                        document_versions: &self.document_versions,
+                        index: &self.index,
+                        uri_str: &uri_str,
+                    },
+                    None,
+                    Vec::new(),
+                );
                 self.semantic_tokens_cache.lock().await.remove(&uri_str);
                 return;
             }
         }
 
-        let open_file_symbols = {
-            self.open_files.get(&uri_str).and_then(|parser| {
-                let tree = parser.tree()?;
-                let source = parser.source();
-                let file_symbols = extract_file_symbols(tree, &source, &uri_str);
-                let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
-                Some((file_symbols, references))
-            })
-        };
-
-        if let Some((file_symbols, references)) = open_file_symbols {
-            self.index
-                .update_file_with_references(&uri_str, file_symbols, references);
+        if let Some(snapshot) = self.open_document_snapshot(&uri_str) {
+            commit_open_document_index_snapshot_if_current(
+                OpenDocumentIndexCommitContext {
+                    open_files: &self.open_files,
+                    template_documents: &self.template_documents,
+                    document_versions: &self.document_versions,
+                    index: &self.index,
+                    uri_str: &uri_str,
+                },
+                &snapshot,
+            );
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
             self.publish_diagnostics(uri).await;
             if refresh_twig_contexts {
@@ -1983,34 +2641,53 @@ impl PhpLspBackend {
             return;
         };
 
-        match parse_workspace_file_for_index_blocking(path.clone(), "watched PHP file reindex")
-            .await
-        {
-            Ok(parsed) => {
-                if let Some(file_symbols) = parsed.file_symbols {
-                    self.index.update_file_with_references(
-                        &parsed.uri,
-                        file_symbols,
-                        parsed.references,
-                    );
-                } else {
-                    if let Some(error) = parsed.error {
+        let (file_symbols, references) =
+            match parse_workspace_file_for_index_blocking(path.clone(), "watched PHP file reindex")
+                .await
+            {
+                Ok(parsed) => {
+                    if let Some(error) = parsed.error.as_ref() {
                         tracing::debug!(
                             "Failed to reindex watched PHP file {}, removing from index: {}",
                             path.display(),
                             error
                         );
                     }
-                    self.index.remove_file(&uri_str);
+                    (parsed.file_symbols, parsed.references)
                 }
-            }
-            Err(message) => {
-                tracing::warn!(
+                Err(message) => {
+                    tracing::warn!(
                     "Failed to schedule watched PHP file reindex for {}, removing from index: {}",
                     path.display(),
                     message
                 );
-                self.index.remove_file(&uri_str);
+                    (None, Vec::new())
+                }
+            };
+
+        let committed_disk = commit_disk_php_index_if_closed(
+            DiskPhpIndexCommitContext {
+                open_files: &self.open_files,
+                template_documents: &self.template_documents,
+                document_versions: &self.document_versions,
+                index: &self.index,
+                uri_str: &uri_str,
+            },
+            file_symbols,
+            references,
+        );
+        if !committed_disk {
+            if let Some(snapshot) = self.open_document_snapshot(&uri_str) {
+                commit_open_document_index_snapshot_if_current(
+                    OpenDocumentIndexCommitContext {
+                        open_files: &self.open_files,
+                        template_documents: &self.template_documents,
+                        document_versions: &self.document_versions,
+                        index: &self.index,
+                        uri_str: &uri_str,
+                    },
+                    &snapshot,
+                );
             }
         }
 
@@ -2028,18 +2705,24 @@ impl PhpLspBackend {
         }
 
         let uri_str = uri.as_str().to_string();
-        self.index.remove_file(&uri_str);
         self.vendor_file_lru.lock().await.remove(&uri_str);
-        self.open_files.remove(&uri_str);
-        self.template_documents.remove(&uri_str);
-        self.document_versions.remove(&uri_str);
+        match self.open_files.entry(uri_str.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                self.document_versions.remove(&uri_str);
+                self.template_documents.remove(&uri_str);
+                entry.remove();
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                self.document_versions.remove(&uri_str);
+                self.template_documents.remove(&uri_str);
+            }
+        }
+        self.index.remove_file(&uri_str);
         self.cancel_debounced_diagnostics(&uri_str).await;
         self.cancel_analyzer_run(&uri_str).await;
         self.cancel_formatter_run(&uri_str).await;
         self.semantic_tokens_cache.lock().await.remove(&uri_str);
-        self.client
-            .publish_diagnostics(uri.clone(), vec![], None)
-            .await;
+        self.publish_empty_diagnostics_if_closed(uri.clone()).await;
         if !is_blade_template_uri(&uri_str) {
             self.refresh_open_twig_contexts_and_republish_diagnostics()
                 .await;
@@ -2055,18 +2738,31 @@ impl PhpLspBackend {
         }
 
         let old_uri_str = old_uri.as_str().to_string();
-        let moved_parser = self
-            .open_files
-            .remove(&old_uri_str)
-            .map(|(_, parser)| parser);
-        let moved_template = self
-            .template_documents
-            .remove(&old_uri_str)
-            .map(|(_, template)| template);
-        let moved_version = self
-            .document_versions
-            .remove(&old_uri_str)
-            .map(|(_, version)| version);
+        let (moved_parser, moved_template, moved_version) =
+            match self.open_files.entry(old_uri_str.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(entry) => {
+                    let version = self
+                        .document_versions
+                        .remove(&old_uri_str)
+                        .map(|(_, version)| version);
+                    let template = self
+                        .template_documents
+                        .remove(&old_uri_str)
+                        .map(|(_, template)| template);
+                    (Some(entry.remove()), template, version)
+                }
+                dashmap::mapref::entry::Entry::Vacant(_) => {
+                    let version = self
+                        .document_versions
+                        .remove(&old_uri_str)
+                        .map(|(_, version)| version);
+                    let template = self
+                        .template_documents
+                        .remove(&old_uri_str)
+                        .map(|(_, template)| template);
+                    (None, template, version)
+                }
+            };
         self.cancel_debounced_diagnostics(&old_uri_str).await;
         self.cancel_analyzer_run(&old_uri_str).await;
         self.cancel_analyzer_run(new_uri.as_str()).await;
@@ -2076,8 +2772,7 @@ impl PhpLspBackend {
             self.index.remove_file(&old_uri_str);
             self.vendor_file_lru.lock().await.remove(&old_uri_str);
             self.semantic_tokens_cache.lock().await.remove(&old_uri_str);
-            self.client
-                .publish_diagnostics(old_uri.clone(), vec![], None)
+            self.publish_empty_diagnostics_if_closed(old_uri.clone())
                 .await;
         }
 
@@ -2089,67 +2784,89 @@ impl PhpLspBackend {
             return;
         }
 
-        if is_blade_template_uri(new_uri.as_str()) {
-            let new_uri_str = new_uri.as_str().to_string();
-            if let Some(parser) = moved_parser {
-                self.open_files.insert(new_uri_str.clone(), parser);
-            }
-            if let Some(template) = moved_template {
-                self.template_documents
-                    .insert(new_uri_str.clone(), template);
-            }
-            if let Some(version) = moved_version {
-                self.document_versions.insert(new_uri_str.clone(), version);
-            }
-            self.index.remove_file(&new_uri_str);
-            self.semantic_tokens_cache.lock().await.remove(&new_uri_str);
-            self.publish_diagnostics(new_uri).await;
-            return;
-        }
-
-        if moved_template.is_some() {
-            self.reindex_php_file(new_uri).await;
-            return;
-        }
-
+        let new_uri_str = new_uri.as_str().to_string();
         let new_excluded = if let Some(path) = uri_to_path(new_uri.as_str()) {
             self.path_is_excluded_by_config(&path).await
         } else {
             false
         };
-        if new_excluded {
-            if let Some(parser) = moved_parser {
-                let new_uri_str = new_uri.as_str().to_string();
-                self.open_files.insert(new_uri_str.clone(), parser);
-                if let Some(version) = moved_version {
-                    self.document_versions.insert(new_uri_str, version);
-                }
-            }
-            self.index.remove_file(new_uri.as_str());
-            self.semantic_tokens_cache
-                .lock()
-                .await
-                .remove(new_uri.as_str());
-            return;
-        }
 
-        if let Some(parser) = moved_parser {
-            let new_uri_str = new_uri.as_str().to_string();
-            if let Some(tree) = parser.tree() {
+        let Some(mut parser) = moved_parser else {
+            self.reindex_php_file(new_uri).await;
+            return;
+        };
+        let state = moved_version.unwrap_or_else(|| {
+            tracing::warn!(
+                "Open document {} had no version while it was renamed; assigning a new lifetime",
+                old_uri_str
+            );
+            self.next_document_state(0)
+        });
+
+        let destination_is_template = is_blade_template_uri(&new_uri_str);
+        let template = if destination_is_template {
+            let source = moved_template
+                .as_ref()
+                .map(|template| template.original_source().to_string())
+                .unwrap_or_else(|| parser.source());
+            let template = preprocess_blade_template(&source);
+            let mut virtual_parser = FileParser::new();
+            virtual_parser.parse_full(template.virtual_source());
+            parser = virtual_parser;
+            Some(template)
+        } else {
+            if let Some(template) = moved_template {
+                let mut source_parser = FileParser::new();
+                source_parser.parse_full(template.original_source());
+                parser = source_parser;
+            }
+            None
+        };
+
+        let indexed_file = if destination_is_template || new_excluded {
+            None
+        } else {
+            parser.tree().map(|tree| {
                 let source = parser.source();
                 let file_symbols = extract_file_symbols(tree, &source, &new_uri_str);
                 let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
-                self.index
-                    .update_file_with_references(&new_uri_str, file_symbols, references);
-            }
-            self.open_files.insert(new_uri_str.clone(), parser);
-            if let Some(version) = moved_version {
-                self.document_versions.insert(new_uri_str.clone(), version);
-            }
-            self.semantic_tokens_cache.lock().await.remove(&new_uri_str);
+                (file_symbols, references)
+            })
+        };
+
+        let committed = commit_renamed_open_document_with_hook(
+            RenamedOpenDocumentCommitContext {
+                open_files: &self.open_files,
+                template_documents: &self.template_documents,
+                document_versions: &self.document_versions,
+                closed_document_reload_tokens: &self.closed_document_reload_tokens,
+                uri_str: &new_uri_str,
+            },
+            RenamedOpenDocument {
+                parser,
+                template,
+                state,
+            },
+            || {
+                if let Some((file_symbols, references)) = indexed_file {
+                    self.index
+                        .update_file_with_references(&new_uri_str, file_symbols, references);
+                } else {
+                    self.index.remove_file(&new_uri_str);
+                }
+            },
+        );
+        if !committed {
+            tracing::debug!(
+                "Skipped stale rename state for {} because the destination is already open",
+                new_uri_str
+            );
+            return;
+        }
+
+        self.semantic_tokens_cache.lock().await.remove(&new_uri_str);
+        if !new_excluded {
             self.publish_diagnostics(new_uri).await;
-        } else {
-            self.reindex_php_file(new_uri).await;
         }
     }
 }

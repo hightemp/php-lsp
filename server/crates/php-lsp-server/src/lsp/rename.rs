@@ -13,17 +13,19 @@ impl PhpLspBackend {
         let pos = params.text_document_position.position;
         let new_name = &params.new_name;
 
-        let parser = match self.open_files.get(&uri_str) {
-            Some(p) => p,
-            None => return Ok(None),
+        let (tree, source) = {
+            let parser = match self.open_files.get(&uri_str) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            let tree = match parser.tree() {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            };
+            (tree, parser.source())
         };
-        let tree = match parser.tree() {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        let source = parser.source();
         let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
-        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+        let file_symbols = extract_file_symbols(&tree, &source, &uri_str);
 
         let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
             self.resolve_member_type(class_fqn, member_name)
@@ -32,7 +34,7 @@ impl PhpLspBackend {
             resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
         };
         let sym = match symbol_at_position_with_resolvers(
-            tree,
+            &tree,
             &source,
             pos.line,
             byte_col,
@@ -56,7 +58,7 @@ impl PhpLspBackend {
                 ))
             })?;
             let refs =
-                find_variable_references_at_position(tree, &source, pos.line, byte_col, true);
+                find_variable_references_at_position(&tree, &source, pos.line, byte_col, true);
             if refs.is_empty() {
                 return Ok(None);
             }
@@ -91,7 +93,11 @@ impl PhpLspBackend {
             return Ok(None);
         }
 
-        let resolved_for_rename = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
+        let resolved_for_rename =
+            super::references::local_symbol_for_reference(&file_symbols, &sym).or_else(|| {
+                self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind, sym.allows_global_fallback)
+                    .filter(|symbol| symbol.uri != uri_str)
+            });
         let phpdoc_virtual_member = phpdoc_virtual_member_for_symbol(&self.index, &sym);
         if phpdoc_virtual_member.as_ref().is_some_and(|member| {
             should_reject_phpdoc_virtual_member_rename(&resolved_for_rename, member)
@@ -151,7 +157,10 @@ impl PhpLspBackend {
         };
 
         // Don't rename built-in symbols
-        if let Some(sym) = self.index.resolve_fqn(&target_fqn) {
+        if let Some(sym) = self
+            .index
+            .resolve_fqn_matching_kinds(&target_fqn, &[target_kind])
+        {
             if sym.modifiers.is_builtin {
                 return Err(tower_lsp::jsonrpc::Error::invalid_params(
                     "Cannot rename built-in symbols",
@@ -162,25 +171,22 @@ impl PhpLspBackend {
         // Find all references (including declaration)
         let mut changes: std::collections::HashMap<Uri, Vec<TextEdit>> =
             std::collections::HashMap::new();
-        let indexed_files: Vec<_> = self
-            .index
-            .file_references
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
+        let reference_matches = self.reference_scan_matches(&target_fqn, target_kind, true);
 
-        for (scanned_files, file_uri) in indexed_files.into_iter().enumerate() {
+        for (scanned_files, (file_uri, refs)) in reference_matches.into_iter().enumerate() {
             cooperative_heavy_request_yield(scanned_files).await;
-            let refs = self.references_for_file(&file_uri, &target_fqn, target_kind, true);
 
             if !refs.is_empty() {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     let edits: Vec<TextEdit> = refs
                         .into_iter()
-                        .map(|r| TextEdit {
-                            range: range_from_lsp_tuple(r.range),
+                        .filter(|reference| !reference.preserve_spelling_on_rename)
+                        .map(|reference| TextEdit {
+                            range: range_from_lsp_tuple(
+                                reference.rename_range.unwrap_or(reference.range),
+                            ),
                             new_text: if target_kind == php_lsp_types::PhpSymbolKind::Property
-                                && r.starts_with_dollar
+                                && reference.starts_with_dollar
                             {
                                 format!(
                                     "${}",
@@ -193,7 +199,9 @@ impl PhpLspBackend {
                             },
                         })
                         .collect();
-                    changes.entry(uri).or_default().extend(edits);
+                    if !edits.is_empty() {
+                        changes.entry(uri).or_default().extend(edits);
+                    }
                 }
             }
         }
@@ -269,7 +277,15 @@ impl PhpLspBackend {
                 }
 
                 // Don't rename built-in or PHPDoc virtual symbols
-                let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
+                let resolved = super::references::local_symbol_for_reference(&file_symbols, &sym)
+                    .or_else(|| {
+                        self.resolve_fqn_with_fallback(
+                            &sym.fqn,
+                            sym.ref_kind,
+                            sym.allows_global_fallback,
+                        )
+                        .filter(|symbol| symbol.uri != uri_str)
+                    });
                 let phpdoc_virtual_member = phpdoc_virtual_member_for_symbol(&self.index, &sym);
                 if phpdoc_virtual_member.as_ref().is_some_and(|member| {
                     should_reject_phpdoc_virtual_member_rename(&resolved, member)
@@ -304,7 +320,20 @@ impl PhpLspBackend {
                     return Ok(None);
                 }
 
-                let rng2 = range_byte_to_utf16(&source, sym.range);
+                let prepare_byte_range = if matches!(
+                    target_kind,
+                    php_lsp_types::PhpSymbolKind::Class
+                        | php_lsp_types::PhpSymbolKind::Interface
+                        | php_lsp_types::PhpSymbolKind::Trait
+                        | php_lsp_types::PhpSymbolKind::Enum
+                        | php_lsp_types::PhpSymbolKind::Function
+                        | php_lsp_types::PhpSymbolKind::GlobalConstant
+                ) {
+                    terminal_identifier_byte_range(tree, sym.range)
+                } else {
+                    sym.range
+                };
+                let rng2 = range_byte_to_utf16(&source, prepare_byte_range);
                 let range = Range {
                     start: Position::new(rng2.0, rng2.1),
                     end: Position::new(rng2.2, rng2.3),
@@ -315,6 +344,42 @@ impl PhpLspBackend {
             None => Ok(None),
         }
     }
+}
+
+fn terminal_identifier_byte_range(
+    tree: &tree_sitter::Tree,
+    fallback: (u32, u32, u32, u32),
+) -> (u32, u32, u32, u32) {
+    let start = tree_sitter::Point::new(fallback.0 as usize, fallback.1 as usize);
+    let end = tree_sitter::Point::new(fallback.2 as usize, fallback.3 as usize);
+    let Some(node) = tree.root_node().descendant_for_point_range(start, end) else {
+        return fallback;
+    };
+    let Some(identifier) = terminal_identifier_node(node) else {
+        return fallback;
+    };
+    let start = identifier.start_position();
+    let end = identifier.end_position();
+    (
+        start.row as u32,
+        start.column as u32,
+        end.row as u32,
+        end.column as u32,
+    )
+}
+
+fn terminal_identifier_node<'tree>(
+    node: tree_sitter::Node<'tree>,
+) -> Option<tree_sitter::Node<'tree>> {
+    if node.kind() == "name" {
+        return Some(node);
+    }
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(found) = node.named_child(index).and_then(terminal_identifier_node) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -594,6 +659,51 @@ fn resolved_symbol_is_phpdoc_virtual_member(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_rename_scans_open_file_before_index_commit() {
+        let uri = "file:///staged-open-rename.php";
+        let source = r#"<?php
+namespace {
+function stagedTarget(): void {}
+}
+namespace App {
+function consume(): void {
+    STAGEDTARGET();
+    namespace\STAGEDTARGET();
+}
+}
+"#;
+        let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+        let backend = service.inner();
+
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        backend.open_files.insert(uri.to_string(), parser);
+        assert!(!backend.index.file_references.contains_key(uri));
+
+        let edit = backend
+            .lsp_rename(RenameParams {
+                text_document_position: TextDocumentPositionParams::new(
+                    TextDocumentIdentifier::new(uri.parse().expect("staged URI")),
+                    Position::new(6, 8),
+                ),
+                new_name: "renamedTarget".to_string(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .expect("rename request")
+            .expect("workspace edit");
+        let changes = edit.changes.expect("rename changes");
+        let uri: Uri = uri.parse().expect("staged URI");
+        let edits = changes.get(&uri).expect("staged open-file edits");
+
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().all(|edit| edit.new_text == "renamedTarget"));
+        let mut edited_lines: Vec<_> = edits.iter().map(|edit| edit.range.start.line).collect();
+        edited_lines.sort_unstable();
+        assert_eq!(edited_lines, vec![2, 6]);
+    }
 
     #[test]
     fn test_symbol_rename_name_validation_by_kind() {

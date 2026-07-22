@@ -123,6 +123,136 @@ $g->prefix;
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_function_hover_respects_symbol_kind_and_source_form_for_global_fallback() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace {
+class GlobalShadow {}
+function gLOBALsHADOW(): string { return 'global'; }
+}
+
+namespace App {
+class LocalCollision {}
+function lOCALcOLLISION(): string { return 'local'; }
+
+function exercise(): void {
+    LOCALcollision();
+    GLOBALshadow();
+    Missing\GLOBALshadow();
+    namespace\GLOBALshadow();
+}
+}
+"#;
+    let uri = "file:///test/function-fallback-hover.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (local_line, local_character) = utf16_position_at(code, "LOCALcollision();");
+    let local_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(2, uri, local_line, local_character + 2))
+        .await
+        .unwrap();
+    let local_hover = hover_markdown_value(&extract_result(local_response));
+    assert!(
+        local_hover.contains("function lOCALcOLLISION"),
+        "kind-aware lookup should hover the same-FQN function, got: {local_hover}"
+    );
+    assert!(
+        !local_hover.contains("class LocalCollision"),
+        "function hover must not select the same-FQN class, got: {local_hover}"
+    );
+
+    let (global_line, global_character) = utf16_position_at(code, "GLOBALshadow();");
+    let global_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, global_line, global_character + 2))
+        .await
+        .unwrap();
+    let global_hover = hover_markdown_value(&extract_result(global_response));
+    assert!(
+        global_hover.contains("function gLOBALsHADOW"),
+        "unqualified PHP fallback should hover the global function, got: {global_hover}"
+    );
+    assert!(
+        !global_hover.contains("class GlobalShadow"),
+        "global function fallback must not select the same-FQN class, got: {global_hover}"
+    );
+
+    let (qualified_line, qualified_character) = utf16_position_at(code, "Missing\\GLOBALshadow");
+    let qualified_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            4,
+            uri,
+            qualified_line,
+            qualified_character + "Missing\\".len() as u32 + 2,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(qualified_response).is_null(),
+        "qualified calls must not hover a global short-name match"
+    );
+
+    let (namespace_line, namespace_character) = utf16_position_at(code, "namespace\\GLOBALshadow");
+    let namespace_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(
+            5,
+            uri,
+            namespace_line,
+            namespace_character + "namespace\\".len() as u32 + 2,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(namespace_response).is_null(),
+        "explicit namespace-relative calls must not hover a global short-name match"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_hover_local_variable_with_inline_phpdoc_var() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -3279,6 +3409,122 @@ class CdbHandler extends BaseHandler {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_local_variable_hover_and_inlay_use_active_namespace_import_alias() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_code = r#"<?php
+namespace Vendor;
+class Foo {}
+function makeFoo(): Foo { return new Foo(); }
+"#;
+    let vendor_uri = "file:///test/ScopedLocalVariableVendor.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace First {
+use Vendor\Foo as AliasOne;
+function first(): void {
+    $first = \Vendor\makeFoo();
+}
+}
+
+namespace Second {
+use Vendor\Foo as AliasTwo;
+function second(): void {
+    $second = \Vendor\makeFoo();
+    $second;
+}
+}
+"#;
+    let uri = "file:///test/ScopedLocalVariableTypeDisplay.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let inlay_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(inlay_hint_request(2, uri, 8, 0, 15, 0))
+        .await
+        .unwrap();
+    let inlay_result = extract_result(inlay_response);
+    let second_scope_labels: Vec<String> = inlay_result
+        .as_array()
+        .expect("expected inlay hint array")
+        .iter()
+        .filter(|hint| hint["position"]["line"].as_u64() == Some(11))
+        .filter_map(inlay_hint_label_text)
+        .collect();
+    assert!(
+        second_scope_labels
+            .iter()
+            .any(|label| label == ": AliasTwo"),
+        "second namespace inlay must use its own import alias: {inlay_result}"
+    );
+    assert!(
+        !second_scope_labels
+            .iter()
+            .any(|label| label.contains("AliasOne")),
+        "first namespace alias must not leak into second namespace inlay: {inlay_result}"
+    );
+
+    let hover_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(hover_request(3, uri, 12, 6))
+        .await
+        .unwrap();
+    let hover_result = extract_result(hover_response);
+    let hover_text = hover_result.to_string();
+    assert!(
+        hover_text.contains("AliasTwo"),
+        "second namespace hover must use its own import alias: {hover_result}"
+    );
+    assert!(
+        !hover_text.contains("AliasOne"),
+        "first namespace alias must not leak into second namespace hover: {hover_result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_simplexml_stubs_drive_inlay_hints_and_hovers() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -3319,6 +3565,8 @@ namespace App;
 
 function parse(string $responseXml): void {
     $x/*xml*/ml = simplexml_load_string($responseXml);
+    $qualified/*qualified*/Value = Missing\simplexml_load_string($responseXml);
+    $namespace/*namespace*/Value = namespace\simplexml_load_string($responseXml);
     if (false === $xml) {
         return;
     }
@@ -3329,7 +3577,14 @@ function parse(string $responseXml): void {
     $status = (string)($result->Status/*prop*/Code ?? '');
 }
 "#;
-    let markers = ["/*xml*/", "/*method*/", "/*nodes*/", "/*prop*/"];
+    let markers = [
+        "/*xml*/",
+        "/*qualified*/",
+        "/*namespace*/",
+        "/*method*/",
+        "/*nodes*/",
+        "/*prop*/",
+    ];
     let marker_position = |marker: &str| -> (u32, u32) {
         let marker_offset = code_with_markers
             .find(marker)
@@ -3344,6 +3599,8 @@ function parse(string $responseXml): void {
         (line, character)
     };
     let (xml_line, xml_character) = marker_position("/*xml*/");
+    let (qualified_line, qualified_character) = marker_position("/*qualified*/");
+    let (namespace_line, namespace_character) = marker_position("/*namespace*/");
     let (method_line, method_character) = marker_position("/*method*/");
     let (nodes_line, nodes_character) = marker_position("/*nodes*/");
     let (prop_line, prop_character) = marker_position("/*prop*/");
@@ -3378,6 +3635,15 @@ function parse(string $responseXml): void {
         "expected simplexml_load_string return type hint, got: {:?}",
         labels
     );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.as_str() == ": SimpleXMLElement|false")
+            .count(),
+        1,
+        "qualified source forms must not receive the global function return type: {:?}",
+        labels
+    );
     assert!(
         labels
             .iter()
@@ -3400,6 +3666,36 @@ function parse(string $responseXml): void {
         xml_hover.contains("SimpleXMLElement|false $xml"),
         "expected local variable hover from global function fallback, got: {}",
         xml_hover
+    );
+
+    let qualified_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(7, uri, qualified_line, qualified_character))
+            .await
+            .unwrap(),
+    );
+    let qualified_hover = hover_markdown_value(&qualified_hover);
+    assert!(
+        !qualified_hover.contains("SimpleXMLElement"),
+        "qualified function calls must not infer a global return type: {qualified_hover}"
+    );
+
+    let namespace_hover = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(8, uri, namespace_line, namespace_character))
+            .await
+            .unwrap(),
+    );
+    let namespace_hover = hover_markdown_value(&namespace_hover);
+    assert!(
+        !namespace_hover.contains("SimpleXMLElement"),
+        "namespace-relative function calls must not infer a global return type: {namespace_hover}"
     );
 
     let method_hover = extract_result(

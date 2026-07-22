@@ -1,6 +1,7 @@
 use super::lsp::diagnostics::{
     current_class_fqn_at_range, parse_phpstan_json_diagnostics, parse_psalm_json_diagnostics,
-    run_diagnostics_blocking, type_info_accepts_inferred_type, InferredExprType,
+    resolve_symbol_at_position_from_index, run_diagnostics_blocking, symbol_reference_matches,
+    type_info_accepts_inferred_type, InferredExprType,
 };
 use super::lsp::document_symbols::{workspace_symbol_candidates, workspace_symbol_lsp_range};
 use super::*;
@@ -48,6 +49,683 @@ fn make_symbol_for_uri(
     let mut symbol = make_symbol(name, fqn, kind, range, parent_fqn);
     symbol.uri = uri.to_string();
     symbol
+}
+
+#[test]
+fn open_document_snapshot_is_atomic_and_staged_file_stays_out_of_global_index() {
+    let uri = "file:///atomic-snapshot.blade.php";
+    let old_template = preprocess_blade_template("{{ $old }}");
+    let new_template = preprocess_blade_template("{{ $new }}");
+    let old_state = OpenDocumentState {
+        version: 1,
+        generation: 7,
+    };
+    let new_state = OpenDocumentState {
+        version: 2,
+        generation: 7,
+    };
+
+    let open_files = Arc::new(DashMap::new());
+    let template_documents = Arc::new(DashMap::new());
+    let document_versions = Arc::new(DashMap::new());
+    let index = Arc::new(WorkspaceIndex::new());
+
+    let mut old_parser = FileParser::new();
+    old_parser.parse_full(old_template.virtual_source());
+    open_files.insert(uri.to_string(), old_parser);
+    template_documents.insert(uri.to_string(), old_template.clone());
+    document_versions.insert(uri.to_string(), old_state);
+
+    let reader_open_files = open_files.clone();
+    let reader_template_documents = template_documents.clone();
+    let reader_document_versions = document_versions.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        open_document_snapshot_from_state_with_lock_hook(
+            &reader_open_files,
+            &reader_template_documents,
+            &reader_document_versions,
+            uri,
+            || {
+                locked_tx.send(()).expect("announce snapshot lock");
+                release_rx.recv().expect("release snapshot lock");
+            },
+        )
+        .expect("old snapshot")
+    });
+
+    locked_rx.recv().expect("snapshot acquired parser lock");
+    let writer_open_files = open_files.clone();
+    let writer_template_documents = template_documents.clone();
+    let writer_document_versions = document_versions.clone();
+    let writer_template = new_template.clone();
+    let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+    let (writer_committed_tx, writer_committed_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        writer_started_tx.send(()).expect("announce writer");
+        let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+            writer_open_files.entry(uri.to_string())
+        else {
+            panic!("open parser entry");
+        };
+        let mut parser = FileParser::new();
+        parser.parse_full(writer_template.virtual_source());
+        writer_template_documents.insert(uri.to_string(), writer_template);
+        writer_document_versions.insert(uri.to_string(), new_state);
+        entry.insert(parser);
+        writer_committed_tx
+            .send(())
+            .expect("announce writer commit");
+    });
+    writer_started_rx.recv().expect("writer started");
+    assert!(matches!(
+        open_files.try_get_mut(uri),
+        dashmap::try_result::TryResult::Locked
+    ));
+    assert!(matches!(
+        writer_committed_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert!(!index.file_symbols.contains_key(uri));
+    assert!(!index.file_references.contains_key(uri));
+
+    release_tx.send(()).expect("release snapshot reader");
+    let old_snapshot = reader.join().expect("snapshot reader");
+    writer.join().expect("snapshot writer");
+    writer_committed_rx.recv().expect("writer committed");
+
+    assert_eq!(old_snapshot.source, old_template.virtual_source());
+    assert_eq!(
+        old_snapshot
+            .template_document
+            .as_ref()
+            .map(TemplateDocument::original_source),
+        Some(old_template.original_source())
+    );
+    assert_eq!(old_snapshot.document_state, Some(old_state));
+    assert_eq!(
+        old_snapshot.file_symbols.symbols.len(),
+        extract_file_symbols(&old_snapshot.tree, &old_snapshot.source, uri)
+            .symbols
+            .len()
+    );
+    assert_eq!(
+        old_snapshot.tree.root_node().end_byte(),
+        old_snapshot.source.len()
+    );
+
+    let new_snapshot = open_document_snapshot_from_state(
+        &open_files,
+        &template_documents,
+        &document_versions,
+        uri,
+    )
+    .expect("new snapshot");
+    assert_eq!(new_snapshot.source, new_template.virtual_source());
+    assert_eq!(
+        new_snapshot
+            .template_document
+            .as_ref()
+            .map(TemplateDocument::original_source),
+        Some(new_template.original_source())
+    );
+    assert_eq!(new_snapshot.document_state, Some(new_state));
+    assert_eq!(
+        new_snapshot.file_symbols.symbols.len(),
+        extract_file_symbols(&new_snapshot.tree, &new_snapshot.source, uri)
+            .symbols
+            .len()
+    );
+    assert_eq!(
+        new_snapshot.tree.root_node().end_byte(),
+        new_snapshot.source.len()
+    );
+    assert!(!index.file_symbols.contains_key(uri));
+    assert!(!index.file_references.contains_key(uri));
+}
+
+#[test]
+fn open_php_snapshot_uses_parser_symbols_instead_of_stale_global_symbols() {
+    let uri = "file:///atomic-php-snapshot.php";
+    let open_files = DashMap::new();
+    let template_documents = DashMap::new();
+    let document_versions = DashMap::new();
+    let index = WorkspaceIndex::new();
+
+    parse_and_index_php_file(&index, uri, "<?php class StaleIndexedClass {}\n");
+    let mut parser = FileParser::new();
+    parser.parse_full("<?php class CurrentOpenClass {}\n");
+    open_files.insert(uri.to_string(), parser);
+    document_versions.insert(
+        uri.to_string(),
+        OpenDocumentState {
+            version: 2,
+            generation: 9,
+        },
+    );
+
+    let snapshot = open_document_snapshot_from_state(
+        &open_files,
+        &template_documents,
+        &document_versions,
+        uri,
+    )
+    .expect("open PHP snapshot");
+    let snapshot_names: Vec<_> = snapshot
+        .file_symbols
+        .symbols
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    let indexed_names: Vec<_> = index
+        .file_symbols
+        .get(uri)
+        .expect("stale indexed symbols")
+        .symbols
+        .iter()
+        .map(|symbol| symbol.name.clone())
+        .collect();
+
+    assert!(snapshot_names.contains(&"CurrentOpenClass"));
+    assert!(!snapshot_names.contains(&"StaleIndexedClass"));
+    assert!(indexed_names.iter().any(|name| name == "StaleIndexedClass"));
+    assert_eq!(snapshot.document_state.map(|state| state.version), Some(2));
+}
+
+#[tokio::test]
+async fn staged_open_php_participates_in_reference_scans_before_global_commit() {
+    let uri = "file:///staged-open-references.php";
+    let template_uri = "file:///stale-reference-scan.blade.php";
+    let source = "<?php\nclass StagedTarget {}\nfunction consume(StagedTarget $value): void {}\n";
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    backend.open_files.insert(uri.to_string(), parser);
+    backend.document_versions.insert(
+        uri.to_string(),
+        OpenDocumentState {
+            version: 1,
+            generation: 1,
+        },
+    );
+
+    let stale_template_source =
+        "<?php\nfunction staleTemplateReference(StagedTarget $value): void {}\n";
+    let mut stale_template_parser = FileParser::new();
+    stale_template_parser.parse_full(stale_template_source);
+    let stale_template_symbols = extract_file_symbols(
+        stale_template_parser.tree().expect("stale template tree"),
+        stale_template_source,
+        template_uri,
+    );
+    let stale_template_references =
+        current_parser_symbol_references(template_uri, &stale_template_parser);
+    backend.index.update_file_with_references(
+        template_uri,
+        stale_template_symbols,
+        stale_template_references,
+    );
+
+    let template = preprocess_blade_template("{{ new StagedTarget() }}");
+    let mut template_parser = FileParser::new();
+    template_parser.parse_full(template.virtual_source());
+    backend
+        .open_files
+        .insert(template_uri.to_string(), template_parser);
+    backend
+        .template_documents
+        .insert(template_uri.to_string(), template);
+    backend.document_versions.insert(
+        template_uri.to_string(),
+        OpenDocumentState {
+            version: 1,
+            generation: 1,
+        },
+    );
+
+    assert!(!backend.index.file_symbols.contains_key(uri));
+    assert!(!backend.index.file_references.contains_key(uri));
+    assert!(backend.index.file_references.contains_key(template_uri));
+    let staged_matches = backend.reference_scan_matches("StagedTarget", PhpSymbolKind::Class, true);
+    assert_eq!(staged_matches.len(), 1);
+    assert_eq!(staged_matches[0].0, uri);
+    assert!(staged_matches[0].1.len() >= 2);
+    assert!(
+        staged_matches
+            .iter()
+            .all(|(candidate_uri, _)| candidate_uri != template_uri),
+        "an open template must hide stale indexed virtual-PHP references"
+    );
+
+    let direct_locations =
+        backend.reference_locations_for_symbol("StagedTarget", PhpSymbolKind::Class, true);
+    assert!(
+        direct_locations.len() >= 2,
+        "definition-side reference scan should include declarations and uses from the staged parser"
+    );
+
+    let locations = backend
+        .lsp_references(ReferenceParams {
+            text_document_position: TextDocumentPositionParams::new(
+                TextDocumentIdentifier::new(uri.parse().expect("staged URI")),
+                Position::new(2, 20),
+            ),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        })
+        .await
+        .expect("references request")
+        .expect("staged references");
+    assert!(
+        locations.len() >= 2,
+        "references request should scan a newly opened parser before index publication"
+    );
+}
+
+#[tokio::test]
+async fn open_only_qualified_function_blocks_global_fallback_reference() {
+    let global_uri = "file:///open-global-function.php";
+    let qualified_uri = "file:///open-qualified-function.php";
+    let caller_uri = "file:///open-qualified-caller.php";
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+
+    for (uri, source) in [
+        (global_uri, "<?php function f(): void {}\n"),
+        (qualified_uri, "<?php namespace Ns; function f(): void {}\n"),
+        (caller_uri, "<?php namespace Ns; f();\n"),
+    ] {
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        backend.open_files.insert(uri.to_string(), parser);
+    }
+
+    assert!(backend.index.file_symbols.is_empty());
+    assert!(backend.index.file_references.is_empty());
+
+    let global_nonempty_uris: Vec<_> = backend
+        .reference_scan_matches("f", PhpSymbolKind::Function, true)
+        .into_iter()
+        .filter_map(|(uri, references)| (!references.is_empty()).then_some(uri))
+        .collect();
+    assert_eq!(global_nonempty_uris, vec![global_uri.to_string()]);
+
+    let qualified_nonempty_uris: Vec<_> = backend
+        .reference_scan_matches("Ns\\f", PhpSymbolKind::Function, true)
+        .into_iter()
+        .filter_map(|(uri, references)| (!references.is_empty()).then_some(uri))
+        .collect();
+    assert_eq!(
+        qualified_nonempty_uris,
+        vec![caller_uri.to_string(), qualified_uri.to_string()],
+        "the open-only qualified declaration must own the unqualified namespace call"
+    );
+}
+
+#[tokio::test]
+async fn staged_open_snapshot_wins_over_stale_index_for_same_file_requests() {
+    let uri = "file:///staged-same-file-requests.php";
+    let stale_source = r#"<?php
+class SnapshotSubject {
+    public function changed(string $old): string { return $old; }
+    public function staleMember(): void {}
+}
+"#;
+    let current_source = r#"<?php
+class SnapshotSubject
+{
+
+    public function changed(string $value, int $count): int { return $count; }
+    public function freshMember(): void {}
+}
+
+$subject = new SnapshotSubject();
+$subject->changed('x', 2);
+$subject->staleMember();
+$subject->fre
+"#;
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    parse_and_index_php_file(&backend.index, uri, stale_source);
+
+    let mut parser = FileParser::new();
+    parser.parse_full(current_source);
+    backend.open_files.insert(uri.to_string(), parser);
+    backend.document_versions.insert(
+        uri.to_string(),
+        OpenDocumentState {
+            version: 2,
+            generation: 1,
+        },
+    );
+    let document = TextDocumentIdentifier::new(uri.parse().expect("staged URI"));
+
+    let signature = backend
+        .lsp_signature_help(SignatureHelpParams {
+            context: None,
+            text_document_position_params: TextDocumentPositionParams::new(
+                document.clone(),
+                Position::new(9, 24),
+            ),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .await
+        .expect("signature request")
+        .expect("signature help from current snapshot");
+    assert_eq!(signature.active_parameter, Some(1));
+    assert!(signature.signatures[0].label.contains("$count"));
+    assert!(!signature.signatures[0].label.contains("$old"));
+
+    let hover = backend
+        .lsp_hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams::new(
+                document.clone(),
+                Position::new(9, 12),
+            ),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .await
+        .expect("hover request")
+        .expect("hover from current snapshot");
+    let HoverContents::Markup(hover_markup) = hover.contents else {
+        panic!("expected markdown hover");
+    };
+    assert!(hover_markup.value.contains("$count"));
+    assert!(!hover_markup.value.contains("$old"));
+
+    let definition = backend
+        .lsp_goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams::new(
+                document.clone(),
+                Position::new(9, 12),
+            ),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .await
+        .expect("definition request")
+        .expect("definition from current snapshot");
+    let GotoDefinitionResponse::Scalar(definition) = definition else {
+        panic!("expected scalar definition");
+    };
+    assert_eq!(definition.uri.as_str(), uri);
+    assert_eq!(definition.range.start.line, 4);
+
+    let removed_hover = backend
+        .lsp_hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams::new(
+                document.clone(),
+                Position::new(10, 12),
+            ),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .await
+        .expect("removed hover request");
+    assert!(
+        removed_hover.is_none(),
+        "a removed local method must not resolve through the stale global index"
+    );
+
+    let removed_definition = backend
+        .lsp_goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams::new(
+                document.clone(),
+                Position::new(10, 12),
+            ),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .await
+        .expect("removed definition request");
+    assert!(
+        removed_definition.is_none(),
+        "a removed local method must not navigate to the stale declaration"
+    );
+
+    let removed_signature = backend
+        .lsp_signature_help(SignatureHelpParams {
+            context: None,
+            text_document_position_params: TextDocumentPositionParams::new(
+                document.clone(),
+                Position::new(10, 22),
+            ),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .await
+        .expect("removed signature request");
+    assert!(
+        removed_signature.is_none(),
+        "a removed local method must not expose its stale signature"
+    );
+
+    let completion = backend
+        .lsp_completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams::new(
+                document,
+                Position::new(11, 13),
+            ),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: None,
+        })
+        .await
+        .expect("completion request")
+        .expect("completion from current snapshot");
+    let completion_items = match completion {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    assert!(completion_items
+        .iter()
+        .any(|item| item.label == "freshMember"));
+    assert!(!completion_items
+        .iter()
+        .any(|item| item.label == "staleMember"));
+}
+
+#[test]
+fn closed_index_restore_cannot_overwrite_a_reopened_document() {
+    let uri = "file:///close-reopen.php";
+    let token = 41;
+    let open_files = Arc::new(DashMap::new());
+    let document_versions = Arc::new(DashMap::new());
+    let reload_tokens = Arc::new(DashMap::new());
+    let index = Arc::new(WorkspaceIndex::new());
+    reload_tokens.insert(uri.to_string(), token);
+
+    let disk_symbols = FileSymbols {
+        symbols: vec![make_symbol_for_uri(
+            uri,
+            "PersistedOnDisk",
+            "PersistedOnDisk",
+            PhpSymbolKind::Class,
+            (0, 0, 0, 1),
+            None,
+        )],
+        ..Default::default()
+    };
+
+    let restore_open_files = open_files.clone();
+    let restore_document_versions = document_versions.clone();
+    let restore_reload_tokens = reload_tokens.clone();
+    let restore_index = index.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let restore = std::thread::spawn(move || {
+        commit_closed_php_index_if_current_with_hook(
+            ClosedPhpIndexCommitContext {
+                open_files: &restore_open_files,
+                document_versions: &restore_document_versions,
+                reload_tokens: &restore_reload_tokens,
+                index: &restore_index,
+                uri_str: uri,
+                token,
+            },
+            Some(disk_symbols),
+            Vec::new(),
+            || {
+                ready_tx.send(()).expect("announce parsed disk snapshot");
+                release_rx.recv().expect("release close restore");
+            },
+        )
+    });
+
+    ready_rx
+        .recv()
+        .expect("close restore reached commit barrier");
+    let mut parser = FileParser::new();
+    parser.parse_full("<?php class ReopenedUnsaved {}");
+    let dashmap::mapref::entry::Entry::Vacant(entry) = open_files.entry(uri.to_string()) else {
+        panic!("closed document must be vacant before reopen");
+    };
+    reload_tokens.remove(uri);
+    document_versions.insert(
+        uri.to_string(),
+        OpenDocumentState {
+            version: 1,
+            generation: 42,
+        },
+    );
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![make_symbol_for_uri(
+                uri,
+                "ReopenedUnsaved",
+                "ReopenedUnsaved",
+                PhpSymbolKind::Class,
+                (0, 0, 0, 1),
+                None,
+            )],
+            ..Default::default()
+        },
+    );
+    entry.insert(parser);
+
+    release_tx.send(()).expect("release stale close restore");
+    assert!(!restore.join().expect("close restore worker"));
+    assert!(index.resolve_fqn("ReopenedUnsaved").is_some());
+    assert!(index.resolve_fqn("PersistedOnDisk").is_none());
+}
+
+#[test]
+fn symbol_reference_matching_uses_php_kind_specific_casing_rules() {
+    let index = WorkspaceIndex::new();
+    let reference = |target_fqn: &str, target_kind| SymbolReference {
+        target_fqn: target_fqn.to_string(),
+        target_kind,
+        range: (0, 0, 0, 1),
+        is_declaration: false,
+        starts_with_dollar: false,
+        allows_global_fallback: false,
+        rename_range: None,
+        preserve_spelling_on_rename: false,
+        is_import_target: false,
+        receiver: SymbolReferenceReceiver::None,
+    };
+
+    assert!(symbol_reference_matches(
+        &index,
+        &reference(r"APP\MIXEDCASEFUNCTION", PhpSymbolKind::Function),
+        r"App\MixedCaseFunction",
+        PhpSymbolKind::Function,
+        true,
+    ));
+    assert!(symbol_reference_matches(
+        &index,
+        &reference(r"APP\MIXEDCASECLASS", PhpSymbolKind::Class),
+        r"App\MixedCaseClass",
+        PhpSymbolKind::Class,
+        true,
+    ));
+    assert!(!symbol_reference_matches(
+        &index,
+        &reference(r"App\mixedcaseconstant", PhpSymbolKind::GlobalConstant),
+        r"App\MixedCaseConstant",
+        PhpSymbolKind::GlobalConstant,
+        true,
+    ));
+    assert!(symbol_reference_matches(
+        &index,
+        &reference(r"APP\OWNER::MIXEDMETHOD", PhpSymbolKind::Method),
+        r"App\Owner::mixedMethod",
+        PhpSymbolKind::Method,
+        true,
+    ));
+    assert!(!symbol_reference_matches(
+        &index,
+        &reference(r"APP\OWNER::$mixedProperty", PhpSymbolKind::Property),
+        r"App\Owner::$MixedProperty",
+        PhpSymbolKind::Property,
+        true,
+    ));
+}
+
+#[test]
+fn symbol_position_index_resolution_is_kind_aware_and_source_form_gated() {
+    let index = WorkspaceIndex::new();
+    index.update_file(
+        "file:///resolution.php",
+        FileSymbols {
+            symbols: vec![
+                make_symbol(
+                    "Collision",
+                    "Collision",
+                    PhpSymbolKind::Class,
+                    (0, 0, 0, 9),
+                    None,
+                ),
+                make_symbol(
+                    "cOLLISION",
+                    "cOLLISION",
+                    PhpSymbolKind::Function,
+                    (1, 0, 1, 9),
+                    None,
+                ),
+                make_symbol(
+                    "fallbackFn",
+                    "fallbackFn",
+                    PhpSymbolKind::Function,
+                    (2, 0, 2, 10),
+                    None,
+                ),
+            ],
+            ..Default::default()
+        },
+    );
+
+    let symbol_at = |fqn: &str, allows_global_fallback| SymbolAtPosition {
+        fqn: fqn.to_string(),
+        name: fqn.rsplit('\\').next().unwrap_or(fqn).to_string(),
+        ref_kind: RefKind::FunctionCall,
+        allows_global_fallback,
+        object_expr: None,
+        range: (0, 0, 0, 1),
+    };
+
+    let collision = resolve_symbol_at_position_from_index(&index, &symbol_at("COLLISION", false))
+        .expect("function lookup must not be shadowed by a same-FQN class");
+    assert_eq!(collision.kind, PhpSymbolKind::Function);
+    assert_eq!(collision.name, "cOLLISION");
+
+    assert!(
+        resolve_symbol_at_position_from_index(&index, &symbol_at(r"App\fallbackFn", true),)
+            .is_some()
+    );
+    assert!(
+        resolve_symbol_at_position_from_index(&index, &symbol_at(r"App\fallbackFn", false),)
+            .is_none()
+    );
+    assert!(
+        resolve_symbol_at_position_from_index(&index, &symbol_at(r"App\B\fallbackFn", false),)
+            .is_none()
+    );
 }
 
 fn offset_at(source: &str, line: u32, col: u32) -> usize {
@@ -243,7 +921,7 @@ class Foo {
     parse_and_index_php_file(&backend.index, uri, code);
 
     let non_lazy_method = backend
-        .resolve_fqn_with_fallback("App\\Foo::stateready", RefKind::MethodCall)
+        .resolve_fqn_with_fallback("App\\Foo::stateready", RefKind::MethodCall, false)
         .expect("non-lazy method lookup should ignore ASCII case");
     assert_eq!(
         (non_lazy_method.kind, non_lazy_method.name.as_str()),
@@ -252,12 +930,12 @@ class Foo {
     );
     assert!(
         backend
-            .resolve_fqn_with_fallback("App\\Foo::stateready", RefKind::ClassConstant)
+            .resolve_fqn_with_fallback("App\\Foo::stateready", RefKind::ClassConstant, false,)
             .is_none(),
         "non-lazy method lookup must not satisfy class constant lookup"
     );
     let lazy_method = backend
-        .resolve_fqn_lazy_with_fallback("App\\Foo::stateready", RefKind::MethodCall)
+        .resolve_fqn_lazy_with_fallback("App\\Foo::stateready", RefKind::MethodCall, false)
         .await
         .expect("method lookup should ignore ASCII case");
     assert_eq!(
@@ -267,7 +945,7 @@ class Foo {
     );
     assert!(
         backend
-            .resolve_fqn_lazy_with_fallback("App\\Foo::stateready", RefKind::ClassConstant)
+            .resolve_fqn_lazy_with_fallback("App\\Foo::stateready", RefKind::ClassConstant, false,)
             .await
             .is_none(),
         "case-insensitive method lookup must not satisfy class constant lookup"
@@ -915,7 +1593,16 @@ fn test_workspace_reindex_keeps_vendor_and_stub_symbols() {
         },
     );
 
-    let removed = remove_indexed_file_symbols(&index, &[PathBuf::from("/tmp/project")]);
+    let open_files = DashMap::new();
+    let template_documents = DashMap::new();
+    let document_versions = DashMap::new();
+    let removed = remove_indexed_file_symbols(
+        &index,
+        &open_files,
+        &template_documents,
+        &document_versions,
+        &[PathBuf::from("/tmp/project")],
+    );
 
     assert_eq!(removed, 1);
     assert!(index.resolve_fqn("App\\Foo").is_none());
@@ -993,6 +1680,21 @@ fn test_document_version_ordering_accepts_only_newer_versions() {
     assert!(document_version_is_newer(Some(1), 2));
     assert!(!document_version_is_newer(Some(2), 2));
     assert!(!document_version_is_newer(Some(3), 2));
+}
+
+#[test]
+fn test_open_document_generation_orders_reused_lsp_versions() {
+    let stale = OpenDocumentState {
+        version: 100,
+        generation: 4,
+    };
+    let reopened = OpenDocumentState {
+        version: 1,
+        generation: 5,
+    };
+
+    assert!(open_document_state_can_replace(stale, reopened));
+    assert!(!open_document_state_can_replace(reopened, stale));
 }
 
 #[test]
@@ -1381,7 +2083,7 @@ fn test_compute_diagnostics_reports_duplicate_workspace_symbols() {
     let uri1 = "file:///one.php";
     let uri2 = "file:///two.php";
     let code1 = "<?php\nnamespace App;\nclass Duplicate {}\n";
-    let code2 = "<?php\nnamespace App;\nclass Duplicate {}\n";
+    let code2 = "<?php\nnamespace app;\ninterface DUPLICATE {}\n";
 
     let mut parser1 = FileParser::new();
     parser1.parse_full(code1);
@@ -3097,6 +3799,58 @@ function run(Box $box): void {
             expected,
             messages
         );
+    }
+}
+
+#[test]
+fn test_compute_diagnostics_accepts_class_type_names_with_different_case() {
+    let uri = "file:///class-type-case-compatibility.php";
+    let code = r#"<?php
+namespace App;
+
+class Foo {}
+
+function acceptsFoo(Foo $value): void {}
+
+function returnsFoo(): Foo {
+    return new foo();
+}
+
+class Box {
+    public Foo $value;
+
+    public function assign(): void {
+        $this->value = new foo();
+    }
+}
+
+function run(): void {
+    acceptsFoo(new foo());
+}
+"#;
+
+    let mut parser = FileParser::new();
+    parser.parse_full(code);
+
+    let index = WorkspaceIndex::new();
+    let symbols = extract_file_symbols(parser.tree().unwrap(), code, uri);
+    index.update_file(uri, symbols);
+
+    let diagnostics = compute_diagnostics(
+        uri,
+        &parser,
+        &index,
+        DiagnosticsMode::BasicSemantic,
+        PhpVersion::DEFAULT,
+    );
+    let messages = diagnostic_messages(&diagnostics);
+
+    for unexpected in [
+        "Type mismatch for App\\acceptsFoo argument $value",
+        "Return type mismatch in App\\returnsFoo",
+        "Property assignment type mismatch for App\\Box::$value",
+    ] {
+        assert_no_diagnostic_containing(&messages, unexpected);
     }
 }
 

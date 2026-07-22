@@ -1,6 +1,66 @@
 mod support;
 
+use php_lsp_types::uri::path_to_uri;
 use support::*;
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_open_php_renamed_to_blade_rebuilds_virtual_document_atomically() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+
+    let target_uri = "file:///test/RenameTarget.php";
+    let old_uri = "file:///test/rename-template.php";
+    let new_uri = "file:///test/rename-template.blade.php";
+    let template = "<div>{{ new \\App\\RenameTarget() }}</div>";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            target_uri,
+            "<?php namespace App; class RenameTarget {}",
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(old_uri, template))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_rename_files_notification(vec![(old_uri, new_uri)]))
+        .await
+        .unwrap();
+
+    let (line, character) = utf16_position_at(template, "RenameTarget");
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(2, new_uri, line, character + 2))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    assert!(
+        result.to_string().contains(target_uri),
+        "renamed Blade snapshot should resolve through rebuilt virtual PHP: {result}"
+    );
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_local_variable_method_return_does_not_use_previous_method_phpdoc() {
@@ -427,6 +487,124 @@ async fn test_watched_files_incrementally_reindex_created_changed_deleted_php_fi
         .unwrap();
 
     let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_did_close_restores_disk_index_after_discarding_unsaved_changes() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-close-restore-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&tmp_root).unwrap();
+    let file_path = tmp_root.join("Discarded.php");
+    let uri = path_to_uri(&file_path).expect("temporary PHP file URI");
+    let uri_str = uri.as_str();
+    let disk_code = "<?php\nnamespace CloseRestore;\nclass PersistedAfterDiscard {}\n";
+    let unsaved_code = "<?php\nnamespace CloseRestore;\nclass UnsavedBeforeDiscard {}\n";
+    fs::write(&file_path, disk_code).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri_str, disk_code))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(uri_str, 2, unsaved_code))
+        .await
+        .unwrap();
+
+    let unsaved_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(2, "UnsavedBeforeDiscard"))
+        .await
+        .unwrap();
+    assert!(
+        workspace_symbol_names(&extract_result(unsaved_response))
+            .iter()
+            .any(|name| name == "UnsavedBeforeDiscard"),
+        "didChange must publish the unsaved open-document snapshot"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_close_notification(uri_str))
+        .await
+        .unwrap();
+
+    let restored_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(3, "PersistedAfterDiscard"))
+        .await
+        .unwrap();
+    let restored_result = extract_result(restored_response);
+    assert!(
+        workspace_symbol_names(&restored_result)
+            .iter()
+            .any(|name| name == "PersistedAfterDiscard"),
+        "didClose must restore the unchanged on-disk symbol: {restored_result}"
+    );
+
+    let stale_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(workspace_symbol_request(4, "UnsavedBeforeDiscard"))
+        .await
+        .unwrap();
+    let stale_result = extract_result(stale_response);
+    assert!(
+        !workspace_symbol_names(&stale_result)
+            .iter()
+            .any(|name| name == "UnsavedBeforeDiscard"),
+        "didClose must remove the discarded unsaved symbol: {stale_result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+
+    let _ = fs::remove_file(&file_path);
+    let _ = fs::remove_dir(&tmp_root);
 }
 
 #[tokio::test(flavor = "current_thread")]

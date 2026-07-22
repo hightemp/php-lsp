@@ -2,8 +2,57 @@ mod support;
 
 use php_lsp_types::uri::path_to_uri;
 use support::*;
-use tower_lsp::ls_types::{DidOpenTextDocumentParams, InitializedParams, TextDocumentItem, Uri};
+use tower_lsp::ls_types::{
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    InitializedParams, Position, Range, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
+};
 use tower_lsp::LanguageServer;
+
+fn open_document_params(uri: &Uri, version: i32, text: &str) -> DidOpenTextDocumentParams {
+    DidOpenTextDocumentParams {
+        text_document: TextDocumentItem::new(
+            uri.clone(),
+            "php".to_string(),
+            version,
+            text.to_string(),
+        ),
+    }
+}
+
+fn incremental_change_params(
+    uri: &Uri,
+    version: i32,
+    range: Range,
+    text: &str,
+) -> DidChangeTextDocumentParams {
+    DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier::new(uri.clone(), version),
+        content_changes: vec![TextDocumentContentChangeEvent {
+            range: Some(range),
+            range_length: None,
+            text: text.to_string(),
+        }],
+    }
+}
+
+async fn next_publish_diagnostics_for_version(
+    notifications: &mut UnboundedReceiver<Request>,
+    uri: &str,
+    version: i64,
+    timeout: Duration,
+) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    loop {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .unwrap_or_else(|| panic!("timed out waiting for diagnostics version {version}"));
+        let params = next_publish_diagnostics(notifications, uri, remaining).await;
+        if params.get("version").and_then(|value| value.as_i64()) == Some(version) {
+            return params;
+        }
+    }
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_open_file_diagnostics_are_syntax_only_while_workspace_indexing_runs() {
@@ -569,6 +618,219 @@ async fn test_did_change_debounces_diagnostics_and_ignores_stale_versions() {
         .await
         .unwrap();
     expect_no_publish_diagnostics(&mut notifications, uri, Duration::from_millis(300)).await;
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_concurrent_did_open_and_dependent_incremental_change_publish_latest_text() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let uri = "file:///test/ConcurrentOpenIncremental.php";
+    let uri_value = uri.parse::<Uri>().unwrap();
+    let original_code = "<?php\nfunction ready(): void {}\n";
+    let open = open_document_params(&uri_value, 1, original_code);
+    let change = incremental_change_params(
+        &uri_value,
+        2,
+        Range::new(Position::new(1, 15), Position::new(1, 16)),
+        "",
+    );
+    let backend = service.inner();
+
+    let (_, _) = tokio::join!(backend.did_open(open), backend.did_change(change));
+
+    let latest =
+        next_publish_diagnostics_for_version(&mut notifications, uri, 2, Duration::from_secs(2))
+            .await;
+    assert!(
+        latest
+            .get("diagnostics")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty()),
+        "version 2 diagnostics should reflect the broken incremental edit applied to didOpen text, got: {}",
+        latest
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_concurrent_dependent_incremental_changes_preserve_edit_chain() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let uri = "file:///test/ConcurrentIncrementalChain.php";
+    let uri_value = uri.parse::<Uri>().unwrap();
+    let original_code = "<?php\nfunction ready(): void {}\n";
+    let backend = service.inner();
+    backend
+        .did_open(open_document_params(&uri_value, 1, original_code))
+        .await;
+    let opened =
+        next_publish_diagnostics_for_version(&mut notifications, uri, 1, Duration::from_secs(1))
+            .await;
+    assert!(
+        opened
+            .get("diagnostics")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.is_empty()),
+        "initial document should be valid, got: {}",
+        opened
+    );
+
+    let version_2 = incremental_change_params(
+        &uri_value,
+        2,
+        Range::new(Position::new(1, 9), Position::new(1, 9)),
+        "renamed_",
+    );
+    let version_3 = incremental_change_params(
+        &uri_value,
+        3,
+        Range::new(Position::new(1, 17), Position::new(1, 22)),
+        "",
+    );
+
+    let (_, _) = tokio::join!(backend.did_change(version_2), backend.did_change(version_3));
+
+    let latest =
+        next_publish_diagnostics_for_version(&mut notifications, uri, 3, Duration::from_secs(2))
+            .await;
+    assert!(
+        latest
+            .get("diagnostics")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.is_empty()),
+        "version 3 must apply its range to version 2 (`function renamed_(): void {{}}`), got: {}",
+        latest
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_close_reopen_never_publishes_stale_previous_generation_diagnostics() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let uri = "file:///test/CloseReopenDiagnostics.php";
+    let uri_value = uri.parse::<Uri>().unwrap();
+    let original_code = "<?php\nfunction ready(): void {}\n";
+    let backend = service.inner();
+    backend
+        .did_open(open_document_params(&uri_value, 1, original_code))
+        .await;
+    let _ =
+        next_publish_diagnostics_for_version(&mut notifications, uri, 1, Duration::from_secs(1))
+            .await;
+
+    backend
+        .did_change(incremental_change_params(
+            &uri_value,
+            2,
+            Range::new(Position::new(1, 15), Position::new(1, 16)),
+            "",
+        ))
+        .await;
+
+    let close = DidCloseTextDocumentParams {
+        text_document: TextDocumentIdentifier::new(uri_value.clone()),
+    };
+    let reopen = open_document_params(&uri_value, 1, "<?php\nfunction reopened(): void {}\n");
+    let (_, _) = tokio::join!(backend.did_close(close), backend.did_open(reopen));
+
+    let reopened =
+        next_publish_diagnostics_for_version(&mut notifications, uri, 1, Duration::from_secs(2))
+            .await;
+    assert!(
+        reopened
+            .get("diagnostics")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.is_empty()),
+        "reopened generation should publish diagnostics for its valid text, got: {}",
+        reopened
+    );
+    expect_no_publish_diagnostics(&mut notifications, uri, Duration::from_millis(400)).await;
 
     service
         .ready()

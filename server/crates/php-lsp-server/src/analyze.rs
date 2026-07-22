@@ -787,8 +787,7 @@ fn analyze_index_class_dependencies_inner(
 
     let parent_fqns: Vec<String> = context
         .index
-        .types
-        .get(&class_fqn)
+        .get_type(&class_fqn)
         .map(|symbol| {
             symbol
                 .extends
@@ -806,7 +805,7 @@ fn analyze_index_class_dependencies_inner(
 }
 
 fn analyze_index_class(context: &AnalyzeLazyIndexContext<'_>, class_fqn: &str) -> bool {
-    if context.index.types.contains_key(class_fqn) {
+    if context.index.contains_type(class_fqn) {
         return false;
     }
 
@@ -836,7 +835,7 @@ fn analyze_index_class(context: &AnalyzeLazyIndexContext<'_>, class_fqn: &str) -
             continue;
         }
         if parse_and_index_analyze_php_file(context.index, &abs)
-            && context.index.types.contains_key(class_fqn)
+            && context.index.contains_type(class_fqn)
         {
             return true;
         }

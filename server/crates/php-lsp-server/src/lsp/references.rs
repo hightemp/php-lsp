@@ -22,7 +22,315 @@ fn reference_count_title(count: usize) -> String {
     }
 }
 
+enum OpenReferenceSnapshot {
+    Ordinary(Vec<php_lsp_types::SymbolReference>),
+    Template,
+}
+
+enum OpenSymbolAuthority {
+    Ordinary(php_lsp_types::FileSymbols),
+    NonOrdinary,
+    Closed,
+}
+
+fn reference_target_key(fqn: &str, kind: php_lsp_types::PhpSymbolKind) -> String {
+    match kind {
+        php_lsp_types::PhpSymbolKind::Function => fqn.trim_start_matches('\\').to_ascii_lowercase(),
+        php_lsp_types::PhpSymbolKind::GlobalConstant => php_lsp_types::global_constant_fqn_key(fqn),
+        _ => fqn.trim_start_matches('\\').to_string(),
+    }
+}
+
+pub(super) fn local_symbol_for_reference(
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &SymbolAtPosition,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    let matches_fqn = |candidate: &&php_lsp_types::SymbolInfo, fqn: &str| {
+        php_lsp_types::symbol_fqn_eq(&candidate.fqn, fqn, candidate.kind)
+    };
+
+    if symbol.ref_kind == RefKind::Constructor {
+        if let Some(constructor) = file_symbols.symbols.iter().find(|candidate| {
+            candidate.kind == php_lsp_types::PhpSymbolKind::Method
+                && matches_fqn(candidate, &symbol.fqn)
+        }) {
+            return Some(Arc::new(constructor.clone()));
+        }
+        let class_fqn = symbol
+            .fqn
+            .strip_suffix("::__construct")
+            .unwrap_or(&symbol.fqn);
+        return file_symbols
+            .symbols
+            .iter()
+            .find(|candidate| {
+                matches!(
+                    candidate.kind,
+                    php_lsp_types::PhpSymbolKind::Class
+                        | php_lsp_types::PhpSymbolKind::Interface
+                        | php_lsp_types::PhpSymbolKind::Trait
+                        | php_lsp_types::PhpSymbolKind::Enum
+                ) && matches_fqn(candidate, class_fqn)
+            })
+            .cloned()
+            .map(Arc::new);
+    }
+
+    let exact = file_symbols
+        .symbols
+        .iter()
+        .find(|candidate| {
+            let kind_matches = match symbol.ref_kind {
+                RefKind::ClassName => matches!(
+                    candidate.kind,
+                    php_lsp_types::PhpSymbolKind::Class
+                        | php_lsp_types::PhpSymbolKind::Interface
+                        | php_lsp_types::PhpSymbolKind::Trait
+                        | php_lsp_types::PhpSymbolKind::Enum
+                ),
+                RefKind::FunctionCall => candidate.kind == php_lsp_types::PhpSymbolKind::Function,
+                RefKind::MethodCall => candidate.kind == php_lsp_types::PhpSymbolKind::Method,
+                RefKind::PropertyAccess | RefKind::StaticPropertyAccess => {
+                    candidate.kind == php_lsp_types::PhpSymbolKind::Property
+                }
+                RefKind::ClassConstant => matches!(
+                    candidate.kind,
+                    php_lsp_types::PhpSymbolKind::ClassConstant
+                        | php_lsp_types::PhpSymbolKind::EnumCase
+                ),
+                RefKind::GlobalConstant => {
+                    candidate.kind == php_lsp_types::PhpSymbolKind::GlobalConstant
+                }
+                RefKind::NamespaceName => candidate.kind == php_lsp_types::PhpSymbolKind::Namespace,
+                RefKind::Variable | RefKind::Constructor | RefKind::Unknown => false,
+            };
+            kind_matches && matches_fqn(candidate, &symbol.fqn)
+        })
+        .cloned()
+        .map(Arc::new);
+    if exact.is_some() {
+        return exact;
+    }
+
+    if symbol.allows_global_fallback {
+        let global = file_symbols.symbols.iter().find(|candidate| {
+            !candidate.fqn.trim_start_matches('\\').contains('\\')
+                && match symbol.ref_kind {
+                    RefKind::FunctionCall => {
+                        candidate.kind == php_lsp_types::PhpSymbolKind::Function
+                            && candidate.name.eq_ignore_ascii_case(&symbol.name)
+                    }
+                    RefKind::GlobalConstant => {
+                        candidate.kind == php_lsp_types::PhpSymbolKind::GlobalConstant
+                            && candidate.name == symbol.name
+                    }
+                    _ => false,
+                }
+        });
+        return global.cloned().map(Arc::new);
+    }
+
+    None
+}
+
 impl PhpLspBackend {
+    fn open_symbol_authority(&self, uri: &str) -> OpenSymbolAuthority {
+        if let Some(snapshot) = self.open_document_snapshot(uri) {
+            if snapshot.template_document.is_none() {
+                OpenSymbolAuthority::Ordinary(snapshot.file_symbols)
+            } else {
+                OpenSymbolAuthority::NonOrdinary
+            }
+        } else if self.open_files.contains_key(uri) || self.template_documents.contains_key(uri) {
+            OpenSymbolAuthority::NonOrdinary
+        } else {
+            OpenSymbolAuthority::Closed
+        }
+    }
+
+    fn open_reference_snapshot(&self, uri: &str) -> Option<OpenReferenceSnapshot> {
+        let snapshot = self.open_document_snapshot(uri)?;
+        if snapshot.template_document.is_some() {
+            return Some(OpenReferenceSnapshot::Template);
+        }
+        Some(OpenReferenceSnapshot::Ordinary(
+            collect_symbol_references_in_file(
+                &snapshot.tree,
+                &snapshot.source,
+                &snapshot.file_symbols,
+            ),
+        ))
+    }
+
+    fn reference_snapshot_for_scan(
+        &self,
+        uri: &str,
+    ) -> Option<Vec<php_lsp_types::SymbolReference>> {
+        if let Some(snapshot) = self.open_reference_snapshot(uri) {
+            return match snapshot {
+                OpenReferenceSnapshot::Ordinary(references) => Some(references),
+                OpenReferenceSnapshot::Template => None,
+            };
+        }
+
+        let indexed_references = self
+            .index
+            .file_references
+            .get(uri)
+            .map(|entry| entry.value().clone());
+
+        // Recheck after cloning the closed-file data. If the document opened
+        // concurrently, the exact open snapshot always takes precedence.
+        if let Some(snapshot) = self.open_reference_snapshot(uri) {
+            return match snapshot {
+                OpenReferenceSnapshot::Ordinary(references) => Some(references),
+                OpenReferenceSnapshot::Template => None,
+            };
+        }
+        if self.open_files.contains_key(uri) || self.template_documents.contains_key(uri) {
+            return None;
+        }
+
+        indexed_references
+    }
+
+    fn reference_matches_with_open_overlay(
+        &self,
+        reference: &php_lsp_types::SymbolReference,
+        target_fqn: &str,
+        target_kind: php_lsp_types::PhpSymbolKind,
+        include_declaration: bool,
+        open_symbol_cache: &mut HashMap<String, OpenSymbolAuthority>,
+        open_qualified_targets: &HashSet<(php_lsp_types::PhpSymbolKind, String)>,
+    ) -> bool {
+        if reference.is_declaration && !include_declaration {
+            return false;
+        }
+        let is_global_fallback_candidate = reference.allows_global_fallback
+            && matches!(
+                target_kind,
+                php_lsp_types::PhpSymbolKind::Function
+                    | php_lsp_types::PhpSymbolKind::GlobalConstant
+            )
+            && reference
+                .target_fqn
+                .rsplit_once('\\')
+                .is_some_and(|(_, short_name)| {
+                    php_lsp_types::symbol_fqn_eq(short_name, target_fqn, target_kind)
+                });
+        if is_global_fallback_candidate
+            && open_qualified_targets.contains(&(
+                target_kind,
+                reference_target_key(&reference.target_fqn, target_kind),
+            ))
+        {
+            return false;
+        }
+        if symbol_reference_matches(
+            &self.index,
+            reference,
+            target_fqn,
+            target_kind,
+            include_declaration,
+        ) {
+            return true;
+        }
+        if !is_global_fallback_candidate {
+            return false;
+        }
+
+        let target_key = reference_target_key(&reference.target_fqn, target_kind);
+        let qualified_target_exists = open_qualified_targets.contains(&(target_kind, target_key))
+            || match self
+                .index
+                .resolve_fqn_matching_kinds(&reference.target_fqn, &[target_kind])
+            {
+                None => false,
+                Some(resolved) => {
+                    let authority = open_symbol_cache
+                        .entry(resolved.uri.clone())
+                        .or_insert_with(|| self.open_symbol_authority(&resolved.uri));
+                    match authority {
+                        OpenSymbolAuthority::Ordinary(file_symbols) => {
+                            file_symbols.symbols.iter().any(|symbol| {
+                                symbol.kind == target_kind
+                                    && php_lsp_types::symbol_fqn_eq(
+                                        &symbol.fqn,
+                                        &reference.target_fqn,
+                                        symbol.kind,
+                                    )
+                            })
+                        }
+                        OpenSymbolAuthority::NonOrdinary => false,
+                        OpenSymbolAuthority::Closed => true,
+                    }
+                }
+            };
+        !qualified_target_exists
+    }
+
+    pub(in crate::server) fn reference_scan_matches(
+        &self,
+        target_fqn: &str,
+        target_kind: php_lsp_types::PhpSymbolKind,
+        include_declaration: bool,
+    ) -> Vec<(String, Vec<php_lsp_types::SymbolReference>)> {
+        let mut uris: HashSet<String> = self
+            .index
+            .file_references
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        let open_uris: Vec<String> = self
+            .open_files
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        uris.extend(open_uris.iter().cloned());
+
+        let mut uris: Vec<_> = uris.into_iter().collect();
+        uris.sort();
+        let mut open_symbol_cache = HashMap::new();
+        let mut open_qualified_targets = HashSet::new();
+        for uri in open_uris {
+            let authority = self.open_symbol_authority(&uri);
+            if let OpenSymbolAuthority::Ordinary(file_symbols) = &authority {
+                open_qualified_targets.extend(
+                    file_symbols
+                        .symbols
+                        .iter()
+                        .filter(|symbol| {
+                            matches!(
+                                symbol.kind,
+                                php_lsp_types::PhpSymbolKind::Function
+                                    | php_lsp_types::PhpSymbolKind::GlobalConstant
+                            )
+                        })
+                        .map(|symbol| {
+                            (symbol.kind, reference_target_key(&symbol.fqn, symbol.kind))
+                        }),
+                );
+            }
+            open_symbol_cache.insert(uri, authority);
+        }
+        uris.into_iter()
+            .filter_map(|uri| {
+                let mut references = self.reference_snapshot_for_scan(&uri)?;
+                references.retain(|reference| {
+                    self.reference_matches_with_open_overlay(
+                        reference,
+                        target_fqn,
+                        target_kind,
+                        include_declaration,
+                        &mut open_symbol_cache,
+                        &open_qualified_targets,
+                    )
+                });
+                Some((uri, references))
+            })
+            .collect()
+    }
+
     pub(crate) async fn lsp_document_highlight(
         &self,
         params: DocumentHighlightParams,
@@ -67,12 +375,38 @@ impl PhpLspBackend {
         let Some(kind) = php_symbol_kind_for_ref_kind(sym.ref_kind) else {
             return Ok(None);
         };
-        let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
+        let local_symbol = local_symbol_for_reference(&file_symbols, &sym);
+        let resolved = if local_symbol.is_some() {
+            local_symbol
+        } else {
+            self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind, sym.allows_global_fallback)
+                .filter(|symbol| symbol.uri != uri_str)
+        };
         let (target_fqn, target_kind) = if let Some(resolved) = resolved {
             (resolved.fqn.clone(), resolved.kind)
         } else {
             (sym.fqn.clone(), kind)
         };
+
+        if matches!(
+            target_kind,
+            php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::GlobalConstant
+        ) {
+            let highlights: Vec<DocumentHighlight> = self
+                .references_for_file(&uri_str, &target_fqn, target_kind, true)
+                .into_iter()
+                .map(|reference| DocumentHighlight {
+                    range: range_from_lsp_tuple(reference.range),
+                    kind: Some(DocumentHighlightKind::TEXT),
+                })
+                .collect();
+            return if highlights.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(highlights))
+            };
+        }
+
         let read_write_capable = target_kind == php_lsp_types::PhpSymbolKind::Property;
 
         let highlights: Vec<DocumentHighlight> =
@@ -180,8 +514,19 @@ impl PhpLspBackend {
                         RefKind::NamespaceName | RefKind::Unknown => return Ok(None),
                     };
 
-                    // Try to canonicalize symbol via index lookup.
-                    let resolved = self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind);
+                    // Prefer this exact parser generation before the staged
+                    // global index catches up.
+                    let local_symbol = local_symbol_for_reference(&file_symbols, &sym);
+                    let resolved = if local_symbol.is_some() {
+                        local_symbol
+                    } else {
+                        self.resolve_fqn_with_fallback(
+                            &sym.fqn,
+                            sym.ref_kind,
+                            sym.allows_global_fallback,
+                        )
+                        .filter(|symbol| symbol.uri != uri_str)
+                    };
                     if let Some(resolved) = resolved {
                         (resolved.fqn.clone(), resolved.kind)
                     } else {
@@ -194,19 +539,13 @@ impl PhpLspBackend {
 
         // Search all indexed files for references
         let mut locations = Vec::new();
-        let indexed_files: Vec<_> = self
-            .index
-            .file_references
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
+        let scanned_files =
+            self.reference_scan_matches(&target_fqn, target_kind, include_declaration);
 
-        for (scanned_files, file_uri) in indexed_files.into_iter().enumerate() {
-            cooperative_heavy_request_yield(scanned_files).await;
+        for (scanned_file_count, (file_uri, references)) in scanned_files.into_iter().enumerate() {
+            cooperative_heavy_request_yield(scanned_file_count).await;
 
-            for r in
-                self.references_for_file(&file_uri, &target_fqn, target_kind, include_declaration)
-            {
+            for r in references {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     locations.push(Location {
                         uri,
@@ -239,8 +578,15 @@ impl PhpLspBackend {
             };
             let source = parser.source();
             (extract_file_symbols(tree, &source, &uri_str), source)
-        } else if let Some(file_symbols) = self.index.file_symbols.get(&uri_str) {
-            let file_symbols = file_symbols.value().clone();
+        } else {
+            let Some(file_symbols) = self
+                .index
+                .file_symbols
+                .get(&uri_str)
+                .map(|entry| entry.value().clone())
+            else {
+                return Ok(None);
+            };
             let Some(path) = uri_to_path(&uri_str) else {
                 return Ok(None);
             };
@@ -249,8 +595,6 @@ impl PhpLspBackend {
                 return Ok(None);
             };
             (file_symbols, source)
-        } else {
-            return Ok(None);
         };
 
         let mut lenses = Vec::new();

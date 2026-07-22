@@ -15,6 +15,16 @@ const CLASS_CONSTANT_MEMBER_KINDS: &[php_lsp_types::PhpSymbolKind] = &[
     php_lsp_types::PhpSymbolKind::ClassConstant,
     php_lsp_types::PhpSymbolKind::EnumCase,
 ];
+const CLASS_LIKE_KINDS: &[php_lsp_types::PhpSymbolKind] = &[
+    php_lsp_types::PhpSymbolKind::Class,
+    php_lsp_types::PhpSymbolKind::Interface,
+    php_lsp_types::PhpSymbolKind::Trait,
+    php_lsp_types::PhpSymbolKind::Enum,
+];
+const FUNCTION_KINDS: &[php_lsp_types::PhpSymbolKind] = &[php_lsp_types::PhpSymbolKind::Function];
+const GLOBAL_CONSTANT_KINDS: &[php_lsp_types::PhpSymbolKind] =
+    &[php_lsp_types::PhpSymbolKind::GlobalConstant];
+const NAMESPACE_KINDS: &[php_lsp_types::PhpSymbolKind] = &[php_lsp_types::PhpSymbolKind::Namespace];
 
 fn member_kinds_for_ref_kind(ref_kind: RefKind) -> Option<&'static [php_lsp_types::PhpSymbolKind]> {
     match ref_kind {
@@ -23,6 +33,43 @@ fn member_kinds_for_ref_kind(ref_kind: RefKind) -> Option<&'static [php_lsp_type
         RefKind::ClassConstant => Some(CLASS_CONSTANT_MEMBER_KINDS),
         _ => None,
     }
+}
+
+fn top_level_kinds_for_ref_kind(
+    ref_kind: RefKind,
+) -> Option<&'static [php_lsp_types::PhpSymbolKind]> {
+    match ref_kind {
+        RefKind::ClassName => Some(CLASS_LIKE_KINDS),
+        RefKind::FunctionCall => Some(FUNCTION_KINDS),
+        RefKind::GlobalConstant => Some(GLOBAL_CONSTANT_KINDS),
+        RefKind::NamespaceName => Some(NAMESPACE_KINDS),
+        _ => None,
+    }
+}
+
+pub(in crate::server) fn resolve_fqn_with_ref_kind(
+    index: &WorkspaceIndex,
+    fqn: &str,
+    ref_kind: RefKind,
+    allow_global_fallback: bool,
+) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+    if let Some(expected_kinds) = member_kinds_for_ref_kind(ref_kind) {
+        return index.resolve_member_matching_kinds(fqn, expected_kinds);
+    }
+
+    let expected_kinds = top_level_kinds_for_ref_kind(ref_kind)?;
+    if let Some(symbol) = index.resolve_fqn_matching_kinds(fqn, expected_kinds) {
+        return Some(symbol);
+    }
+
+    if allow_global_fallback && matches!(ref_kind, RefKind::FunctionCall | RefKind::GlobalConstant)
+    {
+        if let Some((_, short_name)) = fqn.rsplit_once('\\') {
+            return index.resolve_fqn_matching_kinds(short_name, expected_kinds);
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Default)]
@@ -149,7 +196,7 @@ pub(in crate::server) async fn lazy_index_class_with_context(
     class_fqn: &str,
 ) -> bool {
     let requested_class_fqn = class_fqn.trim_start_matches('\\');
-    if context.index.types.contains_key(requested_class_fqn) {
+    if context.index.contains_type(requested_class_fqn) {
         return false;
     }
 
@@ -199,7 +246,7 @@ pub(in crate::server) async fn lazy_index_class_with_context(
                 {
                     touch_vendor_file_lru(&context.index, &context.vendor_file_lru, &abs).await;
                     tracing::debug!("Lazy-indexed vendor file from cache: {}", abs.display());
-                    if context.index.types.contains_key(requested_class_fqn) {
+                    if context.index.contains_type(requested_class_fqn) {
                         return true;
                     }
                     tracing::debug!(
@@ -222,7 +269,7 @@ pub(in crate::server) async fn lazy_index_class_with_context(
                     touch_vendor_file_lru(&context.index, &context.vendor_file_lru, &abs).await;
                 }
                 tracing::debug!("Lazy-indexed file: {}", abs.display());
-                if context.index.types.contains_key(requested_class_fqn) {
+                if context.index.contains_type(requested_class_fqn) {
                     if is_vendor_file {
                         if let Some(cache_config) = vendor_cache_config {
                             save_vendor_index_cache_blocking(
@@ -258,7 +305,7 @@ pub(in crate::server) fn lazy_index_parents_with_context<'a>(
             return;
         }
 
-        let parent_fqns: Vec<String> = if let Some(sym) = context.index.types.get(class_fqn) {
+        let parent_fqns: Vec<String> = if let Some(sym) = context.index.get_type(class_fqn) {
             sym.extends
                 .iter()
                 .chain(sym.implements.iter())
@@ -288,7 +335,7 @@ pub(in crate::server) async fn lazy_index_member_return_types_with_context(
             let owner_fqn = sym.parent_fqn.as_deref().unwrap_or(class_fqn);
             symbol_return_type_fqn(&context.index, owner_fqn, &sym)
         })
-        .filter(|fqn| fqn.contains('\\') && !context.index.types.contains_key(fqn.as_str()))
+        .filter(|fqn| fqn.contains('\\') && !context.index.contains_type(fqn))
         .collect();
 
     for return_fqn in return_fqns {
@@ -709,6 +756,21 @@ impl PhpLspBackend {
         None
     }
 
+    async fn resolve_fqn_lazy_matching_kinds(
+        &self,
+        fqn: &str,
+        expected_kinds: &[php_lsp_types::PhpSymbolKind],
+    ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+        if let Some(sym) = self.index.resolve_fqn_matching_kinds(fqn, expected_kinds) {
+            return Some(sym);
+        }
+
+        let class_fqn = fqn.rsplit_once("::").map_or(fqn, |(class, _)| class);
+        self.lazy_index_class_dependencies(class_fqn).await;
+
+        self.index.resolve_fqn_matching_kinds(fqn, expected_kinds)
+    }
+
     async fn resolve_member_lazy_matching_kinds(
         &self,
         fqn: &str,
@@ -745,28 +807,9 @@ impl PhpLspBackend {
         &self,
         fqn: &str,
         ref_kind: RefKind,
+        allow_global_fallback: bool,
     ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
-        if let Some(expected_kinds) = member_kinds_for_ref_kind(ref_kind) {
-            return self
-                .index
-                .resolve_member_matching_kinds(fqn, expected_kinds);
-        }
-
-        if let Some(sym) = self.index.resolve_fqn(fqn) {
-            if symbol_matches_ref_kind_for_lazy_resolution(&sym, ref_kind) {
-                return Some(sym);
-            }
-        }
-        if ref_kind == RefKind::FunctionCall || ref_kind == RefKind::GlobalConstant {
-            if let Some((_, short_name)) = fqn.rsplit_once('\\') {
-                if let Some(sym) = self.index.resolve_fqn(short_name) {
-                    if symbol_matches_ref_kind_for_lazy_resolution(&sym, ref_kind) {
-                        return Some(sym);
-                    }
-                }
-            }
-        }
-        None
+        resolve_fqn_with_ref_kind(&self.index, fqn, ref_kind, allow_global_fallback)
     }
 
     /// Fallback for `$this->prop->member()` when the declared property type
@@ -849,11 +892,13 @@ impl PhpLspBackend {
         None
     }
 
-    /// Resolve symbol lazily with fallback for global built-ins.
+    /// Resolve a symbol lazily, applying PHP's global function/constant
+    /// fallback only when the original source name permits it.
     pub(in crate::server) async fn resolve_fqn_lazy_with_fallback(
         &self,
         fqn: &str,
         ref_kind: RefKind,
+        allow_global_fallback: bool,
     ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
         if let Some(expected_kinds) = member_kinds_for_ref_kind(ref_kind) {
             return self
@@ -861,63 +906,25 @@ impl PhpLspBackend {
                 .await;
         }
 
-        if let Some(sym) = self.resolve_fqn_lazy(fqn).await {
-            if symbol_matches_ref_kind_for_lazy_resolution(&sym, ref_kind) {
-                return Some(sym);
-            }
+        let expected_kinds = top_level_kinds_for_ref_kind(ref_kind)?;
+        if let Some(sym) = self
+            .resolve_fqn_lazy_matching_kinds(fqn, expected_kinds)
+            .await
+        {
+            return Some(sym);
         }
-        if ref_kind == RefKind::FunctionCall || ref_kind == RefKind::GlobalConstant {
+        if allow_global_fallback
+            && (ref_kind == RefKind::FunctionCall || ref_kind == RefKind::GlobalConstant)
+        {
             if let Some((_, short_name)) = fqn.rsplit_once('\\') {
-                if let Some(sym) = self.resolve_fqn_lazy(short_name).await {
-                    if symbol_matches_ref_kind_for_lazy_resolution(&sym, ref_kind) {
-                        return Some(sym);
-                    }
+                if let Some(sym) = self
+                    .resolve_fqn_lazy_matching_kinds(short_name, expected_kinds)
+                    .await
+                {
+                    return Some(sym);
                 }
             }
         }
         None
     }
-}
-
-fn symbol_matches_ref_kind_for_lazy_resolution(
-    sym: &php_lsp_types::SymbolInfo,
-    ref_kind: RefKind,
-) -> bool {
-    matches!(
-        (ref_kind, sym.kind),
-        (RefKind::ClassName, php_lsp_types::PhpSymbolKind::Class)
-            | (RefKind::ClassName, php_lsp_types::PhpSymbolKind::Interface)
-            | (RefKind::ClassName, php_lsp_types::PhpSymbolKind::Trait)
-            | (RefKind::ClassName, php_lsp_types::PhpSymbolKind::Enum)
-            | (RefKind::Constructor, php_lsp_types::PhpSymbolKind::Method)
-            | (
-                RefKind::FunctionCall,
-                php_lsp_types::PhpSymbolKind::Function
-            )
-            | (RefKind::MethodCall, php_lsp_types::PhpSymbolKind::Method)
-            | (
-                RefKind::PropertyAccess,
-                php_lsp_types::PhpSymbolKind::Property
-            )
-            | (
-                RefKind::StaticPropertyAccess,
-                php_lsp_types::PhpSymbolKind::Property
-            )
-            | (
-                RefKind::ClassConstant,
-                php_lsp_types::PhpSymbolKind::ClassConstant
-            )
-            | (
-                RefKind::ClassConstant,
-                php_lsp_types::PhpSymbolKind::EnumCase
-            )
-            | (
-                RefKind::GlobalConstant,
-                php_lsp_types::PhpSymbolKind::GlobalConstant
-            )
-            | (
-                RefKind::NamespaceName,
-                php_lsp_types::PhpSymbolKind::Namespace
-            )
-    )
 }

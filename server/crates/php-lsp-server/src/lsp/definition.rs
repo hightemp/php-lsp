@@ -2,6 +2,104 @@
 
 use super::super::*;
 use super::hierarchy::{implementation_symbols_for_method, implementation_symbols_for_type};
+use super::references::local_symbol_for_reference;
+
+fn local_type_symbol(
+    file_symbols: &php_lsp_types::FileSymbols,
+    fqn: &str,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    file_symbols
+        .symbols
+        .iter()
+        .find(|symbol| {
+            matches!(
+                symbol.kind,
+                php_lsp_types::PhpSymbolKind::Class
+                    | php_lsp_types::PhpSymbolKind::Interface
+                    | php_lsp_types::PhpSymbolKind::Trait
+                    | php_lsp_types::PhpSymbolKind::Enum
+            ) && php_lsp_types::symbol_fqn_eq(&symbol.fqn, fqn, symbol.kind)
+        })
+        .cloned()
+        .map(Arc::new)
+}
+
+fn snapshot_symbol_location(symbol: &php_lsp_types::SymbolInfo, source: &str) -> Option<Location> {
+    Some(Location {
+        uri: symbol.uri.parse::<Uri>().ok()?,
+        range: range_from_byte_range(source, symbol.selection_range),
+    })
+}
+
+fn local_implementation_types(
+    file_symbols: &php_lsp_types::FileSymbols,
+    target_fqn: &str,
+) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
+    let mut known_parents = HashSet::from([target_fqn.to_ascii_lowercase()]);
+    let mut implementations = Vec::new();
+    loop {
+        let mut changed = false;
+        for symbol in file_symbols.symbols.iter().filter(|symbol| {
+            matches!(
+                symbol.kind,
+                php_lsp_types::PhpSymbolKind::Class
+                    | php_lsp_types::PhpSymbolKind::Interface
+                    | php_lsp_types::PhpSymbolKind::Trait
+                    | php_lsp_types::PhpSymbolKind::Enum
+            )
+        }) {
+            let symbol_key = symbol.fqn.to_ascii_lowercase();
+            if known_parents.contains(&symbol_key)
+                || !symbol
+                    .extends
+                    .iter()
+                    .chain(symbol.implements.iter())
+                    .any(|parent| known_parents.contains(&parent.to_ascii_lowercase()))
+            {
+                continue;
+            }
+            known_parents.insert(symbol_key);
+            changed = true;
+            if matches!(
+                symbol.kind,
+                php_lsp_types::PhpSymbolKind::Class | php_lsp_types::PhpSymbolKind::Enum
+            ) && !symbol.modifiers.is_abstract
+            {
+                implementations.push(Arc::new(symbol.clone()));
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    implementations
+}
+
+fn local_implementation_methods(
+    file_symbols: &php_lsp_types::FileSymbols,
+    target: &php_lsp_types::SymbolInfo,
+) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
+    let Some(parent_fqn) = target.parent_fqn.as_deref() else {
+        return Vec::new();
+    };
+    let implementation_types = local_implementation_types(file_symbols, parent_fqn);
+    file_symbols
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.kind == php_lsp_types::PhpSymbolKind::Method
+                && symbol.name.eq_ignore_ascii_case(&target.name)
+                && implementation_types.iter().any(|implementation| {
+                    symbol
+                        .parent_fqn
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(&implementation.fqn))
+                })
+        })
+        .cloned()
+        .map(Arc::new)
+        .collect()
+}
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_goto_declaration(
@@ -34,7 +132,32 @@ impl PhpLspBackend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let uri_str = uri.as_str().to_string();
-        let pos = params.text_document_position_params.position;
+        let original_pos = params.text_document_position_params.position;
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            template_document,
+            file_symbols,
+            ..
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(None);
+        };
+        let pos = if let Some(template) = &template_document {
+            match template.map_original_position_to_virtual(original_pos) {
+                Some(pos) => pos,
+                None => return Ok(None),
+            }
+        } else {
+            original_pos
+        };
+        let map_template_response = |response| {
+            if let Some(template) = &template_document {
+                map_goto_definition_response_for_template(&uri_str, template, response)
+            } else {
+                response
+            }
+        };
         tracing::debug!(
             "gotoTypeDefinition: {}:{}:{}",
             uri_str,
@@ -43,23 +166,8 @@ impl PhpLspBackend {
         );
 
         let (sym_at_pos, variable_type_fqn, file_symbols) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(parser) => parser,
-                None => return Ok(None),
-            };
-            let tree = match parser.tree() {
-                Some(tree) => tree,
-                None => return Ok(None),
-            };
-            let source = parser.source();
+            let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(&uri_str)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
-
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
@@ -118,10 +226,16 @@ impl PhpLspBackend {
         };
 
         if let Some(type_fqn) = variable_type_fqn {
+            if let Some(local_type) = local_type_symbol(&file_symbols, &type_fqn) {
+                return Ok(snapshot_symbol_location(&local_type, &source)
+                    .map(GotoDefinitionResponse::Scalar)
+                    .map(&map_template_response));
+            }
             return Ok(self
-                .location_for_type_fqn(&type_fqn)
+                .location_for_type_fqn_excluding_uri(&type_fqn, &uri_str)
                 .await
-                .map(GotoDefinitionResponse::Scalar));
+                .map(GotoDefinitionResponse::Scalar)
+                .map(&map_template_response));
         }
 
         let Some(sym_at_pos) = sym_at_pos else {
@@ -133,41 +247,92 @@ impl PhpLspBackend {
             RefKind::ClassName | RefKind::Constructor
         ) {
             let type_fqn = import_target_fqn(&sym_at_pos);
+            if let Some(local_type) = local_type_symbol(&file_symbols, type_fqn) {
+                return Ok(snapshot_symbol_location(&local_type, &source)
+                    .map(GotoDefinitionResponse::Scalar)
+                    .map(&map_template_response));
+            }
             return Ok(self
-                .location_for_type_fqn(type_fqn)
+                .location_for_type_fqn_excluding_uri(type_fqn, &uri_str)
                 .await
-                .map(GotoDefinitionResponse::Scalar));
+                .map(GotoDefinitionResponse::Scalar)
+                .map(&map_template_response));
         }
 
-        let symbol_info = self
-            .resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
-            .await;
+        let symbol_info =
+            if let Some(local_symbol) = local_symbol_for_reference(&file_symbols, &sym_at_pos) {
+                Some(local_symbol)
+            } else {
+                self.resolve_fqn_lazy_with_fallback(
+                    &sym_at_pos.fqn,
+                    sym_at_pos.ref_kind,
+                    sym_at_pos.allows_global_fallback,
+                )
+                .await
+                .filter(|symbol| symbol.uri != uri_str)
+            };
 
         let Some(symbol_info) = symbol_info else {
             return Ok(None);
         };
-        let Some(type_fqn) = self.type_definition_fqn_for_symbol(&symbol_info, &file_symbols)
-        else {
+        let type_fqn = if symbol_info.uri == uri_str {
+            let Some(return_type) = symbol_info
+                .signature
+                .as_ref()
+                .and_then(|signature| signature.return_type.as_ref())
+            else {
+                return Ok(None);
+            };
+            first_type_definition_fqn(
+                return_type,
+                &file_symbols,
+                symbol_info.parent_fqn.as_deref(),
+            )
+        } else {
+            self.type_definition_fqn_for_symbol(&symbol_info, &file_symbols)
+        };
+        let Some(type_fqn) = type_fqn else {
             return Ok(None);
         };
 
+        if let Some(local_type) = local_type_symbol(&file_symbols, &type_fqn) {
+            return Ok(snapshot_symbol_location(&local_type, &source)
+                .map(GotoDefinitionResponse::Scalar)
+                .map(&map_template_response));
+        }
+
         Ok(self
-            .location_for_type_fqn(&type_fqn)
+            .location_for_type_fqn_excluding_uri(&type_fqn, &uri_str)
             .await
-            .map(GotoDefinitionResponse::Scalar))
+            .map(GotoDefinitionResponse::Scalar)
+            .map(map_template_response))
     }
 
     pub(crate) async fn lsp_goto_implementation(
         &self,
         params: GotoImplementationParams,
     ) -> Result<Option<GotoImplementationResponse>> {
-        let uri_str = params
-            .text_document_position_params
-            .text_document
-            .uri
-            .as_str()
-            .to_string();
-        let pos = params.text_document_position_params.position;
+        let uri = params.text_document_position_params.text_document.uri;
+        let uri_str = uri.as_str().to_string();
+        let original_pos = params.text_document_position_params.position;
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            template_document,
+            file_symbols,
+            ..
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(None);
+        };
+        let pos = if let Some(template) = &template_document {
+            match template.map_original_position_to_virtual(original_pos) {
+                Some(pos) => pos,
+                None => return Ok(None),
+            }
+        } else {
+            original_pos
+        };
         tracing::debug!(
             "gotoImplementation: {}:{}:{}",
             uri_str,
@@ -176,22 +341,8 @@ impl PhpLspBackend {
         );
 
         let (candidate, local_candidate) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(parser) => parser,
-                None => return Ok(None),
-            };
-            let tree = match parser.tree() {
-                Some(tree) => tree,
-                None => return Ok(None),
-            };
-            let source = parser.source();
+            let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(&uri_str)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
@@ -236,11 +387,17 @@ impl PhpLspBackend {
                 _ => None,
             };
 
-            let local_candidate = candidate.as_ref().and_then(|(fqn, kind, _)| {
+            let local_candidate = candidate.as_ref().and_then(|(fqn, kind, ref_kind)| {
+                if *ref_kind == RefKind::ClassName {
+                    return local_type_symbol(&file_symbols, fqn)
+                        .map(|symbol| symbol.as_ref().clone());
+                }
                 file_symbols
                     .symbols
                     .iter()
-                    .find(|sym| sym.fqn == *fqn && sym.kind == *kind)
+                    .find(|sym| {
+                        sym.kind == *kind && php_lsp_types::symbol_fqn_eq(&sym.fqn, fqn, sym.kind)
+                    })
                     .cloned()
             });
             (candidate, local_candidate)
@@ -249,15 +406,18 @@ impl PhpLspBackend {
         let Some((target_fqn, _, ref_kind)) = candidate else {
             return Ok(None);
         };
-        let target = self
-            .resolve_fqn_lazy_with_fallback(&target_fqn, ref_kind)
-            .await
-            .or_else(|| local_candidate.map(Arc::new));
+        let target = if let Some(local_candidate) = local_candidate {
+            Some(Arc::new(local_candidate))
+        } else {
+            self.resolve_fqn_lazy_with_fallback(&target_fqn, ref_kind, false)
+                .await
+                .filter(|symbol| symbol.uri != uri_str)
+        };
         let Some(target) = target else {
             return Ok(None);
         };
 
-        let implementation_symbols = match target.kind {
+        let mut implementation_symbols = match target.kind {
             php_lsp_types::PhpSymbolKind::Class
             | php_lsp_types::PhpSymbolKind::Interface
             | php_lsp_types::PhpSymbolKind::Trait
@@ -269,13 +429,42 @@ impl PhpLspBackend {
             }
             _ => Vec::new(),
         };
+        implementation_symbols.retain(|symbol| symbol.uri != uri_str);
+        implementation_symbols.extend(match target.kind {
+            php_lsp_types::PhpSymbolKind::Class
+            | php_lsp_types::PhpSymbolKind::Interface
+            | php_lsp_types::PhpSymbolKind::Trait
+            | php_lsp_types::PhpSymbolKind::Enum => {
+                local_implementation_types(&file_symbols, &target.fqn)
+            }
+            php_lsp_types::PhpSymbolKind::Method => {
+                local_implementation_methods(&file_symbols, &target)
+            }
+            _ => Vec::new(),
+        });
+        let mut seen_implementations = HashSet::new();
+        implementation_symbols.retain(|symbol| {
+            seen_implementations.insert((
+                symbol.uri.clone(),
+                symbol.kind,
+                symbol.fqn.to_ascii_lowercase(),
+            ))
+        });
 
         let mut locations = Vec::new();
         for symbol in implementation_symbols {
-            if let Some(location) = self
-                .location_for_symbol_selection(&symbol, "gotoImplementation source read")
-                .await
-            {
+            let mut location = if symbol.uri == uri_str {
+                snapshot_symbol_location(&symbol, &source)
+            } else {
+                self.location_for_symbol_selection(&symbol, "gotoImplementation source read")
+                    .await
+            };
+            if let Some(mut location) = location.take() {
+                if symbol.uri == uri_str {
+                    if let Some(template) = &template_document {
+                        location = map_location_for_template(&uri_str, template, location);
+                    }
+                }
                 locations.push(location);
             }
         }
@@ -306,7 +495,16 @@ impl PhpLspBackend {
         let uri = params.text_document_position_params.text_document.uri;
         let uri_str = uri.as_str().to_string();
         let original_pos = params.text_document_position_params.position;
-        let template_document = self.template_document(&uri_str);
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            template_document,
+            document_state,
+            file_symbols,
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(None);
+        };
         if let Some(template) = &template_document {
             if let Some(path_context) =
                 template.twig_template_path_context_at_position(original_pos)
@@ -374,30 +572,12 @@ impl PhpLspBackend {
             shape_member_info,
             framework_string_key_context,
             file_symbols,
-            source,
         ) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(p) => p,
-                None => return Ok(None),
-            };
-
-            let tree = match parser.tree() {
-                Some(t) => t,
-                None => return Ok(None),
-            };
-
-            let source = parser.source();
+            let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
             let utf16_index = Utf16LineIndex::new(&source);
             let type_cache =
-                RequestTypeCache::new(&uri_str, self.current_document_version(&uri_str));
-
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(&uri_str)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_default();
+                RequestTypeCache::new(&uri_str, document_state.map(|state| state.version));
 
             // Build a cross-file type resolver that uses the workspace index
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
@@ -472,7 +652,6 @@ impl PhpLspBackend {
                 shape_member_info,
                 framework_string_key_context,
                 file_symbols,
-                source,
             )
         };
 
@@ -610,17 +789,28 @@ impl PhpLspBackend {
             }
         };
 
-        // Look up symbol in index (with lazy vendor fallback)
-        let symbol_info = self
-            .resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
-            .await;
+        // Prefer the exact request snapshot for same-file declarations. The
+        // global index may still contain the previous document generation.
+        let local_symbol_info = local_symbol_for_reference(&file_symbols, &sym_at_pos);
+        let symbol_info = if local_symbol_info.is_some() {
+            local_symbol_info
+        } else {
+            self.resolve_fqn_lazy_with_fallback(
+                &sym_at_pos.fqn,
+                sym_at_pos.ref_kind,
+                sym_at_pos.allows_global_fallback,
+            )
+            .await
+            .filter(|symbol| symbol.uri != uri_str)
+        };
 
         // For constructor refs (`new ClassName()`), fall back to the class
         // declaration when `__construct` is not explicitly defined.
         let symbol_info = if symbol_info.is_none() && sym_at_pos.ref_kind == RefKind::Constructor {
             if let Some(class_fqn) = sym_at_pos.fqn.strip_suffix("::__construct") {
-                self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName)
+                self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName, false)
                     .await
+                    .filter(|symbol| symbol.uri != uri_str)
             } else {
                 None
             }
@@ -635,9 +825,13 @@ impl PhpLspBackend {
         let symbol_info = symbol_info.or(twig_accessor_symbol);
 
         let result = if let Some(sym) = symbol_info {
-            self.location_for_symbol_selection(&sym, "gotoDefinition source read")
-                .await
-                .map(GotoDefinitionResponse::Scalar)
+            if sym.uri == uri_str {
+                snapshot_symbol_location(&sym, &source).map(GotoDefinitionResponse::Scalar)
+            } else {
+                self.location_for_symbol_selection(&sym, "gotoDefinition source read")
+                    .await
+                    .map(GotoDefinitionResponse::Scalar)
+            }
         } else if let Some(virtual_member) =
             phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)
         {
@@ -714,8 +908,9 @@ impl PhpLspBackend {
         let source = parser.source();
         let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
-        let sym = symbol_at_position(tree, &source, pos.line, byte_col, &file_symbols)?;
-        let use_stmt = imported_use_statement_for_symbol(&file_symbols, &sym)?;
+        let scoped_symbols = file_symbols.scoped_at_byte_position(pos.line, byte_col);
+        let sym = symbol_at_position(tree, &source, pos.line, byte_col, &scoped_symbols)?;
+        let use_stmt = imported_use_statement_for_symbol(&scoped_symbols, &sym)?;
         let range = range_byte_to_utf16(&source, use_stmt.range);
 
         Some(GotoDefinitionResponse::Scalar(Location {
@@ -731,14 +926,14 @@ impl PhpLspBackend {
         &self,
         uri_str: &str,
     ) -> Option<php_lsp_types::FileSymbols> {
+        if let Some(snapshot) = self.open_document_snapshot(uri_str) {
+            return Some(snapshot.file_symbols);
+        }
+
         if let Some(file_symbols) = self.index.file_symbols.get(uri_str) {
             return Some(file_symbols.value().clone());
         }
-
-        let parser = self.open_files.get(uri_str)?;
-        let tree = parser.tree()?;
-        let source = parser.source();
-        Some(extract_file_symbols(tree, &source, uri_str))
+        None
     }
 
     pub(in crate::server) async fn source_for_uri(
@@ -959,8 +1154,27 @@ impl PhpLspBackend {
         }
 
         let symbol = self
-            .resolve_fqn_lazy_with_fallback(fqn, RefKind::ClassName)
+            .resolve_fqn_lazy_with_fallback(fqn, RefKind::ClassName, false)
             .await?;
+        self.location_for_symbol_selection(&symbol, "type definition source read")
+            .await
+    }
+
+    async fn location_for_type_fqn_excluding_uri(
+        &self,
+        fqn: &str,
+        excluded_uri: &str,
+    ) -> Option<Location> {
+        if is_builtin_type_name(fqn) {
+            return None;
+        }
+
+        let symbol = self
+            .resolve_fqn_lazy_with_fallback(fqn, RefKind::ClassName, false)
+            .await?;
+        if symbol.uri == excluded_uri {
+            return None;
+        }
         self.location_for_symbol_selection(&symbol, "type definition source read")
             .await
     }
@@ -972,17 +1186,10 @@ impl PhpLspBackend {
         include_declaration: bool,
     ) -> Vec<Location> {
         let mut locations = Vec::new();
-        let indexed_references: Vec<_> = self
-            .index
-            .file_references
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        for file_uri in indexed_references {
-            for reference in
-                self.references_for_file(&file_uri, target_fqn, target_kind, include_declaration)
-            {
+        for (file_uri, references) in
+            self.reference_scan_matches(target_fqn, target_kind, include_declaration)
+        {
+            for reference in references {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     locations.push(Location {
                         uri,

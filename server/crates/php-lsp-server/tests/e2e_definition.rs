@@ -322,6 +322,97 @@ new Local();
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_goto_declaration_uses_import_from_active_namespace_scope() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    for (request_id, uri, code, usage_line, import_line) in [
+        (
+            2,
+            "file:///test/DeclarationScopedUnbracketed.php",
+            r#"<?php
+namespace First;
+use Vendor\Thing as Shared;
+new Shared();
+namespace Second;
+use Vendor\Thing as Shared;
+new Shared();
+"#,
+            6,
+            5,
+        ),
+        (
+            3,
+            "file:///test/DeclarationScopedBracketed.php",
+            r#"<?php
+namespace First {
+use Vendor\Thing as Shared;
+new Shared();
+}
+namespace Second {
+use Vendor\Thing as Shared;
+new Shared();
+}
+"#,
+            7,
+            6,
+        ),
+    ] {
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(uri, code))
+            .await
+            .unwrap();
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(declaration_request(request_id, uri, usage_line, 6))
+            .await
+            .unwrap();
+        let result = extract_result(response);
+        assert_eq!(
+            result.get("uri").and_then(|value| value.as_str()),
+            Some(uri),
+            "declaration must remain in the current document: {result}"
+        );
+        assert_eq!(
+            result["range"]["start"]["line"].as_u64(),
+            Some(import_line),
+            "declaration must select the repeated import in the active namespace: {result}"
+        );
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_goto_type_definition_for_variables_returns_and_properties() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -451,13 +542,13 @@ class Base {
     public function run(): void {}
 }
 
-class Impl extends Base implements Contract {
-    public function work(): void {}
-    public function run(): void {}
+class Impl extends bASE implements cONTRACT {
+    public const work = 1; public function WORK(): void {}
+    public function RUN(): void {}
 }
 
-class Other implements Contract {
-    public function work(): void {}
+class Other implements coNTRACT {
+    public function WoRk(): void {}
 }
 
 function useIt(Contract $contract, Base $base): void {
@@ -553,6 +644,112 @@ function useIt(Contract $contract, Base $base): void {
         "expected Impl::run override location, got: {}",
         override_result
     );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mixed_group_import_clauses_hover_and_definition() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace Vendor\Package {
+class Service {}
+function helper(): void {}
+const FLAG = 1;
+}
+
+namespace App {
+use Vendor\Package\{
+    Service as ImportedService,
+    function helper as ImportedHelper,
+    const FLAG as ImportedFlag
+};
+
+new ImportedService();
+ImportedHelper();
+echo ImportedFlag;
+}
+"#;
+    let uri = "file:///test/mixed-group-imports.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let cases = [
+        ("ImportedService,", r"Vendor\Package\Service", 2_u64),
+        ("ImportedHelper,", r"Vendor\Package\helper", 3_u64),
+        ("ImportedFlag\n", r"Vendor\Package\FLAG", 4_u64),
+    ];
+    for (offset, (needle, expected_fqn, expected_line)) in cases.into_iter().enumerate() {
+        let (line, character) = utf16_position_at(code, needle);
+        let hover = service
+            .ready()
+            .await
+            .unwrap()
+            .call(hover_request(
+                10 + offset as i64 * 2,
+                uri,
+                line,
+                character + 2,
+            ))
+            .await
+            .unwrap();
+        let hover_result = extract_result(hover);
+        let markdown = hover_markdown_value(&hover_result);
+        assert!(
+            markdown.contains(expected_fqn),
+            "mixed group import hover should resolve {expected_fqn}, got: {markdown}"
+        );
+
+        let definition = service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(
+                11 + offset as i64 * 2,
+                uri,
+                line,
+                character + 2,
+            ))
+            .await
+            .unwrap();
+        let definition_result = extract_result(definition);
+        assert_eq!(definition_result["uri"].as_str(), Some(uri));
+        assert_eq!(
+            definition_result["range"]["start"]["line"].as_u64(),
+            Some(expected_line),
+            "mixed group import definition should resolve {expected_fqn}, got: {definition_result}"
+        );
+    }
 
     service
         .ready()
@@ -1316,6 +1513,137 @@ async fn test_goto_definition_cross_file_method_via_same_file_property() {
         target_uri.contains("TimerService.php"),
         "definition should point to TimerService.php, got: {}",
         target_uri
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_function_definition_respects_symbol_kind_and_source_form_for_global_fallback() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace {
+class GlobalShadow {}
+function gLOBALsHADOW(): string { return 'global'; }
+}
+
+namespace App {
+class LocalCollision {}
+function lOCALcOLLISION(): string { return 'local'; }
+
+function exercise(): void {
+    LOCALcollision();
+    GLOBALshadow();
+    Missing\GLOBALshadow();
+    namespace\GLOBALshadow();
+}
+}
+"#;
+    let uri = "file:///test/function-fallback-definition.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (local_line, local_character) = utf16_position_at(code, "LOCALcollision();");
+    let local_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(2, uri, local_line, local_character + 2))
+        .await
+        .unwrap();
+    let local_result = extract_result(local_response);
+    assert_eq!(local_result["uri"].as_str(), Some(uri));
+    assert_eq!(
+        local_result["range"]["start"]["line"].as_u64(),
+        Some(8),
+        "kind-aware lookup should choose the same-FQN function, got: {local_result}"
+    );
+
+    let (global_line, global_character) = utf16_position_at(code, "GLOBALshadow();");
+    let global_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            3,
+            uri,
+            global_line,
+            global_character + 2,
+        ))
+        .await
+        .unwrap();
+    let global_result = extract_result(global_response);
+    assert_eq!(global_result["uri"].as_str(), Some(uri));
+    assert_eq!(
+        global_result["range"]["start"]["line"].as_u64(),
+        Some(3),
+        "unqualified PHP fallback should choose the global function, got: {global_result}"
+    );
+
+    let (qualified_line, qualified_character) = utf16_position_at(code, "Missing\\GLOBALshadow");
+    let qualified_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            4,
+            uri,
+            qualified_line,
+            qualified_character + "Missing\\".len() as u32 + 2,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(qualified_response).is_null(),
+        "qualified calls must not fall back to a global short name"
+    );
+
+    let (namespace_line, namespace_character) = utf16_position_at(code, "namespace\\GLOBALshadow");
+    let namespace_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(definition_request(
+            5,
+            uri,
+            namespace_line,
+            namespace_character + "namespace\\".len() as u32 + 2,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(namespace_response).is_null(),
+        "explicit namespace-relative calls must not fall back to a global short name"
     );
 
     service

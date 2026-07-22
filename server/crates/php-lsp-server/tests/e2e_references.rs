@@ -151,6 +151,200 @@ class Demo {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_global_function_references_and_highlights_require_unqualified_fallback() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace {
+class Target {}
+function tARGET(): void {}
+}
+namespace App {
+function run(): void {
+    TARGET();
+    Foo\TARGET();
+    namespace\TARGET();
+}
+}
+"#;
+    let uri = "file:///test/global-function-references.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (line, character) = line_col(code, "TARGET();");
+    let references = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(2, uri, line, character + 2, true))
+        .await
+        .unwrap();
+    let reference_result = extract_result(references);
+    assert_eq!(
+        location_start_lines(&reference_result),
+        BTreeSet::from([3, 7]),
+        "references should include the global function declaration and only the unqualified fallback call: {reference_result}"
+    );
+
+    let highlights = service
+        .ready()
+        .await
+        .unwrap()
+        .call(document_highlight_request(3, uri, line, character + 2))
+        .await
+        .unwrap();
+    let highlight_result = extract_result(highlights);
+    let highlight_lines = highlight_result
+        .as_array()
+        .unwrap_or_else(|| panic!("document highlights should be an array: {highlight_result}"))
+        .iter()
+        .map(|highlight| {
+            highlight["range"]["start"]["line"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        highlight_lines,
+        BTreeSet::from([3, 7]),
+        "highlights must exclude qualified and explicit namespace-relative calls: {highlight_result}"
+    );
+
+    let (declaration_line, declaration_character) = line_col(code, "tARGET():");
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(
+            4,
+            uri,
+            declaration_line,
+            declaration_character + 2,
+            "renamedTarget",
+        ))
+        .await
+        .unwrap();
+    let rename_result = extract_result(rename);
+    assert_eq!(
+        workspace_edit_start_lines(&rename_result, uri),
+        BTreeSet::from([3, 7]),
+        "rename must edit the function declaration and only the unqualified fallback call: {rename_result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_global_function_fallback_stops_at_namespaced_shadow() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace {
+function shadowed(): void {}
+shadowed();
+}
+namespace App {
+function SHADOWED(): void {}
+function run(): void {
+    shadowed();
+}
+}
+"#;
+    let uri = "file:///test/global-function-shadow.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let (line, character) = line_col(code, "shadowed();");
+    let references = service
+        .ready()
+        .await
+        .unwrap()
+        .call(references_request(2, uri, line, character + 2, true))
+        .await
+        .unwrap();
+    let reference_result = extract_result(references);
+    assert_eq!(
+        location_start_lines(&reference_result),
+        BTreeSet::from([2, 3]),
+        "the namespaced declaration and call must shadow the global fallback: {reference_result}"
+    );
+
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(3, uri, line, character + 2, "renamedGlobal"))
+        .await
+        .unwrap();
+    let rename_result = extract_result(rename);
+    assert_eq!(
+        workspace_edit_start_lines(&rename_result, uri),
+        BTreeSet::from([2, 3]),
+        "global rename must not edit a namespaced shadow: {rename_result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_lens_reference_counts_for_types_and_methods() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -260,7 +454,7 @@ async fn test_workspace_references_use_indexed_closed_files() {
     fs::write(&target_path, target_code).unwrap();
     fs::write(
         &use_path,
-        "<?php\nnamespace App;\n\nfunction consume(): void {\n    new Target();\n}\n",
+        "<?php\nnamespace App;\n\nfunction consume(): void {\n    new tArGeT();\n}\n",
     )
     .unwrap();
 
@@ -343,6 +537,22 @@ async fn test_workspace_references_use_indexed_closed_files() {
         }),
         "references should include closed indexed usage file, got: {}",
         result
+    );
+
+    let rename = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(201, &target_uri, 3, 8, "RenamedTarget"))
+        .await
+        .unwrap();
+    let rename_result = extract_result(rename);
+    let changes = rename_result["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("expected cross-file rename changes: {rename_result}"));
+    assert!(
+        changes.contains_key(&target_uri) && changes.contains_key(&use_uri),
+        "case-insensitive class rename should update declaration and closed-file usage: {rename_result}"
     );
 
     service
@@ -528,7 +738,246 @@ $x = new OldName();
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_builtin_function_fallback_blocks_rename_in_namespace() {
+async fn test_top_level_rename_updates_import_targets_and_preserves_explicit_aliases() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let declaration_code = r#"<?php
+namespace Vendor;
+class Service {}
+"#;
+    let declaration_uri = "file:///test/RenameImportedService.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(declaration_uri, declaration_code))
+        .await
+        .unwrap();
+
+    let consumer_code = r#"<?php
+namespace Explicit {
+use Vendor\Service as Alias;
+function make(): object {
+    return new Alias();
+}
+}
+namespace Implicit {
+use Vendor\Service;
+function make(): object {
+    return new Service();
+}
+}
+namespace Qualified {
+function make(): object {
+    "😀"; return new \Vendor\Service();
+}
+}
+"#;
+    let consumer_uri = "file:///test/RenameImportedServiceConsumers.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(consumer_uri, consumer_code))
+        .await
+        .unwrap();
+
+    let prepare_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(prepare_rename_request(2, consumer_uri, 15, 32))
+        .await
+        .unwrap();
+    let prepare_result = extract_result(prepare_response);
+    assert_eq!(
+        prepare_result,
+        json!({
+            "start": { "line": 15, "character": 29 },
+            "end": { "line": 15, "character": 36 }
+        }),
+        "prepareRename must select only the terminal identifier using UTF-16 columns"
+    );
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(3, declaration_uri, 2, 8, "Renamed"))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+
+    let declaration_edits = result["changes"][declaration_uri]
+        .as_array()
+        .unwrap_or_else(|| panic!("declaration edit missing: {result}"));
+    assert!(declaration_edits.iter().any(|edit| {
+        edit["range"]["start"]["line"].as_u64() == Some(2)
+            && edit["newText"].as_str() == Some("Renamed")
+    }));
+
+    let consumer_edits = result["changes"][consumer_uri]
+        .as_array()
+        .unwrap_or_else(|| panic!("consumer edits missing: {result}"));
+    let edited_lines: BTreeSet<u64> = consumer_edits
+        .iter()
+        .map(|edit| {
+            assert_eq!(edit["newText"].as_str(), Some("Renamed"));
+            edit["range"]["start"]["line"].as_u64().unwrap_or(u64::MAX)
+        })
+        .collect();
+    assert_eq!(
+        edited_lines,
+        BTreeSet::from([2, 8, 10, 15]),
+        "rename must update import targets, the implicit alias, and the terminal FQN segment: {result}"
+    );
+    assert!(
+        !consumer_edits
+            .iter()
+            .any(|edit| edit["range"]["start"]["line"].as_u64() == Some(4)),
+        "explicit alias usage must preserve its spelling: {result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_function_and_constant_rename_preserve_explicit_import_aliases() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let declaration_code = r#"<?php
+namespace Vendor;
+function helper(): void {}
+const FLAG = true;
+"#;
+    let declaration_uri = "file:///test/RenameImportedFunctionAndConstant.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(declaration_uri, declaration_code))
+        .await
+        .unwrap();
+
+    let function_code = r#"<?php
+namespace Explicit {
+use function Vendor\helper as alias_helper;
+alias_helper();
+}
+namespace Implicit {
+use function Vendor\helper;
+helper();
+}
+"#;
+    let function_uri = "file:///test/RenameImportedFunctionConsumers.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(function_uri, function_code))
+        .await
+        .unwrap();
+
+    let constant_code = r#"<?php
+namespace Explicit {
+use const Vendor\FLAG as LOCAL_FLAG;
+echo LOCAL_FLAG;
+}
+namespace Implicit {
+use const Vendor\FLAG;
+echo FLAG;
+}
+"#;
+    let constant_uri = "file:///test/RenameImportedConstantConsumers.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(constant_uri, constant_code))
+        .await
+        .unwrap();
+
+    let function_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(2, declaration_uri, 2, 11, "renamed_helper"))
+        .await
+        .unwrap();
+    let function_result = extract_result(function_response);
+    assert_eq!(
+        workspace_edit_start_lines(&function_result, function_uri),
+        BTreeSet::from([2, 6, 7]),
+        "function rename must preserve the explicit alias usage: {function_result}"
+    );
+
+    let constant_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(rename_request(3, declaration_uri, 3, 7, "RENAMED_FLAG"))
+        .await
+        .unwrap();
+    let constant_result = extract_result(constant_response);
+    assert_eq!(
+        workspace_edit_start_lines(&constant_result, constant_uri),
+        BTreeSet::from([2, 6, 7]),
+        "constant rename must preserve the explicit alias usage: {constant_result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mixed_case_builtin_function_fallback_blocks_rename_in_namespace() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
         socket.collect::<Vec<_>>().await;
@@ -571,7 +1020,7 @@ async fn test_builtin_function_fallback_blocks_rename_in_namespace() {
     let code = r#"<?php
 namespace App\Lsp;
 
-strlen("x");
+StRlEn("x");
 "#;
     let uri = "file:///test/BuiltinRename.php";
 
@@ -594,7 +1043,7 @@ strlen("x");
     let def_result = extract_result(def_resp);
     assert!(
         !def_result.is_null(),
-        "definition for strlen() in namespace should resolve via built-in fallback"
+        "definition for mixed-case StRlEn() in namespace should resolve via built-in fallback"
     );
 
     // Built-ins must not be renameable.
@@ -608,7 +1057,7 @@ strlen("x");
     let prepare_result = extract_result(prepare_resp);
     assert!(
         prepare_result.is_null(),
-        "prepareRename should return null for built-in symbol"
+        "prepareRename should return null for mixed-case built-in symbol"
     );
 
     let rename_resp = service
@@ -1166,7 +1615,7 @@ namespace App;
 class Alpha {
     public function touch(): void {}
     public function run(): void {
-        $this->touch();
+        $this->TOUCH();
     }
 }
 
@@ -1178,7 +1627,7 @@ class Beta {
 }
 
 function run(Alpha $alpha, Beta $beta): void {
-    $alpha->touch();
+    $alpha->ToUcH();
     $beta->touch();
 }
 "#;
@@ -1210,8 +1659,8 @@ function run(Alpha $alpha, Beta $beta): void {
 
     let expected_lines = BTreeSet::from([
         line_col(code, "touch(): void {}").0 as u64,
-        line_col(code, "$this->touch();").0 as u64,
-        line_col(code, "$alpha->touch();").0 as u64,
+        line_col(code, "$this->TOUCH();").0 as u64,
+        line_col(code, "$alpha->ToUcH();").0 as u64,
     ]);
     assert_eq!(
         edit_lines, expected_lines,

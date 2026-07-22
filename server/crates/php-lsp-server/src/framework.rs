@@ -294,12 +294,7 @@ impl<'a> FrameworkProviderContext<'a> {
         }
         visited.push(current_class.to_string());
 
-        let Some(class_sym) = self
-            .index
-            .types
-            .get(current_class)
-            .map(|entry| entry.value().clone())
-        else {
+        let Some(class_sym) = self.index.get_type(current_class) else {
             return false;
         };
 
@@ -2628,11 +2623,7 @@ fn laravel_relation_related_model_from_relation_symbol(
     ctx: &FrameworkProviderContext<'_>,
     relation_fqn: &str,
 ) -> Option<String> {
-    let relation = ctx
-        .index
-        .types
-        .get(relation_fqn.trim_start_matches('\\'))
-        .map(|entry| entry.value().clone())?;
+    let relation = ctx.index.get_type(relation_fqn)?;
 
     for binding in &relation.template_bindings {
         if !matches!(
@@ -2738,11 +2729,7 @@ fn laravel_model_for_builder(
     ctx: &FrameworkProviderContext<'_>,
     builder_fqn: &str,
 ) -> Option<String> {
-    let builder = ctx
-        .index
-        .types
-        .get(builder_fqn.trim_start_matches('\\'))
-        .map(|entry| entry.value().clone())?;
+    let builder = ctx.index.get_type(builder_fqn)?;
 
     for binding in &builder.template_bindings {
         if !matches!(
@@ -2925,7 +2912,9 @@ fn resolve_laravel_type_name_relative_to_owner(
     let owner_namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
     if let Some(namespace) = owner_namespace {
         if let Some(file_symbols) = ctx.index.file_symbols.get(owner.uri.as_str()) {
-            for use_stmt in &file_symbols.use_statements {
+            let scoped_file_symbols =
+                file_symbols.scoped_at_byte_position(owner.range.0, owner.range.1);
+            for use_stmt in &scoped_file_symbols.use_statements {
                 if use_stmt.kind != UseKind::Class
                     || use_stmt.namespace.as_deref() != Some(namespace)
                 {
@@ -2935,7 +2924,7 @@ fn resolve_laravel_type_name_relative_to_owner(
                     .alias
                     .as_deref()
                     .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-                if alias == normalized {
+                if alias.eq_ignore_ascii_case(normalized) {
                     return Some(use_stmt.fqn.trim_start_matches('\\').to_string());
                 }
             }
@@ -2964,14 +2953,18 @@ fn resolve_type_name_to_fqn(
     }
 
     if let Some(file_symbols) = ctx.index.file_symbols.get(owner.uri.as_str()) {
-        return Some(resolve_class_name(type_name, file_symbols.value()));
+        let scoped_file_symbols =
+            file_symbols.scoped_at_byte_position(owner.range.0, owner.range.1);
+        return Some(resolve_class_name(type_name, scoped_file_symbols.as_ref()));
     }
     if ctx
         .source_uri
         .is_some_and(|source_uri| source_uri == owner.uri.as_str())
     {
         if let Some(file_symbols) = ctx.file_symbols {
-            return Some(resolve_class_name(type_name, file_symbols));
+            let scoped_file_symbols =
+                file_symbols.scoped_at_byte_position(owner.range.0, owner.range.1);
+            return Some(resolve_class_name(type_name, scoped_file_symbols.as_ref()));
         }
     }
 
@@ -3936,7 +3929,8 @@ fn normalize_member_name(kind: VirtualMemberKind, member_name: &str) -> String {
 }
 
 fn fqn_matches(left: &str, right: &str) -> bool {
-    left.trim_start_matches('\\') == right.trim_start_matches('\\')
+    left.trim_start_matches('\\')
+        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
 }
 
 fn hash_workspace_root(root: Option<&Path>) -> u64 {

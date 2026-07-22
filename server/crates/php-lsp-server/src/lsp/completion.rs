@@ -1,6 +1,42 @@
 //! Completion LSP handlers extracted from `server.rs`.
 
 use super::super::*;
+use super::references::local_symbol_for_reference;
+
+fn completion_auto_import_symbol(
+    index: &WorkspaceIndex,
+    item: &lsp_types::CompletionItem,
+) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    let fqn = item.data.as_ref()?.as_str()?;
+    let expected_kinds: &[php_lsp_types::PhpSymbolKind] = match item.kind? {
+        lsp_types::CompletionItemKind::CLASS => &[php_lsp_types::PhpSymbolKind::Class],
+        lsp_types::CompletionItemKind::INTERFACE => &[
+            php_lsp_types::PhpSymbolKind::Interface,
+            php_lsp_types::PhpSymbolKind::Trait,
+        ],
+        lsp_types::CompletionItemKind::ENUM => &[php_lsp_types::PhpSymbolKind::Enum],
+        lsp_types::CompletionItemKind::FUNCTION => &[php_lsp_types::PhpSymbolKind::Function],
+        lsp_types::CompletionItemKind::CONSTANT => &[php_lsp_types::PhpSymbolKind::GlobalConstant],
+        _ => return None,
+    };
+    index.resolve_fqn_matching_kinds(fqn, expected_kinds)
+}
+
+fn completion_item_ref_kind(kind: Option<CompletionItemKind>, fqn: &str) -> Option<RefKind> {
+    match kind? {
+        CompletionItemKind::CLASS | CompletionItemKind::INTERFACE | CompletionItemKind::ENUM => {
+            Some(RefKind::ClassName)
+        }
+        CompletionItemKind::FUNCTION => Some(RefKind::FunctionCall),
+        CompletionItemKind::METHOD | CompletionItemKind::CONSTRUCTOR => Some(RefKind::MethodCall),
+        CompletionItemKind::PROPERTY | CompletionItemKind::FIELD => Some(RefKind::PropertyAccess),
+        CompletionItemKind::CONSTANT if fqn.contains("::") => Some(RefKind::ClassConstant),
+        CompletionItemKind::CONSTANT => Some(RefKind::GlobalConstant),
+        CompletionItemKind::ENUM_MEMBER => Some(RefKind::ClassConstant),
+        CompletionItemKind::MODULE => Some(RefKind::NamespaceName),
+        _ => None,
+    }
+}
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_signature_help(
@@ -13,26 +49,30 @@ impl PhpLspBackend {
             .uri
             .as_str()
             .to_string();
-        let pos = params.text_document_position_params.position;
+        let original_pos = params.text_document_position_params.position;
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            template_document,
+            file_symbols,
+            ..
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(None);
+        };
+        let pos = if let Some(template) = &template_document {
+            match template.map_original_position_to_virtual(original_pos) {
+                Some(pos) => pos,
+                None => return Ok(None),
+            }
+        } else {
+            original_pos
+        };
         tracing::debug!("signatureHelp: {}:{}:{}", uri_str, pos.line, pos.character);
 
         let (sym_at_pos, active_parameter) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(p) => p,
-                None => return Ok(None),
-            };
-            let tree = match parser.tree() {
-                Some(t) => t,
-                None => return Ok(None),
-            };
-            let source = parser.source();
+            let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(&uri_str)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
 
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
@@ -53,14 +93,24 @@ impl PhpLspBackend {
             (context.symbol, context.active_parameter)
         };
 
-        let symbol_info = self
-            .resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
-            .await;
+        let local_symbol_info = local_symbol_for_reference(&file_symbols, &sym_at_pos);
+        let symbol_info = if local_symbol_info.is_some() {
+            local_symbol_info
+        } else {
+            self.resolve_fqn_lazy_with_fallback(
+                &sym_at_pos.fqn,
+                sym_at_pos.ref_kind,
+                sym_at_pos.allows_global_fallback,
+            )
+            .await
+            .filter(|symbol| symbol.uri != uri_str)
+        };
 
         let symbol_info = if symbol_info.is_none() && sym_at_pos.ref_kind == RefKind::Constructor {
             if let Some(class_fqn) = sym_at_pos.fqn.strip_suffix("::__construct") {
-                self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName)
+                self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName, false)
                     .await
+                    .filter(|symbol| symbol.uri != uri_str)
             } else {
                 None
             }
@@ -82,7 +132,16 @@ impl PhpLspBackend {
             .as_str()
             .to_string();
         let original_pos = params.text_document_position.position;
-        let template_document = self.template_document(&uri_str);
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            template_document,
+            document_state,
+            file_symbols,
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(None);
+        };
         if let Some(template) = &template_document {
             if let Some(path_context) =
                 template.twig_template_path_context_at_position(original_pos)
@@ -125,19 +184,7 @@ impl PhpLspBackend {
         };
         tracing::debug!("completion: {}:{}:{}", uri_str, pos.line, pos.character);
 
-        let (tree, source) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(p) => p,
-                None => return Ok(None),
-            };
-            let tree = match parser.tree() {
-                Some(t) => t.clone(),
-                None => return Ok(None),
-            };
-            (tree, parser.source())
-        };
         let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
-        let file_symbols = extract_file_symbols(&tree, &source, &uri_str);
         let framework_string_key_context =
             framework_string_key_context_at_position(&source, pos.line, byte_col);
         let (framework_workspace_root, framework_namespace_map) =
@@ -163,7 +210,7 @@ impl PhpLspBackend {
             } else {
                 Vec::new()
             };
-        let type_cache = RequestTypeCache::new(&uri_str, self.current_document_version(&uri_str));
+        let type_cache = RequestTypeCache::new(&uri_str, document_state.map(|state| state.version));
 
         // Detect completion context
         let context = detect_context_at_byte_col(&tree, &source, pos.line, byte_col, &file_symbols);
@@ -327,12 +374,24 @@ impl PhpLspBackend {
                 php_lsp_completion::context::CompletionContext::Free { .. }
                     | php_lsp_completion::context::CompletionContext::Namespace { .. }
             );
+        let auto_import_file_symbols = file_symbols.scoped_at_byte_position(pos.line, byte_col);
 
         // Convert lsp_types::CompletionItem to ls_types::CompletionItem
         // We need to map between the two different type systems
         let items: Vec<CompletionItem> = lsp_items
             .into_iter()
             .map(|mut item| {
+                let auto_import_edit = if enable_auto_imports {
+                    completion_auto_import_symbol(&self.index, &item).and_then(|sym| {
+                        build_completion_auto_import_edit(
+                            &source,
+                            auto_import_file_symbols.as_ref(),
+                            &sym,
+                        )
+                    })
+                } else {
+                    None
+                };
                 let kind = item.kind.map(lsp_completion_kind_to_ls);
 
                 let tags = item.tags.map(|tags| {
@@ -347,17 +406,6 @@ impl PhpLspBackend {
                         .collect()
                 });
 
-                let auto_import_edit = if enable_auto_imports {
-                    item.data
-                        .as_ref()
-                        .and_then(|data| data.as_str())
-                        .and_then(|fqn| self.index.resolve_fqn(fqn))
-                        .and_then(|sym| {
-                            build_completion_auto_import_edit(&source, &file_symbols, &sym)
-                        })
-                } else {
-                    None
-                };
                 let mut additional_text_edits: Vec<TextEdit> = item
                     .additional_text_edits
                     .take()
@@ -451,7 +499,13 @@ impl PhpLspBackend {
         // The FQN is stored in item.data
         if let Some(ref data) = item.data {
             if let Some(fqn) = data.as_str() {
-                if let Some(sym) = self.resolve_fqn_lazy(fqn).await {
+                let sym = if let Some(ref_kind) = completion_item_ref_kind(item.kind, fqn) {
+                    self.resolve_fqn_lazy_with_fallback(fqn, ref_kind, false)
+                        .await
+                } else {
+                    self.resolve_fqn_lazy(fqn).await
+                };
+                if let Some(sym) = sym {
                     // Add full documentation
                     let mut doc_parts = Vec::new();
 
@@ -575,8 +629,11 @@ impl PhpLspBackend {
                 let member_fqn = format!("{}::{}", class_fqn, member_name);
                 let expected_kind = completion_member_type_lookup_kind(member_name);
                 file_symbols.symbols.iter().find_map(|sym| {
-                    if sym.fqn == member_fqn
-                        || (sym.parent_fqn.as_deref() == Some(class_fqn)
+                    if php_lsp_types::symbol_fqn_eq(&sym.fqn, &member_fqn, sym.kind)
+                        || (sym
+                            .parent_fqn
+                            .as_deref()
+                            .is_some_and(|parent| parent.eq_ignore_ascii_case(class_fqn))
                             && sym.matches_member_lookup_name(member_name))
                     {
                         if sym.kind == expected_kind {
@@ -645,23 +702,24 @@ impl PhpLspBackend {
             "completion-member-call-type",
             format!("{class_fqn}::{member_name}:{member_text}"),
             || {
-                let symbol = self
-                    .index
-                    .resolve_member_matching_kinds(
-                        &format!("{}::{}", class_fqn, member_name),
-                        &[php_lsp_types::PhpSymbolKind::Method],
-                    )
-                    .or_else(|| {
-                        let member_fqn = format!("{}::{}", class_fqn, member_name);
-                        file_symbols.symbols.iter().find_map(|sym| {
-                            ((sym.fqn == member_fqn
-                                || (sym.parent_fqn.as_deref() == Some(class_fqn)
-                                    && sym.matches_member_lookup_name(member_name)))
-                                && sym.kind == php_lsp_types::PhpSymbolKind::Method)
-                                .then(|| Arc::new(sym.clone()))
+                let symbol =
+                    self.index
+                        .resolve_member_matching_kinds(
+                            &format!("{}::{}", class_fqn, member_name),
+                            &[php_lsp_types::PhpSymbolKind::Method],
+                        )
+                        .or_else(|| {
+                            let member_fqn = format!("{}::{}", class_fqn, member_name);
+                            file_symbols.symbols.iter().find_map(|sym| {
+                                ((php_lsp_types::symbol_fqn_eq(&sym.fqn, &member_fqn, sym.kind)
+                                    || (sym.parent_fqn.as_deref().is_some_and(|parent| {
+                                        parent.eq_ignore_ascii_case(class_fqn)
+                                    }) && sym.matches_member_lookup_name(member_name)))
+                                    && sym.kind == php_lsp_types::PhpSymbolKind::Method)
+                                    .then(|| Arc::new(sym.clone()))
+                            })
                         })
-                    })
-                    .filter(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Method)?;
+                        .filter(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Method)?;
                 let signature = symbol.signature.as_ref()?;
                 let return_type = symbol_effective_return_type(&symbol)?;
                 let arguments = completion_call_arguments_by_param(
@@ -705,6 +763,8 @@ impl PhpLspBackend {
             "completion-object-type",
             object_expr,
             || {
+                let scoped_file_symbols = file_symbols.scoped_at_byte_position(line, byte_col);
+                let file_symbols = scoped_file_symbols.as_ref();
                 let object_expr = object_expr.trim();
                 if let Some(class_fqn) = infer_new_expression_type(object_expr, file_symbols) {
                     return Some(class_fqn);
@@ -876,6 +936,8 @@ impl PhpLspBackend {
             "completion-member-chain-type",
             object_expr,
             || {
+                let scoped_file_symbols = file_symbols.scoped_at_byte_position(line, byte_col);
+                let file_symbols = scoped_file_symbols.as_ref();
                 let normalized = object_expr.replace("?->", "->");
                 let mut parts = normalized.split("->");
                 let base_expr = parts.next()?.trim();

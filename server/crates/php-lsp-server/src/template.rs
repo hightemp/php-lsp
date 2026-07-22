@@ -60,6 +60,12 @@ impl TemplateDocument {
         &self.virtual_source
     }
 
+    pub(crate) fn has_same_source_and_twig_context(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.original_source == other.original_source
+            && self.twig_variable_types == other.twig_variable_types
+    }
+
     pub(crate) fn with_twig_variable_types(&self, variable_types: &[TemplateVariableType]) -> Self {
         match self.kind {
             TemplateKind::Blade => self.clone(),

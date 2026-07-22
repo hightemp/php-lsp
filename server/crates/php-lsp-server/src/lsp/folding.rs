@@ -26,7 +26,11 @@ fn is_declaration_parent_for_block(node: tree_sitter::Node) -> bool {
         .is_some_and(|parent| is_folding_declaration_node(parent.kind()))
 }
 
-fn folding_range_for_node(node: tree_sitter::Node, source: &str) -> Option<FoldingRange> {
+fn folding_range_for_node(
+    node: tree_sitter::Node,
+    source: &str,
+    utf16_index: &Utf16LineIndex,
+) -> Option<FoldingRange> {
     let kind = match node.kind() {
         "comment" => {
             let text = node_text(source, node).trim_start();
@@ -53,9 +57,9 @@ fn folding_range_for_node(node: tree_sitter::Node, source: &str) -> Option<Foldi
 
     Some(FoldingRange {
         start_line,
-        start_character: Some(start.column as u32),
+        start_character: Some(utf16_index.byte_col_to_utf16(start_line, start.column as u32)),
         end_line,
-        end_character: Some(end.column as u32),
+        end_character: Some(utf16_index.byte_col_to_utf16(end_line, end.column as u32)),
         kind,
         collapsed_text: None,
     })
@@ -64,10 +68,11 @@ fn folding_range_for_node(node: tree_sitter::Node, source: &str) -> Option<Foldi
 fn collect_folding_ranges(
     node: tree_sitter::Node,
     source: &str,
+    utf16_index: &Utf16LineIndex,
     ranges: &mut Vec<FoldingRange>,
     seen: &mut HashSet<(u32, Option<u32>, u32, Option<u32>)>,
 ) {
-    if let Some(range) = folding_range_for_node(node, source) {
+    if let Some(range) = folding_range_for_node(node, source, utf16_index) {
         let key = (
             range.start_line,
             range.start_character,
@@ -81,14 +86,21 @@ fn collect_folding_ranges(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_folding_ranges(child, source, ranges, seen);
+        collect_folding_ranges(child, source, utf16_index, ranges, seen);
     }
 }
 
 fn folding_ranges(tree: &tree_sitter::Tree, source: &str) -> Vec<FoldingRange> {
     let mut ranges = Vec::new();
     let mut seen = HashSet::new();
-    collect_folding_ranges(tree.root_node(), source, &mut ranges, &mut seen);
+    let utf16_index = Utf16LineIndex::new(source);
+    collect_folding_ranges(
+        tree.root_node(),
+        source,
+        &utf16_index,
+        &mut ranges,
+        &mut seen,
+    );
     ranges.sort_by_key(|range| {
         (
             range.start_line,

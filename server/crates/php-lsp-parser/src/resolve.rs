@@ -8,7 +8,8 @@ use crate::cst::{argument_index, argument_name, is_by_ref_output_argument_variab
 use crate::phpdoc::{parse_phpdoc, strip_exact_tag};
 use crate::utf16::utf16_col_to_byte;
 use php_lsp_types::{
-    normalize_shape_key_text, FileSymbols, Signature, SymbolInfo, TypeInfo, UseKind,
+    normalize_shape_key_text, symbol_fqn_eq, FileSymbols, PhpSymbolKind, Signature, SymbolInfo,
+    TypeInfo, UseKind,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -120,6 +121,10 @@ pub struct SymbolAtPosition {
     pub name: String,
     /// The kind of reference (class, function, method, property, variable, etc.).
     pub ref_kind: RefKind,
+    /// Whether PHP may retry an unresolved namespaced function/constant as a
+    /// global short name. This is true only for an unqualified source name
+    /// that is not bound by a corresponding `use function` / `use const`.
+    pub allows_global_fallback: bool,
     /// For member access: the object expression text (e.g., "$this", "$foo").
     pub object_expr: Option<String>,
     /// The node text range.
@@ -246,11 +251,14 @@ pub fn symbol_at_position_with_full_resolvers(
 
     // Find the most specific node at the position
     let node = find_node_at_point(root, point)?;
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
 
     resolve_node(
         node,
         source,
-        file_symbols,
+        &scoped_file_symbols,
         resolver,
         callable_resolver,
         function_resolver,
@@ -480,6 +488,10 @@ fn infer_variable_type_at_position_internal(
     let root = tree.root_node();
     let point = Point::new(line as usize, character as usize);
     let node = find_node_at_point(root, point).unwrap_or(root);
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
     let usage_start = position_to_byte(source, line, character);
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
     infer_textual_expression_type_info(
@@ -583,6 +595,10 @@ pub fn variable_hover_info_at_position(
         node = node.parent()?;
     }
 
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
     let var_name = normalize_var_name(&source[node.byte_range()]);
     let usage_start = node.start_byte();
     let scope = find_enclosing_function(node).unwrap_or_else(|| find_root_node(node));
@@ -818,6 +834,17 @@ fn resolve_node(
     let node_text = &source[node.byte_range()];
     let parent_kind = parent.kind();
 
+    if let Some((function_name, selection)) = namespace_relative_function_call(node, source) {
+        return Some(SymbolAtPosition {
+            fqn: resolve_function_name(&function_name, file_symbols),
+            name: source[selection.byte_range()].to_string(),
+            ref_kind: RefKind::FunctionCall,
+            allows_global_fallback: false,
+            object_expr: None,
+            range: node_range(selection),
+        });
+    }
+
     match parent_kind {
         // Member access: $obj->method() or $obj->property
         "member_access_expression" | "nullsafe_member_access_expression" => {
@@ -855,6 +882,7 @@ fn resolve_node(
                     fqn,
                     name: node_text.to_string(),
                     ref_kind,
+                    allows_global_fallback: false,
                     object_expr: object_text,
                     range: node_range(node),
                 });
@@ -891,6 +919,7 @@ fn resolve_node(
                     fqn,
                     name: node_text.to_string(),
                     ref_kind: RefKind::MethodCall,
+                    allows_global_fallback: false,
                     object_expr: object_text,
                     range: node_range(node),
                 });
@@ -919,6 +948,7 @@ fn resolve_node(
                     },
                     name: node_text.to_string(),
                     ref_kind: RefKind::MethodCall,
+                    allows_global_fallback: false,
                     object_expr: scope_text,
                     range: node_range(node),
                 });
@@ -930,6 +960,7 @@ fn resolve_node(
                 fqn: resolved,
                 name: node_text.to_string(),
                 ref_kind: RefKind::ClassName,
+                allows_global_fallback: false,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -961,6 +992,7 @@ fn resolve_node(
                     },
                     name: member_name,
                     ref_kind,
+                    allows_global_fallback: false,
                     object_expr: scope_text,
                     range: node_range(node),
                 });
@@ -971,6 +1003,7 @@ fn resolve_node(
                 fqn: resolved,
                 name: node_text.to_string(),
                 ref_kind: RefKind::ClassName,
+                allows_global_fallback: false,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -1004,6 +1037,7 @@ fn resolve_node(
                             fqn,
                             name: node_text.to_string(),
                             ref_kind: RefKind::MethodCall,
+                            allows_global_fallback: false,
                             object_expr: object_text,
                             range: node_range(node),
                         });
@@ -1023,6 +1057,11 @@ fn resolve_node(
                     fqn: resolved,
                     name: node_text.to_string(),
                     ref_kind: RefKind::FunctionCall,
+                    allows_global_fallback: unqualified_name_allows_global_fallback(
+                        function_text,
+                        UseKind::Function,
+                        file_symbols,
+                    ),
                     object_expr: None,
                     range: node_range(node),
                 });
@@ -1044,6 +1083,7 @@ fn resolve_node(
                 fqn: resolved,
                 name: node_text.to_string(),
                 ref_kind: RefKind::FunctionCall,
+                allows_global_fallback: false,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -1069,6 +1109,7 @@ fn resolve_node(
                 } else {
                     RefKind::ClassName
                 },
+                allows_global_fallback: false,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -1093,6 +1134,7 @@ fn resolve_node(
                     },
                     name: node_text.to_string(),
                     ref_kind: RefKind::ClassConstant,
+                    allows_global_fallback: false,
                     object_expr: scope_text,
                     range: node_range(node),
                 });
@@ -1104,6 +1146,7 @@ fn resolve_node(
                     fqn: resolved,
                     name: node_text.to_string(),
                     ref_kind: RefKind::ClassName,
+                    allows_global_fallback: false,
                     object_expr: None,
                     range: node_range(node),
                 });
@@ -1119,6 +1162,7 @@ fn resolve_node(
                 fqn: format!("{}::__construct", resolved),
                 name: node_text.to_string(),
                 ref_kind: RefKind::Constructor,
+                allows_global_fallback: false,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -1136,6 +1180,7 @@ fn resolve_node(
                     fqn,
                     name: node_text.to_string(),
                     ref_kind: RefKind::ClassName,
+                    allows_global_fallback: false,
                     object_expr: None,
                     range: node_range(node),
                 });
@@ -1166,6 +1211,7 @@ fn resolve_node(
                     fqn,
                     name: node_text.to_string(),
                     ref_kind,
+                    allows_global_fallback: false,
                     object_expr: None,
                     range: node_range(node),
                 });
@@ -1180,6 +1226,7 @@ fn resolve_node(
                 fqn: resolved,
                 name: node_text.to_string(),
                 ref_kind: RefKind::ClassName,
+                allows_global_fallback: false,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -1193,6 +1240,7 @@ fn resolve_node(
                     fqn: resolved,
                     name: node_text.to_string(),
                     ref_kind: RefKind::ClassName,
+                    allows_global_fallback: false,
                     object_expr: None,
                     range: node_range(node),
                 });
@@ -1208,6 +1256,7 @@ fn resolve_node(
                 fqn: node_text.to_string(),
                 name: node_text.to_string(),
                 ref_kind: RefKind::Variable,
+                allows_global_fallback: false,
                 object_expr: None,
                 range: node_range(node),
             })
@@ -1217,12 +1266,20 @@ fn resolve_node(
         // Check if this is inside a use statement (qualified_name → namespace_use_clause)
         _ if node.kind() == "qualified_name" || node.kind() == "name" => {
             if is_inside_use_clause(node, parent) {
-                // Extract the full FQN from the qualified_name or namespace_use_clause
-                let fqn = extract_use_clause_fqn(node, parent, source);
+                // Prefer the extracted use statement: group-use clauses need
+                // their declaration prefix and may override the declaration
+                // kind per clause (`function` / `const`).
+                let (fqn, ref_kind) = use_clause_symbol(node, file_symbols).unwrap_or_else(|| {
+                    (
+                        extract_use_clause_fqn(node, parent, source),
+                        RefKind::ClassName,
+                    )
+                });
                 return Some(SymbolAtPosition {
                     fqn: fqn.trim_start_matches('\\').to_string(),
                     name: node_text.to_string(),
-                    ref_kind: RefKind::ClassName,
+                    ref_kind,
+                    allows_global_fallback: false,
                     object_expr: None,
                     range: node_range(node),
                 });
@@ -1366,7 +1423,7 @@ fn try_resolve_object_type_inner<'a>(
             // Look up the property in the file's symbols to get its type
             let property_fqn_dollar = format!("{}::${}", class_fqn, prop_name);
             for sym in &file_symbols.symbols {
-                if sym.fqn == property_fqn_dollar {
+                if symbol_fqn_eq(&sym.fqn, &property_fqn_dollar, PhpSymbolKind::Property) {
                     if let Some(ret) = symbol_effective_type_info(sym, file_symbols) {
                         if let Some(resolved) = resolve_symbol_type_info_to_object_fqn(
                             &ret,
@@ -1426,7 +1483,7 @@ fn try_resolve_object_type_inner<'a>(
             // First: look up the method's return type in the current file's symbols
             let method_fqn = format!("{}::{}", class_fqn, method_name);
             for sym in &file_symbols.symbols {
-                if sym.fqn == method_fqn {
+                if symbol_fqn_eq(&sym.fqn, &method_fqn, PhpSymbolKind::Method) {
                     if let Some(ret) = symbol_effective_type_info(sym, file_symbols) {
                         if let Some(resolved) = resolve_symbol_type_info_to_object_fqn(
                             &ret,
@@ -1574,7 +1631,7 @@ fn resolver_owner_type_text_for_object(
 fn type_info_has_generic_base_fqn(type_info: &TypeInfo, class_fqn: &str) -> bool {
     let class_fqn = class_fqn.trim_start_matches('\\');
     match type_info {
-        TypeInfo::Generic { base, .. } => base.trim_start_matches('\\') == class_fqn,
+        TypeInfo::Generic { base, .. } => fqn_eq_ignore_ascii_case(base, class_fqn),
         TypeInfo::Nullable(inner) => type_info_has_generic_base_fqn(inner, class_fqn),
         TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
             .iter()
@@ -2920,7 +2977,7 @@ fn callable_param_type_from_local_signature(
     let symbol = file_symbols
         .symbols
         .iter()
-        .find(|symbol| symbol.fqn == site.target_fqn)?;
+        .find(|symbol| symbol_fqn_eq(&symbol.fqn, &site.target_fqn, symbol.kind))?;
     let signature = symbol.signature.as_ref()?;
     callable_param_type_from_signature(signature, symbol, site, parameter_index, file_symbols)
 }
@@ -3002,7 +3059,11 @@ fn callable_template_names(
         .map(|template| template.name.clone())
         .collect::<HashSet<_>>();
     if let Some((class_fqn, _)) = target_fqn.rsplit_once("::") {
-        if let Some(class_symbol) = file_symbols.symbols.iter().find(|sym| sym.fqn == class_fqn) {
+        if let Some(class_symbol) = file_symbols
+            .symbols
+            .iter()
+            .find(|sym| fqn_eq_ignore_ascii_case(&sym.fqn, class_fqn))
+        {
             names.extend(
                 class_symbol
                     .templates
@@ -3027,10 +3088,14 @@ fn receiver_template_substitutions(
         return substitutions;
     };
     let resolved_base = resolve_class_name(base, file_symbols);
-    if resolved_base.trim_start_matches('\\') != class_fqn.trim_start_matches('\\') {
+    if !fqn_eq_ignore_ascii_case(&resolved_base, class_fqn) {
         return substitutions;
     }
-    let Some(class_symbol) = file_symbols.symbols.iter().find(|sym| sym.fqn == class_fqn) else {
+    let Some(class_symbol) = file_symbols
+        .symbols
+        .iter()
+        .find(|sym| fqn_eq_ignore_ascii_case(&sym.fqn, class_fqn))
+    else {
         return substitutions;
     };
     for (template, arg) in class_symbol.templates.iter().zip(args.iter()) {
@@ -3540,6 +3605,8 @@ fn resolve_type_name_relative_to_symbol(
     {
         return type_name.to_string();
     }
+    let scoped_file_symbols = file_symbols.scoped_at_byte_position(symbol.range.0, symbol.range.1);
+    let file_symbols = scoped_file_symbols.as_ref();
     let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&symbol.fqn);
     let owner_namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
     let (first_part, rest) = type_name
@@ -3554,7 +3621,7 @@ fn resolve_type_name_relative_to_symbol(
                 .alias
                 .as_deref()
                 .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-            if alias == first_part {
+            if alias.eq_ignore_ascii_case(first_part) {
                 let mut resolved = use_stmt.fqn.trim_start_matches('\\').to_string();
                 if let Some(rest) = rest {
                     resolved.push('\\');
@@ -3689,7 +3756,8 @@ fn try_resolve_function_call_return_type(
                     })
             };
             resolved_type(&resolved).or_else(|| {
-                (!raw_name.starts_with('\\') && !raw_name.contains('\\') && resolved != raw_name)
+                (unqualified_name_allows_global_fallback(raw_name, UseKind::Function, file_symbols)
+                    && resolved != raw_name)
                     .then(|| resolved_type(raw_name))
                     .flatten()
             })
@@ -4761,7 +4829,7 @@ fn infer_expression_type_info_with_function_resolver(
                 .symbols
                 .iter()
                 .find_map(|sym| {
-                    (sym.fqn == prop_fqn)
+                    symbol_fqn_eq(&sym.fqn, &prop_fqn, PhpSymbolKind::Property)
                         .then(|| symbol_effective_type_info(sym, file_symbols))
                         .flatten()
                 })
@@ -4800,7 +4868,7 @@ fn infer_expression_type_info_with_function_resolver(
                 .symbols
                 .iter()
                 .find_map(|sym| {
-                    (sym.fqn == method_fqn)
+                    symbol_fqn_eq(&sym.fqn, &method_fqn, PhpSymbolKind::Method)
                         .then(|| symbol_effective_type_info(sym, file_symbols))
                         .flatten()
                 })
@@ -4860,7 +4928,7 @@ fn infer_scoped_call_expression_type_info(
     if let Some(symbol) = file_symbols
         .symbols
         .iter()
-        .find(|sym| sym.fqn == method_fqn)
+        .find(|sym| symbol_fqn_eq(&sym.fqn, &method_fqn, PhpSymbolKind::Method))
     {
         let return_type = symbol_effective_type_info(symbol, file_symbols)?;
         let return_type = resolve_type_info_relative_to_symbol(&return_type, symbol, file_symbols);
@@ -5692,6 +5760,7 @@ fn resolve_name_node(
             fqn: text.to_string(),
             name: text.to_string(),
             ref_kind: RefKind::Variable,
+            allows_global_fallback: false,
             object_expr: None,
             range: node_range(node),
         });
@@ -5704,6 +5773,11 @@ fn resolve_name_node(
             fqn: resolved,
             name: text.to_string(),
             ref_kind: RefKind::GlobalConstant,
+            allows_global_fallback: unqualified_name_allows_global_fallback(
+                text,
+                UseKind::Constant,
+                file_symbols,
+            ),
             object_expr: None,
             range: node_range(node),
         });
@@ -5715,6 +5789,7 @@ fn resolve_name_node(
         fqn: resolved,
         name: text.to_string(),
         ref_kind: RefKind::ClassName,
+        allows_global_fallback: false,
         object_expr: None,
         range: node_range(node),
     })
@@ -5723,6 +5798,85 @@ fn resolve_name_node(
 /// Resolve a class name using use statements and current namespace (public API).
 pub fn resolve_class_name_pub(name: &str, file_symbols: &FileSymbols) -> String {
     resolve_class_name(name, file_symbols)
+}
+
+/// Resolve a function name using use statements and current namespace (public API).
+pub fn resolve_function_name_pub(name: &str, file_symbols: &FileSymbols) -> String {
+    resolve_function_name(name, file_symbols)
+}
+
+/// Resolve a constant name using use statements and current namespace (public API).
+pub fn resolve_constant_name_pub(name: &str, file_symbols: &FileSymbols) -> String {
+    resolve_constant_name(name, file_symbols)
+}
+
+/// Recover a namespace-relative function call that tree-sitter-php currently
+/// represents as a namespace definition plus an error node.
+///
+/// PHP accepts namespace-relative calls. In expression position the CST does
+/// not expose a function-call node, so callers use this helper to retain normal
+/// resolution and reference behavior.
+pub fn namespace_relative_function_call<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(String, Node<'tree>)> {
+    let mut ancestor = Some(node);
+    while let Some(candidate) = ancestor {
+        if candidate.kind() == "namespace_definition" {
+            if !(0..candidate.named_child_count()).any(|index| {
+                candidate
+                    .named_child(index)
+                    .is_some_and(|child| child.is_error())
+            }) {
+                return None;
+            }
+            let text = source[candidate.byte_range()].trim();
+            let slash = text.find('\\')?;
+            if !text[..slash].trim().eq_ignore_ascii_case("namespace") {
+                return None;
+            }
+            let suffix = &text[slash + 1..];
+            if !suffix.contains('(') {
+                return None;
+            }
+
+            let namespace_name = if let Some(name) = candidate.child_by_field_name("name") {
+                name
+            } else {
+                let mut cursor = candidate.walk();
+                let found = candidate
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "namespace_name");
+                found?
+            };
+            let raw_name = format!(
+                "namespace\\{}",
+                source[namespace_name.byte_range()].trim_matches('\\')
+            );
+            let selection = deepest_last_named_node(namespace_name);
+            return Some((raw_name, selection));
+        }
+
+        if matches!(
+            candidate.kind(),
+            "function_definition"
+                | "method_declaration"
+                | "anonymous_function"
+                | "arrow_function"
+                | "program"
+        ) {
+            break;
+        }
+        ancestor = candidate.parent();
+    }
+    None
+}
+
+fn deepest_last_named_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(child) = node.named_child(node.named_child_count().saturating_sub(1)) {
+        node = child;
+    }
+    node
 }
 
 /// Resolve a static access scope name using the current CST context.
@@ -5739,86 +5893,128 @@ pub fn resolve_scope_class_name_pub(
     resolve_scope_class_name(scope_name, context_node, source, file_symbols)
 }
 
-/// Resolve a class name using use statements and current namespace.
-pub fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
-    // Already fully qualified
-    if name.starts_with('\\') {
-        return name.trim_start_matches('\\').to_string();
+fn explicit_namespace_relative_name(name: &str, file_symbols: &FileSymbols) -> Option<String> {
+    let (prefix, rest) = name.split_once('\\')?;
+    if !prefix.eq_ignore_ascii_case("namespace") {
+        return None;
     }
 
-    // Special names
-    match name {
-        "self" | "static" | "parent" | "$this" => return name.to_string(),
-        _ => {}
+    Some(match file_symbols.namespace.as_deref() {
+        Some(namespace) if !namespace.is_empty() => format!("{namespace}\\{rest}"),
+        _ => rest.to_string(),
+    })
+}
+
+fn qualify_in_current_namespace(name: &str, file_symbols: &FileSymbols) -> String {
+    match file_symbols.namespace.as_deref() {
+        Some(namespace) if !namespace.is_empty() => format!("{namespace}\\{name}"),
+        _ => name.to_string(),
+    }
+}
+
+pub(crate) fn unqualified_name_allows_global_fallback(
+    name: &str,
+    use_kind: UseKind,
+    file_symbols: &FileSymbols,
+) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name.contains('\\') {
+        return false;
     }
 
-    // Try to resolve via use statements
-    let parts: Vec<&str> = name.split('\\').collect();
-    let first_part = parts[0];
-
-    for use_stmt in &file_symbols.use_statements {
-        if use_stmt.kind != UseKind::Class {
-            continue;
+    !file_symbols.use_statements.iter().any(|use_stmt| {
+        if use_stmt.kind != use_kind
+            || use_stmt.namespace.as_deref() != file_symbols.namespace.as_deref()
+        {
+            return false;
         }
-
         let alias = use_stmt
             .alias
             .as_deref()
             .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+        match use_kind {
+            UseKind::Function => alias.eq_ignore_ascii_case(name),
+            UseKind::Constant => alias == name,
+            UseKind::Class => false,
+        }
+    })
+}
 
-        if alias == first_part {
-            if parts.len() == 1 {
-                return use_stmt.fqn.clone();
-            } else {
-                // Partial match: use App\Foo; then Foo\Bar → App\Foo\Bar
-                let rest = parts[1..].join("\\");
-                return format!("{}\\{}", use_stmt.fqn, rest);
-            }
+/// Resolve a class name using use statements and current namespace.
+pub fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
+    if name.starts_with('\\') {
+        return name.trim_start_matches('\\').to_string();
+    }
+    if let Some(resolved) = explicit_namespace_relative_name(name, file_symbols) {
+        return resolved;
+    }
+
+    if ["self", "static", "parent", "$this"]
+        .iter()
+        .any(|special| name.eq_ignore_ascii_case(special))
+    {
+        return name.to_string();
+    }
+
+    let (first_part, rest) = name
+        .split_once('\\')
+        .map_or((name, None), |(first, rest)| (first, Some(rest)));
+    for use_stmt in &file_symbols.use_statements {
+        if use_stmt.kind != UseKind::Class
+            || use_stmt.namespace.as_deref() != file_symbols.namespace.as_deref()
+        {
+            continue;
+        }
+        let alias = use_stmt
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+        if alias.eq_ignore_ascii_case(first_part) {
+            return rest.map_or_else(
+                || use_stmt.fqn.clone(),
+                |suffix| format!("{}\\{}", use_stmt.fqn, suffix),
+            );
         }
     }
 
-    // Prepend current namespace
-    if let Some(ref ns) = file_symbols.namespace {
-        format!("{}\\{}", ns, name)
-    } else {
-        name.to_string()
-    }
+    qualify_in_current_namespace(name, file_symbols)
 }
 
 /// Resolve a function name using use statements and current namespace.
 fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
-    // Already fully qualified
     if name.starts_with('\\') {
         return name.trim_start_matches('\\').to_string();
     }
-
-    // Try use statements (function kind)
-    for use_stmt in &file_symbols.use_statements {
-        if use_stmt.kind != UseKind::Function {
-            continue;
-        }
-
-        let alias = use_stmt
-            .alias
-            .as_deref()
-            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-
-        if alias == name {
-            return use_stmt.fqn.clone();
-        }
+    if let Some(resolved) = explicit_namespace_relative_name(name, file_symbols) {
+        return resolved;
     }
 
-    // Keep already-qualified names stable.
+    // Function imports introduce one unqualified alias. Qualified function
+    // names instead expand a class/namespace alias in their first segment.
+    // Function names and aliases use PHP's ASCII case-insensitive semantics.
     if name.contains('\\') {
-        return name.to_string();
+        return resolve_class_name(name, file_symbols);
+    } else {
+        for use_stmt in &file_symbols.use_statements {
+            if use_stmt.kind != UseKind::Function
+                || use_stmt.namespace.as_deref() != file_symbols.namespace.as_deref()
+            {
+                continue;
+            }
+            let alias = use_stmt
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+            if alias.eq_ignore_ascii_case(name) {
+                return use_stmt.fqn.clone();
+            }
+        }
     }
 
-    // For simple function names, try namespace-qualified first.
-    if let Some(ref ns) = file_symbols.namespace {
-        format!("{}\\{}", ns, name)
-    } else {
-        name.to_string()
-    }
+    // Both unqualified and qualified relative names start in the current
+    // namespace. Callers that implement PHP's unqualified global fallback can
+    // try the global spelling after this candidate.
+    qualify_in_current_namespace(name, file_symbols)
 }
 
 /// Resolve a constant name using use statements and current namespace.
@@ -5826,41 +6022,33 @@ fn resolve_constant_name(name: &str, file_symbols: &FileSymbols) -> String {
     if name.starts_with('\\') {
         return name.trim_start_matches('\\').to_string();
     }
+    if let Some(resolved) = explicit_namespace_relative_name(name, file_symbols) {
+        return resolved;
+    }
 
-    let parts: Vec<&str> = name.split('\\').collect();
-    let first_part = parts[0];
+    // Constant imports also introduce only an unqualified alias. A qualified
+    // constant name uses class/namespace alias expansion, just like a
+    // qualified function name.
+    if name.contains('\\') {
+        return resolve_class_name(name, file_symbols);
+    }
 
     for use_stmt in &file_symbols.use_statements {
-        if use_stmt.kind != UseKind::Constant {
+        if use_stmt.kind != UseKind::Constant
+            || use_stmt.namespace.as_deref() != file_symbols.namespace.as_deref()
+        {
             continue;
         }
-
         let alias = use_stmt
             .alias
             .as_deref()
             .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-
-        if alias == first_part {
-            if parts.len() == 1 {
-                return use_stmt.fqn.clone();
-            }
-            return format!("{}\\{}", use_stmt.fqn, parts[1..].join("\\"));
+        if alias == name {
+            return use_stmt.fqn.clone();
         }
     }
 
-    // Keep already-qualified names stable.
-    if name.contains('\\') {
-        if let Some(ref ns) = file_symbols.namespace {
-            return format!("{}\\{}", ns, name);
-        }
-        return name.to_string();
-    }
-
-    if let Some(ref ns) = file_symbols.namespace {
-        format!("{}\\{}", ns, name)
-    } else {
-        name.to_string()
-    }
+    qualify_in_current_namespace(name, file_symbols)
 }
 
 fn is_constant_reference_context(parent_kind: &str) -> bool {
@@ -5906,6 +6094,26 @@ fn is_inside_use_clause(node: Node, parent: Node) -> bool {
         }
     }
     false
+}
+
+fn use_clause_symbol(node: Node, file_symbols: &FileSymbols) -> Option<(String, RefKind)> {
+    let position = node.start_position();
+    let position = (position.row as u32, position.column as u32);
+    file_symbols
+        .use_statements
+        .iter()
+        .find(|statement| {
+            position >= (statement.range.0, statement.range.1)
+                && position < (statement.range.2, statement.range.3)
+        })
+        .map(|statement| {
+            let ref_kind = match statement.kind {
+                UseKind::Class => RefKind::ClassName,
+                UseKind::Function => RefKind::FunctionCall,
+                UseKind::Constant => RefKind::GlobalConstant,
+            };
+            (statement.fqn.clone(), ref_kind)
+        })
 }
 
 /// Extract the full FQN string from a use clause.
@@ -6174,7 +6382,7 @@ fn find_extended_parent_class_fqn(
     file_symbols
         .symbols
         .iter()
-        .find(|sym| sym.fqn == current_class_fqn)
+        .find(|sym| fqn_eq_ignore_ascii_case(&sym.fqn, &current_class_fqn))
         .and_then(|sym| sym.extends.first().cloned())
 }
 
@@ -6184,12 +6392,19 @@ fn resolve_scope_class_name(
     source: &str,
     file_symbols: &FileSymbols,
 ) -> String {
-    match scope_name {
-        "self" | "static" => find_parent_class_fqn(context_node, source, file_symbols)
-            .unwrap_or_else(|| scope_name.to_string()),
-        "parent" => find_extended_parent_class_fqn(context_node, source, file_symbols)
-            .unwrap_or_else(|| scope_name.to_string()),
-        _ => resolve_class_name(scope_name, file_symbols),
+    let start = context_node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
+
+    if scope_name.eq_ignore_ascii_case("self") || scope_name.eq_ignore_ascii_case("static") {
+        find_parent_class_fqn(context_node, source, file_symbols)
+            .unwrap_or_else(|| scope_name.to_string())
+    } else if scope_name.eq_ignore_ascii_case("parent") {
+        find_extended_parent_class_fqn(context_node, source, file_symbols)
+            .unwrap_or_else(|| scope_name.to_string())
+    } else {
+        resolve_class_name(scope_name, file_symbols)
     }
 }
 
@@ -6199,12 +6414,21 @@ fn resolve_type_name_in_context(
     source: &str,
     file_symbols: &FileSymbols,
 ) -> String {
-    match type_name.trim_start_matches('\\') {
-        "self" | "static" => find_parent_class_fqn(context_node, source, file_symbols)
-            .unwrap_or_else(|| type_name.to_string()),
-        "parent" => find_extended_parent_class_fqn(context_node, source, file_symbols)
-            .unwrap_or_else(|| type_name.to_string()),
-        _ => resolve_class_name(type_name, file_symbols),
+    let start = context_node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
+    let bare_type_name = type_name.trim_start_matches('\\');
+
+    if bare_type_name.eq_ignore_ascii_case("self") || bare_type_name.eq_ignore_ascii_case("static")
+    {
+        find_parent_class_fqn(context_node, source, file_symbols)
+            .unwrap_or_else(|| type_name.to_string())
+    } else if bare_type_name.eq_ignore_ascii_case("parent") {
+        find_extended_parent_class_fqn(context_node, source, file_symbols)
+            .unwrap_or_else(|| type_name.to_string())
+    } else {
+        resolve_class_name(type_name, file_symbols)
     }
 }
 
@@ -6424,6 +6648,95 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_repeated_aliases_in_bracketed_namespace_scopes() {
+        let code = r#"<?php
+namespace First {
+    use Vendor\First\Service as Shared;
+    new sHaReD();
+}
+namespace Second {
+    use Vendor\Second\Service as Shared;
+    new SHARED();
+}
+"#;
+
+        let first = parse_and_resolve(code, 3, 9).unwrap();
+        assert_eq!(first.fqn, r"Vendor\First\Service::__construct");
+
+        let second = parse_and_resolve(code, 7, 9).unwrap();
+        assert_eq!(second.fqn, r"Vendor\Second\Service::__construct");
+    }
+
+    #[test]
+    fn test_resolve_repeated_aliases_in_unbracketed_namespace_scopes() {
+        let code = r#"<?php
+namespace First;
+use Vendor\First\Service as Shared;
+new shared();
+
+namespace Second;
+use Vendor\Second\Service as Shared;
+new SHARED();
+"#;
+
+        let first = parse_and_resolve(code, 3, 8).unwrap();
+        assert_eq!(first.fqn, r"Vendor\First\Service::__construct");
+
+        let second = parse_and_resolve(code, 7, 8).unwrap();
+        assert_eq!(second.fqn, r"Vendor\Second\Service::__construct");
+    }
+
+    #[test]
+    fn test_resolve_explicit_namespace_relative_class_and_function_names() {
+        let code = r#"<?php
+namespace App\Feature;
+function run(): void {
+    new namespace\Model();
+    namespace\helper();
+}
+"#;
+
+        let class = parse_and_resolve(code, 3, 22).unwrap();
+        assert_eq!(class.fqn, r"App\Feature\Model::__construct");
+
+        let function = parse_and_resolve(code, 4, 16).unwrap();
+        assert_eq!(function.fqn, r"App\Feature\helper");
+        assert_eq!(function.ref_kind, RefKind::FunctionCall);
+        assert!(!function.allows_global_fallback);
+    }
+
+    #[test]
+    fn test_resolve_top_level_namespace_relative_function_without_changing_scope() {
+        let code = r#"<?php
+namespace App\Feature;
+namespace\helper();
+"#;
+
+        let function = parse_and_resolve(code, 2, 12).unwrap();
+        assert_eq!(function.fqn, r"App\Feature\helper");
+        assert_eq!(function.ref_kind, RefKind::FunctionCall);
+        assert!(!function.allows_global_fallback);
+    }
+
+    #[test]
+    fn test_resolve_function_and_class_aliases_case_insensitively() {
+        let code = r#"<?php
+namespace App;
+use Vendor\Package\Service as ImportedService;
+use function Vendor\Package\helper as ImportedHelper;
+new importedservice();
+IMPORTEDHELPER();
+"#;
+
+        let class = parse_and_resolve(code, 4, 10).unwrap();
+        assert_eq!(class.fqn, r"Vendor\Package\Service::__construct");
+
+        let function = parse_and_resolve(code, 5, 8).unwrap();
+        assert_eq!(function.fqn, r"Vendor\Package\helper");
+        assert!(!function.allows_global_fallback);
+    }
+
+    #[test]
     fn test_resolve_trait_use_clause_name_with_import_alias() {
         let code = r#"<?php
 namespace App\Jobs;
@@ -6476,13 +6789,172 @@ class DeleteMultipleVCard
     }
 
     #[test]
-    fn test_resolve_qualified_function_call_without_double_namespace() {
-        let code = "<?php\nnamespace App\\Diagnostics;\n\nApp\\Utils\\helper();\n";
+    fn test_resolve_qualified_function_call_relative_to_current_namespace() {
+        let code = r#"<?php
+namespace App\Diagnostics;
+
+App\Utils\helper();
+"#;
         let result = parse_and_resolve(code, 3, 13);
         assert!(result.is_some());
         let sym = result.unwrap();
         assert_eq!(sym.ref_kind, RefKind::FunctionCall);
-        assert_eq!(sym.fqn, "App\\Utils\\helper");
+        assert_eq!(sym.fqn, r"App\Diagnostics\App\Utils\helper");
+        assert!(!sym.allows_global_fallback);
+    }
+
+    #[test]
+    fn test_global_fallback_metadata_only_allows_unqualified_unimported_names() {
+        let code = r#"<?php
+namespace App;
+use function Vendor\helper as ImportedHelper;
+use const Vendor\FLAG as ImportedFlag;
+
+plainFunction();
+ImportedHelper();
+echo PLAIN_FLAG;
+echo ImportedFlag;
+"#;
+
+        let (line, col) = find_line_col(code, "plainFunction");
+        let plain_function = parse_and_resolve(code, line, col + 2).unwrap();
+        assert_eq!(plain_function.ref_kind, RefKind::FunctionCall);
+        assert!(plain_function.allows_global_fallback);
+
+        let (line, col) = find_line_col(code, "ImportedHelper();");
+        let imported_function = parse_and_resolve(code, line, col + 2).unwrap();
+        assert_eq!(imported_function.ref_kind, RefKind::FunctionCall);
+        assert!(!imported_function.allows_global_fallback);
+
+        let (line, col) = find_line_col(code, "PLAIN_FLAG");
+        let plain_constant = parse_and_resolve(code, line, col + 2).unwrap();
+        assert_eq!(plain_constant.ref_kind, RefKind::GlobalConstant);
+        assert!(plain_constant.allows_global_fallback);
+
+        let (line, col) = find_line_col(code, "echo ImportedFlag");
+        let imported_constant = parse_and_resolve(code, line, col + 7).unwrap();
+        assert_eq!(imported_constant.ref_kind, RefKind::GlobalConstant);
+        assert!(!imported_constant.allows_global_fallback);
+    }
+
+    #[test]
+    fn test_resolve_mixed_group_use_clause_targets_and_kinds() {
+        let code = r#"<?php
+use Vendor\Package\{
+    Thing as Alias,
+    function helper as DoWork,
+    const FLAG as LocalFlag
+};
+"#;
+
+        for (needle, expected_fqn, expected_kind) in [
+            (
+                "Thing as Alias",
+                r"Vendor\Package\Thing",
+                RefKind::ClassName,
+            ),
+            (
+                "helper as DoWork",
+                r"Vendor\Package\helper",
+                RefKind::FunctionCall,
+            ),
+            (
+                "FLAG as LocalFlag",
+                r"Vendor\Package\FLAG",
+                RefKind::GlobalConstant,
+            ),
+        ] {
+            let (line, col) = find_line_col(code, needle);
+            let symbol = parse_and_resolve(code, line, col + 1)
+                .unwrap_or_else(|| panic!("group-use target should resolve: {needle}"));
+            assert_eq!(symbol.fqn, expected_fqn);
+            assert_eq!(symbol.ref_kind, expected_kind);
+        }
+    }
+
+    #[test]
+    fn test_qualified_function_and_constant_names_expand_only_namespace_aliases() {
+        let code = r#"<?php
+namespace App;
+use Vendor\Package as Lib;
+use const Vendor\FLAG as ConstAlias;
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+
+        assert_eq!(
+            resolve_function_name_pub(r"lib\helper", &file_symbols),
+            r"Vendor\Package\helper"
+        );
+        assert_eq!(
+            resolve_constant_name_pub(r"LIB\FLAG", &file_symbols),
+            r"Vendor\Package\FLAG"
+        );
+        assert_eq!(
+            resolve_constant_name_pub("ConstAlias", &file_symbols),
+            r"Vendor\FLAG"
+        );
+        assert_eq!(
+            resolve_constant_name_pub(r"ConstAlias\CHILD", &file_symbols),
+            r"App\ConstAlias\CHILD"
+        );
+    }
+
+    #[test]
+    fn test_local_method_type_resolution_is_ascii_case_insensitive() {
+        let code = r#"<?php
+namespace App;
+class User { public string $name; }
+class Service {
+    public function build(): User { return new User(); }
+    public function run() { return $this->BUILD()->name; }
+}
+"#;
+        let (line, col) = find_line_col(code, "->name");
+        let symbol = parse_and_resolve(code, line, col + 2).expect("property should resolve");
+        assert_eq!(symbol.fqn, r"App\User::$name");
+        assert_eq!(symbol.ref_kind, RefKind::PropertyAccess);
+    }
+
+    #[test]
+    fn test_phpdoc_type_resolution_isolates_repeated_same_namespace_blocks() {
+        let code = r#"<?php
+namespace App {
+    use Vendor\First\Model as Shared;
+    class FirstFactory {
+        /** @return Shared */
+        public function make() {}
+    }
+}
+namespace App {
+    use Vendor\Second\Model as Shared;
+    class SecondFactory {
+        /** @return Shared */
+        public function make() {}
+    }
+}
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+
+        for (method_fqn, expected_type) in [
+            (r"App\FirstFactory::make", r"\Vendor\First\Model"),
+            (r"App\SecondFactory::make", r"\Vendor\Second\Model"),
+        ] {
+            let method = file_symbols
+                .symbols
+                .iter()
+                .find(|symbol| symbol.fqn == method_fqn)
+                .unwrap_or_else(|| panic!("missing extracted method: {method_fqn}"));
+            assert_eq!(
+                symbol_effective_type_info(method, &file_symbols),
+                Some(TypeInfo::Simple(expected_type.to_string()))
+            );
+        }
     }
 
     #[test]

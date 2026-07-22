@@ -2049,6 +2049,708 @@ class Demo {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_auto_imports_use_cursor_namespace_scope() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_uri = "file:///test/CursorScopedVendorTypes.php";
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+class Service {}
+class Client {}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let unbracketed_uri = "file:///test/CursorScopedUnbracketed.php";
+    let unbracketed_code = r#"<?php
+namespace First;
+use Other\Service as Service;
+
+function localFirst(): void {}
+
+class FirstConsumer
+{
+    public function run(): void
+    {
+        localF
+    }
+}
+
+namespace Second;
+
+class SecondConsumer
+{
+    public function run(): void
+    {
+        Ser
+    }
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(unbracketed_uri, unbracketed_code))
+        .await
+        .unwrap();
+
+    let (local_line, local_character) = utf16_position_after(unbracketed_code, "        localF");
+    let local_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            2,
+            unbracketed_uri,
+            local_line,
+            local_character,
+        ))
+        .await
+        .unwrap();
+    let local_result = extract_result(local_response);
+    let local_items = completion_items_from_result(&local_result);
+    let local_item = local_items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("localFirst"))
+        .unwrap_or_else(|| panic!("expected localFirst completion, got: {local_items:?}"));
+    assert!(
+        local_item
+            .get("additionalTextEdits")
+            .and_then(|value| value.as_array())
+            .is_none_or(Vec::is_empty),
+        "a current-namespace function must not receive an auto-import edit: {local_item:?}"
+    );
+
+    let (service_line, service_character) = utf16_position_after(unbracketed_code, "        Ser");
+    let service_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            3,
+            unbracketed_uri,
+            service_line,
+            service_character,
+        ))
+        .await
+        .unwrap();
+    let service_result = extract_result(service_response);
+    let service_items = completion_items_from_result(&service_result);
+    let service_item = service_items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("Service"))
+        .unwrap_or_else(|| panic!("expected Vendor\\Service completion, got: {service_items:?}"));
+    let service_edits = service_item
+        .get("additionalTextEdits")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(service_edits.len(), 1, "expected one scoped import edit");
+    assert_eq!(
+        service_edits[0]
+            .get("newText")
+            .and_then(|value| value.as_str()),
+        Some("use Vendor\\Service;\n")
+    );
+    let second_namespace_offset = unbracketed_code
+        .find("namespace Second;")
+        .expect("second unbracketed namespace");
+    let second_namespace_line = unbracketed_code[..second_namespace_offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u64;
+    assert_eq!(
+        service_edits[0]["range"]["start"]["line"].as_u64(),
+        Some(second_namespace_line + 1),
+        "unbracketed import must be inserted inside the cursor namespace"
+    );
+
+    let bracketed_uri = "file:///test/CursorScopedBracketed.php";
+    let bracketed_code = r#"<?php
+namespace Alpha {
+    use Other\Client as Client;
+}
+
+namespace Beta {
+
+    class Consumer
+    {
+        public function run(): void
+        {
+            Cli
+        }
+    }
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(bracketed_uri, bracketed_code))
+        .await
+        .unwrap();
+    let (client_line, client_character) = utf16_position_after(bracketed_code, "            Cli");
+    let client_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            4,
+            bracketed_uri,
+            client_line,
+            client_character,
+        ))
+        .await
+        .unwrap();
+    let client_result = extract_result(client_response);
+    let client_items = completion_items_from_result(&client_result);
+    let client_item = client_items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("Client"))
+        .unwrap_or_else(|| panic!("expected Vendor\\Client completion, got: {client_items:?}"));
+    let client_edits = client_item
+        .get("additionalTextEdits")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(client_edits.len(), 1, "expected one scoped import edit");
+    assert_eq!(
+        client_edits[0]
+            .get("newText")
+            .and_then(|value| value.as_str()),
+        Some("use Vendor\\Client;\n")
+    );
+    let beta_namespace_offset = bracketed_code
+        .find("namespace Beta {")
+        .expect("second bracketed namespace");
+    let beta_namespace_line = bracketed_code[..beta_namespace_offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u64;
+    assert_eq!(
+        client_edits[0]["range"]["start"]["line"].as_u64(),
+        Some(beta_namespace_line + 1),
+        "bracketed import must be inserted inside the cursor namespace"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_completion_auto_import_case_rules_are_kind_aware() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_uri = "file:///test/CaseAwareAutoImportVendor.php";
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+class Service {}
+function helper(): void {}
+function utility(): void {}
+const PACKAGE_VERSION = '1';
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let existing_uri = "file:///test/CaseAwareExistingImports.php";
+    let existing_code = r#"<?php
+namespace App;
+
+use vEnDoR\sErViCe;
+use function VENDOR\HELPER;
+use const vendor\PACKAGE_VERSION;
+
+function existingImports(): void
+{
+    new Ser
+    hel
+    PAC
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(existing_uri, existing_code))
+        .await
+        .unwrap();
+
+    for (request_id, needle, label) in [
+        (31, "    new Ser", "Service"),
+        (32, "    hel", "helper"),
+        (33, "    PAC", "PACKAGE_VERSION"),
+    ] {
+        let (line, character) = utf16_position_after(existing_code, needle);
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(
+                request_id,
+                existing_uri,
+                line,
+                character,
+            ))
+            .await
+            .unwrap();
+        let result = extract_result(response);
+        let items = completion_items_from_result(&result);
+        let item = items
+            .iter()
+            .find(|item| item.get("label").and_then(|value| value.as_str()) == Some(label))
+            .unwrap_or_else(|| panic!("expected {label} completion, got: {items:?}"));
+        assert!(
+            item.get("additionalTextEdits")
+                .and_then(|value| value.as_array())
+                .is_none_or(Vec::is_empty),
+            "existing {label} import with PHP-equivalent casing must not be duplicated: {item:?}"
+        );
+    }
+
+    let collision_uri = "file:///test/CaseAwareImportAliases.php";
+    let collision_code = r#"<?php
+namespace App;
+
+use Other\Occupied as service;
+use function Other\occupied_function as HELPER;
+use const vEnDoR\package_version;
+
+function importAliases(): void
+{
+    new Ser
+    hel
+    PAC
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(collision_uri, collision_code))
+        .await
+        .unwrap();
+
+    for (request_id, needle, label) in [(34, "    new Ser", "Service"), (35, "    hel", "helper")] {
+        let (line, character) = utf16_position_after(collision_code, needle);
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(
+                request_id,
+                collision_uri,
+                line,
+                character,
+            ))
+            .await
+            .unwrap();
+        let result = extract_result(response);
+        let items = completion_items_from_result(&result);
+        let item = items
+            .iter()
+            .find(|item| item.get("label").and_then(|value| value.as_str()) == Some(label))
+            .unwrap_or_else(|| panic!("expected {label} completion, got: {items:?}"));
+        assert!(
+            item.get("additionalTextEdits")
+                .and_then(|value| value.as_array())
+                .is_none_or(Vec::is_empty),
+            "{label} alias collision must be case-insensitive: {item:?}"
+        );
+    }
+
+    let (constant_line, constant_character) = utf16_position_after(collision_code, "    PAC");
+    let constant_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            36,
+            collision_uri,
+            constant_line,
+            constant_character,
+        ))
+        .await
+        .unwrap();
+    let constant_result = extract_result(constant_response);
+    let constant_items = completion_items_from_result(&constant_result);
+    let constant_item = constant_items
+        .iter()
+        .find(|item| item.get("label").and_then(|value| value.as_str()) == Some("PACKAGE_VERSION"))
+        .unwrap_or_else(|| panic!("expected PACKAGE_VERSION completion, got: {constant_items:?}"));
+    let constant_edits = constant_item
+        .get("additionalTextEdits")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        constant_edits.len(),
+        1,
+        "constant identifier casing must remain significant: {constant_item:?}"
+    );
+    assert_eq!(
+        constant_edits[0]
+            .get("newText")
+            .and_then(|value| value.as_str()),
+        Some("use const Vendor\\PACKAGE_VERSION;\n")
+    );
+
+    let scoped_uri = "file:///test/CaseAwareScopedDeclarations.php";
+    let scoped_code = r#"<?php
+namespace First;
+
+class Service {}
+function HELPER(): void {}
+
+namespace Second;
+
+function UTILITY(): void {}
+
+function scopedDeclarations(): void
+{
+    new Ser
+    hel
+    uti
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(scoped_uri, scoped_code))
+        .await
+        .unwrap();
+
+    for (request_id, needle, label, detail, expected_import) in [
+        (
+            37,
+            "    new Ser",
+            "Service",
+            "Vendor\\Service",
+            "use Vendor\\Service;\n",
+        ),
+        (
+            38,
+            "    hel",
+            "helper",
+            "Vendor\\helper",
+            "use function Vendor\\helper;\n",
+        ),
+    ] {
+        let (line, character) = utf16_position_after(scoped_code, needle);
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(request_id, scoped_uri, line, character))
+            .await
+            .unwrap();
+        let result = extract_result(response);
+        let items = completion_items_from_result(&result);
+        let item = items
+            .iter()
+            .find(|item| {
+                item.get("label").and_then(|value| value.as_str()) == Some(label)
+                    && item.get("detail").and_then(|value| value.as_str()) == Some(detail)
+            })
+            .unwrap_or_else(|| panic!("expected {detail} completion, got: {items:?}"));
+        let edits = item
+            .get("additionalTextEdits")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            edits.len(),
+            1,
+            "a declaration from another namespace scope must not suppress {detail}: {item:?}"
+        );
+        assert_eq!(
+            edits[0].get("newText").and_then(|value| value.as_str()),
+            Some(expected_import)
+        );
+    }
+
+    let (utility_line, utility_character) = utf16_position_after(scoped_code, "    uti");
+    let utility_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(
+            39,
+            scoped_uri,
+            utility_line,
+            utility_character,
+        ))
+        .await
+        .unwrap();
+    let utility_result = extract_result(utility_response);
+    let utility_items = completion_items_from_result(&utility_result);
+    let utility_item = utility_items
+        .iter()
+        .find(|item| {
+            item.get("label").and_then(|value| value.as_str()) == Some("utility")
+                && item.get("detail").and_then(|value| value.as_str()) == Some("Vendor\\utility")
+        })
+        .unwrap_or_else(|| panic!("expected Vendor\\utility completion, got: {utility_items:?}"));
+    assert!(
+        utility_item
+            .get("additionalTextEdits")
+            .and_then(|value| value.as_array())
+            .is_none_or(Vec::is_empty),
+        "a local function collision in the current namespace must be case-insensitive: {utility_item:?}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_completion_auto_imports_same_fqn_by_completion_kind() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_uri = "file:///test/SameFqnAutoImportVendor.php";
+    let vendor_code = r#"<?php
+namespace Collision;
+
+/** Same-FQN class documentation. */
+class Shared {}
+
+/**
+ * Same-FQN function documentation.
+ * @param int $count Number of items.
+ * @return string
+ */
+function Shared(int $count): string { return (string) $count; }
+const Shared = 1;
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let app_uri = "file:///test/SameFqnAutoImportConsumer.php";
+    let app_code = r#"<?php
+namespace App;
+
+function run(): void
+{
+    Sha
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(app_uri, app_code))
+        .await
+        .unwrap();
+
+    let (line, character) = utf16_position_after(app_code, "    Sha");
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(41, app_uri, line, character))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let items = completion_items_from_result(&result);
+
+    for (kind, expected_import) in [
+        (7, "use Collision\\Shared;\n"),
+        (3, "use function Collision\\Shared;\n"),
+        (21, "use const Collision\\Shared;\n"),
+    ] {
+        let item = items
+            .iter()
+            .find(|item| {
+                item.get("label").and_then(|value| value.as_str()) == Some("Shared")
+                    && item.get("detail").and_then(|value| value.as_str())
+                        == Some("Collision\\Shared")
+                    && item.get("kind").and_then(|value| value.as_u64()) == Some(kind)
+            })
+            .unwrap_or_else(|| {
+                panic!("expected Collision\\Shared completion kind {kind}, got: {items:?}")
+            });
+        let edits = item
+            .get("additionalTextEdits")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            edits.len(),
+            1,
+            "same-FQN completion kind {kind} should have one matching import: {item:?}"
+        );
+        assert_eq!(
+            edits[0].get("newText").and_then(|value| value.as_str()),
+            Some(expected_import),
+            "same-FQN completion must resolve its own symbol kind"
+        );
+    }
+
+    let function_item = items
+        .iter()
+        .find(|item| {
+            item.get("label").and_then(|value| value.as_str()) == Some("Shared")
+                && item.get("detail").and_then(|value| value.as_str()) == Some("Collision\\Shared")
+                && item.get("kind").and_then(|value| value.as_u64()) == Some(3)
+        })
+        .cloned()
+        .expect("same-FQN function completion item");
+    let resolved_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_resolve_request(42, function_item))
+        .await
+        .unwrap();
+    let resolved = extract_result(resolved_response);
+    assert_eq!(
+        resolved.get("detail").and_then(|value| value.as_str()),
+        Some("(int $count): string"),
+        "completionItem/resolve must use the function signature, not the same-FQN class: {resolved}"
+    );
+    assert!(
+        resolved
+            .get("documentation")
+            .and_then(|value| value.get("value"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.contains("Same-FQN function documentation")),
+        "completionItem/resolve must use the function PHPDoc: {resolved}"
+    );
+
+    let eof_uri = "file:///test/AutoImportAtFinalNamespaceEof.php";
+    let eof_code =
+        "<?php\nnamespace First;\nuse Other\\Thing as Shared;\n\nnamespace Second;\nnew Sha";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(eof_uri, eof_code))
+        .await
+        .unwrap();
+    let (eof_line, eof_character) = utf16_position_after(eof_code, "new Sha");
+    let eof_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(completion_request(43, eof_uri, eof_line, eof_character))
+        .await
+        .unwrap();
+    let eof_result = extract_result(eof_response);
+    let eof_items = completion_items_from_result(&eof_result);
+    let eof_item = eof_items
+        .iter()
+        .find(|item| {
+            item.get("label").and_then(|value| value.as_str()) == Some("Shared")
+                && item.get("detail").and_then(|value| value.as_str()) == Some("Collision\\Shared")
+                && item.get("kind").and_then(|value| value.as_u64()) == Some(7)
+        })
+        .unwrap_or_else(|| panic!("expected Collision\\Shared at final EOF, got: {eof_items:?}"));
+    let eof_edits = eof_item
+        .get("additionalTextEdits")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        eof_edits.len(),
+        1,
+        "an import alias from an earlier namespace must not leak at final EOF: {eof_item:?}"
+    );
+    assert_eq!(
+        eof_edits[0].get("newText").and_then(|value| value.as_str()),
+        Some("use Collision\\Shared;\n\n")
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_signature_help_for_function_method_and_constructor() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

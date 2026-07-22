@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// bytes. The cache schema fixture test below guards the representative binary
 /// shape so CI fails until this version and its fingerprint are updated
 /// together.
-pub const CACHE_SCHEMA_VERSION: u32 = 20;
+pub const CACHE_SCHEMA_VERSION: u32 = 23;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -636,15 +636,15 @@ fn unix_ms(time: SystemTime) -> u64 {
 mod tests {
     use super::*;
     use php_lsp_types::{
-        ArrayShapeItem, ParamInfo, PhpDocTypeAlias, PhpDocTypeAliasImport, Signature,
-        SymbolModifiers, SymbolReferenceReceiver, TemplateBinding, TemplateBindingKind,
+        ArrayShapeItem, NamespaceScope, ParamInfo, PhpDocTypeAlias, PhpDocTypeAliasImport,
+        Signature, SymbolModifiers, SymbolReferenceReceiver, TemplateBinding, TemplateBindingKind,
         TemplateParam, TemplateVariance, TypeInfo, UseKind, UseStatement, Visibility,
     };
     use std::io::Write;
 
-    const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 20;
-    const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3263;
-    const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x5b93_7117_674b_b711;
+    const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 23;
+    const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3315;
+    const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x0518_12bd_a359_78dd;
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -762,6 +762,10 @@ mod tests {
                 },
                 file_symbols: FileSymbols {
                     namespace: Some("App".to_string()),
+                    namespace_scopes: vec![NamespaceScope {
+                        namespace: Some("App".to_string()),
+                        range: (0, 0, 12, 1),
+                    }],
                     use_statements: vec![
                         UseStatement {
                             fqn: "Vendor\\Package\\Thing".to_string(),
@@ -812,6 +816,10 @@ mod tests {
                         range: (5, 4, 5, 7),
                         is_declaration: true,
                         starts_with_dollar: false,
+                        allows_global_fallback: false,
+                        rename_range: None,
+                        preserve_spelling_on_rename: false,
+                        is_import_target: false,
                         receiver: SymbolReferenceReceiver::None,
                     },
                     SymbolReference {
@@ -820,6 +828,10 @@ mod tests {
                         range: (8, 10, 8, 13),
                         is_declaration: false,
                         starts_with_dollar: false,
+                        allows_global_fallback: false,
+                        rename_range: None,
+                        preserve_spelling_on_rename: false,
+                        is_import_target: false,
                         receiver: SymbolReferenceReceiver::ResolvedType {
                             type_fqn: "App\\Foo".to_string(),
                         },
@@ -830,6 +842,10 @@ mod tests {
                         range: (9, 15, 9, 20),
                         is_declaration: false,
                         starts_with_dollar: true,
+                        allows_global_fallback: false,
+                        rename_range: None,
+                        preserve_spelling_on_rename: false,
+                        is_import_target: false,
                         receiver: SymbolReferenceReceiver::StaticClass {
                             class_fqn: "App\\Foo".to_string(),
                         },
@@ -840,6 +856,10 @@ mod tests {
                         range: (10, 15, 10, 22),
                         is_declaration: false,
                         starts_with_dollar: false,
+                        allows_global_fallback: false,
+                        rename_range: None,
+                        preserve_spelling_on_rename: false,
+                        is_import_target: false,
                         receiver: SymbolReferenceReceiver::Unresolved,
                     },
                 ],
@@ -1025,6 +1045,10 @@ mod tests {
             range: (3, 12, 3, 15),
             is_declaration: false,
             starts_with_dollar: false,
+            allows_global_fallback: false,
+            rename_range: None,
+            preserve_spelling_on_rename: false,
+            is_import_target: false,
             receiver: Default::default(),
         }];
 

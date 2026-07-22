@@ -7,7 +7,9 @@ use crate::cst::{
     ancestor_field_contains, has_ancestor_before_scope, is_by_ref_output_argument_variable,
     is_foreach_header_declared_variable, node_contains,
 };
-use php_lsp_types::{FileSymbols, PhpDoc, SymbolInfo, TypeInfo, UseKind};
+use php_lsp_types::{
+    global_constant_fqn_key, FileSymbols, PhpDoc, PhpSymbolKind, SymbolInfo, TypeInfo, UseKind,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Tree;
@@ -57,9 +59,29 @@ const BUILTIN_TYPE_NAMES: &[&str] = &[
 const LANGUAGE_CONSTRUCT_CALLS: &[&str] =
     &["die", "empty", "eval", "exit", "isset", "print", "unset"];
 
+const CLASS_LIKE_SYMBOL_KINDS: &[PhpSymbolKind] = &[
+    PhpSymbolKind::Class,
+    PhpSymbolKind::Interface,
+    PhpSymbolKind::Trait,
+    PhpSymbolKind::Enum,
+];
+const FUNCTION_SYMBOL_KINDS: &[PhpSymbolKind] = &[PhpSymbolKind::Function];
+const METHOD_SYMBOL_KINDS: &[PhpSymbolKind] = &[PhpSymbolKind::Method];
+
+fn resolve_symbol_matching_kinds<F>(
+    resolver: &F,
+    fqn: &str,
+    expected_kinds: &[PhpSymbolKind],
+) -> Option<Arc<SymbolInfo>>
+where
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
+{
+    resolver(fqn, expected_kinds).filter(|symbol| expected_kinds.contains(&symbol.kind))
+}
+
 /// Extract semantic diagnostics from a file.
 ///
-/// `resolver` is called with a FQN to look up a symbol in the index.
+/// `resolver` is called with a FQN and the acceptable symbol kinds.
 /// Returns `Some(SymbolInfo)` if the symbol is known, `None` if unknown.
 pub fn extract_semantic_diagnostics<F>(
     tree: &Tree,
@@ -68,7 +90,7 @@ pub fn extract_semantic_diagnostics<F>(
     resolver: F,
 ) -> Vec<SemanticDiagnostic>
 where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     let mut diagnostics = Vec::new();
     let root = tree.root_node();
@@ -91,7 +113,7 @@ fn check_use_statements<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     for use_stmt in &file_symbols.use_statements {
         // Only check class-type use statements
@@ -111,7 +133,7 @@ fn check_use_statements<F>(
             continue;
         }
 
-        if resolver(fqn).is_none() {
+        if resolve_symbol_matching_kinds(resolver, fqn, CLASS_LIKE_SYMBOL_KINDS).is_none() {
             // Skip aliased use statements that don't resolve — they are often
             // namespace-prefix imports (e.g., `use Symfony\...\Constraints as Assert;`)
             // where the FQN refers to a namespace, not a class.
@@ -136,8 +158,12 @@ fn walk_node_for_diagnostics<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
     let kind = node.kind();
 
     match kind {
@@ -156,6 +182,15 @@ fn walk_node_for_diagnostics<F>(
         // function_call_expression (free function calls)
         "function_call_expression" => {
             check_function_call(node, source, file_symbols, resolver, diagnostics);
+        }
+        "namespace_definition" => {
+            check_namespace_relative_function_call(
+                node,
+                source,
+                file_symbols,
+                resolver,
+                diagnostics,
+            );
         }
         _ => {}
     }
@@ -177,7 +212,7 @@ fn check_class_in_new<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     // Find the class name child
     let mut class_fqn: Option<String> = None;
@@ -190,7 +225,10 @@ fn check_class_in_new<F>(
                 let name = &source[child.byte_range()];
                 let fqn = resolve_class_name(name, file_symbols);
 
-                if should_check_class(&fqn) && resolver(&fqn).is_none() {
+                if should_check_class(&fqn)
+                    && resolve_symbol_matching_kinds(resolver, &fqn, CLASS_LIKE_SYMBOL_KINDS)
+                        .is_none()
+                {
                     diagnostics.push(SemanticDiagnostic {
                         range: node_range(&child),
                         message: format!("Unknown class: {}", fqn),
@@ -208,7 +246,9 @@ fn check_class_in_new<F>(
     // Check constructor argument count
     if let (Some(fqn), Some(_name_node)) = (class_fqn, class_name_node) {
         let ctor_fqn = format!("{}::__construct", fqn);
-        if let Some(ctor_sym) = resolver(&ctor_fqn) {
+        if let Some(ctor_sym) =
+            resolve_symbol_matching_kinds(resolver, &ctor_fqn, METHOD_SYMBOL_KINDS)
+        {
             if let Some(ref sig) = ctor_sym.signature {
                 // Required = contiguous leading params without defaults.
                 // Once a param has a default or is variadic, all subsequent are optional.
@@ -261,7 +301,7 @@ fn check_type_reference<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     // For optional_type (?Type), drill into the inner node.
     let target = if node.kind() == "optional_type" {
@@ -299,7 +339,9 @@ fn check_type_reference<F>(
         }
 
         let fqn = resolve_class_name(name, file_symbols);
-        if should_check_class(&fqn) && resolver(&fqn).is_none() {
+        if should_check_class(&fqn)
+            && resolve_symbol_matching_kinds(resolver, &fqn, CLASS_LIKE_SYMBOL_KINDS).is_none()
+        {
             diagnostics.push(SemanticDiagnostic {
                 range: node_range(&name_node),
                 message: format!("Unknown class: {}", fqn),
@@ -317,7 +359,7 @@ fn check_inheritance_clause<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
@@ -326,7 +368,10 @@ fn check_inheritance_clause<F>(
                 let name = &source[child.byte_range()];
                 let fqn = resolve_class_name(name, file_symbols);
 
-                if should_check_class(&fqn) && resolver(&fqn).is_none() {
+                if should_check_class(&fqn)
+                    && resolve_symbol_matching_kinds(resolver, &fqn, CLASS_LIKE_SYMBOL_KINDS)
+                        .is_none()
+                {
                     diagnostics.push(SemanticDiagnostic {
                         range: node_range(&child),
                         message: format!("Unknown class: {}", fqn),
@@ -346,7 +391,7 @@ fn check_function_call<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     // Prefer the explicit "function" field to preserve qualified names.
     let target_node = node
@@ -418,6 +463,29 @@ fn check_function_call<F>(
     }
 }
 
+fn check_namespace_relative_function_call<F>(
+    node: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &F,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) where
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
+{
+    let Some((name, selection)) = crate::resolve::namespace_relative_function_call(node, source)
+    else {
+        return;
+    };
+    let resolved = resolve_function_name(&name, file_symbols);
+    if resolve_function_symbol(resolver, &resolved).is_none() {
+        diagnostics.push(SemanticDiagnostic {
+            range: node_range(&selection),
+            message: format!("Unknown function: {resolved}"),
+            kind: SemanticDiagnosticKind::UnknownFunction,
+        });
+    }
+}
+
 fn resolve_function_call_target<F>(
     name: &str,
     resolved_name: &str,
@@ -425,25 +493,37 @@ fn resolve_function_call_target<F>(
     resolver: &F,
 ) -> Option<(String, Arc<SymbolInfo>)>
 where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
-    if is_unqualified_name(name) {
-        if resolved_name != name {
-            return resolve_function_symbol(resolver, resolved_name)
-                .map(|sym| (resolved_name.to_string(), sym));
-        }
+    if !is_unqualified_name(name) {
+        return resolve_function_symbol(resolver, resolved_name)
+            .map(|sym| (resolved_name.to_string(), sym));
+    }
 
-        if let Some(ref ns) = file_symbols.namespace {
-            let namespaced = format!("{}\\{}", ns, name);
-            if let Some(sym) = resolve_function_symbol(resolver, &namespaced) {
-                return Some((namespaced, sym));
-            }
+    let has_function_import = file_symbols.use_statements.iter().any(|statement| {
+        if statement.kind != UseKind::Function {
+            return false;
         }
+        let alias = statement
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| statement.fqn.rsplit('\\').next().unwrap_or(&statement.fqn));
+        alias.eq_ignore_ascii_case(name)
+    });
+    if has_function_import {
+        return resolve_function_symbol(resolver, resolved_name)
+            .map(|sym| (resolved_name.to_string(), sym));
+    }
 
+    if let Some(sym) = resolve_function_symbol(resolver, resolved_name) {
+        return Some((resolved_name.to_string(), sym));
+    }
+
+    if file_symbols.namespace.is_some() {
         return resolve_function_symbol(resolver, name).map(|sym| (name.to_string(), sym));
     }
 
-    resolve_function_symbol(resolver, resolved_name).map(|sym| (resolved_name.to_string(), sym))
+    None
 }
 
 fn unknown_function_diagnostic_fqn<F>(
@@ -453,34 +533,20 @@ fn unknown_function_diagnostic_fqn<F>(
     resolver: &F,
 ) -> Option<String>
 where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     if resolve_function_call_target(name, resolved_name, file_symbols, resolver).is_some() {
-        return None;
+        None
+    } else {
+        Some(resolved_name.to_string())
     }
-
-    if is_unqualified_name(name) {
-        if resolved_name != name {
-            return Some(resolved_name.to_string());
-        }
-
-        return Some(
-            file_symbols
-                .namespace
-                .as_ref()
-                .map(|ns| format!("{}\\{}", ns, name))
-                .unwrap_or_else(|| name.to_string()),
-        );
-    }
-
-    Some(resolved_name.to_string())
 }
 
 fn resolve_function_symbol<F>(resolver: &F, fqn: &str) -> Option<Arc<SymbolInfo>>
 where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
-    resolver(fqn)
+    resolve_symbol_matching_kinds(resolver, fqn, FUNCTION_SYMBOL_KINDS)
 }
 
 fn is_unqualified_name(name: &str) -> bool {
@@ -512,46 +578,7 @@ fn should_check_class(fqn: &str) -> bool {
 
 /// Resolve a class name to FQN using use statements and namespace.
 fn resolve_class_name(name: &str, file_symbols: &FileSymbols) -> String {
-    // Already fully qualified
-    if name.starts_with('\\') {
-        return name.trim_start_matches('\\').to_string();
-    }
-
-    // Special names
-    if is_builtin_type_name(name) {
-        return name.to_string();
-    }
-
-    // Try to resolve via use statements
-    let parts: Vec<&str> = name.split('\\').collect();
-    let first_part = parts[0];
-
-    for use_stmt in &file_symbols.use_statements {
-        if use_stmt.kind != UseKind::Class {
-            continue;
-        }
-
-        let alias = use_stmt
-            .alias
-            .as_deref()
-            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-
-        if alias == first_part {
-            if parts.len() == 1 {
-                return use_stmt.fqn.clone();
-            } else {
-                let rest = parts[1..].join("\\");
-                return format!("{}\\{}", use_stmt.fqn, rest);
-            }
-        }
-    }
-
-    // Prepend current namespace
-    if let Some(ref ns) = file_symbols.namespace {
-        format!("{}\\{}", ns, name)
-    } else {
-        name.to_string()
-    }
+    crate::resolve::resolve_class_name_pub(name, file_symbols)
 }
 
 fn is_builtin_type_name(name: &str) -> bool {
@@ -561,42 +588,7 @@ fn is_builtin_type_name(name: &str) -> bool {
 
 /// Resolve a function name to FQN.
 fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
-    // Fully qualified
-    if name.starts_with('\\') {
-        return name.trim_start_matches('\\').to_string();
-    }
-
-    // Try use statements for functions
-    let parts: Vec<&str> = name.split('\\').collect();
-    let first_part = parts[0];
-
-    for use_stmt in &file_symbols.use_statements {
-        if use_stmt.kind != UseKind::Function {
-            continue;
-        }
-
-        let alias = use_stmt
-            .alias
-            .as_deref()
-            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-
-        if alias == first_part {
-            if parts.len() == 1 {
-                return use_stmt.fqn.clone();
-            } else {
-                let rest = parts[1..].join("\\");
-                return format!("{}\\{}", use_stmt.fqn, rest);
-            }
-        }
-    }
-
-    // Keep already-qualified names stable.
-    if name.contains('\\') {
-        return name.to_string();
-    }
-
-    // Simple name — could be global or namespace function.
-    name.to_string()
+    crate::resolve::resolve_function_name_pub(name, file_symbols)
 }
 
 /// Count the number of actual arguments in an `object_creation_expression` or similar call node.
@@ -631,15 +623,25 @@ fn check_unused_imports(
             .alias
             .as_deref()
             .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-
         if imported_name.is_empty() {
             continue;
         }
 
-        let is_used_in_phpdoc =
-            use_stmt.kind == UseKind::Class && import_name_is_used_in_phpdoc(source, imported_name);
+        let scope_range = file_symbols
+            .namespace_scope_at_byte_position(use_stmt.range.0, use_stmt.range.1)
+            .map(|scope| scope.range);
+        let is_used_in_phpdoc = use_stmt.kind == UseKind::Class
+            && import_name_is_used_in_phpdoc(source, imported_name, scope_range);
 
-        if !import_name_is_used(root, source, imported_name, use_stmt.range) && !is_used_in_phpdoc {
+        if !import_name_is_used(
+            root,
+            source,
+            imported_name,
+            use_stmt.range,
+            scope_range,
+            use_stmt.kind,
+        ) && !is_used_in_phpdoc
+        {
             diagnostics.push(SemanticDiagnostic {
                 range: use_stmt.range,
                 message: format!("Unused import: {}", use_stmt.fqn),
@@ -654,37 +656,70 @@ fn import_name_is_used(
     source: &str,
     imported_name: &str,
     import_range: (u32, u32, u32, u32),
+    scope_range: Option<ByteRange>,
+    import_kind: UseKind,
 ) -> bool {
-    if range_contains(import_range, node_range(&node)) {
+    let current_range = node_range(&node);
+    if scope_range.is_some_and(|scope| !ranges_overlap(scope, current_range)) {
+        return false;
+    }
+    if range_contains(import_range, current_range) {
         return false;
     }
 
     if matches!(node.kind(), "name" | "qualified_name" | "namespace_name") {
         let text = &source[node.byte_range()];
-        if first_name_segment(text) == imported_name {
+        if import_kind != UseKind::Class && text.trim_start_matches('\\').contains('\\') {
+            // Function and constant imports alias one unqualified symbol only;
+            // do not descend into a qualified name and accidentally count its
+            // first child as use of that alias.
+            return false;
+        }
+        let first = first_name_segment(text);
+        if if matches!(import_kind, UseKind::Class | UseKind::Function) {
+            first.eq_ignore_ascii_case(imported_name)
+        } else {
+            first == imported_name
+        } {
             return true;
         }
     }
 
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if import_name_is_used(child, source, imported_name, import_range) {
-            return true;
-        }
-    }
-
-    false
+    let used = node.named_children(&mut cursor).any(|child| {
+        import_name_is_used(
+            child,
+            source,
+            imported_name,
+            import_range,
+            scope_range,
+            import_kind,
+        )
+    });
+    used
 }
 
-fn import_name_is_used_in_phpdoc(source: &str, imported_name: &str) -> bool {
+fn import_name_is_used_in_phpdoc(
+    source: &str,
+    imported_name: &str,
+    scope_range: Option<ByteRange>,
+) -> bool {
+    let (scope_start, scope_end) = scope_range.map_or((0, source.len()), |range| {
+        (
+            source_byte_offset(source, range.0, range.1),
+            source_byte_offset(source, range.2, range.3),
+        )
+    });
+    let scoped_source = &source[scope_start.min(source.len())..scope_end.min(source.len())];
+
     let mut offset = 0usize;
-    while let Some(relative_start) = source[offset..].find("/**") {
+    while let Some(relative_start) = scoped_source[offset..].find("/**") {
         let start = offset + relative_start;
-        let Some(relative_end) = source[start..].find("*/") else {
+        let Some(relative_end) = scoped_source[start..].find("*/") else {
             break;
         };
         let end = start + relative_end + 2;
-        let phpdoc = crate::phpdoc::parse_phpdoc(&source[start..end]);
+        let phpdoc = crate::phpdoc::parse_phpdoc(&scoped_source[start..end]);
         if phpdoc_uses_imported_name(&phpdoc, imported_name) {
             return true;
         }
@@ -805,7 +840,7 @@ fn type_info_uses_imported_name(type_info: &TypeInfo, imported_name: &str) -> bo
 }
 
 fn type_name_uses_imported_name(name: &str, imported_name: &str) -> bool {
-    first_name_segment(name) == imported_name
+    first_name_segment(name).eq_ignore_ascii_case(imported_name)
 }
 
 fn first_name_segment(name: &str) -> &str {
@@ -833,7 +868,18 @@ struct VariableOccurrence {
 }
 
 type ByteRange = (u32, u32, u32, u32);
-type SymbolKey<'a> = (php_lsp_types::PhpSymbolKind, &'a str);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DuplicateSymbolCategory {
+    ClassLike,
+    Function,
+    GlobalConstant,
+    Method,
+    Property,
+    ClassConstant,
+}
+
+type SymbolKey = (DuplicateSymbolCategory, String);
 
 fn check_variable_diagnostics<F>(
     root: tree_sitter::Node,
@@ -842,7 +888,7 @@ fn check_variable_diagnostics<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     check_variables_in_scope(root, source, file_symbols, resolver, diagnostics);
 }
@@ -854,7 +900,7 @@ fn check_variables_in_scope<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     let mut occurrences = Vec::new();
     collect_variable_occurrences(
@@ -888,7 +934,7 @@ fn walk_nested_scopes<F>(
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     if is_variable_scope(node) {
         check_variables_in_scope(node, source, file_symbols, resolver, diagnostics);
@@ -906,7 +952,7 @@ fn collect_variable_occurrences(
     scope_id: usize,
     source: &str,
     file_symbols: &FileSymbols,
-    resolver: &impl Fn(&str) -> Option<Arc<SymbolInfo>>,
+    resolver: &impl Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
     occurrences: &mut Vec<VariableOccurrence>,
 ) {
     if node.id() != scope_id && is_variable_scope(node) {
@@ -985,7 +1031,7 @@ fn is_builtin_compact_function_call(
     node: tree_sitter::Node,
     source: &str,
     file_symbols: &FileSymbols,
-    resolver: &impl Fn(&str) -> Option<Arc<SymbolInfo>>,
+    resolver: &impl Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 ) -> bool {
     if node.kind() != "function_call_expression" {
         return false;
@@ -997,7 +1043,6 @@ fn is_builtin_compact_function_call(
     else {
         return false;
     };
-
     if function.kind() == "member_access_expression" {
         return false;
     }
@@ -1006,21 +1051,32 @@ fn is_builtin_compact_function_call(
     if let Some(global_name) = raw_name.strip_prefix('\\') {
         return !global_name.contains('\\') && global_name.eq_ignore_ascii_case("compact");
     }
-
     if !raw_name.eq_ignore_ascii_case("compact") {
         return false;
     }
 
-    let resolved_name = resolve_function_name(raw_name, file_symbols);
-    if resolved_name != raw_name {
-        return resolved_name == "compact";
-    }
+    let start = node.start_position();
+    let scoped_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
 
-    if let Some(namespace) = &file_symbols.namespace {
-        let namespaced = format!("{}\\{}", namespace, raw_name);
-        if resolve_function_symbol(resolver, &namespaced).is_some() {
+    if let Some(import) = scoped_symbols.use_statements.iter().find(|statement| {
+        if statement.kind != UseKind::Function {
             return false;
         }
+        let alias = statement
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| statement.fqn.rsplit('\\').next().unwrap_or(&statement.fqn));
+        alias.eq_ignore_ascii_case(raw_name)
+    }) {
+        return import.fqn.eq_ignore_ascii_case("compact");
+    }
+
+    let namespaced = resolve_function_name(raw_name, &scoped_symbols);
+    if scoped_symbols.namespace.is_some()
+        && resolve_function_symbol(resolver, &namespaced).is_some()
+    {
+        return false;
     }
 
     true
@@ -1245,7 +1301,7 @@ fn report_variable_diagnostics<F>(
     report_unused_declarations: bool,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     let mut declared_by_name: HashMap<&str, Vec<&VariableOccurrence>> = HashMap::new();
     let mut used_by_name: HashMap<&str, Vec<&VariableOccurrence>> = HashMap::new();
@@ -1367,7 +1423,7 @@ fn should_suppress_unused_parameter<F>(
     resolver: &F,
 ) -> bool
 where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     if scope.kind() != "method_declaration" {
         return false;
@@ -1391,7 +1447,7 @@ fn method_overrides_indexed_parent<F>(
     resolver: &F,
 ) -> bool
 where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     let scope_range = node_range(&scope);
     let Some(class_sym) = innermost_class_symbol_containing(file_symbols, scope_range) else {
@@ -1438,7 +1494,7 @@ fn class_or_ancestor_has_method<F>(
     visited: &mut HashSet<String>,
 ) -> bool
 where
-    F: Fn(&str) -> Option<Arc<SymbolInfo>>,
+    F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     let class_fqn = class_fqn.trim_start_matches('\\');
     if !visited.insert(class_fqn.to_string()) {
@@ -1446,11 +1502,13 @@ where
     }
 
     let method_fqn = format!("{}::{}", class_fqn, method_name);
-    if resolver(&method_fqn).is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Method) {
+    if resolve_symbol_matching_kinds(resolver, &method_fqn, METHOD_SYMBOL_KINDS).is_some() {
         return true;
     }
 
-    let Some(class_sym) = resolver(class_fqn) else {
+    let Some(class_sym) =
+        resolve_symbol_matching_kinds(resolver, class_fqn, CLASS_LIKE_SYMBOL_KINDS)
+    else {
         return false;
     };
 
@@ -1574,41 +1632,94 @@ fn check_duplicate_symbols_in_file(
     file_symbols: &FileSymbols,
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) {
-    let mut seen: HashMap<SymbolKey<'_>, Vec<ByteRange>> = HashMap::new();
+    let mut seen: HashMap<SymbolKey, Vec<(&str, ByteRange)>> = HashMap::new();
 
-    for sym in &file_symbols.symbols {
-        if !is_duplicate_checked_symbol(sym.kind) {
+    for symbol in &file_symbols.symbols {
+        let Some(key) = duplicate_symbol_key(symbol) else {
             continue;
-        }
-        seen.entry((sym.kind, sym.fqn.as_str()))
+        };
+        seen.entry(key)
             .or_default()
-            .push(sym.selection_range);
+            .push((symbol.fqn.as_str(), symbol.selection_range));
     }
 
-    for ((_, fqn), ranges) in seen {
-        if ranges.len() <= 1 {
-            continue;
-        }
-        for range in ranges {
-            diagnostics.push(SemanticDiagnostic {
+    let mut duplicates: Vec<(&str, ByteRange)> = seen
+        .into_values()
+        .filter(|entries| entries.len() > 1)
+        .flatten()
+        .collect();
+    duplicates.sort_by_key(|(_, range)| *range);
+
+    diagnostics.extend(
+        duplicates
+            .into_iter()
+            .map(|(fqn, range)| SemanticDiagnostic {
                 range,
-                message: format!("Duplicate symbol: {}", fqn),
+                message: format!("Duplicate symbol: {fqn}"),
                 kind: SemanticDiagnosticKind::DuplicateSymbol,
-            });
-        }
-    }
+            }),
+    );
 }
 
-fn is_duplicate_checked_symbol(kind: php_lsp_types::PhpSymbolKind) -> bool {
-    matches!(
-        kind,
-        php_lsp_types::PhpSymbolKind::Class
-            | php_lsp_types::PhpSymbolKind::Interface
-            | php_lsp_types::PhpSymbolKind::Trait
-            | php_lsp_types::PhpSymbolKind::Enum
-            | php_lsp_types::PhpSymbolKind::Function
-            | php_lsp_types::PhpSymbolKind::GlobalConstant
-    )
+fn duplicate_symbol_key(symbol: &SymbolInfo) -> Option<SymbolKey> {
+    use php_lsp_types::PhpSymbolKind;
+
+    let key = match symbol.kind {
+        PhpSymbolKind::Class
+        | PhpSymbolKind::Interface
+        | PhpSymbolKind::Trait
+        | PhpSymbolKind::Enum => (
+            DuplicateSymbolCategory::ClassLike,
+            symbol.fqn.to_ascii_lowercase(),
+        ),
+        PhpSymbolKind::Function => (
+            DuplicateSymbolCategory::Function,
+            symbol.fqn.to_ascii_lowercase(),
+        ),
+        PhpSymbolKind::GlobalConstant => (
+            DuplicateSymbolCategory::GlobalConstant,
+            global_constant_fqn_key(&symbol.fqn),
+        ),
+        PhpSymbolKind::Method => (
+            DuplicateSymbolCategory::Method,
+            member_duplicate_key(symbol, true)?,
+        ),
+        PhpSymbolKind::Property => (
+            DuplicateSymbolCategory::Property,
+            member_duplicate_key(symbol, false)?,
+        ),
+        PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase => (
+            DuplicateSymbolCategory::ClassConstant,
+            member_duplicate_key(symbol, false)?,
+        ),
+        PhpSymbolKind::Namespace => return None,
+    };
+    Some(key)
+}
+
+fn member_duplicate_key(symbol: &SymbolInfo, lowercase_member: bool) -> Option<String> {
+    let (owner, member) = symbol.fqn.rsplit_once("::")?;
+    let member = if lowercase_member {
+        member.to_ascii_lowercase()
+    } else {
+        member.to_string()
+    };
+    Some(format!("{}::{member}", owner.to_ascii_lowercase()))
+}
+
+fn ranges_overlap(left: ByteRange, right: ByteRange) -> bool {
+    (left.0, left.1) < (right.2, right.3) && (right.0, right.1) < (left.2, left.3)
+}
+
+fn source_byte_offset(source: &str, line: u32, column: u32) -> usize {
+    let mut offset = 0usize;
+    for (row, text) in source.split_inclusive('\n').enumerate() {
+        if row == line as usize {
+            return offset + (column as usize).min(text.len());
+        }
+        offset += text.len();
+    }
+    source.len()
 }
 
 fn range_contains(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {
@@ -1644,25 +1755,12 @@ pub fn collect_aliased_class_fqns(
     use crate::resolve::resolve_class_name_pub;
     use std::collections::HashSet;
 
-    // Build a set of alias prefixes for quick lookup.
-    let aliases: HashSet<&str> = file_symbols
-        .use_statements
-        .iter()
-        .filter(|u| u.kind == UseKind::Class && u.alias.is_some())
-        .filter_map(|u| u.alias.as_deref())
-        .collect();
-
-    if aliases.is_empty() {
-        return vec![];
-    }
-
     let src = source.as_bytes();
     let mut fqns = HashSet::new();
     let mut cursor = tree.root_node().walk();
     collect_qualified_names_recursive(
         &mut cursor,
         src,
-        &aliases,
         file_symbols,
         &mut fqns,
         &resolve_class_name_pub,
@@ -1675,7 +1773,6 @@ pub fn collect_aliased_class_fqns(
 fn collect_qualified_names_recursive(
     cursor: &mut tree_sitter::TreeCursor,
     source: &[u8],
-    aliases: &std::collections::HashSet<&str>,
     file_symbols: &FileSymbols,
     out: &mut std::collections::HashSet<String>,
     resolver: &dyn Fn(&str, &FileSymbols) -> String,
@@ -1685,15 +1782,25 @@ fn collect_qualified_names_recursive(
         if node.kind() == "qualified_name" {
             let text = node.utf8_text(source).unwrap_or_default();
             if let Some(first) = text.split('\\').next() {
-                if aliases.contains(first) {
-                    let fqn = resolver(text, file_symbols);
+                let start = node.start_position();
+                let scoped_file_symbols =
+                    file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+                let has_alias = scoped_file_symbols.use_statements.iter().any(|statement| {
+                    statement.kind == UseKind::Class
+                        && statement
+                            .alias
+                            .as_deref()
+                            .is_some_and(|alias| alias.eq_ignore_ascii_case(first))
+                });
+                if has_alias {
+                    let fqn = resolver(text, &scoped_file_symbols);
                     out.insert(fqn);
                 }
             }
         }
         // Recurse into children
         if cursor.goto_first_child() {
-            collect_qualified_names_recursive(cursor, source, aliases, file_symbols, out, resolver);
+            collect_qualified_names_recursive(cursor, source, file_symbols, out, resolver);
             cursor.goto_parent();
         }
         if !cursor.goto_next_sibling() {
@@ -1775,6 +1882,23 @@ mod tests {
         code: &str,
         resolver: impl Fn(&str) -> Option<Arc<SymbolInfo>>,
     ) -> Vec<SemanticDiagnostic> {
+        parse_and_check_typed(code, |fqn, expected_kinds| {
+            resolver(fqn).map(|symbol| {
+                if expected_kinds.contains(&symbol.kind) {
+                    symbol
+                } else {
+                    let mut symbol = symbol.as_ref().clone();
+                    symbol.kind = expected_kinds[0];
+                    Arc::new(symbol)
+                }
+            })
+        })
+    }
+
+    fn parse_and_check_typed(
+        code: &str,
+        resolver: impl Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
+    ) -> Vec<SemanticDiagnostic> {
         let mut parser = FileParser::new();
         parser.parse_full(code);
         let tree = parser.tree().unwrap();
@@ -1788,10 +1912,10 @@ mod tests {
         let tree = parser.tree().unwrap();
         let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
         let symbols = file_symbols.symbols.clone();
-        extract_semantic_diagnostics(tree, code, &file_symbols, |fqn| {
+        extract_semantic_diagnostics(tree, code, &file_symbols, |fqn, expected_kinds| {
             symbols
                 .iter()
-                .find(|sym| sym.fqn == fqn)
+                .find(|sym| sym.fqn == fqn && expected_kinds.contains(&sym.kind))
                 .cloned()
                 .map(Arc::new)
         })
@@ -1915,6 +2039,63 @@ App\Utils\helper();
             !unknown_funcs.is_empty(),
             "Expected unknown function diagnostic for namespaced call"
         );
+    }
+
+    #[test]
+    fn test_semantic_resolution_rejects_wrong_top_level_symbol_kind() {
+        let function_code = "<?php\nnamespace App;\nMissing();\n";
+        let function_diags =
+            parse_and_check_typed(function_code, |_fqn, _expected_kinds| Some(dummy_symbol()));
+        assert!(function_diags.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UnknownFunction
+                && diagnostic.message.contains("Missing")
+        }));
+
+        let class_code = "<?php\nnamespace App;\nnew Missing();\n";
+        let class_diags = parse_and_check_typed(class_code, |fqn, _expected_kinds| {
+            Some(function_symbol(fqn, Vec::new()))
+        });
+        assert!(class_diags.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UnknownClass
+                && diagnostic.message.contains("Missing")
+        }));
+    }
+
+    #[test]
+    fn test_semantic_resolution_selects_signature_for_legal_same_fqn_symbols() {
+        let code = r#"<?php
+new Collision();
+Collision();
+"#;
+        let required_param = ParamInfo {
+            name: "value".to_string(),
+            type_info: None,
+            default_value: None,
+            is_variadic: false,
+            is_by_ref: false,
+            is_promoted: false,
+        };
+        let diags = parse_and_check_typed(code, |fqn, expected_kinds| {
+            if expected_kinds.contains(&PhpSymbolKind::Function) {
+                Some(function_symbol(fqn, vec![required_param.clone()]))
+            } else if expected_kinds.contains(&PhpSymbolKind::Class) {
+                let mut symbol = dummy_symbol().as_ref().clone();
+                symbol.name = "Collision".to_string();
+                symbol.fqn = fqn.to_string();
+                Some(Arc::new(symbol))
+            } else {
+                None
+            }
+        });
+
+        assert!(!diags.iter().any(|diagnostic| matches!(
+            diagnostic.kind,
+            SemanticDiagnosticKind::UnknownClass | SemanticDiagnosticKind::UnknownFunction
+        )));
+        assert!(diags.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::ArgumentCountMismatch
+                && diagnostic.message.contains("Collision")
+        }));
     }
 
     #[test]
@@ -2553,6 +2734,39 @@ function run(): array {
     }
 
     #[test]
+    fn test_compact_import_from_another_namespace_does_not_hide_builtin_fallback() {
+        let code = r#"<?php
+namespace First;
+
+use function Vendor\compact;
+
+function first(): void {}
+
+namespace Second;
+
+function run(): array {
+    $title = 'Extended service';
+    return compact('title');
+}
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            if fqn == "Vendor\\compact" {
+                Some(function_symbol(fqn, vec![variadic_param("var_name")]))
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            !diags.iter().any(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UnusedVariable
+                    && diagnostic.message.contains("$title")
+            }),
+            "an import from another namespace must not mask builtin compact fallback: {diags:?}"
+        );
+    }
+
+    #[test]
     fn test_namespaced_compact_function_does_not_count_string_arguments_as_reads() {
         let code = r#"<?php
 namespace App\Controller;
@@ -2890,5 +3104,230 @@ class Duplicate {}
         assert!(duplicates
             .iter()
             .all(|d| d.message.contains("App\\Duplicate")));
+    }
+
+    #[test]
+    fn test_duplicate_class_members_use_php_kind_specific_casing_rules() {
+        let code = r#"<?php
+class Owner {
+    public function run(): void {}
+    public function RUN(): void {}
+
+    public string $value;
+    public string $value;
+
+    public const FLAG = 1;
+    public const FLAG = 2;
+}
+
+enum Status {
+    case Ready;
+    case Ready;
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+        let duplicates: Vec<_> = diags
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::DuplicateSymbol)
+            .collect();
+
+        assert_eq!(
+            duplicates.len(),
+            8,
+            "unexpected diagnostics: {duplicates:?}"
+        );
+        assert!(duplicates
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Owner::RUN")));
+        assert!(duplicates
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Status::Ready")));
+    }
+
+    #[test]
+    fn test_legal_member_overrides_are_not_duplicate_declarations() {
+        let code = r#"<?php
+class Base {
+    public function run(): void {}
+    public string $value;
+    public const FLAG = 1;
+}
+
+class Child extends Base {
+    public function RUN(): void {}
+    public string $value;
+    public const FLAG = 2;
+}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+        assert!(
+            !diags
+                .iter()
+                .any(|diagnostic| { diagnostic.kind == SemanticDiagnosticKind::DuplicateSymbol }),
+            "legal overrides must not be reported as duplicates: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_top_level_class_and_function_duplicates_ignore_ascii_case() {
+        let code = r#"<?php
+class MixedCase {}
+class MIXEDCASE {}
+function helper(): void {}
+function HELPER(): void {}
+"#;
+        let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+        let duplicates = diags
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::DuplicateSymbol)
+            .count();
+        assert_eq!(duplicates, 4, "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn test_multi_namespace_diagnostics_use_the_local_namespace_scope() {
+        let code = r#"<?php
+namespace First {
+    class Local {}
+    new Local();
+}
+namespace Second {
+    class Local {}
+    new Local();
+}
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            [r"First\Local", r"Second\Local"]
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(fqn))
+                .then(dummy_symbol)
+        });
+        assert!(
+            !diags
+                .iter()
+                .any(|diagnostic| { diagnostic.kind == SemanticDiagnosticKind::UnknownClass }),
+            "namespace-local classes should resolve independently: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_namespace_relative_function_call_uses_current_namespace() {
+        let code = r#"<?php
+namespace App\Feature;
+function run(): void {
+    namespace\helper();
+}
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            fqn.eq_ignore_ascii_case(r"App\Feature\helper")
+                .then(dummy_symbol)
+        });
+        assert!(
+            !diags
+                .iter()
+                .any(|diagnostic| { diagnostic.kind == SemanticDiagnosticKind::UnknownFunction }),
+            "namespace-relative function should resolve locally: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_mixed_group_imports_resolve_with_per_clause_kinds() {
+        let code = r#"<?php
+use Vendor\Package\{
+    Service as ImportedService,
+    function helper as ImportedHelper,
+    const FLAG as ImportedFlag
+};
+
+new importedservice();
+IMPORTEDHELPER();
+echo ImportedFlag;
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            [r"Vendor\Package\Service", r"Vendor\Package\helper"]
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(fqn))
+                .then(dummy_symbol)
+        });
+
+        assert!(
+            !diags.iter().any(|diagnostic| matches!(
+                diagnostic.kind,
+                SemanticDiagnosticKind::UnknownClass
+                    | SemanticDiagnosticKind::UnknownFunction
+                    | SemanticDiagnosticKind::UnusedImport
+            )),
+            "mixed group clauses should retain their own kinds: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_qualified_function_uses_namespace_alias_but_constant_alias_does_not_prefix() {
+        let code = r#"<?php
+namespace App;
+use Vendor\Package as Lib;
+use const Vendor\FLAG as ConstAlias;
+
+lib\helper();
+echo ConstAlias\CHILD;
+"#;
+        let diags = parse_and_check(code, |fqn| {
+            fqn.eq_ignore_ascii_case(r"Vendor\Package\helper")
+                .then(dummy_symbol)
+        });
+
+        assert!(!diags.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UnknownFunction
+                || (diagnostic.kind == SemanticDiagnosticKind::UnusedImport
+                    && diagnostic.message.contains(r"Vendor\Package"))
+        }));
+        assert!(diags.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UnusedImport
+                && diagnostic.message.contains(r"Vendor\FLAG")
+        }));
+    }
+
+    #[test]
+    fn test_collect_aliased_class_fqns_is_scope_aware_and_case_insensitive() {
+        let code = r#"<?php
+namespace App {
+    use Vendor\First as Shared;
+    new shared\One();
+}
+namespace App {
+    use Vendor\Second as Shared;
+    new SHARED\Two();
+}
+"#;
+        let mut parser = FileParser::new();
+        parser.parse_full(code);
+        let tree = parser.tree().unwrap();
+        let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
+        let mut fqns = collect_aliased_class_fqns(tree, code, &file_symbols);
+        fqns.sort();
+
+        assert_eq!(fqns, vec![r"Vendor\First\One", r"Vendor\Second\Two"]);
+    }
+
+    #[test]
+    fn test_duplicate_global_constants_ignore_namespace_case_only() {
+        let code = r#"<?php
+namespace Vendor\Package { const FLAG = 1; }
+namespace vendor\package { const FLAG = 2; const flag = 3; }
+"#;
+        let diags = parse_and_check(code, |_| None);
+        let duplicates: Vec<_> = diags
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::DuplicateSymbol)
+            .collect();
+
+        assert_eq!(
+            duplicates.len(),
+            2,
+            "only the two FLAG declarations collide"
+        );
+        assert!(duplicates
+            .iter()
+            .all(|diagnostic| diagnostic.message.ends_with(r"\FLAG")));
     }
 }

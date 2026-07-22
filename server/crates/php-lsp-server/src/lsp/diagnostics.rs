@@ -4,7 +4,6 @@ use super::super::*;
 use php_lsp_parser::resolve::{
     symbol_at_position_with_full_resolvers, FunctionTypeResolver, ResolvedFunctionType,
 };
-use tracing::Instrument;
 
 fn build_analyzer_shell_command(template: &str, file_path: &Path) -> String {
     let escaped_file = shell_escape(&file_path.to_string_lossy());
@@ -314,57 +313,237 @@ impl PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         let text = &params.text_document.text;
         let version = params.text_document.version;
+        let document_state = self.next_document_state(version);
         let template_kind = template_kind_for_document(&uri_str, &params.text_document.language_id);
 
         tracing::debug!("didOpen: {}", uri_str);
-        self.log_trace(&format!("didOpen: {}", uri_str)).await;
-        self.document_versions.insert(uri_str.clone(), version);
-        self.cancel_debounced_diagnostics(&uri_str).await;
-        self.cancel_analyzer_run(&uri_str).await;
-        self.cancel_formatter_run(&uri_str).await;
-
         if let Some(template_kind) = template_kind {
-            let twig_variable_types = if template_kind == TemplateKind::Twig {
-                self.twig_variable_types_for_template(&uri_str).await
-            } else {
-                Vec::new()
-            };
-            let parser =
-                self.open_template_document(&uri_str, text, template_kind, &twig_variable_types);
-            self.index.remove_file(&uri_str);
-            self.open_files.insert(uri_str, parser);
+            // The parser entry is the primary per-document write lock. Commit
+            // parser/template/version while it is held so readers observe one
+            // lifetime and an immediate didChange waits for this base parser.
+            match self.open_files.entry(uri_str.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                    if self
+                        .current_document_state(&uri_str)
+                        .is_some_and(|current| {
+                            !open_document_state_can_replace(current, document_state)
+                        })
+                    {
+                        return;
+                    }
+                    self.closed_document_reload_tokens.remove(&uri_str);
+                    let parser = self.open_template_document(&uri_str, text, template_kind, &[]);
+                    self.document_versions
+                        .insert(uri_str.clone(), document_state);
+                    self.index.remove_file(&uri_str);
+                    entry.insert(parser);
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    if self
+                        .current_document_state(&uri_str)
+                        .is_some_and(|current| {
+                            !open_document_state_can_replace(current, document_state)
+                        })
+                    {
+                        return;
+                    }
+                    self.closed_document_reload_tokens.remove(&uri_str);
+                    let parser = self.open_template_document(&uri_str, text, template_kind, &[]);
+                    self.document_versions
+                        .insert(uri_str.clone(), document_state);
+                    self.index.remove_file(&uri_str);
+                    entry.insert(parser);
+                }
+            }
+            let twig_open_snapshot = (template_kind == TemplateKind::Twig)
+                .then(|| self.template_document(&uri_str))
+                .flatten();
+
+            self.log_trace(&format!("didOpen: {}", uri_str)).await;
+            if self.current_document_state(&uri_str) != Some(document_state) {
+                return;
+            }
+            if !self
+                .cancel_debounced_diagnostics_if_current(&uri_str, document_state)
+                .await
+            {
+                return;
+            }
+            if !self
+                .cancel_analyzer_run_if_current(&uri_str, document_state)
+                .await
+            {
+                return;
+            }
+            if !self
+                .cancel_formatter_run_if_current(&uri_str, document_state)
+                .await
+            {
+                return;
+            }
+
+            if template_kind == TemplateKind::Twig {
+                let twig_variable_types = self.twig_variable_types_for_template(&uri_str).await;
+                let dashmap::mapref::entry::Entry::Occupied(mut open_entry) =
+                    self.open_files.entry(uri_str.clone())
+                else {
+                    return;
+                };
+                if self.current_document_state(&uri_str) != Some(document_state) {
+                    return;
+                }
+                let Some(snapshot) = twig_open_snapshot.as_ref() else {
+                    return;
+                };
+                let Some(current_template) = self.template_documents.get(&uri_str) else {
+                    return;
+                };
+                if !current_template.has_same_source_and_twig_context(snapshot) {
+                    return;
+                }
+                drop(current_template);
+                let parser = self.open_template_document(
+                    &uri_str,
+                    text,
+                    template_kind,
+                    &twig_variable_types,
+                );
+                open_entry.insert(parser);
+            }
+
+            if self.current_document_state(&uri_str) != Some(document_state) {
+                return;
+            }
             self.publish_diagnostics(&uri).await;
             return;
         }
 
-        self.template_documents.remove(&uri_str);
-        let mut parser = FileParser::new();
-        parser.parse_full(text);
+        // Serialize parsing and commit through the parser entry. A didChange
+        // on another Tokio worker cannot observe a version without its parser
+        // or apply an incremental edit before this lifetime's base is ready.
+        let indexed_symbol_count = match self.open_files.entry(uri_str.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if self
+                    .current_document_state(&uri_str)
+                    .is_some_and(|current| {
+                        !open_document_state_can_replace(current, document_state)
+                    })
+                {
+                    return;
+                }
+                self.closed_document_reload_tokens.remove(&uri_str);
+                let mut parser = FileParser::new();
+                parser.parse_full(text);
+                let indexed_file = parser.tree().map(|tree| {
+                    let file_symbols = extract_file_symbols(tree, text, &uri_str);
+                    let references = collect_symbol_references_in_file(tree, text, &file_symbols);
+                    let sym_count = file_symbols.symbols.len();
+                    (file_symbols, references, sym_count)
+                });
+                let indexed_symbol_count =
+                    if let Some((file_symbols, references, sym_count)) = indexed_file {
+                        self.index
+                            .update_file_with_references(&uri_str, file_symbols, references);
+                        Some(sym_count)
+                    } else {
+                        self.index.remove_file(&uri_str);
+                        None
+                    };
+                self.template_documents.remove(&uri_str);
+                self.document_versions
+                    .insert(uri_str.clone(), document_state);
+                entry.insert(parser);
+                indexed_symbol_count
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if self
+                    .current_document_state(&uri_str)
+                    .is_some_and(|current| {
+                        !open_document_state_can_replace(current, document_state)
+                    })
+                {
+                    return;
+                }
+                self.closed_document_reload_tokens.remove(&uri_str);
+                let mut parser = FileParser::new();
+                parser.parse_full(text);
+                let indexed_file = parser.tree().map(|tree| {
+                    let file_symbols = extract_file_symbols(tree, text, &uri_str);
+                    let references = collect_symbol_references_in_file(tree, text, &file_symbols);
+                    let sym_count = file_symbols.symbols.len();
+                    (file_symbols, references, sym_count)
+                });
+                let indexed_symbol_count =
+                    if let Some((file_symbols, references, sym_count)) = indexed_file {
+                        self.index
+                            .update_file_with_references(&uri_str, file_symbols, references);
+                        Some(sym_count)
+                    } else {
+                        self.index.remove_file(&uri_str);
+                        None
+                    };
+                self.template_documents.remove(&uri_str);
+                self.document_versions
+                    .insert(uri_str.clone(), document_state);
+                entry.insert(parser);
+                indexed_symbol_count
+            }
+        };
 
-        // Update index with symbols from this file
+        self.log_trace(&format!("didOpen: {}", uri_str)).await;
+        if self.current_document_state(&uri_str) != Some(document_state) {
+            return;
+        }
+        if !self
+            .cancel_debounced_diagnostics_if_current(&uri_str, document_state)
+            .await
+        {
+            return;
+        }
+        if !self
+            .cancel_analyzer_run_if_current(&uri_str, document_state)
+            .await
+        {
+            return;
+        }
+        if !self
+            .cancel_formatter_run_if_current(&uri_str, document_state)
+            .await
+        {
+            return;
+        }
+
+        // Exclusion lookup is async, so publish parser/state/index together
+        // first and remove the exact committed state afterward when excluded.
         let excluded = if let Some(path) = uri_to_path(&uri_str) {
             self.path_is_excluded_by_config(&path).await
         } else {
             false
         };
-        if !excluded {
-            if let Some(tree) = parser.tree() {
-                let file_symbols = extract_file_symbols(tree, text, &uri_str);
-                let references = collect_symbol_references_in_file(tree, text, &file_symbols);
-                let sym_count = file_symbols.symbols.len();
-                self.index
-                    .update_file_with_references(&uri_str, file_symbols, references);
-                self.log_trace(&format!("Indexed {} symbols from {}", sym_count, uri_str))
-                    .await;
+        let indexed_symbol_count = if excluded {
+            let dashmap::mapref::entry::Entry::Occupied(_open_entry) =
+                self.open_files.entry(uri_str.clone())
+            else {
+                return;
+            };
+            if self.current_document_state(&uri_str) != Some(document_state) {
+                return;
             }
-        } else {
             self.index.remove_file(&uri_str);
+            None
+        } else {
+            indexed_symbol_count
+        };
+        if let Some(sym_count) = indexed_symbol_count {
+            self.log_trace(&format!("Indexed {} symbols from {}", sym_count, uri_str))
+                .await;
         }
 
-        self.open_files.insert(uri_str, parser);
-
+        if self.current_document_state(&uri_str) != Some(document_state) {
+            return;
+        }
         self.publish_diagnostics(&uri).await;
-        if uri_is_php_file(&uri) {
+        if uri_is_php_file(&uri) && self.current_document_state(&uri_str) == Some(document_state) {
             self.invalidate_twig_context_disk_cache_for_source_uri(uri.as_str())
                 .await;
             self.refresh_open_twig_contexts_and_republish_diagnostics()
@@ -378,28 +557,108 @@ impl PhpLspBackend {
         let version = params.text_document.version;
 
         tracing::debug!("didChange: {} version {}", uri_str, version);
-        if !self.accept_document_version(&uri_str, version) {
+        // The parser entry serializes all document writers. Accept the version
+        // and apply incremental edits while it is held so v3 can only apply
+        // ranges after v2 has committed its parser base.
+        let (document_state, template_change) = match self.open_files.entry(uri_str.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let Some(current) = self.current_document_state(&uri_str) else {
+                    tracing::debug!("Ignoring didChange without state for {}", uri_str);
+                    return;
+                };
+                if !document_version_is_newer(Some(current.version), version) {
+                    tracing::debug!(
+                        "Ignoring stale didChange for {}: incoming version {}, current version {}",
+                        uri_str,
+                        version,
+                        current.version
+                    );
+                    return;
+                }
+                let accepted = OpenDocumentState {
+                    version,
+                    generation: current.generation,
+                };
+
+                let template_change = self.template_document(&uri_str).map(|template| {
+                    let updated = params
+                        .content_changes
+                        .iter()
+                        .fold(template, |template, change| {
+                            template.apply_change(change.range, &change.text)
+                        });
+                    let refresh_twig_contexts = updated.kind() == TemplateKind::Twig;
+                    let mut parser = FileParser::new();
+                    parser.parse_full(updated.virtual_source());
+                    self.template_documents.insert(uri_str.clone(), updated);
+                    self.index.remove_file(&uri_str);
+                    entry.insert(parser);
+                    refresh_twig_contexts
+                });
+
+                let indexed_file = if template_change.is_none() {
+                    let parser = entry.get_mut();
+                    for change in &params.content_changes {
+                        if let Some(range) = change.range {
+                            parser.apply_edit(
+                                range.start.line,
+                                range.start.character,
+                                range.end.line,
+                                range.end.character,
+                                &change.text,
+                            );
+                        } else {
+                            parser.parse_full(&change.text);
+                        }
+                    }
+                    parser.tree().map(|tree| {
+                        let source = parser.source();
+                        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+                        let references =
+                            collect_symbol_references_in_file(tree, &source, &file_symbols);
+                        (file_symbols, references)
+                    })
+                } else {
+                    None
+                };
+
+                if template_change.is_none() {
+                    if let Some((file_symbols, references)) = indexed_file {
+                        self.index
+                            .update_file_with_references(&uri_str, file_symbols, references);
+                    } else {
+                        self.index.remove_file(&uri_str);
+                    }
+                }
+
+                self.document_versions.insert(uri_str.clone(), accepted);
+                (accepted, template_change)
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                tracing::debug!("Ignoring didChange for unopened document {}", uri_str);
+                return;
+            }
+        };
+
+        if !self
+            .cancel_analyzer_run_if_current(&uri_str, document_state)
+            .await
+        {
             return;
         }
-        self.cancel_analyzer_run(&uri_str).await;
-        self.cancel_formatter_run(&uri_str).await;
+        if !self
+            .cancel_formatter_run_if_current(&uri_str, document_state)
+            .await
+        {
+            return;
+        }
 
-        if let Some(template) = self.template_document(&uri_str) {
-            let updated = params
-                .content_changes
-                .iter()
-                .fold(template, |template, change| {
-                    template.apply_change(change.range, &change.text)
-                });
-            let refresh_twig_contexts = updated.kind() == TemplateKind::Twig;
-            let mut parser = FileParser::new();
-            parser.parse_full(updated.virtual_source());
-            self.template_documents.insert(uri_str.clone(), updated);
-            self.index.remove_file(&uri_str);
-            self.open_files.insert(uri_str.clone(), parser);
+        if let Some(refresh_twig_contexts) = template_change {
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
-            self.schedule_fast_diagnostics(uri, version).await;
-            if refresh_twig_contexts {
+            self.schedule_fast_diagnostics(uri, document_state).await;
+            if refresh_twig_contexts
+                && self.current_document_state(&uri_str) == Some(document_state)
+            {
                 self.refresh_open_twig_contexts_and_republish_diagnostics()
                     .await;
             }
@@ -412,37 +671,21 @@ impl PhpLspBackend {
             false
         };
 
-        if let Some(mut parser) = self.open_files.get_mut(&uri_str) {
-            for change in &params.content_changes {
-                if let Some(range) = change.range {
-                    parser.apply_edit(
-                        range.start.line,
-                        range.start.character,
-                        range.end.line,
-                        range.end.character,
-                        &change.text,
-                    );
-                } else {
-                    // Full content replacement
-                    parser.parse_full(&change.text);
-                }
+        if excluded {
+            let dashmap::mapref::entry::Entry::Occupied(_entry) =
+                self.open_files.entry(uri_str.clone())
+            else {
+                return;
+            };
+            if self.current_document_state(&uri_str) != Some(document_state) {
+                return;
             }
-
-            // Update index with new symbols
-            if excluded {
-                self.index.remove_file(&uri_str);
-            } else if let Some(tree) = parser.tree() {
-                let source = parser.source();
-                let file_symbols = extract_file_symbols(tree, &source, &uri_str);
-                let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
-                self.index
-                    .update_file_with_references(&uri_str, file_symbols, references);
-            }
+            self.index.remove_file(&uri_str);
         }
 
         let refresh_twig_contexts = uri_is_php_file(&uri);
-        self.schedule_fast_diagnostics(uri, version).await;
-        if refresh_twig_contexts {
+        self.schedule_fast_diagnostics(uri, document_state).await;
+        if refresh_twig_contexts && self.current_document_state(&uri_str) == Some(document_state) {
             self.invalidate_twig_context_disk_cache_for_source_uri(&uri_str)
                 .await;
             self.refresh_open_twig_contexts_and_republish_diagnostics()
@@ -454,21 +697,83 @@ impl PhpLspBackend {
         let uri = params.text_document.uri;
         let uri_str = uri.as_str().to_string();
         tracing::debug!("didClose: {}", uri_str);
-        let refresh_twig_contexts =
-            uri_is_php_file(&uri) && !self.template_documents.contains_key(&uri_str);
-        self.open_files.remove(&uri_str);
-        self.template_documents.remove(&uri_str);
-        self.document_versions.remove(&uri_str);
-        self.cancel_debounced_diagnostics(&uri_str).await;
-        self.cancel_analyzer_run(&uri_str).await;
-        self.cancel_formatter_run(&uri_str).await;
-        self.semantic_tokens_cache.lock().await.remove(&uri_str);
-        // Clear diagnostics for closed file
-        self.client.publish_diagnostics(uri, vec![], None).await;
-        if refresh_twig_contexts {
+        let is_php_uri = uri_is_php_file(&uri);
+        let (restore_token, refresh_twig_contexts) = match self.open_files.entry(uri_str.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                // Serialize removal with didOpen/didChange and Twig refresh,
+                // all of which use the parser entry as the writer lock.
+                let restore_php_index =
+                    is_php_uri && !self.template_documents.contains_key(&uri_str);
+                self.document_versions.remove(&uri_str);
+                self.template_documents.remove(&uri_str);
+                let restore_token = restore_php_index.then(|| {
+                    let token = self
+                        .next_document_generation
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.closed_document_reload_tokens
+                        .insert(uri_str.clone(), token);
+                    // Drop the unsaved open-document snapshot immediately. The
+                    // on-disk snapshot is restored asynchronously below.
+                    self.index.remove_file(&uri_str);
+                    token
+                });
+                entry.remove();
+                (restore_token, restore_php_index)
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                self.document_versions.remove(&uri_str);
+                self.template_documents.remove(&uri_str);
+                (None, false)
+            }
+        };
+        self.cancel_debounced_diagnostics_if_closed(&uri_str).await;
+        self.cancel_analyzer_run_if_closed(&uri_str).await;
+        self.cancel_formatter_run_if_closed(&uri_str).await;
+        self.clear_semantic_tokens_if_closed(&uri_str).await;
+        if let Some(token) = restore_token {
+            self.restore_closed_php_index(&uri_str, token).await;
+        }
+        self.publish_empty_diagnostics_if_closed(uri).await;
+        if refresh_twig_contexts && self.current_document_state(&uri_str).is_none() {
             self.refresh_open_twig_contexts_and_republish_diagnostics()
                 .await;
         }
+    }
+
+    async fn restore_closed_php_index(&self, uri_str: &str, token: u64) {
+        let parsed = if let Some(path) = uri_to_path(uri_str) {
+            if self.path_is_excluded_by_config(&path).await {
+                None
+            } else {
+                match parse_workspace_file_for_index_blocking(path, "closed PHP document reindex")
+                    .await
+                {
+                    Ok(parsed) => Some(parsed),
+                    Err(message) => {
+                        tracing::debug!("Failed to restore closed PHP index: {}", message);
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        let (file_symbols, references) = parsed
+            .map(|parsed| (parsed.file_symbols, parsed.references))
+            .unwrap_or_else(|| (None, Vec::new()));
+        commit_closed_php_index_if_current(
+            ClosedPhpIndexCommitContext {
+                open_files: &self.open_files,
+                document_versions: &self.document_versions,
+                reload_tokens: &self.closed_document_reload_tokens,
+                index: &self.index,
+                uri_str,
+                token,
+            },
+            file_symbols,
+            references,
+        );
     }
 
     pub(crate) async fn lsp_did_save(&self, params: DidSaveTextDocumentParams) {
@@ -488,64 +793,20 @@ impl PhpLspBackend {
     }
 }
 
-/// Compute diagnostics for a file (syntax + semantic).
-///
-/// Extracted as a free function so it can be called both from
-/// `publish_diagnostics` and from post-indexing re-checks.
-pub(in crate::server) async fn compute_open_file_diagnostics(
-    uri_str: &str,
-    open_files: &DashMap<String, FileParser>,
-    index: &Arc<WorkspaceIndex>,
-    diagnostics_config: DiagnosticsRuntimeConfig,
-    document_version: Option<i32>,
-) -> Vec<Diagnostic> {
-    let Some(source) = open_files.get(uri_str).map(|parser| parser.source()) else {
-        return vec![];
-    };
-
-    compute_source_diagnostics_blocking(
-        uri_str.to_string(),
-        source,
-        index.clone(),
-        diagnostics_config,
-        document_version,
-    )
-    .await
-}
-
 pub(in crate::server) async fn preresolve_open_file_diagnostic_dependencies(
-    index: &WorkspaceIndex,
-    open_files: &DashMap<String, FileParser>,
-    uri_str: &str,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
     vendor_context: &VendorLazyIndexContext,
 ) {
-    let use_statement_fqns = index
-        .file_symbols
-        .get(uri_str)
-        .map(|fs| {
-            fs.use_statements
-                .iter()
-                .filter(|u| u.kind == php_lsp_types::UseKind::Class)
-                .filter(|u| u.fqn.contains('\\'))
-                .map(|u| u.fqn.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let alias_fqns = if let Some(parser) = open_files.get(uri_str) {
-        if let Some(tree) = parser.tree() {
-            let source = parser.source();
-            index
-                .file_symbols
-                .get(uri_str)
-                .map(|fs| collect_aliased_class_fqns(tree, &source, &fs))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    let use_statement_fqns = file_symbols
+        .use_statements
+        .iter()
+        .filter(|u| u.kind == php_lsp_types::UseKind::Class)
+        .filter(|u| u.fqn.contains('\\'))
+        .map(|u| u.fqn.clone())
+        .collect::<Vec<_>>();
+    let alias_fqns = collect_aliased_class_fqns(tree, source, file_symbols);
 
     let mut seen = std::collections::HashSet::new();
     for fqn in use_statement_fqns.into_iter().chain(alias_fqns) {
@@ -715,14 +976,30 @@ pub(in crate::server) fn symbol_reference_matches(
         return false;
     }
 
-    if reference.target_fqn == target_fqn
-        && reference_kind_matches(reference.target_kind, target_kind)
-    {
+    if !reference_kind_matches(reference.target_kind, target_kind) {
+        return false;
+    }
+
+    if php_lsp_types::symbol_fqn_eq(&reference.target_fqn, target_fqn, target_kind) {
         return true;
     }
 
-    if !reference_kind_matches(reference.target_kind, target_kind) {
-        return false;
+    if reference.allows_global_fallback
+        && matches!(
+            target_kind,
+            php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::GlobalConstant
+        )
+        && index
+            .resolve_fqn_matching_kinds(&reference.target_fqn, &[target_kind])
+            .is_none()
+        && reference
+            .target_fqn
+            .rsplit_once('\\')
+            .is_some_and(|(_, short_name)| {
+                php_lsp_types::symbol_fqn_eq(short_name, target_fqn, target_kind)
+            })
+    {
+        return true;
     }
 
     if reference.is_declaration {
@@ -959,7 +1236,9 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
 
     let semantic_started = Instant::now();
     let sem_diags =
-        extract_semantic_diagnostics(tree, &source, &file_symbols, |fqn| index.resolve_fqn(fqn));
+        extract_semantic_diagnostics(tree, &source, &file_symbols, |fqn, expected_kinds| {
+            index.resolve_fqn_matching_kinds(fqn, expected_kinds)
+        });
     warn_if_slow_diagnostic_phase(uri_str, "semantic", semantic_started);
 
     for sd in sem_diags {
@@ -1636,14 +1915,7 @@ fn resolve_function_type_from_index(
     index: &WorkspaceIndex,
     function_fqn: &str,
 ) -> Option<ResolvedFunctionType> {
-    let sym = index.resolve_fqn(function_fqn).or_else(|| {
-        function_fqn
-            .rsplit_once('\\')
-            .and_then(|(_, short_name)| index.resolve_fqn(short_name))
-    })?;
-    if sym.kind != php_lsp_types::PhpSymbolKind::Function {
-        return None;
-    }
+    let sym = resolve_fqn_with_ref_kind(index, function_fqn, RefKind::FunctionCall, false)?;
     symbol_return_type_text_from_index(index, &sym.fqn, &sym).map(|type_text| {
         ResolvedFunctionType::with_signature(type_text, sym.signature.clone())
             .with_symbol_fqn(sym.fqn.clone())
@@ -1751,8 +2023,7 @@ fn is_enum_builtin_property_access(
 
     let class_fqn = class_fqn.trim_start_matches('\\');
     if !index
-        .types
-        .get(class_fqn)
+        .get_type(class_fqn)
         .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
     {
         return false;
@@ -1797,8 +2068,7 @@ pub(in crate::server) fn is_enum_builtin_method_call(
     };
 
     index
-        .types
-        .get(class_fqn.trim_start_matches('\\'))
+        .get_type(class_fqn)
         .is_some_and(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Enum)
 }
 
@@ -1816,11 +2086,7 @@ pub(in crate::server) fn class_has_unindexed_ancestor(
     }
     visited.push(class_fqn.to_string());
 
-    let Some(class_sym) = index
-        .types
-        .get(class_fqn)
-        .map(|entry| entry.value().clone())
-    else {
+    let Some(class_sym) = index.get_type(class_fqn) else {
         return false;
     };
 
@@ -1833,8 +2099,7 @@ pub(in crate::server) fn class_has_unindexed_ancestor(
             if parent.is_empty() || fqn_matches(parent, class_fqn) {
                 return false;
             }
-            !index.types.contains_key(parent)
-                || class_has_unindexed_ancestor(index, parent, visited)
+            !index.contains_type(parent) || class_has_unindexed_ancestor(index, parent, visited)
         })
 }
 
@@ -1844,7 +2109,7 @@ pub(in crate::server) fn is_unindexed_imported_type(
     class_fqn: &str,
 ) -> bool {
     let normalized = class_fqn.trim_start_matches('\\');
-    if index.types.contains_key(normalized) {
+    if index.contains_type(normalized) {
         return false;
     }
 
@@ -1944,7 +2209,7 @@ pub(in crate::server) fn resolve_member_on_class_for_ref_kind(
 ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
     index.get_members(class_fqn).into_iter().find(|sym| {
         symbol_kind_matches_ref_kind(sym, ref_kind)
-            && (exact_fqn.is_some_and(|fqn| sym.fqn == fqn)
+            && (exact_fqn.is_some_and(|fqn| php_lsp_types::symbol_fqn_eq(&sym.fqn, fqn, sym.kind))
                 || sym.matches_member_lookup_name(member_name))
     })
 }
@@ -2163,11 +2428,7 @@ pub(in crate::server) fn class_extends_or_implements(
     }
     visited.push(current_class.to_string());
 
-    let Some(class_sym) = index
-        .types
-        .get(current_class)
-        .map(|entry| entry.value().clone())
-    else {
+    let Some(class_sym) = index.get_type(current_class) else {
         return false;
     };
 
@@ -2200,11 +2461,7 @@ pub(in crate::server) fn class_or_ancestor_uses_trait(
         return true;
     }
 
-    let Some(class_sym) = index
-        .types
-        .get(current_class)
-        .map(|entry| entry.value().clone())
-    else {
+    let Some(class_sym) = index.get_type(current_class) else {
         return false;
     };
 
@@ -2229,11 +2486,7 @@ pub(in crate::server) fn class_uses_trait(
     }
     visited.push(current_class.to_string());
 
-    let Some(class_sym) = index
-        .types
-        .get(current_class)
-        .map(|entry| entry.value().clone())
-    else {
+    let Some(class_sym) = index.get_type(current_class) else {
         return false;
     };
 
@@ -2244,7 +2497,8 @@ pub(in crate::server) fn class_uses_trait(
 }
 
 pub(in crate::server) fn fqn_matches(left: &str, right: &str) -> bool {
-    left.trim_start_matches('\\') == right.trim_start_matches('\\')
+    left.trim_start_matches('\\')
+        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
 }
 
 pub(in crate::server) fn byte_range_contains(
@@ -2538,6 +2792,9 @@ pub(in crate::server) fn check_call_argument_types(
         .as_ref()
         .map(|entry| entry.value())
         .unwrap_or(file_symbols);
+    let scoped_expected_file_symbols =
+        expected_file_symbols.scoped_at_byte_position(callable.range.0, callable.range.1);
+    let expected_file_symbols = scoped_expected_file_symbols.as_ref();
 
     let arguments = call_arguments(call_node, source);
     for (arg_index, arg) in arguments.into_iter().enumerate() {
@@ -2609,7 +2866,9 @@ pub(in crate::server) fn check_return_type_compatibility(
         return;
     };
 
-    if !type_info_accepts_inferred_type(expected, &actual, file_symbols, index) {
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(callable.range.0, callable.range.1);
+    if !type_info_accepts_inferred_type(expected, &actual, scoped_file_symbols.as_ref(), index) {
         diagnostics.push(diagnostic_at_byte_range(
             actual.range,
             utf16_index,
@@ -2684,6 +2943,9 @@ pub(in crate::server) fn check_property_assignment_type_compatibility(
         .as_ref()
         .map(|entry| entry.value())
         .unwrap_or(file_symbols);
+    let scoped_expected_file_symbols =
+        expected_file_symbols.scoped_at_byte_position(property.range.0, property.range.1);
+    let expected_file_symbols = scoped_expected_file_symbols.as_ref();
 
     if !type_info_accepts_inferred_type(expected, &actual, expected_file_symbols, index) {
         diagnostics.push(diagnostic_at_byte_range(
@@ -2799,20 +3061,12 @@ pub(in crate::server) fn resolve_symbol_at_position_from_index(
     index: &WorkspaceIndex,
     sym_at_pos: &SymbolAtPosition,
 ) -> Option<Arc<php_lsp_types::SymbolInfo>> {
-    if let Some(symbol) = index.resolve_fqn(&sym_at_pos.fqn) {
-        return Some(symbol);
-    }
-
-    if matches!(
+    resolve_fqn_with_ref_kind(
+        index,
+        &sym_at_pos.fqn,
         sym_at_pos.ref_kind,
-        RefKind::FunctionCall | RefKind::GlobalConstant
-    ) {
-        if let Some((_, short_name)) = sym_at_pos.fqn.rsplit_once('\\') {
-            return index.resolve_fqn(short_name);
-        }
-    }
-
-    None
+        sym_at_pos.allows_global_fallback,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2971,6 +3225,10 @@ pub(in crate::server) fn infer_expression_type(
     file_symbols: &php_lsp_types::FileSymbols,
 ) -> Option<InferredExprType> {
     let node = normalized_expression_node(node);
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
     let raw = source[node.byte_range()].trim();
     let lower = raw.to_ascii_lowercase();
     let kind = node.kind();
@@ -3449,7 +3707,7 @@ pub(in crate::server) fn simple_type_accepts_inferred_type(
                 resolve_class_name_pub(expected, file_symbols)
             };
             let actual_fqn = actual.comparable.trim_start_matches('\\');
-            expected_fqn == actual_fqn
+            fqn_matches(&expected_fqn, actual_fqn)
                 || class_extends_or_implements(index, actual_fqn, &expected_fqn, &mut Vec::new())
         }
     }
@@ -3584,6 +3842,12 @@ pub(in crate::server) fn override_signatures_are_compatible(
     ) else {
         return true;
     };
+    let scoped_child_file_symbols =
+        child_file_symbols.scoped_at_byte_position(child_method.range.0, child_method.range.1);
+    let child_file_symbols = scoped_child_file_symbols.as_ref();
+    let scoped_parent_file_symbols =
+        parent_file_symbols.scoped_at_byte_position(parent_method.range.0, parent_method.range.1);
+    let parent_file_symbols = scoped_parent_file_symbols.as_ref();
 
     if child_sig.params.len() < parent_sig.params.len() {
         return false;
@@ -3749,15 +4013,12 @@ pub(in crate::server) fn type_info_is_owner_template(
         return false;
     };
 
-    index
-        .types
-        .get(owner_fqn.trim_start_matches('\\'))
-        .is_some_and(|owner| {
-            owner
-                .templates
-                .iter()
-                .any(|template| template.name == *name)
-        })
+    index.get_type(owner_fqn).is_some_and(|owner| {
+        owner
+            .templates
+            .iter()
+            .any(|template| template.name == *name)
+    })
 }
 
 pub(in crate::server) fn normalized_type_info_for_override(
@@ -4064,7 +4325,9 @@ pub(in crate::server) fn workspace_duplicate_symbol_diagnostics(
             }
 
             entry.value().symbols.iter().any(|other| {
-                other.kind == sym.kind && other.fqn == sym.fqn && !other.modifiers.is_builtin
+                duplicate_symbol_kinds_share_table(other.kind, sym.kind)
+                    && php_lsp_types::symbol_fqn_eq(&other.fqn, &sym.fqn, sym.kind)
+                    && !other.modifiers.is_builtin
             })
         });
 
@@ -4089,6 +4352,22 @@ pub(in crate::server) fn workspace_duplicate_symbol_diagnostics(
     }
 
     diagnostics
+}
+
+fn duplicate_symbol_kinds_share_table(
+    left: php_lsp_types::PhpSymbolKind,
+    right: php_lsp_types::PhpSymbolKind,
+) -> bool {
+    let is_class_like = |kind| {
+        matches!(
+            kind,
+            php_lsp_types::PhpSymbolKind::Class
+                | php_lsp_types::PhpSymbolKind::Interface
+                | php_lsp_types::PhpSymbolKind::Trait
+                | php_lsp_types::PhpSymbolKind::Enum
+        )
+    };
+    (is_class_like(left) && is_class_like(right)) || left == right
 }
 
 pub(in crate::server) fn is_duplicate_checked_symbol_kind(
@@ -4246,8 +4525,15 @@ impl PhpLspBackend {
     /// Publish diagnostics for a file.
     pub(in crate::server) async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
-        let template_document = self.template_document(&uri_str);
-        let version = self.current_document_version(&uri_str);
+        let snapshot = self.open_document_snapshot(&uri_str);
+        let document_state = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.document_state);
+        let template_document = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.template_document.clone());
+        let source = snapshot.as_ref().map(|snapshot| snapshot.source.clone());
+        let version = document_state.map(|state| state.version);
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let indexing_active = indexing_run_is_active(&self.indexing_run).await;
         let mut effective_diagnostics_mode =
@@ -4260,14 +4546,16 @@ impl PhpLspBackend {
         // Pre-resolve use statements via lazy indexing so that vendor classes
         // are available for the synchronous `compute_diagnostics` resolver.
         if should_preresolve_dependencies {
-            let vendor_context = self.vendor_lazy_index_context().await;
-            preresolve_open_file_diagnostic_dependencies(
-                &self.index,
-                &self.open_files,
-                &uri_str,
-                &vendor_context,
-            )
-            .await;
+            if let Some(snapshot) = snapshot.as_ref() {
+                let vendor_context = self.vendor_lazy_index_context().await;
+                preresolve_open_file_diagnostic_dependencies(
+                    &snapshot.tree,
+                    &snapshot.source,
+                    &snapshot.file_symbols,
+                    &vendor_context,
+                )
+                .await;
+            }
         }
 
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
@@ -4279,14 +4567,18 @@ impl PhpLspBackend {
             budget: diagnostic_budget,
             php_version,
         };
-        let mut diagnostics = compute_open_file_diagnostics(
-            &uri_str,
-            &self.open_files,
-            &self.index,
-            diagnostics_config,
-            version,
-        )
-        .await;
+        let mut diagnostics = if let Some(source) = source.as_ref() {
+            compute_source_diagnostics_blocking(
+                uri_str.clone(),
+                source.clone(),
+                self.index.clone(),
+                diagnostics_config,
+                version,
+            )
+            .await
+        } else {
+            Vec::new()
+        };
         if let Some(template) = &template_document {
             diagnostics = template.map_diagnostics_to_original(
                 diagnostics,
@@ -4302,14 +4594,18 @@ impl PhpLspBackend {
         {
             effective_diagnostics_mode = DiagnosticsMode::SyntaxOnly;
             diagnostics_config.mode = effective_diagnostics_mode;
-            diagnostics = compute_open_file_diagnostics(
-                &uri_str,
-                &self.open_files,
-                &self.index,
-                diagnostics_config,
-                version,
-            )
-            .await;
+            diagnostics = if let Some(source) = source.as_ref() {
+                compute_source_diagnostics_blocking(
+                    uri_str.clone(),
+                    source.clone(),
+                    self.index.clone(),
+                    diagnostics_config,
+                    version,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
             if let Some(template) = &template_document {
                 diagnostics = template.map_diagnostics_to_original(
                     diagnostics,
@@ -4326,7 +4622,10 @@ impl PhpLspBackend {
             && effective_diagnostics_mode == DiagnosticsMode::BasicSemantic
             && !has_syntax_errors
         {
-            let analyzer_token = self.start_analyzer_run(&uri_str).await;
+            let Some(analyzer_token) = self.start_analyzer_run(&uri_str, document_state).await
+            else {
+                return;
+            };
             diagnostics.extend(
                 self.phpstan_diagnostics_for_uri(uri, analyzer_token.clone())
                     .await,
@@ -4346,12 +4645,12 @@ impl PhpLspBackend {
             self.finish_analyzer_run(&uri_str, &analyzer_token).await;
         }
 
-        if self.current_document_version(&uri_str) != version {
+        if self.current_document_state(&uri_str) != document_state {
             tracing::debug!(
-                "Skipping stale diagnostics for {}: computed for version {:?}, current {:?}",
+                "Skipping stale diagnostics for {}: computed for state {:?}, current {:?}",
                 uri_str,
-                version,
-                self.current_document_version(&uri_str)
+                document_state,
+                self.current_document_state(&uri_str)
             );
             return;
         }
@@ -4360,54 +4659,44 @@ impl PhpLspBackend {
         {
             effective_diagnostics_mode = DiagnosticsMode::SyntaxOnly;
             diagnostics_config.mode = effective_diagnostics_mode;
-            diagnostics = compute_open_file_diagnostics(
-                &uri_str,
-                &self.open_files,
-                &self.index,
-                diagnostics_config,
-                version,
-            )
-            .await;
+            diagnostics = if let Some(source) = source.as_ref() {
+                compute_source_diagnostics_blocking(
+                    uri_str.clone(),
+                    source.clone(),
+                    self.index.clone(),
+                    diagnostics_config,
+                    version,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
             if let Some(template) = &template_document {
                 diagnostics = template.map_diagnostics_to_original(
                     diagnostics,
                     effective_diagnostics_mode == DiagnosticsMode::Off,
                 );
             }
-            if self.current_document_version(&uri_str) != version {
+            if self.current_document_state(&uri_str) != document_state {
                 tracing::debug!(
-                    "Skipping stale diagnostics for {}: computed for version {:?}, current {:?}",
+                    "Skipping stale diagnostics for {}: computed for state {:?}, current {:?}",
                     uri_str,
-                    version,
-                    self.current_document_version(&uri_str)
+                    document_state,
+                    self.current_document_state(&uri_str)
                 );
                 return;
             }
         }
 
-        let publish_started = Instant::now();
-        let publish_span = tracing::debug_span!(
-            "diagnostics.publish",
-            uri = %uri_str,
-            version = ?version,
-            duration_ms = tracing::field::Empty,
-        );
-        async {
-            if self.current_document_version(&uri_str) != version {
-                return;
-            }
-            if effective_diagnostics_mode == DiagnosticsMode::BasicSemantic
-                && indexing_run_is_active(&self.indexing_run).await
-            {
-                return;
-            }
-            self.client
-                .publish_diagnostics(uri.clone(), diagnostics, version)
-                .await;
-        }
-        .instrument(publish_span.clone())
-        .await;
-        publish_span.record("duration_ms", publish_started.elapsed().as_millis() as u64);
+        self.diagnostics_publisher
+            .publish(DiagnosticPublishRequest {
+                uri: uri.clone(),
+                diagnostics,
+                version,
+                expected_state: document_state,
+                expected_template: template_document,
+                require_idle_index: effective_diagnostics_mode == DiagnosticsMode::BasicSemantic,
+            });
     }
 
     pub(in crate::server) async fn filter_lazy_resolved_symbol_diagnostics(
@@ -4426,7 +4715,7 @@ impl PhpLspBackend {
                     } else if let Some(ref_kind) =
                         lazy_resolvable_diagnostic_ref_kind(&diagnostic.message)
                     {
-                        self.resolve_fqn_lazy_with_fallback(&fqn, ref_kind)
+                        self.resolve_fqn_lazy_with_fallback(&fqn, ref_kind, false)
                             .await
                             .is_some()
                     } else {

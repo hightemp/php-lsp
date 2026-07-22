@@ -420,7 +420,9 @@ posix_geteuid();
         let tree = parser.tree().expect("test PHP should parse");
         let file_symbols = extract_file_symbols(tree, code, "file:///test.php");
         let diagnostics =
-            extract_semantic_diagnostics(tree, code, &file_symbols, |fqn| index.resolve_fqn(fqn));
+            extract_semantic_diagnostics(tree, code, &file_symbols, |fqn, expected_kinds| {
+                index.resolve_fqn_matching_kinds(fqn, expected_kinds)
+            });
         let unknown_functions: Vec<_> = diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::UnknownFunction)

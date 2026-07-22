@@ -2,8 +2,8 @@
 
 use dashmap::DashMap;
 use php_lsp_types::{
-    ArrayShapeItem, FileSymbols, PhpSymbolKind, Signature, SymbolInfo, SymbolReference,
-    TemplateBindingKind, TypeInfo,
+    global_constant_fqn_key, symbol_fqn_eq, ArrayShapeItem, FileSymbols, PhpSymbolKind, Signature,
+    SymbolInfo, SymbolReference, TemplateBindingKind, TypeInfo,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -15,6 +15,40 @@ const MAX_TYPE_ALIAS_EXPANSION_DEPTH: usize = 32;
 
 fn member_kind_matches(kind: PhpSymbolKind, expected_kinds: Option<&[PhpSymbolKind]>) -> bool {
     expected_kinds.is_none_or(|kinds| kinds.contains(&kind))
+}
+
+fn case_insensitive_fqn_key(fqn: &str) -> String {
+    fqn.trim_start_matches('\\').to_ascii_lowercase()
+}
+
+fn top_level_symbol_key(symbol: &SymbolInfo) -> String {
+    match symbol.kind {
+        PhpSymbolKind::Class
+        | PhpSymbolKind::Interface
+        | PhpSymbolKind::Trait
+        | PhpSymbolKind::Enum
+        | PhpSymbolKind::Function => case_insensitive_fqn_key(&symbol.fqn),
+        PhpSymbolKind::GlobalConstant => global_constant_fqn_key(&symbol.fqn),
+        _ => symbol.fqn.trim_start_matches('\\').to_string(),
+    }
+}
+
+fn top_level_symbol_kinds_share_table(left: PhpSymbolKind, right: PhpSymbolKind) -> bool {
+    match right {
+        PhpSymbolKind::Class
+        | PhpSymbolKind::Interface
+        | PhpSymbolKind::Trait
+        | PhpSymbolKind::Enum => matches!(
+            left,
+            PhpSymbolKind::Class
+                | PhpSymbolKind::Interface
+                | PhpSymbolKind::Trait
+                | PhpSymbolKind::Enum
+        ),
+        PhpSymbolKind::Function => left == PhpSymbolKind::Function,
+        PhpSymbolKind::GlobalConstant => left == PhpSymbolKind::GlobalConstant,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,10 +65,10 @@ struct TypeAliasVisit {
 
 /// Global index of all symbols in the workspace.
 pub struct WorkspaceIndex {
-    /// FQN → SymbolInfo for types (classes, interfaces, traits, enums)
+    /// ASCII-lowercased FQN → SymbolInfo for types.
     pub types: DashMap<String, Arc<SymbolInfo>>,
 
-    /// FQN → SymbolInfo for functions
+    /// ASCII-lowercased FQN → SymbolInfo for functions.
     pub functions: DashMap<String, Arc<SymbolInfo>>,
 
     /// FQN → SymbolInfo for constants
@@ -82,13 +116,16 @@ impl WorkspaceIndex {
                 | PhpSymbolKind::Interface
                 | PhpSymbolKind::Trait
                 | PhpSymbolKind::Enum => {
-                    self.types.insert(sym.fqn.clone(), sym_arc);
+                    self.types
+                        .insert(case_insensitive_fqn_key(&sym.fqn), sym_arc);
                 }
                 PhpSymbolKind::Function => {
-                    self.functions.insert(sym.fqn.clone(), sym_arc);
+                    self.functions
+                        .insert(case_insensitive_fqn_key(&sym.fqn), sym_arc);
                 }
                 PhpSymbolKind::GlobalConstant => {
-                    self.constants.insert(sym.fqn.clone(), sym_arc);
+                    self.constants
+                        .insert(global_constant_fqn_key(&sym.fqn), sym_arc);
                 }
                 // Methods, properties, class constants belong to their parent type
                 // and are stored in file_symbols, queried via parent_fqn
@@ -132,17 +169,18 @@ impl WorkspaceIndex {
         removed_symbol: &SymbolInfo,
         symbols: &DashMap<String, Arc<SymbolInfo>>,
     ) {
+        let key = top_level_symbol_key(removed_symbol);
         let should_remove = symbols
-            .get(&removed_symbol.fqn)
+            .get(&key)
             .is_some_and(|entry| entry.uri == removed_uri);
         if !should_remove {
             return;
         }
 
-        symbols.remove(&removed_symbol.fqn);
+        symbols.remove(&key);
 
         if let Some(replacement) = self.find_top_level_symbol_replacement(removed_symbol) {
-            symbols.insert(removed_symbol.fqn.clone(), replacement);
+            symbols.insert(top_level_symbol_key(&replacement), replacement);
         }
     }
 
@@ -155,7 +193,8 @@ impl WorkspaceIndex {
                 .symbols
                 .iter()
                 .find(|candidate| {
-                    candidate.fqn == removed_symbol.fqn && candidate.kind == removed_symbol.kind
+                    top_level_symbol_kinds_share_table(candidate.kind, removed_symbol.kind)
+                        && symbol_fqn_eq(&candidate.fqn, &removed_symbol.fqn, removed_symbol.kind)
                 })
                 .cloned()
                 .map(Arc::new)
@@ -167,19 +206,88 @@ impl WorkspaceIndex {
     /// Handles both top-level symbols (`App\Foo`) and member symbols
     /// (`App\Foo::method`, `App\Foo::CONST`, `App\Foo::$prop`).
     pub fn resolve_fqn(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
-        // Try top-level lookup first
-        if let Some(sym) = self.types.get(fqn).map(|r| r.value().clone()) {
+        let normalized = fqn.trim_start_matches('\\');
+        let case_insensitive_key = case_insensitive_fqn_key(normalized);
+
+        if let Some(sym) = self
+            .types
+            .get(&case_insensitive_key)
+            .map(|entry| entry.value().clone())
+        {
             return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
-        if let Some(sym) = self.functions.get(fqn).map(|r| r.value().clone()) {
+        if let Some(sym) = self
+            .functions
+            .get(&case_insensitive_key)
+            .map(|entry| entry.value().clone())
+        {
             return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
-        if let Some(sym) = self.constants.get(fqn).map(|r| r.value().clone()) {
+        if let Some(sym) = self
+            .constants
+            .get(&global_constant_fqn_key(normalized))
+            .map(|entry| entry.value().clone())
+        {
             return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
 
-        // Try Class::member resolution
-        self.resolve_member(fqn)
+        self.resolve_member(normalized)
+    }
+
+    /// Resolve an FQN to a symbol of one of the expected kinds.
+    ///
+    /// Top-level PHP symbol tables are independent, so a class and a function
+    /// may legally share the same case-insensitive FQN. Selecting the symbol
+    /// before checking its kind would make the map lookup order observable.
+    pub fn resolve_fqn_matching_kinds(
+        &self,
+        fqn: &str,
+        expected_kinds: &[PhpSymbolKind],
+    ) -> Option<Arc<SymbolInfo>> {
+        let normalized = fqn.trim_start_matches('\\');
+        if normalized.contains("::") {
+            return self.resolve_member_matching_kinds(normalized, expected_kinds);
+        }
+
+        let case_insensitive_key = case_insensitive_fqn_key(normalized);
+        if let Some(sym) = self
+            .types
+            .get(&case_insensitive_key)
+            .map(|entry| entry.value().clone())
+            .filter(|symbol| expected_kinds.contains(&symbol.kind))
+        {
+            return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
+        }
+        if let Some(sym) = self
+            .functions
+            .get(&case_insensitive_key)
+            .map(|entry| entry.value().clone())
+            .filter(|symbol| expected_kinds.contains(&symbol.kind))
+        {
+            return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
+        }
+        if let Some(sym) = self
+            .constants
+            .get(&global_constant_fqn_key(normalized))
+            .map(|entry| entry.value().clone())
+            .filter(|symbol| expected_kinds.contains(&symbol.kind))
+        {
+            return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
+        }
+
+        None
+    }
+
+    /// Return whether a class-like symbol exists using PHP's casing rules.
+    pub fn contains_type(&self, fqn: &str) -> bool {
+        self.types.contains_key(&case_insensitive_fqn_key(fqn))
+    }
+
+    /// Get a class-like symbol using PHP's casing rules.
+    pub fn get_type(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
+        self.types
+            .get(&case_insensitive_fqn_key(fqn))
+            .map(|entry| entry.value().clone())
     }
 
     /// Resolve a `Class::member` FQN to the member symbol.
@@ -229,16 +337,16 @@ impl WorkspaceIndex {
         visited: &mut HashSet<String>,
         substitutions: &TemplateSubstitutions,
     ) -> Option<Arc<SymbolInfo>> {
-        if !visited.insert(class_fqn.to_string()) {
+        if !visited.insert(case_insensitive_fqn_key(class_fqn)) {
             return None;
         }
 
         let members = self.get_direct_members(class_fqn);
         // Prefer exact FQN match first
-        if let Some(sym) = members
-            .iter()
-            .find(|m| m.fqn == original_fqn && member_kind_matches(m.kind, expected_kinds))
-        {
+        if let Some(sym) = members.iter().find(|member| {
+            member_kind_matches(member.kind, expected_kinds)
+                && symbol_fqn_eq(&member.fqn, original_fqn, member.kind)
+        }) {
             return Some(self.materialize_symbol(sym.clone(), substitutions));
         }
         // Fallback: match by PHP member lookup semantics.
@@ -250,7 +358,7 @@ impl WorkspaceIndex {
         }
 
         // Walk the class hierarchy: look up extends and implements
-        if let Some(class_sym) = self.types.get(class_fqn).map(|r| r.value().clone()) {
+        if let Some(class_sym) = self.get_type(class_fqn) {
             // Try traits first: their members are mixed into the class/trait body.
             for trait_fqn in &class_sym.traits {
                 let edge_substitutions =
@@ -370,7 +478,11 @@ impl WorkspaceIndex {
         let mut members = Vec::new();
         for entry in self.file_symbols.iter() {
             for sym in &entry.value().symbols {
-                if sym.parent_fqn.as_deref() == Some(type_fqn) {
+                if sym
+                    .parent_fqn
+                    .as_deref()
+                    .is_some_and(|parent| parent.eq_ignore_ascii_case(type_fqn))
+                {
                     members.push(Arc::new(sym.clone()));
                 }
             }
@@ -386,7 +498,7 @@ impl WorkspaceIndex {
         visited: &mut HashSet<String>,
         substitutions: &TemplateSubstitutions,
     ) {
-        if !visited.insert(type_fqn.to_string()) {
+        if !visited.insert(case_insensitive_fqn_key(type_fqn)) {
             return;
         }
 
@@ -399,7 +511,7 @@ impl WorkspaceIndex {
         );
 
         // Recurse into parent classes and interfaces
-        if let Some(class_sym) = self.types.get(type_fqn).map(|r| r.value().clone()) {
+        if let Some(class_sym) = self.get_type(type_fqn) {
             for trait_fqn in &class_sym.traits {
                 let edge_substitutions =
                     self.template_substitutions_for_edge(&class_sym, trait_fqn, substitutions);
@@ -442,11 +554,7 @@ impl WorkspaceIndex {
             return TemplateSubstitutions::new();
         };
 
-        let Some(target) = self
-            .types
-            .get(target_fqn)
-            .map(|entry| entry.value().clone())
-        else {
+        let Some(target) = self.get_type(target_fqn) else {
             return TemplateSubstitutions::new();
         };
 
@@ -675,14 +783,13 @@ impl WorkspaceIndex {
         name: &str,
         visited: &mut Vec<TypeAliasVisit>,
     ) -> Option<TypeInfo> {
-        let class_symbol = self
-            .types
-            .get(class_fqn)
-            .map(|entry| entry.value().clone())?;
-        let file_symbols = self
-            .file_symbols
-            .get(&class_symbol.uri)
-            .map(|entry| entry.value().clone());
+        let class_symbol = self.get_type(class_fqn)?;
+        let file_symbols = self.file_symbols.get(&class_symbol.uri).map(|entry| {
+            entry
+                .value()
+                .scoped_at_byte_position(class_symbol.range.0, class_symbol.range.1)
+                .into_owned()
+        });
         let phpdoc = class_symbol
             .doc_comment
             .as_deref()
@@ -785,11 +892,11 @@ impl WorkspaceIndex {
         types: &mut Vec<Arc<SymbolInfo>>,
         visited: &mut HashSet<String>,
     ) {
-        if !visited.insert(type_fqn.to_string()) {
+        if !visited.insert(case_insensitive_fqn_key(type_fqn)) {
             return;
         }
 
-        let Some(class_sym) = self.types.get(type_fqn).map(|r| r.value().clone()) else {
+        let Some(class_sym) = self.get_type(type_fqn) else {
             return;
         };
         types.push(class_sym.clone());
@@ -807,7 +914,8 @@ impl WorkspaceIndex {
 }
 
 fn same_fqn(left: &str, right: &str) -> bool {
-    left.trim_start_matches('\\') == right.trim_start_matches('\\')
+    left.trim_start_matches('\\')
+        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
 }
 
 fn alias_scope_for_symbol(symbol: &SymbolInfo) -> TypeAliasScope {
@@ -1271,6 +1379,105 @@ mod tests {
     }
 
     #[test]
+    fn test_type_and_function_lookup_is_ascii_case_insensitive_but_constants_are_not() {
+        let index = WorkspaceIndex::new();
+        let class = make_class("MixedCaseClass", r"App\MixedCaseClass", "file:///case.php");
+        let function = make_function(
+            "MixedCaseFunction",
+            r"App\MixedCaseFunction",
+            "file:///case.php",
+        );
+        let mut constant = make_class(
+            "MixedCaseConstant",
+            r"App\MixedCaseConstant",
+            "file:///case.php",
+        );
+        constant.kind = PhpSymbolKind::GlobalConstant;
+
+        index.update_file(
+            "file:///case.php",
+            FileSymbols {
+                symbols: vec![class, function, constant],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            index.resolve_fqn(r"app\mixedcaseclass").unwrap().name,
+            "MixedCaseClass"
+        );
+        assert_eq!(
+            index.resolve_fqn(r"APP\MIXEDCASEFUNCTION").unwrap().name,
+            "MixedCaseFunction"
+        );
+        assert!(index.contains_type(r"APP\MIXEDCASECLASS"));
+        assert_eq!(
+            index.resolve_fqn(r"aPP\MixedCaseConstant").unwrap().name,
+            "MixedCaseConstant"
+        );
+        assert!(index.resolve_fqn(r"App\mixedcaseconstant").is_none());
+        assert!(index.resolve_fqn(r"App\MixedCaseConstant").is_some());
+    }
+
+    #[test]
+    fn test_kind_aware_lookup_distinguishes_class_and_function_with_same_fqn() {
+        let index = WorkspaceIndex::new();
+        let class = make_class("SharedName", r"App\SharedName", "file:///class.php");
+        let function = make_function("sHAREDnAME", r"App\sHAREDnAME", "file:///function.php");
+
+        index.update_file(
+            "file:///class.php",
+            FileSymbols {
+                symbols: vec![class],
+                ..Default::default()
+            },
+        );
+        index.update_file(
+            "file:///function.php",
+            FileSymbols {
+                symbols: vec![function],
+                ..Default::default()
+            },
+        );
+
+        let class = index
+            .resolve_fqn_matching_kinds(r"app\SHAREDNAME", &[PhpSymbolKind::Class])
+            .expect("class lookup should use the type symbol table");
+        assert_eq!(class.name, "SharedName");
+
+        let function = index
+            .resolve_fqn_matching_kinds(r"APP\sharedname", &[PhpSymbolKind::Function])
+            .expect("function lookup should use the function symbol table");
+        assert_eq!(function.name, "sHAREDnAME");
+    }
+
+    #[test]
+    fn test_member_lookup_accepts_owner_casing_without_relaxing_properties() {
+        let index = WorkspaceIndex::new();
+        let class = make_class("Owner", r"App\Owner", "file:///owner.php");
+        let method = make_method("MixedCaseMethod", r"App\Owner", "file:///owner.php");
+        let mut property = make_method("MixedCaseProperty", r"App\Owner", "file:///owner.php");
+        property.kind = PhpSymbolKind::Property;
+        property.fqn = r"App\Owner::$MixedCaseProperty".to_string();
+
+        index.update_file(
+            "file:///owner.php",
+            FileSymbols {
+                symbols: vec![class, method, property],
+                ..Default::default()
+            },
+        );
+
+        assert!(index.resolve_fqn(r"app\owner::MIXEDCASEMETHOD").is_some());
+        assert!(index
+            .resolve_fqn(r"app\owner::$MixedCaseProperty")
+            .is_some());
+        assert!(index
+            .resolve_fqn(r"app\owner::$mixedcaseproperty")
+            .is_none());
+    }
+
+    #[test]
     fn test_remove_file() {
         let index = WorkspaceIndex::new();
         let sym = make_class("Foo", "App\\Foo", "file:///test.php");
@@ -1313,6 +1520,44 @@ mod tests {
             .resolve_fqn("App\\Foo")
             .expect("duplicate FQN remains");
         assert_eq!(found.uri, "file:///b.php");
+    }
+
+    #[test]
+    fn test_remove_file_restores_mixed_kind_class_like_symbol_with_equivalent_fqn() {
+        let index = WorkspaceIndex::new();
+        let class = make_class("Thing", "App\\Thing", "file:///class.php");
+        let mut interface = make_class("THING", "App\\THING", "file:///interface.php");
+        interface.kind = PhpSymbolKind::Interface;
+
+        index.update_file(
+            "file:///class.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                symbols: vec![class],
+                ..Default::default()
+            },
+        );
+        index.update_file(
+            "file:///interface.php",
+            FileSymbols {
+                namespace: Some("App".to_string()),
+                symbols: vec![interface],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            index.resolve_fqn("app\\thing").map(|symbol| symbol.kind),
+            Some(PhpSymbolKind::Interface)
+        );
+
+        index.remove_file("file:///interface.php");
+
+        let restored = index
+            .resolve_fqn("APP\\THING")
+            .expect("class-like symbol from the remaining file must be restored");
+        assert_eq!(restored.kind, PhpSymbolKind::Class);
+        assert_eq!(restored.uri, "file:///class.php");
     }
 
     #[test]

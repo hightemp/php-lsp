@@ -1,13 +1,23 @@
 //! Hover LSP handlers extracted from `server.rs`.
 
 use super::super::*;
+use super::references::local_symbol_for_reference;
 
 impl PhpLspBackend {
     pub(crate) async fn lsp_hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let uri_str = uri.as_str().to_string();
         let original_pos = params.text_document_position_params.position;
-        let template_document = self.template_document(&uri_str);
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            template_document,
+            document_state,
+            file_symbols,
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(None);
+        };
         let pos = if let Some(template) = &template_document {
             match template.map_original_position_to_virtual(original_pos) {
                 Some(pos) => pos,
@@ -19,37 +29,13 @@ impl PhpLspBackend {
         tracing::debug!("hover: {}:{}:{}", uri_str, pos.line, pos.character);
 
         // Extract symbol-at-position and local variable hover info inside a block so DashMap guard is dropped.
-        let (
-            sym_at_pos,
-            local_var_hover,
-            shape_member_hover,
-            call_site_return_type,
-            file_symbols,
-            source,
-        ) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(p) => p,
-                None => return Ok(None),
-            };
-
-            let tree = match parser.tree() {
-                Some(t) => t,
-                None => return Ok(None),
-            };
-
-            let source = parser.source();
+        let (sym_at_pos, local_var_hover, shape_member_hover, call_site_return_type, file_symbols) = {
+            let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
             let utf16_index = Utf16LineIndex::new(&source);
 
-            // Get file symbols for name resolution
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(&uri_str)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_default();
             let type_cache =
-                RequestTypeCache::new(&uri_str, self.current_document_version(&uri_str));
+                RequestTypeCache::new(&uri_str, document_state.map(|state| state.version));
 
             // Build a cross-file type resolver for method chain resolution
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
@@ -126,6 +112,7 @@ impl PhpLspBackend {
                             fqn: variable_name.clone(),
                             name: variable_name,
                             ref_kind: RefKind::Variable,
+                            allows_global_fallback: false,
                             object_expr: None,
                             range: node_range_node(variable_node),
                         }
@@ -139,23 +126,32 @@ impl PhpLspBackend {
                 shape_member_hover,
                 call_site_return_type,
                 file_symbols,
-                source,
             )
         };
 
         // Look up symbol in index (with lazy vendor fallback)
+        let local_symbol_info = local_symbol_for_reference(&file_symbols, &sym_at_pos);
         let symbol_info = match sym_at_pos.ref_kind {
             RefKind::Variable => None, // Variables are local, handled by gotoDefinition.
             _ => {
-                let info = self
-                    .resolve_fqn_lazy_with_fallback(&sym_at_pos.fqn, sym_at_pos.ref_kind)
-                    .await;
+                let info = if local_symbol_info.is_some() {
+                    local_symbol_info
+                } else {
+                    self.resolve_fqn_lazy_with_fallback(
+                        &sym_at_pos.fqn,
+                        sym_at_pos.ref_kind,
+                        sym_at_pos.allows_global_fallback,
+                    )
+                    .await
+                    .filter(|symbol| symbol.uri != uri_str)
+                };
                 // For constructor refs, fall back to the class if __construct is
                 // not explicitly defined.
                 if info.is_none() && sym_at_pos.ref_kind == RefKind::Constructor {
                     if let Some(class_fqn) = sym_at_pos.fqn.strip_suffix("::__construct") {
-                        self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName)
+                        self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName, false)
                             .await
+                            .filter(|symbol| symbol.uri != uri_str)
                     } else {
                         None
                     }
@@ -203,7 +199,7 @@ impl PhpLspBackend {
             // Build hover content
             let mut content = String::new();
             let hover_file_symbols =
-                hover_file_symbols_for_uri(&self.index, &file_symbols, &sym.uri);
+                hover_file_symbols_for_uri(&self.index, &file_symbols, &uri_str, &sym.uri);
             let type_owner_fqn = hover_symbol_type_owner_fqn(&sym);
 
             // Symbol kind label
@@ -357,6 +353,7 @@ impl PhpLspBackend {
                         &hover_file_symbols_for_uri(
                             &self.index,
                             &file_symbols,
+                            &uri_str,
                             &virtual_member.owner.uri,
                         ),
                         &virtual_member,
@@ -373,6 +370,7 @@ impl PhpLspBackend {
                         &hover_file_symbols_for_owner_fqn(
                             &self.index,
                             &file_symbols,
+                            &uri_str,
                             &virtual_member.owner_fqn,
                         ),
                         &virtual_member,
@@ -485,8 +483,12 @@ impl PhpLspBackend {
 fn hover_file_symbols_for_uri(
     index: &WorkspaceIndex,
     fallback: &php_lsp_types::FileSymbols,
+    fallback_uri: &str,
     uri: &str,
 ) -> php_lsp_types::FileSymbols {
+    if uri == fallback_uri {
+        return fallback.clone();
+    }
     index
         .file_symbols
         .get(uri)
@@ -497,11 +499,23 @@ fn hover_file_symbols_for_uri(
 fn hover_file_symbols_for_owner_fqn(
     index: &WorkspaceIndex,
     fallback: &php_lsp_types::FileSymbols,
+    fallback_uri: &str,
     owner_fqn: &str,
 ) -> php_lsp_types::FileSymbols {
+    if fallback.symbols.iter().any(|symbol| {
+        matches!(
+            symbol.kind,
+            php_lsp_types::PhpSymbolKind::Class
+                | php_lsp_types::PhpSymbolKind::Interface
+                | php_lsp_types::PhpSymbolKind::Trait
+                | php_lsp_types::PhpSymbolKind::Enum
+        ) && php_lsp_types::symbol_fqn_eq(&symbol.fqn, owner_fqn, symbol.kind)
+    }) {
+        return fallback.clone();
+    }
     index
         .resolve_fqn(owner_fqn.trim_start_matches('\\'))
-        .map(|symbol| hover_file_symbols_for_uri(index, fallback, &symbol.uri))
+        .map(|symbol| hover_file_symbols_for_uri(index, fallback, fallback_uri, &symbol.uri))
         .unwrap_or_else(|| fallback.clone())
 }
 
@@ -1521,9 +1535,8 @@ fn hover_index_type_symbol(
     type_fqn: &str,
 ) -> Option<php_lsp_types::SymbolInfo> {
     index
-        .types
-        .get(type_fqn.trim_start_matches('\\'))
-        .map(|symbol| symbol.value().as_ref().clone())
+        .get_type(type_fqn)
+        .map(|symbol| symbol.as_ref().clone())
 }
 
 fn append_hover_relation_line(

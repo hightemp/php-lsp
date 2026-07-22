@@ -13,6 +13,7 @@ use php_lsp_types::{
 };
 use serde_json::json;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// PHP keywords for free context.
 const PHP_KEYWORDS: &[&str] = &[
@@ -168,6 +169,7 @@ fn provide_completions_with_current_class(
             member_prefix,
             class_fqn.as_deref(),
             index,
+            file_symbols,
             current_class_fqn,
             *access_mode,
         ),
@@ -180,6 +182,7 @@ fn provide_completions_with_current_class(
             class_expr,
             member_prefix,
             index,
+            file_symbols,
             current_class_fqn,
         ),
         CompletionContext::ArrayKey { .. } => vec![],
@@ -195,12 +198,59 @@ fn provide_completions_with_current_class(
     }
 }
 
+fn completion_members(
+    index: &WorkspaceIndex,
+    file_symbols: &FileSymbols,
+    type_fqn: &str,
+) -> Vec<Arc<SymbolInfo>> {
+    let has_current_type = file_symbols.symbols.iter().any(|symbol| {
+        matches!(
+            symbol.kind,
+            PhpSymbolKind::Class
+                | PhpSymbolKind::Interface
+                | PhpSymbolKind::Trait
+                | PhpSymbolKind::Enum
+        ) && php_lsp_types::symbol_fqn_eq(&symbol.fqn, type_fqn, symbol.kind)
+    });
+    let mut members = index.get_members(type_fqn);
+    if !has_current_type {
+        return members;
+    }
+
+    // The open document is authoritative for direct members of its own type.
+    // Preserve inherited/indexed members, but discard the previous indexed
+    // generation of direct members before adding this parser snapshot.
+    members.retain(|member| {
+        !member.parent_fqn.as_deref().is_some_and(|parent_fqn| {
+            parent_fqn
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case(type_fqn.trim_start_matches('\\'))
+        })
+    });
+    members.extend(
+        file_symbols
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.parent_fqn.as_deref().is_some_and(|parent_fqn| {
+                    parent_fqn
+                        .trim_start_matches('\\')
+                        .eq_ignore_ascii_case(type_fqn.trim_start_matches('\\'))
+                })
+            })
+            .cloned()
+            .map(Arc::new),
+    );
+    members
+}
+
 /// Provide member access completions (`->`).
 fn provide_member_completions(
     object_expr: &str,
     member_prefix: &str,
     inferred_class_fqn: Option<&str>,
     index: &WorkspaceIndex,
+    file_symbols: &FileSymbols,
     current_class_fqn: Option<&str>,
     access_mode: MemberAccessMode,
 ) -> Vec<CompletionItem> {
@@ -219,7 +269,7 @@ fn provide_member_completions(
     };
 
     if let Some(fqn) = class_fqn {
-        let members = index.get_members(&fqn);
+        let members = completion_members(index, file_symbols, &fqn);
         for member in members {
             // Skip static members for instance access
             if member.modifiers.is_static {
@@ -443,6 +493,7 @@ fn provide_static_completions(
     class_expr: &str,
     member_prefix: &str,
     index: &WorkspaceIndex,
+    file_symbols: &FileSymbols,
     current_class_fqn: Option<&str>,
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
@@ -454,7 +505,7 @@ fn provide_static_completions(
 
     let fqn = class_fqn.to_string();
 
-    let members = index.get_members(&fqn);
+    let members = completion_members(index, file_symbols, &fqn);
     for member in members {
         let is_parent_instance_method =
             class_expr == "parent" && member.kind == PhpSymbolKind::Method;
@@ -2199,5 +2250,102 @@ mod tests {
             !labels.contains(&"basePrivate"),
             "parent:: should not expose private parent members"
         );
+    }
+
+    #[test]
+    fn current_file_members_replace_stale_index_generation() {
+        let stale_symbols = FileSymbols {
+            symbols: vec![
+                make_symbol(
+                    "Subject",
+                    "App\\Subject",
+                    PhpSymbolKind::Class,
+                    None,
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "oldMethod",
+                    "App\\Subject::oldMethod",
+                    PhpSymbolKind::Method,
+                    Some("App\\Subject"),
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "oldStatic",
+                    "App\\Subject::oldStatic",
+                    PhpSymbolKind::Method,
+                    Some("App\\Subject"),
+                    Visibility::Public,
+                    true,
+                ),
+            ],
+            ..Default::default()
+        };
+        let current_symbols = FileSymbols {
+            symbols: vec![
+                make_symbol(
+                    "Subject",
+                    "App\\Subject",
+                    PhpSymbolKind::Class,
+                    None,
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "newMethod",
+                    "App\\Subject::newMethod",
+                    PhpSymbolKind::Method,
+                    Some("App\\Subject"),
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "newStatic",
+                    "App\\Subject::newStatic",
+                    PhpSymbolKind::Method,
+                    Some("App\\Subject"),
+                    Visibility::Public,
+                    true,
+                ),
+            ],
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///subject.php", stale_symbols);
+
+        let member_items = provide_completions(
+            &CompletionContext::MemberAccess {
+                object_expr: "$this".to_string(),
+                member_prefix: String::new(),
+                class_fqn: Some("App\\Subject".to_string()),
+                access_mode: MemberAccessMode::Read,
+            },
+            &index,
+            &current_symbols,
+        );
+        let member_labels: Vec<_> = member_items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert!(member_labels.contains(&"newMethod"));
+        assert!(!member_labels.contains(&"oldMethod"));
+
+        let static_items = provide_completions(
+            &CompletionContext::StaticAccess {
+                class_fqn: "App\\Subject".to_string(),
+                class_expr: "self".to_string(),
+                member_prefix: String::new(),
+            },
+            &index,
+            &current_symbols,
+        );
+        let static_labels: Vec<_> = static_items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert!(static_labels.contains(&"newStatic"));
+        assert!(!static_labels.contains(&"oldStatic"));
     }
 }

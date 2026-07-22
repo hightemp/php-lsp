@@ -1147,10 +1147,12 @@ fn infer_twig_context_value_type(
     index: Option<&WorkspaceIndex>,
     php_sources: Option<&TwigContextPhpSourceResolver<'_>>,
 ) -> Option<String> {
+    let position = byte_line_col_at_offset(source, range.0.min(source.len()));
+    let scoped_file_symbols = file_symbols.scoped_at_byte_position(position.0, position.1);
     infer_twig_context_value_type_inner(
         source,
         range,
-        file_symbols,
+        scoped_file_symbols.as_ref(),
         index,
         php_sources,
         &mut HashSet::new(),
@@ -1178,7 +1180,7 @@ fn infer_twig_context_value_type_inner(
         php_sources,
         visited_variables,
     ) {
-        return twig_context_type_info_text(file_symbols, "", &type_info);
+        return Some(type_info.to_string());
     }
     if value.starts_with('[') || value.starts_with("array") {
         if let Some(class_name) = first_new_class_name(value) {
@@ -1663,7 +1665,15 @@ fn twig_context_callable_return_type(
     if let Some(type_start) = signature.rfind(':') {
         let type_text = signature.get(type_start + 1..)?.trim();
         if !type_text.is_empty() {
-            return Some(resolve_twig_context_type_text(file_symbols, type_text));
+            let position = byte_line_col_at_offset(source, start);
+            let scoped_file_symbols = file_symbols.scoped_at_byte_position(position.0, position.1);
+            let owner_fqn =
+                containing_class_fqn_at_offset(source, start, scoped_file_symbols.as_ref());
+            return Some(resolve_twig_context_type_text(
+                scoped_file_symbols.as_ref(),
+                owner_fqn.as_deref().unwrap_or(""),
+                type_text,
+            ));
         }
     }
     None
@@ -1671,19 +1681,13 @@ fn twig_context_callable_return_type(
 
 fn resolve_twig_context_type_text(
     file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
     type_text: &str,
 ) -> String {
     let type_text = type_text.trim();
-    let nullable = type_text.strip_prefix('?');
-    let bare = nullable.unwrap_or(type_text).trim();
-    if bare.is_empty()
-        || bare.contains(['|', '&', '<', '>', '[', ']'])
-        || twig_context_builtin_type_name(bare)
-    {
-        return type_text.to_string();
-    }
-    let resolved = resolve_twig_context_class_name(file_symbols, bare);
-    nullable.map(|_| format!("?{resolved}")).unwrap_or(resolved)
+    twig_context_type_text_to_type_info(type_text)
+        .and_then(|type_info| twig_context_type_info_text(file_symbols, owner_fqn, &type_info))
+        .unwrap_or_else(|| type_text.to_string())
 }
 
 fn merge_twig_context_type_infos(
@@ -1737,16 +1741,15 @@ fn infer_twig_context_array_append_value_type(
         })
         .collect::<Vec<_>>();
     let value_type = merge_twig_context_type_infos(value_types)?;
-    twig_context_type_info_text(
-        file_symbols,
-        "",
-        &php_lsp_types::TypeInfo::Generic {
+    Some(
+        php_lsp_types::TypeInfo::Generic {
             base: "array".to_string(),
             args: vec![
                 php_lsp_types::TypeInfo::Simple("int".to_string()),
                 value_type,
             ],
-        },
+        }
+        .to_string(),
     )
 }
 
@@ -2394,7 +2397,10 @@ fn php_class_string_fqn_at_range(
         return None;
     }
     let class_name = text.get(..suffix_start)?.trim();
-    (!class_name.is_empty()).then(|| resolve_twig_context_class_name(file_symbols, class_name))
+    let position = byte_line_col_at_offset(source, start);
+    let scoped_file_symbols = file_symbols.scoped_at_byte_position(position.0, position.1);
+    (!class_name.is_empty())
+        .then(|| resolve_twig_context_class_name(scoped_file_symbols.as_ref(), class_name))
 }
 
 fn symfony_form_type_fields(
@@ -2427,8 +2433,12 @@ fn symfony_form_type_fields(
                 .symbols
                 .iter()
                 .find(|candidate| {
-                    candidate.fqn == build_form_fqn
-                        && matches!(candidate.kind, php_lsp_types::PhpSymbolKind::Method)
+                    matches!(candidate.kind, php_lsp_types::PhpSymbolKind::Method)
+                        && php_lsp_types::symbol_fqn_eq(
+                            &candidate.fqn,
+                            &build_form_fqn,
+                            candidate.kind,
+                        )
                 })
                 .map(|candidate| candidate.range)
         });
@@ -2440,8 +2450,12 @@ fn symfony_form_type_fields(
                 .symbols
                 .iter()
                 .find(|candidate| {
-                    candidate.fqn == form_type_fqn
-                        && matches!(candidate.kind, php_lsp_types::PhpSymbolKind::Class)
+                    matches!(candidate.kind, php_lsp_types::PhpSymbolKind::Class)
+                        && php_lsp_types::symbol_fqn_eq(
+                            &candidate.fqn,
+                            form_type_fqn,
+                            candidate.kind,
+                        )
                 })
                 .map(|candidate| candidate.range)
         });
@@ -3041,7 +3055,9 @@ fn twig_context_type_info_text_for_symbol(
 ) -> Option<String> {
     let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(fallback_owner_fqn);
     if let Some(symbol_file_symbols) = index.file_symbols.get(&symbol.uri) {
-        return twig_context_type_info_text(&symbol_file_symbols, owner_fqn, type_info);
+        let scoped_file_symbols =
+            symbol_file_symbols.scoped_at_byte_position(symbol.range.0, symbol.range.1);
+        return twig_context_type_info_text(scoped_file_symbols.as_ref(), owner_fqn, type_info);
     }
 
     twig_context_type_info_text(fallback_file_symbols, owner_fqn, type_info)
@@ -3321,32 +3337,9 @@ pub(in crate::server) fn resolve_twig_context_class_name(
     file_symbols: &php_lsp_types::FileSymbols,
     raw_name: &str,
 ) -> String {
-    let raw_name = raw_name.trim_start_matches('\\');
-    if raw_name.contains('\\') {
-        return raw_name.to_string();
-    }
-
-    for use_statement in &file_symbols.use_statements {
-        if use_statement.kind != php_lsp_types::UseKind::Class {
-            continue;
-        }
-        let alias = use_statement.alias.as_deref().unwrap_or_else(|| {
-            use_statement
-                .fqn
-                .rsplit('\\')
-                .next()
-                .unwrap_or(use_statement.fqn.as_str())
-        });
-        if alias == raw_name {
-            return use_statement.fqn.clone();
-        }
-    }
-
-    file_symbols
-        .namespace
-        .as_ref()
-        .map(|namespace| format!("{namespace}\\{raw_name}"))
-        .unwrap_or_else(|| raw_name.to_string())
+    resolve_class_name_pub(raw_name, file_symbols)
+        .trim_start_matches('\\')
+        .to_string()
 }
 
 pub(in crate::server) fn find_top_level_double_arrow(
@@ -4451,14 +4444,65 @@ fn symfony_user_class_score(fqn: &str) -> u8 {
     }
 }
 
+struct OpenTemplateRefreshSnapshot<'a> {
+    uri: &'a str,
+    state: OpenDocumentState,
+    document: &'a TemplateDocument,
+}
+
+fn replace_open_template_if_current(
+    snapshot: OpenTemplateRefreshSnapshot<'_>,
+    parser: FileParser,
+    template: TemplateDocument,
+    open_files: &DashMap<String, FileParser>,
+    template_documents: &DashMap<String, TemplateDocument>,
+    document_versions: &DashMap<String, OpenDocumentState>,
+) -> bool {
+    let dashmap::mapref::entry::Entry::Occupied(mut open_entry) =
+        open_files.entry(snapshot.uri.to_string())
+    else {
+        return false;
+    };
+    if document_versions.get(snapshot.uri).map(|current| *current) != Some(snapshot.state) {
+        return false;
+    }
+    let Some(current_template) = template_documents.get(snapshot.uri) else {
+        return false;
+    };
+    if !current_template.has_same_source_and_twig_context(snapshot.document) {
+        return false;
+    }
+    drop(current_template);
+
+    // Keep the parser entry locked until the refreshed virtual document and
+    // parser are committed. Concurrent document writers use the same entry.
+    template_documents.insert(snapshot.uri.to_string(), template);
+    open_entry.insert(parser);
+    true
+}
+
+pub(in crate::server) struct OpenTwigContextRefreshState<'a> {
+    pub(in crate::server) open_files: &'a Arc<DashMap<String, FileParser>>,
+    pub(in crate::server) template_documents: &'a Arc<DashMap<String, TemplateDocument>>,
+    pub(in crate::server) document_versions: &'a Arc<DashMap<String, OpenDocumentState>>,
+    pub(in crate::server) index: &'a Arc<WorkspaceIndex>,
+    pub(in crate::server) workspace_roots: &'a [PathBuf],
+    pub(in crate::server) twig_context_disk_cache: &'a Arc<Mutex<TwigContextDiskCache>>,
+    pub(in crate::server) semantic_tokens_cache: &'a Arc<Mutex<SemanticTokensCache>>,
+}
+
 pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
-    open_files: &Arc<DashMap<String, FileParser>>,
-    template_documents: &Arc<DashMap<String, TemplateDocument>>,
-    index: &Arc<WorkspaceIndex>,
-    workspace_roots: &[PathBuf],
-    twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
-    semantic_tokens_cache: &Arc<Mutex<SemanticTokensCache>>,
+    state: OpenTwigContextRefreshState<'_>,
 ) -> Vec<String> {
+    let OpenTwigContextRefreshState {
+        open_files,
+        template_documents,
+        document_versions,
+        index,
+        workspace_roots,
+        twig_context_disk_cache,
+        semantic_tokens_cache,
+    } = state;
     let mut candidates: Vec<_> = template_documents
         .iter()
         .filter_map(|entry| {
@@ -4487,6 +4531,9 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         if template.kind() != TemplateKind::Twig {
             continue;
         }
+        let Some(state) = document_versions.get(&uri_str).map(|current| *current) else {
+            continue;
+        };
 
         let variable_types = twig_variable_types_for_template_state(
             &uri_str,
@@ -4500,8 +4547,21 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         let refreshed_template = template.with_twig_variable_types(&variable_types);
         let mut parser = FileParser::new();
         parser.parse_full(refreshed_template.virtual_source());
-        template_documents.insert(uri_str.clone(), refreshed_template);
-        open_files.insert(uri_str.clone(), parser);
+        let replaced = replace_open_template_if_current(
+            OpenTemplateRefreshSnapshot {
+                uri: &uri_str,
+                state,
+                document: &template,
+            },
+            parser,
+            refreshed_template,
+            open_files,
+            template_documents,
+            document_versions,
+        );
+        if !replaced {
+            continue;
+        }
         index.remove_file(&uri_str);
         semantic_tokens_cache.lock().await.remove(&uri_str);
         refreshed.push(uri_str);
@@ -4553,14 +4613,15 @@ impl PhpLspBackend {
 
     pub(in crate::server) async fn refresh_open_twig_contexts(&self) -> Vec<String> {
         let roots = self.current_workspace_roots().await;
-        refresh_open_twig_contexts_for_state(
-            &self.open_files,
-            &self.template_documents,
-            &self.index,
-            &roots,
-            &self.twig_context_disk_cache,
-            &self.semantic_tokens_cache,
-        )
+        refresh_open_twig_contexts_for_state(OpenTwigContextRefreshState {
+            open_files: &self.open_files,
+            template_documents: &self.template_documents,
+            document_versions: &self.document_versions,
+            index: &self.index,
+            workspace_roots: &roots,
+            twig_context_disk_cache: &self.twig_context_disk_cache,
+            semantic_tokens_cache: &self.semantic_tokens_cache,
+        })
         .await
     }
 
@@ -4595,6 +4656,236 @@ impl PhpLspBackend {
 mod tests {
     use super::*;
 
+    fn parse_test_file_symbols(source: &str, uri: &str) -> php_lsp_types::FileSymbols {
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        let tree = parser.tree().expect("test PHP should parse");
+        extract_file_symbols(tree, source, uri)
+    }
+
+    #[test]
+    fn stale_twig_context_refresh_cannot_replace_reopened_document() {
+        let uri = "file:///workspace/templates/page.html.twig";
+        let stale_source = "{{ stale }}";
+        let current_source = "{{ current }}";
+        let stale_template = preprocess_twig_template(stale_source, &[]);
+        let current_template = preprocess_twig_template(current_source, &[]);
+        let mut stale_parser = FileParser::new();
+        stale_parser.parse_full(stale_template.virtual_source());
+        let mut current_parser = FileParser::new();
+        current_parser.parse_full(current_template.virtual_source());
+
+        let open_files = DashMap::new();
+        open_files.insert(uri.to_string(), current_parser);
+        let template_documents = DashMap::new();
+        template_documents.insert(uri.to_string(), current_template);
+        let document_versions = DashMap::new();
+        document_versions.insert(
+            uri.to_string(),
+            OpenDocumentState {
+                version: 1,
+                generation: 1,
+            },
+        );
+
+        assert!(!replace_open_template_if_current(
+            OpenTemplateRefreshSnapshot {
+                uri,
+                state: OpenDocumentState {
+                    version: 1,
+                    generation: 1,
+                },
+                document: &stale_template,
+            },
+            stale_parser,
+            stale_template.clone(),
+            &open_files,
+            &template_documents,
+            &document_versions,
+        ));
+        assert_eq!(
+            template_documents
+                .get(uri)
+                .expect("current template should remain open")
+                .original_source(),
+            current_source
+        );
+    }
+
+    #[test]
+    fn stale_twig_refresh_cannot_cross_reopen_with_reused_lsp_version() {
+        let uri = "file:///workspace/templates/reopened.html.twig";
+        let source = "{{ value }}";
+        let stale_template = preprocess_twig_template(source, &[]);
+        let current_template = preprocess_twig_template(source, &[]);
+        let mut stale_parser = FileParser::new();
+        stale_parser.parse_full(stale_template.virtual_source());
+        let mut current_parser = FileParser::new();
+        current_parser.parse_full(current_template.virtual_source());
+        let open_files = DashMap::new();
+        open_files.insert(uri.to_string(), current_parser);
+        let template_documents = DashMap::new();
+        template_documents.insert(uri.to_string(), current_template);
+        let document_versions = DashMap::new();
+        document_versions.insert(
+            uri.to_string(),
+            OpenDocumentState {
+                version: 1,
+                generation: 2,
+            },
+        );
+
+        assert!(!replace_open_template_if_current(
+            OpenTemplateRefreshSnapshot {
+                uri,
+                state: OpenDocumentState {
+                    version: 1,
+                    generation: 1,
+                },
+                document: &stale_template,
+            },
+            stale_parser,
+            stale_template.clone(),
+            &open_files,
+            &template_documents,
+            &document_versions,
+        ));
+    }
+
+    #[test]
+    fn stale_twig_context_refresh_cannot_replace_newer_document_version() {
+        let uri = "file:///workspace/templates/versioned.html.twig";
+        let source = "{{ value }}";
+        let refreshed_template = preprocess_twig_template(source, &[]);
+        let current_template = preprocess_twig_template(source, &[]);
+        let mut refreshed_parser = FileParser::new();
+        refreshed_parser.parse_full(refreshed_template.virtual_source());
+        let mut current_parser = FileParser::new();
+        current_parser.parse_full(current_template.virtual_source());
+
+        let open_files = DashMap::new();
+        open_files.insert(uri.to_string(), current_parser);
+        let template_documents = DashMap::new();
+        template_documents.insert(uri.to_string(), current_template);
+        let document_versions = DashMap::new();
+        document_versions.insert(
+            uri.to_string(),
+            OpenDocumentState {
+                version: 2,
+                generation: 1,
+            },
+        );
+
+        assert!(!replace_open_template_if_current(
+            OpenTemplateRefreshSnapshot {
+                uri,
+                state: OpenDocumentState {
+                    version: 1,
+                    generation: 1,
+                },
+                document: &refreshed_template,
+            },
+            refreshed_parser,
+            refreshed_template.clone(),
+            &open_files,
+            &template_documents,
+            &document_versions,
+        ));
+        assert_eq!(
+            document_versions.get(uri).map(|state| state.version),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn older_twig_context_refresh_cannot_replace_newer_context_generation() {
+        let uri = "file:///workspace/templates/context.html.twig";
+        let source = "{{ value.name }}";
+        let older_template = preprocess_twig_template(
+            source,
+            &[TemplateVariableType {
+                name: "value".to_string(),
+                type_text: "array{name: string}".to_string(),
+                shape_definitions: vec![TemplateShapeKeyDefinition {
+                    target: TemplateShapeDefinitionTarget::Direct,
+                    path: vec!["name".to_string()],
+                    uri: "file:///workspace/old.php".to_string(),
+                    range: (1, 2, 1, 6),
+                }],
+            }],
+        );
+        let newer_template = preprocess_twig_template(
+            source,
+            &[TemplateVariableType {
+                name: "value".to_string(),
+                type_text: "array{name: string}".to_string(),
+                shape_definitions: vec![TemplateShapeKeyDefinition {
+                    target: TemplateShapeDefinitionTarget::Direct,
+                    path: vec!["name".to_string()],
+                    uri: "file:///workspace/new.php".to_string(),
+                    range: (8, 4, 8, 8),
+                }],
+            }],
+        );
+        let older_virtual_source = older_template.virtual_source().to_string();
+        let newer_virtual_source = newer_template.virtual_source().to_string();
+        assert_eq!(
+            older_virtual_source, newer_virtual_source,
+            "definition metadata should not affect generated PHP"
+        );
+
+        let mut older_parser = FileParser::new();
+        older_parser.parse_full(older_template.virtual_source());
+        let mut newer_parser = FileParser::new();
+        newer_parser.parse_full(newer_template.virtual_source());
+        let open_files = DashMap::new();
+        open_files.insert(uri.to_string(), newer_parser);
+        let template_documents = DashMap::new();
+        template_documents.insert(uri.to_string(), newer_template);
+        let document_versions = DashMap::new();
+        document_versions.insert(
+            uri.to_string(),
+            OpenDocumentState {
+                version: 1,
+                generation: 1,
+            },
+        );
+
+        assert!(!replace_open_template_if_current(
+            OpenTemplateRefreshSnapshot {
+                uri,
+                state: OpenDocumentState {
+                    version: 1,
+                    generation: 1,
+                },
+                document: &older_template,
+            },
+            older_parser,
+            older_template.clone(),
+            &open_files,
+            &template_documents,
+            &document_versions,
+        ));
+        assert_eq!(
+            template_documents
+                .get(uri)
+                .expect("newer context should remain open")
+                .virtual_source(),
+            newer_virtual_source
+        );
+        let definition = template_documents
+            .get(uri)
+            .expect("newer context should remain open")
+            .twig_shape_key_definition(
+                "value",
+                TemplateShapeDefinitionTarget::Direct,
+                &["name".to_string()],
+            )
+            .expect("newer shape definition");
+        assert_eq!(definition.uri.as_str(), "file:///workspace/new.php");
+        assert_eq!(definition.range.start, Position::new(8, 4));
+    }
+
     #[test]
     fn infers_nested_literal_array_shape_type_for_twig_context() {
         let source = concat!(
@@ -4612,6 +4903,53 @@ mod tests {
         assert_eq!(
             type_text,
             "array{encryption: array{temp_dir_path: string, enabled: bool}, sftp: array{host: string, port: int}}"
+        );
+    }
+
+    #[test]
+    fn resolves_imported_complex_callback_return_in_literal_array_context() {
+        let source = concat!(
+            "<?php\n",
+            "namespace App\\Controller;\n",
+            "use App\\Dto\\FirstResult as Foo;\n",
+            "use App\\Dto\\SecondResult as Bar;\n",
+            "final class ReportController\n",
+            "{\n",
+            "    public function show(): void\n",
+            "    {\n",
+            "        $this->render('report.html.twig', [\n",
+            "            'items' => array_map(\n",
+            "                fn (mixed $value): Foo|Bar|self => $value,\n",
+            "                [],\n",
+            "            ),\n",
+            "        ]);\n",
+            "    }\n",
+            "}\n",
+        );
+        let uri = "file:///workspace/src/Controller/ReportController.php";
+        let file_symbols = parse_test_file_symbols(source, uri);
+        let context_key = source.find("'items'").expect("render context key");
+        let context_start = source[..context_key]
+            .rfind('[')
+            .expect("render context start");
+        let context_end = context_start
+            + source[context_start..]
+                .find("]);")
+                .expect("render context end")
+            + 1;
+
+        let type_text = infer_twig_context_value_type(
+            source,
+            (context_start, context_end),
+            &file_symbols,
+            None,
+            None,
+        )
+        .expect("literal array callback type");
+
+        assert_eq!(
+            type_text,
+            "array{items: array<int, App\\Dto\\FirstResult|App\\Dto\\SecondResult|App\\Controller\\ReportController>}"
         );
     }
 
@@ -4641,6 +4979,93 @@ mod tests {
         assert_eq!(
             type_text,
             "array<int, array{nr: string, code: string, description: string}>"
+        );
+    }
+
+    #[test]
+    fn resolves_imported_complex_callback_return_in_appended_array_context() {
+        let source = concat!(
+            "<?php\n",
+            "namespace App\\Controller;\n",
+            "use App\\Dto\\FirstResult as Foo;\n",
+            "use App\\Dto\\SecondResult as Bar;\n",
+            "final class ReportController\n",
+            "{\n",
+            "    public function show(): void\n",
+            "    {\n",
+            "        $items = [];\n",
+            "        $items[] = array_map(\n",
+            "            static fn (mixed $value): Foo|Bar|static => $value,\n",
+            "            [],\n",
+            "        );\n",
+            "        $this->render('report.html.twig', ['items' => $items]);\n",
+            "    }\n",
+            "}\n",
+        );
+        let uri = "file:///workspace/src/Controller/ReportController.php";
+        let file_symbols = parse_test_file_symbols(source, uri);
+        let value_start = source.rfind("$items").expect("render variable usage");
+        let mut visited_variables = HashSet::new();
+
+        let type_text = infer_twig_context_assignment_value_type(
+            source,
+            value_start,
+            "items",
+            &file_symbols,
+            None,
+            None,
+            &mut visited_variables,
+        )
+        .expect("appended array callback type");
+
+        assert_eq!(
+            type_text,
+            "array<int, array<int, App\\Dto\\FirstResult|App\\Dto\\SecondResult|App\\Controller\\ReportController>>"
+        );
+    }
+
+    #[test]
+    fn resolves_external_symbol_type_in_its_namespace_scope() {
+        let source = concat!(
+            "<?php\n",
+            "namespace First\\Space;\n",
+            "use Vendor\\FirstResult as SharedResult;\n",
+            "class FirstService\n",
+            "{\n",
+            "    public function result(): SharedResult|self {}\n",
+            "}\n",
+            "namespace Second\\Space;\n",
+            "use Vendor\\SecondResult as SharedResult;\n",
+            "class SecondService\n",
+            "{\n",
+            "    public function result(): SharedResult|self {}\n",
+            "}\n",
+        );
+        let uri = "file:///workspace/src/MultiNamespaceServices.php";
+        let file_symbols = parse_test_file_symbols(source, uri);
+        let symbol = file_symbols
+            .symbols
+            .iter()
+            .find(|symbol| symbol.fqn == "Second\\Space\\SecondService::result")
+            .cloned()
+            .expect("second namespace method");
+        let return_type =
+            symbol_effective_return_type(&symbol).expect("second namespace return type");
+        let index = WorkspaceIndex::new();
+        index.update_file(uri, file_symbols);
+
+        let type_text = twig_context_type_info_text_for_symbol(
+            &index,
+            &php_lsp_types::FileSymbols::default(),
+            &symbol,
+            "",
+            &return_type,
+        )
+        .expect("scoped external symbol type");
+
+        assert_eq!(
+            type_text,
+            "Vendor\\SecondResult|Second\\Space\\SecondService"
         );
     }
 

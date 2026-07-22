@@ -45,8 +45,8 @@ namespace App;
 
 class Demo {
     public function run(): void {
-        new Bar();
-        helper();
+        new bAr();
+        HELPER();
     }
 }
 "#;
@@ -66,7 +66,7 @@ class Demo {
         },
         "severity": 2,
         "source": "php-lsp",
-        "message": "Unknown class: App\\Bar"
+        "message": "Unknown class: App\\bAr"
     }]);
     let class_resp = service
         .ready()
@@ -100,7 +100,7 @@ class Demo {
         },
         "severity": 2,
         "source": "php-lsp",
-        "message": "Unknown function: App\\helper"
+        "message": "Unknown function: App\\HELPER"
     }]);
     let function_resp = service
         .ready()
@@ -196,6 +196,464 @@ class ConflictDemo {
             .any(|edit| edit["newText"].as_str() == Some("BarImport")),
         "expected usage replacement with alias, got: {}",
         conflict_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_add_use_is_scoped_to_bracketed_namespace() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_uri = "file:///test/BracketedVendor.php";
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+class Bar {}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let app_uri = "file:///test/BracketedAddUse.php";
+    let app_code = r#"<?php
+namespace First {
+    use Other\Bar;
+
+    class FirstDemo {}
+}
+
+namespace Second {
+    function make(): object {
+        return new Bar();
+    }
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(app_uri, app_code))
+        .await
+        .unwrap();
+
+    let diagnostic = json!([{
+        "range": {
+            "start": { "line": 9, "character": 19 },
+            "end": { "line": 9, "character": 22 }
+        },
+        "severity": 2,
+        "source": "php-lsp",
+        "message": "Unknown class: Second\\Bar"
+    }]);
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(2, app_uri, 9, 19, 9, 22, diagnostic))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let action = result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Import Vendor\\Bar")
+        })
+        .unwrap_or_else(|| panic!("expected unaliased scoped import action, got: {result}"));
+    let edits = action["edit"]["changes"][app_uri]
+        .as_array()
+        .expect("import edits");
+    assert!(
+        edits.iter().any(|edit| {
+            edit["range"]["start"]["line"].as_u64() == Some(8)
+                && edit["newText"].as_str() == Some("use Vendor\\Bar;\n\n")
+        }),
+        "expected import inside the second bracketed namespace, got: {action}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_add_use_uses_active_repeated_unbracketed_alias() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_uri = "file:///test/RepeatedAliasVendor.php";
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+class Bar {}
+class Baz {}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let app_uri = "file:///test/RepeatedAliasAddUse.php";
+    let app_code = r#"<?php
+namespace First;
+use Vendor\Bar as FirstBar;
+use Other\Baz;
+
+namespace Second;
+use Vendor\Bar as SecondBar;
+
+function make(): array {
+    return [new Bar(), new Baz()];
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(app_uri, app_code))
+        .await
+        .unwrap();
+
+    let bar_diagnostic = json!([{
+        "range": {
+            "start": { "line": 9, "character": 16 },
+            "end": { "line": 9, "character": 19 }
+        },
+        "severity": 2,
+        "source": "php-lsp",
+        "message": "Unknown class: Second\\Bar"
+    }]);
+    let bar_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(
+            2,
+            app_uri,
+            9,
+            16,
+            9,
+            19,
+            bar_diagnostic,
+        ))
+        .await
+        .unwrap();
+    let bar_result = extract_result(bar_response);
+    let bar_action = bar_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Import Vendor\\Bar as SecondBar")
+        })
+        .unwrap_or_else(|| panic!("expected alias from the active namespace, got: {bar_result}"));
+    let bar_edits = bar_action["edit"]["changes"][app_uri]
+        .as_array()
+        .expect("alias replacement edits");
+    assert_eq!(bar_edits.len(), 1, "existing active import must be reused");
+    assert_eq!(bar_edits[0]["newText"].as_str(), Some("SecondBar"));
+
+    let baz_diagnostic = json!([{
+        "range": {
+            "start": { "line": 9, "character": 27 },
+            "end": { "line": 9, "character": 30 }
+        },
+        "severity": 2,
+        "source": "php-lsp",
+        "message": "Unknown class: Second\\Baz"
+    }]);
+    let baz_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(
+            3,
+            app_uri,
+            9,
+            27,
+            9,
+            30,
+            baz_diagnostic,
+        ))
+        .await
+        .unwrap();
+    let baz_result = extract_result(baz_response);
+    let baz_action = baz_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Import Vendor\\Baz")
+        })
+        .unwrap_or_else(|| panic!("expected other-scope alias to be ignored, got: {baz_result}"));
+    let baz_edits = baz_action["edit"]["changes"][app_uri]
+        .as_array()
+        .expect("import edits");
+    assert!(
+        baz_edits.iter().any(|edit| {
+            edit["range"]["start"]["line"].as_u64() == Some(7)
+                && edit["newText"].as_str() == Some("use Vendor\\Baz;\n")
+        }),
+        "expected insertion after the active namespace imports, got: {baz_action}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_code_action_add_const_uses_scoped_case_sensitive_collisions() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let vendor_uri = "file:///test/ConstantVendor.php";
+    let vendor_code = r#"<?php
+namespace Vendor;
+
+const FLAG = true;
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(vendor_uri, vendor_code))
+        .await
+        .unwrap();
+
+    let app_uri = "file:///test/ScopedConstantAddUse.php";
+    let app_code = r#"<?php
+namespace Previous {
+    const FLAG = false;
+}
+
+namespace ActiveSame {
+    const FLAG = false;
+    echo FLAG;
+}
+
+namespace ActiveDifferent {
+    const flag = false;
+    echo FLAG;
+}
+
+namespace ActiveMissing {
+    echo flag;
+}
+"#;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(app_uri, app_code))
+        .await
+        .unwrap();
+
+    let same_case_diagnostic = json!([{
+        "range": {
+            "start": { "line": 7, "character": 9 },
+            "end": { "line": 7, "character": 13 }
+        },
+        "severity": 2,
+        "source": "php-lsp",
+        "message": "Unknown constant: ActiveSame\\FLAG"
+    }]);
+    let same_case_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(
+            2,
+            app_uri,
+            7,
+            9,
+            7,
+            13,
+            same_case_diagnostic,
+        ))
+        .await
+        .unwrap();
+    let same_case_result = extract_result(same_case_response);
+    let same_case_action = same_case_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str())
+                == Some("Import Vendor\\FLAG as FLAGImport")
+        })
+        .unwrap_or_else(|| {
+            panic!("expected same-case local constant to force an alias, got: {same_case_result}")
+        });
+    let same_case_edits = same_case_action["edit"]["changes"][app_uri]
+        .as_array()
+        .expect("constant import edits");
+    assert!(same_case_edits.iter().any(|edit| {
+        edit["newText"].as_str() == Some("use const Vendor\\FLAG as FLAGImport;\n\n")
+    }));
+    assert!(same_case_edits
+        .iter()
+        .any(|edit| edit["newText"].as_str() == Some("FLAGImport")));
+
+    let different_case_diagnostic = json!([{
+        "range": {
+            "start": { "line": 12, "character": 9 },
+            "end": { "line": 12, "character": 13 }
+        },
+        "severity": 2,
+        "source": "php-lsp",
+        "message": "Unknown constant: ActiveDifferent\\FLAG"
+    }]);
+    let different_case_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(
+            3,
+            app_uri,
+            12,
+            9,
+            12,
+            13,
+            different_case_diagnostic,
+        ))
+        .await
+        .unwrap();
+    let different_case_result = extract_result(different_case_response);
+    let different_case_action = different_case_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Import Vendor\\FLAG")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected differently-cased and other-scope constants not to collide, got: {different_case_result}"
+            )
+        });
+    let different_case_edits = different_case_action["edit"]["changes"][app_uri]
+        .as_array()
+        .expect("constant import edits");
+    assert!(different_case_edits.iter().any(|edit| {
+        edit["range"]["start"]["line"].as_u64() == Some(11)
+            && edit["newText"].as_str() == Some("use const Vendor\\FLAG;\n\n")
+    }));
+    assert!(!different_case_edits
+        .iter()
+        .any(|edit| edit["newText"].as_str() == Some("FLAGImport")));
+
+    let mismatched_candidate_diagnostic = json!([{
+        "range": {
+            "start": { "line": 16, "character": 9 },
+            "end": { "line": 16, "character": 13 }
+        },
+        "severity": 2,
+        "source": "php-lsp",
+        "message": "Unknown constant: ActiveMissing\\flag"
+    }]);
+    let mismatched_candidate_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(
+            4,
+            app_uri,
+            16,
+            9,
+            16,
+            13,
+            mismatched_candidate_diagnostic,
+        ))
+        .await
+        .unwrap();
+    let mismatched_candidate_result = extract_result(mismatched_candidate_response);
+    assert!(
+        mismatched_candidate_result
+            .as_array()
+            .expect("code actions array")
+            .iter()
+            .all(|action| {
+                action.get("title").and_then(|value| value.as_str())
+                    != Some("Import Vendor\\FLAG")
+            }),
+        "global constant candidates must remain identifier-case-sensitive: {mismatched_candidate_result}"
     );
 
     service
@@ -2682,6 +3140,80 @@ class Demo {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_organize_imports_ignores_import_target_references_for_unused_imports() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+namespace App;
+
+use Vendor\UnusedClass;
+use Vendor\UnusedAliasedClass as ClassAlias;
+use function Vendor\unused_function;
+use function Vendor\unused_aliased_function as function_alias;
+use const Vendor\UNUSED_CONST;
+use const Vendor\UNUSED_ALIASED_CONST as CONST_ALIAS;
+
+class Demo {}
+"#;
+    let uri = "file:///test/OrganizeUnusedImportTargets.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(organize_imports_request(2, uri))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let organize_action = result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Organize imports")
+        })
+        .unwrap_or_else(|| panic!("expected Organize imports action: {result}"));
+    assert_eq!(
+        organize_action["edit"]["changes"][uri][0]["newText"].as_str(),
+        Some(""),
+        "explicit and implicit class/function/const import targets must not count as usages"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_action_organize_imports_uses_semantic_references_and_phpdoc_types() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -2716,7 +3248,7 @@ use const Vendor\RUNTIME_CONST;
 
 class Demo {
     /**
-     * @param DocAlias $value
+     * @param dOcAlIaS $value
      * @param string $label DocTextOnly appears only in prose.
      */
     public function run(Runtime $runtime, $value, string $label): void {

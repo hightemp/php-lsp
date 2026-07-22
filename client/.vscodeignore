@@ -9,6 +9,8 @@
 !LICENSE
 !CHANGELOG.md
 !images/
+!language-configuration.json
+!twig-language-configuration.json
 
 # Exclude dev/build files
 src/**

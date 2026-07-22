@@ -15,32 +15,17 @@ impl PhpLspBackend {
     ) -> Result<Option<Vec<InlayHint>>> {
         let uri_str = params.text_document.uri.as_str().to_string();
         let php_version = *self.php_version.lock().await;
-        let template_document = self.template_document(&uri_str);
-
-        let (tree, source, file_symbols, document_version) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(parser) => parser,
-                None => return Ok(None),
-            };
-            let tree = match parser.tree() {
-                Some(tree) => tree.clone(),
-                None => return Ok(None),
-            };
-            let source = parser.source();
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(&uri_str)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_else(|| extract_file_symbols(&tree, &source, &uri_str));
-
-            (
-                tree,
-                source,
-                file_symbols,
-                self.current_document_version(&uri_str),
-            )
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            template_document,
+            document_state,
+            file_symbols,
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(None);
         };
+        let document_version = document_state.map(|state| state.version);
 
         let index = self.index.clone();
         let original_requested_range = params.range;
@@ -226,6 +211,23 @@ pub(in crate::server) struct InlayHintContext<'a> {
     pub(in crate::server) requested_range: (u32, u32, u32, u32),
     pub(in crate::server) allow_twig_property_accessors: bool,
     pub(in crate::server) allow_blocking_file_io: bool,
+}
+
+fn inlay_context_with_file_symbols<'a>(
+    ctx: &'a InlayHintContext<'_>,
+    file_symbols: &'a php_lsp_types::FileSymbols,
+) -> InlayHintContext<'a> {
+    InlayHintContext {
+        tree: ctx.tree,
+        source: ctx.source,
+        file_symbols,
+        index: ctx.index,
+        type_cache: ctx.type_cache,
+        utf16_index: ctx.utf16_index,
+        requested_range: ctx.requested_range,
+        allow_twig_property_accessors: ctx.allow_twig_property_accessors,
+        allow_blocking_file_io: ctx.allow_blocking_file_io,
+    }
 }
 
 pub(in crate::server) fn collect_scope_end_inlay_hints(
@@ -682,6 +684,11 @@ pub(in crate::server) fn local_variable_inlay_type(
         "local-variable-inlay",
         format!("{variable_name}:{usage_start}"),
         || {
+            let start = variable_node.start_position();
+            let scoped_file_symbols = ctx
+                .file_symbols
+                .scoped_at_byte_position(start.row as u32, start.column as u32);
+            let scoped_ctx = inlay_context_with_file_symbols(ctx, scoped_file_symbols.as_ref());
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 ctx.type_cache.cached_string(
                     (0, 0, 0, 0),
@@ -693,14 +700,14 @@ pub(in crate::server) fn local_variable_inlay_type(
             let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
                 resolve_callable_parameter_type_from_index(
                     ctx.index,
-                    ctx.file_symbols,
+                    scoped_file_symbols.as_ref(),
                     callable_ctx,
                 )
             };
             let parser_info = infer_variable_hover_info_at_node_with_resolvers(
                 variable_node,
                 ctx.source,
-                ctx.file_symbols,
+                scoped_file_symbols.as_ref(),
                 usage_start,
                 variable_name,
                 Some(&resolver),
@@ -711,7 +718,8 @@ pub(in crate::server) fn local_variable_inlay_type(
             let allow_scalar = is_foreach_variable;
 
             if is_foreach_variable {
-                if let Some(type_hint) = foreach_variable_inlay_type_from_index(ctx, variable_node)
+                if let Some(type_hint) =
+                    foreach_variable_inlay_type_from_index(&scoped_ctx, variable_node)
                 {
                     return Some(type_hint);
                 }
@@ -719,27 +727,36 @@ pub(in crate::server) fn local_variable_inlay_type(
 
             if let Some(type_hint) = parser_info.as_ref().and_then(|info| {
                 info.phpdoc_comment.as_ref().and_then(|_| {
-                    local_variable_type_from_hover_info(info, ctx.file_symbols, allow_scalar)
+                    local_variable_type_from_hover_info(
+                        info,
+                        scoped_file_symbols.as_ref(),
+                        allow_scalar,
+                    )
                 })
             }) {
                 return Some(type_hint);
             }
 
             if let Some(type_hint) =
-                rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs))
+                rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(&scoped_ctx, rhs))
             {
                 return Some(type_hint);
             }
 
             if !is_foreach_variable {
-                if let Some(type_hint) = foreach_variable_inlay_type_from_index(ctx, variable_node)
+                if let Some(type_hint) =
+                    foreach_variable_inlay_type_from_index(&scoped_ctx, variable_node)
                 {
                     return Some(type_hint);
                 }
             }
 
             parser_info.as_ref().and_then(|info| {
-                local_variable_type_from_hover_info(info, ctx.file_symbols, allow_scalar)
+                local_variable_type_from_hover_info(
+                    info,
+                    scoped_file_symbols.as_ref(),
+                    allow_scalar,
+                )
             })
         },
     )
@@ -1032,7 +1049,7 @@ pub(in crate::server) fn indexed_call_expression_type_info(
         .rsplit_once("::")
         .map(|(owner, _)| owner.to_string())
         .or_else(|| symbol.parent_fqn.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| symbol.fqn.clone());
     let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
     let type_info =
         doctrine_collection_getter_return_type_info(ctx, &symbol, &owner_fqn, &type_info)
@@ -1146,6 +1163,7 @@ pub(in crate::server) fn server_member_symbol_at_position(
                     fqn: symbol.fqn.clone(),
                     name: member_name.to_string(),
                     ref_kind,
+                    allows_global_fallback: false,
                     object_expr: Some(node_text(ctx.source, object).trim().to_string()),
                     range: node_range_node(name_node),
                 });
@@ -1164,6 +1182,7 @@ pub(in crate::server) fn server_member_symbol_at_position(
                     fqn: symbol.fqn.clone(),
                     name: method_name,
                     ref_kind: RefKind::MethodCall,
+                    allows_global_fallback: false,
                     object_expr: candidate
                         .child_by_field_name("object")
                         .map(|object| node_text(ctx.source, object).trim().to_string()),
@@ -1413,7 +1432,11 @@ pub(in crate::server) fn server_expression_type_info(
         "object_creation_expression" => {
             let class_node = object_creation_class_node(expression)?;
             let class_name = node_text(ctx.source, class_node).trim();
-            let fqn = resolve_class_name_pub(class_name, ctx.file_symbols)
+            let start = class_node.start_position();
+            let scoped_file_symbols = ctx
+                .file_symbols
+                .scoped_at_byte_position(start.row as u32, start.column as u32);
+            let fqn = resolve_class_name_pub(class_name, scoped_file_symbols.as_ref())
                 .trim_start_matches('\\')
                 .to_string();
             if fqn.is_empty() {
@@ -1555,7 +1578,11 @@ pub(in crate::server) fn doctrine_get_repository_entity_fqn(
 
     let first_arg = call_arguments(object, ctx.source).into_iter().next()?;
     let raw = node_text(ctx.source, first_arg.value_node);
-    class_string_fqn_from_expression_text(raw, ctx.file_symbols, ctx.index)
+    let start = first_arg.value_node.start_position();
+    let scoped_file_symbols = ctx
+        .file_symbols
+        .scoped_at_byte_position(start.row as u32, start.column as u32);
+    class_string_fqn_from_expression_text(raw, scoped_file_symbols.as_ref(), ctx.index)
 }
 
 pub(in crate::server) fn doctrine_repository_class_for_entity(
@@ -1651,7 +1678,8 @@ pub(in crate::server) fn doctrine_repository_class_from_entity_attribute(
         .as_ref()
         .map(|symbols| symbols.value())
         .unwrap_or(current_file_symbols);
-    let resolved = resolve_class_name_pub(&repository_name, file_symbols)
+    let scoped_file_symbols = file_symbols.scoped_at_byte_position(entity.range.0, entity.range.1);
+    let resolved = resolve_class_name_pub(&repository_name, scoped_file_symbols.as_ref())
         .trim_start_matches('\\')
         .to_string();
 
@@ -2022,7 +2050,11 @@ pub(in crate::server) fn local_variable_inlay_type_from_new_expression(
 ) -> Option<LocalVariableInlayType> {
     let class_node = object_creation_class_node(expression)?;
     let class_name = node_text(ctx.source, class_node).trim();
-    let fqn = resolve_class_name_pub(class_name, ctx.file_symbols)
+    let start = class_node.start_position();
+    let scoped_file_symbols = ctx
+        .file_symbols
+        .scoped_at_byte_position(start.row as u32, start.column as u32);
+    let fqn = resolve_class_name_pub(class_name, scoped_file_symbols.as_ref())
         .trim_start_matches('\\')
         .to_string();
     if fqn.is_empty() {
@@ -2030,7 +2062,7 @@ pub(in crate::server) fn local_variable_inlay_type_from_new_expression(
     }
 
     Some(LocalVariableInlayType {
-        display: shorten_inlay_type_display(&fqn, ctx.file_symbols),
+        display: shorten_inlay_type_display(&fqn, scoped_file_symbols.as_ref()),
         target_fqn: Some(fqn),
     })
 }
@@ -2166,7 +2198,7 @@ pub(in crate::server) fn call_site_argument_type_from_text(
             || file_symbols
                 .symbols
                 .iter()
-                .any(|symbol| symbol.fqn == resolved)
+                .any(|symbol| symbol.fqn.eq_ignore_ascii_case(&resolved))
         {
             return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
                 php_lsp_types::TypeInfo::Simple(resolved),
@@ -2466,24 +2498,27 @@ pub(in crate::server) fn call_site_argument_type_uncached(
 ) -> Option<php_lsp_types::TypeInfo> {
     let raw = node_text(ctx.source, node).trim();
     let lower = raw.to_ascii_lowercase();
+    let start = node.start_position();
+    let scoped_file_symbols = ctx
+        .file_symbols
+        .scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
 
-    if let Some(class_fqn) = class_string_fqn_from_expression_text(raw, ctx.file_symbols, ctx.index)
-    {
+    if let Some(class_fqn) = class_string_fqn_from_expression_text(raw, file_symbols, ctx.index) {
         return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
             php_lsp_types::TypeInfo::Simple(class_fqn),
         ))));
     }
 
     if let Some(value) = unquote_php_string_literal(raw) {
-        let resolved = resolve_class_name_pub(&value, ctx.file_symbols)
+        let resolved = resolve_class_name_pub(&value, file_symbols)
             .trim_start_matches('\\')
             .to_string();
         if ctx.index.resolve_fqn(&resolved).is_some()
-            || ctx
-                .file_symbols
+            || file_symbols
                 .symbols
                 .iter()
-                .any(|symbol| symbol.fqn == resolved)
+                .any(|symbol| symbol.fqn.eq_ignore_ascii_case(&resolved))
         {
             return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
                 php_lsp_types::TypeInfo::Simple(resolved),
@@ -2515,7 +2550,7 @@ pub(in crate::server) fn call_site_argument_type_uncached(
     if node.kind() == "object_creation_expression" {
         let class_node = object_creation_class_node(node)?;
         let class_name = node_text(ctx.source, class_node).trim();
-        let fqn = resolve_class_name_pub(class_name, ctx.file_symbols)
+        let fqn = resolve_class_name_pub(class_name, file_symbols)
             .trim_start_matches('\\')
             .to_string();
         if !fqn.is_empty() {
@@ -2544,7 +2579,10 @@ pub(in crate::server) fn class_string_fqn_from_expression_text(
         .trim_start_matches('\\')
         .to_string();
     (index.resolve_fqn(&fqn).is_some()
-        || file_symbols.symbols.iter().any(|symbol| symbol.fqn == fqn))
+        || file_symbols
+            .symbols
+            .iter()
+            .any(|symbol| symbol.fqn.eq_ignore_ascii_case(&fqn)))
     .then_some(fqn)
 }
 
@@ -2574,9 +2612,13 @@ pub(in crate::server) fn call_site_variable_phpdoc_type(
         Some(&callable_param_resolver),
     )?;
     let phpdoc = parse_phpdoc(info.phpdoc_comment.as_deref()?);
+    let start = node.start_position();
+    let scoped_file_symbols = ctx
+        .file_symbols
+        .scoped_at_byte_position(start.row as u32, start.column as u32);
     phpdoc
         .var_type
-        .map(|type_info| resolve_call_site_type_names(&type_info, ctx.file_symbols))
+        .map(|type_info| resolve_call_site_type_names(&type_info, scoped_file_symbols.as_ref()))
 }
 
 pub(in crate::server) fn resolve_callable_parameter_type_from_index(
@@ -3159,6 +3201,11 @@ pub(in crate::server) fn local_variable_hover_data(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
 ) -> Option<LocalVariableHoverData> {
+    let start = variable_node.start_position();
+    let scoped_file_symbols = ctx
+        .file_symbols
+        .scoped_at_byte_position(start.row as u32, start.column as u32);
+    let scoped_ctx = inlay_context_with_file_symbols(ctx, scoped_file_symbols.as_ref());
     let variable_name = variable_text_for_node(ctx.source, variable_node)?;
     let usage_start = variable_node.start_byte();
     let current_rhs = current_assignment_rhs_for_variable(variable_node, ctx.source);
@@ -3181,33 +3228,39 @@ pub(in crate::server) fn local_variable_hover_data(
         )
     };
     let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
-        resolve_callable_parameter_type_from_index(ctx.index, ctx.file_symbols, callable_ctx)
+        resolve_callable_parameter_type_from_index(
+            ctx.index,
+            scoped_file_symbols.as_ref(),
+            callable_ctx,
+        )
     };
     let parser_info = infer_variable_hover_info_at_node_with_resolvers(
         variable_node,
         ctx.source,
-        ctx.file_symbols,
+        scoped_file_symbols.as_ref(),
         parser_usage_start,
         &variable_name,
         Some(&resolver),
         Some(&callable_param_resolver),
     );
-    let foreach_type_hint = foreach_variable_inlay_type_from_index(ctx, variable_node)
+    let foreach_type_hint = foreach_variable_inlay_type_from_index(&scoped_ctx, variable_node)
         .filter(|_| enclosing_foreach_statement_for_variable(ctx.source, variable_node).is_some());
     let type_hint = foreach_type_hint
         .or_else(|| {
             parser_info.as_ref().and_then(|info| {
-                info.phpdoc_comment
-                    .as_ref()
-                    .and_then(|_| local_variable_type_from_hover_info(info, ctx.file_symbols, true))
+                info.phpdoc_comment.as_ref().and_then(|_| {
+                    local_variable_type_from_hover_info(info, scoped_file_symbols.as_ref(), true)
+                })
             })
         })
-        .or_else(|| rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(ctx, rhs)))
-        .or_else(|| foreach_variable_inlay_type_from_index(ctx, variable_node))
         .or_else(|| {
-            parser_info
-                .as_ref()
-                .and_then(|info| local_variable_type_from_hover_info(info, ctx.file_symbols, true))
+            rhs_node.and_then(|rhs| local_variable_inlay_type_from_expression(&scoped_ctx, rhs))
+        })
+        .or_else(|| foreach_variable_inlay_type_from_index(&scoped_ctx, variable_node))
+        .or_else(|| {
+            parser_info.as_ref().and_then(|info| {
+                local_variable_type_from_hover_info(info, scoped_file_symbols.as_ref(), true)
+            })
         });
     let phpdoc_comment = parser_info.and_then(|info| info.phpdoc_comment);
 
@@ -3538,6 +3591,14 @@ pub(in crate::server) fn simple_type_fqn_from_owner_or_index(
         return simple_type_fqn_from_index(index, uri, type_name);
     }
 
+    if let Some(imported) = imported_type_fqn_for_owner(index, owner_fqn, uri, type_name) {
+        return Some(imported);
+    }
+
+    if !owner_fqn.contains('\\') && index.resolve_fqn(type_name).is_some() {
+        return Some(type_name.to_string());
+    }
+
     if type_name.contains('\\') {
         return Some(resolve_qualified_type_fqn_from_owner_or_index(
             index, owner_fqn, uri, type_name,
@@ -3568,32 +3629,10 @@ fn resolve_qualified_type_fqn_from_owner_or_index(
     let Some((owner_namespace, _)) = owner_fqn.rsplit_once('\\') else {
         return raw.to_string();
     };
-    let (first_part, rest) = raw.split_once('\\').unwrap_or((raw, ""));
+    let first_part = raw.split('\\').next().unwrap_or(raw);
 
-    if let Some(file_symbols) = index.file_symbols.get(uri) {
-        for use_statement in &file_symbols.use_statements {
-            if use_statement.kind != php_lsp_types::UseKind::Class
-                || use_statement.namespace.as_deref() != Some(owner_namespace)
-            {
-                continue;
-            }
-
-            let alias = use_statement.alias.as_deref().unwrap_or_else(|| {
-                use_statement
-                    .fqn
-                    .rsplit('\\')
-                    .next()
-                    .unwrap_or(use_statement.fqn.as_str())
-            });
-            if alias == first_part {
-                let mut resolved = use_statement.fqn.trim_start_matches('\\').to_string();
-                if !rest.is_empty() {
-                    resolved.push('\\');
-                    resolved.push_str(rest);
-                }
-                return resolved;
-            }
-        }
+    if let Some(imported) = imported_type_fqn_for_owner(index, owner_fqn, uri, raw) {
+        return imported;
     }
 
     let namespace_root = owner_namespace
@@ -3605,6 +3644,63 @@ fn resolve_qualified_type_fqn_from_owner_or_index(
     }
 
     format!("{owner_namespace}\\{raw}")
+}
+
+pub(in crate::server) fn imported_type_fqn_for_owner(
+    index: &WorkspaceIndex,
+    owner_fqn: &str,
+    uri: &str,
+    type_name: &str,
+) -> Option<String> {
+    let owner_namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
+    let raw = type_name.trim_start_matches('\\');
+    let (first_part, rest) = raw.split_once('\\').unwrap_or((raw, ""));
+    let file_symbols = index.file_symbols.get(uri)?;
+    let scoped_file_symbols = file_symbols
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol.fqn.eq_ignore_ascii_case(owner_fqn)
+                && matches!(
+                    symbol.kind,
+                    php_lsp_types::PhpSymbolKind::Class
+                        | php_lsp_types::PhpSymbolKind::Interface
+                        | php_lsp_types::PhpSymbolKind::Trait
+                        | php_lsp_types::PhpSymbolKind::Enum
+                        | php_lsp_types::PhpSymbolKind::Function
+                )
+        })
+        .map(|symbol| file_symbols.scoped_at_byte_position(symbol.range.0, symbol.range.1))
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed(file_symbols.value()));
+    let use_statement = scoped_file_symbols
+        .use_statements
+        .iter()
+        .find(|statement| {
+            if statement.kind != php_lsp_types::UseKind::Class
+                || statement.namespace.as_deref() != owner_namespace
+            {
+                return false;
+            }
+
+            statement
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| {
+                    statement
+                        .fqn
+                        .rsplit('\\')
+                        .next()
+                        .unwrap_or(statement.fqn.as_str())
+                })
+                .eq_ignore_ascii_case(first_part)
+        })?;
+
+    let mut resolved = use_statement.fqn.trim_start_matches('\\').to_string();
+    if !rest.is_empty() {
+        resolved.push('\\');
+        resolved.push_str(rest);
+    }
+    Some(resolved)
 }
 
 pub(in crate::server) fn is_explicit_local_variable_type_hint(
@@ -4064,11 +4160,9 @@ pub(in crate::server) fn shorten_inlay_type_display(
         return display.to_string();
     }
 
-    if let Some(use_stmt) = file_symbols
-        .use_statements
-        .iter()
-        .find(|use_stmt| use_stmt.kind == php_lsp_types::UseKind::Class && use_stmt.fqn == display)
-    {
+    if let Some(use_stmt) = file_symbols.use_statements.iter().find(|use_stmt| {
+        use_stmt.kind == php_lsp_types::UseKind::Class && use_stmt.fqn.eq_ignore_ascii_case(display)
+    }) {
         return use_stmt
             .alias
             .clone()
@@ -4076,11 +4170,13 @@ pub(in crate::server) fn shorten_inlay_type_display(
     }
 
     if let Some(namespace) = file_symbols.namespace.as_deref() {
-        if let Some(rest) = display
-            .strip_prefix(namespace)
-            .and_then(|rest| rest.strip_prefix('\\'))
+        if display.len() > namespace.len()
+            && display
+                .get(..namespace.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(namespace))
+            && display.as_bytes().get(namespace.len()) == Some(&b'\\')
         {
-            return rest.to_string();
+            return display[namespace.len() + 1..].to_string();
         }
     }
 

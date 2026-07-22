@@ -14,7 +14,7 @@
   },
   "license": "MIT",
   "engines": {
-    "vscode": "^1.75.0"
+    "vscode": "^1.82.0"
   },
   "categories": [
     "Programming Languages"
@@ -401,17 +401,20 @@
     "watch": "node esbuild.mjs --watch",
     "check:cache-path": "node scripts/check-cache-path.mjs",
     "check:commands": "node scripts/check-commands.mjs",
+    "check:lifecycle": "node scripts/check-lifecycle.mjs",
+    "check:vscode-engine": "node scripts/check-vscode-engine.mjs",
     "prepare:package": "node scripts/prepare-package-metadata.mjs",
-    "lint": "tsc --noEmit",
+    "lint": "npm run check:vscode-engine && npm run check:lifecycle && tsc --noEmit",
     "package": "vsce package"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
-    "@types/vscode": "^1.75.0",
+    "@types/vscode": "1.82.0",
     "@types/node": "^20.0.0",
     "esbuild": "^0.21.0",
+    "semver": "^7.7.4",
     "typescript": "^5.5.0"
   }
 }

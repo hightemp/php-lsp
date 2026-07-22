@@ -57,12 +57,13 @@ use php_lsp_parser::symbols::extract_file_symbols;
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
@@ -111,6 +112,382 @@ const HEAVY_REQUEST_YIELD_INTERVAL: usize = 32;
 const FILE_IO_SLOW_WARNING_MS: u64 = 100;
 const FILE_IO_TIMEOUT_MS: u64 = 15_000;
 const DIAGNOSTIC_PHASE_SLOW_WARNING_MS: u64 = 500;
+const DIAGNOSTIC_PUBLISHER_MAX_SHARDS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenDocumentState {
+    version: i32,
+    generation: u64,
+}
+
+struct OpenDocumentSnapshot {
+    tree: tree_sitter::Tree,
+    source: String,
+    template_document: Option<TemplateDocument>,
+    document_state: Option<OpenDocumentState>,
+    file_symbols: php_lsp_types::FileSymbols,
+}
+
+fn open_document_snapshot_from_state_with_lock_hook<F>(
+    open_files: &DashMap<String, FileParser>,
+    template_documents: &DashMap<String, TemplateDocument>,
+    document_versions: &DashMap<String, OpenDocumentState>,
+    uri_str: &str,
+    after_open_lock: F,
+) -> Option<OpenDocumentSnapshot>
+where
+    F: FnOnce(),
+{
+    // The parser entry is the primary per-document lock. Writers publish the
+    // parser, template, and version while holding its write guard, so clone
+    // every request-facing component before releasing this read guard.
+    let parser = open_files.get(uri_str)?;
+    after_open_lock();
+    let tree = parser.tree()?.clone();
+    let source = parser.source();
+    let template_document = template_documents
+        .get(uri_str)
+        .map(|document| document.value().clone());
+    let document_state = document_versions.get(uri_str).map(|state| *state);
+    drop(parser);
+    let file_symbols = extract_file_symbols(&tree, &source, uri_str);
+
+    Some(OpenDocumentSnapshot {
+        tree,
+        source,
+        template_document,
+        document_state,
+        file_symbols,
+    })
+}
+
+fn open_document_snapshot_from_state(
+    open_files: &DashMap<String, FileParser>,
+    template_documents: &DashMap<String, TemplateDocument>,
+    document_versions: &DashMap<String, OpenDocumentState>,
+    uri_str: &str,
+) -> Option<OpenDocumentSnapshot> {
+    open_document_snapshot_from_state_with_lock_hook(
+        open_files,
+        template_documents,
+        document_versions,
+        uri_str,
+        || {},
+    )
+}
+
+struct OpenDocumentIndexCommitContext<'a> {
+    open_files: &'a DashMap<String, FileParser>,
+    template_documents: &'a DashMap<String, TemplateDocument>,
+    document_versions: &'a DashMap<String, OpenDocumentState>,
+    index: &'a WorkspaceIndex,
+    uri_str: &'a str,
+}
+
+fn commit_open_document_index_snapshot_if_current_with_hook<F>(
+    ctx: OpenDocumentIndexCommitContext<'_>,
+    snapshot: &OpenDocumentSnapshot,
+    before_index_commit: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    let references = snapshot.template_document.is_none().then(|| {
+        collect_symbol_references_in_file(&snapshot.tree, &snapshot.source, &snapshot.file_symbols)
+    });
+    let dashmap::mapref::entry::Entry::Occupied(_open_entry) =
+        ctx.open_files.entry(ctx.uri_str.to_string())
+    else {
+        return false;
+    };
+    if snapshot.document_state.is_none()
+        || ctx.document_versions.get(ctx.uri_str).map(|state| *state) != snapshot.document_state
+    {
+        return false;
+    }
+    let current_template = ctx
+        .template_documents
+        .get(ctx.uri_str)
+        .map(|template| template.value().clone());
+    let template_matches = match (&snapshot.template_document, &current_template) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => current.has_same_source_and_twig_context(expected),
+        _ => false,
+    };
+    if !template_matches {
+        return false;
+    }
+
+    before_index_commit();
+    if let Some(references) = references {
+        ctx.index.update_file_with_references(
+            ctx.uri_str,
+            snapshot.file_symbols.clone(),
+            references,
+        );
+    } else {
+        ctx.index.remove_file(ctx.uri_str);
+    }
+    true
+}
+
+fn commit_open_document_index_snapshot_if_current(
+    ctx: OpenDocumentIndexCommitContext<'_>,
+    snapshot: &OpenDocumentSnapshot,
+) -> bool {
+    commit_open_document_index_snapshot_if_current_with_hook(ctx, snapshot, || {})
+}
+
+#[derive(Clone, Copy)]
+struct ClosedPhpIndexCommitContext<'a> {
+    open_files: &'a DashMap<String, FileParser>,
+    document_versions: &'a DashMap<String, OpenDocumentState>,
+    reload_tokens: &'a DashMap<String, u64>,
+    index: &'a WorkspaceIndex,
+    uri_str: &'a str,
+    token: u64,
+}
+
+fn commit_closed_php_index_if_current_with_hook<F>(
+    ctx: ClosedPhpIndexCommitContext<'_>,
+    file_symbols: Option<php_lsp_types::FileSymbols>,
+    references: Vec<php_lsp_types::SymbolReference>,
+    before_open_lock: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    before_open_lock();
+    let dashmap::mapref::entry::Entry::Vacant(_open_entry) =
+        ctx.open_files.entry(ctx.uri_str.to_string())
+    else {
+        return false;
+    };
+    if ctx.document_versions.contains_key(ctx.uri_str)
+        || ctx
+            .reload_tokens
+            .get(ctx.uri_str)
+            .is_none_or(|current| *current != ctx.token)
+    {
+        return false;
+    }
+
+    if let Some(file_symbols) = file_symbols {
+        ctx.index
+            .update_file_with_references(ctx.uri_str, file_symbols, references);
+    } else {
+        ctx.index.remove_file(ctx.uri_str);
+    }
+    ctx.reload_tokens.remove(ctx.uri_str);
+    true
+}
+
+fn commit_closed_php_index_if_current(
+    ctx: ClosedPhpIndexCommitContext<'_>,
+    file_symbols: Option<php_lsp_types::FileSymbols>,
+    references: Vec<php_lsp_types::SymbolReference>,
+) -> bool {
+    commit_closed_php_index_if_current_with_hook(ctx, file_symbols, references, || {})
+}
+
+struct DiagnosticPublishRequest {
+    uri: Uri,
+    diagnostics: Vec<Diagnostic>,
+    version: Option<i32>,
+    expected_state: Option<OpenDocumentState>,
+    expected_template: Option<TemplateDocument>,
+    require_idle_index: bool,
+}
+
+#[derive(Clone)]
+struct DiagnosticsPublisher {
+    shards: Arc<Vec<DiagnosticsPublisherShard>>,
+    open_files: Arc<DashMap<String, FileParser>>,
+    document_versions: Arc<DashMap<String, OpenDocumentState>>,
+    template_documents: Arc<DashMap<String, TemplateDocument>>,
+}
+
+struct DiagnosticsPublisherShard {
+    pending: Arc<StdMutex<HashMap<String, DiagnosticPublishRequest>>>,
+    wake: mpsc::Sender<()>,
+}
+
+impl DiagnosticsPublisher {
+    fn new(
+        client: Client,
+        open_files: Arc<DashMap<String, FileParser>>,
+        document_versions: Arc<DashMap<String, OpenDocumentState>>,
+        template_documents: Arc<DashMap<String, TemplateDocument>>,
+        indexing_run: Arc<Mutex<Option<OperationCancellationToken>>>,
+    ) -> Self {
+        let shard_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .clamp(1, DIAGNOSTIC_PUBLISHER_MAX_SHARDS);
+        let shards = (0..shard_count)
+            .map(|_| {
+                spawn_diagnostics_publish_worker(
+                    client.clone(),
+                    open_files.clone(),
+                    document_versions.clone(),
+                    template_documents.clone(),
+                    indexing_run.clone(),
+                )
+            })
+            .collect();
+        Self {
+            shards: Arc::new(shards),
+            open_files,
+            document_versions,
+            template_documents,
+        }
+    }
+
+    fn publish(&self, request: DiagnosticPublishRequest) {
+        let mut hasher = DefaultHasher::new();
+        request.uri.as_str().hash(&mut hasher);
+        let shard = &self.shards[hasher.finish() as usize % self.shards.len()];
+        let uri_str = request.uri.as_str().to_string();
+        match shard.pending.lock() {
+            Ok(mut pending) => {
+                if pending.get(&uri_str).is_some_and(|current| {
+                    diagnostic_publish_request_is_current(
+                        current,
+                        &self.open_files,
+                        &self.document_versions,
+                        &self.template_documents,
+                    ) && !diagnostic_publish_request_is_current(
+                        &request,
+                        &self.open_files,
+                        &self.document_versions,
+                        &self.template_documents,
+                    )
+                }) {
+                    return;
+                }
+                pending.insert(uri_str, request);
+            }
+            Err(poisoned) => {
+                let mut pending = poisoned.into_inner();
+                if pending.get(&uri_str).is_some_and(|current| {
+                    diagnostic_publish_request_is_current(
+                        current,
+                        &self.open_files,
+                        &self.document_versions,
+                        &self.template_documents,
+                    ) && !diagnostic_publish_request_is_current(
+                        &request,
+                        &self.open_files,
+                        &self.document_versions,
+                        &self.template_documents,
+                    )
+                }) {
+                    return;
+                }
+                pending.insert(uri_str, request);
+            }
+        }
+        match shard.wake.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing::debug!("Skipping diagnostics because the publisher has stopped");
+            }
+        }
+    }
+}
+
+fn diagnostic_publish_request_is_current(
+    request: &DiagnosticPublishRequest,
+    open_files: &DashMap<String, FileParser>,
+    document_versions: &DashMap<String, OpenDocumentState>,
+    template_documents: &DashMap<String, TemplateDocument>,
+) -> bool {
+    let uri_str = request.uri.as_str();
+    let snapshot = open_document_snapshot_from_state(
+        open_files,
+        template_documents,
+        document_versions,
+        uri_str,
+    );
+    let (current_state, current_template) = snapshot
+        .map(|snapshot| (snapshot.document_state, snapshot.template_document))
+        .unwrap_or((None, None));
+    if current_state != request.expected_state {
+        return false;
+    }
+    match (&request.expected_template, &current_template) {
+        (None, None) => true,
+        (Some(snapshot), Some(current)) => current.has_same_source_and_twig_context(snapshot),
+        _ => false,
+    }
+}
+
+fn spawn_diagnostics_publish_worker(
+    client: Client,
+    open_files: Arc<DashMap<String, FileParser>>,
+    document_versions: Arc<DashMap<String, OpenDocumentState>>,
+    template_documents: Arc<DashMap<String, TemplateDocument>>,
+    indexing_run: Arc<Mutex<Option<OperationCancellationToken>>>,
+) -> DiagnosticsPublisherShard {
+    let pending: Arc<StdMutex<HashMap<String, DiagnosticPublishRequest>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
+    let worker_pending = pending.clone();
+    let (wake, mut receiver) = mpsc::channel(1);
+    tokio::spawn(async move {
+        while receiver.recv().await.is_some() {
+            loop {
+                let requests: Vec<_> = match worker_pending.lock() {
+                    Ok(mut pending) => pending.drain().map(|(_, request)| request).collect(),
+                    Err(poisoned) => poisoned
+                        .into_inner()
+                        .drain()
+                        .map(|(_, request)| request)
+                        .collect(),
+                };
+                if requests.is_empty() {
+                    break;
+                }
+                for request in requests {
+                    let uri_str = request.uri.as_str().to_string();
+                    if !diagnostic_publish_request_is_current(
+                        &request,
+                        &open_files,
+                        &document_versions,
+                        &template_documents,
+                    ) {
+                        continue;
+                    }
+                    if request.require_idle_index && indexing_run_is_active(&indexing_run).await {
+                        continue;
+                    }
+                    if !diagnostic_publish_request_is_current(
+                        &request,
+                        &open_files,
+                        &document_versions,
+                        &template_documents,
+                    ) {
+                        continue;
+                    }
+
+                    let publish_started = Instant::now();
+                    let publish_span = tracing::debug_span!(
+                        "diagnostics.publish",
+                        uri = %uri_str,
+                        version = ?request.version,
+                        duration_ms = tracing::field::Empty,
+                    );
+                    client
+                        .publish_diagnostics(request.uri, request.diagnostics, request.version)
+                        .instrument(publish_span.clone())
+                        .await;
+                    publish_span
+                        .record("duration_ms", publish_started.elapsed().as_millis() as u64);
+                }
+            }
+        }
+    });
+    DiagnosticsPublisherShard { pending, wake }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RequestTypeCacheKey {
@@ -268,6 +645,14 @@ const DEFAULT_PARTIAL_ANALYSIS_DIAGNOSTIC: bool = true;
 
 fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {
     current.is_none_or(|current| incoming > current)
+}
+
+fn open_document_state_can_replace(
+    current: OpenDocumentState,
+    incoming: OpenDocumentState,
+) -> bool {
+    incoming.generation > current.generation
+        || (incoming.generation == current.generation && incoming.version >= current.version)
 }
 
 async fn cooperative_heavy_request_yield(index: usize) {
@@ -827,6 +1212,14 @@ struct WorkspaceIndexingOptions {
     work_done_progress_supported: bool,
 }
 
+#[derive(Clone, Copy)]
+struct WorkspaceLiveIndexContext<'a> {
+    index: &'a WorkspaceIndex,
+    open_files: &'a DashMap<String, FileParser>,
+    template_documents: &'a DashMap<String, TemplateDocument>,
+    document_versions: &'a DashMap<String, OpenDocumentState>,
+}
+
 #[derive(Debug, Clone)]
 struct SemanticTokensSnapshot {
     result_id: String,
@@ -1234,10 +1627,16 @@ pub struct PhpLspBackend {
     open_files: Arc<DashMap<String, FileParser>>,
     /// Open Blade-like template documents backed by virtual PHP parsers.
     template_documents: Arc<DashMap<String, TemplateDocument>>,
-    /// Latest LSP document version observed for each open document.
-    document_versions: Arc<DashMap<String, i32>>,
+    /// Latest LSP version and server-side lifetime generation for each open document.
+    document_versions: Arc<DashMap<String, OpenDocumentState>>,
+    /// Close-reload token for restoring the on-disk index after discarding unsaved edits.
+    closed_document_reload_tokens: Arc<DashMap<String, u64>>,
+    /// Monotonic source for document lifetime generations; LSP versions may reset on reopen.
+    next_document_generation: AtomicU64,
     /// Per-document debounce tasks for fast diagnostics after didChange.
     diagnostic_debounce_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    /// Serializes diagnostic notifications per document without blocking handlers on client I/O.
+    diagnostics_publisher: DiagnosticsPublisher,
     /// Per-document external analyzer runs that can be cancelled by newer document events.
     analyzer_runs: Arc<Mutex<HashMap<String, OperationCancellationToken>>>,
     /// Per-document external formatter runs that can be cancelled by newer document events.
@@ -1307,15 +1706,29 @@ pub struct PhpLspBackend {
 
 impl PhpLspBackend {
     pub fn new(client: Client) -> Self {
+        let open_files = Arc::new(DashMap::new());
+        let template_documents = Arc::new(DashMap::new());
+        let document_versions = Arc::new(DashMap::new());
+        let indexing_run = Arc::new(Mutex::new(None));
+        let diagnostics_publisher = DiagnosticsPublisher::new(
+            client.clone(),
+            open_files.clone(),
+            document_versions.clone(),
+            template_documents.clone(),
+            indexing_run.clone(),
+        );
         PhpLspBackend {
             client,
-            open_files: Arc::new(DashMap::new()),
-            template_documents: Arc::new(DashMap::new()),
-            document_versions: Arc::new(DashMap::new()),
+            open_files,
+            template_documents,
+            document_versions,
+            closed_document_reload_tokens: Arc::new(DashMap::new()),
+            next_document_generation: AtomicU64::new(1),
             diagnostic_debounce_tasks: Arc::new(Mutex::new(HashMap::new())),
+            diagnostics_publisher,
             analyzer_runs: Arc::new(Mutex::new(HashMap::new())),
             formatter_runs: Arc::new(Mutex::new(HashMap::new())),
-            indexing_run: Arc::new(Mutex::new(None)),
+            indexing_run,
             index: Arc::new(WorkspaceIndex::new()),
             workspace_root: Mutex::new(None),
             workspace_roots: Mutex::new(Vec::new()),
@@ -1357,23 +1770,30 @@ impl PhpLspBackend {
     }
 
     fn current_document_version(&self, uri_str: &str) -> Option<i32> {
-        self.document_versions.get(uri_str).map(|version| *version)
+        self.current_document_state(uri_str)
+            .map(|state| state.version)
     }
 
-    fn accept_document_version(&self, uri_str: &str, incoming: i32) -> bool {
-        let current = self.current_document_version(uri_str);
-        if !document_version_is_newer(current, incoming) {
-            tracing::debug!(
-                "Ignoring stale didChange for {}: incoming version {}, current version {:?}",
-                uri_str,
-                incoming,
-                current
-            );
-            return false;
-        }
+    fn current_document_state(&self, uri_str: &str) -> Option<OpenDocumentState> {
+        self.document_versions.get(uri_str).map(|state| *state)
+    }
 
-        self.document_versions.insert(uri_str.to_string(), incoming);
-        true
+    fn open_document_snapshot(&self, uri_str: &str) -> Option<OpenDocumentSnapshot> {
+        open_document_snapshot_from_state(
+            &self.open_files,
+            &self.template_documents,
+            &self.document_versions,
+            uri_str,
+        )
+    }
+
+    fn next_document_state(&self, version: i32) -> OpenDocumentState {
+        OpenDocumentState {
+            version,
+            generation: self
+                .next_document_generation
+                .fetch_add(1, Ordering::Relaxed),
+        }
     }
 
     async fn invalidate_request_fs_caches(&self) {
@@ -1405,17 +1825,46 @@ impl PhpLspBackend {
         }
     }
 
-    async fn start_analyzer_run(&self, uri_str: &str) -> OperationCancellationToken {
+    async fn cancel_debounced_diagnostics_if_current(
+        &self,
+        uri_str: &str,
+        expected: OpenDocumentState,
+    ) -> bool {
+        let mut tasks = self.diagnostic_debounce_tasks.lock().await;
+        if self.current_document_state(uri_str) != Some(expected) {
+            return false;
+        }
+        if let Some(handle) = tasks.remove(uri_str) {
+            handle.abort();
+        }
+        true
+    }
+
+    async fn cancel_debounced_diagnostics_if_closed(&self, uri_str: &str) -> bool {
+        let mut tasks = self.diagnostic_debounce_tasks.lock().await;
+        if self.current_document_state(uri_str).is_some() {
+            return false;
+        }
+        if let Some(handle) = tasks.remove(uri_str) {
+            handle.abort();
+        }
+        true
+    }
+
+    async fn start_analyzer_run(
+        &self,
+        uri_str: &str,
+        expected: Option<OpenDocumentState>,
+    ) -> Option<OperationCancellationToken> {
         let token = OperationCancellationToken::new();
-        if let Some(previous) = self
-            .analyzer_runs
-            .lock()
-            .await
-            .insert(uri_str.to_string(), token.clone())
-        {
+        let mut runs = self.analyzer_runs.lock().await;
+        if self.current_document_state(uri_str) != expected {
+            return None;
+        }
+        if let Some(previous) = runs.insert(uri_str.to_string(), token.clone()) {
             previous.cancel();
         }
-        token
+        Some(token)
     }
 
     async fn finish_analyzer_run(&self, uri_str: &str, token: &OperationCancellationToken) {
@@ -1432,6 +1881,32 @@ impl PhpLspBackend {
         if let Some(token) = self.analyzer_runs.lock().await.remove(uri_str) {
             token.cancel();
         }
+    }
+
+    async fn cancel_analyzer_run_if_current(
+        &self,
+        uri_str: &str,
+        expected: OpenDocumentState,
+    ) -> bool {
+        let mut runs = self.analyzer_runs.lock().await;
+        if self.current_document_state(uri_str) != Some(expected) {
+            return false;
+        }
+        if let Some(token) = runs.remove(uri_str) {
+            token.cancel();
+        }
+        true
+    }
+
+    async fn cancel_analyzer_run_if_closed(&self, uri_str: &str) -> bool {
+        let mut runs = self.analyzer_runs.lock().await;
+        if self.current_document_state(uri_str).is_some() {
+            return false;
+        }
+        if let Some(token) = runs.remove(uri_str) {
+            token.cancel();
+        }
+        true
     }
 
     async fn start_formatter_run(&self, uri_str: &str) -> OperationCancellationToken {
@@ -1463,6 +1938,58 @@ impl PhpLspBackend {
         }
     }
 
+    async fn cancel_formatter_run_if_current(
+        &self,
+        uri_str: &str,
+        expected: OpenDocumentState,
+    ) -> bool {
+        let mut runs = self.formatter_runs.lock().await;
+        if self.current_document_state(uri_str) != Some(expected) {
+            return false;
+        }
+        if let Some(token) = runs.remove(uri_str) {
+            token.cancel();
+        }
+        true
+    }
+
+    async fn cancel_formatter_run_if_closed(&self, uri_str: &str) -> bool {
+        let mut runs = self.formatter_runs.lock().await;
+        if self.current_document_state(uri_str).is_some() {
+            return false;
+        }
+        if let Some(token) = runs.remove(uri_str) {
+            token.cancel();
+        }
+        true
+    }
+
+    async fn clear_semantic_tokens_if_closed(&self, uri_str: &str) -> bool {
+        let mut cache = self.semantic_tokens_cache.lock().await;
+        if self.current_document_state(uri_str).is_some() {
+            return false;
+        }
+        cache.remove(uri_str);
+        true
+    }
+
+    async fn publish_empty_diagnostics_if_closed(&self, uri: Uri) -> bool {
+        let uri_str = uri.as_str().to_string();
+        if self.current_document_state(&uri_str).is_some() {
+            return false;
+        }
+        self.diagnostics_publisher
+            .publish(DiagnosticPublishRequest {
+                uri,
+                diagnostics: vec![],
+                version: None,
+                expected_state: None,
+                expected_template: None,
+                require_idle_index: false,
+            });
+        true
+    }
+
     async fn start_indexing_run(&self) -> OperationCancellationToken {
         let token = OperationCancellationToken::new();
         if let Some(previous) = self.indexing_run.lock().await.replace(token.clone()) {
@@ -1471,12 +1998,13 @@ impl PhpLspBackend {
         token
     }
 
-    async fn schedule_fast_diagnostics(&self, uri: Uri, version: i32) {
+    async fn schedule_fast_diagnostics(&self, uri: Uri, expected: OpenDocumentState) {
+        let version = expected.version;
         let uri_str = uri.as_str().to_string();
-        let client = self.client.clone();
         let open_files = self.open_files.clone();
         let template_documents = self.template_documents.clone();
         let document_versions = self.document_versions.clone();
+        let diagnostics_publisher = self.diagnostics_publisher.clone();
         let index = self.index.clone();
         let indexing_run = self.indexing_run.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
@@ -1489,9 +2017,19 @@ impl PhpLspBackend {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(debounce).await;
 
-            if document_versions.get(&task_uri_str).map(|current| *current) != Some(version) {
+            let Some(snapshot) = open_document_snapshot_from_state(
+                &open_files,
+                &template_documents,
+                &document_versions,
+                &task_uri_str,
+            ) else {
+                return;
+            };
+            if snapshot.document_state != Some(expected) {
                 return;
             }
+            let source = snapshot.source;
+            let template_document = snapshot.template_document;
 
             let indexing_active = indexing_run_is_active(&indexing_run).await;
             let effective_diagnostics_mode =
@@ -1502,13 +2040,10 @@ impl PhpLspBackend {
                 budget: diagnostic_budget,
                 php_version,
             };
-            let template_document = template_documents
-                .get(&task_uri_str)
-                .map(|template| template.value().clone());
-            let mut diagnostics = compute_open_file_diagnostics(
-                &task_uri_str,
-                &open_files,
-                &index,
+            let mut diagnostics = compute_source_diagnostics_blocking(
+                task_uri_str.clone(),
+                source.clone(),
+                index.clone(),
                 diagnostics_config,
                 Some(version),
             )
@@ -1520,64 +2055,42 @@ impl PhpLspBackend {
                 );
             }
 
-            if document_versions.get(&task_uri_str).map(|current| *current) == Some(version) {
-                if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
-                    && indexing_run_is_active(&indexing_run).await
-                {
-                    diagnostics_config.mode = DiagnosticsMode::SyntaxOnly;
-                    diagnostics = compute_open_file_diagnostics(
-                        &task_uri_str,
-                        &open_files,
-                        &index,
-                        diagnostics_config,
-                        Some(version),
-                    )
-                    .await;
-                    if let Some(template) = &template_document {
-                        diagnostics = template.map_diagnostics_to_original(
-                            diagnostics,
-                            diagnostics_config.mode == DiagnosticsMode::Off,
-                        );
-                    }
-                }
-
-                if document_versions.get(&task_uri_str).map(|current| *current) != Some(version) {
-                    return;
-                }
-
-                let publish_started = Instant::now();
-                let publish_span = tracing::debug_span!(
-                    "diagnostics.publish",
-                    uri = %task_uri_str,
-                    version = ?Some(version),
-                    duration_ms = tracing::field::Empty,
-                );
-                async {
-                    if document_versions.get(&task_uri_str).map(|current| *current) != Some(version)
-                    {
-                        return;
-                    }
-                    if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
-                        && indexing_run_is_active(&indexing_run).await
-                    {
-                        return;
-                    }
-                    client
-                        .publish_diagnostics(uri, diagnostics, Some(version))
-                        .await;
-                }
-                .instrument(publish_span.clone())
+            if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+                && indexing_run_is_active(&indexing_run).await
+            {
+                diagnostics_config.mode = DiagnosticsMode::SyntaxOnly;
+                diagnostics = compute_source_diagnostics_blocking(
+                    task_uri_str.clone(),
+                    source,
+                    index.clone(),
+                    diagnostics_config,
+                    Some(version),
+                )
                 .await;
-                publish_span.record("duration_ms", publish_started.elapsed().as_millis() as u64);
+                if let Some(template) = &template_document {
+                    diagnostics = template.map_diagnostics_to_original(
+                        diagnostics,
+                        diagnostics_config.mode == DiagnosticsMode::Off,
+                    );
+                }
             }
+
+            diagnostics_publisher.publish(DiagnosticPublishRequest {
+                uri,
+                diagnostics,
+                version: Some(version),
+                expected_state: Some(expected),
+                expected_template: template_document,
+                require_idle_index: diagnostics_config.mode == DiagnosticsMode::BasicSemantic,
+            });
         });
 
-        if let Some(previous) = self
-            .diagnostic_debounce_tasks
-            .lock()
-            .await
-            .insert(uri_str, handle)
-        {
+        let mut debounce_tasks = self.diagnostic_debounce_tasks.lock().await;
+        if self.current_document_state(&uri_str) != Some(expected) {
+            handle.abort();
+            return;
+        }
+        if let Some(previous) = debounce_tasks.insert(uri_str, handle) {
             previous.abort();
         }
     }
@@ -1989,7 +2502,13 @@ impl PhpLspBackend {
             .iter()
             .find_map(|config| config.namespace_map.clone());
 
-        let removed = remove_indexed_file_symbols(&self.index, &effective_roots);
+        let removed = remove_indexed_file_symbols(
+            &self.index,
+            &self.open_files,
+            &self.template_documents,
+            &self.document_versions,
+            &effective_roots,
+        );
         self.client
             .log_message(
                 MessageType::INFO,
@@ -2007,8 +2526,8 @@ impl PhpLspBackend {
         let twig_context_disk_cache = self.twig_context_disk_cache.clone();
         let semantic_tokens_cache = self.semantic_tokens_cache.clone();
         let reindex_document_versions = self.document_versions.clone();
+        let diagnostics_publisher = self.diagnostics_publisher.clone();
         let reindex_index = self.index.clone();
-        let reindex_client = self.client.clone();
         let diagnostics_mode = *self.diagnostics_mode.lock().await;
         let diagnostic_severity = *self.diagnostic_severity.lock().await;
         let diagnostic_budget = *self.diagnostic_budget.lock().await;
@@ -2059,7 +2578,12 @@ impl PhpLspBackend {
                 }
                 if let Err(e) = index_workspace(
                     &client,
-                    &index,
+                    WorkspaceLiveIndexContext {
+                        index: &index,
+                        open_files: &open_files,
+                        template_documents: &template_documents,
+                        document_versions: &reindex_document_versions,
+                    },
                     &config.root,
                     config.namespace_map.as_ref(),
                     &indexing_options,
@@ -2111,14 +2635,15 @@ impl PhpLspBackend {
             let workspace_roots: Vec<PathBuf> =
                 configs.iter().map(|config| config.root.clone()).collect();
             twig_context_disk_cache.lock().await.clear();
-            refresh_open_twig_contexts_for_state(
-                &open_files,
-                &template_documents,
-                &reindex_index,
-                &workspace_roots,
-                &twig_context_disk_cache,
-                &semantic_tokens_cache,
-            )
+            refresh_open_twig_contexts_for_state(OpenTwigContextRefreshState {
+                open_files: &open_files,
+                template_documents: &template_documents,
+                document_versions: &reindex_document_versions,
+                index: &reindex_index,
+                workspace_roots: &workspace_roots,
+                twig_context_disk_cache: &twig_context_disk_cache,
+                semantic_tokens_cache: &semantic_tokens_cache,
+            })
             .await;
             if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
                 return;
@@ -2126,34 +2651,49 @@ impl PhpLspBackend {
             let open_file_uris: Vec<String> =
                 open_files.iter().map(|entry| entry.key().clone()).collect();
             for uri_str in open_file_uris {
+                let Some(snapshot) = open_document_snapshot_from_state(
+                    &open_files,
+                    &template_documents,
+                    &reindex_document_versions,
+                    &uri_str,
+                ) else {
+                    continue;
+                };
+                commit_open_document_index_snapshot_if_current(
+                    OpenDocumentIndexCommitContext {
+                        open_files: &open_files,
+                        template_documents: &template_documents,
+                        document_versions: &reindex_document_versions,
+                        index: &reindex_index,
+                        uri_str: &uri_str,
+                    },
+                    &snapshot,
+                );
                 if let Ok(uri) = uri_str.parse::<Uri>() {
-                    let version = reindex_document_versions
-                        .get(&uri_str)
-                        .map(|current| *current);
-                    let template_document = template_documents
-                        .get(&uri_str)
-                        .map(|template| template.value().clone());
+                    let document_state = snapshot.document_state;
+                    let version = document_state.map(|state| state.version);
+                    let template_document = snapshot.template_document.clone();
                     if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
                         && template_document.is_none()
                         && index_vendor
                     {
                         preresolve_open_file_diagnostic_dependencies(
-                            &reindex_index,
-                            &open_files,
-                            &uri_str,
+                            &snapshot.tree,
+                            &snapshot.source,
+                            &snapshot.file_symbols,
                             &vendor_lazy_context,
                         )
                         .await;
                     }
-                    let mut diags = compute_open_file_diagnostics(
-                        &uri_str,
-                        &open_files,
-                        &reindex_index,
+                    let mut diags = compute_source_diagnostics_blocking(
+                        uri_str.clone(),
+                        snapshot.source.clone(),
+                        reindex_index.clone(),
                         diagnostics_config,
                         version,
                     )
                     .await;
-                    if let Some(template) = template_document {
+                    if let Some(template) = &template_document {
                         diags = template.map_diagnostics_to_original(
                             diags,
                             diagnostics_config.mode == DiagnosticsMode::Off,
@@ -2168,28 +2708,15 @@ impl PhpLspBackend {
                         )
                         .await;
                     }
-                    if reindex_document_versions
-                        .get(&uri_str)
-                        .map(|current| *current)
-                        == version
-                    {
-                        let publish_started = Instant::now();
-                        let publish_span = tracing::debug_span!(
-                            "diagnostics.publish",
-                            uri = %uri_str,
-                            version = ?version,
-                            duration_ms = tracing::field::Empty,
-                        );
-                        async {
-                            reindex_client
-                                .publish_diagnostics(uri, diags, version)
-                                .await;
-                        }
-                        .instrument(publish_span.clone())
-                        .await;
-                        publish_span
-                            .record("duration_ms", publish_started.elapsed().as_millis() as u64);
-                    }
+                    diagnostics_publisher.publish(DiagnosticPublishRequest {
+                        uri,
+                        diagnostics: diags,
+                        version,
+                        expected_state: document_state,
+                        expected_template: template_document,
+                        require_idle_index: diagnostics_config.mode
+                            == DiagnosticsMode::BasicSemantic,
+                    });
                 }
             }
         });

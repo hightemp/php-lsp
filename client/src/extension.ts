@@ -4,6 +4,13 @@ import * as fs from "fs";
 import type { ChildProcess } from "child_process";
 import { phpLspCacheDirForRoot } from "./cachePath";
 import {
+  BoundedRestartTracker,
+  DisposableResourceRegistry,
+  languageClientFailurePolicy,
+  LifecycleCoordinator,
+  reconcileLanguageClientState,
+} from "./lifecycle";
+import {
   workspace,
   commands,
   env,
@@ -33,11 +40,21 @@ let indexingStatusSubscription: Disposable | undefined;
 let outputChannel: OutputChannel | undefined;
 let lastBinaryResolutionError: string | undefined;
 let lastStartError: string | undefined;
-let lifecycleQueue: Promise<void> = Promise.resolve();
-let lifecycleOperationDepth = 0;
 const stoppingClients = new WeakSet<LanguageClient>();
+const lifecycleCoordinator = new LifecycleCoordinator();
+const clientFileWatchers = new DisposableResourceRegistry<LanguageClient>();
 
 const STOP_TIMEOUT_MS = 5000;
+const WATCHED_FILE_GLOBS = [
+  "**/*.php",
+  "**/*.twig",
+  "**/composer.json",
+  "**/composer.lock",
+  "**/vendor/composer/installed.json",
+  "**/vendor/composer/installed.php",
+  "**/vendor/composer/autoload_*.php",
+  "**/.php-lsp.toml",
+] as const;
 
 type IndexingPhase =
   | "starting"
@@ -488,24 +505,13 @@ function errorMessage(error: unknown): string {
 }
 
 function enqueueLifecycleOperation(reason: string, operation: () => Promise<void>): Promise<void> {
-  const run = lifecycleQueue
-    .catch(() => undefined)
-    .then(async () => {
-      lifecycleLog(`Lifecycle begin: ${reason}`);
-      lifecycleOperationDepth += 1;
-      try {
-        await operation();
-        lifecycleLog(`Lifecycle complete: ${reason}`);
-      } catch (error: unknown) {
-        lifecycleLog(`Lifecycle failed: ${reason}: ${errorMessage(error)}`);
-        throw error;
-      } finally {
-        lifecycleOperationDepth = Math.max(0, lifecycleOperationDepth - 1);
-      }
-    });
-
-  lifecycleQueue = run.catch(() => undefined);
-  return run;
+  return lifecycleCoordinator.enqueue(reason, operation, (event) => {
+    if (event.phase === "failed") {
+      lifecycleLog(`Lifecycle failed: ${event.reason}: ${errorMessage(event.error)}`);
+    } else {
+      lifecycleLog(`Lifecycle ${event.phase}: ${event.reason}`);
+    }
+  });
 }
 
 // Best-effort fallback for a timed-out stop; vscode-languageclient owns this child process.
@@ -553,19 +559,27 @@ function isBrokenPipeError(error: Error): boolean {
 }
 
 function createClientErrorHandler(clientProvider: () => LanguageClient | undefined): ErrorHandler {
+  const restartTracker = new BoundedRestartTracker();
   return {
     error(error: Error, _message, count): { action: ErrorAction; handled: boolean } {
       const languageClient = clientProvider();
-      const staleOrStopping = !languageClient
-        || client !== languageClient
-        || stoppingClients.has(languageClient)
-        || lifecycleOperationDepth > 0;
+      const failurePolicy = languageClientFailurePolicy(
+        client,
+        languageClient,
+        languageClient !== undefined && stoppingClients.has(languageClient),
+      );
 
-      if (isBrokenPipeError(error) && staleOrStopping) {
+      if (isBrokenPipeError(error)) {
+        if (failurePolicy.pipe === "shutdown") {
+          lifecycleLog(
+            `Suppressed stale language-client pipe error during lifecycle transition: ${error.message}; count=${count ?? 0}`,
+          );
+          return { action: ErrorAction.Shutdown, handled: true };
+        }
         lifecycleLog(
-          `Suppressed stale language-client pipe error during lifecycle transition: ${error.message}; count=${count ?? 0}`,
+          `Language-client pipe closed unexpectedly; waiting for connection restart: ${error.message}; count=${count ?? 0}`,
         );
-        return { action: ErrorAction.Shutdown, handled: true };
+        return { action: ErrorAction.Continue, handled: true };
       }
 
       lifecycleLog(`Language-client connection error: ${error.message}; count=${count ?? 0}`);
@@ -573,22 +587,32 @@ function createClientErrorHandler(clientProvider: () => LanguageClient | undefin
     },
     closed(): { action: CloseAction; handled: boolean } {
       const languageClient = clientProvider();
-      const staleOrStopping = !languageClient
-        || client !== languageClient
-        || stoppingClients.has(languageClient)
-        || lifecycleOperationDepth > 0;
+      const failurePolicy = languageClientFailurePolicy(
+        client,
+        languageClient,
+        languageClient !== undefined && stoppingClients.has(languageClient),
+      );
 
-      if (staleOrStopping) {
+      if (failurePolicy.close === "doNotRestart") {
         lifecycleLog("Suppressed stale language-client close during lifecycle transition");
+        return { action: CloseAction.DoNotRestart, handled: true };
+      }
+
+      if (!restartTracker.shouldRestart()) {
+        lifecycleLog("Language-client restart limit reached after repeated crashes");
+        statusController?.update({
+          phase: "error",
+          message: "Language server repeatedly crashed and will not be restarted",
+        });
         return { action: CloseAction.DoNotRestart, handled: true };
       }
 
       lifecycleLog("Language-client connection closed unexpectedly");
       statusController?.update({
-        phase: "error",
-        message: "Language server connection closed",
+        phase: "starting",
+        message: "Language server connection closed; restarting",
       });
-      return { action: CloseAction.DoNotRestart, handled: false };
+      return { action: CloseAction.Restart, handled: true };
     },
   };
 }
@@ -909,6 +933,7 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
   const logLevel = config.get<string>("logLevel", "info");
   const serverEnvironment = getServerEnvironment(logLevel);
   let languageClient: LanguageClient | undefined;
+  const fileEvents = WATCHED_FILE_GLOBS.map((glob) => workspace.createFileSystemWatcher(glob));
 
   const serverOptions: ServerOptions = {
     run: {
@@ -939,28 +964,37 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
       { scheme: "untitled", language: "twig" },
     ],
     synchronize: {
-      fileEvents: [
-        workspace.createFileSystemWatcher("**/*.php"),
-        workspace.createFileSystemWatcher("**/*.twig"),
-        workspace.createFileSystemWatcher("**/composer.json"),
-        workspace.createFileSystemWatcher("**/composer.lock"),
-        workspace.createFileSystemWatcher("**/vendor/composer/installed.json"),
-        workspace.createFileSystemWatcher("**/vendor/composer/installed.php"),
-        workspace.createFileSystemWatcher("**/vendor/composer/autoload_*.php"),
-        workspace.createFileSystemWatcher("**/.php-lsp.toml"),
-      ],
+      fileEvents,
     },
     initializationOptions: buildInitializationOptions(config, stubsPath),
     errorHandler: createClientErrorHandler(() => languageClient),
   };
 
-  languageClient = new LanguageClient(
-    "phpLsp",
-    "PHP Language Server",
-    serverOptions,
-    clientOptions,
-  );
-  return languageClient;
+  try {
+    languageClient = new LanguageClient(
+      "phpLsp",
+      "PHP Language Server",
+      serverOptions,
+      clientOptions,
+    );
+    clientFileWatchers.register(languageClient, fileEvents);
+    return languageClient;
+  } catch (error: unknown) {
+    for (const watcher of fileEvents) {
+      watcher.dispose();
+    }
+    throw error;
+  }
+}
+
+function disposeClientFileWatchers(languageClient: LanguageClient, reason: string): void {
+  const disposed = clientFileWatchers.dispose(languageClient, (error) => {
+    lifecycleLog(`File watcher dispose failed: reason=${reason}; error=${errorMessage(error)}`);
+  });
+  if (disposed === 0) {
+    return;
+  }
+  lifecycleLog(`Disposed ${disposed} file watcher(s): reason=${reason}`);
 }
 
 async function notifyServerConfigurationChanged(context: ExtensionContext): Promise<void> {
@@ -988,6 +1022,7 @@ async function stopLanguageClient(reason: string): Promise<void> {
 
   const processToTerminate = managedServerProcess(currentClient);
   stoppingClients.add(currentClient);
+  disposeClientFileWatchers(currentClient, reason);
   lifecycleLog(`Stopping language server: reason=${reason}; timeoutMs=${STOP_TIMEOUT_MS}`);
   try {
     await currentClient.stop(STOP_TIMEOUT_MS);
@@ -1013,13 +1048,19 @@ async function stopLanguageClient(reason: string): Promise<void> {
 }
 
 async function startLanguageClient(context: ExtensionContext, reason: string): Promise<boolean> {
+  if (client) {
+    lifecycleLog(`Start skipped: reason=${reason}; a language client already exists`);
+    return true;
+  }
+
+  let nextClient: LanguageClient | undefined;
   try {
     const binary = getServerBinaryForStart(context);
     lifecycleLog(
       `Starting language server: reason=${reason}; source=${binarySourceLabel(binary.source, binary.platformDir)}; path=${binary.serverPath}; platform=${binary.platformDir ?? `${os.platform()}-${os.arch()}`}`,
     );
 
-    const nextClient = createLanguageClient(context, binary);
+    nextClient = createLanguageClient(context, binary);
     client = nextClient;
     indexingStatusSubscription = nextClient.onNotification(
       "phpLsp/indexingStatus",
@@ -1033,9 +1074,21 @@ async function startLanguageClient(context: ExtensionContext, reason: string): P
   } catch (error: unknown) {
     const message = errorMessage(error);
     lastStartError = message;
-    client = undefined;
+    if (client === nextClient) {
+      client = undefined;
+    }
     indexingStatusSubscription?.dispose();
     indexingStatusSubscription = undefined;
+    if (nextClient) {
+      disposeClientFileWatchers(nextClient, `failed start: ${reason}`);
+      try {
+        await nextClient.dispose(STOP_TIMEOUT_MS);
+      } catch (disposeError: unknown) {
+        lifecycleLog(
+          `Client dispose failed after start error: reason=${reason}; error=${errorMessage(disposeError)}`,
+        );
+      }
+    }
     statusController?.update({
       phase: "error",
       message,
@@ -1043,6 +1096,43 @@ async function startLanguageClient(context: ExtensionContext, reason: string): P
     window.showErrorMessage(`PHP Language Server failed to start: ${message}`);
     return false;
   }
+}
+
+async function reconcileLanguageClient(
+  context: ExtensionContext,
+  reason: string,
+): Promise<void> {
+  await reconcileLanguageClientState({
+    isEnabled: () => workspace
+      .getConfiguration("phpLsp")
+      .get<boolean>("enable", true),
+    hasClient: () => client !== undefined,
+    start: () => startLanguageClient(context, reason),
+    stop: () => stopLanguageClient(reason),
+    onDisabled: () => {
+      statusController?.update({
+        phase: "ready",
+        message: "Language server is disabled",
+      });
+    },
+    onRunning: () => notifyServerConfigurationChanged(context),
+    onStarting: () => {
+      statusController?.update({
+        phase: "starting",
+        message: "Starting language server",
+      });
+    },
+  });
+}
+
+function enqueueLanguageClientReconciliation(
+  context: ExtensionContext,
+  reason: string,
+): Promise<void> {
+  return enqueueLifecycleOperation(
+    reason,
+    async () => reconcileLanguageClient(context, reason),
+  );
 }
 
 async function restartLanguageClient(context: ExtensionContext): Promise<void> {
@@ -1134,8 +1224,6 @@ async function clearCacheAndRestartLanguageClient(context: ExtensionContext): Pr
 }
 
 export function activate(context: ExtensionContext): void {
-  const config = workspace.getConfiguration("phpLsp");
-
   const controller = new PhpLspStatusController(() => getExtensionSnapshot(context));
   statusController = controller;
 
@@ -1164,27 +1252,7 @@ export function activate(context: ExtensionContext): void {
     if (!event.affectsConfiguration("phpLsp")) {
       return;
     }
-
-    const enabled = workspace.getConfiguration("phpLsp").get<boolean>("enable", true);
-    if (!enabled) {
-      await enqueueLifecycleOperation("disable setting changed", async () => {
-        await stopLanguageClient("disable setting changed");
-        statusController?.update({
-          phase: "ready",
-          message: "Language server is disabled",
-        });
-      });
-    } else if (!client) {
-      await enqueueLifecycleOperation("enable setting changed", async () => {
-        statusController?.update({
-          phase: "starting",
-          message: "Starting language server",
-        });
-        await startLanguageClient(context, "enable setting changed");
-      });
-    } else {
-      await notifyServerConfigurationChanged(context);
-    }
+    await enqueueLanguageClientReconciliation(context, "configuration changed");
   });
 
   context.subscriptions.push(
@@ -1196,19 +1264,8 @@ export function activate(context: ExtensionContext): void {
     enableConfigSubscription,
   );
 
-  if (!config.get<boolean>("enable", true)) {
-    lifecycleLog("Extension activated with phpLsp.enable=false; server start skipped");
-    statusController?.update({
-      phase: "ready",
-      message: "Language server is disabled",
-    });
-    return;
-  }
-
-  // Start the client (also launches the server)
-  void enqueueLifecycleOperation("extension activation", async () => {
-    await startLanguageClient(context, "extension activation");
-  });
+  // Re-read configuration inside the lifecycle queue before starting.
+  void enqueueLanguageClientReconciliation(context, "extension activation");
 }
 
 export async function deactivate(): Promise<void> {

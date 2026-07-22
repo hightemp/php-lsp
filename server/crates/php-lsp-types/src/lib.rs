@@ -453,6 +453,16 @@ pub struct UseStatement {
     pub range: (u32, u32, u32, u32),
 }
 
+/// A lexical namespace section in a PHP file.
+///
+/// The range uses tree-sitter byte columns. `namespace` is `None` for the
+/// global namespace, including an explicit `namespace { ... }` section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceScope {
+    pub namespace: Option<String>,
+    pub range: (u32, u32, u32, u32),
+}
+
 /// Kind of use statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UseKind {
@@ -465,12 +475,115 @@ pub enum UseKind {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FileSymbols {
     pub namespace: Option<String>,
+    /// Namespace sections in source order. Older cache entries omit this
+    /// field and continue to use the legacy file-level `namespace` value.
+    #[serde(default)]
+    pub namespace_scopes: Vec<NamespaceScope>,
     pub use_statements: Vec<UseStatement>,
     pub symbols: Vec<SymbolInfo>,
     #[serde(default)]
     pub type_aliases: Vec<PhpDocTypeAlias>,
     #[serde(default)]
     pub type_alias_imports: Vec<PhpDocTypeAliasImport>,
+}
+
+impl FileSymbols {
+    /// Return a copy whose namespace and imports are limited to the namespace
+    /// section containing the provided tree-sitter byte position.
+    pub fn scoped_at_byte_position(&self, line: u32, column: u32) -> std::borrow::Cow<'_, Self> {
+        let Some(scope) = self.namespace_scope_at_byte_position(line, column) else {
+            return std::borrow::Cow::Borrowed(self);
+        };
+
+        if self.namespace_scopes.len() == 1
+            && self.namespace == scope.namespace
+            && self.use_statements.iter().all(|statement| {
+                byte_position_in_range(statement.range.0, statement.range.1, scope.range)
+            })
+        {
+            return std::borrow::Cow::Borrowed(self);
+        }
+
+        let mut scoped = self.clone();
+        scoped.namespace = scope.namespace.clone();
+        scoped.use_statements.retain(|statement| {
+            byte_position_in_range(statement.range.0, statement.range.1, scope.range)
+        });
+        scoped.namespace_scopes = vec![scope.clone()];
+        std::borrow::Cow::Owned(scoped)
+    }
+
+    /// Find the namespace section containing a tree-sitter byte position.
+    pub fn namespace_scope_at_byte_position(
+        &self,
+        line: u32,
+        column: u32,
+    ) -> Option<&NamespaceScope> {
+        let position = (line, column);
+        self.namespace_scopes
+            .iter()
+            .find(|scope| byte_position_in_range(line, column, scope.range))
+            .or_else(|| {
+                self.namespace_scopes
+                    .last()
+                    .filter(|scope| position == (scope.range.2, scope.range.3))
+            })
+    }
+}
+
+fn byte_position_in_range(line: u32, column: u32, range: (u32, u32, u32, u32)) -> bool {
+    let position = (line, column);
+    position >= (range.0, range.1) && position < (range.2, range.3)
+}
+
+/// Compare symbol FQNs using PHP's kind-specific casing rules.
+pub fn symbol_fqn_eq(left: &str, right: &str, kind: PhpSymbolKind) -> bool {
+    let left = left.trim_start_matches('\\');
+    let right = right.trim_start_matches('\\');
+
+    match kind {
+        PhpSymbolKind::Class
+        | PhpSymbolKind::Interface
+        | PhpSymbolKind::Trait
+        | PhpSymbolKind::Enum
+        | PhpSymbolKind::Function => left.eq_ignore_ascii_case(right),
+        PhpSymbolKind::Method => member_fqn_eq(left, right, true),
+        PhpSymbolKind::Property | PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase => {
+            member_fqn_eq(left, right, false)
+        }
+        PhpSymbolKind::GlobalConstant => {
+            global_constant_fqn_key(left) == global_constant_fqn_key(right)
+        }
+        PhpSymbolKind::Namespace => left == right,
+    }
+}
+
+/// Build the lookup key for a global constant FQN.
+///
+/// PHP namespace segments are ASCII case-insensitive, while the final constant
+/// identifier remains case-sensitive.
+pub fn global_constant_fqn_key(fqn: &str) -> String {
+    let fqn = fqn.trim_start_matches('\\');
+    match fqn.rsplit_once('\\') {
+        Some((namespace, name)) => format!("{}\\{}", namespace.to_ascii_lowercase(), name),
+        None => fqn.to_string(),
+    }
+}
+
+fn member_fqn_eq(left: &str, right: &str, member_is_case_insensitive: bool) -> bool {
+    let Some((left_owner, left_member)) = left.rsplit_once("::") else {
+        return false;
+    };
+    let Some((right_owner, right_member)) = right.rsplit_once("::") else {
+        return false;
+    };
+
+    left_owner.eq_ignore_ascii_case(right_owner)
+        && if member_is_case_insensitive {
+            left_member.eq_ignore_ascii_case(right_member)
+        } else {
+            left_member == right_member
+        }
 }
 
 /// Receiver information for a precomputed member occurrence.
@@ -510,6 +623,26 @@ pub struct SymbolReference {
     pub is_declaration: bool,
     /// True when the edited text itself starts with `$` (`$prop`, `Class::$prop`).
     pub starts_with_dollar: bool,
+    /// Whether an unresolved namespaced function/constant occurrence may match
+    /// the global short name under PHP's unqualified-name fallback rules.
+    #[serde(default)]
+    pub allows_global_fallback: bool,
+    /// Optional LSP UTF-16 range to edit during symbol rename.
+    ///
+    /// Navigation keeps using `range`, while qualified names and import targets
+    /// can limit rename to their final identifier segment.
+    #[serde(default)]
+    pub rename_range: Option<(u32, u32, u32, u32)>,
+    /// Keep the source spelling when the occurrence is an explicit import
+    /// alias. Renaming the imported declaration updates the import target, not
+    /// the independently chosen alias or its usages.
+    #[serde(default)]
+    pub preserve_spelling_on_rename: bool,
+    /// True when this occurrence is the imported target inside a `use` clause.
+    /// Such references participate in navigation and rename, but must not make
+    /// an otherwise unused import count as used.
+    #[serde(default)]
+    pub is_import_target: bool,
     /// Receiver resolution state for member references.
     #[serde(default)]
     pub receiver: SymbolReferenceReceiver,
@@ -582,5 +715,86 @@ mod tests {
             PhpSymbolKind::Function.to_lsp_symbol_kind(),
             lsp_types::SymbolKind::FUNCTION
         );
+    }
+
+    #[test]
+    fn test_global_constant_fqn_namespace_is_case_insensitive_only() {
+        assert!(symbol_fqn_eq(
+            r"Vendor\Package\FLAG",
+            r"vendor\package\FLAG",
+            PhpSymbolKind::GlobalConstant,
+        ));
+        assert!(!symbol_fqn_eq(
+            r"Vendor\Package\FLAG",
+            r"vendor\package\flag",
+            PhpSymbolKind::GlobalConstant,
+        ));
+        assert_eq!(
+            global_constant_fqn_key(r"\Vendor\Package\FLAG"),
+            r"vendor\package\FLAG"
+        );
+    }
+
+    #[test]
+    fn test_member_fqn_casing_follows_php_lookup_rules() {
+        assert!(symbol_fqn_eq(
+            r"App\Service::doWork",
+            r"app\service::DOWORK",
+            PhpSymbolKind::Method,
+        ));
+        assert!(symbol_fqn_eq(
+            r"App\Service::$value",
+            r"app\service::$value",
+            PhpSymbolKind::Property,
+        ));
+        assert!(!symbol_fqn_eq(
+            r"App\Service::$value",
+            r"app\service::$VALUE",
+            PhpSymbolKind::Property,
+        ));
+    }
+
+    #[test]
+    fn final_namespace_scope_includes_cursor_at_file_end_only() {
+        let file_symbols = FileSymbols {
+            namespace: Some("First".to_string()),
+            namespace_scopes: vec![
+                NamespaceScope {
+                    namespace: Some("First".to_string()),
+                    range: (0, 0, 3, 0),
+                },
+                NamespaceScope {
+                    namespace: Some("Second".to_string()),
+                    range: (3, 0, 6, 3),
+                },
+            ],
+            use_statements: vec![
+                UseStatement {
+                    fqn: r"Vendor\One".to_string(),
+                    alias: Some("Shared".to_string()),
+                    kind: UseKind::Class,
+                    namespace: Some("First".to_string()),
+                    range: (1, 0, 1, 22),
+                },
+                UseStatement {
+                    fqn: r"Vendor\Two".to_string(),
+                    alias: Some("Shared".to_string()),
+                    kind: UseKind::Class,
+                    namespace: Some("Second".to_string()),
+                    range: (4, 0, 4, 22),
+                },
+            ],
+            ..FileSymbols::default()
+        };
+
+        let boundary = file_symbols
+            .namespace_scope_at_byte_position(3, 0)
+            .expect("adjacent boundary belongs to the following scope");
+        assert_eq!(boundary.namespace.as_deref(), Some("Second"));
+
+        let scoped = file_symbols.scoped_at_byte_position(6, 3);
+        assert_eq!(scoped.namespace.as_deref(), Some("Second"));
+        assert_eq!(scoped.use_statements.len(), 1);
+        assert_eq!(scoped.use_statements[0].fqn, r"Vendor\Two");
     }
 }

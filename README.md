@@ -15,6 +15,8 @@
 
 Rust PHP Language Server (LSP 3.17) with a VS Code extension.
 
+The extension requires Visual Studio Code 1.82 or newer.
+
 php-lsp targets PHP 7.4-8.4 projects and provides indexed PHP language
 intelligence: diagnostics, hover, completion, navigation, references, rename,
 formatting integration, semantic tokens, hierarchy views, and built-in
@@ -47,7 +49,8 @@ phpstorm-stubs support.
 - Framework-aware static providers for common Laravel string keys, Symfony
   Twig template names, and Symfony route names without booting the application.
 - Blade-like and Symfony/Twig template documents use virtual PHP plus source
-  maps for conservative hover, completion, definition, inlay hints,
+  maps for conservative hover, completion, definition, type definition,
+  implementation, inlay hints,
   diagnostics, and semantic tokens in supported template expressions and
   control blocks.
 - Override signature and PHP-version compatibility diagnostics.
@@ -221,7 +224,8 @@ phpstorm-stubs support.
   Twig semantics for filters, tests, `in`, functions, macros, ternaries, null
   coalescing, and dynamic/bracket attribute access remain unsupported, but safe
   subexpressions are source-mapped where possible for hover, completion,
-  definition, and inlay hints. Current supported Twig cases include simple
+  definition, type definition, implementation, and inlay hints. Current
+  supported Twig cases include simple
   member/root variables inside otherwise unsupported expressions,
   type-preserving `slice`/`filter` foreach inference, getter-backed
   property-style labels, static template-path and route-key navigation, static
@@ -530,7 +534,9 @@ for these VS Code platform directories:
 - `win32-arm64`
 
 Published Linux binaries are built from the GNU targets
-(`*-unknown-linux-gnu`). Alpine/musl is not part of the universal VSIX release
+(`*-unknown-linux-gnu`). The `linux-x64` release binary targets glibc 2.28 and
+is checked both for newer glibc symbol requirements and by execution on Ubuntu
+20.04 before packaging. Alpine/musl is not part of the universal VSIX release
 target set.
 
 `make release` requires a clean working tree, reads the semver value from

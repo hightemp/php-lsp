@@ -15,6 +15,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_ZIGBUILD_VERSION: "0.22.3"
+  LINUX_GLIBC_BASELINE: "2.28"
+  UBUNTU_20_04_IMAGE: "ubuntu@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"
+  ZIG_VERSION: "0.15.2"
 
 jobs:
   build-server:
@@ -26,6 +30,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             platform: linux-x64
+            zig: true
 
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
@@ -59,14 +64,28 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: mlugg/setup-zig@v2
+        if: matrix.zig
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        run: cargo install cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION" --locked
+
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --locked
 
       - name: Build (native)
-        if: "!matrix.cross"
+        if: ${{ !matrix.cross && !matrix.zig }}
         working-directory: server
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (portable Linux GNU)
+        if: matrix.zig
+        working-directory: server
+        run: cargo zigbuild --release --target "${{ matrix.target }}.${LINUX_GLIBC_BASELINE}"
 
       - name: Build (cross)
         if: matrix.cross
@@ -87,6 +106,14 @@ jobs:
         if: "!contains(matrix.target, 'windows')"
         run: |
           strip "server/target/${{ matrix.target }}/release/${{ steps.binary.outputs.name }}" 2>/dev/null || true
+
+      - name: Smoke Linux x64 compatibility
+        if: matrix.platform == 'linux-x64'
+        run: |
+          scripts/smoke-linux-x64-compat.sh \
+            "server/target/${{ matrix.target }}/release/${{ steps.binary.outputs.name }}" \
+            "$LINUX_GLIBC_BASELINE" \
+            "$UBUNTU_20_04_IMAGE"
 
       - name: Upload server binary
         uses: actions/upload-artifact@v4

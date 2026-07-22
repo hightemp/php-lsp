@@ -5601,3 +5601,119 @@ change.
   - Validation: `cargo fmt --all --check`; `git diff --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test -p php-lsp-parser array_write`; `cargo test -p php-lsp-server --test e2e_hover array_write`; `cargo test --all`; `make install`; Verifier subagent GO.
   - Files:
     /home/apanov/Projects/bdpn-ui/app/src/Controller/SubscriberController.php
+
+- [x] **AUDIT-PROJECT-BUGS-2026-07-21** Audit the project for reproducible defects *(done 2026-07-21)*
+  - Started: 2026-07-21; inspect parser/index, server LSP handlers, client/tooling, and automated checks; report only concrete defects with evidence, impact, and reproduction guidance without changing product code.
+  - Implemented: completed a read-only cross-project audit and recorded 12 verified follow-up defects below, grouped to avoid duplicate fixes across Twig concurrency, PHP name resolution, and client lifecycle concerns.
+  - Validation: `make check`; `npm run build`; focused PHP 8.3/runtime and `php-lsp analyze` repros; direct stdio JSON-RPC repros; `npx --no-install @vscode/vsce ls`; `readelf --version-info`; Ubuntu 20.04 Docker smoke; `git diff --check`; Verifier follow-up `GO`.
+
+### Milestone: Post-audit correctness and compatibility fixes (2026-07-21 -> 2026-07-21)
+
+**Статус:** completed
+**Цель:** устранить подтверждённые аудитом ошибки совместимости, потери состояния документов, PHP name resolution, LSP ranges/template mapping и жизненного цикла VS Code client.
+
+#### Exit criteria
+
+- Все 14 воспроизводимых и найденных при верификации дефектов закрыты регрессионными тестами и целевыми acceptance-проверками.
+- Linux и VS Code compatibility floors согласованы с реально поставляемыми зависимостями и бинарниками.
+- Асинхронные обновления Twig и перезапуски client не могут перезаписывать более новое состояние или оставлять ресурсы предыдущего запуска.
+
+#### Задачи
+
+- [x] **AUD-20260721-001** Build Linux release binaries against the supported glibc baseline. *(done 2026-07-21)*
+  - Started: 2026-07-21; pin a reproducible Linux build baseline and add an executable compatibility smoke check.
+  - Scope: replace the floating native `ubuntu-latest` GNU build path with a reproducible compatible toolchain/sysroot or equivalent portable target, and add an ABI smoke check.
+  - Validation target: the packaged `linux-x64` binary runs on Ubuntu 20.04 and does not require glibc newer than the documented floor.
+  - Implemented: release Linux x64 builds use the reproducible Zig `gnu.2.28` target, with reusable ABI and Ubuntu compatibility smoke scripts.
+  - Validation: a fresh release binary and the binary extracted from VSIX both require glibc `<= 2.28` and pass in the pinned Ubuntu 20.04 image.
+
+- [x] **AUD-20260721-002** Align the VS Code engine floor with `vscode-languageclient`. *(done 2026-07-21)*
+  - Started: 2026-07-21; synchronize manifest/runtime requirements and cover the declared minimum.
+  - Scope: make the extension manifest and dependency runtime requirement agree so every installable VS Code version can construct the language client.
+  - Validation target: manifest semver coverage and activation smoke at the minimum declared VS Code version.
+  - Implemented: the extension and language-client dependency now share the VS Code `^1.82.0` floor, guarded by a manifest/lockfile compatibility check.
+  - Validation: client lint passes and the packaged extension completes activation and shutdown at declared VS Code minimum `1.82.0`.
+
+- [x] **AUD-20260721-003** Prevent stale Twig document writes across concurrent notifications and context refreshes. *(done 2026-07-21)*
+  - Started: 2026-07-21; add version-aware state updates for both documented Twig races and concurrent regressions.
+  - Scope: preserve an immediate `didChange` racing with `didOpen`, and reject stale Twig context refresh snapshots after a newer document version is stored.
+  - Validation target: concurrent stdio regressions for both lost-first-change and refresh-overwrites-newer-text schedules.
+  - Implemented: document generation/version checks and parser-entry serialization now guard Twig opens, changes, context refreshes, reopen lifetimes, and diagnostics publication.
+  - Validation: concurrent Twig notification/context unit tests and `e2e_templates`/`e2e_diagnostics` pass under the full test suite.
+
+- [x] **AUD-20260721-004** Model namespace and import scope per PHP namespace block. *(done 2026-07-21)*
+  - Started: 2026-07-21; make resolution/reference scope cursor-aware for multi-namespace files.
+  - Scope: stop using the last file namespace and unfiltered file-wide imports when resolving symbols/references in files containing multiple namespace sections.
+  - Validation target: bracketed and unbracketed multi-namespace tests with repeated aliases and namespace-local classes.
+  - Implemented: namespace/import scopes are recorded per block and selected by cursor for extraction, resolution, references, completion, hover, and navigation.
+  - Validation: bracketed and unbracketed repeated-alias parser regressions and affected LSP e2e suites pass.
+
+- [x] **AUD-20260721-005** Resolve PHP class/function declarations and aliases ASCII case-insensitively. *(done 2026-07-21)*
+  - Started: 2026-07-21; normalize only PHP case-insensitive symbol kinds across index and parser lookup paths.
+  - Scope: normalize class-like and function lookup across index, resolver, references, rename, and import aliases while keeping constants and properties case-sensitive.
+  - Validation target: same-file, cross-file, builtin-function, alias, references, and rename regressions with casing differences.
+  - Implemented: kind-aware lookup keys follow PHP casing rules, while rename/reference metadata safely handles import targets and preserves explicit aliases.
+  - Validation: parser reference tests, index tests, `e2e_references`, and `e2e_code_actions` all pass, including mixed-case builtin and import rename cases.
+
+- [x] **AUD-20260721-006** Diagnose duplicate class members that are PHP fatal errors. *(done 2026-07-21)*
+  - Started: 2026-07-21; extend semantic duplicate detection with owner- and kind-aware member keys.
+  - Scope: extend duplicate-symbol diagnostics to methods, properties, class constants, and enum cases with kind-appropriate semantics.
+  - Validation target: PHP-fatal duplicate-member fixtures produce deterministic `DuplicateSymbol` diagnostics without false positives for legal overrides.
+  - Implemented: semantic duplicate detection uses owner-, kind-, namespace-, and PHP-casing-aware keys for methods, properties, class constants, and enum cases.
+  - Validation: duplicate-member and legal-override parser regressions pass in `cargo test --all`.
+
+- [x] **AUD-20260721-007** Serialize client restart/start decisions and dispose file watchers. *(done 2026-07-21)*
+  - Started: 2026-07-21; harden queued lifecycle decisions and explicitly own watcher disposal.
+  - Scope: re-check lifecycle state inside queued operations, prevent restart/configuration double-start, and explicitly own/dispose all watchers created for a language client.
+  - Validation target: slow-stop restart/config race launches one server, and repeated restart leaves no prior watchers or client process alive.
+  - Implemented: client lifecycle operations run through one reconciliation queue with restart budgeting, current-state rechecks, and explicit watcher/client resource ownership.
+  - Validation: lifecycle static checks, TypeScript compilation, production bundling, and VSIX activation/deactivation resource smoke pass.
+
+- [x] **AUD-20260721-008** Fix namespace-relative qualified name resolution. *(done 2026-07-21)*
+  - Started: 2026-07-21; align qualified and explicit `namespace\\` name resolution with PHP runtime semantics.
+  - Scope: resolve qualified function names such as `B\\f()` under the current namespace and handle explicit `namespace\\Foo` / `namespace\\f()` syntax consistently in resolution and references.
+  - Validation target: PHP-runtime-matching resolver, reference, hover, and definition regressions for both forms.
+  - Implemented: qualified names and explicit `namespace\\` forms now resolve relative to the active namespace, with global fallback limited to eligible unqualified calls.
+  - Validation: resolver/reference unit regressions and hover, definition, and reference e2e suites pass.
+
+- [x] **AUD-20260721-009** Preserve per-clause kinds in mixed group imports. *(done 2026-07-21)*
+  - Started: 2026-07-21; extract group prefix and per-clause import kind from the CST.
+  - Scope: correctly extract prefix, alias, and Class/Function/Constant kind for `use X\\{C, function f, const K}`.
+  - Validation target: extraction, diagnostics, hover, definition, and references resolve every mixed group clause to its declared FQN.
+  - Implemented: group-use extraction preserves the shared prefix plus each clause's class/function/constant kind, alias, and target range.
+  - Validation: symbol/resolver unit tests and mixed-group hover/definition e2e coverage pass.
+
+- [x] **AUD-20260721-010** Convert folding range columns from bytes to UTF-16. *(done 2026-07-21)*
+  - Started: 2026-07-21; convert both folding endpoints and add a Unicode protocol regression.
+  - Scope: apply the shared UTF-16 conversion invariant to `FoldingRange.start_character` and `end_character`.
+  - Validation target: e2e folding response after emoji/non-ASCII prefixes reports UTF-16 characters.
+  - Implemented: folding start/end columns are converted from parser byte columns through the shared UTF-16 line index.
+  - Validation: the non-ASCII folding regression passes in `e2e_symbols`.
+
+- [x] **AUD-20260721-011** Map template positions for type-definition and implementation requests. *(done 2026-07-21)*
+  - Started: 2026-07-21; reuse template original/virtual mapping in both request handlers and add Blade/Twig coverage.
+  - Scope: apply original-to-virtual position mapping and response mapping for Blade/Twig `typeDefinition` and `implementation`, matching ordinary definition behavior.
+  - Validation target: Blade and Twig e2e requests resolve class type definitions and interface implementations from original template positions.
+  - Implemented: type-definition and implementation requests use atomic template snapshots and map request/result positions between original Blade/Twig and virtual PHP.
+  - Validation: Blade and Twig type-definition/implementation scenarios pass in `e2e_templates`.
+
+- [x] **AUD-20260721-012** Include Blade and Twig language configuration files in VSIX packages. *(done 2026-07-21)*
+  - Started: 2026-07-21; update the VSIX whitelist and smoke contract for manifest-referenced files.
+  - Scope: update the VSIX whitelist and packaging smoke contract for both manifest-referenced JSON files.
+  - Validation target: `vsce ls` and packaged VSIX inspection contain both language configuration files.
+  - Implemented: the VSIX whitelist includes both PHP/Blade and Twig language-configuration JSON files, and package smoke validates every manifest-referenced configuration.
+  - Validation: a fresh staged VSIX build contains both files and passes package, activation, CLI, and Linux x64 compatibility smoke.
+
+- [x] **AUD-20260721-013** Restore the saved PHP index when an unsaved open document is closed. *(done 2026-07-21)*
+  - Started: 2026-07-21; prevent a discarded in-memory edit from either erasing the last saved index entry or racing a later reopen.
+  - Scope: remove the unsaved open-document snapshot on `didClose`, asynchronously reparse the on-disk file, and publish it only while the URI is still closed and the close generation is current.
+  - Validation target: e2e close-after-unsaved-edit restores disk symbols, and a deterministic close/reopen race cannot overwrite the reopened document.
+  - Implemented: `didClose` removes the unsaved snapshot, schedules disk restoration with a close token, and rejects restoration after reopen or a newer close generation.
+  - Validation: close/discard restoration e2e and deterministic close/reopen race tests pass.
+
+- [x] **AUD-20260721-014** Keep open parser, template, version, and index snapshots atomic across background writers. *(done 2026-07-21)*
+  - Started: 2026-07-21; extend the Twig race fix to every reader and writer that can cross document notifications, file operations, or workspace indexing.
+  - Scope: snapshot same-document requests and diagnostics under the parser-entry lock, merge open-document URI scans, serialize rename/reindex publication, and ensure open unsaved symbols win over delayed disk indexing.
+  - Validation target: deterministic races cover partial rename publication, watched-file reindex versus open edits, workspace disk indexing versus unsaved buffers, and template/index isolation; focused LSP regressions cover same-file symbols and open-only references.
+  - Implemented: request-facing open-document snapshots clone parser/template/version state under one entry lock; guarded index commits, URI unions, rename/reindex publication, and open-buffer overlays prevent stale disk state from winning.
+  - Validation: deterministic parser/index, rename, reindex, workspace-index, close/reopen, and Twig races plus same-file/open-only/template LSP regressions pass in the final `make check`.

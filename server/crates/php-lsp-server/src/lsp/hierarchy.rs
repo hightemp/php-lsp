@@ -129,6 +129,53 @@ async fn type_hierarchy_symbol_from_item(
     backend: &PhpLspBackend,
     item: &TypeHierarchyItem,
 ) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    let uri = item.uri.as_str();
+    if let Some(OpenDocumentSnapshot {
+        source,
+        file_symbols,
+        ..
+    }) = backend.open_document_snapshot(uri)
+    {
+        if let Some(fqn) = item
+            .data
+            .as_ref()
+            .and_then(|data| data.get("fqn"))
+            .and_then(|value| value.as_str())
+        {
+            if let Some(sym) = file_symbols.symbols.iter().find(|sym| {
+                is_type_hierarchy_symbol_kind(sym.kind)
+                    && php_lsp_types::symbol_fqn_eq(&sym.fqn, fqn, sym.kind)
+            }) {
+                return Some(Arc::new(sym.clone()));
+            }
+        }
+
+        let selection = (
+            item.selection_range.start.line,
+            utf16_col_to_byte(
+                &source,
+                item.selection_range.start.line,
+                item.selection_range.start.character,
+            ),
+            item.selection_range.end.line,
+            utf16_col_to_byte(
+                &source,
+                item.selection_range.end.line,
+                item.selection_range.end.character,
+            ),
+        );
+        return file_symbols
+            .symbols
+            .iter()
+            .find(|sym| {
+                sym.name == item.name
+                    && sym.selection_range == selection
+                    && is_type_hierarchy_symbol_kind(sym.kind)
+            })
+            .cloned()
+            .map(Arc::new);
+    }
+
     if let Some(data) = item.data.as_ref() {
         if let Some(fqn) = data.get("fqn").and_then(|value| value.as_str()) {
             if let Some(sym) = backend.index.resolve_fqn(fqn) {
@@ -139,7 +186,6 @@ async fn type_hierarchy_symbol_from_item(
         }
     }
 
-    let uri = item.uri.as_str();
     let source = backend
         .source_for_uri(uri, "typeHierarchy item source read")
         .await?;
@@ -184,15 +230,15 @@ fn direct_type_subtypes(
 
     for entry in index.types.iter() {
         let sym = entry.value().clone();
-        if !is_type_hierarchy_symbol_kind(sym.kind) || sym.fqn == target_fqn {
+        if !is_type_hierarchy_symbol_kind(sym.kind) || sym.fqn.eq_ignore_ascii_case(target_fqn) {
             continue;
         }
         let matches_target = sym
             .extends
             .iter()
             .chain(sym.implements.iter())
-            .any(|parent| parent == target_fqn);
-        if matches_target && seen.insert(sym.fqn.clone()) {
+            .any(|parent| parent.eq_ignore_ascii_case(target_fqn));
+        if matches_target && seen.insert(sym.fqn.to_ascii_lowercase()) {
             subtypes.push(sym);
         }
     }
@@ -206,11 +252,11 @@ fn direct_type_parent_fqns(sym: &php_lsp_types::SymbolInfo) -> Vec<String> {
     sym.extends
         .iter()
         .chain(sym.implements.iter())
-        .filter_map(|fqn| seen.insert(fqn.clone()).then_some(fqn.clone()))
+        .filter_map(|fqn| seen.insert(fqn.to_ascii_lowercase()).then_some(fqn.clone()))
         .collect()
 }
 
-fn direct_symbol_by_fqn(
+fn direct_method_by_fqn(
     index: &WorkspaceIndex,
     fqn: &str,
 ) -> Option<Arc<php_lsp_types::SymbolInfo>> {
@@ -219,7 +265,10 @@ fn direct_symbol_by_fqn(
             .value()
             .symbols
             .iter()
-            .find(|sym| sym.fqn == fqn)
+            .find(|sym| {
+                sym.kind == php_lsp_types::PhpSymbolKind::Method
+                    && php_lsp_types::symbol_fqn_eq(&sym.fqn, fqn, sym.kind)
+            })
             .cloned()
             .map(Arc::new)
     })
@@ -242,7 +291,7 @@ fn collect_implementation_type_descendants(
     visited: &mut HashSet<String>,
     result: &mut Vec<Arc<php_lsp_types::SymbolInfo>>,
 ) {
-    if !visited.insert(target_fqn.to_string()) {
+    if !visited.insert(target_fqn.to_ascii_lowercase()) {
         return;
     }
 
@@ -279,13 +328,15 @@ pub(super) fn implementation_symbols_for_method(
 
     for subtype in implementation_type_descendants(index, parent_fqn) {
         let member_fqn = format!("{}::{}", subtype.fqn, target.name);
-        let Some(method) = direct_symbol_by_fqn(index, &member_fqn) else {
+        let Some(method) = direct_method_by_fqn(index, &member_fqn) else {
             continue;
         };
-        if method.kind != php_lsp_types::PhpSymbolKind::Method || method.fqn == target.fqn {
+        if method.kind != php_lsp_types::PhpSymbolKind::Method
+            || php_lsp_types::symbol_fqn_eq(&method.fqn, &target.fqn, method.kind)
+        {
             continue;
         }
-        if seen.insert(method.fqn.clone()) {
+        if seen.insert(method.fqn.to_ascii_lowercase()) {
             locations.push(method);
         }
     }
@@ -302,6 +353,53 @@ async fn call_hierarchy_symbol_from_item(
     backend: &PhpLspBackend,
     item: &CallHierarchyItem,
 ) -> Option<Arc<php_lsp_types::SymbolInfo>> {
+    let uri = item.uri.as_str();
+    if let Some(OpenDocumentSnapshot {
+        source,
+        file_symbols,
+        ..
+    }) = backend.open_document_snapshot(uri)
+    {
+        if let Some(fqn) = item
+            .data
+            .as_ref()
+            .and_then(|data| data.get("fqn"))
+            .and_then(|value| value.as_str())
+        {
+            if let Some(sym) = file_symbols.symbols.iter().find(|sym| {
+                is_call_hierarchy_symbol_kind(sym.kind)
+                    && php_lsp_types::symbol_fqn_eq(&sym.fqn, fqn, sym.kind)
+            }) {
+                return Some(Arc::new(sym.clone()));
+            }
+        }
+
+        let selection = (
+            item.selection_range.start.line,
+            utf16_col_to_byte(
+                &source,
+                item.selection_range.start.line,
+                item.selection_range.start.character,
+            ),
+            item.selection_range.end.line,
+            utf16_col_to_byte(
+                &source,
+                item.selection_range.end.line,
+                item.selection_range.end.character,
+            ),
+        );
+        return file_symbols
+            .symbols
+            .iter()
+            .find(|sym| {
+                sym.name == item.name
+                    && sym.selection_range == selection
+                    && is_call_hierarchy_symbol_kind(sym.kind)
+            })
+            .cloned()
+            .map(Arc::new);
+    }
+
     if let Some(data) = item.data.as_ref() {
         if let Some(fqn) = data.get("fqn").and_then(|value| value.as_str()) {
             if let Some(sym) = backend.index.resolve_fqn(fqn) {
@@ -310,7 +408,6 @@ async fn call_hierarchy_symbol_from_item(
         }
     }
 
-    let uri = item.uri.as_str();
     let source = backend
         .source_for_uri(uri, "callHierarchy item source read")
         .await?;
@@ -501,23 +598,18 @@ impl PhpLspBackend {
             .to_string();
         let pos = params.text_document_position_params.position;
 
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            file_symbols,
+            ..
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(None);
+        };
         let (candidate, local_candidate, containing_candidate, allow_containing_fallback) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(parser) => parser,
-                None => return Ok(None),
-            };
-            let tree = match parser.tree() {
-                Some(tree) => tree,
-                None => return Ok(None),
-            };
-            let source = parser.source();
+            let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(&uri_str)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
@@ -539,8 +631,8 @@ impl PhpLspBackend {
             let candidate = sym_at_pos
                 .as_ref()
                 .filter(|sym| is_call_hierarchy_ref_kind(sym.ref_kind))
-                .map(|sym| (sym.fqn.clone(), sym.ref_kind));
-            let local_candidate = candidate.as_ref().and_then(|(fqn, _)| {
+                .map(|sym| (sym.fqn.clone(), sym.ref_kind, sym.allows_global_fallback));
+            let local_candidate = candidate.as_ref().and_then(|(fqn, _, _)| {
                 file_symbols
                     .symbols
                     .iter()
@@ -559,17 +651,21 @@ impl PhpLspBackend {
         };
 
         let mut symbol = None;
-        if let Some((fqn, ref_kind)) = candidate {
-            symbol = self.resolve_fqn_lazy_with_fallback(&fqn, ref_kind).await;
+        if let Some((fqn, ref_kind, allow_global_fallback)) = candidate {
+            symbol = local_candidate.map(Arc::new);
+            if symbol.is_none() {
+                symbol = self
+                    .resolve_fqn_lazy_with_fallback(&fqn, ref_kind, allow_global_fallback)
+                    .await
+                    .filter(|symbol| symbol.uri != uri_str);
+            }
             if symbol.is_none() && ref_kind == RefKind::Constructor {
                 if let Some(class_fqn) = fqn.strip_suffix("::__construct") {
                     symbol = self
-                        .resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName)
-                        .await;
+                        .resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName, false)
+                        .await
+                        .filter(|symbol| symbol.uri != uri_str);
                 }
-            }
-            if symbol.is_none() {
-                symbol = local_candidate.map(Arc::new);
             }
         }
 
@@ -584,10 +680,13 @@ impl PhpLspBackend {
             return Ok(None);
         }
 
-        Ok(self
-            .call_hierarchy_item_for_symbol(&symbol, "callHierarchy/prepare source read")
-            .await
-            .map(|item| vec![item]))
+        let item = if symbol.uri == uri_str {
+            call_hierarchy_item_from_symbol(&symbol, &source)
+        } else {
+            self.call_hierarchy_item_for_symbol(&symbol, "callHierarchy/prepare source read")
+                .await
+        };
+        Ok(item.map(|item| vec![item]))
     }
 
     pub(crate) async fn lsp_incoming_calls(
@@ -601,15 +700,78 @@ impl PhpLspBackend {
 
         let mut calls_by_caller: HashMap<String, (php_lsp_types::SymbolInfo, Vec<Range>)> =
             HashMap::new();
-        for entry in self.index.file_symbols.iter() {
-            let file_uri = entry.key().clone();
-            let file_symbols = entry.value().clone();
+        let mut file_uris: HashSet<String> = self
+            .index
+            .file_symbols
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        let open_file_uris: Vec<String> = self
+            .open_files
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        file_uris.extend(
+            open_file_uris
+                .into_iter()
+                .filter(|file_uri| !self.template_documents.contains_key(file_uri)),
+        );
 
-            if let Some(parser) = self.open_files.get(&file_uri) {
-                if let Some(tree) = parser.tree() {
-                    let source = parser.source();
+        for file_uri in file_uris {
+            if let Some(OpenDocumentSnapshot {
+                tree,
+                source,
+                template_document,
+                file_symbols,
+                ..
+            }) = self.open_document_snapshot(&file_uri)
+            {
+                if template_document.is_some() {
+                    continue;
+                }
+                incoming_call_hierarchy_for_file(
+                    &tree,
+                    &source,
+                    &file_symbols,
+                    &target.fqn,
+                    target_kind,
+                    &mut calls_by_caller,
+                );
+                continue;
+            }
+
+            let Some(file_symbols) = self
+                .index
+                .file_symbols
+                .get(&file_uri)
+                .map(|entry| entry.value().clone())
+            else {
+                continue;
+            };
+            if self.open_files.contains_key(&file_uri)
+                || self.template_documents.contains_key(&file_uri)
+            {
+                continue;
+            }
+            let Some(path) = uri_to_path(&file_uri) else {
+                continue;
+            };
+            let Ok(source) =
+                read_file_to_string_blocking(path, "callHierarchy/incoming read").await
+            else {
+                continue;
+            };
+            if let Some(OpenDocumentSnapshot {
+                tree,
+                source,
+                template_document,
+                file_symbols,
+                ..
+            }) = self.open_document_snapshot(&file_uri)
+            {
+                if template_document.is_none() {
                     incoming_call_hierarchy_for_file(
-                        tree,
+                        &tree,
                         &source,
                         &file_symbols,
                         &target.fqn,
@@ -619,15 +781,11 @@ impl PhpLspBackend {
                 }
                 continue;
             }
-
-            let Some(path) = uri_to_path(&file_uri) else {
+            if self.open_files.contains_key(&file_uri)
+                || self.template_documents.contains_key(&file_uri)
+            {
                 continue;
-            };
-            let Ok(source) =
-                read_file_to_string_blocking(path, "callHierarchy/incoming read").await
-            else {
-                continue;
-            };
+            }
             let mut parser = FileParser::new();
             parser.parse_full(&source);
             if let Some(tree) = parser.tree() {
@@ -678,20 +836,25 @@ impl PhpLspBackend {
         }
 
         let file_uri = caller.uri.clone();
-        let file_symbols = self
-            .index
-            .file_symbols
-            .get(&file_uri)
-            .map(|entry| entry.value().clone())
-            .unwrap_or_default();
-
-        let call_targets = if let Some(parser) = self.open_files.get(&file_uri) {
-            let Some(tree) = parser.tree() else {
+        let call_targets = if let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            template_document,
+            file_symbols,
+            ..
+        }) = self.open_document_snapshot(&file_uri)
+        {
+            if template_document.is_some() {
                 return Ok(None);
-            };
-            let source = parser.source();
-            outgoing_call_hierarchy_for_tree(tree, &source, &file_symbols, &self.index, &caller)
+            }
+            outgoing_call_hierarchy_for_tree(&tree, &source, &file_symbols, &self.index, &caller)
         } else {
+            let file_symbols = self
+                .index
+                .file_symbols
+                .get(&file_uri)
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default();
             let Some(path) = uri_to_path(&file_uri) else {
                 return Ok(None);
             };
@@ -700,12 +863,37 @@ impl PhpLspBackend {
             else {
                 return Ok(None);
             };
-            let mut parser = FileParser::new();
-            parser.parse_full(&source);
-            let Some(tree) = parser.tree() else {
-                return Ok(None);
-            };
-            outgoing_call_hierarchy_for_tree(tree, &source, &file_symbols, &self.index, &caller)
+            if let Some(OpenDocumentSnapshot {
+                tree,
+                source,
+                template_document,
+                file_symbols,
+                ..
+            }) = self.open_document_snapshot(&file_uri)
+            {
+                if template_document.is_some() {
+                    return Ok(None);
+                }
+                outgoing_call_hierarchy_for_tree(
+                    &tree,
+                    &source,
+                    &file_symbols,
+                    &self.index,
+                    &caller,
+                )
+            } else {
+                if self.open_files.contains_key(&file_uri)
+                    || self.template_documents.contains_key(&file_uri)
+                {
+                    return Ok(None);
+                }
+                let mut parser = FileParser::new();
+                parser.parse_full(&source);
+                let Some(tree) = parser.tree() else {
+                    return Ok(None);
+                };
+                outgoing_call_hierarchy_for_tree(tree, &source, &file_symbols, &self.index, &caller)
+            }
         };
 
         let mut calls = Vec::new();
@@ -744,23 +932,18 @@ impl PhpLspBackend {
             .to_string();
         let pos = params.text_document_position_params.position;
 
-        let (candidate, local_candidate, containing_class_fqn) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(parser) => parser,
-                None => return Ok(None),
-            };
-            let tree = match parser.tree() {
-                Some(tree) => tree,
-                None => return Ok(None),
-            };
-            let source = parser.source();
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            file_symbols,
+            ..
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(None);
+        };
+        let (candidate, local_candidate, containing_class_fqn, containing_class_candidate) = {
+            let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(&uri_str)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
                 self.resolve_member_type(class_fqn, member_name)
             };
@@ -794,24 +977,44 @@ impl PhpLspBackend {
             });
             let point_range = (pos.line, byte_col, pos.line, byte_col);
             let containing_class_fqn = current_class_fqn_at_range(&file_symbols, point_range);
-            (candidate, local_candidate, containing_class_fqn)
+            let containing_class_candidate = containing_class_fqn.as_ref().and_then(|fqn| {
+                file_symbols
+                    .symbols
+                    .iter()
+                    .find(|sym| {
+                        is_type_hierarchy_symbol_kind(sym.kind)
+                            && php_lsp_types::symbol_fqn_eq(&sym.fqn, fqn, sym.kind)
+                    })
+                    .cloned()
+            });
+            (
+                candidate,
+                local_candidate,
+                containing_class_fqn,
+                containing_class_candidate,
+            )
         };
 
         let mut symbol = None;
         if let Some(fqn) = candidate {
-            symbol = self
-                .resolve_fqn_lazy_with_fallback(&fqn, RefKind::ClassName)
-                .await;
+            symbol = local_candidate.map(Arc::new);
             if symbol.is_none() {
-                symbol = local_candidate.map(Arc::new);
+                symbol = self
+                    .resolve_fqn_lazy_with_fallback(&fqn, RefKind::ClassName, false)
+                    .await
+                    .filter(|symbol| symbol.uri != uri_str);
             }
         }
 
         if symbol.is_none() {
+            symbol = containing_class_candidate.map(Arc::new);
+        }
+        if symbol.is_none() {
             if let Some(class_fqn) = containing_class_fqn {
                 symbol = self
-                    .resolve_fqn_lazy_with_fallback(&class_fqn, RefKind::ClassName)
-                    .await;
+                    .resolve_fqn_lazy_with_fallback(&class_fqn, RefKind::ClassName, false)
+                    .await
+                    .filter(|symbol| symbol.uri != uri_str);
             }
         }
 
@@ -819,10 +1022,13 @@ impl PhpLspBackend {
             return Ok(None);
         };
 
-        Ok(self
-            .type_hierarchy_item_for_symbol(&symbol, "typeHierarchy/prepare source read")
-            .await
-            .map(|item| vec![item]))
+        let item = if symbol.uri == uri_str {
+            type_hierarchy_item_from_symbol(&symbol, &source)
+        } else {
+            self.type_hierarchy_item_for_symbol(&symbol, "typeHierarchy/prepare source read")
+                .await
+        };
+        Ok(item.map(|item| vec![item]))
     }
 
     pub(crate) async fn lsp_supertypes(
@@ -838,7 +1044,7 @@ impl PhpLspBackend {
         for parent_fqn in parent_fqns {
             self.lazy_index_class(&parent_fqn).await;
             if let Some(parent) = self
-                .resolve_fqn_lazy_with_fallback(&parent_fqn, RefKind::ClassName)
+                .resolve_fqn_lazy_with_fallback(&parent_fqn, RefKind::ClassName, false)
                 .await
             {
                 if let Some(item) = self

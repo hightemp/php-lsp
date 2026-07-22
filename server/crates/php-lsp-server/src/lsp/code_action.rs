@@ -34,6 +34,9 @@ pub(crate) fn unknown_symbol_from_diagnostic(message: &str) -> Option<(ImportKin
     if let Some(fqn) = message.strip_prefix("Unknown function: ") {
         return Some((ImportKind::Function, fqn.to_string()));
     }
+    if let Some(fqn) = message.strip_prefix("Unknown constant: ") {
+        return Some((ImportKind::Constant, fqn.to_string()));
+    }
     None
 }
 
@@ -197,30 +200,83 @@ pub(crate) fn existing_use_alias(use_stmt: &php_lsp_types::UseStatement) -> Stri
 pub(crate) fn used_import_aliases(
     file_symbols: &php_lsp_types::FileSymbols,
     import_kind: ImportKind,
-) -> std::collections::HashSet<String> {
+) -> UsedImportAliases {
     let mut aliases = std::collections::HashSet::new();
     for use_stmt in &file_symbols.use_statements {
         if use_kind_matches(import_kind, use_stmt.kind) {
             aliases.insert(existing_use_alias(use_stmt));
         }
     }
-    if import_kind == ImportKind::Class {
+    if matches!(
+        import_kind,
+        ImportKind::Class | ImportKind::Function | ImportKind::Constant
+    ) {
         for sym in &file_symbols.symbols {
-            if matches!(
-                sym.kind,
-                php_lsp_types::PhpSymbolKind::Class
-                    | php_lsp_types::PhpSymbolKind::Interface
-                    | php_lsp_types::PhpSymbolKind::Trait
-                    | php_lsp_types::PhpSymbolKind::Enum
-            ) {
+            let kind_matches = match import_kind {
+                ImportKind::Class => matches!(
+                    sym.kind,
+                    php_lsp_types::PhpSymbolKind::Class
+                        | php_lsp_types::PhpSymbolKind::Interface
+                        | php_lsp_types::PhpSymbolKind::Trait
+                        | php_lsp_types::PhpSymbolKind::Enum
+                ),
+                ImportKind::Function => sym.kind == php_lsp_types::PhpSymbolKind::Function,
+                ImportKind::Constant => sym.kind == php_lsp_types::PhpSymbolKind::GlobalConstant,
+            };
+            if kind_matches && symbol_is_in_active_import_scope(file_symbols, sym) {
                 aliases.insert(sym.name.clone());
             }
         }
     }
-    aliases
+    UsedImportAliases {
+        aliases,
+        case_sensitive: import_kind == ImportKind::Constant,
+    }
 }
 
-pub(crate) fn unique_import_alias(base: &str, used: &std::collections::HashSet<String>) -> String {
+fn symbol_is_in_active_import_scope(
+    file_symbols: &php_lsp_types::FileSymbols,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> bool {
+    if let [scope] = file_symbols.namespace_scopes.as_slice() {
+        let position = (symbol.range.0, symbol.range.1);
+        return position >= (scope.range.0, scope.range.1)
+            && position < (scope.range.2, scope.range.3);
+    }
+
+    let symbol_fqn = symbol.fqn.trim_start_matches('\\');
+    let symbol_namespace = symbol_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
+    match (
+        file_symbols
+            .namespace
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+        symbol_namespace,
+    ) {
+        (Some(expected), Some(actual)) => actual.eq_ignore_ascii_case(expected),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+pub(crate) struct UsedImportAliases {
+    aliases: std::collections::HashSet<String>,
+    case_sensitive: bool,
+}
+
+impl UsedImportAliases {
+    pub(crate) fn contains(&self, alias: &str) -> bool {
+        if self.case_sensitive {
+            self.aliases.contains(alias)
+        } else {
+            self.aliases
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(alias))
+        }
+    }
+}
+
+pub(crate) fn unique_import_alias(base: &str, used: &UsedImportAliases) -> String {
     let mut candidate = format!("{}Import", base);
     let mut suffix = 2usize;
     while used.contains(&candidate) {
@@ -230,15 +286,27 @@ pub(crate) fn unique_import_alias(base: &str, used: &std::collections::HashSet<S
     candidate
 }
 
+fn import_fqn_matches(left: &str, right: &str, import_kind: ImportKind) -> bool {
+    let left = left.trim_start_matches('\\');
+    let right = right.trim_start_matches('\\');
+    if import_kind != ImportKind::Constant {
+        return left.eq_ignore_ascii_case(right);
+    }
+
+    let (left_namespace, left_identifier) = left.rsplit_once('\\').unwrap_or(("", left));
+    let (right_namespace, right_identifier) = right.rsplit_once('\\').unwrap_or(("", right));
+    left_namespace.eq_ignore_ascii_case(right_namespace) && left_identifier == right_identifier
+}
+
 pub(crate) fn existing_import_for_fqn<'a>(
     file_symbols: &'a php_lsp_types::FileSymbols,
     fqn: &str,
     import_kind: ImportKind,
 ) -> Option<&'a php_lsp_types::UseStatement> {
-    file_symbols
-        .use_statements
-        .iter()
-        .find(|use_stmt| use_kind_matches(import_kind, use_stmt.kind) && use_stmt.fqn == fqn)
+    file_symbols.use_statements.iter().find(|use_stmt| {
+        use_kind_matches(import_kind, use_stmt.kind)
+            && import_fqn_matches(&use_stmt.fqn, fqn, import_kind)
+    })
 }
 
 pub(crate) fn line_is_blank(source: &str, line: u32) -> bool {
@@ -257,6 +325,30 @@ pub(crate) fn find_use_insert_line(source: &str, file_symbols: &php_lsp_types::F
         .max()
     {
         return last_use_line + 1;
+    }
+
+    if let Some(scope) = file_symbols.namespace_scopes.first() {
+        let start_line = scope.range.0 as usize;
+        let end_line = scope.range.2 as usize;
+        let mut namespace_declaration = false;
+        for (idx, line) in source
+            .lines()
+            .enumerate()
+            .skip(start_line)
+            .take(end_line.saturating_sub(start_line) + 1)
+        {
+            if !namespace_declaration {
+                namespace_declaration = line.trim_start().starts_with("namespace ")
+                    || line.trim_start().starts_with("namespace{")
+                    || line.trim_start().starts_with("namespace {");
+                if !namespace_declaration {
+                    break;
+                }
+            }
+            if line.contains(';') || line.contains('{') {
+                return idx as u32 + 1;
+            }
+        }
     }
 
     for (idx, line) in source.lines().enumerate() {
@@ -387,6 +479,9 @@ fn reference_matches_import(
     reference: &php_lsp_types::SymbolReference,
     import: &OrganizableImport,
 ) -> bool {
+    if reference.is_import_target {
+        return false;
+    }
     let target_fqn = reference.target_fqn.trim_start_matches('\\');
     let import_fqn = import.fqn.trim_start_matches('\\');
 
@@ -568,7 +663,7 @@ fn phpdoc_name_uses_import(name: &str, import: &OrganizableImport) -> bool {
         return true;
     }
 
-    first_name_segment(name) == import_alias(import)
+    first_name_segment(name).eq_ignore_ascii_case(import_alias(import))
 }
 
 fn first_name_segment(name: &str) -> &str {
@@ -1176,11 +1271,7 @@ pub(crate) fn collect_method_contract_visibilities(
         return;
     }
 
-    let Some(type_sym) = index
-        .types
-        .get(&normalized_type)
-        .map(|entry| entry.value().clone())
-    else {
+    let Some(type_sym) = index.get_type(&normalized_type) else {
         return;
     };
 
@@ -1361,7 +1452,11 @@ pub(crate) fn direct_member_symbols_from_index(
     let mut members = Vec::new();
     for entry in index.file_symbols.iter() {
         for sym in &entry.value().symbols {
-            if sym.parent_fqn.as_deref() == Some(type_fqn) {
+            if sym
+                .parent_fqn
+                .as_deref()
+                .is_some_and(|parent| parent.eq_ignore_ascii_case(type_fqn))
+            {
                 members.push(Arc::new(sym.clone()));
             }
         }
@@ -1384,11 +1479,7 @@ pub(crate) fn collect_concrete_methods_from_type(
         return;
     }
 
-    let Some(type_sym) = index
-        .types
-        .get(&normalized_type)
-        .map(|entry| entry.value().clone())
-    else {
+    let Some(type_sym) = index.get_type(&normalized_type) else {
         return;
     };
 
@@ -1418,11 +1509,7 @@ pub(crate) fn collect_required_methods_from_type(
         return;
     }
 
-    let Some(type_sym) = index
-        .types
-        .get(&normalized_type)
-        .map(|entry| entry.value().clone())
-    else {
+    let Some(type_sym) = index.get_type(&normalized_type) else {
         return;
     };
 
@@ -5069,6 +5156,11 @@ pub(crate) fn build_add_import_edit(
     import_kind: ImportKind,
     diagnostic_range: Range,
 ) -> Option<(WorkspaceEdit, Option<String>)> {
+    let diagnostic_byte_range = lsp_range_to_byte_range(source, diagnostic_range);
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(diagnostic_byte_range.0, diagnostic_byte_range.1);
+    let file_symbols = scoped_file_symbols.as_ref();
+
     if let Some(existing) = existing_import_for_fqn(file_symbols, import_fqn, import_kind) {
         if let Some(alias) = existing.alias.clone() {
             let edit = TextEdit {
@@ -5704,6 +5796,15 @@ pub(crate) fn byte_ranges_overlap(left: (u32, u32, u32, u32), right: (u32, u32, 
     (left.0, left.1) <= (right.2, right.3) && (right.0, right.1) <= (left.2, left.3)
 }
 
+fn open_document_snapshot_for_code_action(
+    backend: &PhpLspBackend,
+    uri: &str,
+    expected_version: Option<i32>,
+) -> Option<OpenDocumentSnapshot> {
+    let snapshot = backend.open_document_snapshot(uri)?;
+    (snapshot.document_state.map(|state| state.version) == expected_version).then_some(snapshot)
+}
+
 impl PhpLspBackend {
     pub(crate) async fn lsp_code_action(
         &self,
@@ -5749,7 +5850,20 @@ impl PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         let php_version = *self.php_version.lock().await;
         let analyzer_code_actions = *self.analyzer_code_actions.lock().await;
-        let document_version = self.current_document_version(&uri_str);
+        let diagnostics_mode = *self.diagnostics_mode.lock().await;
+        let diagnostic_severity = *self.diagnostic_severity.lock().await;
+        let diagnostic_budget = *self.diagnostic_budget.lock().await;
+        let Some(OpenDocumentSnapshot {
+            tree,
+            source,
+            document_state,
+            file_symbols,
+            ..
+        }) = self.open_document_snapshot(&uri_str)
+        else {
+            return Ok(Some(vec![]));
+        };
+        let document_version = document_state.map(|state| state.version);
 
         let (
             source,
@@ -5761,21 +5875,7 @@ impl PhpLspBackend {
             refactor_inline_actions,
             implement_missing_methods_actions,
         ) = {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(p) => p,
-                None => return Ok(Some(vec![])),
-            };
-            let tree = match parser.tree() {
-                Some(t) => t,
-                None => return Ok(Some(vec![])),
-            };
-            let source = parser.source();
-            let file_symbols = self
-                .index
-                .file_symbols
-                .get(&uri_str)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri_str));
+            let tree = &tree;
             let organize_imports_edit = if wants_organize_imports || wants_quickfix {
                 build_organize_imports_edit(uri.clone(), &source, tree, &file_symbols)
             } else {
@@ -5970,13 +6070,8 @@ impl PhpLspBackend {
         }
 
         let diagnostics = if params.context.diagnostics.is_empty() {
-            let parser = match self.open_files.get(&uri_str) {
-                Some(p) => p,
-                None => return Ok(Some(vec![])),
-            };
-            let diagnostics_mode = *self.diagnostics_mode.lock().await;
-            let diagnostic_severity = *self.diagnostic_severity.lock().await;
-            let diagnostic_budget = *self.diagnostic_budget.lock().await;
+            let mut parser = FileParser::new();
+            parser.parse_full(&source);
             compute_diagnostics_with_config_for_version(
                 &uri_str,
                 &parser,
@@ -5987,7 +6082,7 @@ impl PhpLspBackend {
                     budget: diagnostic_budget,
                     php_version,
                 },
-                self.current_document_version(&uri_str),
+                document_version,
             )
             .into_iter()
             .filter(|diag| range_overlaps(diag.range, params.range))
@@ -6061,8 +6156,8 @@ impl PhpLspBackend {
                     .filter(|entry| {
                         let sym = entry.value();
                         !sym.modifiers.is_builtin
-                            && (sym.name == unresolved_short
-                                || short_name(&sym.fqn) == unresolved_short)
+                            && (sym.name.eq_ignore_ascii_case(unresolved_short)
+                                || short_name(&sym.fqn).eq_ignore_ascii_case(unresolved_short))
                     })
                     .map(|entry| entry.value().clone())
                     .collect(),
@@ -6073,12 +6168,23 @@ impl PhpLspBackend {
                     .filter(|entry| {
                         let sym = entry.value();
                         !sym.modifiers.is_builtin
+                            && (sym.name.eq_ignore_ascii_case(unresolved_short)
+                                || short_name(&sym.fqn).eq_ignore_ascii_case(unresolved_short))
+                    })
+                    .map(|entry| entry.value().clone())
+                    .collect(),
+                ImportKind::Constant => self
+                    .index
+                    .constants
+                    .iter()
+                    .filter(|entry| {
+                        let sym = entry.value();
+                        !sym.modifiers.is_builtin
                             && (sym.name == unresolved_short
                                 || short_name(&sym.fqn) == unresolved_short)
                     })
                     .map(|entry| entry.value().clone())
                     .collect(),
-                ImportKind::Constant => Vec::new(),
             };
             candidates.sort_by(|a, b| a.fqn.cmp(&b.fqn));
             candidates.dedup_by(|a, b| a.fqn == b.fqn);
@@ -6163,12 +6269,11 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let source = match self.open_files.get(&uri) {
-                    Some(parser) => parser.source(),
-                    None => {
-                        params.edit = Some(empty_workspace_edit());
-                        return Ok(params);
-                    }
+                let Some(OpenDocumentSnapshot { source, .. }) =
+                    open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
                 };
 
                 params.edit = Some(add_return_type_edit(
@@ -6192,27 +6297,14 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let (source, file_symbols) = match self.open_files.get(&uri) {
-                    Some(parser) => {
-                        let source = parser.source();
-                        let file_symbols = match parser.tree() {
-                            Some(tree) => self
-                                .index
-                                .file_symbols
-                                .get(&uri)
-                                .map(|entry| entry.value().clone())
-                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
-                            None => {
-                                params.edit = Some(empty_workspace_edit());
-                                return Ok(params);
-                            }
-                        };
-                        (source, file_symbols)
-                    }
-                    None => {
-                        params.edit = Some(empty_workspace_edit());
-                        return Ok(params);
-                    }
+                let Some(OpenDocumentSnapshot {
+                    source,
+                    file_symbols,
+                    ..
+                }) = open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
                 };
 
                 let Some(class_sym) = file_symbols.symbols.iter().find(|sym| {
@@ -6259,27 +6351,14 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let (source, file_symbols) = match self.open_files.get(&uri) {
-                    Some(parser) => {
-                        let source = parser.source();
-                        let file_symbols = match parser.tree() {
-                            Some(tree) => self
-                                .index
-                                .file_symbols
-                                .get(&uri)
-                                .map(|entry| entry.value().clone())
-                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
-                            None => {
-                                params.edit = Some(empty_workspace_edit());
-                                return Ok(params);
-                            }
-                        };
-                        (source, file_symbols)
-                    }
-                    None => {
-                        params.edit = Some(empty_workspace_edit());
-                        return Ok(params);
-                    }
+                let Some(OpenDocumentSnapshot {
+                    source,
+                    file_symbols,
+                    ..
+                }) = open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
                 };
 
                 let Some(class_sym) = file_symbols.symbols.iter().find(|sym| {
@@ -6317,27 +6396,14 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let (source, file_symbols) = match self.open_files.get(&uri) {
-                    Some(parser) => {
-                        let source = parser.source();
-                        let file_symbols = match parser.tree() {
-                            Some(tree) => self
-                                .index
-                                .file_symbols
-                                .get(&uri)
-                                .map(|entry| entry.value().clone())
-                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
-                            None => {
-                                params.edit = Some(empty_workspace_edit());
-                                return Ok(params);
-                            }
-                        };
-                        (source, file_symbols)
-                    }
-                    None => {
-                        params.edit = Some(empty_workspace_edit());
-                        return Ok(params);
-                    }
+                let Some(OpenDocumentSnapshot {
+                    source,
+                    file_symbols,
+                    ..
+                }) = open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
                 };
 
                 let Some(property) = file_symbols.symbols.iter().find(|sym| {
@@ -6376,27 +6442,14 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let (source, file_symbols) = match self.open_files.get(&uri) {
-                    Some(parser) => {
-                        let source = parser.source();
-                        let file_symbols = match parser.tree() {
-                            Some(tree) => self
-                                .index
-                                .file_symbols
-                                .get(&uri)
-                                .map(|entry| entry.value().clone())
-                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
-                            None => {
-                                params.edit = Some(empty_workspace_edit());
-                                return Ok(params);
-                            }
-                        };
-                        (source, file_symbols)
-                    }
-                    None => {
-                        params.edit = Some(empty_workspace_edit());
-                        return Ok(params);
-                    }
+                let Some(OpenDocumentSnapshot {
+                    source,
+                    file_symbols,
+                    ..
+                }) = open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
                 };
 
                 let Some(symbol) = file_symbols
@@ -6432,27 +6485,14 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let (source, file_symbols) = match self.open_files.get(&uri) {
-                    Some(parser) => {
-                        let source = parser.source();
-                        let file_symbols = match parser.tree() {
-                            Some(tree) => self
-                                .index
-                                .file_symbols
-                                .get(&uri)
-                                .map(|entry| entry.value().clone())
-                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
-                            None => {
-                                params.edit = Some(empty_workspace_edit());
-                                return Ok(params);
-                            }
-                        };
-                        (source, file_symbols)
-                    }
-                    None => {
-                        params.edit = Some(empty_workspace_edit());
-                        return Ok(params);
-                    }
+                let Some(OpenDocumentSnapshot {
+                    source,
+                    file_symbols,
+                    ..
+                }) = open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
                 };
 
                 let Some(property) = file_symbols.symbols.iter().find(|sym| {
@@ -6480,27 +6520,14 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let (source, file_symbols) = match self.open_files.get(&uri) {
-                    Some(parser) => {
-                        let source = parser.source();
-                        let file_symbols = match parser.tree() {
-                            Some(tree) => self
-                                .index
-                                .file_symbols
-                                .get(&uri)
-                                .map(|entry| entry.value().clone())
-                                .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri)),
-                            None => {
-                                params.edit = Some(empty_workspace_edit());
-                                return Ok(params);
-                            }
-                        };
-                        (source, file_symbols)
-                    }
-                    None => {
-                        params.edit = Some(empty_workspace_edit());
-                        return Ok(params);
-                    }
+                let Some(OpenDocumentSnapshot {
+                    source,
+                    file_symbols,
+                    ..
+                }) = open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
                 };
 
                 let Some(symbol) = file_symbols.symbols.iter().find(|sym| {
@@ -6532,18 +6559,15 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let Some(parser) = self.open_files.get(&uri) else {
-                    params.edit = Some(empty_workspace_edit());
-                    return Ok(params);
-                };
-                let source = parser.source();
-                let Some(tree) = parser.tree() else {
+                let Some(OpenDocumentSnapshot { tree, source, .. }) =
+                    open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
                     params.edit = Some(empty_workspace_edit());
                     return Ok(params);
                 };
                 let range = lsp_range_to_byte_range(&source, requested_range);
                 params.edit =
-                    extract_variable_edit(uri_value, tree, &source, range, &variable_name)
+                    extract_variable_edit(uri_value, &tree, &source, range, &variable_name)
                         .or_else(|| Some(empty_workspace_edit()));
             }
             (
@@ -6560,25 +6584,20 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let Some(parser) = self.open_files.get(&uri) else {
+                let Some(OpenDocumentSnapshot {
+                    tree,
+                    source,
+                    file_symbols,
+                    ..
+                }) = open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
                     params.edit = Some(empty_workspace_edit());
                     return Ok(params);
                 };
-                let source = parser.source();
-                let Some(tree) = parser.tree() else {
-                    params.edit = Some(empty_workspace_edit());
-                    return Ok(params);
-                };
-                let file_symbols = self
-                    .index
-                    .file_symbols
-                    .get(&uri)
-                    .map(|entry| entry.value().clone())
-                    .unwrap_or_else(|| extract_file_symbols(tree, &source, &uri));
                 let range = lsp_range_to_byte_range(&source, requested_range);
                 params.edit = extract_constant_edit(
                     uri_value,
-                    tree,
+                    &tree,
                     &source,
                     &file_symbols,
                     range,
@@ -6600,18 +6619,16 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let Some(parser) = self.open_files.get(&uri) else {
-                    params.edit = Some(empty_workspace_edit());
-                    return Ok(params);
-                };
-                let source = parser.source();
-                let Some(tree) = parser.tree() else {
+                let Some(OpenDocumentSnapshot { tree, source, .. }) =
+                    open_document_snapshot_for_code_action(self, &uri, document_version)
+                else {
                     params.edit = Some(empty_workspace_edit());
                     return Ok(params);
                 };
                 let range = lsp_range_to_byte_range(&source, requested_range);
-                params.edit = inline_variable_edit(uri_value, tree, &source, range, &variable_name)
-                    .or_else(|| Some(empty_workspace_edit()));
+                params.edit =
+                    inline_variable_edit(uri_value, &tree, &source, range, &variable_name)
+                        .or_else(|| Some(empty_workspace_edit()));
             }
             _ => {
                 params.edit = Some(empty_workspace_edit());

@@ -2372,14 +2372,7 @@ pub(in crate::server) fn resolve_function_return_type_from_index(
     index: &WorkspaceIndex,
     function_fqn: &str,
 ) -> Option<String> {
-    let sym = index.resolve_fqn(function_fqn).or_else(|| {
-        function_fqn
-            .rsplit_once('\\')
-            .and_then(|(_, short_name)| index.resolve_fqn(short_name))
-    })?;
-    if sym.kind != php_lsp_types::PhpSymbolKind::Function {
-        return None;
-    }
+    let sym = resolve_fqn_with_ref_kind(index, function_fqn, RefKind::FunctionCall, false)?;
     symbol_return_type_text_from_index(index, &sym.fqn, &sym)
 }
 
@@ -2558,7 +2551,7 @@ fn resolved_type_text_from_index(
 
     if type_name.trim().starts_with('\\')
         || index.resolve_fqn(&resolved).is_some()
-        || type_name_resolved_by_class_import(index, uri, type_name, &resolved)
+        || type_name_resolved_by_class_import(index, owner_fqn, uri, type_name, &resolved)
     {
         format!("\\{}", resolved.trim_start_matches('\\'))
     } else {
@@ -2568,37 +2561,15 @@ fn resolved_type_text_from_index(
 
 fn type_name_resolved_by_class_import(
     index: &WorkspaceIndex,
+    owner_fqn: &str,
     uri: &str,
     type_name: &str,
     resolved: &str,
 ) -> bool {
-    let type_name = type_name.trim().trim_start_matches('\\');
-    let Some(first_part) = type_name.split('\\').next().filter(|part| !part.is_empty()) else {
-        return false;
-    };
-    let resolved = resolved.trim_start_matches('\\');
-
-    index.file_symbols.get(uri).is_some_and(|file_symbols| {
-        file_symbols.use_statements.iter().any(|use_statement| {
-            if !matches!(use_statement.kind, php_lsp_types::UseKind::Class) {
-                return false;
-            }
-
-            let alias = use_statement.alias.as_deref().unwrap_or_else(|| {
-                use_statement
-                    .fqn
-                    .rsplit('\\')
-                    .next()
-                    .unwrap_or(&use_statement.fqn)
-            });
-
-            let imported_fqn = use_statement.fqn.trim_start_matches('\\');
-            alias == first_part
-                && (resolved == imported_fqn
-                    || resolved
-                        .strip_prefix(imported_fqn)
-                        .is_some_and(|rest| rest.starts_with('\\')))
-        })
+    imported_type_fqn_for_owner(index, owner_fqn, uri, type_name).is_some_and(|imported| {
+        imported
+            .trim_start_matches('\\')
+            .eq_ignore_ascii_case(resolved.trim_start_matches('\\'))
     })
 }
 

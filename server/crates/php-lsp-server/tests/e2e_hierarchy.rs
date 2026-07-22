@@ -178,11 +178,11 @@ interface Contract {}
 
 class Base {}
 
-class Child extends Base implements Contract {}
+class Child extends bASE implements cONTRACT {}
 
-class GrandChild extends Child {}
+class GrandChild extends cHILD {}
 
-class Other implements Contract {}
+class Other implements coNTRACT {}
 "#;
     let uri = "file:///test/type-hierarchy.php";
 

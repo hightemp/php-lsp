@@ -60,7 +60,10 @@ require_one_of() {
 }
 
 require_entry "extension/package.json"
+require_entry "extension/package-lock.json"
 require_entry "extension/out/extension.js"
+require_entry "extension/language-configuration.json"
+require_entry "extension/twig-language-configuration.json"
 require_one_of "README" "extension/README.md" "extension/readme.md"
 require_one_of "LICENSE" "extension/LICENSE" "extension/LICENSE.txt" "extension/license.txt"
 require_entry "extension/stubs/PhpStormStubsMap.php"
@@ -88,13 +91,25 @@ for platform in "${PLATFORMS[@]}"; do
     require_entry "extension/bin/$platform/$binary_name"
 done
 
-unzip -q "$VSIX" extension/package.json extension/out/extension.js -d "$TMP_DIR"
+unzip -q "$VSIX" \
+    extension/package.json \
+    extension/package-lock.json \
+    extension/out/extension.js \
+    extension/language-configuration.json \
+    extension/twig-language-configuration.json \
+    -d "$TMP_DIR"
 mkdir -p "$TMP_DIR/extension/node_modules/vscode"
 cat > "$TMP_DIR/extension/node_modules/vscode/index.js" <<'JS'
 const any = new Proxy(function () {}, {
   get(_target, property) {
     if (property === "then") {
       return undefined;
+    }
+    if (property === Symbol.iterator) {
+      return function* emptyIterator() {};
+    }
+    if (property === Symbol.toPrimitive) {
+      return () => "";
     }
     return any;
   },
@@ -154,48 +169,92 @@ class ThemeColor {
   }
 }
 
+const smokeState = {
+  errorMessages: [],
+  fileWatchersCreated: 0,
+  fileWatchersDisposed: 0,
+  outputLines: [],
+};
 const disposable = () => new Disposable();
 const configuration = {
   get(key, fallback) {
     if (key === "enable") {
-      return false;
+      return true;
+    }
+    if (key === "serverPath") {
+      return process.execPath;
     }
     return fallback;
   },
+  inspect() {
+    return undefined;
+  },
 };
 
+const withFallback = (target) => new Proxy(target, {
+  get(value, property) {
+    if (property in value) {
+      return value[property];
+    }
+    return any;
+  },
+});
+
 module.exports = new Proxy({
-  commands: {
+  __phpLspSmoke: smokeState,
+  commands: withFallback({
     executeCommand: async () => undefined,
     registerCommand: disposable,
-  },
+  }),
   Disposable,
   MarkdownString,
   StatusBarAlignment: { Left: 1, Right: 2 },
   ThemeColor,
+  version: process.env.PHP_LSP_SMOKE_VSCODE_VERSION ?? "0.0.0",
   Uri: {
     file(fsPath) {
       return { fsPath, scheme: "file", toString: () => `file://${fsPath}` };
     },
   },
-  window: {
-    createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
+  window: withFallback({
+    activeTextEditor: undefined,
+    createOutputChannel: () => ({
+      append(value) { smokeState.outputLines.push(String(value)); },
+      appendLine(value) { smokeState.outputLines.push(String(value)); },
+      show() {},
+      dispose() {},
+    }),
     createStatusBarItem: () => ({
       show() {},
       hide() {},
       dispose() {},
     }),
-    showErrorMessage: async () => undefined,
+    showErrorMessage: async (message) => {
+      smokeState.errorMessages.push(message);
+      return undefined;
+    },
     showInformationMessage: async () => undefined,
     showQuickPick: async () => undefined,
     showWarningMessage: async () => undefined,
-  },
-  workspace: {
-    createFileSystemWatcher: disposable,
+  }),
+  workspace: withFallback({
+    createFileSystemWatcher: () => {
+      smokeState.fileWatchersCreated += 1;
+      return {
+        dispose() {
+          smokeState.fileWatchersDisposed += 1;
+        },
+        onDidChange: disposable,
+        onDidCreate: disposable,
+        onDidDelete: disposable,
+      };
+    },
     getConfiguration: () => configuration,
     onDidChangeConfiguration: disposable,
+    notebookDocuments: [],
+    textDocuments: [],
     workspaceFolders: [],
-  },
+  }),
 }, {
   get(target, property) {
     if (property in target) {
@@ -208,16 +267,38 @@ JS
 
 node - "$TMP_DIR/extension" <<'NODE'
 const assert = require("assert");
+const childProcess = require("child_process");
+const { EventEmitter } = require("events");
 const path = require("path");
+const { PassThrough } = require("stream");
 
 const extensionRoot = process.argv[2];
 const packageJson = require(path.join(extensionRoot, "package.json"));
+const packageLock = require(path.join(extensionRoot, "package-lock.json"));
 
 assert.strictEqual(packageJson.main, "./out/extension.js", "package.json main must point at bundled extension.js");
+assert.strictEqual(packageLock.packages?.[""]?.engines?.vscode, packageJson.engines?.vscode, "package-lock.json must preserve package.json engines.vscode");
+assert.strictEqual(packageJson.engines?.vscode, packageLock.packages?.["node_modules/vscode-languageclient"]?.engines?.vscode, "extension and vscode-languageclient VS Code engine ranges must agree");
 assert(Array.isArray(packageJson.activationEvents), "package.json activationEvents must be an array");
 assert(packageJson.activationEvents.includes("onLanguage:php"), "extension must activate for PHP files");
 assert(packageJson.contributes?.commands?.some((command) => command.command === "phpLsp.restartServer"), "restart command must be contributed");
 assert(packageJson.contributes?.commands?.some((command) => command.command === "phpLsp.clearCacheAndRestart"), "clear cache command must be contributed");
+
+const minimumVersionMatch = packageJson.engines.vscode.match(/\d+\.\d+\.\d+/);
+assert(minimumVersionMatch, "engines.vscode must contain a minimum version");
+process.env.PHP_LSP_SMOKE_VSCODE_VERSION = minimumVersionMatch[0];
+
+for (const language of packageJson.contributes?.languages ?? []) {
+  if (!language.configuration) {
+    continue;
+  }
+  const relativeConfiguration = language.configuration.replace(/^\.\//, "");
+  const configurationPath = path.join(extensionRoot, relativeConfiguration);
+  assert.doesNotThrow(
+    () => JSON.parse(require("fs").readFileSync(configurationPath, "utf8")),
+    `language configuration for ${language.id} must be packaged valid JSON`,
+  );
+}
 
 const extensionModule = require(path.join(extensionRoot, "out", "extension.js"));
 assert.strictEqual(typeof extensionModule.activate, "function", "extension.js must export activate()");
@@ -234,9 +315,148 @@ const context = {
   subscriptions: [],
 };
 
-extensionModule.activate(context);
-Promise.resolve(extensionModule.deactivate()).then(() => {
-  console.log("VSIX smoke test passed");
+const protocolState = {
+  exitNotifications: 0,
+  initializeRequests: 0,
+  initializedNotifications: 0,
+  shutdownRequests: 0,
+  spawnCalls: 0,
+};
+
+function waitFor(predicate, description, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (predicate()) {
+        resolve();
+      } else if (Date.now() >= deadline) {
+        reject(new Error(`Timed out waiting for ${description}`));
+      } else {
+        setTimeout(poll, 10);
+      }
+    };
+    poll();
+  });
+}
+
+function writeProtocolMessage(stream, message) {
+  const payload = Buffer.from(JSON.stringify(message), "utf8");
+  stream.write(Buffer.concat([
+    Buffer.from(`Content-Length: ${payload.length}\r\n\r\n`, "ascii"),
+    payload,
+  ]));
+}
+
+function createMockLanguageServerProcess(command) {
+  assert.strictEqual(command, process.execPath, "LanguageClient must launch the configured smoke server executable");
+  protocolState.spawnCalls += 1;
+
+  const serverProcess = new EventEmitter();
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let input = Buffer.alloc(0);
+
+  Object.assign(serverProcess, {
+    exitCode: null,
+    killed: false,
+    pid: Number.MAX_SAFE_INTEGER,
+    signalCode: null,
+    stderr,
+    stdin,
+    stdio: [stdin, stdout, stderr],
+    stdout,
+    kill() {
+      this.killed = true;
+      this.signalCode = "SIGTERM";
+      this.emit("exit", null, this.signalCode);
+      return true;
+    },
+  });
+
+  const handleMessage = (message) => {
+    if (message.method === "initialize" && message.id !== undefined) {
+      protocolState.initializeRequests += 1;
+      writeProtocolMessage(stdout, {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          capabilities: {},
+          serverInfo: { name: "php-lsp-vsix-smoke", version: "0.0.0" },
+        },
+      });
+    } else if (message.method === "initialized") {
+      protocolState.initializedNotifications += 1;
+    } else if (message.method === "shutdown" && message.id !== undefined) {
+      protocolState.shutdownRequests += 1;
+      writeProtocolMessage(stdout, { jsonrpc: "2.0", id: message.id, result: null });
+    } else if (message.method === "exit") {
+      protocolState.exitNotifications += 1;
+      serverProcess.exitCode = 0;
+      serverProcess.killed = true;
+    }
+  };
+
+  stdin.on("data", (chunk) => {
+    input = Buffer.concat([input, chunk]);
+    while (true) {
+      const headerEnd = input.indexOf("\r\n\r\n");
+      if (headerEnd < 0) {
+        return;
+      }
+      const header = input.subarray(0, headerEnd).toString("ascii");
+      const contentLengthMatch = /^Content-Length:\s*(\d+)$/im.exec(header);
+      assert(contentLengthMatch, `LanguageClient emitted a message without Content-Length: ${header}`);
+      const contentLength = Number(contentLengthMatch[1]);
+      const messageEnd = headerEnd + 4 + contentLength;
+      if (input.length < messageEnd) {
+        return;
+      }
+      const payload = input.subarray(headerEnd + 4, messageEnd).toString("utf8");
+      input = input.subarray(messageEnd);
+      handleMessage(JSON.parse(payload));
+    }
+  });
+
+  return serverProcess;
+}
+
+async function runActivationSmoke() {
+  const originalSpawn = childProcess.spawn;
+  const vscode = require(path.join(extensionRoot, "node_modules", "vscode"));
+  childProcess.spawn = createMockLanguageServerProcess;
+  try {
+    extensionModule.activate(context);
+    await waitFor(
+      () => protocolState.initializedNotifications === 1
+        && vscode.__phpLspSmoke.outputLines.some((line) => line.includes("Started language server:")),
+      "LanguageClient.start() completion at the declared VS Code floor",
+    );
+
+    assert.strictEqual(protocolState.spawnCalls, 1, "activation must call LanguageClient.start() exactly once");
+    assert.strictEqual(protocolState.initializeRequests, 1, "LanguageClient.start() must complete the initialize request");
+
+    assert(vscode.__phpLspSmoke.fileWatchersCreated > 0, "LanguageClient construction must create file watchers");
+    assert.deepStrictEqual(vscode.__phpLspSmoke.errorMessages, [], "activation must not report compatibility errors");
+
+    await extensionModule.deactivate();
+    assert.strictEqual(protocolState.shutdownRequests, 1, "deactivation must send shutdown to the started client");
+    assert.strictEqual(protocolState.exitNotifications, 1, "deactivation must send exit to the started client");
+    assert.strictEqual(
+      vscode.__phpLspSmoke.fileWatchersDisposed,
+      vscode.__phpLspSmoke.fileWatchersCreated,
+      "deactivation must dispose every watcher created for the LanguageClient",
+    );
+  } finally {
+    childProcess.spawn = originalSpawn;
+  }
+}
+
+runActivationSmoke().then(() => {
+  console.log(`VSIX smoke test passed at declared VS Code minimum ${process.env.PHP_LSP_SMOKE_VSCODE_VERSION}`);
+}).catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
 });
 NODE
 

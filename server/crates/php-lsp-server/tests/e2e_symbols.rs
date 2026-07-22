@@ -315,6 +315,78 @@ class Demo {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_folding_range_characters_use_utf16_after_non_ascii_text() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = "<?php\nfunction demo(): void {\n    \"😀\"; $values = [\n        1,\n        \"Ж\", ];\n}\n";
+    let uri = "file:///test/FoldingUtf16.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let resp = service
+        .ready()
+        .await
+        .unwrap()
+        .call(folding_range_request(2, uri))
+        .await
+        .unwrap();
+    let result = extract_result(resp);
+    let ranges = result.as_array().expect("folding range array");
+    let array_range = ranges
+        .iter()
+        .find(|range| {
+            range["startLine"].as_u64() == Some(2)
+                && range["endLine"].as_u64() == Some(4)
+                && range["kind"].as_str() == Some("region")
+        })
+        .unwrap_or_else(|| panic!("expected multiline array folding range, got: {result}"));
+    let expected_start = utf16_position_at(code, "[\n");
+    let expected_end = utf16_position_after(code, "]");
+
+    assert_eq!(
+        array_range["startCharacter"].as_u64(),
+        Some(expected_start.1 as u64),
+        "folding startCharacter should use UTF-16 columns, got: {array_range}"
+    );
+    assert_eq!(
+        array_range["endCharacter"].as_u64(),
+        Some(expected_end.1 as u64),
+        "folding endCharacter should use UTF-16 columns, got: {array_range}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_document_links_for_static_include_require_paths() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

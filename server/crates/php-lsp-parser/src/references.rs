@@ -5,12 +5,14 @@
 
 use crate::cst::{ancestor_field_contains, is_foreach_header_declared_variable};
 use crate::resolve::{
-    resolve_scope_class_name_pub, symbol_at_position_with_resolvers, CallableParamTypeResolver,
-    MemberTypeResolver, RefKind,
+    namespace_relative_function_call, resolve_class_name_pub, resolve_constant_name_pub,
+    resolve_function_name_pub, resolve_scope_class_name_pub, symbol_at_position_with_resolvers,
+    unqualified_name_allows_global_fallback, CallableParamTypeResolver, MemberTypeResolver,
+    RefKind,
 };
 use crate::utf16::range_byte_to_utf16;
 use php_lsp_types::{
-    FileSymbols, PhpSymbolKind, SymbolReference, SymbolReferenceReceiver, UseKind,
+    symbol_fqn_eq, FileSymbols, PhpSymbolKind, SymbolReference, SymbolReferenceReceiver, UseKind,
 };
 use tree_sitter::{Node, Point, Tree};
 
@@ -185,6 +187,10 @@ pub fn collect_symbol_references_in_file_with_resolvers(
             range: range_byte_to_utf16(source, symbol.selection_range),
             is_declaration: true,
             starts_with_dollar: symbol.kind == PhpSymbolKind::Property,
+            allows_global_fallback: false,
+            rename_range: None,
+            preserve_spelling_on_rename: false,
+            is_import_target: false,
             receiver: SymbolReferenceReceiver::None,
         });
     }
@@ -213,6 +219,16 @@ fn sort_and_dedup_symbol_references(references: &mut Vec<SymbolReference>) {
             .then_with(|| left.range.cmp(&right.range))
             .then_with(|| left.is_declaration.cmp(&right.is_declaration))
             .then_with(|| left.starts_with_dollar.cmp(&right.starts_with_dollar))
+            .then_with(|| {
+                left.allows_global_fallback
+                    .cmp(&right.allows_global_fallback)
+            })
+            .then_with(|| left.rename_range.cmp(&right.rename_range))
+            .then_with(|| {
+                left.preserve_spelling_on_rename
+                    .cmp(&right.preserve_spelling_on_rename)
+            })
+            .then_with(|| left.is_import_target.cmp(&right.is_import_target))
             .then_with(|| left.receiver.cmp(&right.receiver))
     });
     references.dedup_by(symbol_references_equal_for_dedup);
@@ -231,6 +247,10 @@ fn symbol_references_have_same_dedup_key(left: &SymbolReference, right: &SymbolR
         && left.range == right.range
         && left.is_declaration == right.is_declaration
         && left.starts_with_dollar == right.starts_with_dollar
+        && left.allows_global_fallback == right.allows_global_fallback
+        && left.rename_range == right.rename_range
+        && left.preserve_spelling_on_rename == right.preserve_spelling_on_rename
+        && left.is_import_target == right.is_import_target
         && left.receiver == right.receiver
 }
 
@@ -259,7 +279,27 @@ fn collect_symbol_references_walk(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) {
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
+
+    if node.kind() == "namespace_definition" {
+        if let Some((function_name, selection)) = namespace_relative_function_call(node, source) {
+            push_symbol_reference(
+                references,
+                resolve_function_name_to_fqn(&function_name, file_symbols),
+                PhpSymbolKind::Function,
+                reference_range(source, selection),
+                CollectedReferenceOptions::default(),
+            );
+        }
+    }
+
     match node.kind() {
+        "namespace_use_clause" => {
+            push_import_target_reference(node, source, file_symbols, references);
+        }
         "object_creation_expression" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
@@ -281,10 +321,11 @@ fn collect_symbol_references_walk(
                         format!("{}::{}", scope_fqn, member_name),
                         PhpSymbolKind::Method,
                         reference_range(source, name_node),
-                        false,
-                        false,
-                        SymbolReferenceReceiver::StaticClass {
-                            class_fqn: scope_fqn,
+                        CollectedReferenceOptions {
+                            receiver: SymbolReferenceReceiver::StaticClass {
+                                class_fqn: scope_fqn,
+                            },
+                            ..Default::default()
                         },
                     );
                 } else {
@@ -293,9 +334,10 @@ fn collect_symbol_references_walk(
                         format!("::{}", member_name),
                         PhpSymbolKind::Method,
                         reference_range(source, name_node),
-                        false,
-                        false,
-                        SymbolReferenceReceiver::Unresolved,
+                        CollectedReferenceOptions {
+                            receiver: SymbolReferenceReceiver::Unresolved,
+                            ..Default::default()
+                        },
                     );
                 }
             }
@@ -323,10 +365,12 @@ fn collect_symbol_references_walk(
                         format!("{}::{}", scope_fqn, member),
                         kind,
                         reference_range(source, name_node),
-                        false,
-                        raw_name.starts_with('$'),
-                        SymbolReferenceReceiver::StaticClass {
-                            class_fqn: scope_fqn,
+                        CollectedReferenceOptions {
+                            starts_with_dollar: raw_name.starts_with('$'),
+                            receiver: SymbolReferenceReceiver::StaticClass {
+                                class_fqn: scope_fqn,
+                            },
+                            ..Default::default()
                         },
                     );
                 } else {
@@ -335,9 +379,11 @@ fn collect_symbol_references_walk(
                         format!("::{}", member),
                         kind,
                         reference_range(source, name_node),
-                        false,
-                        raw_name.starts_with('$'),
-                        SymbolReferenceReceiver::Unresolved,
+                        CollectedReferenceOptions {
+                            starts_with_dollar: raw_name.starts_with('$'),
+                            receiver: SymbolReferenceReceiver::Unresolved,
+                            ..Default::default()
+                        },
                     );
                 }
             }
@@ -365,9 +411,10 @@ fn collect_symbol_references_walk(
                     target_fqn,
                     PhpSymbolKind::Property,
                     reference_range(source, name_node),
-                    false,
-                    false,
-                    receiver,
+                    CollectedReferenceOptions {
+                        receiver,
+                        ..Default::default()
+                    },
                 );
             }
         }
@@ -389,9 +436,10 @@ fn collect_symbol_references_walk(
                     target_fqn,
                     PhpSymbolKind::Method,
                     reference_range(source, name_node),
-                    false,
-                    false,
-                    receiver,
+                    CollectedReferenceOptions {
+                        receiver,
+                        ..Default::default()
+                    },
                 );
             }
         }
@@ -421,9 +469,10 @@ fn collect_symbol_references_walk(
                     target,
                     PhpSymbolKind::ClassConstant,
                     reference_range(source, name_node),
-                    false,
-                    false,
-                    receiver,
+                    CollectedReferenceOptions {
+                        receiver,
+                        ..Default::default()
+                    },
                 );
             }
         }
@@ -435,9 +484,20 @@ fn collect_symbol_references_walk(
                     resolve_function_name_to_fqn(text, file_symbols),
                     PhpSymbolKind::Function,
                     reference_range(source, func_node),
-                    false,
-                    false,
-                    SymbolReferenceReceiver::None,
+                    CollectedReferenceOptions {
+                        allows_global_fallback: unqualified_name_allows_global_fallback(
+                            text,
+                            UseKind::Function,
+                            file_symbols,
+                        ),
+                        rename_range: Some(terminal_identifier_range(source, func_node)),
+                        preserve_spelling_on_rename: explicit_import_alias_covers_entire_name(
+                            text,
+                            UseKind::Function,
+                            file_symbols,
+                        ),
+                        ..Default::default()
+                    },
                 );
             }
         }
@@ -516,10 +576,103 @@ fn push_class_reference(
         resolved,
         PhpSymbolKind::Class,
         reference_range(source, node),
-        false,
-        false,
-        SymbolReferenceReceiver::None,
+        CollectedReferenceOptions {
+            rename_range: Some(terminal_identifier_range(source, node)),
+            preserve_spelling_on_rename: explicit_import_alias_covers_entire_name(
+                text,
+                UseKind::Class,
+                file_symbols,
+            ),
+            ..Default::default()
+        },
     );
+}
+
+fn push_import_target_reference(
+    clause: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    references: &mut Vec<SymbolReference>,
+) {
+    let clause_range = node_range(clause);
+    let Some(use_statement) = file_symbols
+        .use_statements
+        .iter()
+        .find(|statement| statement.range == clause_range)
+    else {
+        return;
+    };
+
+    let alias_node = clause.child_by_field_name("alias");
+    let mut cursor = clause.walk();
+    let Some(target_node) = clause.named_children(&mut cursor).find(|child| {
+        Some(child.id()) != alias_node.map(|alias| alias.id())
+            && matches!(child.kind(), "name" | "qualified_name" | "namespace_name")
+    }) else {
+        return;
+    };
+
+    let target_kind = match use_statement.kind {
+        UseKind::Class => PhpSymbolKind::Class,
+        UseKind::Function => PhpSymbolKind::Function,
+        UseKind::Constant => PhpSymbolKind::GlobalConstant,
+    };
+    push_symbol_reference(
+        references,
+        use_statement.fqn.trim_start_matches('\\').to_string(),
+        target_kind,
+        reference_range(source, target_node),
+        CollectedReferenceOptions {
+            rename_range: Some(terminal_identifier_range(source, target_node)),
+            is_import_target: true,
+            ..Default::default()
+        },
+    );
+}
+
+fn explicit_import_alias_covers_entire_name(
+    raw_name: &str,
+    use_kind: UseKind,
+    file_symbols: &FileSymbols,
+) -> bool {
+    let raw_name = raw_name.trim();
+    if raw_name.starts_with('\\') {
+        return false;
+    }
+    let (first_segment, suffix) = raw_name
+        .split_once('\\')
+        .map_or((raw_name, None), |(first, rest)| (first, Some(rest)));
+    if suffix.is_some() {
+        return false;
+    }
+
+    file_symbols.use_statements.iter().any(|statement| {
+        if statement.kind != use_kind || statement.alias.is_none() {
+            return false;
+        }
+        let alias = statement.alias.as_deref().unwrap_or_default();
+        match use_kind {
+            UseKind::Class | UseKind::Function => alias.eq_ignore_ascii_case(first_segment),
+            UseKind::Constant => alias == first_segment,
+        }
+    })
+}
+
+fn terminal_identifier_range(source: &str, node: Node) -> (u32, u32, u32, u32) {
+    reference_range(source, terminal_identifier_node(node).unwrap_or(node))
+}
+
+fn terminal_identifier_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    if node.kind() == "name" {
+        return Some(node);
+    }
+
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(found) = node.named_child(index).and_then(terminal_identifier_node) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn scoped_member_reference_class(
@@ -551,6 +704,9 @@ fn push_constant_reference_if_plain_name(
     file_symbols: &FileSymbols,
     references: &mut Vec<SymbolReference>,
 ) {
+    if namespace_relative_function_call(node, source).is_some() {
+        return;
+    }
     let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
     if matches!(
         parent_kind,
@@ -562,6 +718,8 @@ fn push_constant_reference_if_plain_name(
             | "enum_declaration"
             | "function_definition"
             | "named_type"
+            | "qualified_name"
+            | "namespace_name"
             | "use_declaration"
             | "namespace_use_clause"
             | "scoped_call_expression"
@@ -582,9 +740,20 @@ fn push_constant_reference_if_plain_name(
         resolve_constant_name_to_fqn(text, file_symbols),
         PhpSymbolKind::GlobalConstant,
         reference_range(source, node),
-        false,
-        false,
-        SymbolReferenceReceiver::None,
+        CollectedReferenceOptions {
+            allows_global_fallback: unqualified_name_allows_global_fallback(
+                text,
+                UseKind::Constant,
+                file_symbols,
+            ),
+            rename_range: Some(terminal_identifier_range(source, node)),
+            preserve_spelling_on_rename: explicit_import_alias_covers_entire_name(
+                text,
+                UseKind::Constant,
+                file_symbols,
+            ),
+            ..Default::default()
+        },
     );
 }
 
@@ -662,22 +831,46 @@ fn ref_kind_matches_symbol_kind(ref_kind: RefKind, target_kind: PhpSymbolKind) -
     )
 }
 
+struct CollectedReferenceOptions {
+    starts_with_dollar: bool,
+    allows_global_fallback: bool,
+    rename_range: Option<(u32, u32, u32, u32)>,
+    preserve_spelling_on_rename: bool,
+    is_import_target: bool,
+    receiver: SymbolReferenceReceiver,
+}
+
+impl Default for CollectedReferenceOptions {
+    fn default() -> Self {
+        Self {
+            starts_with_dollar: false,
+            allows_global_fallback: false,
+            rename_range: None,
+            preserve_spelling_on_rename: false,
+            is_import_target: false,
+            receiver: SymbolReferenceReceiver::None,
+        }
+    }
+}
+
 fn push_symbol_reference(
     references: &mut Vec<SymbolReference>,
     target_fqn: String,
     target_kind: PhpSymbolKind,
     range: (u32, u32, u32, u32),
-    is_declaration: bool,
-    starts_with_dollar: bool,
-    receiver: SymbolReferenceReceiver,
+    options: CollectedReferenceOptions,
 ) {
     references.push(SymbolReference {
         target_fqn,
         target_kind,
         range,
-        is_declaration,
-        starts_with_dollar,
-        receiver,
+        is_declaration: false,
+        starts_with_dollar: options.starts_with_dollar,
+        allows_global_fallback: options.allows_global_fallback,
+        rename_range: options.rename_range,
+        preserve_spelling_on_rename: options.preserve_spelling_on_rename,
+        is_import_target: options.is_import_target,
+        receiver: options.receiver,
     });
 }
 
@@ -697,7 +890,7 @@ fn find_class_references(
     // Check declarations in this file
     if include_declaration {
         for sym in &file_symbols.symbols {
-            if sym.fqn == target_fqn
+            if sym.fqn.eq_ignore_ascii_case(target_fqn)
                 && matches!(
                     sym.kind,
                     PhpSymbolKind::Class
@@ -725,6 +918,10 @@ fn walk_for_class_refs(
     target_fqn: &str,
     results: &mut Vec<ReferenceLocation>,
 ) {
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
     let kind = node.kind();
 
     // Check nodes that can contain class name references
@@ -817,7 +1014,7 @@ fn check_class_name_ref(
     let text = &source[node.byte_range()];
     let resolved = resolve_name_to_fqn(text, file_symbols);
 
-    if resolved == target_fqn {
+    if resolved.eq_ignore_ascii_case(target_fqn) {
         let start = node.start_position();
         let end = node.end_position();
         results.push(ReferenceLocation {
@@ -833,48 +1030,11 @@ fn check_class_name_ref(
 
 /// Resolve a name to FQN using use statements and namespace context.
 fn resolve_name_to_fqn(name: &str, file_symbols: &FileSymbols) -> String {
-    // Already fully qualified
-    if name.starts_with('\\') {
-        return name.trim_start_matches('\\').to_string();
-    }
-
-    // Special names
     match name {
         "self" | "static" | "parent" | "$this" | "string" | "int" | "float" | "bool" | "array"
         | "callable" | "iterable" | "object" | "mixed" | "void" | "never" | "null" | "false"
-        | "true" => return name.to_string(),
-        _ => {}
-    }
-
-    // Try use statements
-    let parts: Vec<&str> = name.split('\\').collect();
-    let first_part = parts[0];
-
-    for use_stmt in &file_symbols.use_statements {
-        if use_stmt.kind != UseKind::Class {
-            continue;
-        }
-
-        let alias = use_stmt
-            .alias
-            .as_deref()
-            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-
-        if alias == first_part {
-            if parts.len() == 1 {
-                return use_stmt.fqn.clone();
-            } else {
-                let rest = parts[1..].join("\\");
-                return format!("{}\\{}", use_stmt.fqn, rest);
-            }
-        }
-    }
-
-    // Prepend namespace
-    if let Some(ref ns) = file_symbols.namespace {
-        format!("{}\\{}", ns, name)
-    } else {
-        name.to_string()
+        | "true" => name.to_string(),
+        _ => resolve_class_name_pub(name, file_symbols),
     }
 }
 
@@ -889,7 +1049,9 @@ fn find_function_references(
 ) {
     if include_declaration {
         for sym in &file_symbols.symbols {
-            if sym.fqn == target_fqn && sym.kind == PhpSymbolKind::Function {
+            if sym.kind == PhpSymbolKind::Function
+                && symbol_fqn_eq(&sym.fqn, target_fqn, PhpSymbolKind::Function)
+            {
                 results.push(ReferenceLocation {
                     range: sym.selection_range,
                 });
@@ -908,11 +1070,34 @@ fn walk_for_function_refs(
     target_fqn: &str,
     results: &mut Vec<ReferenceLocation>,
 ) {
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
+    if node.kind() == "namespace_definition" {
+        if let Some((function_name, selection)) = namespace_relative_function_call(node, source) {
+            let resolved = resolve_function_name_to_fqn(&function_name, file_symbols);
+            if resolved_name_matches_target(&resolved, target_fqn, PhpSymbolKind::Function, false) {
+                results.push(ReferenceLocation {
+                    range: node_range(selection),
+                });
+            }
+        }
+    }
     if node.kind() == "function_call_expression" {
         if let Some(func_node) = node.child_by_field_name("function") {
             let text = &source[func_node.byte_range()];
             let resolved = resolve_function_name_to_fqn(text, file_symbols);
-            if resolved == target_fqn {
+            if resolved_name_matches_target(
+                &resolved,
+                target_fqn,
+                PhpSymbolKind::Function,
+                unqualified_name_allows_global_fallback(text, UseKind::Function, file_symbols)
+                    && !file_symbols.symbols.iter().any(|symbol| {
+                        symbol.kind == PhpSymbolKind::Function
+                            && symbol_fqn_eq(&symbol.fqn, &resolved, PhpSymbolKind::Function)
+                    }),
+            ) {
                 let start = func_node.start_position();
                 let end = func_node.end_position();
                 results.push(ReferenceLocation {
@@ -935,69 +1120,25 @@ fn walk_for_function_refs(
 
 /// Resolve a function name to FQN.
 fn resolve_function_name_to_fqn(name: &str, file_symbols: &FileSymbols) -> String {
-    if name.starts_with('\\') {
-        return name.trim_start_matches('\\').to_string();
-    }
+    resolve_function_name_pub(name, file_symbols)
+}
 
-    // Try use statements (function)
-    for use_stmt in &file_symbols.use_statements {
-        if use_stmt.kind != UseKind::Function {
-            continue;
-        }
-
-        let alias = use_stmt
-            .alias
-            .as_deref()
-            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-
-        if alias == name {
-            return use_stmt.fqn.clone();
-        }
-    }
-
-    // Keep already-qualified names stable.
-    if name.contains('\\') {
-        return name.to_string();
-    }
-
-    // Namespace-qualified for simple names
-    if let Some(ref ns) = file_symbols.namespace {
-        format!("{}\\{}", ns, name)
-    } else {
-        name.to_string()
-    }
+fn resolved_name_matches_target(
+    resolved_fqn: &str,
+    target_fqn: &str,
+    target_kind: PhpSymbolKind,
+    allows_global_fallback: bool,
+) -> bool {
+    symbol_fqn_eq(resolved_fqn, target_fqn, target_kind)
+        || (allows_global_fallback
+            && resolved_fqn
+                .rsplit_once('\\')
+                .is_some_and(|(_, short_name)| symbol_fqn_eq(short_name, target_fqn, target_kind)))
 }
 
 /// Resolve a global constant name to FQN.
 fn resolve_constant_name_to_fqn(name: &str, file_symbols: &FileSymbols) -> String {
-    if name.starts_with('\\') {
-        return name.trim_start_matches('\\').to_string();
-    }
-
-    for use_stmt in &file_symbols.use_statements {
-        if use_stmt.kind != UseKind::Constant {
-            continue;
-        }
-
-        let alias = use_stmt
-            .alias
-            .as_deref()
-            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-
-        if alias == name {
-            return use_stmt.fqn.clone();
-        }
-    }
-
-    if name.contains('\\') {
-        return name.to_string();
-    }
-
-    if let Some(ref ns) = file_symbols.namespace {
-        format!("{}\\{}", ns, name)
-    } else {
-        name.to_string()
-    }
+    resolve_constant_name_pub(name, file_symbols)
 }
 
 /// Find all references to a class member (method, property, class constant, enum case).
@@ -1019,7 +1160,7 @@ fn find_member_references(
 
     if include_declaration {
         for sym in &file_symbols.symbols {
-            if sym.fqn == target_fqn {
+            if symbol_fqn_eq(&sym.fqn, target_fqn, target_kind) {
                 results.push(ReferenceLocation {
                     range: sym.selection_range,
                 });
@@ -1042,12 +1183,16 @@ fn find_member_references(
 fn walk_for_member_refs(
     node: Node,
     source: &str,
-    _file_symbols: &FileSymbols,
+    file_symbols: &FileSymbols,
     target_fqn: &str,
     member_name: &str,
     target_kind: PhpSymbolKind,
     results: &mut Vec<ReferenceLocation>,
 ) {
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
     let kind = node.kind();
 
     match kind {
@@ -1103,10 +1248,10 @@ fn walk_for_member_refs(
                     // For scoped access, also check that the scope resolves to the right class
                     if let Some(scope_node) = node.child_by_field_name("scope") {
                         let scope_text = &source[scope_node.byte_range()];
-                        let scope_fqn = resolve_name_to_fqn(scope_text, _file_symbols);
+                        let scope_fqn = resolve_name_to_fqn(scope_text, file_symbols);
                         let expected_class = &target_fqn[..target_fqn.rfind("::").unwrap_or(0)];
 
-                        if scope_fqn == expected_class
+                        if scope_fqn.eq_ignore_ascii_case(expected_class)
                             || scope_text == "self"
                             || scope_text == "static"
                             || scope_text == "parent"
@@ -1144,10 +1289,10 @@ fn walk_for_member_refs(
                     // For scoped access, also check that the scope resolves to the right class
                     if let Some(scope_node) = node.child_by_field_name("scope") {
                         let scope_text = &source[scope_node.byte_range()];
-                        let scope_fqn = resolve_name_to_fqn(scope_text, _file_symbols);
+                        let scope_fqn = resolve_name_to_fqn(scope_text, file_symbols);
                         let expected_class = &target_fqn[..target_fqn.rfind("::").unwrap_or(0)];
 
-                        if scope_fqn == expected_class
+                        if scope_fqn.eq_ignore_ascii_case(expected_class)
                             || scope_text == "self"
                             || scope_text == "static"
                             || scope_text == "parent"
@@ -1181,10 +1326,10 @@ fn walk_for_member_refs(
                 let text = &source[name_node.byte_range()];
                 if member_reference_name_matches(text, member_name, target_kind) {
                     let scope_text = &source[scope_node.byte_range()];
-                    let scope_fqn = resolve_name_to_fqn(scope_text, _file_symbols);
+                    let scope_fqn = resolve_name_to_fqn(scope_text, file_symbols);
                     let expected_class = &target_fqn[..target_fqn.rfind("::").unwrap_or(0)];
 
-                    if scope_fqn == expected_class
+                    if scope_fqn.eq_ignore_ascii_case(expected_class)
                         || scope_text == "self"
                         || scope_text == "static"
                         || scope_text == "parent"
@@ -1212,7 +1357,7 @@ fn walk_for_member_refs(
         walk_for_member_refs(
             child,
             source,
-            _file_symbols,
+            file_symbols,
             target_fqn,
             member_name,
             target_kind,
@@ -1247,7 +1392,9 @@ fn find_constant_references(
 ) {
     if include_declaration {
         for sym in &file_symbols.symbols {
-            if sym.fqn == target_fqn && sym.kind == PhpSymbolKind::GlobalConstant {
+            if sym.kind == PhpSymbolKind::GlobalConstant
+                && symbol_fqn_eq(&sym.fqn, target_fqn, PhpSymbolKind::GlobalConstant)
+            {
                 results.push(ReferenceLocation {
                     range: sym.selection_range,
                 });
@@ -1267,6 +1414,11 @@ fn walk_for_constant_refs(
     target_fqn: &str,
     results: &mut Vec<ReferenceLocation>,
 ) {
+    let start = node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let file_symbols = scoped_file_symbols.as_ref();
+
     // Constants appear as "name" nodes that are not function calls, class names, etc.
     if node.kind() == "name" || node.kind() == "qualified_name" {
         let parent = node.parent();
@@ -1281,13 +1433,24 @@ fn walk_for_constant_refs(
             && parent_kind != "enum_declaration"
             && parent_kind != "function_definition"
             && parent_kind != "named_type"
+            && parent_kind != "qualified_name"
+            && parent_kind != "namespace_name"
             && parent_kind != "use_declaration"
             && parent_kind != "namespace_use_clause"
         {
             let text = &source[node.byte_range()];
             // Try resolving as constant
             let resolved = resolve_constant_name_to_fqn(text, file_symbols);
-            if resolved == target_fqn {
+            if resolved_name_matches_target(
+                &resolved,
+                target_fqn,
+                PhpSymbolKind::GlobalConstant,
+                unqualified_name_allows_global_fallback(text, UseKind::Constant, file_symbols)
+                    && !file_symbols.symbols.iter().any(|symbol| {
+                        symbol.kind == PhpSymbolKind::GlobalConstant
+                            && symbol_fqn_eq(&symbol.fqn, &resolved, PhpSymbolKind::GlobalConstant)
+                    }),
+            ) {
                 let start = node.start_position();
                 let end = node.end_position();
                 results.push(ReferenceLocation {
@@ -1430,6 +1593,10 @@ mod tests {
             range: (4, 8, 4, 14),
             is_declaration: false,
             starts_with_dollar,
+            allows_global_fallback: false,
+            rename_range: None,
+            preserve_spelling_on_rename: false,
+            is_import_target: false,
             receiver: SymbolReferenceReceiver::ResolvedType {
                 type_fqn: "App\\Target".to_string(),
             },
@@ -1539,6 +1706,156 @@ helper();
         let refs = find_refs(code, "App\\helper", PhpSymbolKind::Function);
         // 1 declaration + 2 calls = 3
         assert_eq!(refs.len(), 3, "Should find declaration + 2 calls");
+    }
+
+    #[test]
+    fn test_find_class_and_function_references_case_insensitively() {
+        let code = r#"<?php
+namespace App;
+class MixedCaseClass {}
+function MixedCaseFunction() {}
+new mixedcaseclass();
+MIXEDCASEFUNCTION();
+"#;
+
+        let class_refs = find_refs(code, r"app\MIXEDCASECLASS", PhpSymbolKind::Class);
+        assert_eq!(class_refs.len(), 2);
+
+        let function_refs = find_refs(code, r"APP\mixedcasefunction", PhpSymbolKind::Function);
+        assert_eq!(function_refs.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_references_uses_each_namespace_block_import_scope() {
+        let code = r#"<?php
+namespace First {
+    use Vendor\First\Service as Shared;
+    new Shared();
+}
+namespace Second {
+    use Vendor\Second\Service as Shared;
+    new Shared();
+}
+"#;
+        let refs = collect_refs(code);
+
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == r"Vendor\First\Service" && reference.range.0 == 3
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_fqn == r"Vendor\Second\Service" && reference.range.0 == 7
+        }));
+    }
+
+    #[test]
+    fn test_collect_references_resolves_namespace_relative_and_qualified_functions() {
+        let code = r#"<?php
+namespace App\Feature;
+namespace\helper();
+Support\other();
+"#;
+        let refs = collect_refs(code);
+
+        assert!(refs.iter().any(|reference| {
+            reference.target_kind == PhpSymbolKind::Function
+                && reference.target_fqn == r"App\Feature\helper"
+                && !reference.allows_global_fallback
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_kind == PhpSymbolKind::Function
+                && reference.target_fqn == r"App\Feature\Support\other"
+                && !reference.allows_global_fallback
+        }));
+    }
+
+    #[test]
+    fn test_global_function_reference_fallback_requires_unqualified_source_name() {
+        let code = r#"<?php
+namespace App;
+strlen('plain');
+Support\strlen('qualified');
+"#;
+
+        let global_refs = find_refs(code, "strlen", PhpSymbolKind::Function);
+        assert_eq!(
+            global_refs
+                .iter()
+                .map(|reference| reference.range.0)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "only the unqualified call may match the canonical global function"
+        );
+
+        let collected = collect_refs(code);
+        let plain = collected
+            .iter()
+            .find(|reference| {
+                reference.target_kind == PhpSymbolKind::Function && reference.range.0 == 2
+            })
+            .expect("unqualified function reference should be collected");
+        assert_eq!(plain.target_fqn, r"App\strlen");
+        assert!(plain.allows_global_fallback);
+
+        let qualified = collected
+            .iter()
+            .find(|reference| {
+                reference.target_kind == PhpSymbolKind::Function && reference.range.0 == 3
+            })
+            .expect("qualified function reference should be collected");
+        assert!(!qualified.allows_global_fallback);
+
+        let explicit = collect_refs(
+            r#"<?php
+namespace App\Feature;
+namespace\strlen('explicit');
+Support\other();
+"#,
+        );
+        let explicit = explicit
+            .iter()
+            .find(|reference| reference.target_kind == PhpSymbolKind::Function)
+            .expect("namespace-relative function reference should be collected");
+        assert!(!explicit.allows_global_fallback);
+    }
+
+    #[test]
+    fn test_collect_references_expands_namespace_aliases_for_qualified_symbols() {
+        let code = r#"<?php
+namespace App;
+use Vendor\Package as Lib;
+use const Vendor\FLAG as ConstAlias;
+lib\helper();
+echo LIB\FLAG;
+echo ConstAlias\CHILD;
+"#;
+        let refs = collect_refs(code);
+
+        assert!(refs.iter().any(|reference| {
+            reference.target_kind == PhpSymbolKind::Function
+                && reference.target_fqn == r"Vendor\Package\helper"
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_kind == PhpSymbolKind::GlobalConstant
+                && reference.target_fqn == r"Vendor\Package\FLAG"
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.target_kind == PhpSymbolKind::GlobalConstant
+                && reference.target_fqn == r"App\ConstAlias\CHILD"
+        }));
+        assert!(!refs.iter().any(|reference| {
+            reference.target_kind == PhpSymbolKind::GlobalConstant
+                && reference.target_fqn == r"Vendor\FLAG\CHILD"
+        }));
+    }
+
+    #[test]
+    fn test_global_constant_references_ignore_namespace_case_only() {
+        let code = r#"<?php
+echo \Vendor\Package\FLAG;
+"#;
+
+        assert!(!find_refs(code, r"vendor\package\FLAG", PhpSymbolKind::GlobalConstant).is_empty());
+        assert!(find_refs(code, r"vendor\package\flag", PhpSymbolKind::GlobalConstant).is_empty());
     }
 
     #[test]
@@ -1682,6 +1999,102 @@ echo IS_ENABLED;
                 && reference.target_kind == PhpSymbolKind::GlobalConstant
                 && !reference.is_declaration
         }));
+    }
+
+    #[test]
+    fn test_import_references_preserve_explicit_aliases_for_rename() {
+        let code = r#"<?php
+namespace App;
+
+use Vendor\{
+    Service as Alias,
+    ImplicitService,
+    function helper as call_it,
+    function plain_helper,
+    const FLAG as LOCAL_FLAG,
+    const OTHER
+};
+
+new Alias();
+new ImplicitService();
+call_it();
+plain_helper();
+echo LOCAL_FLAG;
+echo OTHER;
+"#;
+        let refs = collect_refs(code);
+
+        for (target_fqn, target_kind) in [
+            (r"Vendor\Service", PhpSymbolKind::Class),
+            (r"Vendor\helper", PhpSymbolKind::Function),
+            (r"Vendor\FLAG", PhpSymbolKind::GlobalConstant),
+        ] {
+            let matching: Vec<_> = refs
+                .iter()
+                .filter(|reference| {
+                    reference.target_fqn == target_fqn && reference.target_kind == target_kind
+                })
+                .collect();
+            assert_eq!(
+                matching.len(),
+                2,
+                "expected import target plus aliased usage for {target_fqn}: {matching:?}"
+            );
+            assert_eq!(
+                matching
+                    .iter()
+                    .filter(|reference| reference.preserve_spelling_on_rename)
+                    .count(),
+                1,
+                "only the explicit alias usage should preserve spelling: {matching:?}"
+            );
+            assert_eq!(
+                matching
+                    .iter()
+                    .filter(|reference| reference.is_import_target)
+                    .count(),
+                1,
+                "one reference must identify the import target: {matching:?}"
+            );
+            assert!(matching
+                .iter()
+                .all(|reference| reference.rename_range.is_some()));
+        }
+
+        for (target_fqn, target_kind) in [
+            (r"Vendor\ImplicitService", PhpSymbolKind::Class),
+            (r"Vendor\plain_helper", PhpSymbolKind::Function),
+            (r"Vendor\OTHER", PhpSymbolKind::GlobalConstant),
+        ] {
+            let matching: Vec<_> = refs
+                .iter()
+                .filter(|reference| {
+                    reference.target_fqn == target_fqn && reference.target_kind == target_kind
+                })
+                .collect();
+            assert_eq!(
+                matching.len(),
+                2,
+                "expected import target plus implicit usage for {target_fqn}: {matching:?}"
+            );
+            assert!(
+                matching
+                    .iter()
+                    .all(|reference| !reference.preserve_spelling_on_rename),
+                "implicit aliases must be renamed with their target: {matching:?}"
+            );
+            assert_eq!(
+                matching
+                    .iter()
+                    .filter(|reference| reference.is_import_target)
+                    .count(),
+                1,
+                "one reference must identify the import target: {matching:?}"
+            );
+            assert!(matching
+                .iter()
+                .all(|reference| reference.rename_range.is_some()));
+        }
     }
 
     #[test]
