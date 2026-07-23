@@ -5,8 +5,8 @@
 | Поле | Значение |
 |------|----------|
 | Проект | php-lsp |
-| Версия документа | 1.1 |
-| Дата | 2026-05-25 |
+| Версия документа | 1.2 |
+| Дата | 2026-07-22 |
 | Статус | Актуализировано по текущей реализации `0.7.0`; детальная runtime-документация вынесена в `docs/` |
 | Лицензия | MIT |
 | LSP версия | 3.17 |
@@ -30,9 +30,9 @@
 | 1 | Полная совместимость с PhpStorm | Нереалистично; цель — покрыть 80% частых сценариев |
 | 2 | Выполнение PHP-кода / интерпретатор | Не нужен для LSP; потребовал бы runtime |
 | 3 | Полная замена PHPStan/Psalm | PHPStan/Psalm интегрируются как внешние diagnostics, но php-lsp остается editor-first LSP |
-| 4 | Поддержка Blade/Twig/других шаблонизаторов | Возможно в будущих версиях через embedded languages |
+| 4 | Полная совместимость с Blade/Twig runtime | Реализована консервативная virtual-PHP/source-map поддержка, но сервер не запускает template engine, extensions или framework container |
 | 5 | Debugger / Xdebug интеграция | Отдельный протокол (DAP), вне scope |
-| 6 | Refactoring уровня IDE (Extract Method, Move Class) | Сложность слишком высока для MVP/v1 |
+| 6 | Крупные структурные refactoring (`Extract Method`, `Move Class`) | Реализованы локальные extract/inline/member refactoring, но межфайловые структурные преобразования остаются вне scope |
 
 ---
 
@@ -42,12 +42,13 @@
 
 | Версия | Статус | Ключевые синтаксические особенности для парсинга |
 |--------|--------|--------------------------------------------------|
-| 7.4 | Полная поддержка | Typed properties, arrow functions `fn()`, null coalescing assignment `??=`, spread in arrays |
-| 8.0 | Полная поддержка | Union types `A\|B`, named arguments, match expression, nullsafe operator `?->`, attributes `#[...]`, constructor promotion, `throw` expression |
-| 8.1 | Полная поддержка | Enums, fibers (как символ), intersection types `A&B`, readonly properties, `never` return type, first-class callable syntax `strlen(...)` |
-| 8.2 | Полная поддержка | Readonly classes, DNF types `(A&B)\|C`, `true`/`false`/`null` standalone types, constants in traits |
-| 8.3 | Полная поддержка | Typed class constants, `#[\Override]`, dynamic class constant fetch `$class::{$const}` |
-| 8.4+ | Best-effort | Парсинг без падений, но новые конструкции могут не индексироваться полностью |
+| 7.4 | Поддерживаемая цель | Typed properties, arrow functions `fn()`, null coalescing assignment `??=`, spread in arrays |
+| 8.0 | Поддерживаемая цель | Union types `A\|B`, named arguments, match expression, nullsafe operator `?->`, attributes `#[...]`, constructor promotion, `throw` expression |
+| 8.1 | Поддерживаемая цель | Enums, fibers (как символ), intersection types `A&B`, readonly properties, `never` return type, first-class callable syntax `strlen(...)` |
+| 8.2 | Поддерживаемая цель | Readonly classes, DNF types `(A&B)\|C`, `true`/`false`/`null` standalone types, constants in traits |
+| 8.3 | Поддерживаемая цель | Typed class constants, `#[\Override]`, dynamic class constant fetch `$class::{$const}` |
+| 8.4 | Поддерживаемая цель | Version-aware diagnostics/stubs и текущая grammar; новые или динамические конструкции анализируются best-effort |
+| Новее 8.4 | Best-effort | Парсинг без падений, но новые конструкции могут не индексироваться полностью |
 
 Настройка `phpLsp.phpVersion` влияет на:
 - PHP-version diagnostics.
@@ -57,7 +58,7 @@
 
 ### 2.2 VS Code
 
-- Минимальная версия: 1.75.0 (для стабильной поддержки `vscode-languageclient` v9+)
+- Минимальная версия: 1.82.0 (согласована с `vscode-languageclient` и manifest)
 - Поддержка: актуальные стабильные версии
 
 ### 2.3 Серверная часть
@@ -69,12 +70,12 @@
 | Target | Тройка | Примечание |
 |--------|--------|-----------|
 | Windows x64 | `x86_64-pc-windows-msvc` | Основная |
-| Windows ARM64 | `aarch64-pc-windows-msvc` | Опциональная |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | Published universal-VSIX target |
 | macOS x64 | `x86_64-apple-darwin` | Intel Mac |
 | macOS ARM64 | `aarch64-apple-darwin` | Apple Silicon |
-| Linux x64 (glibc) | `x86_64-unknown-linux-gnu` | Основная |
+| Linux x64 (glibc) | `x86_64-unknown-linux-gnu` | Основная release-сборка через Zig selector `x86_64-unknown-linux-gnu.2.28`; проверяется на Ubuntu 20.04 |
 | Linux ARM64 (glibc) | `aarch64-unknown-linux-gnu` | Для ARM серверов |
-| Linux x64 (musl) | `x86_64-unknown-linux-musl` | Ручная сборка возможна скриптом, но target не входит в published VSIX set |
+| Linux x64 (musl) | Пользовательская сборка | Не входит в published VSIX set; подключается через `phpLsp.serverPath` |
 
 ---
 
@@ -99,15 +100,15 @@
 | `window/workDoneProgress/create` | server→client | MVP | Создание прогресс-бара индексации |
 | `$/progress` | server→client | MVP | Обновление прогресса индексации |
 
-### 3.2 MVP — обязательные LSP-методы
+### 3.2 MVP capability baseline (реализовано)
 
 #### Синхронизация документов
 
 | Метод | Описание | Детали реализации |
 |-------|----------|-------------------|
-| `textDocument/didOpen` | Документ открыт | Получить полный текст, распарсить tree-sitter (grammar `php` с поддержкой mixed HTML), обновить индекс файла, отправить диагностики |
-| `textDocument/didChange` | Инкрементальные изменения | `TextDocumentSyncKind.Incremental (2)`. Применить дельты к буферу (ropey::Rope), перепарсить инкрементально через tree-sitter `parse(source, old_tree)`, обновить индекс файла, debounce диагностик (200мс) |
-| `textDocument/didClose` | Документ закрыт | Освободить буфер открытого документа, переключиться на файловую версию |
+| `textDocument/didOpen` | Документ открыт | Получить полный текст, распарсить tree-sitter, атомарно опубликовать parser/template/version и применимое PHP-index состояние, отправить диагностики |
+| `textDocument/didChange` | Инкрементальные изменения | `TextDocumentSyncKind.Incremental (2)`. Сериализовать изменение по URI, отклонить stale generation/version, обновить parser/template/index и debounce диагностик (~180мс) |
+| `textDocument/didClose` | Документ закрыт | Удалить open-buffer состояние; для обычного PHP guarded-восстановить сохранённую дисковую версию, если URI не переоткрыт |
 | `textDocument/didSave` | Документ сохранён | `save.includeText = false`. Триггер для тяжёлых проверок |
 
 #### Диагностика
@@ -123,13 +124,13 @@
 | `textDocument/hover` | Информация о символе | Тип/сигнатура + PHPDoc. Формат: `MarkupKind.Markdown`. Показать: FQN, параметры, return type, @param/@return из PHPDoc |
 | `textDocument/definition` | Переход к определению | Класс → файл/строка определения. Функция/метод → определение. Property/const → определение. Поддержка: class, interface, trait, enum, function, method, property, class constant, global constant |
 | `textDocument/references` | Поиск всех ссылок | Поиск по индексу workspace. Параметр `includeDeclaration`. Поддержка тех же символов, что и definition |
-| `textDocument/rename` | Переименование символа | `prepareProvider: true` для валидации позиции. Возврат `WorkspaceEdit` с текстовыми правками во всех файлах. Проверки: имя не пустое, нет коллизий, позиция на переименовываемом символе |
+| `textDocument/rename` | Переименование символа | `prepareProvider: true` для валидации позиции. Возврат `WorkspaceEdit` с текстовыми правками во всех файлах. Проверяются syntax/kind нового имени, built-in/virtual ограничения и точность receiver для member rename |
 
 #### Completion
 
 | Метод | Описание | Детали реализации |
 |-------|----------|-------------------|
-| `textDocument/completion` | Автодополнение | `triggerCharacters: ['$', '>', ':', '\\']`. Контексты: (1) после `->` / `?->` — методы/свойства по типу объекта (best-effort); (2) после `::` — статические методы/свойства/константы; (3) после `\` — namespace completion; (4) после `$` — локальные переменные; (5) свободный контекст — функции, классы, ключевые слова PHP. `resolveProvider: true` для ленивой подгрузки документации |
+| `textDocument/completion` | Автодополнение | `triggerCharacters: ['$', '>', ':', '\\', '[', '\'', '"']`. Контексты: member/static access, namespace/import, local variables, array-shape keys, global symbols and keywords. `resolveProvider: true` для ленивой подгрузки документации |
 | `completionItem/resolve` | Детали элемента | Подгрузить PHPDoc, полную сигнатуру, deprecated-статус |
 
 #### Символы
@@ -137,22 +138,24 @@
 | Метод | Описание | Детали реализации |
 |-------|----------|-------------------|
 | `textDocument/documentSymbol` | Символы документа | Иерархический формат (`DocumentSymbol[]`): namespace → class → method/property/const. SymbolKind: Class(5), Method(6), Property(7), Constructor(9), Enum(10), Interface(11), Function(12), Variable(13), Constant(14), EnumMember(22) |
-| `workspace/symbol` | Поиск символов workspace | Fuzzy-match по query. Возврат `WorkspaceSymbol[]` с location |
+| `workspace/symbol` | Поиск символов workspace | Ranked fuzzy-match по query, максимум 200 flat symbol locations |
 
 #### Трейсинг
 
-- Сервер поддерживает параметр `trace` из `InitializeParams` (`off`/`messages`/`verbose`)
-- При `verbose` — логировать полные JSON-RPC сообщения через `$/logTrace`
-- Совместимость с `phpLsp.trace.server` настройкой в VS Code (стандартный механизм `vscode-languageclient`)
+- Сервер принимает `trace` из `InitializeParams` (`off`/`messages`/`verbose`)
+  и при `verbose` добавляет отдельные operational messages.
+- Полный transport trace настраивается через `phpLsp.trace.server` и механизм
+  `vscode-languageclient`; сервер не дублирует весь JSON-RPC поток через
+  `$/logTrace`.
 
-### 3.3 v1 — желательные LSP-методы
+### 3.3 Исторический v1 capability scope (реализовано)
 
 | Метод | Описание | Детали реализации |
 |-------|----------|-------------------|
 | `textDocument/signatureHelp` | Подсказка параметров | `triggerCharacters: ['(', ',']`, `retriggerCharacters: [',']`. Показать параметры функции/метода, подсветить текущий |
-| `textDocument/codeAction` | Code actions | `codeActionKinds: ['quickfix', 'source.organizeImports']`. Quick-fix: добавить `use`, добавить return type. Organize imports: сортировка `use` statements |
-| `textDocument/formatting` | Форматирование | Интеграция с внешним formatter (php-cs-fixer / phpcbf) через конфиг |
-| `textDocument/rangeFormatting` | Форматирование диапазона | Аналогично formatting, но с передачей range |
+| `textDocument/codeAction` | Code actions | Quick fixes, lazy resolve, organize imports, generate/implement members, visibility/promotion, PHPDoc sync, local extract/inline refactoring и opt-in analyzer fixes |
+| `textDocument/formatting` | Форматирование | Trusted external formatter (`auto`, Pint, PHP CS Fixer, phpcbf, custom) через timeout-bound process |
+| `textDocument/rangeFormatting` | Форматирование диапазона | Консервативно форматирует только выбранный PHP fragment через временный файл |
 | `textDocument/semanticTokens/full` | Семантическая подсветка | Полный набор токенов для файла |
 | `textDocument/semanticTokens/full/delta` | Дельта семантических токенов | Инкрементальное обновление |
 
@@ -163,23 +166,22 @@
 | Индекс | Тип | PHP-применение |
 |--------|-----|----------------|
 | 0 | `namespace` | Namespace имена |
-| 1 | `class` | Имена классов |
-| 2 | `enum` | PHP enums |
-| 3 | `interface` | Интерфейсы |
-| 4 | `type` | Type aliases (будущее) |
-| 5 | `typeParameter` | Generic (будущее) |
-| 6 | `parameter` | Параметры функций |
-| 7 | `variable` | Локальные переменные ($var) |
-| 8 | `property` | Свойства классов |
-| 9 | `enumMember` | Enum cases |
-| 10 | `function` | Функции |
-| 11 | `method` | Методы классов |
-| 12 | `keyword` | Ключевые слова PHP |
+| 1 | `type` | Общие type references |
+| 2 | `class` | Имена классов |
+| 3 | `enum` | PHP enums |
+| 4 | `interface` | Интерфейсы |
+| 5 | `parameter` | Параметры функций |
+| 6 | `variable` | Локальные переменные ($var) |
+| 7 | `property` | Свойства классов |
+| 8 | `enumMember` | Enum cases |
+| 9 | `function` | Функции |
+| 10 | `method` | Методы классов |
+| 11 | `keyword` | Ключевые слова PHP |
+| 12 | `modifier` | Visibility/static/readonly и другие модификаторы |
 | 13 | `comment` | Комментарии/PHPDoc |
 | 14 | `string` | Строки |
 | 15 | `number` | Числа |
 | 16 | `operator` | Операторы |
-| 17 | `decorator` | Атрибуты `#[...]` |
 
 Модификаторы:
 
@@ -191,10 +193,13 @@
 | 3 | `static` | Статические методы/свойства |
 | 4 | `deprecated` | @deprecated из PHPDoc |
 | 5 | `abstract` | abstract класс/метод |
-| 6 | `modification` | Присваивание переменной |
-| 7 | `defaultLibrary` | Built-in PHP функции/классы |
+| 6 | `documentation` | PHPDoc/documentation token |
+| 7 | `defaultLibrary` | Присутствует в advertised legend; текущий extractor этот bit не выставляет |
 
-### 3.4 vNext — перспективные LSP-методы
+### 3.4 Исторический vNext capability scope (реализовано)
+
+Все строки ниже реализованы; текущий уровень `Supported`/`Partial` и точные
+ограничения определяет `docs/lsp-features.md`.
 
 | Метод | Описание |
 |-------|----------|
@@ -211,12 +216,15 @@
 ### 4.1 Решение: tree-sitter-php (основная стратегия)
 
 **Обоснование:**
-1. **Инкрементальный парсинг** — критически важен для LSP. При каждом нажатии клавиши tree-sitter перепарсит только изменившееся поддерево за <1мс.
+1. **Инкрементальный парсинг** — критически важен для LSP: tree-sitter повторно использует неизменившиеся части дерева.
 2. **Проверенная error recovery** — на битом коде CST содержит ERROR-ноды, но остальное дерево валидно.
-3. **Боевая зрелость** — используется GitHub, Neovim, Zed. 207 stars, 36 контрибуторов, 642 коммита. Покрывает PHP 7.4–8.3.
+3. **Боевая зрелость** — grammar используется несколькими редакторами и поддерживает PHP 7.4–8.4 best-effort.
 4. Используется grammar `php` (не `php_only`) для поддержки mixed PHP/HTML файлов.
 
-**Альтернатива (для мониторинга):** crate `php-parser` (wudi) — 0.1.x, 22x быстрее tree-sitter, нативный AST, fault-tolerant, но нет инкрементального парсинга, 1 автор, 2 месяца возраста. Также стоит мониторить парсер из Mago (2800 stars, JetBrains-спонсор).
+**Альтернативы для мониторинга:** fault-tolerant PHP AST parsers, включая
+Mago. Замена допустима только после проверки incremental editing, error
+recovery, диапазонов и текущего MSRV; меняющиеся popularity-счётчики здесь не
+фиксируются.
 
 ### 4.2 Требования к парсеру
 
@@ -247,28 +255,34 @@ didChange(deltas)
 Центральная структура для hover, completion, definition, references, rename.
 
 Хранит:
-- **types**: FQN → SymbolInfo (классы, интерфейсы, трейты, enum)
-- **functions**: FQN → SymbolInfo
-- **constants**: FQN → SymbolInfo
+- **types**: case-insensitive normalized FQN → SymbolInfo (классы, интерфейсы, трейты, enum)
+- **functions**: case-insensitive normalized FQN → SymbolInfo
+- **constants**: case-insensitive namespace + case-sensitive final name → SymbolInfo
 - **file_symbols**: URI файла → список символов (для инкрементального обновления)
 - **file_references**: URI файла → список non-local references, извлеченных при парсинге
-- **namespace_map**: маппинг из composer.json
 
-Реализация: `DashMap` для lock-free concurrent access.
+Реализация: `DashMap` с sharded-lock concurrent access.
+Composer `NamespaceMap` хранится отдельно в backend resolution state и не
+является полем `WorkspaceIndex`.
 
 Стратегия инкрементального обновления:
-1. При `didChange` → перепарсить файл → извлечь символы → `index.update_file(uri, new_symbols)`
-2. `update_file` удаляет старые символы файла, добавляет новые
-3. При `didClose` без сохранения → откатиться к дисковой версии
-4. Новые файлы в workspace → `workspace/didChangeWatchedFiles` → парсить и добавить
+1. При `didChange` → перепарсить файл → извлечь symbols/references → guarded
+   `update_file_with_references` для актуального open generation/version.
+2. Фоновая индексация строит отдельный disk index и публикует только URI,
+   которые всё ещё закрыты; open-buffer state накладывается поверх.
+3. При `didClose` ordinary PHP open entry удаляется, а сохранённый дисковый
+   source перечитывается и публикуется под close token.
+4. Новые/изменённые файлы → `workspace/didChangeWatchedFiles`; deleted и
+   исключённые URI удаляются через `remove_file`.
 
 Кэш на диск:
 - Формат: bincode.
 - Namespaces: `workspace`, `stubs`, `vendor`.
 - Инвалидация: schema version, php-lsp version, PHP version, include/exclude
-  paths, stub extension set, stubs/vendor metadata hash, mtime + size каждого
-  файла.
-- Путь: `~/.cache/php-lsp/{workspace-hash}/{namespace}/index.bin`
+  paths, stub extension set, stubs/vendor metadata hash, mtime, size и content
+  hash каждого файла.
+- Путь: `<cache-base>/php-lsp/{workspace-hash}/{namespace}/index.bin`, где base
+  выбирается из `$XDG_CACHE_HOME`, затем `$HOME/.cache`, затем OS temp.
 
 ### 5.2 Composer/autoload
 
@@ -293,8 +307,11 @@ cache namespace и ограничивать горячий in-memory set LRU. К
 1. Git submodule в `server/data/stubs`
 2. При первом запуске — парсить stubs tree-sitter, построить индекс built-in символов
 3. Кэшировать результат на диск
-4. Пометить символы модификатором `defaultLibrary`
-5. Конфиг `phpLsp.stubs.extensions` — какие расширения подключить (по умолчанию ~30 основных)
+4. Пометить stub symbols внутренним `SymbolModifiers.is_builtin`; это не
+   означает emitted semantic-token `defaultLibrary`
+5. Если `phpLsp.stubs.extensions` не задан, обнаружить и загрузить все доступные
+   extension directories; `[]` отключает stubs, непустой список задаёт явный
+   selection.
 
 ### 5.4 PHPDoc парсинг
 
@@ -329,8 +346,10 @@ php-lsp/
 │   │   ├── php-lsp-server/          # Главный бинарник — точка входа
 │   │   │   ├── Cargo.toml
 │   │   │   └── src/
-│   │   │       ├── main.rs          # tokio::main, stdio transport
-│   │   │       └── server.rs        # LanguageServer trait impl + capabilities
+│   │   │       ├── main.rs          # explicit Tokio runtime, stdio transport
+│   │   │       ├── server.rs        # shared backend state + trait delegation
+│   │   │       ├── lsp/             # focused LSP request/notification handlers
+│   │   │       └── indexing/        # workspace/cache/stubs/vendor orchestration
 │   │   │
 │   │   ├── php-lsp-parser/          # Парсинг (tree-sitter wrapper)
 │   │   │   ├── Cargo.toml
@@ -374,7 +393,8 @@ php-lsp/
 │   ├── tsconfig.json
 │   ├── esbuild.mjs
 │   └── src/
-│       └── extension.ts             # activate/deactivate
+│       ├── extension.ts             # activate/deactivate and client wiring
+│       └── lifecycle.ts             # serialized lifecycle/restart/resource ownership
 │
 ├── test-fixtures/                   # Тестовые PHP-проекты
 │   ├── basic/
@@ -399,16 +419,17 @@ php-lsp/
 Community fork оригинального tower-lsp (оригинал заброшен с 2023).
 
 Обоснование:
-- Крупнейшая экосистема — используется Biome, Oxc, Harper, Veryl
-- ~43K downloads/month, активная поддержка
+- Используется в нескольких production language-server проектах
 - Простой API: `LanguageServer` trait → `LspService::new()` → `Server::serve()`
 - Нативная поддержка tokio
 - Обновлённые `lsp-types` 0.97+
 
 Известное ограничение: нотификации обрабатываются асинхронно (возможен
-out-of-order). Решение: хранить latest document version, игнорировать
-stale/duplicate `didChange`, отменять pending diagnostics tasks и публиковать
-diagnostics только если версия не изменилась во время вычисления.
+out-of-order). Решение: сериализовать parser entry по URI, хранить generation и
+latest document version, согласованно захватывать parser/template/state inputs
+для request snapshot, игнорировать stale background/index updates, coalesce
+pending diagnostics и проверять generation/version/template identity перед
+публикацией.
 
 ### 6.3 Конкурентность
 
@@ -416,20 +437,23 @@ diagnostics только если версия не изменилась во в
 
 1. **Fast path** (hover, completion, definition, signatureHelp):
    - Inline в обработчике запроса
-   - Читает snapshot индекса (lock-free через DashMap)
+   - Читает coherent open-document snapshot и concurrent maps `WorkspaceIndex`
    - Целевая латентность: <50мс (p95)
 
 2. **Medium path** (didChange, diagnostics, single-file index update):
-   - didChange applies accepted LSP versions to the incremental parser.
-   - Symbols/references refresh immediately for the open buffer.
-   - Fast diagnostics are debounced (~180-200мс), version-checked, and stale
-     tasks are cancelled.
+   - didChange сериализуется parser-entry lock и принимает только актуальные
+     generation/version.
+   - Parser/template/symbol/reference/index state публикуется согласованно;
+     open buffer имеет приоритет над disk/cache/watch updates.
+   - Fast diagnostics debounced (~180мс), snapshot-checked, stale tasks are
+     cancelled/coalesced per URI.
 
 3. **Heavy path** (workspace indexing, references, rename):
    - Background tasks через tokio::spawn / `spawn_blocking`.
    - Workspace indexing: bounded CPU-aware `JoinSet` queue.
-   - `$/cancelRequest` / cooperative cancellation for indexing, references,
-     rename, and external analyzers.
+   - `$/cancelRequest` cooperatively cancels references/rename requests.
+   - Superseding indexing runs and newer document events cancel indexing and
+     external analyzers through internal operation tokens.
 
 ---
 
@@ -442,6 +466,7 @@ diagnostics только если версия не изменилась во в
   "phpLsp.serverPath": "",
   "phpLsp.includePaths": [],
   "phpLsp.excludePaths": [],
+  // Example explicit selection. Omit to auto-discover every available stub directory.
   "phpLsp.stubs.extensions": [
     "Core", "SPL", "standard", "pcre", "date", "json", "mbstring",
     "ctype", "tokenizer", "dom", "SimpleXML", "PDO", "curl", "filter",
@@ -452,6 +477,8 @@ diagnostics только если версия не изменилась во в
   "phpLsp.composer.enabled": true,
   "phpLsp.indexVendor": true,
   "phpLsp.diagnostics.mode": "basic-semantic",
+  "phpLsp.diagnostics.memberTypeNodeBudget": 512,
+  "phpLsp.diagnostics.partialAnalysisDiagnostic": true,
   "phpLsp.diagnostics.severity": {
     "unknownSymbols": "warning",
     "unused": "warning",
@@ -461,14 +488,17 @@ diagnostics только если версия не изменилась во в
     "overrideSignatures": "warning",
     "phpVersion": "warning"
   },
-  "phpLsp.formatting.provider": "none",
+  "phpLsp.allowProjectCommands": false,
+  "phpLsp.formatting.provider": "auto",
   "phpLsp.formatting.command": "",
+  "phpLsp.formatting.timeoutMs": 30000,
   "phpLsp.phpstan.enabled": false,
   "phpLsp.phpstan.command": "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}",
   "phpLsp.phpstan.timeoutMs": 30000,
   "phpLsp.psalm.enabled": false,
   "phpLsp.psalm.command": "vendor/bin/psalm --output-format=json --no-progress {file}",
   "phpLsp.psalm.timeoutMs": 30000,
+  "phpLsp.analyzerCodeActions.enabled": false,
   "phpLsp.trace.server": "off",
   "phpLsp.logLevel": "info"
 }
@@ -494,7 +524,7 @@ stubs directory to the server through `initializationOptions`.
 | Completion latency (p95) | <150мс | Аналогично |
 | Definition latency (p95) | <50мс | Аналогично |
 | didChange processing | <50мс | Внутренний таймер (parse + index update) |
-| Diagnostics after edit | <500мс | Включая debounce 200мс |
+| Diagnostics after edit | <500мс | Включая debounce ~180мс |
 
 ### 8.2 Память
 
@@ -549,7 +579,9 @@ In-process mock client (без spawn процесса):
   PHPDoc, references/rename, completion and framework-heavy no-false-positive
   cases.
 - `test-fixtures/vendor-resolve/` покрывает lazy vendor resolution.
-- Сквозные проверки лежат в `server/crates/php-lsp-server/tests/e2e.rs`.
+- Сквозные проверки разделены по feature-area в
+  `server/crates/php-lsp-server/tests/e2e_*.rs`; общий JSON-RPC harness лежит в
+  `tests/support/mod.rs`.
 
 ### 9.4 Тест-проекты
 
@@ -569,9 +601,13 @@ In-process mock client (без spawn процесса):
 
 1. CI: Rust stable + `rustfmt`, `clippy -D warnings`, `cargo test --all`.
 2. CI: Node.js 20 + `npm ci`, `npm run lint` (`tsc --noEmit`), `npm run build`.
-3. Release: matrix build for six published server targets.
-4. Release: package universal VSIX with all platform binaries and bundled stubs.
-5. Release: smoke test packaged VSIX, create GitHub release, publish to VS
+3. Release: matrix build for six published server targets; `linux-x64` uses Zig
+   target `gnu.2.28`, ABI inspection, and execution on pinned Ubuntu 20.04.
+4. Release: package universal VSIX with all platform binaries, bundled stubs,
+   and manifest-referenced Blade/Twig language configurations.
+5. Release: verify engine/lock compatibility, simulated minimum-version
+   LanguageClient activation/shutdown, watcher disposal, packaged CLI, and the
+   extracted Linux binary; then create the GitHub release and publish to VS
    Marketplace when `VSCE_PAT` is configured.
 
 ### 10.2 Доставка бинарника
@@ -581,6 +617,8 @@ Universal VSIX:
   `darwin-arm64`, `win32-x64`, `win32-arm64`.
 - Linux binaries are GNU/glibc builds; Alpine/musl is not part of the published
   VSIX target set.
+- Published `linux-x64` requires glibc 2.28 or newer and is smoke-tested on
+  Ubuntu 20.04; native local Cargo builds do not establish this release floor.
 - Fallback: `phpLsp.serverPath` для пользовательского бинарника.
 
 ### 10.3 Обновление

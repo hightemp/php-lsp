@@ -5717,3 +5717,15 @@ change.
   - Validation target: deterministic races cover partial rename publication, watched-file reindex versus open edits, workspace disk indexing versus unsaved buffers, and template/index isolation; focused LSP regressions cover same-file symbols and open-only references.
   - Implemented: request-facing open-document snapshots clone parser/template/version state under one entry lock; guarded index commits, URI unions, rename/reindex publication, and open-buffer overlays prevent stale disk state from winning.
   - Validation: deterministic parser/index, rename, reindex, workspace-index, close/reopen, and Twig races plus same-file/open-only/template LSP regressions pass in the final `make check`.
+
+- [x] **DOCS-CODE-AUDIT-2026-07-22** Reconcile README and project documentation with the current implementation. *(done 2026-07-22)*
+  - Started: 2026-07-22; audit user-facing features, configuration, architecture, development commands, compatibility floors, and known limitations against Rust/TypeScript code and release tooling.
+  - Scope: update stale or incomplete documentation only where behavior is confirmed by code/tests; keep internal correctness fixes out of user-facing feature claims unless they affect guarantees or architecture.
+  - Validation target: repository-local link/command checks, client lint/build where relevant, `git diff --check`, and Verifier review.
+  - Implemented: reconciled the root README, PRD/ADR, configuration guide, LSP matrix, architecture, CLI/performance guidance, production baseline, and risk register with current code and release tooling; refreshed the generated marketplace README; documented and separately tracked the uncovered unopened-Blade disk-index limitation.
+  - Validation: `make check` passes all 777 non-doc Rust tests plus stubs/fmt/Clippy/client lint; client production build passes; JSON/schema, semantic-token legend, local Markdown links, shell syntax, generated README equality, and `git diff --check` pass; final Verifier follow-up returned `GO`.
+
+- [ ] **H-INDEXING-UNOPENED-BLADE-DISK-SCAN-2026-07-22** Exclude unopened Blade templates from ordinary PHP workspace indexing.
+  - Found: 2026-07-22 during the documentation/code reconciliation audit; recursive collection accepts every `.php` suffix and the background parser does not classify `*.blade.php` before extracting raw PHP symbols/references.
+  - Scope: make initial/cache/background indexing use the same Blade classification as open/template-aware reindex paths, remove legacy raw Blade cache entries safely, and preserve ordinary `.php` indexing without project-specific exclusions.
+  - Validation target: cold and warm workspace-index regressions prove unopened Blade files never enter PHP symbols/references while ordinary PHP files still do; open/rename/reindex template races remain green.

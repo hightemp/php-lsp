@@ -7,11 +7,10 @@
 [![GitHub Release](https://img.shields.io/github/v/release/hightemp/php-lsp?label=github%20release)](https://github.com/hightemp/php-lsp/releases)
 [![Release Downloads](https://img.shields.io/github/downloads/hightemp/php-lsp/total.svg?label=release%20downloads&logo=github)](https://github.com/hightemp/php-lsp/releases)
 [![VS Marketplace Version](https://badgen.net/vs-marketplace/v/hightemp.ht-php-lsp?label=marketplace)](https://marketplace.visualstudio.com/items?itemName=hightemp.ht-php-lsp)
-[![VS Marketplace Downloads](https://img.shields.io/badge/marketplace%20downloads-5-007ACC?logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=hightemp.ht-php-lsp)
-[![VS Marketplace Installs](https://img.shields.io/badge/installs-1-007ACC?logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=hightemp.ht-php-lsp)
-[![VS Marketplace Rating](https://img.shields.io/badge/rating-no%20ratings-lightgrey?logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=hightemp.ht-php-lsp)
+[![VS Marketplace Downloads](https://img.shields.io/visual-studio-marketplace/d/hightemp.ht-php-lsp?label=marketplace%20downloads)](https://marketplace.visualstudio.com/items?itemName=hightemp.ht-php-lsp)
+[![VS Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/hightemp.ht-php-lsp?label=installs)](https://marketplace.visualstudio.com/items?itemName=hightemp.ht-php-lsp)
+[![VS Marketplace Rating](https://img.shields.io/visual-studio-marketplace/r/hightemp.ht-php-lsp?label=rating)](https://marketplace.visualstudio.com/items?itemName=hightemp.ht-php-lsp)
 [![License](https://img.shields.io/github/license/hightemp/php-lsp)](LICENSE)
-![](https://asdertasd.site/counter/php-lsp)
 
 Rust PHP Language Server (LSP 3.17) with a VS Code extension.
 
@@ -28,7 +27,11 @@ phpstorm-stubs support.
 
 - Syntax diagnostics with incremental tree-sitter parsing.
 - Semantic diagnostics for unknown classes, functions, imports, members, and
-  duplicate workspace symbols.
+  duplicate top-level or class-member declarations.
+- PHP-compatible name resolution across bracketed and unbracketed namespace
+  sections, including mixed class/function/constant group imports,
+  namespace-relative qualified names, and symbol-kind-specific casing and
+  fallback rules.
 - Member diagnostics for visibility, static/instance misuse, missing methods,
   missing properties, and missing class constants.
 - Basic type compatibility checks for assignments, returns, arguments,
@@ -49,10 +52,9 @@ phpstorm-stubs support.
 - Framework-aware static providers for common Laravel string keys, Symfony
   Twig template names, and Symfony route names without booting the application.
 - Blade-like and Symfony/Twig template documents use virtual PHP plus source
-  maps for conservative hover, completion, definition, type definition,
-  implementation, inlay hints,
-  diagnostics, and semantic tokens in supported template expressions and
-  control blocks.
+  maps for conservative hover, completion, signature help, definition, type
+  definition, implementation, inlay hints, diagnostics, and semantic tokens in
+  supported template expressions and control blocks.
 - Override signature and PHP-version compatibility diagnostics.
 - Optional PHPStan and Psalm diagnostics through configured external commands.
 - Per-category diagnostic severity controls for unknown symbols, unused code,
@@ -76,8 +78,8 @@ phpstorm-stubs support.
 - Signature help for functions, methods, constructors, and active parameter
   tracking.
 - Inlay hints for argument labels, inferred PHPDoc parameter/return types,
-  useful inferred local variable types, and end-of-scope labels for methods and
-  large blocks.
+  useful inferred local variable types, and end-of-scope labels for functions,
+  methods, closures, and large type/control-flow scopes.
 - Semantic tokens with full, delta, and range requests.
 
 ### Navigation
@@ -89,8 +91,8 @@ phpstorm-stubs support.
 - Go to type definition for inferred variables, members, function returns, and
   indexed symbol types.
 - Go to implementation for interface/trait/base types and methods.
-- Find references through indexed per-file references and same-scope local
-  variable references.
+- Find references through indexed closed-file references, authoritative open
+  PHP snapshots, and same-scope local variable references.
 - Document highlight for local variables and non-local symbols.
 - Selection ranges based on the parsed AST.
 - Linked editing for namespace/use alias edits.
@@ -109,7 +111,8 @@ phpstorm-stubs support.
 ### Refactoring And Editing
 
 - Rename for classes, functions, methods, properties, constants, and local
-  variables.
+  variables. Top-level rename updates import targets while preserving explicit
+  aliases; destructive member edits require an exact or type-resolved receiver.
 - Prepare rename rejects unsupported or built-in targets before editing.
 - Quick fixes to import unresolved classes/functions, remove unused imports,
   apply diagnostic replacement metadata, and optionally map PHPStan/Psalm
@@ -174,7 +177,12 @@ phpstorm-stubs support.
 - Watched PHP file changes and LSP file-operation notifications.
 - Create/change/delete PHP file events reindex or remove symbols from the
   workspace index.
-- Rename file notifications move indexed file state from old URI to new URI.
+- Rename notifications remove old-URI state and reindex or reclassify PHP/Blade
+  destinations.
+- Open editor buffers remain authoritative over background cache, watcher, and
+  workspace-index results. Closing an ordinary PHP buffer rebuilds its index
+  entry from the saved on-disk file unless the document has already been
+  reopened.
 
 ## Known Limitations
 
@@ -189,9 +197,9 @@ phpstorm-stubs support.
   vendor metadata is cached in memory with an LRU for lazy vendor symbols. The
   primary large-workspace warm cache target is met; installed-vendor first-hit
   behavior remains a watch item.
-- `references`, `rename`, and reference-count code lenses use indexed
-  per-file references, but still iterate workspace reference sets and can be
-  expensive on very large repositories.
+- `references`, `rename`, and reference-count code lenses merge indexed
+  closed-file references with ordinary open PHP snapshots, but still iterate
+  workspace reference sets and can be expensive on very large repositories.
 - Workspace indexing parses files through a bounded CPU-aware task queue; the
   primary large-workspace indexing baseline is measured in
   `docs/production-baseline.md`.
@@ -224,8 +232,8 @@ phpstorm-stubs support.
   Twig semantics for filters, tests, `in`, functions, macros, ternaries, null
   coalescing, and dynamic/bracket attribute access remain unsupported, but safe
   subexpressions are source-mapped where possible for hover, completion,
-  definition, type definition, implementation, and inlay hints. Current
-  supported Twig cases include simple
+  signature help, definition, type definition, implementation, and inlay hints.
+  Current supported Twig cases include simple
   member/root variables inside otherwise unsupported expressions,
   type-preserving `slice`/`filter` foreach inference, getter-backed
   property-style labels, static template-path and route-key navigation, static
@@ -233,6 +241,11 @@ phpstorm-stubs support.
   items, Symfony form/app globals, PHPDoc/literal shape keys, and open-template
   context refresh after relevant PHP changes. See `docs/lsp-features.md` for
   the exact supported template surface.
+- The initial disk workspace scan currently treats an unopened `*.blade.php`
+  file as raw PHP because of its suffix. Opening or template-aware reindexing
+  removes that raw PHP index entry; virtual template state is never added to the
+  workspace index. Avoiding the initial raw entry is tracked as a follow-up
+  correctness fix.
 - Diagnostics are optimized for editor feedback: file changes publish fast
   in-process diagnostics, while full diagnostics and optional external analyzer
   runs are used on open/save and reconfiguration.
@@ -408,6 +421,9 @@ The extension contributes these VS Code commands:
 - If using the bundled binary, verify that your platform is one of
   `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, `win32-x64`, or
   `win32-arm64`.
+- The published `linux-x64` binary requires glibc 2.28 or newer and is smoke
+  tested on Ubuntu 20.04. Alpine/musl is not a release target; on an unsupported
+  libc, build a compatible binary and select it with `phpLsp.serverPath`.
 - If the bundled binary is absent and `phpLsp.serverPath` is empty, the client
   tries `php-lsp` from `PATH` and logs the selected source in the LSP output
   channel.
@@ -507,14 +523,14 @@ Available targets:
 | `make` / `make all` / `make package` | Full build: server + client + stubs → `.vsix` |
 | `make install` | Build and install `.vsix` into VS Code |
 | `make server` | Build a release Rust binary for the detected host platform and copy it to `client/bin/<platform>/` |
-| `make server-all` | Cross-compile server binaries for all configured targets |
-| `make package-all` | Universal `.vsix` with all configured platform binaries |
+| `make server-all` | Build all configured targets when their Rust targets, linkers, and platform SDKs are already provisioned |
+| `make package-all` | Build all configured targets, then package a local universal `.vsix` preflight; cross toolchains must be provisioned |
 | `make client` | `npm ci` + build extension JS |
 | `make stubs` | Init submodule + bundle phpstorm-stubs |
 | `make check-stubs` | Verify source and bundled phpstorm-stubs have enough PHP files and required core stubs |
 | `make check` | Stubs integrity, lint, and tests |
 | `make test` | Run Rust tests |
-| `make lint` | `cargo fmt --check`, `clippy`, `tsc --noEmit` |
+| `make lint` | Rust format/Clippy plus VS Code engine, client lifecycle, and TypeScript checks |
 | `make fmt` | Auto-format Rust code |
 | `make release` | Read `VERSION`, patch package/Cargo versions, commit, force-update the release tag, and push |
 | `make clean` | Remove all build artefacts |
@@ -523,8 +539,8 @@ Stubs submodule (`server/data/stubs`) is pulled automatically on first build if 
 `scripts/bundle-stubs.sh`, `make check-stubs`, CI, and release packaging fail
 if source or bundled stubs are missing, too small, or lack required core files.
 
-`make server-all` and `make package-all` use `scripts/build-server.sh --all`
-for these VS Code platform directories:
+`make server-all` and `make package-all` use plain Cargo through
+`scripts/build-server.sh --all` for these VS Code platform directories:
 
 - `linux-x64`
 - `linux-arm64`
@@ -533,19 +549,40 @@ for these VS Code platform directories:
 - `win32-x64`
 - `win32-arm64`
 
+These convenience targets do not install Rust targets, cross-linkers, or Apple
+and Windows SDKs, so they are only turnkey on a suitably provisioned build
+host. The GitHub release workflow's per-platform matrix is the canonical
+published build path.
+
 Published Linux binaries are built from the GNU targets
 (`*-unknown-linux-gnu`). The `linux-x64` release binary targets glibc 2.28 and
 is checked both for newer glibc symbol requirements and by execution on Ubuntu
 20.04 before packaging. Alpine/musl is not part of the universal VSIX release
 target set.
 
+The glibc guarantee applies to the `linux-x64` artifact produced by the
+release workflow, which uses `cargo-zigbuild` with target
+`x86_64-unknown-linux-gnu.2.28`. A normal host build from `make server` or
+`scripts/build-server.sh` uses the installed native toolchain and does not by
+itself establish that compatibility floor. Given a release-compatible binary,
+validate it locally with:
+
+```bash
+scripts/check-linux-abi.sh client/bin/linux-x64/php-lsp 2.28
+scripts/smoke-linux-x64-compat.sh client/bin/linux-x64/php-lsp 2.28
+```
+
+The second command requires Docker and executes the binary in Ubuntu 20.04.
+
 `make release` requires a clean working tree, reads the semver value from
 `VERSION`, updates `client/package.json`, `client/package-lock.json`,
 `server/Cargo.toml`, and `server/Cargo.lock`, commits those version changes
 when needed, creates or updates tag `v<VERSION>`, then pushes `main` and the
-tag to GitHub. Build the universal package with `make package-all` before
-publishing release artefacts. The GitHub release workflow also publishes the
-packaged extension to VS Marketplace using the `VSCE_PAT` repository secret.
+tag to GitHub. That tag starts the release workflow, which builds and validates
+the six binaries and the universal package. `make package-all` is an optional
+local preflight, not the publication path. The workflow also publishes the
+packaged extension to VS Marketplace when the `VSCE_PAT` repository secret is
+configured.
 
 ### Manual steps
 
@@ -577,9 +614,26 @@ npm run build
 make check-stubs
 
 # 3. Package VSIX
+mkdir -p target
 cd client
-npx @vscode/vsce package --no-dependencies
+npx @vscode/vsce package --no-dependencies --out ../target/php-lsp-host.vsix
+
+# 4. From the repository root, inspect a Linux-x64 host-only package
+cd ..
+PHP_LSP_VSIX_PLATFORMS=linux-x64 \
+  scripts/smoke-vsix.sh target/php-lsp-host.vsix
 ```
+
+For another host, replace `linux-x64` with the platform directory created under
+`client/bin/`. Packaged CLI execution is part of this smoke only for
+`linux-x64`.
+
+Without `PHP_LSP_VSIX_PLATFORMS`, `scripts/smoke-vsix.sh` validates the
+universal release contract and requires binaries for all six published
+platforms. The smoke also checks manifest/package-lock engine compatibility,
+Blade/Twig language configuration files, bundled stubs, Node-shimmed
+LanguageClient protocol activation/shutdown while reporting the declared VS
+Code floor, watcher disposal, and the packaged CLI.
 
 #### Cross-compilation
 
@@ -587,6 +641,10 @@ npx @vscode/vsce package --no-dependencies
 ./scripts/build-server.sh x86_64-unknown-linux-gnu # specific target
 ./scripts/build-server.sh --all                    # configured targets
 ```
+
+These commands require the selected Rust targets and cross toolchains to be
+installed. They do not reproduce the release workflow's Linux ABI guarantee by
+themselves.
 
 ## Project Structure
 

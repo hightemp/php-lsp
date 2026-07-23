@@ -69,3 +69,17 @@ scripts/examples/run-cli-analyze-large-workspace.sh /path/to/project
 
 Both scripts build `server/target/release/php-lsp` when the release binary is
 missing. Set `PHP_LSP_BIN` to test a different binary.
+
+## Binary And Package Smoke
+
+Exercise the packaged CLI surface against the default fixture with:
+
+```bash
+scripts/smoke-cli.sh client/bin/linux-x64/php-lsp
+```
+
+Pass a second argument to use another fixture directory. The script checks
+`--version`, help output, `init-config`, JSON reports and accepted exit-code
+handling for `analyze` and `fix --dry-run`; it does not establish Linux ABI
+compatibility. For a published Linux x64 candidate, pair it with the ABI and
+Ubuntu checks described in `docs/performance.md`.

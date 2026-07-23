@@ -98,6 +98,8 @@ version = "8.3"
 
 [diagnostics]
 mode = "basic-semantic"
+memberTypeNodeBudget = 512
+partialAnalysisDiagnostic = true
 
 [diagnostics.severity]
 unknownSymbols = "warning"
@@ -139,7 +141,7 @@ enabled = false
 | Section | Keys |
 |---|---|
 | `[php]` | `version` |
-| `[diagnostics]` | `mode` |
+| `[diagnostics]` | `mode`, `memberTypeNodeBudget`, `partialAnalysisDiagnostic` |
 | `[diagnostics.severity]` | `unknownSymbols`, `unused`, `duplicateSymbols`, `members`, `typeCompatibility`, `overrideSignatures`, `phpVersion` |
 | `[indexing]` | `composer`, `vendor`, `include`, `exclude`, `stubs` |
 | `[stubs]` | `path`, `extensions` |
@@ -147,6 +149,15 @@ enabled = false
 | `[phpstan]` | `enabled`, `command`, `timeoutMs`, `memory_limit` |
 | `[psalm]` | `enabled`, `command`, `timeoutMs` |
 | `[analyzerCodeActions]` | `enabled` |
+
+`diagnostics.memberTypeNodeBudget` limits the relevant syntax nodes inspected
+by the expensive member-access and type-compatibility categories. The default is
+`512`; `0` disables this cap. When the cap is reached,
+`diagnostics.partialAnalysisDiagnostic` controls whether php-lsp publishes the
+informational `partial-analysis` diagnostic in addition to logging the skipped
+categories. The deprecated `diagnostics.memberTypeBudget` spelling remains an
+accepted project-config alias for compatibility; new files should use
+`memberTypeNodeBudget`.
 
 ## Stubs
 

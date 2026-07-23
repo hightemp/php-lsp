@@ -2,7 +2,7 @@
 
 Зафиксированные решения, принятые перед началом разработки.
 
-Статус на 2026-05-25: этот файл остается ADR-журналом. Если решение было
+Статус на 2026-07-22: этот файл остается ADR-журналом. Если решение было
 расширено последующими production-readiness задачами, ниже добавлен блок
 `Текущий статус`.
 
@@ -22,7 +22,8 @@
 **Текущий статус:** Marketplace package published as `hightemp.ht-php-lsp`
 (`client/package.json` name `ht-php-lsp`, publisher `hightemp`). Settings prefix
 remains `phpLsp.*`; command IDs remain `phpLsp.restartServer`,
-`phpLsp.clearCacheAndRestart`, and `phpLsp.showStatus`.
+`phpLsp.clearCacheAndRestart`, `phpLsp.showStatus`, and
+`phpLsp.showServerVersion`.
 
 ---
 
@@ -56,12 +57,15 @@ badges and prerequisites use Rust 1.85+.
 - Обновлённые lsp-types 0.97+
 
 **Известное ограничение:** нотификации обрабатываются асинхронно (out-of-order).
-**Mitigation:** собственная очередь для didChange через mpsc channel с ordering по version.
+**Mitigation:** per-URI serialization и ordering по document generation/version.
 
-**Текущий статус:** didChange ordering is enforced by latest-version tracking,
-stale/duplicate version rejection, per-URI debounced diagnostics tasks, and
-version checks before publish. This supersedes the original mpsc-only mitigation
-shape while preserving the same ordering goal.
+**Текущий статус:** parser entry serves as the per-URI serialization boundary.
+Readers capture coherent parser/source/template/state inputs and build request
+snapshots; writers publish parser/template/version/index state under the entry
+guard. Generation plus version rejects stale changes, background indexing,
+diagnostics, and template refresh results. `didClose` restores saved PHP disk
+state under a token that is invalidated by reopen. This supersedes the original
+mpsc-only mitigation while preserving the same ordering goal.
 
 ---
 
@@ -280,10 +284,13 @@ roots.
 - Дисциплинирует: код всегда компилируется, тесты проходят
 - Минимальный overhead: один yml файл
 
-**Текущий статус:** CI runs Rust fmt/clippy/tests and client typecheck/build.
-Release workflow builds six platform binaries, packages a universal VSIX, runs
-VSIX smoke checks, creates a GitHub release, and publishes to VS Marketplace
-when `VSCE_PAT` is configured.
+**Текущий статус:** CI runs Rust fmt/clippy/tests plus client engine/lifecycle,
+typecheck, and build checks. The release workflow builds six platform binaries;
+Linux x64 uses Zig `gnu.2.28`, ABI inspection, and an Ubuntu 20.04 execution
+smoke. The universal VSIX smoke verifies manifest/lock engine compatibility,
+language configurations, simulated minimum-version LanguageClient
+activation/shutdown, watcher disposal, packaged CLI, and extracted Linux binary
+compatibility before release/optional Marketplace publication.
 
 ---
 
@@ -350,7 +357,7 @@ external formatter integration through `auto`, `pint`, `php-cs-fixer`,
 | 1 | Динамическая типизация PHP | Высокая | Среднее | Best-effort: PHPDoc + type hints. Не пытаться быть PHPStan |
 | 2 | Magic methods (__get, __call) | Высокая | Среднее | PHPDoc @property, @method. Laravel: пользователь подключает ide-helper stubs |
 | 3 | CST ≠ AST (tree-sitter) | Средняя | Среднее | Явный модуль symbols.rs для маппинга. Одноразовая работа |
-| 4 | tower-lsp notification ordering | Средняя | Высокое | mpsc channel + ordering по document version |
+| 4 | tower-lsp notification ordering | Средняя | Высокое | Parser-entry serialization, generation/version ordering, atomic request snapshots, guarded publication |
 | 5 | Память на крупных проектах | Средняя | Среднее | Lazy vendor indexing. Compact symbol representation |
 | 6 | PHPDoc parsing сложность | Средняя | Среднее | Поддержаны сложные PHPDoc type forms и virtual members; full analyzer-level templates remain external-analyzer territory |
 | 7 | phpstorm-stubs размер (~50MB) | Низкая | Низкое | Парсить при первом запуске, кэшировать (~5-10MB compact) |

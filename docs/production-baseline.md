@@ -1,8 +1,54 @@
 # Production Baseline
 
-Latest acceptance refresh: 2026-05-28
+Latest correctness/compatibility acceptance: 2026-07-21
+Latest large-workspace performance refresh: 2026-05-28
 Current project version: `0.7.0`
-Latest checked revision: `a7308f3` + working tree acceptance updates
+Latest checked revision: `7be9e21` + documentation working tree
+
+## Post-Audit Correctness And Compatibility Acceptance
+
+Date: 2026-07-21
+Git revision: `03f2dbe`
+Scope: closure of the 14-item post-audit milestone covering Linux/VS Code
+compatibility, PHP name resolution and ranges, atomic open/template/index
+state, saved-index restoration, and client lifecycle ownership.
+
+No large-workspace profile or latency samples were collected in this refresh.
+All performance tables below remain measurements from 2026-05-28 or their
+explicitly dated earlier baselines.
+
+Validation summary:
+
+| Check | Result |
+|---|---|
+| `make check` | pass |
+| Rust non-doc tests | pass, 777 tests |
+| Client production build / VSIX prepublish path | pass |
+| Linux x64 Zig `gnu.2.28` ABI inspection | pass, no required glibc symbol newer than 2.28 |
+| Pinned Ubuntu 20.04 execution smoke | pass |
+| VSIX manifest/lock engine and language-configuration checks | pass |
+| Node-shimmed LanguageClient activation/shutdown at declared `1.82.0` floor and watcher disposal | pass |
+| Packaged CLI and extracted Linux binary compatibility smoke | pass |
+
+Rust acceptance test breakdown:
+
+| Target | Tests |
+|---|---:|
+| `php-lsp-completion` | 50 |
+| `php-lsp-index` | 59 |
+| `php-lsp-parser` | 279 |
+| `php-lsp-server` library unit tests | 199 |
+| `php-lsp-server` binary unit tests | 2 |
+| `php-lsp-server` split e2e tests | 180 |
+| `php-lsp-types` | 8 |
+| **Total** | **777** |
+
+Release-candidate evidence captured during acceptance:
+
+| Artifact | Result |
+|---|---|
+| Fresh portable Linux x64 binary | 11,770,560 bytes; ABI `<= 2.28`; Ubuntu 20.04 pass |
+| Staged VSIX | 7,016,001 bytes; 551 entries; package/language-config/activation/CLI smoke pass |
 
 ## Initial Baseline
 
@@ -160,7 +206,7 @@ payloads, and no expected non-null definition misses. Completion label misses
 are reported for review but are not a failure condition for this broad corpus
 audit.
 
-## Build Artifacts
+## Initial Baseline Build Artifacts
 
 | Artifact | Command | Size |
 |----------|---------|------|
@@ -182,7 +228,9 @@ VSIX contents reported by `vsce`:
 ## Notes
 
 - Packaging output is intentionally written under `target/php-lsp-profile/` so release artifacts in `client/` are not overwritten during baseline collection.
-- The current baseline validates correctness and package size only. Production performance measurements for cold start, indexing throughput, memory RSS, stubs load time and request latency are tracked separately in `PR-002` and `PR-003`.
+- The initial baseline validated correctness and package size only. Later,
+  explicitly dated sections contain the production performance measurements;
+  the 2026-07-21 acceptance did not refresh them.
 
 ## Perf Harness Smoke Run
 

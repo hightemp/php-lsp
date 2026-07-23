@@ -24,15 +24,17 @@ Current tracked artifacts:
 The risk register in `docs/production-risk-register.md` explains which numbers
 are still production blockers.
 
-Latest large-workspace validation numbers are recorded in
+Latest large-workspace performance numbers are recorded in
 `docs/production-baseline.md` under "Production Validation Large Workspace Run".
 The latest intelligence milestone refresh is recorded there under
-"IE-045 Intelligence Milestone Acceptance Refresh".
+"IE-045 Intelligence Milestone Acceptance Refresh". The newer 2026-07-21
+post-audit correctness and compatibility acceptance added no performance
+samples, so it does not replace these measurements.
 
-## Latest Acceptance Snapshot
+## Latest Performance Acceptance Snapshot
 
-The latest acceptance refresh was captured on 2026-05-28 against the primary
-10k-file Symfony workspace.
+The latest performance acceptance refresh was captured on 2026-05-28 against
+the primary 10k-file Symfony workspace.
 
 | Area | Artifact | Result |
 |---|---|---|
@@ -131,22 +133,46 @@ Host package smoke:
 ```bash
 ./scripts/build-server.sh
 ./scripts/bundle-stubs.sh
+mkdir -p target/php-lsp-profile
 cd client
 npm ci
 npm run build
-npx @vscode/vsce package --no-dependencies
+npx @vscode/vsce package --no-dependencies \
+  --out ../target/php-lsp-profile/php-lsp-host.vsix
+cd ..
+PHP_LSP_VSIX_PLATFORMS=linux-x64 \
+  scripts/smoke-vsix.sh target/php-lsp-profile/php-lsp-host.vsix
 ```
+
+The final two lines are the Linux x64 host example. Substitute the platform
+directory produced under `client/bin/` on another host; packaged CLI execution
+inside this smoke is Linux-x64-only.
 
 Universal release package smoke is covered by the release workflow and
 `scripts/smoke-vsix.sh`. The smoke test checks:
 
 - `extension/package.json`
+- Manifest/package-lock VS Code engine compatibility.
 - Bundled `extension/out/extension.js`
+- Manifest-referenced Blade and Twig language configuration files.
 - README and license files.
 - Bundled stubs, including required core files and a minimum PHP stub-file
   count.
 - Platform binaries.
-- Extension module exports and an activation/deactivation load check.
+- Extension module exports, Node-shimmed LanguageClient protocol activation and
+  shutdown while reporting the declared VS Code floor, and watcher disposal.
+- Packaged `php-lsp --version`, `init-config`, `analyze`, and `fix` CLI behavior
+  for `linux-x64` host smoke.
+
+For a release-compatible Linux x64 artifact, also run:
+
+```bash
+scripts/check-linux-abi.sh client/bin/linux-x64/php-lsp 2.28
+scripts/smoke-linux-x64-compat.sh client/bin/linux-x64/php-lsp 2.28
+```
+
+The second command requires Docker and executes the binary on Ubuntu 20.04.
+Host-native Cargo output is not evidence for the release glibc floor.
 
 ## Cache Interpretation
 
@@ -216,8 +242,11 @@ For workflow/release changes:
 
 ```bash
 go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/ci.yml .github/workflows/release.yml
-bash -n scripts/build-server.sh scripts/bundle-stubs.sh scripts/check-stubs.sh scripts/profile-workspace.sh scripts/benchmark-lsp-latency.sh scripts/smoke-vsix.sh
+bash -n scripts/*.sh scripts/examples/*.sh
 scripts/check-stubs.sh --kind source server/data/stubs
 scripts/check-stubs.sh --kind bundled client/stubs
+scripts/smoke-cli.sh client/bin/linux-x64/php-lsp
+scripts/check-linux-abi.sh client/bin/linux-x64/php-lsp 2.28
+scripts/smoke-linux-x64-compat.sh client/bin/linux-x64/php-lsp 2.28
 git diff --check
 ```

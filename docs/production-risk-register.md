@@ -1,8 +1,9 @@
 # Production Risk Register
 
 Date: 2026-05-22
-Last updated: 2026-06-01
-Scope: production-readiness milestone, weeks 1-6.
+Last updated: 2026-07-22
+Scope: production readiness through the post-audit correctness and
+compatibility acceptance.
 
 This document tracks known production gaps after the baseline/profiling setup.
 The format is intentionally operational: every risk is tied to an owner task in
@@ -14,14 +15,14 @@ The format is intentionally operational: every risk is tied to an owner task in
 |----|------|----------|------------|--------|
 | R-001 | Disk cache maturity | High | `PR-010`, `PR-011`, `PV-002`, `IE-045`, `PHB-010`, `PHB-015` | Mitigated |
 | R-002 | `references`/`rename`/`codeLens` scale | High | `PR-022`, `PR-021`, `PV-003`, `PV-004`, `PV-011`, `IE-045` | Accepted limitation |
-| R-003 | Parallel indexing acceptance | High | `PR-013`, `PR-023`, `PV-002`, `IE-045` | Mitigated |
+| R-003 | Parallel indexing acceptance | High | `PR-013`, `PR-023`, `PV-002`, `IE-045`, `AUD-20260721-014` | Mitigated |
 | R-004 | Sync file IO in async/hot paths | High | `PR-023`, `PV-003`, `PV-004`, `IE-045` | Mitigated |
 | R-005 | Request cancellation coverage for heavy operations | High | `PR-021`, `PR-050`, `PV-004`, `IE-045` | Mitigated |
-| R-006 | `didChange` debounce/version ordering | High | `PR-020`, `PR-050` | Mitigated |
-| R-007 | Version-aware stubs and package integrity | Medium | `PR-030`, `PR-011`, `PHA-005` | Mitigated |
+| R-006 | Open-document ordering and atomicity | High | `PR-020`, `PR-050`, `AUD-20260721-003`, `AUD-20260721-013`, `AUD-20260721-014` | Mitigated |
+| R-007 | Runtime compatibility and package integrity | Medium | `PR-030`, `PR-011`, `PHA-005`, `AUD-20260721-001`, `AUD-20260721-002`, `AUD-20260721-012` | Mitigated |
 | R-008 | Lazy vendor indexing scale validation | Medium | `PR-012`, `PR-011`, `PV-014`, `PHB-017` | Partially mitigated |
 | R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041`, `IE-030`, `IE-031`, `PV-012`, `IE-045`, `PHB-003`, `PHB-016` | Accepted limitation |
-| R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052`, `IE-045`, `PHB-001`, `PHB-002`, `PHB-004`, `PHB-005`, `PHB-012`, `PHB-014` | Mitigated |
+| R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052`, `IE-045`, `PHB-001`, `PHB-002`, `PHB-004`, `PHB-005`, `PHB-012`, `PHB-014`, `AUD-20260721-004`-`012`, `H-INDEXING-UNOPENED-BLADE-DISK-SCAN-2026-07-22` | Mitigated with tracked limitation |
 
 ## Risks
 
@@ -80,7 +81,9 @@ Current evidence:
 
 - `PR-022` added `WorkspaceIndex::file_references` and `SymbolReference`.
 - Workspace indexing, lazy vendor/stub indexing, `didOpen`, `didChange`, and watched-file reindex now collect per-file references.
-- `references`, `rename`, and `codeLens` use indexed references; closed files are not reparsed for the common path.
+- `references`, `rename`, and `codeLens` use indexed references for closed
+  files and merge atomic snapshots from ordinary open PHP buffers; template
+  virtual PHP is excluded.
 - These requests still iterate indexed file reference sets and can remain O(indexed files) on very large workspaces.
 - `PV-003` latency benchmark on `large-symfony` shows warm open-file
   `references` p95/p99 at 72.527 ms / 74.123 ms and rename dry-run p95/p99 at
@@ -130,7 +133,9 @@ Current evidence:
 
 - `PR-013` replaced the sequential indexing loop with a bounded `JoinSet::spawn_blocking` task queue.
 - Parse concurrency uses a CPU-aware default capped at 8 workers.
-- `WorkspaceIndex::update_file()` is still centralized after each parse task completes, and a regression test covers concurrent index updates.
+- Each indexing run builds an isolated disk index. Parsed/cache results publish
+  to the live index only while the URI remains closed, authoritative open-buffer
+  state is overlaid afterward, and only disk-derived state is cached.
 - `PV-002` primary large workspace cold run indexed 10575 files / 72683 symbols
   with `filesPerSec=1503.84`, `symbolsPerSec=10336.04`, and peak RSS
   730,419,200 bytes.
@@ -224,7 +229,7 @@ Exit signal:
 - `IE-045` refreshed the cancellation result after the intelligence milestone.
 - New hover/completion requests remain responsive while obsolete work is cancelled or yields.
 
-### R-006: `didChange` debounce/version ordering
+### R-006: Open-document ordering and atomicity
 
 Current evidence:
 
@@ -232,23 +237,33 @@ Current evidence:
 - `didChange` ignores stale/duplicate document versions.
 - Fast diagnostics publish after a 180ms debounce and include the LSP document version.
 - Pending debounce tasks are cancelled on new edits, save, close, delete, and rename.
+- `AUD-20260721-003` and `AUD-20260721-014` added document-lifetime
+  generations, parser-entry serialization, coherent parser/source/template
+  request snapshots, guarded index publication, and template identity checks.
+- `AUD-20260721-013` removes the open PHP overlay on close and reparses the
+  saved disk source only while the close token remains current; reopen wins.
 
 Impact:
 
-- The stale diagnostics overwrite risk is covered by version checks.
+- Stale diagnostics, template refreshes, watcher parses, workspace indexing,
+  and close/reopen restoration are covered by generation/version ordering and
+  deterministic race tests.
 - Parser/index refresh still happens on each accepted edit; monitor burst CPU cost on large files.
 
 Mitigation:
 
 - `PR-020`: implemented debounce and version ordering.
 - `PR-050`: added 100 `didChange` events/sec stress case with non-ASCII text.
+- `AUD-20260721-003`, `013`, and `014`: implemented atomic open-document state,
+  guarded background publication, disk restoration, and race regressions.
 
 Exit signal:
 
 - Latest-version diagnostics only after a burst; covered by e2e tests.
-- No stale diagnostics overwrite newer diagnostics.
+- No stale parser/template/index/diagnostic result overwrites a newer open
+  generation or reopened URI.
 
-### R-007: Version-aware stubs and package integrity
+### R-007: Runtime compatibility and package integrity
 
 Current evidence:
 
@@ -260,6 +275,13 @@ Current evidence:
   release packaging, and packaged VSIX smoke tests.
 - Server startup now logs intentional stubs disablement separately from missing
   or uninitialized stubs paths.
+- `AUD-20260721-001` builds release Linux x64 through Zig `gnu.2.28`, rejects
+  newer glibc symbol requirements, and executes the artifact on Ubuntu 20.04.
+- `AUD-20260721-002` aligns the extension and language-client dependency on VS
+  Code `1.82.0` and checks the manifest/lock relationship plus simulated
+  minimum-version protocol activation/shutdown.
+- `AUD-20260721-012` packages and verifies both manifest-referenced Blade/Twig
+  language configuration files.
 
 Impact:
 
@@ -275,6 +297,8 @@ Mitigation:
 - `PHA-005`: added `scripts/check-stubs.sh`, `make check-stubs`,
   `bundle-stubs.sh` hard failures, workflow guards, VSIX smoke checks for core
   stub files/minimum count, and bundled-stubs symbol availability coverage.
+- `AUD-20260721-001`, `002`, and `012`: added ABI/Ubuntu, engine floor,
+  lifecycle/resource, language-configuration, and packaged CLI smoke coverage.
 
 Exit signal:
 
@@ -511,6 +535,15 @@ Current evidence:
 - `PHB-012` ranked namespace completions by prefix quality before truncation.
 - `PHB-014` clarified module ownership and generated-path boundaries in
   architecture documentation.
+- `AUD-20260721-004`-`009` aligned cursor-scoped namespace/import resolution,
+  mixed group-import kinds, PHP casing/fallback, duplicate-member diagnostics,
+  and safe import/member rename behavior.
+- `AUD-20260721-010`/`011` added UTF-16 folding endpoints and mapped template
+  type-definition/implementation; template signature help is covered by the
+  same atomic source-map request model.
+- The 2026-07-22 reconciliation found that the initial disk scan can still
+  parse an unopened `*.blade.php` as raw PHP. The follow-up task
+  `H-INDEXING-UNOPENED-BLADE-DISK-SCAN-2026-07-22` owns this residual mismatch.
 
 Impact:
 
@@ -532,6 +565,19 @@ Exit signal:
 
 - README and `docs/lsp-features.md` clearly mark supported/partial/unsupported behavior.
 - Capabilities align with behavior or known limitations explain the gap.
+
+## Post-Audit Correctness Closure (2026-07-21)
+
+The 14 post-audit tasks closed the following correctness and compatibility
+classes. This acceptance did not collect new large-workspace timings, so the
+R-002/R-008 watch items and the 2026-05-28 performance evidence remain current.
+
+| Area | Closed tasks | Evidence | Residual limitation |
+|---|---|---|---|
+| Release/runtime compatibility | `AUD-20260721-001`, `002`, `007`, `012` | glibc `<=2.28`, Ubuntu 20.04, VS Code `1.82.0` engine/lifecycle, watcher, language-config, VSIX and CLI smoke | Alpine/musl and local all-target cross builds are not published guarantees. |
+| PHP resolution and rename | `AUD-20260721-004`-`009` | parser/index and hover/definition/reference/rename regressions for scopes, casing, fallback, duplicates, and mixed imports | Full dynamic runtime resolution remains best-effort. |
+| Atomic document/index state | `AUD-20260721-003`, `013`, `014` | deterministic Twig/open/index/watcher/rename/close-reopen races and saved-disk restoration | Initial unopened Blade disk classification is tracked separately. |
+| LSP positions and template mapping | `AUD-20260721-010`, `011` | non-ASCII folding plus Blade/Twig type-definition/implementation and atomic signature-help mapping | Full template-engine semantics remain out of scope. |
 
 ## LLM Audit Follow-Up Closure (2026-06-01)
 

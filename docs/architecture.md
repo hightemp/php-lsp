@@ -8,7 +8,7 @@ which paths affect latency.
 
 | Component | Path | Responsibility |
 |---|---|---|
-| VS Code client | `client/src/extension.ts` | Starts the bundled or configured server binary, forwards `phpLsp.*` settings, shows status UI, clears disk cache, and registers VS Code commands. |
+| VS Code client | `client/src/extension.ts`, `client/src/lifecycle.ts` | Resolves the bundled or configured server, reconciles serialized start/stop/restart state, forwards `phpLsp.*` settings, owns file watchers, shows status UI, clears disk cache, and registers VS Code commands. |
 | Server binary | `server/crates/php-lsp-server` | Implements LSP 3.17 over stdio with `tower-lsp-server`, owns request handlers and orchestration. |
 | Parser | `server/crates/php-lsp-parser` | Wraps tree-sitter PHP, incremental edits, symbol extraction, diagnostics helpers, references, semantic tokens, PHPDoc parsing, and type helpers. |
 | Index | `server/crates/php-lsp-index` | Stores global workspace symbols, Composer namespace maps, phpstorm-stubs, vendor metadata, and disk cache snapshots. |
@@ -33,10 +33,16 @@ prefer the focused module for its feature instead of growing `server.rs`.
 ```text
 server/crates/php-lsp-server/src/
   server.rs                  # PhpLspBackend state, shared helpers, LanguageServer delegation
+  config.rs                  # effective VS Code/global/project configuration
+  analyze.rs                 # analyze CLI
+  fix.rs                     # fix CLI
+  framework.rs               # framework metadata and static heuristics
+  template.rs                # Blade/Twig preprocessing and source maps
   lsp/
     lifecycle.rs             # initialize/shutdown
     diagnostics.rs           # didOpen/didChange/didSave/didClose
     completion.rs            # completion, completion resolve, signature help
+    completion_helpers.rs    # virtual members, shapes, local variables, auto-import edits
     hover.rs                 # hover response assembly
     definition.rs            # definition/declaration/typeDefinition/implementation
     references.rs            # documentHighlight/references/codeLens
@@ -49,6 +55,9 @@ server/crates/php-lsp-server/src/
     document_symbols.rs      # document symbols, workspace symbols, selection/linked editing
     folding.rs               # folding ranges
     document_links.rs        # include/require document links
+    templates.rs             # virtual PHP snapshots and template position mapping
+    external_command.rs      # analyzer/formatter processes, timeouts, JSON parsing
+    conversions.rs           # conversions between the two LSP type crates
   indexing/
     workspace.rs             # initialized, workspace sync, watched files, file operations
     cache.rs                 # runtime cache config/hash inputs for php-lsp-index
@@ -91,6 +100,7 @@ tracked:
 - `client/out/`
 - `client/bin/`
 - `client/stubs/`
+- `client/README.md`
 - `client/*.vsix`
 - `target/` and `server/target/`
 
@@ -99,6 +109,12 @@ These paths are covered by the root `.gitignore`; `npm ci`,
 recreate them as needed. `server/data/stubs/` is different: it is the
 intentional phpstorm-stubs git submodule used as the source for bundled PHP
 symbols.
+
+`client/README.md` is an ignored, generated packaging mirror of the root
+`README.md`, not an independent documentation source. The
+`client/scripts/prepare-package-metadata.mjs` prepublish step refreshes it;
+edit the root README and regenerate the mirror rather than maintaining two
+copies by hand.
 
 ## E2E Test Layout
 
@@ -146,9 +162,11 @@ Tree-sitter and parser data use byte columns. LSP uses UTF-16 columns.
 | `SymbolInfo.range` | Tree-sitter byte columns. |
 | `SymbolInfo.selection_range` | Tree-sitter byte columns. |
 | `UseStatement.range` | Tree-sitter byte columns. |
-| `UseStatement.namespace` | Parser namespace scope for the import, used to avoid leaking imports across multi-namespace files. |
+| `NamespaceScope.range` | Tree-sitter byte columns. |
 | Parser semantic diagnostic ranges | Tree-sitter byte columns unless converted at the server boundary. |
 | `SymbolReference.range` | LSP UTF-16 columns. |
+| `SymbolReference.rename_range` | LSP UTF-16 columns when a rename needs a narrower import-target edit. |
+| `FoldingRange.start_character` / `end_character` | LSP UTF-16 columns after conversion at the server boundary. |
 | LSP request and response ranges | UTF-16 columns. |
 
 Outbound LSP handlers must convert byte-backed ranges with
@@ -174,10 +192,31 @@ indexed in dedicated `WorkspaceIndex` maps. Members remain part of
 `SymbolInfo.name` is stored without `$`, while property FQNs include `$` as in
 `Class::$prop`.
 
+Lookup keys follow PHP's symbol-kind rules rather than one blanket string
+comparison. Class-like symbols and functions are ASCII case-insensitive.
+Member owners and method names are ASCII case-insensitive, while properties,
+class constants, and enum cases keep exact member spelling. For global
+constants, namespace segments are normalized case-insensitively but the final
+constant identifier remains case-sensitive.
+
+`FileSymbols.namespace_scopes` records the source range of every bracketed or
+unbracketed namespace section. Each `UseStatement` carries its namespace and
+per-clause class/function/constant kind, so repeated aliases and mixed group
+imports are resolved against the section containing the cursor.
+
+A leading-backslash name remains fully qualified. An ordinary qualified name
+resolves from the active namespace and its first segment can expand an
+applicable class/namespace import. An explicit `namespace\...` name always
+prepends the active namespace and bypasses imports. Only eligible unqualified
+function or constant occurrences can try PHP's global fallback.
+
 `SymbolReference` entries are precomputed occurrences used by references,
 rename, and code lenses. Unresolved member references such as `::method` and
 `::$prop` may be useful for non-destructive discovery, but they are not precise
 enough for workspace rename edits without a resolved receiver type.
+Reference metadata also records whether PHP's unqualified global fallback is
+legal and, for import targets, the exact rename range and whether explicit
+alias spelling must be preserved.
 
 ## Data Flow
 
@@ -213,12 +252,19 @@ Lazy vendor indexing persists a parsed vendor file only after the requested
 class is actually present in the index, and later sessions can reload that file
 from the `vendor` cache namespace.
 
+For open documents, the parser entry is the per-URI synchronization boundary.
+Request paths that combine parser, source, template, version, and symbol state
+capture coherent tree/source/template/version inputs while holding that entry's
+read guard, then derive one `OpenDocumentSnapshot` from those clones. Writers
+publish companion state and the live index while holding the write entry, so a
+request cannot combine a new symbol index with an older editor buffer.
+
 ## Feature Ownership Map
 
 | Feature area | LSP/server entry point | Parser/completion layer | Index/cache layer | Primary tests |
 |---|---|---|---|---|
 | Hover | `src/lsp/hover.rs`, shared parameter/type Markdown helpers in `src/lsp/completion_helpers.rs`, call-site return inference reused from `src/lsp/inlay_hints.rs` | `resolve.rs`, PHPDoc helpers, indexed PHP 8 attribute extraction | `workspace.rs` symbol lookup plus `SymbolInfo` source ranges, attributes, class/method relations, templates, and bindings | `tests/e2e_hover.rs` |
-| Definition/declaration/type definition | `src/lsp/definition.rs` | `resolve.rs` | `workspace.rs`, lazy vendor lookup | `tests/e2e_definition.rs` |
+| Definition/declaration/type definition/implementation | `src/lsp/definition.rs` | `resolve.rs` | `workspace.rs`, lazy vendor lookup | `tests/e2e_definition.rs`, `tests/e2e_templates.rs` |
 | Completion | `src/lsp/completion.rs` | `php-lsp-completion/src/context.rs`, `provider.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + `tests/e2e_completion.rs` |
 | Signature help | `src/lsp/completion.rs` | call/member resolution helpers | `workspace.rs` signature lookup | `tests/e2e_completion.rs` |
 | References/code lens | `src/lsp/references.rs` | `references.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs` |
@@ -278,7 +324,8 @@ edited file and an indexed cross-file call follow the same type path.
 
 ## Startup Flow
 
-1. VS Code activates on PHP files or a workspace containing `composer.json`.
+1. VS Code 1.82 or newer activates the extension on PHP, Blade, or Twig files,
+   or when a workspace contains `composer.json`, `*.blade.php`, or `*.twig`.
 2. The client resolves the server binary:
    - `phpLsp.serverPath` if configured.
    - Otherwise `client/bin/<platform>/php-lsp` or `php-lsp.exe`.
@@ -320,26 +367,40 @@ to an effective root:
 - `phpLsp.excludePaths` removes relative or absolute paths from indexing and
   lazy vendor work.
 
-Workspace folder changes update the root list and remove symbols for removed
-roots. Configuration changes that affect indexing trigger a workspace reindex.
+Workspace folder changes update the root list and remove disk-derived symbols
+for removed roots while retaining authoritative open-buffer index state.
+Configuration changes that affect indexing trigger a workspace reindex.
 
 ## Open File Model
 
-Open documents are stored in `open_files` as `FileParser` instances. The server
-also tracks the latest LSP document version per URI.
+Each open URI has a `FileParser` entry that acts as its serialization boundary,
+plus state containing the LSP version and a monotonically increasing
+document-lifetime generation. A new generation distinguishes a reopened
+document even when the client resets its LSP version.
+
+Request paths that need combined state capture a cloned tree, source text,
+optional template/source-map state, and version/generation state under the
+parser-entry guard, then derive symbols and construct an
+`OpenDocumentSnapshot` from those coherent clones. Open/change/rename writers
+update the parser, template, state, and live index while holding the entry write
+guard. Index publication uses the same generation/version ordering, so cache
+loads, watcher work, or an older parse cannot overwrite a newer editor buffer.
 
 On `textDocument/didOpen`:
 
 - The file is parsed from the editor text.
 - Symbols and non-local references are extracted.
-- The global index is updated immediately unless the path is excluded.
+- Parser state and the global index are committed for the same document
+  generation unless the path is excluded or the document is a template.
 - Full diagnostics are published.
 
 On `textDocument/didChange`:
 
-- Incremental LSP edits are applied to the existing parser.
-- Document versions are checked so older changes are ignored.
-- Symbols and references are refreshed in the index.
+- Incremental LSP edits are applied to the existing parser entry.
+- Document generations and versions are checked so stale changes or background
+  results are ignored.
+- Symbols, references, template state, and open-buffer index state are
+  refreshed under the same parser-entry write guard.
 - Fast diagnostics are debounced and published only for the latest known version.
 - Any running external analyzer for that document is cancelled.
 
@@ -350,22 +411,27 @@ On `textDocument/didSave`:
 
 On `textDocument/didClose`:
 
-- Parser state, version state, semantic-token cache, pending diagnostics, and
+- The matching open generation, semantic-token cache, pending diagnostics, and
   analyzer runs for the URI are cleared.
+- For an ordinary PHP buffer, including one with discarded unsaved edits, the
+  open-buffer index entry is removed and the saved on-disk PHP source is
+  reparsed into the index asynchronously under a close token. The result is
+  discarded if the URI is reopened first.
 - Diagnostics are cleared in the client.
 
 ## Template Documents
 
-Blade-like and Twig documents are kept out of the normal PHP workspace index.
-When an open document is recognized as a template, the server stores a
-`TemplateDocument` next to the virtual `FileParser`:
+Recognized open Blade and Twig documents are kept out of the normal PHP
+workspace index. When an open document is recognized as a template, the server
+stores a `TemplateDocument` next to the virtual `FileParser`:
 
 - The original template source remains the LSP document source of truth.
 - A conservative preprocessor emits virtual PHP only for supported expression
   and control-block ranges.
 - A source map converts template positions to virtual PHP positions for hover,
-  completion, definition, inlay hints, diagnostics, and semantic tokens, then
-  maps returned ranges back to the template.
+  completion, signature help, definition, type definition, implementation,
+  inlay hints, diagnostics, and semantic tokens, then maps returned ranges back
+  to the template.
 - Template diagnostics run through a conservative allowlist after virtual PHP
   analysis. Only exact source-mapped expression diagnostics such as unknown
   methods/class constants, unknown classes, and type compatibility errors are
@@ -490,23 +556,34 @@ state are rebuilt from current open buffers plus the disk cache. The scanner
 does not boot Symfony, evaluate Twig extensions, run user code, or read the
 service container.
 
+Open template virtual-PHP snapshots are deliberately excluded from workspace
+symbol and reference scans. A rename that changes an open URI's PHP/Blade
+classification rebuilds the parser and template source map and publishes one
+atomic open-document state instead of exposing an intermediate PHP-only state.
+The initial disk workspace scan currently matches every `.php` suffix, so an
+unopened `*.blade.php` file can still be parsed as raw PHP until a
+template-aware open or reindex path removes that entry. This is a tracked
+limitation, not a source-map capability.
+
 ## Symbol Index
 
 `WorkspaceIndex` is a concurrent in-memory index:
 
 | Map | Key | Contents |
 |---|---|---|
-| `types` | FQN | Classes, interfaces, traits, enums. |
-| `functions` | FQN | Global functions. |
-| `constants` | FQN | Global constants. |
+| `types` | Normalized case-insensitive FQN | Classes, interfaces, traits, enums. |
+| `functions` | Normalized case-insensitive FQN | Global functions. |
+| `constants` | Case-insensitive namespace plus exact final identifier | Global constants. |
 | `file_symbols` | URI | Full symbol list for a file, including members and namespaces. |
 | `file_references` | URI | Precomputed non-local references found during parsing. |
 
 Top-level symbols are stored in dedicated maps for direct lookup. Members are
 stored in `file_symbols` and resolved through parent type lookup. Reference
 queries, rename, and reference-count code lenses use `file_references` for
-non-local symbols. They avoid reparsing closed files in the common path, but can
-still iterate many indexed reference sets for workspace-wide operations.
+closed files and merge reference extraction from atomic snapshots of ordinary
+open PHP documents. Template virtual PHP is excluded. These operations avoid
+reparsing closed files in the common path, but can still iterate many indexed
+reference sets for workspace-wide operations.
 
 ## Disk Cache Model
 
@@ -571,11 +648,14 @@ Flow:
 2. Resolve source directories from Composer maps, include paths, and workspace
    root.
 3. Collect PHP files on Tokio's blocking pool while honoring exclude paths.
-4. Load valid cached files into `WorkspaceIndex`.
+4. Load valid cached files into an isolated disk index for this run.
 5. Parse changed or missing files through a bounded `spawn_blocking` queue.
-6. Update the global index as parse tasks finish.
-7. Save a new workspace cache.
-8. Send `ready` status with counts, elapsed time, cache stats, parse
+6. Update the isolated disk index as parse tasks finish.
+7. Publish each closed-file result to the live index only if the URI is still
+   closed; overlay authoritative open-document snapshots after background work.
+8. Save only the disk-derived index to the workspace cache, excluding unsaved
+   editor state.
+9. Send `ready` status with counts, elapsed time, cache stats, parse
    concurrency, and cache path.
 
 Parse concurrency is CPU-aware and capped to avoid unbounded memory growth.
@@ -624,8 +704,10 @@ Diagnostics are controlled by `phpLsp.diagnostics.mode`:
 | `basic-semantic` | Syntax plus built-in semantic diagnostics. |
 
 Built-in semantic diagnostics include unknown symbols, unused imports/variables,
-duplicate symbols, member access problems, type compatibility, override
-signatures, and PHP-version checks. Per-category severity is controlled by
+duplicate top-level declarations and PHP-fatal duplicate methods, properties,
+class constants, or enum cases, member access problems, type compatibility,
+override signatures, and PHP-version checks. Duplicate-name comparisons follow
+the casing rules of each symbol kind. Per-category severity is controlled by
 `phpLsp.diagnostics.severity`.
 
 Member access and type-compatibility diagnostics share a latency budget because
@@ -643,13 +725,14 @@ diagnostics report only cross-file duplicates from the index. This avoids
 publishing the same declaration pair twice when the current file is already in
 the workspace index.
 
-Unknown function diagnostics use PHP's namespace fallback order. Explicitly
-qualified calls and `use function` aliases must resolve to the indexed symbol
-they name. Unqualified calls are checked against the current namespace first and
-then the global function table, which is where bundled PHP stubs expose built-in
-functions. PHP language constructs that can use call-like syntax, such as
-`empty(...)`, are not treated as resolvable functions. A diagnostic is emitted
-only when those fallbacks do not resolve.
+Unknown function diagnostics resolve names in the namespace/import section at
+the cursor. A leading-backslash name is fully qualified. An ordinary qualified
+name is relative to the active namespace and can expand a matching import;
+`namespace\...` always prepends the active namespace without import expansion.
+Only an unqualified call without a covering `use function` alias may fall back
+from the current namespace to the global function table, where bundled stubs
+expose built-ins. PHP language constructs that can use call-like syntax, such
+as `empty(...)`, are not treated as resolvable functions.
 
 Type compatibility diagnostics are intentionally approximate. They compare
 known literal/scalar values, class names, arrays, array/object shapes,
@@ -665,16 +748,17 @@ handled conservatively rather than as a full PHPStan/Psalm type lattice.
 
 There are two publishing paths:
 
-- Fast diagnostics after `didChange`: debounced, in-process, version-checked,
-  computed on Tokio's blocking pool, and intended for editor feedback.
+- Fast diagnostics after `didChange`: debounced and coalesced per URI,
+  in-process, snapshot-checked, computed on Tokio's blocking pool, and intended
+  for editor feedback.
 - Full diagnostics after open/save/reconfiguration: in-process diagnostics plus
   enabled PHPStan/Psalm external analyzer output.
 
 In-process diagnostic parsing and semantic checks are queued through
 `spawn_blocking` before publication, so expensive diagnostics do not occupy an
 async executor worker. The pipeline records tracing spans for queue wait,
-compute, and publish phases, then checks the document version before sending the
-result to the client.
+compute, and publish phases, then checks document generation, version, and
+template identity before sending the result to the client.
 
 External analyzer runs are per document. A newer document event cancels the
 previous analyzer run for that URI. Analyzer commands are timeout-bound and
@@ -683,7 +767,10 @@ expected to print JSON.
 ## Request Paths
 
 Low-latency requests such as hover, completion, signature help, definition, and
-semantic tokens operate primarily on the open file parser and the global index.
+semantic tokens operate on one atomic open-document snapshot plus the global
+index. Ordinary open PHP buffers are authoritative over disk-derived index
+state; template virtual PHP remains request-local and is not added to workspace
+reference scans.
 Request-time filesystem work is kept bounded and off the async executor:
 
 - Composer/config discovery used by LSP initialization/reindex runs on the
@@ -713,11 +800,12 @@ unopened files from disk through blocking/background IO. The current production
 target is to keep common open-file requests responsive while heavier operations
 are measured on large projects.
 
-The latest acceptance refresh was captured on 2026-05-28 after the IDE
-intelligence milestone. On the primary 10k-file Symfony workspace, warm
-open-file p95 for hover/completion/definition stayed under 7 ms, while heavy
-`references` and rename dry-run requests kept unrelated hover/completion below
-10 ms p95.
+The latest correctness and compatibility acceptance refresh was captured on
+2026-07-21. It did not collect new performance samples. The latest
+large-workspace performance refresh remains 2026-05-28: on the primary 10k-file
+Symfony workspace, warm open-file p95 for hover/completion/definition stayed
+under 7 ms, while heavy `references` and rename dry-run requests kept unrelated
+hover/completion below 10 ms p95.
 
 ## Public Entry Points
 
@@ -731,10 +819,11 @@ entry points are:
 | Lifecycle | `src/lsp/lifecycle.rs`, `src/indexing/workspace.rs`. |
 | Document sync | `src/lsp/diagnostics.rs`. |
 | Workspace sync | `src/indexing/workspace.rs`. |
-| Navigation | `src/lsp/hover.rs`, `src/lsp/definition.rs`. |
+| Navigation | `src/lsp/hover.rs`, `src/lsp/definition.rs`, `src/lsp/templates.rs`. |
 | Symbols and hierarchy | `src/lsp/document_symbols.rs`, `src/lsp/hierarchy.rs`. |
 | Editing | `src/lsp/rename.rs`, `src/lsp/code_action.rs`, `src/lsp/formatting.rs`. |
-| Intelligence | `src/lsp/completion.rs`, `src/lsp/inlay_hints.rs`, `src/lsp/semantic_tokens.rs`, `src/lsp/folding.rs`. |
+| Intelligence | `src/lsp/completion.rs`, `src/lsp/completion_helpers.rs`, `src/lsp/inlay_hints.rs`, `src/lsp/semantic_tokens.rs`, `src/lsp/folding.rs`. |
+| External tools and type bridges | `src/lsp/external_command.rs`, `src/lsp/conversions.rs`. |
 
 Non-LSP command-line entry points are `analyze::run_analyze_cli` and
 `fix::run_fix_cli`.
@@ -767,3 +856,6 @@ uses the language-client timeout path, which terminates the managed child
 process when the server does not exit cleanly. The LSP output channel records
 the lifecycle reason, selected binary source, binary path, platform target, stop
 reason, and cache directories removed by the cache-clearing command.
+Unexpected connection closures use a bounded restart window, and file watchers
+are owned by the corresponding language-client instance and disposed on every
+stop or failed start.
