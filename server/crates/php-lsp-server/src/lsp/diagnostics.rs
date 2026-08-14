@@ -30,6 +30,17 @@ fn build_phpstan_shell_command(config: &PhpStanConfig, file_path: &Path) -> Stri
     build_analyzer_shell_command(&template, file_path)
 }
 
+fn reversed_content_change_range(
+    params: &DidChangeTextDocumentParams,
+) -> Option<((u32, u32), (u32, u32))> {
+    params.content_changes.iter().find_map(|change| {
+        let range = change.range.as_ref()?;
+        let start = (range.start.line, range.start.character);
+        let end = (range.end.line, range.end.character);
+        (end < start).then_some((start, end))
+    })
+}
+
 fn phpstan_json_message_line(message: &serde_json::Value) -> Option<u32> {
     message
         .get("line")
@@ -335,6 +346,7 @@ impl PhpLspBackend {
                     let parser = self.open_template_document(&uri_str, text, template_kind, &[]);
                     self.document_versions
                         .insert(uri_str.clone(), document_state);
+                    self.documents_requiring_full_sync.remove(&uri_str);
                     self.index.remove_file(&uri_str);
                     entry.insert(parser);
                 }
@@ -351,6 +363,7 @@ impl PhpLspBackend {
                     let parser = self.open_template_document(&uri_str, text, template_kind, &[]);
                     self.document_versions
                         .insert(uri_str.clone(), document_state);
+                    self.documents_requiring_full_sync.remove(&uri_str);
                     self.index.remove_file(&uri_str);
                     entry.insert(parser);
                 }
@@ -452,6 +465,7 @@ impl PhpLspBackend {
                 self.template_documents.remove(&uri_str);
                 self.document_versions
                     .insert(uri_str.clone(), document_state);
+                self.documents_requiring_full_sync.remove(&uri_str);
                 entry.insert(parser);
                 indexed_symbol_count
             }
@@ -485,6 +499,7 @@ impl PhpLspBackend {
                 self.template_documents.remove(&uri_str);
                 self.document_versions
                     .insert(uri_str.clone(), document_state);
+                self.documents_requiring_full_sync.remove(&uri_str);
                 entry.insert(parser);
                 indexed_symbol_count
             }
@@ -557,6 +572,7 @@ impl PhpLspBackend {
         let version = params.text_document.version;
 
         tracing::debug!("didChange: {} version {}", uri_str, version);
+
         // The parser entry serializes all document writers. Accept the version
         // and apply incremental edits while it is held so v3 can only apply
         // ranges after v2 has committed its parser base.
@@ -572,6 +588,37 @@ impl PhpLspBackend {
                         uri_str,
                         version,
                         current.version
+                    );
+                    return;
+                }
+                let starts_with_full_text_change = params
+                    .content_changes
+                    .first()
+                    .is_some_and(|change| change.range.is_none());
+                let requires_full_sync = self
+                    .documents_requiring_full_sync
+                    .get(&uri_str)
+                    .is_some_and(|generation| *generation == current.generation);
+                if requires_full_sync && !starts_with_full_text_change {
+                    tracing::warn!(
+                        "Ignoring incremental didChange for {} version {} until a full-text change resynchronizes generation {}",
+                        uri_str,
+                        version,
+                        current.generation
+                    );
+                    return;
+                }
+                if let Some((start, end)) = reversed_content_change_range(&params) {
+                    self.documents_requiring_full_sync
+                        .insert(uri_str.clone(), current.generation);
+                    tracing::warn!(
+                        "Ignoring didChange with reversed range for {} version {}: {}:{} -> {}:{}; full-text synchronization required",
+                        uri_str,
+                        version,
+                        start.0,
+                        start.1,
+                        end.0,
+                        end.1
                     );
                     return;
                 }
@@ -600,13 +647,23 @@ impl PhpLspBackend {
                     let parser = entry.get_mut();
                     for change in &params.content_changes {
                         if let Some(range) = change.range {
-                            parser.apply_edit(
+                            if let Err(error) = parser.apply_edit(
                                 range.start.line,
                                 range.start.character,
                                 range.end.line,
                                 range.end.character,
                                 &change.text,
-                            );
+                            ) {
+                                self.documents_requiring_full_sync
+                                    .insert(uri_str.clone(), current.generation);
+                                tracing::error!(
+                                    "Rejected didChange for {} version {} after range preflight: {}",
+                                    uri_str,
+                                    version,
+                                    error
+                                );
+                                return;
+                            }
                         } else {
                             parser.parse_full(&change.text);
                         }
@@ -632,6 +689,9 @@ impl PhpLspBackend {
                 }
 
                 self.document_versions.insert(uri_str.clone(), accepted);
+                if starts_with_full_text_change {
+                    self.documents_requiring_full_sync.remove(&uri_str);
+                }
                 (accepted, template_change)
             }
             dashmap::mapref::entry::Entry::Vacant(_) => {
@@ -705,6 +765,7 @@ impl PhpLspBackend {
                 let restore_php_index =
                     is_php_uri && !self.template_documents.contains_key(&uri_str);
                 self.document_versions.remove(&uri_str);
+                self.documents_requiring_full_sync.remove(&uri_str);
                 self.template_documents.remove(&uri_str);
                 let restore_token = restore_php_index.then(|| {
                     let token = self
@@ -722,6 +783,7 @@ impl PhpLspBackend {
             }
             dashmap::mapref::entry::Entry::Vacant(_) => {
                 self.document_versions.remove(&uri_str);
+                self.documents_requiring_full_sync.remove(&uri_str);
                 self.template_documents.remove(&uri_str);
                 (None, false)
             }

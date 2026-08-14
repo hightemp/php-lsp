@@ -1,7 +1,29 @@
 //! FileParser: tree-sitter + ropey::Rope for incremental PHP parsing.
 
 use ropey::Rope;
+use std::fmt;
 use tree_sitter::{InputEdit, Parser, Point, Tree};
+
+/// An invalid incremental edit that could not be applied safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyEditError {
+    /// The LSP range ends before it starts.
+    ReversedRange { start: (u32, u32), end: (u32, u32) },
+}
+
+impl fmt::Display for ApplyEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReversedRange { start, end } => write!(
+                formatter,
+                "incremental edit range ends before it starts: {}:{} -> {}:{}",
+                start.0, start.1, end.0, end.1
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApplyEditError {}
 
 /// Manages parsing state for a single PHP file.
 pub struct FileParser {
@@ -44,7 +66,14 @@ impl FileParser {
         end_line: u32,
         end_char: u32,
         new_text: &str,
-    ) {
+    ) -> Result<(), ApplyEditError> {
+        if (end_line, end_char) < (start_line, start_char) {
+            return Err(ApplyEditError::ReversedRange {
+                start: (start_line, start_char),
+                end: (end_line, end_char),
+            });
+        }
+
         let start_line = start_line as usize;
         let start_char = start_char as usize;
         let end_line = end_line as usize;
@@ -53,6 +82,7 @@ impl FileParser {
         // Calculate byte offsets from rope (UTF-16 → byte).
         let start_byte = self.utf16_position_to_byte(start_line, start_char);
         let old_end_byte = self.utf16_position_to_byte(end_line, end_char);
+        debug_assert!(start_byte <= old_end_byte);
 
         // Tree-sitter Points need byte columns (byte offset from line start).
         let start_byte_col = start_byte - self.line_start_byte(start_line);
@@ -90,6 +120,7 @@ impl FileParser {
         // Reparse incrementally
         let source = self.rope.to_string();
         self.tree = self.parser.parse(source.as_bytes(), self.tree.as_ref());
+        Ok(())
     }
 
     /// Get the current tree-sitter Tree (if parsed successfully).
@@ -229,7 +260,9 @@ mod tests {
         parser.parse_full("<?php\nclass Foo {}\n");
 
         // Change "Foo" to "Bar" (line 1, chars 6-9)
-        parser.apply_edit(1, 6, 1, 9, "Bar");
+        parser
+            .apply_edit(1, 6, 1, 9, "Bar")
+            .expect("valid incremental edit");
 
         let source = parser.source();
         assert!(source.contains("class Bar {}"));
@@ -243,7 +276,9 @@ mod tests {
         let mut parser = FileParser::new();
         parser.parse_full("<?php\n$emoji = \"😀\"; $name = 1;\n");
 
-        parser.apply_edit(1, 15, 1, 20, "$value");
+        parser
+            .apply_edit(1, 15, 1, 20, "$value")
+            .expect("valid incremental edit after emoji");
 
         let source = parser.source();
         assert!(source.contains("$emoji = \"😀\"; $value = 1;"));
@@ -260,7 +295,9 @@ mod tests {
 
         let start = utf16_position_at(source, "$name");
         let end = utf16_position_after(source, "$name");
-        parser.apply_edit(start.0, start.1, end.0, end.1, "$value");
+        parser
+            .apply_edit(start.0, start.1, end.0, end.1, "$value")
+            .expect("valid incremental edit after complex emoji");
 
         let source = parser.source();
         assert!(source.contains("\"🇺🇸 👨‍👩‍👧‍👦 👍🏽 ❤️ e\u{0301}\"; $value = 1;"));
@@ -274,13 +311,131 @@ mod tests {
         let mut parser = FileParser::new();
         parser.parse_full("<?php\n$value = \"😀\";\n");
 
-        parser.apply_edit(1, 9, 1, 13, "\"ok\"");
+        parser
+            .apply_edit(1, 9, 1, 13, "\"ok\"")
+            .expect("valid emoji replacement");
 
         let source = parser.source();
         assert!(source.contains("$value = \"ok\";"));
 
         let tree = parser.tree().expect("Should have a tree after edit");
         assert!(!tree.root_node().has_error());
+    }
+
+    #[test]
+    fn test_incremental_collapsed_range_inserts_text() {
+        let mut parser = FileParser::new();
+        parser.parse_full("<?php\n$value = 1;\n");
+
+        parser
+            .apply_edit(1, 0, 1, 0, "$prefix = 0;\n")
+            .expect("collapsed incremental range should be a valid insertion");
+
+        assert_eq!(parser.source(), "<?php\n$prefix = 0;\n$value = 1;\n");
+        assert!(!parser
+            .tree()
+            .expect("Should have a tree after insertion")
+            .root_node()
+            .has_error());
+    }
+
+    #[test]
+    fn test_incremental_reversed_same_line_range_preserves_state() {
+        let mut parser = FileParser::new();
+        parser.parse_full("<?php\nclass Demo {}\n");
+        let original_source = parser.source();
+        let original_tree = parser
+            .tree()
+            .expect("Should have an original tree")
+            .root_node()
+            .to_sexp();
+
+        let error = parser
+            .apply_edit(1, 10, 1, 6, "Broken")
+            .expect_err("reversed same-line range should be rejected");
+
+        assert_eq!(
+            error,
+            ApplyEditError::ReversedRange {
+                start: (1, 10),
+                end: (1, 6),
+            }
+        );
+        assert_eq!(parser.source(), original_source);
+        assert_eq!(
+            parser
+                .tree()
+                .expect("Tree should remain available")
+                .root_node()
+                .to_sexp(),
+            original_tree
+        );
+    }
+
+    #[test]
+    fn test_incremental_reversed_cross_line_range_preserves_state() {
+        let mut parser = FileParser::new();
+        parser.parse_full("<?php\nclass First {}\nclass Second {}\n");
+        let original_source = parser.source();
+        let original_tree = parser
+            .tree()
+            .expect("Should have an original tree")
+            .root_node()
+            .to_sexp();
+
+        let error = parser
+            .apply_edit(2, 5, 1, 5, "Broken")
+            .expect_err("reversed cross-line range should be rejected");
+
+        assert_eq!(
+            error,
+            ApplyEditError::ReversedRange {
+                start: (2, 5),
+                end: (1, 5),
+            }
+        );
+        assert_eq!(parser.source(), original_source);
+        assert_eq!(
+            parser
+                .tree()
+                .expect("Tree should remain available")
+                .root_node()
+                .to_sexp(),
+            original_tree
+        );
+    }
+
+    #[test]
+    fn test_incremental_reversed_utf16_range_preserves_multibyte_text() {
+        let mut parser = FileParser::new();
+        let original_source = "<?php\n$emoji = \"😀\"; $name = 1;\n";
+        parser.parse_full(original_source);
+        let original_tree = parser
+            .tree()
+            .expect("Should have an original tree")
+            .root_node()
+            .to_sexp();
+
+        let error = parser
+            .apply_edit(1, 20, 1, 10, "$broken")
+            .expect_err("reversed UTF-16 range should be rejected");
+
+        assert_eq!(
+            error,
+            ApplyEditError::ReversedRange {
+                start: (1, 20),
+                end: (1, 10),
+            }
+        );
+        assert_eq!(parser.source(), original_source);
+        assert_eq!(
+            parser
+                .tree()
+                .expect("Tree should remain available")
+                .root_node()
+                .to_sexp(),
+            original_tree
+        );
     }
 
     #[test]

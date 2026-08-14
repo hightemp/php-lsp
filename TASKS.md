@@ -5754,3 +5754,10 @@ change.
   - Validation target: план отличает валидный collapsed range от reversed range, не предлагает частично согласованный `InputEdit`; `git diff --check` проходит.
   - Implemented: под H-1 добавлен план с parser-level `Result`, атомарным preflight всех `contentChanges`, сохранением согласованного snapshot при отказе и исправленным набором инвариантов `InputEdit`.
   - Validation: plan проверен против текущего `lsp_did_change` call path; перечислены parser unit и LSP e2e regressions; `git diff --check` и whitespace-проверка untracked отчёта прошли.
+
+- [x] **H-PARSER-REVERSED-LSP-RANGE-2026-08-14** Prevent `apply_edit` panic on reversed LSP ranges. *(done 2026-08-14)*
+  - Started: 2026-08-14; validate all incremental `didChange` ranges before mutation and add a parser-level error so reversed ranges cannot corrupt or crash rope/tree-sitter state.
+  - Scope: preserve valid collapsed insertions; reject an entire invalid notification before parser, template, version, or index mutation; log enough URI/version/range context for diagnosis without project-specific behavior.
+  - Validation target: parser unit regressions for collapsed, same-line, cross-line, and UTF-16 reversed ranges; LSP e2e proves invalid `didChange` keeps the prior snapshot and a later full-text change recovers; focused tests, fmt, Clippy, `git diff --check`, and Verifier GO.
+  - Implemented: `FileParser::apply_edit` returns a typed error before mutation for reversed ranges; `didChange` preflights the whole notification, preserves the last consistent snapshot, requires a generation-aware full-text resync, and carries/clears that state across open, close, delete, and rename lifecycles.
+  - Validation: 283 parser tests, 11 diagnostics E2E, 7 indexing E2E, focused atomic rename/unit regressions, `cargo fmt --all --check`, parser/server Clippy with `-D warnings`, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO after three review passes.

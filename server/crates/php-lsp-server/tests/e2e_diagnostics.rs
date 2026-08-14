@@ -629,6 +629,233 @@ async fn test_did_change_debounces_diagnostics_and_ignores_stale_versions() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_reversed_did_change_preserves_snapshot_and_full_change_recovers() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let old_uri = "file:///test/ReversedDidChange.php";
+    let new_uri = "file:///test/RenamedReversedDidChange.php";
+    let original_code = "<?php\nclass Before {}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(old_uri, original_code))
+        .await
+        .unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::build("textDocument/didChange")
+                .params(json!({
+                    "textDocument": {
+                        "uri": old_uri,
+                        "version": 2
+                    },
+                    "contentChanges": [
+                        {
+                            "range": {
+                                "start": { "line": 1, "character": 6 },
+                                "end": { "line": 1, "character": 12 }
+                            },
+                            "text": "Mutated"
+                        },
+                        {
+                            "range": {
+                                "start": { "line": 1, "character": 13 },
+                                "end": { "line": 1, "character": 6 }
+                            },
+                            "text": "Broken"
+                        }
+                    ]
+                }))
+                .finish(),
+        )
+        .await
+        .unwrap();
+
+    let document_symbols = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(document_symbol_request(2, old_uri))
+            .await
+            .unwrap(),
+    );
+    let document_symbol_names = document_symbols
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|symbol| symbol.get("name").and_then(|name| name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        document_symbol_names,
+        vec!["Before"],
+        "reversed didChange must preserve the open parser snapshot"
+    );
+
+    let indexed_before = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(workspace_symbol_request(3, "Before"))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        workspace_symbol_names(&indexed_before)
+            .iter()
+            .any(|name| name == "Before"),
+        "reversed didChange must preserve the previous workspace index snapshot"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_rename_files_notification(vec![(old_uri, new_uri)]))
+        .await
+        .unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(
+            Request::build("textDocument/didChange")
+                .params(json!({
+                    "textDocument": {
+                        "uri": new_uri,
+                        "version": 3
+                    },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 1, "character": 6 },
+                            "end": { "line": 1, "character": 12 }
+                        },
+                        "text": "Wrong"
+                    }]
+                }))
+                .finish(),
+        )
+        .await
+        .unwrap();
+
+    let symbols_after_incremental = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(document_symbol_request(4, new_uri))
+            .await
+            .unwrap(),
+    );
+    let names_after_incremental = symbols_after_incremental
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|symbol| symbol.get("name").and_then(|name| name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names_after_incremental,
+        vec!["Before"],
+        "incremental changes must remain blocked until a full-text synchronization"
+    );
+
+    let index_after_incremental = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(workspace_symbol_request(5, "Before"))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        workspace_symbol_uris(&index_after_incremental)
+            .iter()
+            .any(|uri| uri == new_uri),
+        "blocked incremental changes must preserve the renamed workspace index snapshot"
+    );
+
+    let recovered_code = "<?php\nclass After {}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(new_uri, 4, recovered_code))
+        .await
+        .unwrap();
+
+    let recovered_symbols = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(document_symbol_request(6, new_uri))
+            .await
+            .unwrap(),
+    );
+    let recovered_symbol_names = recovered_symbols
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|symbol| symbol.get("name").and_then(|name| name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovered_symbol_names,
+        vec!["After"],
+        "a later full-text didChange should recover parser synchronization"
+    );
+
+    let indexed_after = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(workspace_symbol_request(7, "After"))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        workspace_symbol_names(&indexed_after)
+            .iter()
+            .any(|name| name == "After"),
+        "a later full-text didChange should replace the workspace index snapshot"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_concurrent_did_open_and_dependent_incremental_change_publish_latest_text() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();

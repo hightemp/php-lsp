@@ -8,12 +8,14 @@ struct RenamedOpenDocument {
     parser: FileParser,
     template: Option<TemplateDocument>,
     state: OpenDocumentState,
+    requires_full_sync: bool,
 }
 
 struct RenamedOpenDocumentCommitContext<'a> {
     open_files: &'a DashMap<String, FileParser>,
     template_documents: &'a DashMap<String, TemplateDocument>,
     document_versions: &'a DashMap<String, OpenDocumentState>,
+    documents_requiring_full_sync: &'a DashMap<String, u64>,
     closed_document_reload_tokens: &'a DashMap<String, u64>,
     uri_str: &'a str,
 }
@@ -44,6 +46,12 @@ where
     }
     ctx.document_versions
         .insert(ctx.uri_str.to_string(), document.state);
+    if document.requires_full_sync {
+        ctx.documents_requiring_full_sync
+            .insert(ctx.uri_str.to_string(), document.state.generation);
+    } else {
+        ctx.documents_requiring_full_sync.remove(ctx.uri_str);
+    }
     ctx.closed_document_reload_tokens.remove(ctx.uri_str);
     before_parser_publish();
 
@@ -959,6 +967,7 @@ mod tests {
         let open_files = Arc::new(DashMap::new());
         let template_documents = Arc::new(DashMap::new());
         let document_versions = Arc::new(DashMap::new());
+        let documents_requiring_full_sync = Arc::new(DashMap::new());
         let reload_tokens = Arc::new(DashMap::new());
         reload_tokens.insert(uri.to_string(), 17);
 
@@ -973,6 +982,7 @@ mod tests {
         let writer_open_files = Arc::clone(&open_files);
         let writer_templates = Arc::clone(&template_documents);
         let writer_versions = Arc::clone(&document_versions);
+        let writer_full_sync = Arc::clone(&documents_requiring_full_sync);
         let writer_reload_tokens = Arc::clone(&reload_tokens);
         let (staged_tx, staged_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -982,6 +992,7 @@ mod tests {
                     open_files: &writer_open_files,
                     template_documents: &writer_templates,
                     document_versions: &writer_versions,
+                    documents_requiring_full_sync: &writer_full_sync,
                     closed_document_reload_tokens: &writer_reload_tokens,
                     uri_str: uri,
                 },
@@ -989,6 +1000,7 @@ mod tests {
                     parser,
                     template: Some(template),
                     state,
+                    requires_full_sync: true,
                 },
                 || {
                     staged_tx.send(()).expect("report staged rename");
@@ -1040,6 +1052,12 @@ mod tests {
         assert!(source.contains("$renamed"));
         assert_eq!(original_source.as_deref(), Some("{{ $renamed }}"));
         assert_eq!(actual_state, Some(state));
+        assert_eq!(
+            documents_requiring_full_sync
+                .get(uri)
+                .map(|generation| *generation),
+            Some(state.generation)
+        );
         assert!(!reload_tokens.contains_key(uri));
     }
 
@@ -2709,11 +2727,13 @@ impl PhpLspBackend {
         match self.open_files.entry(uri_str.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 self.document_versions.remove(&uri_str);
+                self.documents_requiring_full_sync.remove(&uri_str);
                 self.template_documents.remove(&uri_str);
                 entry.remove();
             }
             dashmap::mapref::entry::Entry::Vacant(_) => {
                 self.document_versions.remove(&uri_str);
+                self.documents_requiring_full_sync.remove(&uri_str);
                 self.template_documents.remove(&uri_str);
             }
         }
@@ -2738,7 +2758,7 @@ impl PhpLspBackend {
         }
 
         let old_uri_str = old_uri.as_str().to_string();
-        let (moved_parser, moved_template, moved_version) =
+        let (moved_parser, moved_template, moved_version, moved_full_sync_generation) =
             match self.open_files.entry(old_uri_str.clone()) {
                 dashmap::mapref::entry::Entry::Occupied(entry) => {
                     let version = self
@@ -2749,7 +2769,16 @@ impl PhpLspBackend {
                         .template_documents
                         .remove(&old_uri_str)
                         .map(|(_, template)| template);
-                    (Some(entry.remove()), template, version)
+                    let full_sync_generation = self
+                        .documents_requiring_full_sync
+                        .remove(&old_uri_str)
+                        .map(|(_, generation)| generation);
+                    (
+                        Some(entry.remove()),
+                        template,
+                        version,
+                        full_sync_generation,
+                    )
                 }
                 dashmap::mapref::entry::Entry::Vacant(_) => {
                     let version = self
@@ -2760,7 +2789,11 @@ impl PhpLspBackend {
                         .template_documents
                         .remove(&old_uri_str)
                         .map(|(_, template)| template);
-                    (None, template, version)
+                    let full_sync_generation = self
+                        .documents_requiring_full_sync
+                        .remove(&old_uri_str)
+                        .map(|(_, generation)| generation);
+                    (None, template, version, full_sync_generation)
                 }
             };
         self.cancel_debounced_diagnostics(&old_uri_str).await;
@@ -2802,6 +2835,7 @@ impl PhpLspBackend {
             );
             self.next_document_state(0)
         });
+        let requires_full_sync = moved_full_sync_generation == Some(state.generation);
 
         let destination_is_template = is_blade_template_uri(&new_uri_str);
         let template = if destination_is_template {
@@ -2839,6 +2873,7 @@ impl PhpLspBackend {
                 open_files: &self.open_files,
                 template_documents: &self.template_documents,
                 document_versions: &self.document_versions,
+                documents_requiring_full_sync: &self.documents_requiring_full_sync,
                 closed_document_reload_tokens: &self.closed_document_reload_tokens,
                 uri_str: &new_uri_str,
             },
@@ -2846,6 +2881,7 @@ impl PhpLspBackend {
                 parser,
                 template,
                 state,
+                requires_full_sync,
             },
             || {
                 if let Some((file_symbols, references)) = indexed_file {

@@ -1629,6 +1629,8 @@ pub struct PhpLspBackend {
     template_documents: Arc<DashMap<String, TemplateDocument>>,
     /// Latest LSP version and server-side lifetime generation for each open document.
     document_versions: Arc<DashMap<String, OpenDocumentState>>,
+    /// Document generations that must receive a full-text change before ranged edits resume.
+    documents_requiring_full_sync: Arc<DashMap<String, u64>>,
     /// Close-reload token for restoring the on-disk index after discarding unsaved edits.
     closed_document_reload_tokens: Arc<DashMap<String, u64>>,
     /// Monotonic source for document lifetime generations; LSP versions may reset on reopen.
@@ -1722,6 +1724,7 @@ impl PhpLspBackend {
             open_files,
             template_documents,
             document_versions,
+            documents_requiring_full_sync: Arc::new(DashMap::new()),
             closed_document_reload_tokens: Arc::new(DashMap::new()),
             next_document_generation: AtomicU64::new(1),
             diagnostic_debounce_tasks: Arc::new(Mutex::new(HashMap::new())),
