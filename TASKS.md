@@ -5729,3 +5729,28 @@ change.
   - Found: 2026-07-22 during the documentation/code reconciliation audit; recursive collection accepts every `.php` suffix and the background parser does not classify `*.blade.php` before extracting raw PHP symbols/references.
   - Scope: make initial/cache/background indexing use the same Blade classification as open/template-aware reindex paths, remove legacy raw Blade cache entries safely, and preserve ordinary `.php` indexing without project-specific exclusions.
   - Validation target: cold and warm workspace-index regressions prove unopened Blade files never enter PHP symbols/references while ordinary PHP files still do; open/rename/reindex template races remain green.
+
+- [x] **AUDIT-2026-08-07** Изучить весь код проекта и найти все ошибки; написать отчёт в md. *(done 2026-08-07)*
+  - Started: 2026-08-07; полный аудит кодовой базы (Rust server + TS client), поиск багов, антипаттернов, нарушений AGENTS.md.
+  - Scope: запустить make check (cargo fmt/clippy/test, client lint/build), проинспектировать ключевые модули, собрать находки в отчёт.
+  - Validation target: отчёт md создан, найденные ошибки задокументированы с file:line ссылками.
+  - Implemented: создан `AUDIT-2026-08-07.md` с 22 находками (4 high, 10 medium, 8 low); каждая верифицирована в исходном коде. Запущены cargo fmt/clippy (чисто), client lint (чисто), cargo test --all (1 flaky e2e тест на race condition).
+
+- [x] **AUDIT-REVIEW-2026-08-14** Проверить и прокомментировать отчёт `AUDIT-2026-08-07.md` от имени Codex. *(done 2026-08-14)*
+  - Started: 2026-08-14; перепроверить каждую находку по текущему коду, отделить подтверждённые дефекты от спорных оценок и добавить в отчёт вывод Codex с рекомендуемыми приоритетами.
+  - Scope: статическая верификация и лёгкие точечные проверки без полного `cargo test`/сборки из-за ограниченной свободной памяти.
+  - Validation target: все пункты отчёта получают явный статус и обоснование; `git diff --check` проходит.
+  - Implemented: в отчёт добавлена независимая рецензия Codex по всем 23 фактически перечисленным пунктам с исправленной арифметикой, статусами, severity, уточнениями fix-стратегий и порядком работ.
+  - Validation: точечный `test_goto_definition_vendor_inherited_method` прошёл с `CARGO_BUILD_JOBS=1`; `git diff --check` и whitespace-проверка untracked отчёта прошли; тяжёлые полные проверки не запускались из-за ограниченной памяти.
+
+- [x] **AUDIT-REVIEW-INLINE-COMMENTS-2026-08-14** Разместить комментарии Codex непосредственно под каждым пунктом `AUDIT-2026-08-07.md`. *(done 2026-08-14)*
+  - Started: 2026-08-14; перенести локальные вердикты и обоснования из сводной таблицы под соответствующие H/M/L-находки, сохранив общую итоговую оценку и приоритеты.
+  - Validation target: все 23 пункта имеют расположенный рядом комментарий Codex; дублирующая таблица удалена; `git diff --check` проходит.
+  - Implemented: под `Fix` каждого из 23 пунктов добавлен локальный blockquote с вердиктом, скорректированной severity и обоснованием Codex; нижняя дублирующая таблица заменена коротким пояснением.
+  - Validation: количество H/M/L-пунктов и inline-комментариев совпадает (23/23); строки сводной таблицы отсутствуют; `git diff --check` и whitespace-проверка untracked отчёта прошли.
+
+- [x] **AUDIT-H1-FIX-PLAN-2026-08-14** Детализировать план исправления H-1 в `AUDIT-2026-08-07.md`. *(done 2026-08-14)*
+  - Started: 2026-08-14; описать безопасную обработку reversed LSP range без рассинхронизации rope/tree-sitter и перечислить необходимые regression-тесты.
+  - Validation target: план отличает валидный collapsed range от reversed range, не предлагает частично согласованный `InputEdit`; `git diff --check` проходит.
+  - Implemented: под H-1 добавлен план с parser-level `Result`, атомарным preflight всех `contentChanges`, сохранением согласованного snapshot при отказе и исправленным набором инвариантов `InputEdit`.
+  - Validation: plan проверен против текущего `lsp_did_change` call path; перечислены parser unit и LSP e2e regressions; `git diff --check` и whitespace-проверка untracked отчёта прошли.
