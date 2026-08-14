@@ -5774,3 +5774,17 @@ change.
   - Validation target: focused index regressions, cache reconstruction coverage, concurrency snapshot test, `cargo fmt --all --check`, `cargo clippy -p php-lsp-index --all-targets -- -D warnings`, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
   - Implemented: `get_direct_members` now performs one normalized parent lookup into immutable COW buckets sharing the primary `Arc<FileSymbols>` snapshot; update/remove serialize writers per URI and maintain only affected parent contributions without persistent `SymbolInfo` duplication.
   - Validation: 62 index tests, 50 completion tests, 21 completion E2E, 14 definition E2E, cache/update/remove/concurrency regressions, fmt, Clippy for index/completion/server with `-D warnings`, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO after the race fix and second review pass.
+
+- [x] **REFACTOR-INDEX-TEST-MODULES-2026-08-14** Move large inline index tests into dedicated child modules. *(done 2026-08-14)*
+  - Started: 2026-08-14; extract the `workspace.rs` and `cache.rs` test bodies without changing production behavior or test visibility.
+  - Scope: use flat `src/workspace_tests.rs` and `src/cache_tests.rs` private child-module files so tests retain access to implementation details; do not modify the audit report.
+  - Validation target: unchanged index test count and results, `cargo fmt --all --check`, index Clippy with `-D warnings`, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
+  - Implemented: moved the complete inline test bodies into private `workspace::tests` and `cache::tests` child files; production modules now keep only their `#[cfg(test)] mod tests;` declarations.
+  - Validation: all 62 index tests passed unchanged; index Clippy with `-D warnings`, `cargo fmt --all --check`, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO.
+
+- [x] **REFACTOR-WORKSPACE-FLAT-TEST-MODULES-2026-08-14** Extract inline Rust tests across the workspace into flat sibling files. *(done 2026-08-14)*
+  - Started: 2026-08-14; scan every Rust crate and replace each inline `#[cfg(test)] mod tests` with a flat `<module>_tests.rs` child module.
+  - Scope: completion, index, parser, server, and types crates; preserve module privacy and test names, leave integration/e2e suites and test-only shared helpers in place, and do not modify the audit report.
+  - Validation target: no inline `mod tests {` remains, crate test counts/results stay unchanged, workspace Clippy and fmt pass, `git diff --check` passes, and Verifier returns GO with `CARGO_BUILD_JOBS=1`.
+  - Implemented: extracted all 31 inline unit-test modules into flat sibling `*_tests.rs` files with explicit `#[path]`; preserved production suffixes from mid-file modules and raw/multiline fixture bytes, while retaining two shared test-only helper blocks in their production modules.
+  - Validation: types 8/8, parser 283/283, index 62/62, completion 50/50, server library 199/199, server binary 2/2, and all server E2E tests except the known flaky vendor-inherited-definition case passed; that case reproduced both pass and fail in isolated runs and is unaffected by `cfg(test)` extraction. Workspace Clippy with `-D warnings`, fmt, `git diff --check`, and the zero-inline-module structural check passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO.
