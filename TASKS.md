@@ -5761,3 +5761,16 @@ change.
   - Validation target: parser unit regressions for collapsed, same-line, cross-line, and UTF-16 reversed ranges; LSP e2e proves invalid `didChange` keeps the prior snapshot and a later full-text change recovers; focused tests, fmt, Clippy, `git diff --check`, and Verifier GO.
   - Implemented: `FileParser::apply_edit` returns a typed error before mutation for reversed ranges; `didChange` preflights the whole notification, preserves the last consistent snapshot, requires a generation-aware full-text resync, and carries/clears that state across open, close, delete, and rename lifecycles.
   - Validation: 283 parser tests, 11 diagnostics E2E, 7 indexing E2E, focused atomic rename/unit regressions, `cargo fmt --all --check`, parser/server Clippy with `-D warnings`, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO after three review passes.
+
+- [x] **AUDIT-H4-FIX-PLAN-2026-08-14** Детализировать план исправления H-4 в `AUDIT-2026-08-07.md`. *(done 2026-08-14)*
+  - Started: 2026-08-14; спроектировать direct-member index без workspace-wide scan и без постоянного дублирования тяжёлых `SymbolInfo`.
+  - Validation target: план покрывает update/remove/cache lifecycle, concurrent snapshot safety, PHP casing/inheritance semantics, memory overhead и regression-тесты; `git diff --check` проходит.
+  - Implemented: под H-4 добавлен план compact locator index с нормализованным parent FQN, file snapshot generations, COW buckets и точечной invalidation без полного hierarchy cache.
+  - Validation: Codegraph подтвердил два call path и cache rebuild через `update_file_with_references`; проверены update/remove, duplicate-parent, casing, inheritance и concurrent snapshot инварианты; `git diff --check` прошёл.
+
+- [x] **PERF-INDEX-DIRECT-MEMBERS-2026-08-14** Eliminate workspace-wide scans from direct member lookup. *(done 2026-08-14)*
+  - Started: 2026-08-14; add a compact generation-aware inverted index from normalized parent FQN to member locations.
+  - Scope: update/remove/cache lifecycle, duplicate parent declarations, PHP case semantics, inheritance/template substitutions, and concurrent file replacement without persistent `SymbolInfo` duplication.
+  - Validation target: focused index regressions, cache reconstruction coverage, concurrency snapshot test, `cargo fmt --all --check`, `cargo clippy -p php-lsp-index --all-targets -- -D warnings`, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
+  - Implemented: `get_direct_members` now performs one normalized parent lookup into immutable COW buckets sharing the primary `Arc<FileSymbols>` snapshot; update/remove serialize writers per URI and maintain only affected parent contributions without persistent `SymbolInfo` duplication.
+  - Validation: 62 index tests, 50 completion tests, 21 completion E2E, 14 definition E2E, cache/update/remove/concurrency regressions, fmt, Clippy for index/completion/server with `-D warnings`, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO after the race fix and second review pass.

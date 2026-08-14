@@ -7,11 +7,21 @@ use php_lsp_types::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 type TemplateSubstitutions = HashMap<String, TypeInfo>;
 const MAX_TYPE_ALIAS_EXPANSION_DEPTH: usize = 32;
+
+#[derive(Clone)]
+struct DirectMemberSource {
+    uri: Arc<str>,
+    file_symbols: Arc<FileSymbols>,
+    symbol_indices: Arc<[usize]>,
+}
 
 fn member_kind_matches(kind: PhpSymbolKind, expected_kinds: Option<&[PhpSymbolKind]>) -> bool {
     expected_kinds.is_none_or(|kinds| kinds.contains(&kind))
@@ -75,10 +85,19 @@ pub struct WorkspaceIndex {
     pub constants: DashMap<String, Arc<SymbolInfo>>,
 
     /// File URI → extracted symbols for that file
-    pub file_symbols: DashMap<String, FileSymbols>,
+    pub file_symbols: DashMap<String, Arc<FileSymbols>>,
 
     /// File URI → precomputed non-local symbol references for that file
     pub file_references: DashMap<String, Vec<SymbolReference>>,
+
+    /// ASCII-lowercased parent FQN → compact locations of its direct members.
+    direct_members_by_parent: DashMap<String, Arc<[DirectMemberSource]>>,
+
+    /// File URI → generation and per-URI write barrier for snapshot replacement.
+    file_update_generations: DashMap<String, u64>,
+
+    /// Monotonic source for file symbol snapshot generations.
+    next_file_symbol_generation: AtomicU64,
 }
 
 impl WorkspaceIndex {
@@ -90,6 +109,9 @@ impl WorkspaceIndex {
             constants: DashMap::new(),
             file_symbols: DashMap::new(),
             file_references: DashMap::new(),
+            direct_members_by_parent: DashMap::new(),
+            file_update_generations: DashMap::new(),
+            next_file_symbol_generation: AtomicU64::new(1),
         }
     }
 
@@ -105,45 +127,114 @@ impl WorkspaceIndex {
         file_symbols: FileSymbols,
         file_references: Vec<SymbolReference>,
     ) {
-        // Remove old symbols for this file
-        self.remove_file(uri);
+        self.update_file_with_references_with_hook(uri, file_symbols, file_references, || {});
+    }
 
-        // Add new symbols to global indices
-        for sym in &file_symbols.symbols {
-            let sym_arc = Arc::new(sym.clone());
+    fn update_file_with_references_with_hook<F>(
+        &self,
+        uri: &str,
+        file_symbols: FileSymbols,
+        file_references: Vec<SymbolReference>,
+        before_direct_member_publish: F,
+    ) where
+        F: FnOnce(),
+    {
+        let uri_key = uri.to_string();
+        // The mutable generation guard is the per-URI write barrier. Readers
+        // use immutable snapshots, while other writers cannot interleave a commit.
+        let mut generation_guard = self
+            .file_update_generations
+            .entry(uri_key.clone())
+            .or_insert(0);
+        let old_direct_member_parents = self.remove_file_snapshot(uri);
+
+        let generation = self
+            .next_file_symbol_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let mut direct_member_indices: HashMap<String, Vec<usize>> = HashMap::new();
+        let file_symbols = Arc::new(file_symbols);
+
+        // Add new symbols to global indices and collect compact direct-member locators.
+        for (symbol_index, sym) in file_symbols.symbols.iter().enumerate() {
+            if let Some(parent_fqn) = sym.parent_fqn.as_deref() {
+                direct_member_indices
+                    .entry(case_insensitive_fqn_key(parent_fqn))
+                    .or_default()
+                    .push(symbol_index);
+            }
             match sym.kind {
                 PhpSymbolKind::Class
                 | PhpSymbolKind::Interface
                 | PhpSymbolKind::Trait
                 | PhpSymbolKind::Enum => {
                     self.types
-                        .insert(case_insensitive_fqn_key(&sym.fqn), sym_arc);
+                        .insert(case_insensitive_fqn_key(&sym.fqn), Arc::new(sym.clone()));
                 }
                 PhpSymbolKind::Function => {
                     self.functions
-                        .insert(case_insensitive_fqn_key(&sym.fqn), sym_arc);
+                        .insert(case_insensitive_fqn_key(&sym.fqn), Arc::new(sym.clone()));
                 }
                 PhpSymbolKind::GlobalConstant => {
                     self.constants
-                        .insert(global_constant_fqn_key(&sym.fqn), sym_arc);
+                        .insert(global_constant_fqn_key(&sym.fqn), Arc::new(sym.clone()));
                 }
-                // Methods, properties, class constants belong to their parent type
-                // and are stored in file_symbols, queried via parent_fqn
+                // Members are stored through compact locators below.
                 _ => {}
             }
         }
 
-        // Store file symbols
-        self.file_symbols.insert(uri.to_string(), file_symbols);
-        self.file_references
-            .insert(uri.to_string(), file_references);
+        // Publish the file snapshot and its generation before making locators visible.
+        let member_uri: Arc<str> = Arc::from(uri);
+        self.file_symbols
+            .insert(uri_key.clone(), Arc::clone(&file_symbols));
+        self.file_references.insert(uri_key, file_references);
+        let new_direct_member_parents = direct_member_indices
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let removed_direct_member_parents = old_direct_member_parents
+            .difference(&new_direct_member_parents)
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.remove_direct_member_sources(uri, &removed_direct_member_parents);
+        before_direct_member_publish();
+        for (parent_key, symbol_indices) in direct_member_indices {
+            self.insert_direct_member_source(
+                parent_key,
+                DirectMemberSource {
+                    uri: Arc::clone(&member_uri),
+                    file_symbols: Arc::clone(&file_symbols),
+                    symbol_indices: Arc::from(symbol_indices),
+                },
+            );
+        }
+        *generation_guard = generation;
     }
 
     /// Remove all symbols from a file.
     pub fn remove_file(&self, uri: &str) {
+        match self.file_update_generations.entry(uri.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let direct_member_parents = self.remove_file_snapshot(uri);
+                self.remove_direct_member_sources(uri, &direct_member_parents);
+                entry.remove();
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let direct_member_parents = self.remove_file_snapshot(uri);
+                self.remove_direct_member_sources(uri, &direct_member_parents);
+                drop(entry);
+            }
+        }
+    }
+
+    fn remove_file_snapshot(&self, uri: &str) -> HashSet<String> {
         self.file_references.remove(uri);
+        let mut direct_member_parents = HashSet::new();
         if let Some((_, old_symbols)) = self.file_symbols.remove(uri) {
             for sym in &old_symbols.symbols {
+                if let Some(parent_fqn) = sym.parent_fqn.as_deref() {
+                    direct_member_parents.insert(case_insensitive_fqn_key(parent_fqn));
+                }
                 match sym.kind {
                     PhpSymbolKind::Class
                     | PhpSymbolKind::Interface
@@ -159,6 +250,46 @@ impl WorkspaceIndex {
                     }
                     _ => {}
                 }
+            }
+        }
+        direct_member_parents
+    }
+
+    fn insert_direct_member_source(&self, parent_key: String, source: DirectMemberSource) {
+        match self.direct_members_by_parent.entry(parent_key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let mut sources = entry
+                    .get()
+                    .iter()
+                    .filter(|existing| existing.uri.as_ref() != source.uri.as_ref())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                sources.push(source);
+                entry.insert(Arc::from(sources));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::from(vec![source]));
+            }
+        }
+    }
+
+    fn remove_direct_member_sources(&self, uri: &str, parent_keys: &HashSet<String>) {
+        for parent_key in parent_keys {
+            let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+                self.direct_members_by_parent.entry(parent_key.clone())
+            else {
+                continue;
+            };
+            let sources = entry
+                .get()
+                .iter()
+                .filter(|source| source.uri.as_ref() != uri)
+                .cloned()
+                .collect::<Vec<_>>();
+            if sources.is_empty() {
+                entry.remove();
+            } else if sources.len() != entry.get().len() {
+                entry.insert(Arc::from(sources));
             }
         }
     }
@@ -475,19 +606,43 @@ impl WorkspaceIndex {
 
     /// Get only the direct members of a type (no inheritance traversal).
     fn get_direct_members(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
-        let mut members = Vec::new();
-        for entry in self.file_symbols.iter() {
-            for sym in &entry.value().symbols {
-                if sym
-                    .parent_fqn
-                    .as_deref()
-                    .is_some_and(|parent| parent.eq_ignore_ascii_case(type_fqn))
-                {
-                    members.push(Arc::new(sym.clone()));
+        let parent_key = case_insensitive_fqn_key(type_fqn);
+        let Some(sources) = self
+            .direct_members_by_parent
+            .get(&parent_key)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            return Vec::new();
+        };
+        self.direct_members_from_sources(&parent_key, &sources)
+            .unwrap_or_default()
+    }
+
+    fn direct_members_from_sources(
+        &self,
+        parent_key: &str,
+        sources: &[DirectMemberSource],
+    ) -> Option<Vec<Arc<SymbolInfo>>> {
+        let capacity = sources
+            .iter()
+            .map(|source| source.symbol_indices.len())
+            .sum();
+        let mut members = Vec::with_capacity(capacity);
+        for source in sources {
+            for &symbol_index in source.symbol_indices.iter() {
+                let symbol = source.file_symbols.symbols.get(symbol_index)?;
+                let parent_matches = symbol.parent_fqn.as_deref().is_some_and(|parent_fqn| {
+                    parent_fqn
+                        .trim_start_matches('\\')
+                        .eq_ignore_ascii_case(parent_key)
+                });
+                if !parent_matches {
+                    return None;
                 }
+                members.push(Arc::new(symbol.clone()));
             }
         }
-        members
+        Some(members)
     }
 
     /// Recursively collect members including those from parent classes/interfaces.
@@ -1602,6 +1757,197 @@ mod tests {
         index.update_file("file:///test.php", sym_v2);
         assert!(index.resolve_fqn("Foo").is_none());
         assert!(index.resolve_fqn("Bar").is_some());
+    }
+
+    #[test]
+    fn direct_member_index_replaces_the_previous_file_generation() {
+        let index = WorkspaceIndex::new();
+        let uri = "file:///members.php";
+        index.update_file(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    make_class("Owner", "App\\Owner", uri),
+                    make_method("oldMember", "App\\Owner", uri),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert!(index.resolve_fqn("App\\Owner::oldMember").is_some());
+
+        index.update_file(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    make_class("Owner", "App\\Owner", uri),
+                    make_method("newMember", "App\\Owner", uri),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert!(index.resolve_fqn("App\\Owner::oldMember").is_none());
+        assert!(index.resolve_fqn("App\\Owner::newMember").is_some());
+        let sources = index
+            .direct_members_by_parent
+            .get(&case_insensitive_fqn_key("App\\Owner"))
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("direct-member bucket");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].uri.as_ref(), uri);
+        assert_eq!(sources[0].symbol_indices.as_ref(), &[1]);
+        let file_symbols = index.file_symbols.get(uri).expect("indexed file snapshot");
+        assert!(Arc::ptr_eq(file_symbols.value(), &sources[0].file_symbols));
+        assert!(index
+            .file_update_generations
+            .get(uri)
+            .is_some_and(|generation| *generation > 0));
+    }
+
+    #[test]
+    fn removing_file_preserves_direct_members_from_duplicate_parent_in_another_file() {
+        let index = WorkspaceIndex::new();
+        let first_uri = "file:///first.php";
+        let second_uri = "file:///second.php";
+        index.update_file(
+            first_uri,
+            FileSymbols {
+                symbols: vec![make_method("fromFirst", "App\\Shared", first_uri)],
+                ..Default::default()
+            },
+        );
+        index.update_file(
+            second_uri,
+            FileSymbols {
+                symbols: vec![make_method("fromSecond", "App\\Shared", second_uri)],
+                ..Default::default()
+            },
+        );
+
+        let mut names = index
+            .get_direct_members("app\\shared")
+            .into_iter()
+            .map(|member| member.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["fromFirst", "fromSecond"]);
+
+        index.remove_file(first_uri);
+
+        let remaining = index.get_direct_members("APP\\SHARED");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "fromSecond");
+        assert_eq!(remaining[0].uri, second_uri);
+
+        index.remove_file(second_uri);
+        assert!(!index
+            .direct_members_by_parent
+            .contains_key(&case_insensitive_fqn_key("App\\Shared")));
+    }
+
+    #[test]
+    fn concurrent_member_writers_are_serialized_and_readers_keep_an_immutable_snapshot() {
+        let index = Arc::new(WorkspaceIndex::new());
+        let uri = "file:///concurrent-members.php";
+        index.update_file(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    make_class("Owner", "App\\Owner", uri),
+                    make_method("oldOne", "App\\Owner", uri),
+                    make_method("oldTwo", "App\\Owner", uri),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let writer_a_index = Arc::clone(&index);
+        let (writer_a_staged_tx, writer_a_staged_rx) = std::sync::mpsc::channel();
+        let (writer_a_release_tx, writer_a_release_rx) = std::sync::mpsc::channel();
+        let writer_a = std::thread::spawn(move || {
+            writer_a_index.update_file_with_references_with_hook(
+                uri,
+                FileSymbols {
+                    symbols: vec![
+                        make_class("Owner", "App\\Owner", uri),
+                        make_method("fromWriterA", "App\\Owner", uri),
+                    ],
+                    ..Default::default()
+                },
+                Vec::new(),
+                || {
+                    writer_a_staged_tx.send(()).expect("report staged writer A");
+                    writer_a_release_rx.recv().expect("release writer A");
+                },
+            );
+        });
+
+        writer_a_staged_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer A reached the staged snapshot");
+
+        let writer_b_index = Arc::clone(&index);
+        let (writer_b_started_tx, writer_b_started_rx) = std::sync::mpsc::channel();
+        let (writer_b_done_tx, writer_b_done_rx) = std::sync::mpsc::channel();
+        let writer_b = std::thread::spawn(move || {
+            writer_b_started_tx.send(()).expect("report writer B start");
+            writer_b_index.update_file(
+                uri,
+                FileSymbols {
+                    symbols: vec![
+                        make_class("Owner", "App\\Owner", uri),
+                        make_method("fromWriterB", "App\\Owner", uri),
+                    ],
+                    ..Default::default()
+                },
+            );
+            writer_b_done_tx
+                .send(())
+                .expect("report writer B completion");
+        });
+        writer_b_started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer B started");
+        assert!(
+            writer_b_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "writer B must wait for writer A's per-URI commit"
+        );
+
+        let reader_index = Arc::clone(&index);
+        let (reader_tx, reader_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut names = reader_index
+                .get_direct_members("App\\Owner")
+                .into_iter()
+                .map(|member| member.name.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            reader_tx.send(names).expect("return member snapshot");
+        });
+        assert_eq!(
+            reader_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("reader should not wait for an in-progress replacement"),
+            vec!["oldOne", "oldTwo"]
+        );
+        reader.join().expect("member reader joined");
+
+        writer_a_release_tx.send(()).expect("release writer A");
+        writer_a.join().expect("writer A joined");
+        writer_b_done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer B completed after writer A");
+        writer_b.join().expect("writer B joined");
+
+        let names = index
+            .get_direct_members("App\\Owner")
+            .into_iter()
+            .map(|member| member.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["fromWriterB"]);
     }
 
     #[test]

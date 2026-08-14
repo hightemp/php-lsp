@@ -492,7 +492,7 @@ fn hover_file_symbols_for_uri(
     index
         .file_symbols
         .get(uri)
-        .map(|entry| entry.value().clone())
+        .map(|entry| entry.value().as_ref().clone())
         .unwrap_or_else(|| fallback.clone())
 }
 

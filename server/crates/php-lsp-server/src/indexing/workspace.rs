@@ -2283,7 +2283,7 @@ pub(in crate::server) async fn index_workspace(
         let Some(file_symbols) = disk_index
             .file_symbols
             .get(&uri_str)
-            .map(|symbols| symbols.value().clone())
+            .map(|symbols| symbols.value().as_ref().clone())
         else {
             continue;
         };

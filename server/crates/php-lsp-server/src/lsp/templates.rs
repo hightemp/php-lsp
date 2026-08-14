@@ -3636,7 +3636,7 @@ async fn direct_twig_variable_types_for_template_state(
         let file_symbols = index
             .file_symbols
             .get(source_uri.as_str())
-            .map(|symbols| symbols.value().clone())
+            .map(|symbols| symbols.value().as_ref().clone())
             .or_else(|| {
                 entry
                     .value()

@@ -426,7 +426,7 @@ impl PhpLspBackend {
             .index
             .file_symbols
             .get(&uri_str)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().as_ref().clone())
         {
             let Some(source) = self
                 .source_for_uri(&uri_str, "documentSymbol source read")

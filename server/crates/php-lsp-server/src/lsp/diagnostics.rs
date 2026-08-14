@@ -2852,7 +2852,7 @@ pub(in crate::server) fn check_call_argument_types(
     let callable_file_symbols = index.file_symbols.get(&callable.uri);
     let expected_file_symbols = callable_file_symbols
         .as_ref()
-        .map(|entry| entry.value())
+        .map(|entry| entry.value().as_ref())
         .unwrap_or(file_symbols);
     let scoped_expected_file_symbols =
         expected_file_symbols.scoped_at_byte_position(callable.range.0, callable.range.1);
@@ -3003,7 +3003,7 @@ pub(in crate::server) fn check_property_assignment_type_compatibility(
     let property_file_symbols = index.file_symbols.get(&property.uri);
     let expected_file_symbols = property_file_symbols
         .as_ref()
-        .map(|entry| entry.value())
+        .map(|entry| entry.value().as_ref())
         .unwrap_or(file_symbols);
     let scoped_expected_file_symbols =
         expected_file_symbols.scoped_at_byte_position(property.range.0, property.range.1);

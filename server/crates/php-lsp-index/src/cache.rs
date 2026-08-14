@@ -421,7 +421,7 @@ pub fn build_cache_from_sources(
         let Some(file_symbols) = index
             .file_symbols
             .get(&source.uri)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().as_ref().clone())
         else {
             continue;
         };
@@ -679,6 +679,15 @@ mod tests {
         }
     }
 
+    fn make_member_symbol(uri: &str) -> SymbolInfo {
+        let mut symbol = make_symbol(uri);
+        symbol.name = "member".to_string();
+        symbol.fqn = "App\\Foo::member".to_string();
+        symbol.kind = PhpSymbolKind::Method;
+        symbol.parent_fqn = Some("App\\Foo".to_string());
+        symbol
+    }
+
     fn cache_schema_symbol(uri: &str, name: &str, kind: PhpSymbolKind) -> SymbolInfo {
         SymbolInfo {
             name: name.to_string(),
@@ -923,7 +932,7 @@ mod tests {
             FileSymbols {
                 namespace: Some("App".to_string()),
                 use_statements: vec![],
-                symbols: vec![make_symbol(&uri)],
+                symbols: vec![make_symbol(&uri), make_member_symbol(&uri)],
                 ..Default::default()
             },
         );
@@ -947,6 +956,7 @@ mod tests {
         assert_eq!(report.loaded_files, 1);
         assert!(report.parse_files.is_empty());
         assert!(loaded.resolve_fqn("App\\Foo").is_some());
+        assert!(loaded.resolve_fqn("App\\Foo::member").is_some());
 
         fs::remove_dir_all(root).unwrap();
     }

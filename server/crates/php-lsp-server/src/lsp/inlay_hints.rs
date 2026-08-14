@@ -1676,7 +1676,7 @@ pub(in crate::server) fn doctrine_repository_class_from_entity_attribute(
     let entity_file_symbols = index.file_symbols.get(&entity.uri);
     let file_symbols = entity_file_symbols
         .as_ref()
-        .map(|symbols| symbols.value())
+        .map(|symbols| symbols.value().as_ref())
         .unwrap_or(current_file_symbols);
     let scoped_file_symbols = file_symbols.scoped_at_byte_position(entity.range.0, entity.range.1);
     let resolved = resolve_class_name_pub(&repository_name, scoped_file_symbols.as_ref())
@@ -1919,7 +1919,7 @@ pub(in crate::server) fn doctrine_collection_item_type_from_mutators(
     let owner_file_symbols = index.file_symbols.get(uri);
     let file_symbols = owner_file_symbols
         .as_ref()
-        .map(|symbols| symbols.value())
+        .map(|symbols| symbols.value().as_ref())
         .unwrap_or(current_file_symbols);
 
     for candidate in collection_mutator_method_candidates(collection_suffix) {
