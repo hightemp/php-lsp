@@ -5788,3 +5788,16 @@ change.
   - Validation target: no inline `mod tests {` remains, crate test counts/results stay unchanged, workspace Clippy and fmt pass, `git diff --check` passes, and Verifier returns GO with `CARGO_BUILD_JOBS=1`.
   - Implemented: extracted all 31 inline unit-test modules into flat sibling `*_tests.rs` files with explicit `#[path]`; preserved production suffixes from mid-file modules and raw/multiline fixture bytes, while retaining two shared test-only helper blocks in their production modules.
   - Validation: types 8/8, parser 283/283, index 62/62, completion 50/50, server library 199/199, server binary 2/2, and all server E2E tests except the known flaky vendor-inherited-definition case passed; that case reproduced both pass and fail in isolated runs and is unaffected by `cfg(test)` extraction. Workspace Clippy with `-D warnings`, fmt, `git diff --check`, and the zero-inline-module structural check passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO.
+
+- [x] **AUDIT-M2-FIX-PLAN-2026-08-14** Detail the AST-based null-coalesce probe fix in `AUDIT-2026-08-07.md`. *(done 2026-08-14)*
+  - Started: 2026-08-14; verify the installed tree-sitter PHP node model, correct the reproduction, and define left/right/nested coalesce invariants and regression coverage.
+  - Validation target: the plan avoids raw source search, preserves genuine left-operand suppression, does not suppress right operands or `??` inside strings/comments, and `git diff --check` passes.
+  - Implemented: documented ancestor-branch tracking against the `binary_expression.operator == "??"` AST shape, nearest-coalesce left/right semantics, exact non-reproducing/reproducing examples, and focused regression coverage without a raw source dependency.
+  - Validation: verified the tree-sitter PHP 0.23.11 node schema and current offset comparison/call path; `git diff --check` passed.
+
+- [x] **FIX-PARSER-NULL-COALESCE-PROBE-2026-08-14** Make undefined-variable null-coalesce suppression AST-aware. *(done 2026-08-14)*
+  - Started: 2026-08-14; replace raw `??` text search with exact tree-sitter operator/operand inspection while preserving scope boundaries.
+  - Scope: genuine left operands, right operands, array access, strings/comments containing `??`, nested/chained coalescing, and `??=` assignment behavior; no hardcoded source-text matching.
+  - Validation target: focused semantic regressions, all parser tests, parser Clippy with `-D warnings`, fmt, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
+  - Implemented: `is_null_coalesce_probe` now tracks the immediate ancestor branch and recognizes only exact AST operator fields for `binary_expression ??` and `augmented_assignment_expression ??=`, suppressing only the nearest operator's left operand without reading source text.
+  - Validation: 4 focused null-coalesce regressions and all 286 parser tests passed; parser Clippy with `-D warnings`, fmt, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO.

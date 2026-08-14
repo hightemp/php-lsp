@@ -972,7 +972,7 @@ fn collect_variable_occurrences(
                 range: node_range(&node),
                 start_byte: node.start_byte(),
                 declaration_kind: variable_declaration_kind(node, source, &name),
-                null_coalesce_probe: is_null_coalesce_probe(node, source),
+                null_coalesce_probe: is_null_coalesce_probe(node),
             });
         }
     }
@@ -1266,7 +1266,8 @@ fn is_non_local_variable_context(node: tree_sitter::Node) -> bool {
     false
 }
 
-fn is_null_coalesce_probe(node: tree_sitter::Node, source: &str) -> bool {
+fn is_null_coalesce_probe(node: tree_sitter::Node) -> bool {
+    let mut branch = node;
     let mut current = node.parent();
     while let Some(parent) = current {
         if matches!(
@@ -1281,12 +1282,21 @@ fn is_null_coalesce_probe(node: tree_sitter::Node, source: &str) -> bool {
             return false;
         }
 
-        let text = &source[parent.byte_range()];
-        if let Some(operator_offset) = text.find("??") {
-            let node_offset = node.start_byte().saturating_sub(parent.start_byte());
-            return node_offset < operator_offset;
+        let is_null_coalesce = parent
+            .child_by_field_name("operator")
+            .is_some_and(|operator| {
+                matches!(
+                    (parent.kind(), operator.kind()),
+                    ("binary_expression", "??") | ("augmented_assignment_expression", "??=")
+                )
+            });
+        if is_null_coalesce {
+            return parent
+                .child_by_field_name("left")
+                .is_some_and(|left| left.id() == branch.id());
         }
 
+        branch = parent;
         current = parent.parent();
     }
     false

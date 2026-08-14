@@ -814,6 +814,78 @@ function run(): bool {
 }
 
 #[test]
+fn test_null_coalesce_probe_uses_nearest_left_or_right_operand() {
+    let code = r#"<?php
+function run(): void {
+    echo $direct ?? null;
+    echo $items['key'] ?? null;
+    echo $outer ?? $inner ?? null;
+    echo null ?? $rightMissing;
+    echo ($defined ?? $nestedRightMissing) ?? null;
+}
+"#;
+    let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+    let is_undefined = |name: &str| {
+        diags.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message.contains(name)
+        })
+    };
+
+    for suppressed in ["$direct", "$items", "$outer", "$inner", "$defined"] {
+        assert!(
+            !is_undefined(suppressed),
+            "Left null-coalesce operand `{suppressed}` should be an isset-style probe, got: {diags:?}"
+        );
+    }
+    for reported in ["$rightMissing", "$nestedRightMissing"] {
+        assert!(
+            is_undefined(reported),
+            "Right null-coalesce operand `{reported}` should remain a normal read, got: {diags:?}"
+        );
+    }
+}
+
+#[test]
+fn test_null_coalesce_probe_ignores_operator_text_in_strings_and_comments() {
+    let code = r#"<?php
+function run(): void {
+    consume($stringMissing, "a??b");
+    consume($commentMissing /* ?? */);
+}
+"#;
+    let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+    for expected in ["$stringMissing", "$commentMissing"] {
+        assert!(
+            diags.iter().any(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && diagnostic.message.contains(expected)
+            }),
+            "`??` source text must not hide undefined variable `{expected}`, got: {diags:?}"
+        );
+    }
+}
+
+#[test]
+fn test_null_coalesce_assignment_left_operand_remains_a_probe() {
+    let code = r#"<?php
+function run(): void {
+    $value ??= 1;
+}
+"#;
+    let diags = parse_and_check(code, |_fqn| Some(dummy_symbol()));
+
+    assert!(
+        !diags.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message.contains("$value")
+        }),
+        "Null-coalesce assignment left operand should remain an isset-style probe, got: {diags:?}"
+    );
+}
+
+#[test]
 fn test_compact_string_arguments_count_variables_as_reads() {
     let code = r#"<?php
 function run(): array {
