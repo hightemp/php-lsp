@@ -5847,3 +5847,16 @@ change.
   - Validation target: focused Unix cycle/external-link regressions, cross-platform nested traversal tests, full index tests, index/server Clippy with `-D warnings`, fmt, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
   - Implemented: centralized non-following collection/counting, rejected linked entries and path-like extension names before filesystem access, validated every required/source relative component below an optionally linked root, and reused the policy in server validation, cache hashing, and `phpstub://` reads.
   - Validation: 66 index tests, 5 server stubs tests, focused effective-config/cache tests, index/server Clippy with `-D warnings`, fmt, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO after five review passes covering intermediate symlinks, configured extension escapes, cache metadata, and source reads.
+
+- [x] **AUDIT-M7-FIX-PLAN-2026-08-17** Detail off-runtime PHPStan/Psalm output parsing in `AUDIT-2026-08-07.md`. *(done 2026-08-17)*
+  - Started: 2026-08-17; trace analyzer subprocess, JSON parsing, path filtering, error mapping, and file-existence preflight for both analyzers.
+  - Validation target: the plan moves JSON/FS work to one blocking task per result, canonicalizes the target once, preserves sync parser tests and nonzero-exit errors, removes direct async filesystem checks, and covers multi-file path filtering; `git diff --check` passes.
+  - Implemented: documented a shared one-target-canonicalization matcher, one `spawn_blocking` parse/filter task per analyzer result, preserved status/stderr mapping, async metadata preflight, and PHPStan/Psalm multi-file regressions.
+  - Validation: confirmed both async run paths, the shared canonical matcher call path, synchronous parser consumers, and duplicate blocking `exists()` checks; `git diff --check` passed.
+
+- [x] **FIX-ANALYZER-OFF-RUNTIME-PARSING-2026-08-17** Move PHPStan/Psalm JSON and filesystem filtering off async runtime threads. *(done 2026-08-17)*
+  - Started: 2026-08-17; canonicalize each target once, run owned output parsing/filtering in one blocking task, and replace synchronous analyzer file preflight.
+  - Scope: PHPStan/Psalm exact and canonical path matching, multi-file output, nonzero/malformed output error mapping, join failures, timeout/cancellation compatibility, and async metadata checks; no per-key blocking tasks.
+  - Validation target: focused parser/runner regressions, server analyzer tests, server Clippy with `-D warnings`, fmt, `git diff --check`, structural async-IO search, and Verifier GO with `CARGO_BUILD_JOBS=1`.
+  - Implemented: added one-target/candidate-caching path matcher, one owned blocking output processor for PHPStan/Psalm stdout and stderr, preserved status/error orchestration, and replaced runtime-thread existence checks with Tokio metadata.
+  - Validation: 204 server lib tests, including multi-file canonical matching, missing/single-file behavior, nonzero/malformed analyzer output, and current-thread offload assertions, plus server Clippy with `-D warnings`, fmt, `git diff --check`, and structural blocking-IO searches passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO after two review passes.

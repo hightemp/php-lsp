@@ -1,7 +1,7 @@
 use super::lsp::diagnostics::{
-    current_class_fqn_at_range, parse_phpstan_json_diagnostics, parse_psalm_json_diagnostics,
-    resolve_symbol_at_position_from_index, run_diagnostics_blocking, symbol_reference_matches,
-    type_info_accepts_inferred_type, InferredExprType,
+    current_class_fqn_at_range, parse_analyzer_output_off_runtime, parse_phpstan_json_diagnostics,
+    parse_psalm_json_diagnostics, resolve_symbol_at_position_from_index, run_diagnostics_blocking,
+    symbol_reference_matches, type_info_accepts_inferred_type, InferredExprType,
 };
 use super::lsp::document_symbols::{workspace_symbol_candidates, workspace_symbol_lsp_range};
 use super::*;
@@ -6016,6 +6016,162 @@ fn test_parse_psalm_json_diagnostics_maps_issues() {
         diagnostics[0].message,
         "Method App\\Foo::missing does not exist"
     );
+}
+
+static ANALYZER_PARSE_CALLER_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
+    std::sync::Mutex::new(None);
+
+fn assert_analyzer_parser_is_off_runtime_thread(
+    stdout: &str,
+    _file_path: &Path,
+) -> std::result::Result<Vec<Diagnostic>, String> {
+    if stdout != "probe" {
+        return Err(format!("unexpected analyzer probe output: {stdout:?}"));
+    }
+    let caller_thread = ANALYZER_PARSE_CALLER_THREAD
+        .lock()
+        .map_err(|_| "analyzer caller thread lock poisoned".to_string())?
+        .take()
+        .ok_or_else(|| "missing analyzer caller thread".to_string())?;
+    if std::thread::current().id() == caller_thread {
+        return Err("analyzer parser ran on the async runtime thread".to_string());
+    }
+    Ok(Vec::new())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_analyzer_output_parser_runs_off_current_thread_runtime() {
+    *ANALYZER_PARSE_CALLER_THREAD.lock().unwrap() = Some(std::thread::current().id());
+    let processed = parse_analyzer_output_off_runtime(
+        "Test analyzer",
+        b"probe".to_vec(),
+        b" probe stderr ".to_vec(),
+        PathBuf::from("/tmp/probe.php"),
+        assert_analyzer_parser_is_off_runtime_thread,
+    )
+    .await
+    .unwrap();
+    let diagnostics = processed.diagnostics.expect("non-empty probe").unwrap();
+    assert!(diagnostics.is_empty());
+    assert_eq!(processed.stderr_details, "probe stderr");
+
+    let empty = parse_analyzer_output_off_runtime(
+        "Test analyzer",
+        b" \n\t ".to_vec(),
+        b" empty stderr ".to_vec(),
+        PathBuf::from("/tmp/probe.php"),
+        assert_analyzer_parser_is_off_runtime_thread,
+    )
+    .await
+    .unwrap();
+    assert!(empty.diagnostics.is_none());
+    assert_eq!(empty.stderr_details, "empty stderr");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_analyzer_json_parsers_match_canonical_target_and_filter_other_files() {
+    use std::os::unix::fs::symlink;
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-analyzer-canonical-test-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join("Target.php");
+    let alias = root.join("Alias.php");
+    let other = root.join("Other.php");
+    std::fs::write(&target, "<?php class Target {}").unwrap();
+    std::fs::write(&other, "<?php class Other {}").unwrap();
+    symlink(&target, &alias).unwrap();
+
+    let phpstan_output = serde_json::json!({
+        "files": {
+            (alias.to_string_lossy().to_string()): {
+                "messages": [{ "message": "canonical target", "line": 2 }]
+            },
+            (other.to_string_lossy().to_string()): {
+                "messages": [{ "message": "other file", "line": 3 }]
+            }
+        }
+    })
+    .to_string();
+    let phpstan = parse_phpstan_json_diagnostics(&phpstan_output, &target).unwrap();
+    assert_eq!(phpstan.len(), 1);
+    assert_eq!(phpstan[0].message, "canonical target");
+
+    let psalm_output = serde_json::json!([
+        {
+            "message": "canonical target",
+            "file_path": alias.to_string_lossy().to_string(),
+            "line_from": 2
+        },
+        {
+            "message": "other file",
+            "file_path": other.to_string_lossy().to_string(),
+            "line_from": 3
+        }
+    ])
+    .to_string();
+    let psalm = parse_psalm_json_diagnostics(&psalm_output, &target).unwrap();
+    assert_eq!(psalm.len(), 1);
+    assert_eq!(psalm[0].message, "canonical target");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_analyzer_json_parsers_keep_exact_missing_target_and_phpstan_single_file_fallback() {
+    let target = PathBuf::from("/definitely/missing/php-lsp/Target.php");
+    let other = PathBuf::from("/definitely/missing/php-lsp/Other.php");
+    let phpstan_multi = serde_json::json!({
+        "files": {
+            (target.to_string_lossy().to_string()): {
+                "messages": [{ "message": "exact missing target", "line": 2 }]
+            },
+            (other.to_string_lossy().to_string()): {
+                "messages": [{ "message": "other missing file", "line": 3 }]
+            }
+        }
+    })
+    .to_string();
+    let diagnostics = parse_phpstan_json_diagnostics(&phpstan_multi, &target).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].message, "exact missing target");
+
+    let phpstan_single = serde_json::json!({
+        "files": {
+            (other.to_string_lossy().to_string()): {
+                "messages": [{ "message": "single file fallback", "line": 4 }]
+            }
+        }
+    })
+    .to_string();
+    let diagnostics = parse_phpstan_json_diagnostics(&phpstan_single, &target).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].message, "single file fallback");
+
+    let psalm_output = serde_json::json!([
+        {
+            "message": "exact missing target",
+            "file_path": target.to_string_lossy().to_string(),
+            "line_from": 2
+        },
+        {
+            "message": "other missing file",
+            "file_path": other.to_string_lossy().to_string(),
+            "line_from": 3
+        }
+    ])
+    .to_string();
+    let diagnostics = parse_psalm_json_diagnostics(&psalm_output, &target).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].message, "exact missing target");
 }
 
 #[tokio::test]

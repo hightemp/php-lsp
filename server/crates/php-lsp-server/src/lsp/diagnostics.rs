@@ -55,19 +55,93 @@ fn phpstan_json_message_u32(message: &serde_json::Value, key: &str) -> Option<u3
         .and_then(|value| u32::try_from(value).ok())
 }
 
-fn phpstan_file_key_matches(key: &str, target: &Path) -> bool {
-    let key_path = PathBuf::from(key);
-    if key_path == target {
-        return true;
+struct AnalyzerTargetPathMatcher {
+    target: PathBuf,
+    canonical_target: Option<PathBuf>,
+    candidate_matches: HashMap<PathBuf, bool>,
+}
+
+impl AnalyzerTargetPathMatcher {
+    fn new(target: &Path) -> Self {
+        Self {
+            target: target.to_path_buf(),
+            canonical_target: target.canonicalize().ok(),
+            candidate_matches: HashMap::new(),
+        }
     }
 
-    if let (Ok(key_canonical), Ok(target_canonical)) =
-        (key_path.canonicalize(), target.canonicalize())
-    {
-        return key_canonical == target_canonical;
+    fn matches(&mut self, key: &str) -> bool {
+        let key_path = PathBuf::from(key);
+        if key_path == self.target {
+            return true;
+        }
+        if let Some(matches) = self.candidate_matches.get(&key_path) {
+            return *matches;
+        }
+
+        let matches = self.canonical_target.as_ref().is_some_and(|target| {
+            key_path
+                .canonicalize()
+                .is_ok_and(|candidate| candidate == *target)
+        });
+        self.candidate_matches.insert(key_path, matches);
+        matches
+    }
+}
+
+pub(in crate::server) struct ProcessedAnalyzerOutput {
+    pub(in crate::server) diagnostics: Option<std::result::Result<Vec<Diagnostic>, String>>,
+    pub(in crate::server) stderr_details: String,
+}
+
+pub(in crate::server) async fn parse_analyzer_output_off_runtime(
+    analyzer: &'static str,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    file_path: PathBuf,
+    parser: fn(&str, &Path) -> std::result::Result<Vec<Diagnostic>, String>,
+) -> std::result::Result<ProcessedAnalyzerOutput, String> {
+    tokio::task::spawn_blocking(move || {
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        ProcessedAnalyzerOutput {
+            diagnostics: (!stdout.trim().is_empty()).then(|| parser(&stdout, &file_path)),
+            stderr_details: stderr.trim().to_string(),
+        }
+    })
+    .await
+    .map_err(|err| format!("{} output parsing task failed: {}", analyzer, err))
+}
+
+fn analyzer_output_error(
+    error: String,
+    status: std::process::ExitStatus,
+    stderr_details: &str,
+) -> String {
+    if status.success() {
+        return error;
     }
 
-    false
+    if stderr_details.is_empty() {
+        format!("{} (exit {})", error, status)
+    } else {
+        format!("{} (exit {}: {})", error, status, stderr_details)
+    }
+}
+
+fn empty_analyzer_output_error(
+    analyzer: &str,
+    status: std::process::ExitStatus,
+    stderr_details: &str,
+) -> String {
+    if stderr_details.is_empty() {
+        format!("{} command exited with {}", analyzer, status)
+    } else {
+        format!(
+            "{} command exited with {}: {}",
+            analyzer, status, stderr_details
+        )
+    }
 }
 
 fn phpstan_message_to_diagnostic(message: &serde_json::Value) -> Option<Diagnostic> {
@@ -112,6 +186,8 @@ fn phpstan_message_to_diagnostic(message: &serde_json::Value) -> Option<Diagnost
     })
 }
 
+/// Parse PHPStan output synchronously. Async callers must use
+/// [`parse_analyzer_output_off_runtime`] because path filtering may access the filesystem.
 pub(in crate::server) fn parse_phpstan_json_diagnostics(
     stdout: &str,
     file_path: &Path,
@@ -123,8 +199,9 @@ pub(in crate::server) fn parse_phpstan_json_diagnostics(
     };
 
     let mut diagnostics = Vec::new();
+    let mut matcher = AnalyzerTargetPathMatcher::new(file_path);
     for (file_key, file_value) in files {
-        if files.len() != 1 && !phpstan_file_key_matches(file_key, file_path) {
+        if files.len() != 1 && !matcher.matches(file_key) {
             continue;
         }
 
@@ -156,35 +233,31 @@ pub(in crate::server) async fn run_phpstan_for_file(
         cancellation,
     )
     .await?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let std::process::Output {
+        status,
+        stdout,
+        stderr,
+    } = output;
 
-    if stdout.trim().is_empty() {
-        if output.status.success() {
-            return Ok(vec![]);
+    let processed = parse_analyzer_output_off_runtime(
+        "PHPStan",
+        stdout,
+        stderr,
+        file_path,
+        parse_phpstan_json_diagnostics,
+    )
+    .await?;
+    match processed.diagnostics {
+        None if status.success() => Ok(vec![]),
+        None => Err(empty_analyzer_output_error(
+            "PHPStan",
+            status,
+            &processed.stderr_details,
+        )),
+        Some(result) => {
+            result.map_err(|err| analyzer_output_error(err, status, &processed.stderr_details))
         }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let details = stderr.trim();
-        return Err(if details.is_empty() {
-            format!("PHPStan command exited with {}", output.status)
-        } else {
-            format!("PHPStan command exited with {}: {}", output.status, details)
-        });
     }
-
-    parse_phpstan_json_diagnostics(&stdout, &file_path).map_err(|err| {
-        if output.status.success() {
-            err
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let details = stderr.trim();
-            if details.is_empty() {
-                format!("{} (exit {})", err, output.status)
-            } else {
-                format!("{} (exit {}: {})", err, output.status, details)
-            }
-        }
-    })
 }
 
 fn psalm_issue_u32(issue: &serde_json::Value, key: &str) -> Option<u32> {
@@ -194,7 +267,10 @@ fn psalm_issue_u32(issue: &serde_json::Value, key: &str) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
-fn psalm_issue_path_matches(issue: &serde_json::Value, target: &Path) -> bool {
+fn psalm_issue_path_matches(
+    issue: &serde_json::Value,
+    matcher: &mut AnalyzerTargetPathMatcher,
+) -> bool {
     let Some(path) = issue
         .get("file_path")
         .or_else(|| issue.get("file_name"))
@@ -203,7 +279,7 @@ fn psalm_issue_path_matches(issue: &serde_json::Value, target: &Path) -> bool {
         return true;
     };
 
-    phpstan_file_key_matches(path, target)
+    matcher.matches(path)
 }
 
 fn psalm_severity(issue: &serde_json::Value) -> DiagnosticSeverity {
@@ -250,6 +326,8 @@ fn psalm_issue_to_diagnostic(issue: &serde_json::Value) -> Option<Diagnostic> {
     })
 }
 
+/// Parse Psalm output synchronously. Async callers must use
+/// [`parse_analyzer_output_off_runtime`] because path filtering may access the filesystem.
 pub(in crate::server) fn parse_psalm_json_diagnostics(
     stdout: &str,
     file_path: &Path,
@@ -265,11 +343,16 @@ pub(in crate::server) fn parse_psalm_json_diagnostics(
         return Ok(vec![]);
     };
 
-    Ok(issues
-        .iter()
-        .filter(|issue| psalm_issue_path_matches(issue, file_path))
-        .filter_map(psalm_issue_to_diagnostic)
-        .collect())
+    let mut diagnostics = Vec::new();
+    let mut matcher = AnalyzerTargetPathMatcher::new(file_path);
+    for issue in issues {
+        if psalm_issue_path_matches(issue, &mut matcher) {
+            if let Some(diagnostic) = psalm_issue_to_diagnostic(issue) {
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+    Ok(diagnostics)
 }
 
 pub(in crate::server) async fn run_psalm_for_file(
@@ -287,35 +370,31 @@ pub(in crate::server) async fn run_psalm_for_file(
         cancellation,
     )
     .await?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let std::process::Output {
+        status,
+        stdout,
+        stderr,
+    } = output;
 
-    if stdout.trim().is_empty() {
-        if output.status.success() {
-            return Ok(vec![]);
+    let processed = parse_analyzer_output_off_runtime(
+        "Psalm",
+        stdout,
+        stderr,
+        file_path,
+        parse_psalm_json_diagnostics,
+    )
+    .await?;
+    match processed.diagnostics {
+        None if status.success() => Ok(vec![]),
+        None => Err(empty_analyzer_output_error(
+            "Psalm",
+            status,
+            &processed.stderr_details,
+        )),
+        Some(result) => {
+            result.map_err(|err| analyzer_output_error(err, status, &processed.stderr_details))
         }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let details = stderr.trim();
-        return Err(if details.is_empty() {
-            format!("Psalm command exited with {}", output.status)
-        } else {
-            format!("Psalm command exited with {}: {}", output.status, details)
-        });
     }
-
-    parse_psalm_json_diagnostics(&stdout, &file_path).map_err(|err| {
-        if output.status.success() {
-            err
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let details = stderr.trim();
-            if details.is_empty() {
-                format!("{} (exit {})", err, output.status)
-            } else {
-                format!("{} (exit {}: {})", err, output.status, details)
-            }
-        }
-    })
 }
 
 impl PhpLspBackend {
@@ -4479,7 +4558,7 @@ impl PhpLspBackend {
         let Some(file_path) = uri_to_path(uri.as_str()) else {
             return vec![];
         };
-        if !file_path.exists() {
+        if tokio::fs::metadata(&file_path).await.is_err() {
             return vec![];
         }
 
@@ -4528,7 +4607,7 @@ impl PhpLspBackend {
         let Some(file_path) = uri_to_path(uri.as_str()) else {
             return vec![];
         };
-        if !file_path.exists() {
+        if tokio::fs::metadata(&file_path).await.is_err() {
             return vec![];
         }
 
