@@ -5886,3 +5886,16 @@ change.
   - Validation target: client explicit-settings check, client lint/build, server unit reset matrix, initialize/configuration E2E resets and project fallback, server lib/E2E tests, server Clippy with `-D warnings`, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
   - Implemented: extracted one sparse explicit-client snapshot builder for initialize/didChange and added a typed server resolver that rebuilds every runtime field from defaults plus the effective global/project/client merge before diffing state and side effects.
   - Validation: client snapshot regression check, full client lint/build, server reset/project-fallback unit tests, `e2e_initialize` (5/5), server lib tests (206/206), Clippy `--all-targets -D warnings`, formatting, and `git diff --check` passed with one build job; Verifier returned GO.
+
+- [x] **AUDIT-L1-FIX-PLAN-2026-08-17** Detail PHP-case-insensitive private-member owner matching in `AUDIT-2026-08-07.md`. *(done 2026-08-17)*
+  - Started: 2026-08-17; inspect the current private visibility helper, its instance/static call paths, shared PHP FQN comparators, and provider regression coverage.
+  - Validation target: the plan reuses the kind-aware shared comparator, preserves leading-slash normalization and private-owner isolation, covers both instance and static completion paths without relying on parser-produced casing mismatches, and keeps the fix scoped to completion.
+  - Implemented: confirmed the lone completion-local comparator is case-sensitive and documented replacement with `symbol_fqn_eq` plus focused mismatched-casing/leading-slash provider regressions.
+  - Validation: checked all `member_is_visible` callers, the authoritative open-file member merge, cursor-class tests, static `self`/`parent` behavior, and existing shared comparator semantics; `git diff --check` passed.
+
+- [x] **FIX-PRIVATE-MEMBER-FQN-CASING-2026-08-17** Match private-member owner FQNs with PHP class-name casing rules. *(done 2026-08-17)*
+  - Started: 2026-08-17; replace the completion-local case-sensitive comparison with the shared kind-aware FQN comparator.
+  - Scope: private instance/static completion, optional leading namespace separator, mismatched owner casing, and isolation from a different declaring class; public/protected visibility remains unchanged.
+  - Validation target: focused provider regression, full `php-lsp-completion` tests, Rustfmt, completion Clippy with `-D warnings`, `git diff --check`, and Verifier GO using `CARGO_BUILD_JOBS=1`.
+  - Implemented: private visibility now uses shared `symbol_fqn_eq` with class-name casing rules; removed the divergent local comparator and added instance/static regressions for case and leading-slash differences plus a foreign-owner negative assertion.
+  - Validation: focused regression passed (1/1), full `php-lsp-completion` tests passed (54/54), Rustfmt, completion Clippy `--all-targets -D warnings`, and `git diff --check` passed with one build job; Verifier returned GO.

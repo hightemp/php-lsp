@@ -960,7 +960,11 @@ fn member_is_visible(
                     .as_deref()
                     .zip(current_class_fqn)
                     .is_some_and(|(declaring_class, current_class)| {
-                        fqn_matches(declaring_class, current_class)
+                        php_lsp_types::symbol_fqn_eq(
+                            declaring_class,
+                            current_class,
+                            PhpSymbolKind::Class,
+                        )
                     })
         }
     }
@@ -1046,10 +1050,6 @@ fn byte_range_contains_cursor(outer: (u32, u32, u32, u32), cursor: (u32, u32, u3
 fn byte_range_contains(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {
     (inner.0 > outer.0 || (inner.0 == outer.0 && inner.1 >= outer.1))
         && (inner.2 < outer.2 || (inner.2 == outer.2 && inner.3 <= outer.3))
-}
-
-fn fqn_matches(left: &str, right: &str) -> bool {
-    left.trim_start_matches('\\') == right.trim_start_matches('\\')
 }
 
 #[cfg(test)]

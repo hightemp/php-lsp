@@ -1274,6 +1274,90 @@ fn test_member_completion_uses_cursor_class_for_two_classes() {
 }
 
 #[test]
+fn test_private_member_completion_matches_owner_fqn_using_php_class_rules() {
+    let service = with_range(
+        make_symbol(
+            "Service",
+            "App\\Service",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        ),
+        (0, 0, 12, 1),
+    );
+    let instance_private = make_symbol(
+        "instancePrivate",
+        "App\\Service::instancePrivate",
+        PhpSymbolKind::Method,
+        Some("\\app\\SERVICE"),
+        Visibility::Private,
+        false,
+    );
+    let static_private = make_symbol(
+        "staticPrivate",
+        "App\\Service::staticPrivate",
+        PhpSymbolKind::Method,
+        Some("\\APP\\service"),
+        Visibility::Private,
+        true,
+    );
+    let foreign_private = make_symbol(
+        "foreignPrivate",
+        "App\\Other::foreignPrivate",
+        PhpSymbolKind::Method,
+        Some("App\\Other"),
+        Visibility::Private,
+        false,
+    );
+    let file_symbols = FileSymbols {
+        namespace: Some("App".to_string()),
+        symbols: vec![
+            service,
+            instance_private,
+            static_private,
+            foreign_private.clone(),
+        ],
+        ..Default::default()
+    };
+    let index = WorkspaceIndex::new();
+    index.update_file("file:///test.php", file_symbols.clone());
+
+    let instance_context = CompletionContext::MemberAccess {
+        object_expr: "$this".to_string(),
+        member_prefix: String::new(),
+        class_fqn: Some("app\\service".to_string()),
+        access_mode: MemberAccessMode::Read,
+    };
+    let instance_items =
+        provide_completions_at_range(&instance_context, &index, &file_symbols, (5, 8, 5, 8));
+    assert!(
+        instance_items
+            .iter()
+            .any(|item| item.label == "instancePrivate"),
+        "$this-> should include a private member when owner FQN casing differs"
+    );
+
+    let static_context = CompletionContext::StaticAccess {
+        class_expr: "self".to_string(),
+        member_prefix: String::new(),
+        class_fqn: "APP\\SERVICE".to_string(),
+    };
+    let static_items =
+        provide_completions_at_range(&static_context, &index, &file_symbols, (5, 8, 5, 8));
+    assert!(
+        static_items
+            .iter()
+            .any(|item| item.label == "staticPrivate"),
+        "self:: should include a private member when owner FQN casing differs"
+    );
+    assert!(
+        !member_is_visible(&foreign_private, true, Some("\\APP\\SERVICE")),
+        "a private member declared by another class must remain hidden"
+    );
+}
+
+#[test]
 #[allow(deprecated)]
 fn test_cursorless_completion_never_infers_class_from_symbol_order() {
     for reverse_classes in [false, true] {
