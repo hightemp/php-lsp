@@ -121,20 +121,20 @@ const PHP_SNIPPETS: &[SnippetTemplate] = &[
     },
 ];
 
-/// Provide completion items based on context.
+/// Provide completion items without inferring cursor-dependent class or callable scope.
+///
+/// This compatibility wrapper is conservative: scope-sensitive private/protected
+/// members, callable parameters, and `$this` require [`provide_completions_at_range`].
+#[deprecated(
+    since = "0.7.0",
+    note = "use provide_completions_at_range; cursor-less completion cannot determine class or callable scope"
+)]
 pub fn provide_completions(
     context: &CompletionContext,
     index: &WorkspaceIndex,
     file_symbols: &FileSymbols,
 ) -> Vec<CompletionItem> {
-    let current_class_fqn = find_current_class_fqn(file_symbols);
-    provide_completions_with_current_class(
-        context,
-        index,
-        file_symbols,
-        current_class_fqn.as_deref(),
-        None,
-    )
+    provide_completions_with_current_class(context, index, file_symbols, None, None)
 }
 
 /// Provide completion items at a byte-column cursor range.
@@ -991,22 +991,6 @@ fn symbol_kind_to_completion_kind(kind: PhpSymbolKind) -> CompletionItemKind {
         PhpSymbolKind::EnumCase => CompletionItemKind::ENUM_MEMBER,
         PhpSymbolKind::Namespace => CompletionItemKind::MODULE,
     }
-}
-
-/// Find the FQN of the class/interface/trait/enum we're currently inside.
-fn find_current_class_fqn(file_symbols: &FileSymbols) -> Option<String> {
-    for sym in &file_symbols.symbols {
-        match sym.kind {
-            PhpSymbolKind::Class
-            | PhpSymbolKind::Interface
-            | PhpSymbolKind::Trait
-            | PhpSymbolKind::Enum => {
-                return Some(sym.fqn.clone());
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn find_current_class_fqn_at_range(

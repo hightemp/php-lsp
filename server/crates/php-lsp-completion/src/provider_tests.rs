@@ -64,6 +64,14 @@ fn test_param(name: &str, type_info: Option<TypeInfo>, is_promoted: bool) -> Par
     }
 }
 
+fn provide_completions_outside_class_for_test(
+    context: &CompletionContext,
+    index: &WorkspaceIndex,
+    file_symbols: &FileSymbols,
+) -> Vec<CompletionItem> {
+    provide_completions_at_range(context, index, file_symbols, (u32::MAX, 0, u32::MAX, 0))
+}
+
 #[test]
 fn test_keyword_completion() {
     let index = WorkspaceIndex::new();
@@ -71,7 +79,7 @@ fn test_keyword_completion() {
     let ctx = CompletionContext::Free {
         prefix: "cla".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
     assert!(labels.contains(&"class"), "Should contain 'class' keyword");
     let class_item = items
@@ -124,7 +132,7 @@ fn test_class_completion() {
     let ctx = CompletionContext::Free {
         prefix: "User".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
     assert!(
         items.iter().any(|i| i.label == "UserService"),
         "Should find UserService"
@@ -152,7 +160,7 @@ fn test_use_statement_completion_inserts_full_fqn() {
     let ctx = CompletionContext::UseStatement {
         prefix: "Ven".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &FileSymbols::default());
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &FileSymbols::default());
     let item = items
         .iter()
         .find(|item| item.label == "ClassName")
@@ -194,7 +202,7 @@ fn test_namespace_completion_prioritizes_fqn_prefix_over_contains_matches() {
     let ctx = CompletionContext::Namespace {
         prefix: "App\\".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
     let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
 
     assert_eq!(labels.first(), Some(&"ZedService"));
@@ -234,7 +242,7 @@ fn test_namespace_completion_keeps_prefix_matches_before_truncating_contains_noi
     let ctx = CompletionContext::Namespace {
         prefix: "Ty".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
 
     assert_eq!(
         items.first().map(|item| item.label.as_str()),
@@ -279,7 +287,7 @@ fn test_free_completion_ranks_prefix_matches_before_contains_matches() {
     let ctx = CompletionContext::Free {
         prefix: "Ty".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
 
     assert_eq!(
         items.first().map(|item| item.label.as_str()),
@@ -292,6 +300,7 @@ fn test_free_completion_ranks_prefix_matches_before_contains_matches() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_variable_completion() {
     let file_symbols = FileSymbols {
         namespace: None,
@@ -643,7 +652,7 @@ fn test_member_completion_uses_inferred_class_fqn() {
         class_fqn: Some("App\\Test\\Baz".to_string()),
         access_mode: MemberAccessMode::Read,
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
 
     assert!(
         items.iter().any(|i| i.label == "test"),
@@ -701,7 +710,7 @@ fn test_member_completion_filters_static_and_visibility() {
         class_fqn: Some("App\\Service".to_string()),
         access_mode: MemberAccessMode::Read,
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
     let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
 
     assert!(labels.contains(&"name"));
@@ -769,7 +778,7 @@ fn test_member_completion_sorts_methods_before_properties() {
         class_fqn: Some("App\\Client".to_string()),
         access_mode: MemberAccessMode::Read,
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
     let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
 
     assert_eq!(labels.first().copied(), Some("request"));
@@ -820,7 +829,7 @@ fn test_member_completion_includes_phpdoc_virtual_members() {
         class_fqn: Some("App\\Service".to_string()),
         access_mode: MemberAccessMode::Read,
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
 
     let slug = items
         .iter()
@@ -871,7 +880,7 @@ fn test_member_completion_filters_phpdoc_properties_by_access_mode() {
         class_fqn: Some("App\\Service".to_string()),
         access_mode: MemberAccessMode::Read,
     };
-    let read_items = provide_completions(&read_ctx, &index, &file_symbols);
+    let read_items = provide_completions_outside_class_for_test(&read_ctx, &index, &file_symbols);
     let read_labels: Vec<&str> = read_items.iter().map(|item| item.label.as_str()).collect();
     assert!(read_labels.contains(&"version"));
     assert!(read_labels.contains(&"label"));
@@ -886,7 +895,7 @@ fn test_member_completion_filters_phpdoc_properties_by_access_mode() {
         class_fqn: Some("App\\Service".to_string()),
         access_mode: MemberAccessMode::Write,
     };
-    let write_items = provide_completions(&write_ctx, &index, &file_symbols);
+    let write_items = provide_completions_outside_class_for_test(&write_ctx, &index, &file_symbols);
     let write_labels: Vec<&str> = write_items.iter().map(|item| item.label.as_str()).collect();
     assert!(write_labels.contains(&"dirty"));
     assert!(write_labels.contains(&"label"));
@@ -931,7 +940,7 @@ fn test_member_completion_inherits_phpdoc_virtual_members() {
         class_fqn: Some("App\\Service".to_string()),
         access_mode: MemberAccessMode::Read,
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
 
     assert!(items.iter().any(|item| item.label == "id"));
 }
@@ -985,7 +994,7 @@ fn test_static_completion_filters_instance_members() {
         member_prefix: String::new(),
         class_fqn: "App\\Service".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
     let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
 
     assert!(labels.contains(&"create"));
@@ -1055,7 +1064,7 @@ fn test_static_completion_sorts_constants_before_methods_and_properties() {
         member_prefix: String::new(),
         class_fqn: "App\\Service".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
     let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
 
     assert_eq!(
@@ -1089,7 +1098,7 @@ fn test_static_completion_includes_static_phpdoc_virtual_methods() {
         member_prefix: String::new(),
         class_fqn: "App\\Service".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
     let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
 
     assert!(labels.contains(&"make"));
@@ -1122,7 +1131,7 @@ fn test_static_completion_includes_class_pseudo_constant() {
         member_prefix: String::new(),
         class_fqn: "App\\Service".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_outside_class_for_test(&ctx, &index, &file_symbols);
     let class_item = items
         .iter()
         .find(|item| item.label == "class")
@@ -1133,6 +1142,18 @@ fn test_static_completion_includes_class_pseudo_constant() {
 
 #[test]
 fn test_parent_static_completion_includes_instance_methods() {
+    let mut child = with_range(
+        make_symbol(
+            "Child",
+            "App\\Child",
+            PhpSymbolKind::Class,
+            None,
+            Visibility::Public,
+            false,
+        ),
+        (10, 0, 20, 1),
+    );
+    child.extends = vec!["App\\Base".to_string()];
     let file_symbols = FileSymbols {
         namespace: Some("App".to_string()),
         use_statements: vec![],
@@ -1161,6 +1182,7 @@ fn test_parent_static_completion_includes_instance_methods() {
                 Visibility::Public,
                 true,
             ),
+            child,
         ],
         ..Default::default()
     };
@@ -1172,7 +1194,7 @@ fn test_parent_static_completion_includes_instance_methods() {
         member_prefix: String::new(),
         class_fqn: "App\\Base".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_at_range(&ctx, &index, &file_symbols, (12, 8, 12, 8));
     let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
 
     assert!(
@@ -1249,6 +1271,115 @@ fn test_member_completion_uses_cursor_class_for_two_classes() {
         !labels.contains(&"baseSecret"),
         "$this-> should not expose private members from another class"
     );
+}
+
+#[test]
+#[allow(deprecated)]
+fn test_cursorless_completion_never_infers_class_from_symbol_order() {
+    for reverse_classes in [false, true] {
+        let first = with_range(
+            make_symbol(
+                "First",
+                "App\\First",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (0, 0, 8, 1),
+        );
+        let second = with_range(
+            make_symbol(
+                "Second",
+                "App\\Second",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (10, 0, 18, 1),
+        );
+        let mut classes = if reverse_classes {
+            vec![second, first]
+        } else {
+            vec![first, second]
+        };
+        classes.extend([
+            make_symbol(
+                "firstPublic",
+                "App\\First::firstPublic",
+                PhpSymbolKind::Method,
+                Some("App\\First"),
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "firstProtected",
+                "App\\First::firstProtected",
+                PhpSymbolKind::Method,
+                Some("App\\First"),
+                Visibility::Protected,
+                false,
+            ),
+            make_symbol(
+                "firstPrivate",
+                "App\\First::firstPrivate",
+                PhpSymbolKind::Method,
+                Some("App\\First"),
+                Visibility::Private,
+                false,
+            ),
+            make_symbol(
+                "secondPrivate",
+                "App\\Second::secondPrivate",
+                PhpSymbolKind::Method,
+                Some("App\\Second"),
+                Visibility::Private,
+                false,
+            ),
+        ]);
+        let file_symbols = FileSymbols {
+            symbols: classes,
+            ..Default::default()
+        };
+        let index = WorkspaceIndex::new();
+        index.update_file("file:///two-classes.php", file_symbols.clone());
+        let first_context = CompletionContext::MemberAccess {
+            object_expr: "$this".to_string(),
+            member_prefix: String::new(),
+            class_fqn: Some("App\\First".to_string()),
+            access_mode: MemberAccessMode::Read,
+        };
+
+        let cursorless = provide_completions(&first_context, &index, &file_symbols);
+        let cursorless_labels = cursorless
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(cursorless_labels.contains(&"firstPublic"));
+        assert!(!cursorless_labels.contains(&"firstProtected"));
+        assert!(!cursorless_labels.contains(&"firstPrivate"));
+
+        let in_first =
+            provide_completions_at_range(&first_context, &index, &file_symbols, (4, 8, 4, 8));
+        let first_labels = in_first
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(first_labels.contains(&"firstProtected"));
+        assert!(first_labels.contains(&"firstPrivate"));
+
+        let second_context = CompletionContext::MemberAccess {
+            object_expr: "$this".to_string(),
+            member_prefix: String::new(),
+            class_fqn: Some("App\\Second".to_string()),
+            access_mode: MemberAccessMode::Read,
+        };
+        let in_second =
+            provide_completions_at_range(&second_context, &index, &file_symbols, (14, 8, 14, 8));
+        assert!(in_second.iter().any(|item| item.label == "secondPrivate"));
+        assert!(!in_second.iter().any(|item| item.label == "firstPrivate"));
+    }
 }
 
 #[test]
@@ -1535,7 +1666,7 @@ fn current_file_members_replace_stale_index_generation() {
     let index = WorkspaceIndex::new();
     index.update_file("file:///subject.php", stale_symbols);
 
-    let member_items = provide_completions(
+    let member_items = provide_completions_outside_class_for_test(
         &CompletionContext::MemberAccess {
             object_expr: "$this".to_string(),
             member_prefix: String::new(),
@@ -1552,7 +1683,7 @@ fn current_file_members_replace_stale_index_generation() {
     assert!(member_labels.contains(&"newMethod"));
     assert!(!member_labels.contains(&"oldMethod"));
 
-    let static_items = provide_completions(
+    let static_items = provide_completions_outside_class_for_test(
         &CompletionContext::StaticAccess {
             class_fqn: "App\\Subject".to_string(),
             class_expr: "self".to_string(),

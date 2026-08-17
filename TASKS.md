@@ -5821,3 +5821,16 @@ change.
   - Validation target: focused parser/completion regressions, expanded completion E2E, full relevant suites, parser/completion/server Clippy with `-D warnings`, fmt, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
   - Implemented: added half-open callable selection, scope-aware `$this`, byte-column-safe local-variable offsets, nested callable barriers, closure/arrow capture propagation, and direct unit/E2E coverage for methods, promoted constructors, global scope, by-reference variadics, malformed PHP, and non-ASCII cursors.
   - Validation: 293 parser tests, 52 completion tests, 23 completion E2E, parser/completion/server Clippy with `-D warnings`, fmt, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO after blocking variadic and Unicode-offset regressions were added and fixed.
+
+- [x] **AUDIT-M5-FIX-PLAN-2026-08-17** Detail removal of the cursor-less first-class completion heuristic in `AUDIT-2026-08-07.md`. *(done 2026-08-17)*
+  - Started: 2026-08-17; verify all callers and define a backward-compatible migration from the public range-less provider API.
+  - Validation target: the plan removes first-symbol class inference, makes cursor-less scope behavior conservative, keeps production on the required range-aware API, and covers symbol-order/multi-class regressions; `git diff --check` passes.
+  - Implemented: documented removal of first-class inference, a deprecated conservative compatibility wrapper, mandatory range-aware internal usage, test migration, and multi-class/symbol-order regressions.
+  - Validation: confirmed that all workspace calls outside provider unit tests already use `provide_completions_at_range`; `git diff --check` passed.
+
+- [x] **FIX-COMPLETION-CURSORLESS-CLASS-SCOPE-2026-08-17** Remove first-symbol class inference from the cursor-less completion API. *(done 2026-08-17)*
+  - Started: 2026-08-17; delete `find_current_class_fqn`, deprecate the compatibility wrapper, and make it conservative without a cursor position.
+  - Scope: migrate internal tests/callers to range-aware completion, preserve range-independent behavior, and prove multi-class/private visibility is independent of symbol order; no inferred class without a cursor.
+  - Validation target: completion unit regressions, completion E2E, completion/server Clippy with `-D warnings`, fmt, `git diff --check`, structural caller search, and Verifier GO with `CARGO_BUILD_JOBS=1`.
+  - Implemented: removed first-symbol class inference; deprecated `provide_completions` now passes no class/callable scope, while internal callers/tests use the range-aware API except dedicated conservative compatibility regressions.
+  - Validation: 53 completion tests, 23 completion E2E, completion/server Clippy with `-D warnings`, fmt, `git diff --check`, and structural searches for the removed helper and cursor-less callers passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO.
