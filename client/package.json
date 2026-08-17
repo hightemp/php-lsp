@@ -402,9 +402,10 @@
     "check:cache-path": "node scripts/check-cache-path.mjs",
     "check:commands": "node scripts/check-commands.mjs",
     "check:lifecycle": "node scripts/check-lifecycle.mjs",
+    "check:server-process": "node scripts/check-server-process.mjs",
     "check:vscode-engine": "node scripts/check-vscode-engine.mjs",
     "prepare:package": "node scripts/prepare-package-metadata.mjs",
-    "lint": "npm run check:vscode-engine && npm run check:lifecycle && tsc --noEmit",
+    "lint": "npm run check:vscode-engine && npm run check:lifecycle && npm run check:server-process && tsc --noEmit",
     "package": "vsce package"
   },
   "dependencies": {

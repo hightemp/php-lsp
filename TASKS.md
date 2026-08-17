@@ -5860,3 +5860,16 @@ change.
   - Validation target: focused parser/runner regressions, server analyzer tests, server Clippy with `-D warnings`, fmt, `git diff --check`, structural async-IO search, and Verifier GO with `CARGO_BUILD_JOBS=1`.
   - Implemented: added one-target/candidate-caching path matcher, one owned blocking output processor for PHPStan/Psalm stdout and stderr, preserved status/error orchestration, and replaced runtime-thread existence checks with Tokio metadata.
   - Validation: 204 server lib tests, including multi-file canonical matching, missing/single-file behavior, nonzero/malformed analyzer output, and current-thread offload assertions, plus server Clippy with `-D warnings`, fmt, `git diff --check`, and structural blocking-IO searches passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO after two review passes.
+
+- [x] **AUDIT-M10-FIX-PLAN-2026-08-17** Detail managed server SIGTERM/SIGKILL escalation in `AUDIT-2026-08-07.md`. *(done 2026-08-17)*
+  - Started: 2026-08-17; inspect language-client ownership, stop/restart call paths, Node child-process liveness semantics, cross-platform signals, and available client test harnesses.
+  - Validation target: the plan ignores the misleading `killed` flag after signal delivery, cleans timers/listeners, escalates and waits boundedly, logs final PID state, preserves direct-process Windows behavior, and defines fake-child regressions; `git diff --check` passes.
+  - Implemented: documented an extracted two-phase termination state machine, exit-based liveness, race-safe bounded waits, cross-platform SIGKILL escalation, typed final status/logging, and fake-child lifecycle tests integrated into client lint.
+  - Validation: confirmed direct executable server options, stop/restart callers, immediate `killed` semantics, absence of a current extension process test, and the esbuild-based lifecycle test pattern; `git diff --check` passed.
+
+- [x] **FIX-CLIENT-SERVER-PROCESS-ESCALATION-2026-08-17** Escalate managed server shutdown from SIGTERM to SIGKILL. *(done 2026-08-17)*
+  - Started: 2026-08-17; extract a testable two-phase process termination helper and integrate typed final status into extension lifecycle logging.
+  - Scope: exit-based liveness, signal return/throw handling, bounded TERM/KILL waits, timer/listener cleanup, PID/race logging, Unix/Windows direct-child behavior, and no shell/process-group commands.
+  - Validation target: fake-child process check integrated into client lint, client TypeScript lint, production build, `git diff --check`, and Verifier GO.
+  - Implemented: extracted an exit-based TERM/KILL state machine with bounded race-safe waits, signal failure escalation, PID/state logging and typed results; extension stop lifecycle now distinguishes a stopped client from a still-running managed process.
+  - Validation: fake-child process lifecycle check, full client lint/TypeScript checks, production build, and `git diff --check` passed; Verifier returned GO.

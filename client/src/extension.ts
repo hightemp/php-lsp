@@ -4,6 +4,11 @@ import * as fs from "fs";
 import type { ChildProcess } from "child_process";
 import { phpLspCacheDirForRoot } from "./cachePath";
 import {
+  childProcessIsRunning,
+  type ManagedServerTerminationResult,
+  terminateManagedServerProcess,
+} from "./serverProcess";
+import {
   BoundedRestartTracker,
   DisposableResourceRegistry,
   languageClientFailurePolicy,
@@ -519,37 +524,6 @@ function managedServerProcess(languageClient: LanguageClient): ChildProcess | un
   return (languageClient as unknown as { _serverProcess?: ChildProcess })._serverProcess;
 }
 
-function childProcessIsRunning(childProcess: ChildProcess | undefined): childProcess is ChildProcess {
-  return !!childProcess
-    && childProcess.pid !== undefined
-    && !childProcess.killed
-    && childProcess.exitCode === null
-    && childProcess.signalCode === null;
-}
-
-async function terminateManagedServerProcess(processToTerminate: ChildProcess | undefined, reason: string): Promise<void> {
-  if (!childProcessIsRunning(processToTerminate)) {
-    lifecycleLog(`Fallback process termination skipped: reason=${reason}; process handle unavailable`);
-    return;
-  }
-
-  lifecycleLog(`Fallback process termination requested: reason=${reason}; pid=${processToTerminate.pid}`);
-  try {
-    processToTerminate.kill();
-  } catch (error: unknown) {
-    lifecycleLog(`Fallback process termination failed: reason=${reason}; error=${errorMessage(error)}`);
-    return;
-  }
-
-  await new Promise<void>((resolve) => {
-    const timeout = setTimeout(resolve, 1000);
-    processToTerminate.once("exit", () => {
-      clearTimeout(timeout);
-      resolve();
-    });
-  });
-}
-
 function isBrokenPipeError(error: Error): boolean {
   const message = error.message.toLowerCase();
   return message.includes("epipe")
@@ -1025,19 +999,41 @@ async function stopLanguageClient(reason: string): Promise<void> {
   disposeClientFileWatchers(currentClient, reason);
   lifecycleLog(`Stopping language server: reason=${reason}; timeoutMs=${STOP_TIMEOUT_MS}`);
   try {
+    let terminationResult: ManagedServerTerminationResult | "not-required" = "not-required";
     await currentClient.stop(STOP_TIMEOUT_MS);
     if (childProcessIsRunning(processToTerminate)) {
       lifecycleLog(
         `Language server process still running after stop: reason=${reason}; pid=${processToTerminate?.pid}`,
       );
-      await terminateManagedServerProcess(processToTerminate, reason);
+      terminationResult = await terminateManagedServerProcess(
+        processToTerminate,
+        reason,
+        lifecycleLog,
+      );
     }
-    lifecycleLog(`Stopped language server: reason=${reason}`);
+    if (terminationResult === "still-running") {
+      lifecycleLog(
+        `Language client stopped but managed server process remains alive: reason=${reason}; pid=${processToTerminate?.pid}`,
+      );
+    } else {
+      lifecycleLog(
+        `Stopped language server: reason=${reason}; processTermination=${terminationResult}`,
+      );
+    }
   } catch (error: unknown) {
     lifecycleLog(
       `Stop failed or timed out: reason=${reason}; error=${errorMessage(error)}; managed process termination requested when available`,
     );
-    await terminateManagedServerProcess(processToTerminate, reason);
+    const terminationResult = await terminateManagedServerProcess(
+      processToTerminate,
+      reason,
+      lifecycleLog,
+    );
+    if (terminationResult === "still-running") {
+      lifecycleLog(
+        `Stop fallback exhausted with managed server process still alive: reason=${reason}; pid=${processToTerminate?.pid}`,
+      );
+    }
   } finally {
     try {
       await currentClient.dispose(STOP_TIMEOUT_MS);
