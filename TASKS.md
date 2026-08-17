@@ -5873,3 +5873,16 @@ change.
   - Validation target: fake-child process check integrated into client lint, client TypeScript lint, production build, `git diff --check`, and Verifier GO.
   - Implemented: extracted an exit-based TERM/KILL state machine with bounded race-safe waits, signal failure escalation, PID/state logging and typed results; extension stop lifecycle now distinguishes a stopped client from a still-running managed process.
   - Validation: fake-child process lifecycle check, full client lint/TypeScript checks, production build, and `git diff --check` passed; Verifier returned GO.
+
+- [x] **AUDIT-M11-FIX-PLAN-2026-08-17** Detail reset-safe layered configuration snapshots in `AUDIT-2026-08-07.md`. *(done 2026-08-17)*
+  - Started: 2026-08-17; trace explicit VS Code settings, initialization/change payloads, global/project/client merge precedence, runtime defaults, and side-effect detection.
+  - Validation target: the plan resets removed client overrides to project/global/server defaults without sending VS Code defaults that mask project config, resolves every runtime field from a fresh typed default, preserves empty-versus-absent stubs semantics, and covers client/server/E2E reset regressions; `git diff --check` passes.
+  - Implemented: documented sparse explicit-client snapshots, typed default-based server resolution, preserved global/project/client precedence and aliases, full-field diff application, client builder extraction, and unit/E2E reset coverage.
+  - Validation: confirmed the client `inspect`/payload behavior, effective merge order, all runtime state fields and their defaults, formatting/analyzer partial-current inheritance, stubs absent/empty distinction, and existing configuration E2E path; `git diff --check` passed.
+
+- [x] **FIX-LAYERED-CONFIGURATION-RESET-2026-08-17** Reset removed client settings through a fresh layered runtime snapshot. *(done 2026-08-17)*
+  - Started: 2026-08-17; resolve every runtime field from typed defaults plus global/project/explicit-client settings and keep the client payload sparse.
+  - Scope: diagnostics, indexing, paths, stubs absent/empty/path, logging, formatting, PHPStan, Psalm, analyzer actions, command-trust precedence, side-effect flags, initialize/didChange parity, and no VS Code defaults masking project config.
+  - Validation target: client explicit-settings check, client lint/build, server unit reset matrix, initialize/configuration E2E resets and project fallback, server lib/E2E tests, server Clippy with `-D warnings`, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
+  - Implemented: extracted one sparse explicit-client snapshot builder for initialize/didChange and added a typed server resolver that rebuilds every runtime field from defaults plus the effective global/project/client merge before diffing state and side effects.
+  - Validation: client snapshot regression check, full client lint/build, server reset/project-fallback unit tests, `e2e_initialize` (5/5), server lib tests (206/206), Clippy `--all-targets -D warnings`, formatting, and `git diff --check` passed with one build job; Verifier returned GO.

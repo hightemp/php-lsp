@@ -1197,7 +1197,186 @@ impl Default for DiagnosticsRuntimeConfig {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRuntimeConfiguration {
+    php_version: PhpVersion,
+    diagnostics_mode: DiagnosticsMode,
+    diagnostic_severity: DiagnosticSeverityConfig,
+    diagnostic_budget: DiagnosticBudgetConfig,
+    composer_enabled: bool,
+    index_vendor: bool,
+    include_paths: Vec<PathBuf>,
+    exclude_paths: Vec<PathBuf>,
+    stub_extensions: Option<Vec<String>>,
+    log_level: String,
+    stubs_path: Option<PathBuf>,
+    formatting: FormattingConfig,
+    phpstan: PhpStanConfig,
+    psalm: PsalmConfig,
+    analyzer_code_actions: AnalyzerCodeActionConfig,
+}
+
+impl Default for ResolvedRuntimeConfiguration {
+    fn default() -> Self {
+        Self {
+            php_version: PhpVersion::DEFAULT,
+            diagnostics_mode: DiagnosticsMode::default(),
+            diagnostic_severity: DiagnosticSeverityConfig::default(),
+            diagnostic_budget: DiagnosticBudgetConfig::default(),
+            composer_enabled: true,
+            index_vendor: true,
+            include_paths: Vec::new(),
+            exclude_paths: Vec::new(),
+            stub_extensions: None,
+            log_level: "info".to_string(),
+            stubs_path: None,
+            formatting: FormattingConfig::default(),
+            phpstan: PhpStanConfig::default(),
+            psalm: PsalmConfig::default(),
+            analyzer_code_actions: AnalyzerCodeActionConfig::default(),
+        }
+    }
+}
+
+impl ResolvedRuntimeConfiguration {
+    fn from_settings(raw_settings: &serde_json::Value) -> Self {
+        let settings = php_lsp_settings(raw_settings);
+        let mut resolved = Self::default();
+
+        if let Some(raw) = settings_string(settings, "phpVersion", &["phpVersion"]) {
+            if let Some(parsed) = PhpVersion::parse(raw) {
+                resolved.php_version = parsed;
+            } else {
+                tracing::warn!("Ignoring invalid phpVersion: {}", raw);
+            }
+        }
+        if let Some(raw) = settings_string(settings, "diagnosticsMode", &["diagnostics", "mode"]) {
+            if let Some(parsed) = DiagnosticsMode::parse(raw) {
+                resolved.diagnostics_mode = parsed;
+            } else {
+                tracing::warn!("Ignoring invalid diagnostics mode: {}", raw);
+            }
+        }
+        if let Some(raw) = settings_value(
+            settings,
+            "diagnosticsSeverity",
+            &["diagnostics", "severity"],
+        ) {
+            if let Some(parsed) = DiagnosticSeverityConfig::parse(raw) {
+                resolved.diagnostic_severity = parsed;
+            } else {
+                tracing::warn!("Ignoring invalid diagnostics severity settings: {raw}");
+            }
+        }
+        resolved.diagnostic_budget = diagnostic_budget_config_from_settings(settings);
+
+        if let Some(enabled) = settings_bool(settings, "composerEnabled", &["composer", "enabled"])
+        {
+            resolved.composer_enabled = enabled;
+        }
+        if let Some(enabled) = settings_bool(settings, "indexVendor", &["indexVendor"]) {
+            resolved.index_vendor = enabled;
+        }
+        if let Some(paths) = settings_string_array(settings, "includePaths", &["includePaths"]) {
+            resolved.include_paths = normalize_config_paths(paths);
+        }
+        if let Some(paths) = settings_string_array(settings, "excludePaths", &["excludePaths"]) {
+            resolved.exclude_paths = normalize_config_paths(paths);
+        }
+        resolved.stub_extensions =
+            settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
+        if let Some(level) = settings_string(settings, "logLevel", &["logLevel"]) {
+            resolved.log_level = level.trim().to_ascii_lowercase();
+        }
+        resolved.stubs_path = settings_string_aliases(
+            settings,
+            "stubsPath",
+            &[&["stubs", "path"], &["bundledStubsPath"]],
+        )
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+
+        let formatting_defaults = FormattingConfig::default();
+        let formatting_provider =
+            settings_string(settings, "formattingProvider", &["formatting", "provider"]);
+        let formatting_command =
+            settings_value(settings, "formattingCommand", &["formatting", "command"])
+                .and_then(serde_json::Value::as_str);
+        let formatting_timeout_ms = settings_u64_aliases(
+            settings,
+            "formattingTimeoutMs",
+            &[&["formatting", "timeoutMs"], &["formatting", "timeout"]],
+        );
+        let formatting_provider = formatting_provider.map(str::to_string).unwrap_or_else(|| {
+            if formatting_command.is_some() {
+                "custom".to_string()
+            } else {
+                formatting_defaults.provider.clone()
+            }
+        });
+        resolved.formatting = FormattingConfig::from_options(
+            Some(&formatting_provider),
+            formatting_command,
+            formatting_timeout_ms.or(Some(formatting_defaults.timeout_ms)),
+        );
+
+        if let Some(enabled) = settings_bool(settings, "phpstanEnabled", &["phpstan", "enabled"]) {
+            resolved.phpstan.enabled = enabled;
+        }
+        if let Some(command) = settings_string(settings, "phpstanCommand", &["phpstan", "command"])
+        {
+            let command = command.trim();
+            if !command.is_empty() {
+                resolved.phpstan.command = command.to_string();
+            }
+        }
+        if let Some(timeout_ms) = settings_u64_aliases(
+            settings,
+            "phpstanTimeoutMs",
+            &[&["phpstan", "timeoutMs"], &["phpstan", "timeout"]],
+        ) {
+            resolved.phpstan.timeout_ms = timeout_ms.max(1_000);
+        }
+        if let Some(memory_limit) = settings_string_aliases(
+            settings,
+            "phpstanMemoryLimit",
+            &[&["phpstan", "memoryLimit"], &["phpstan", "memory_limit"]],
+        ) {
+            let memory_limit = memory_limit.trim();
+            resolved.phpstan.memory_limit =
+                (!memory_limit.is_empty()).then(|| memory_limit.to_string());
+        }
+
+        if let Some(enabled) = settings_bool(settings, "psalmEnabled", &["psalm", "enabled"]) {
+            resolved.psalm.enabled = enabled;
+        }
+        if let Some(command) = settings_string(settings, "psalmCommand", &["psalm", "command"]) {
+            let command = command.trim();
+            if !command.is_empty() {
+                resolved.psalm.command = command.to_string();
+            }
+        }
+        if let Some(timeout_ms) = settings_u64_aliases(
+            settings,
+            "psalmTimeoutMs",
+            &[&["psalm", "timeoutMs"], &["psalm", "timeout"]],
+        ) {
+            resolved.psalm.timeout_ms = timeout_ms.max(1_000);
+        }
+        if let Some(enabled) = settings_bool(
+            settings,
+            "analyzerCodeActionsEnabled",
+            &["analyzerCodeActions", "enabled"],
+        ) {
+            resolved.analyzer_code_actions.enabled = enabled;
+        }
+
+        resolved
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
 struct AppliedConfiguration {
     diagnostics_changed: bool,
     stubs_changed: bool,
@@ -1514,10 +1693,6 @@ pub(crate) fn normalize_config_paths(paths: Vec<String>) -> Vec<PathBuf> {
             (!path.is_empty()).then(|| normalize_path(Path::new(path)))
         })
         .collect()
-}
-
-fn settings_u64(settings: &serde_json::Value, flat_key: &str, nested_path: &[&str]) -> Option<u64> {
-    settings_value(settings, flat_key, nested_path).and_then(|value| value.as_u64())
 }
 
 fn settings_string_aliases<'a>(
@@ -2102,283 +2277,139 @@ impl PhpLspBackend {
         &self,
         raw_settings: &serde_json::Value,
     ) -> AppliedConfiguration {
-        let settings = php_lsp_settings(raw_settings);
+        let ResolvedRuntimeConfiguration {
+            php_version,
+            diagnostics_mode,
+            diagnostic_severity,
+            diagnostic_budget,
+            composer_enabled,
+            index_vendor,
+            include_paths,
+            exclude_paths,
+            stub_extensions,
+            log_level,
+            stubs_path,
+            formatting,
+            phpstan,
+            psalm,
+            analyzer_code_actions,
+        } = ResolvedRuntimeConfiguration::from_settings(raw_settings);
         let mut applied = AppliedConfiguration::default();
 
-        if let Some(raw_php_version) = settings_string(settings, "phpVersion", &["phpVersion"]) {
-            if let Some(parsed) = PhpVersion::parse(raw_php_version) {
-                let mut php_version = self.php_version.lock().await;
-                if *php_version != parsed {
-                    *php_version = parsed;
-                    applied.diagnostics_changed = true;
-                    applied.stubs_changed = true;
-                }
-            } else {
-                tracing::warn!("Ignoring invalid phpVersion: {}", raw_php_version);
-            }
-        }
-
-        if let Some(raw_mode) =
-            settings_string(settings, "diagnosticsMode", &["diagnostics", "mode"])
         {
-            if let Some(parsed) = DiagnosticsMode::parse(raw_mode) {
-                let mut diagnostics_mode = self.diagnostics_mode.lock().await;
-                if *diagnostics_mode != parsed {
-                    *diagnostics_mode = parsed;
-                    applied.diagnostics_changed = true;
-                }
-            } else {
-                tracing::warn!("Ignoring invalid diagnostics mode: {}", raw_mode);
+            let mut current = self.php_version.lock().await;
+            if *current != php_version {
+                *current = php_version;
+                applied.diagnostics_changed = true;
+                applied.stubs_changed = true;
             }
         }
-
-        if let Some(raw_severity) = settings_value(
-            settings,
-            "diagnosticsSeverity",
-            &["diagnostics", "severity"],
-        ) {
-            if let Some(parsed) = DiagnosticSeverityConfig::parse(raw_severity) {
-                let mut diagnostic_severity = self.diagnostic_severity.lock().await;
-                if *diagnostic_severity != parsed {
-                    *diagnostic_severity = parsed;
-                    applied.diagnostics_changed = true;
-                }
-            } else {
-                tracing::warn!("Ignoring invalid diagnostics severity settings: {raw_severity}");
-            }
-        }
-
-        let raw_member_type_node_budget = diagnostic_member_type_node_budget_setting(settings);
-        let partial_analysis_diagnostic = settings_bool(
-            settings,
-            "diagnosticsPartialAnalysisDiagnostic",
-            &["diagnostics", "partialAnalysisDiagnostic"],
-        );
-        if raw_member_type_node_budget.is_some() || partial_analysis_diagnostic.is_some() {
-            let current = *self.diagnostic_budget.lock().await;
-            let mut next = current;
-
-            if let Some(raw_budget) = raw_member_type_node_budget {
-                if let Some(parsed) = diagnostic_member_type_node_budget_from_u64(raw_budget) {
-                    next.member_type_node_budget = parsed;
-                } else {
-                    tracing::warn!(
-                        "Ignoring diagnostics member/type node budget that exceeds this platform: {raw_budget}"
-                    );
-                }
-            }
-
-            if let Some(enabled) = partial_analysis_diagnostic {
-                next.partial_analysis_diagnostic = enabled;
-            }
-
-            if next != current {
-                *self.diagnostic_budget.lock().await = next;
+        {
+            let mut current = self.diagnostics_mode.lock().await;
+            if *current != diagnostics_mode {
+                *current = diagnostics_mode;
                 applied.diagnostics_changed = true;
             }
         }
-
-        if let Some(enabled) = settings_bool(settings, "composerEnabled", &["composer", "enabled"])
         {
-            let mut composer_enabled = self.composer_enabled.lock().await;
-            if *composer_enabled != enabled {
-                *composer_enabled = enabled;
-                applied.indexing_changed = true;
+            let mut current = self.diagnostic_severity.lock().await;
+            if *current != diagnostic_severity {
+                *current = diagnostic_severity;
+                applied.diagnostics_changed = true;
             }
         }
-
-        if let Some(enabled) = settings_bool(settings, "indexVendor", &["indexVendor"]) {
-            let changed = {
-                let mut index_vendor = self.index_vendor.lock().await;
-                if *index_vendor != enabled {
-                    *index_vendor = enabled;
-                    true
-                } else {
-                    false
-                }
-            };
-            if changed {
-                applied.indexing_changed = true;
-                if !enabled {
-                    self.vendor_autoload_cache.lock().await.clear();
-                    let evicted = self.vendor_file_lru.lock().await.clear();
-                    for uri in evicted {
-                        self.index.remove_file(&uri);
-                    }
-                    let roots = self.workspace_roots.lock().await.clone();
-                    remove_indexed_vendor_symbols(&self.index, &roots);
-                }
-            }
-        }
-
-        if let Some(paths) = settings_string_array(settings, "includePaths", &["includePaths"]) {
-            let paths = normalize_config_paths(paths);
-            let mut include_paths = self.include_paths.lock().await;
-            if *include_paths != paths {
-                *include_paths = paths;
-                applied.indexing_changed = true;
-            }
-        }
-
-        if let Some(paths) = settings_string_array(settings, "excludePaths", &["excludePaths"]) {
-            let paths = normalize_config_paths(paths);
-            let mut exclude_paths = self.exclude_paths.lock().await;
-            if *exclude_paths != paths {
-                *exclude_paths = paths;
-                applied.indexing_changed = true;
-            }
-        }
-
-        let next_stub_extensions =
-            settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
         {
-            let mut stub_extensions = self.stub_extensions.lock().await;
-            if *stub_extensions != next_stub_extensions {
-                *stub_extensions = next_stub_extensions;
+            let mut current = self.diagnostic_budget.lock().await;
+            if *current != diagnostic_budget {
+                *current = diagnostic_budget;
+                applied.diagnostics_changed = true;
+            }
+        }
+        {
+            let mut current = self.composer_enabled.lock().await;
+            if *current != composer_enabled {
+                *current = composer_enabled;
+                applied.indexing_changed = true;
+            }
+        }
+
+        let index_vendor_changed = {
+            let mut current = self.index_vendor.lock().await;
+            if *current != index_vendor {
+                *current = index_vendor;
+                true
+            } else {
+                false
+            }
+        };
+        if index_vendor_changed {
+            applied.indexing_changed = true;
+            if !index_vendor {
+                self.vendor_autoload_cache.lock().await.clear();
+                let evicted = self.vendor_file_lru.lock().await.clear();
+                for uri in evicted {
+                    self.index.remove_file(&uri);
+                }
+                let roots = self.workspace_roots.lock().await.clone();
+                remove_indexed_vendor_symbols(&self.index, &roots);
+            }
+        }
+
+        {
+            let mut current = self.include_paths.lock().await;
+            if *current != include_paths {
+                *current = include_paths;
+                applied.indexing_changed = true;
+            }
+        }
+        {
+            let mut current = self.exclude_paths.lock().await;
+            if *current != exclude_paths {
+                *current = exclude_paths;
+                applied.indexing_changed = true;
+            }
+        }
+        {
+            let mut current = self.stub_extensions.lock().await;
+            if *current != stub_extensions {
+                *current = stub_extensions;
+                applied.stubs_changed = true;
+            }
+        }
+        {
+            let mut current = self.stubs_path.lock().await;
+            if *current != stubs_path {
+                *current = stubs_path;
                 applied.stubs_changed = true;
             }
         }
 
-        if let Some(log_level) = settings_string(settings, "logLevel", &["logLevel"]) {
-            *self.log_level.lock().await = log_level.trim().to_ascii_lowercase();
-        }
+        *self.log_level.lock().await = log_level;
 
-        if let Some(stubs_path) = settings_string_aliases(
-            settings,
-            "stubsPath",
-            &[&["stubs", "path"], &["bundledStubsPath"]],
-        ) {
-            let next_path = if stubs_path.trim().is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(stubs_path))
-            };
-            let mut current_path = self.stubs_path.lock().await;
-            if *current_path != next_path {
-                *current_path = next_path;
-                applied.stubs_changed = true;
-            }
-        }
-
-        let formatting_provider =
-            settings_string(settings, "formattingProvider", &["formatting", "provider"]);
-        let formatting_command =
-            settings_value(settings, "formattingCommand", &["formatting", "command"])
-                .and_then(|value| value.as_str());
-        let formatting_timeout_ms = settings_u64_aliases(
-            settings,
-            "formattingTimeoutMs",
-            &[&["formatting", "timeoutMs"], &["formatting", "timeout"]],
-        );
-        if formatting_provider.is_some()
-            || formatting_command.is_some()
-            || formatting_timeout_ms.is_some()
         {
-            let current = self.formatting_config.lock().await.clone();
-            let next_config = {
-                let provider = formatting_provider.map(str::to_string).unwrap_or_else(|| {
-                    if formatting_command.is_some() {
-                        "custom".to_string()
-                    } else {
-                        current.provider.clone()
-                    }
-                });
-                let command = if formatting_command.is_some() {
-                    formatting_command
-                } else if formatting_provider.is_some() && provider != current.provider {
-                    None
-                } else {
-                    current.command.as_deref()
-                };
-                FormattingConfig::from_options(
-                    Some(&provider),
-                    command,
-                    formatting_timeout_ms.or(Some(current.timeout_ms)),
-                )
-            };
-            *self.formatting_config.lock().await = next_config;
+            let mut current = self.formatting_config.lock().await;
+            if *current != formatting {
+                *current = formatting;
+            }
         }
-
-        let phpstan_enabled = settings_bool(settings, "phpstanEnabled", &["phpstan", "enabled"]);
-        let phpstan_command = settings_string(settings, "phpstanCommand", &["phpstan", "command"]);
-        let phpstan_timeout_ms =
-            settings_u64(settings, "phpstanTimeoutMs", &["phpstan", "timeoutMs"]);
-        let phpstan_memory_limit = settings_string_aliases(
-            settings,
-            "phpstanMemoryLimit",
-            &[&["phpstan", "memoryLimit"], &["phpstan", "memory_limit"]],
-        );
-
-        if phpstan_enabled.is_some()
-            || phpstan_command.is_some()
-            || phpstan_timeout_ms.is_some()
-            || phpstan_memory_limit.is_some()
         {
-            let current = self.phpstan_config.lock().await.clone();
-            let mut next_config = current.clone();
-            if let Some(enabled) = phpstan_enabled {
-                next_config.enabled = enabled;
-            }
-            if let Some(command) = phpstan_command {
-                let command = command.trim();
-                if command.is_empty() {
-                    next_config.command = PhpStanConfig::default().command;
-                } else {
-                    next_config.command = command.to_string();
-                }
-            }
-            if let Some(timeout_ms) = phpstan_timeout_ms {
-                next_config.timeout_ms = timeout_ms.max(1_000);
-            }
-            if let Some(memory_limit) = phpstan_memory_limit {
-                let memory_limit = memory_limit.trim();
-                next_config.memory_limit =
-                    (!memory_limit.is_empty()).then(|| memory_limit.to_string());
-            }
-
-            if next_config != current {
-                *self.phpstan_config.lock().await = next_config;
+            let mut current = self.phpstan_config.lock().await;
+            if *current != phpstan {
+                *current = phpstan;
                 applied.diagnostics_changed = true;
             }
         }
-
-        let psalm_enabled = settings_bool(settings, "psalmEnabled", &["psalm", "enabled"]);
-        let psalm_command = settings_string(settings, "psalmCommand", &["psalm", "command"]);
-        let psalm_timeout_ms = settings_u64(settings, "psalmTimeoutMs", &["psalm", "timeoutMs"]);
-
-        if psalm_enabled.is_some() || psalm_command.is_some() || psalm_timeout_ms.is_some() {
-            let current = self.psalm_config.lock().await.clone();
-            let mut next_config = current.clone();
-            if let Some(enabled) = psalm_enabled {
-                next_config.enabled = enabled;
-            }
-            if let Some(command) = psalm_command {
-                let command = command.trim();
-                if command.is_empty() {
-                    next_config.command = PsalmConfig::default().command;
-                } else {
-                    next_config.command = command.to_string();
-                }
-            }
-            if let Some(timeout_ms) = psalm_timeout_ms {
-                next_config.timeout_ms = timeout_ms.max(1_000);
-            }
-
-            if next_config != current {
-                *self.psalm_config.lock().await = next_config;
+        {
+            let mut current = self.psalm_config.lock().await;
+            if *current != psalm {
+                *current = psalm;
                 applied.diagnostics_changed = true;
             }
         }
-
-        if let Some(enabled) = settings_bool(
-            settings,
-            "analyzerCodeActionsEnabled",
-            &["analyzerCodeActions", "enabled"],
-        ) {
-            let mut analyzer_code_actions = self.analyzer_code_actions.lock().await;
-            let next_config = AnalyzerCodeActionConfig { enabled };
-            if *analyzer_code_actions != next_config {
-                *analyzer_code_actions = next_config;
+        {
+            let mut current = self.analyzer_code_actions.lock().await;
+            if *current != analyzer_code_actions {
+                *current = analyzer_code_actions;
             }
         }
 

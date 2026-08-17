@@ -3,6 +3,7 @@ import * as os from "os";
 import * as fs from "fs";
 import type { ChildProcess } from "child_process";
 import { phpLspCacheDirForRoot } from "./cachePath";
+import { buildExplicitClientSettings } from "./configuration";
 import {
   childProcessIsRunning,
   type ManagedServerTerminationResult,
@@ -814,93 +815,6 @@ function getStubsPath(context: ExtensionContext): string | undefined {
   return undefined;
 }
 
-function hasConfiguredValue(config: ReturnType<typeof workspace.getConfiguration>, key: string): boolean {
-  const inspected = config.inspect<unknown>(key);
-  return inspected !== undefined && (
-    inspected.globalValue !== undefined ||
-    inspected.workspaceValue !== undefined ||
-    inspected.workspaceFolderValue !== undefined ||
-    inspected.globalLanguageValue !== undefined ||
-    inspected.workspaceLanguageValue !== undefined ||
-    inspected.workspaceFolderLanguageValue !== undefined
-  );
-}
-
-function setIfConfigured<T>(
-  target: Record<string, unknown>,
-  config: ReturnType<typeof workspace.getConfiguration>,
-  key: string,
-  optionKey: string,
-  defaultValue: T,
-): void {
-  if (hasConfiguredValue(config, key)) {
-    target[optionKey] = config.get<T>(key, defaultValue);
-  }
-}
-
-function buildInitializationOptions(config: ReturnType<typeof workspace.getConfiguration>, stubsPath: string | undefined): Record<string, unknown> {
-  const options: Record<string, unknown> = {};
-
-  setIfConfigured(options, config, "phpVersion", "phpVersion", "8.2");
-  setIfConfigured(options, config, "diagnostics.mode", "diagnosticsMode", "basic-semantic");
-  setIfConfigured(options, config, "diagnostics.severity", "diagnosticsSeverity", {});
-  setIfConfigured(
-    options,
-    config,
-    "diagnostics.memberTypeNodeBudget",
-    "diagnosticsMemberTypeNodeBudget",
-    512,
-  );
-  setIfConfigured(
-    options,
-    config,
-    "diagnostics.partialAnalysisDiagnostic",
-    "diagnosticsPartialAnalysisDiagnostic",
-    true,
-  );
-  setIfConfigured(options, config, "composer.enabled", "composerEnabled", true);
-  setIfConfigured(options, config, "indexVendor", "indexVendor", true);
-  setIfConfigured(options, config, "includePaths", "includePaths", []);
-  setIfConfigured(options, config, "excludePaths", "excludePaths", []);
-  setIfConfigured(options, config, "stubs.extensions", "stubExtensions", []);
-  setIfConfigured(options, config, "logLevel", "logLevel", "info");
-  setIfConfigured(options, config, "allowProjectCommands", "allowProjectCommands", false);
-  setIfConfigured(options, config, "formatting.provider", "formattingProvider", "auto");
-  setIfConfigured(options, config, "formatting.command", "formattingCommand", "");
-  setIfConfigured(options, config, "formatting.timeoutMs", "formattingTimeoutMs", 30000);
-  setIfConfigured(options, config, "phpstan.enabled", "phpstanEnabled", false);
-  setIfConfigured(
-    options,
-    config,
-    "phpstan.command",
-    "phpstanCommand",
-    "vendor/bin/phpstan analyse --error-format=json --no-progress --no-interaction {file}",
-  );
-  setIfConfigured(options, config, "phpstan.timeoutMs", "phpstanTimeoutMs", 30000);
-  setIfConfigured(options, config, "psalm.enabled", "psalmEnabled", false);
-  setIfConfigured(
-    options,
-    config,
-    "psalm.command",
-    "psalmCommand",
-    "vendor/bin/psalm --output-format=json --no-progress {file}",
-  );
-  setIfConfigured(options, config, "psalm.timeoutMs", "psalmTimeoutMs", 30000);
-  setIfConfigured(
-    options,
-    config,
-    "analyzerCodeActions.enabled",
-    "analyzerCodeActionsEnabled",
-    false,
-  );
-
-  if (stubsPath) {
-    options.bundledStubsPath = stubsPath;
-  }
-
-  return options;
-}
-
 function createLanguageClient(context: ExtensionContext, binary: ServerBinaryResolution): LanguageClient {
   const config = workspace.getConfiguration("phpLsp");
   const stubsPath = getStubsPath(context);
@@ -940,7 +854,7 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
     synchronize: {
       fileEvents,
     },
-    initializationOptions: buildInitializationOptions(config, stubsPath),
+    initializationOptions: buildExplicitClientSettings(config, stubsPath),
     errorHandler: createClientErrorHandler(() => languageClient),
   };
 
@@ -978,7 +892,7 @@ async function notifyServerConfigurationChanged(context: ExtensionContext): Prom
 
   const config = workspace.getConfiguration("phpLsp");
   await client.sendNotification("workspace/didChangeConfiguration", {
-    settings: buildInitializationOptions(config, getStubsPath(context)),
+    settings: buildExplicitClientSettings(config, getStubsPath(context)),
   });
 }
 

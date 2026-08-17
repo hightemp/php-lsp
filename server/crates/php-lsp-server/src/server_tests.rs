@@ -5466,6 +5466,188 @@ fn test_formatting_provider_none_disables_stale_command() {
     );
 }
 
+#[tokio::test]
+async fn test_runtime_configuration_resets_missing_fields_to_typed_defaults() {
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let custom = serde_json::json!({
+        "phpVersion": "7.4",
+        "diagnosticsMode": "off",
+        "diagnosticsSeverity": "error",
+        "diagnosticsMemberTypeNodeBudget": 0,
+        "diagnosticsPartialAnalysisDiagnostic": false,
+        "composerEnabled": false,
+        "indexVendor": false,
+        "includePaths": ["src", "packages"],
+        "excludePaths": ["generated"],
+        "stubExtensions": [],
+        "logLevel": "debug",
+        "stubsPath": "/custom/stubs",
+        "formattingProvider": "custom",
+        "formattingCommand": "vendor/bin/fmt {file}",
+        "formattingTimeoutMs": 1500,
+        "phpstanEnabled": true,
+        "phpstanCommand": "vendor/bin/phpstan-custom {file}",
+        "phpstanTimeoutMs": 1600,
+        "phpstanMemoryLimit": "1G",
+        "psalmEnabled": true,
+        "psalmCommand": "vendor/bin/psalm-custom {file}",
+        "psalmTimeoutMs": 1700,
+        "analyzerCodeActionsEnabled": true
+    });
+
+    let applied = backend.apply_configuration_settings(&custom).await;
+    assert_eq!(
+        applied,
+        AppliedConfiguration {
+            diagnostics_changed: true,
+            stubs_changed: true,
+            indexing_changed: true,
+        }
+    );
+    assert_eq!(
+        *backend.php_version.lock().await,
+        PhpVersion::parse("7.4").unwrap()
+    );
+    assert_eq!(*backend.diagnostics_mode.lock().await, DiagnosticsMode::Off);
+    assert_eq!(
+        backend
+            .diagnostic_budget
+            .lock()
+            .await
+            .member_type_node_budget,
+        None
+    );
+    assert!(
+        !backend
+            .diagnostic_budget
+            .lock()
+            .await
+            .partial_analysis_diagnostic
+    );
+    assert!(!*backend.composer_enabled.lock().await);
+    assert!(!*backend.index_vendor.lock().await);
+    assert_eq!(
+        *backend.include_paths.lock().await,
+        vec![PathBuf::from("src"), PathBuf::from("packages")]
+    );
+    assert_eq!(
+        *backend.exclude_paths.lock().await,
+        vec![PathBuf::from("generated")]
+    );
+    assert_eq!(*backend.stub_extensions.lock().await, Some(Vec::new()));
+    assert_eq!(backend.log_level.lock().await.as_str(), "debug");
+    assert_eq!(
+        *backend.stubs_path.lock().await,
+        Some(PathBuf::from("/custom/stubs"))
+    );
+    assert_eq!(
+        *backend.formatting_config.lock().await,
+        FormattingConfig::from_options(Some("custom"), Some("vendor/bin/fmt {file}"), Some(1500),)
+    );
+    assert_eq!(
+        *backend.phpstan_config.lock().await,
+        PhpStanConfig {
+            enabled: true,
+            command: "vendor/bin/phpstan-custom {file}".to_string(),
+            timeout_ms: 1600,
+            memory_limit: Some("1G".to_string()),
+        }
+    );
+    assert_eq!(
+        *backend.psalm_config.lock().await,
+        PsalmConfig {
+            enabled: true,
+            command: "vendor/bin/psalm-custom {file}".to_string(),
+            timeout_ms: 1700,
+        }
+    );
+    assert!(backend.analyzer_code_actions.lock().await.enabled);
+
+    let reset = backend
+        .apply_configuration_settings(&serde_json::json!({}))
+        .await;
+    assert_eq!(
+        reset,
+        AppliedConfiguration {
+            diagnostics_changed: true,
+            stubs_changed: true,
+            indexing_changed: true,
+        }
+    );
+    assert_eq!(*backend.php_version.lock().await, PhpVersion::DEFAULT);
+    assert_eq!(
+        *backend.diagnostics_mode.lock().await,
+        DiagnosticsMode::default()
+    );
+    assert_eq!(
+        *backend.diagnostic_severity.lock().await,
+        DiagnosticSeverityConfig::default()
+    );
+    assert_eq!(
+        *backend.diagnostic_budget.lock().await,
+        DiagnosticBudgetConfig::default()
+    );
+    assert!(*backend.composer_enabled.lock().await);
+    assert!(*backend.index_vendor.lock().await);
+    assert!(backend.include_paths.lock().await.is_empty());
+    assert!(backend.exclude_paths.lock().await.is_empty());
+    assert_eq!(*backend.stub_extensions.lock().await, None);
+    assert_eq!(backend.log_level.lock().await.as_str(), "info");
+    assert_eq!(*backend.stubs_path.lock().await, None);
+    assert_eq!(
+        *backend.formatting_config.lock().await,
+        FormattingConfig::default()
+    );
+    assert_eq!(
+        *backend.phpstan_config.lock().await,
+        PhpStanConfig::default()
+    );
+    assert_eq!(*backend.psalm_config.lock().await, PsalmConfig::default());
+    assert_eq!(
+        *backend.analyzer_code_actions.lock().await,
+        AnalyzerCodeActionConfig::default()
+    );
+}
+
+#[test]
+fn test_resolved_runtime_configuration_reveals_project_values_after_client_reset() {
+    let project = serde_json::json!({
+        "phpVersion": "7.4",
+        "diagnostics": { "mode": "syntax-only" },
+        "formatting": { "provider": "pint", "timeout": 2400 },
+        "phpstan": { "timeout": 2500, "memory_limit": "2G" },
+        "psalm": { "timeout": 2600 },
+        "stubs": { "extensions": ["Core"] }
+    });
+    let mut with_client_override = project.clone();
+    merge_json_objects(
+        &mut with_client_override,
+        &serde_json::json!({
+            "phpVersion": "8.3",
+            "diagnosticsMode": "off",
+            "formattingProvider": "none",
+            "stubExtensions": []
+        }),
+    );
+
+    let overridden = ResolvedRuntimeConfiguration::from_settings(&with_client_override);
+    assert_eq!(overridden.php_version, PhpVersion::parse("8.3").unwrap());
+    assert_eq!(overridden.diagnostics_mode, DiagnosticsMode::Off);
+    assert_eq!(overridden.formatting.provider, "none");
+    assert_eq!(overridden.stub_extensions, Some(Vec::new()));
+
+    let revealed = ResolvedRuntimeConfiguration::from_settings(&project);
+    assert_eq!(revealed.php_version, PhpVersion::parse("7.4").unwrap());
+    assert_eq!(revealed.diagnostics_mode, DiagnosticsMode::SyntaxOnly);
+    assert_eq!(revealed.formatting.provider, "pint");
+    assert_eq!(revealed.formatting.timeout_ms, 2400);
+    assert_eq!(revealed.phpstan.timeout_ms, 2500);
+    assert_eq!(revealed.phpstan.memory_limit.as_deref(), Some("2G"));
+    assert_eq!(revealed.psalm.timeout_ms, 2600);
+    assert_eq!(revealed.stub_extensions, Some(vec!["Core".to_string()]));
+}
+
 #[test]
 fn test_framework_string_key_cache_evicts_lru_entries() {
     fn key(root: &str, domain: &str) -> FrameworkStringKeyCacheKey {

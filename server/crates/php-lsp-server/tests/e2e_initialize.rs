@@ -357,7 +357,11 @@ async fn test_project_config_controls_diagnostics_and_reloads_on_watch() {
         .ready()
         .await
         .unwrap()
-        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .call(initialize_request_with_options(
+            1,
+            Some(&root_uri),
+            Some(json!({ "diagnosticsMode": "syntax-only" })),
+        ))
         .await
         .unwrap();
 
@@ -372,12 +376,31 @@ async fn test_project_config_controls_diagnostics_and_reloads_on_watch() {
         .await
         .unwrap();
 
+    let client_override =
+        next_publish_diagnostics(&mut notifications, &file_uri, Duration::from_secs(1)).await;
+    assert!(
+        client_override["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| !diagnostics.is_empty()),
+        "explicit client setting should override project diagnostics off: {}",
+        client_override
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_configuration_notification(
+            json!({ "phpLsp": {} }),
+        ))
+        .await
+        .unwrap();
     let disabled =
         next_publish_diagnostics(&mut notifications, &file_uri, Duration::from_secs(1)).await;
     assert_eq!(
         disabled["diagnostics"].as_array().map(Vec::len),
         Some(0),
-        "project config should disable diagnostics"
+        "removing client override should reveal project diagnostics off"
     );
 
     fs::write(&config_path, "[diagnostics]\nmode = \"syntax-only\"\n").unwrap();
@@ -724,6 +747,98 @@ class Demo {
         }),
         "basic-semantic diagnostics should enable computed add-use quick-fix, got: {}",
         diagnostics_on_result
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_configuration_notification(json!({
+            "phpLsp": {
+                "phpVersion": "7.4",
+                "diagnostics": { "mode": "off" }
+            }
+        })))
+        .await
+        .unwrap();
+    let explicit_php74 = service
+        .ready()
+        .await
+        .unwrap()
+        .call(add_return_type_request(
+            6,
+            return_type_uri,
+            ((0, 0), (8, 0)),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(explicit_php74)
+            .as_array()
+            .is_some_and(|actions| actions.is_empty()),
+        "explicit PHP 7.4 override should disable union return type action"
+    );
+    let explicit_diagnostics_off = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(7, app_uri, 5, 12, 5, 15, json!([])))
+        .await
+        .unwrap();
+    assert!(
+        extract_result(explicit_diagnostics_off)
+            .as_array()
+            .is_some_and(|actions| actions.is_empty()),
+        "explicit diagnostics off override should suppress quick-fixes"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_configuration_notification(
+            json!({ "phpLsp": {} }),
+        ))
+        .await
+        .unwrap();
+    let reset_php82 = service
+        .ready()
+        .await
+        .unwrap()
+        .call(add_return_type_request(
+            8,
+            return_type_uri,
+            ((0, 0), (8, 0)),
+        ))
+        .await
+        .unwrap();
+    let reset_php82_result = extract_result(reset_php82);
+    assert!(
+        reset_php82_result.as_array().is_some_and(|actions| {
+            actions.iter().any(|action| {
+                action.get("title").and_then(|value| value.as_str())
+                    == Some("Add return type `string|null`")
+            })
+        }),
+        "removing PHP override should restore server default PHP 8.2, got: {}",
+        reset_php82_result
+    );
+    let reset_diagnostics = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request(9, app_uri, 5, 12, 5, 15, json!([])))
+        .await
+        .unwrap();
+    let reset_diagnostics_result = extract_result(reset_diagnostics);
+    assert!(
+        reset_diagnostics_result.as_array().is_some_and(|actions| {
+            actions.iter().any(|action| {
+                action.get("title").and_then(|value| value.as_str()) == Some("Import Vendor\\Bar")
+            })
+        }),
+        "removing diagnostics override should restore basic-semantic default, got: {}",
+        reset_diagnostics_result
     );
 
     service
