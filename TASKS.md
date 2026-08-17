@@ -5899,3 +5899,16 @@ change.
   - Validation target: focused provider regression, full `php-lsp-completion` tests, Rustfmt, completion Clippy with `-D warnings`, `git diff --check`, and Verifier GO using `CARGO_BUILD_JOBS=1`.
   - Implemented: private visibility now uses shared `symbol_fqn_eq` with class-name casing rules; removed the divergent local comparator and added instance/static regressions for case and leading-slash differences plus a foreign-owner negative assertion.
   - Validation: focused regression passed (1/1), full `php-lsp-completion` tests passed (54/54), Rustfmt, completion Clippy `--all-targets -D warnings`, and `git diff --check` passed with one build job; Verifier returned GO.
+
+- [x] **AUDIT-L3-FIX-PLAN-2026-08-17** Detail fail-closed range-formatter wrapper handling in `AUDIT-2026-08-07.md`. *(done 2026-08-17)*
+  - Started: 2026-08-17; inspect wrapper insertion/removal, external formatter outcomes, handler edit construction, current positive E2E fixtures, and warning delivery.
+  - Validation target: the plan never applies wrapped output unless the synthetic PHP prefix can be removed, preserves unwrapped selections and LF/CRLF, logs a bounded warning, corrects existing formatter fixtures, and adds helper plus protocol regressions.
+  - Implemented: confirmed the corruption path and documented an `Option`-based unwrap contract, fail-closed handler branch, flat unit coverage, well-behaved positive fixtures, and malformed-output E2E.
+  - Validation: traced the complete range-formatting path and all existing formatting tests; `git diff --check` passed.
+
+- [x] **FIX-RANGE-FORMATTER-WRAPPER-2026-08-17** Reject range formatter output that loses the synthetic PHP wrapper. *(done 2026-08-17)*
+  - Started: 2026-08-17; make wrapper removal explicit and fail closed before constructing a range `TextEdit`.
+  - Scope: wrapped versus already-PHP selections, LF/CRLF prefixes, bounded warning delivery, positive fake-formatter contracts, and malformed output returning no edits.
+  - Validation target: focused flat unit tests, full `e2e_formatting`, server lib tests, Rustfmt, server Clippy with `-D warnings`, `git diff --check`, and Verifier GO using `CARGO_BUILD_JOBS=1`.
+  - Implemented: wrapper removal now returns `Option`, accepts only the injected LF/CRLF PHP prefix for wrapped fragments, and discards malformed output with a bounded warning; added flat helper tests, corrected positive fake formatters, and added a no-edit protocol regression.
+  - Validation: wrapper unit tests passed (3/3), `e2e_formatting` passed (6/6), server lib tests passed (209/209), Rustfmt, server Clippy `--all-targets -D warnings`, and `git diff --check` passed with one build job; Verifier returned GO.

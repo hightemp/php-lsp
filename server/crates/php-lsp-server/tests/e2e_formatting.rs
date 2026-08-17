@@ -177,7 +177,8 @@ async fn test_document_range_formatting_uses_custom_external_command() {
     });
 
     let formatted_range = "    echo \"one\";\n";
-    let formatter_command = format!("printf '%s' '{}' > {{file}}", formatted_range);
+    let formatter_output = format!("<?php\n{}", formatted_range);
+    let formatter_command = format!("printf '%s' '{}' > {{file}}", formatter_output);
 
     service
         .ready()
@@ -247,7 +248,8 @@ async fn test_document_range_formatting_uses_utf16_range_after_complex_unicode_p
     });
 
     let formatted_range = "    echo \"one\";\n";
-    let formatter_command = format!("printf '%s' '{}' > {{file}}", formatted_range);
+    let formatter_output = format!("<?php\n{}", formatted_range);
+    let formatter_command = format!("printf '%s' '{}' > {{file}}", formatter_output);
 
     service
         .ready()
@@ -309,6 +311,71 @@ async fn test_document_range_formatting_uses_utf16_range_after_complex_unicode_p
     assert_eq!(
         edits[0]["range"]["start"]["character"].as_u64(),
         Some(start.1 as u64)
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_document_range_formatting_rejects_output_without_synthetic_wrapper() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let malformed_output = "    echo \"wrapper lost\";\n";
+    let formatter_command = format!("printf '%s' '{}' > {{file}}", malformed_output);
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({
+                "formattingProvider": "custom",
+                "formattingCommand": formatter_command
+            })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = "<?php\nfunction ok(): void {\necho \"one\";\n}\n";
+    let uri = "file:///test/RangeFormatMissingWrapper.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(range_formatting_request(2, uri, 2, 0, 3, 0))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let edits = result.as_array().expect("range formatting edits array");
+    assert!(
+        edits.is_empty(),
+        "formatter output without the synthetic wrapper must be discarded: {result}"
     );
 
     service

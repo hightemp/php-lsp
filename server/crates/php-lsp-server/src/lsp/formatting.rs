@@ -209,16 +209,15 @@ fn range_formatter_input(fragment: &str) -> (String, bool) {
     }
 }
 
-fn strip_range_formatter_wrapper(formatted: String, was_wrapped: bool) -> String {
+fn strip_range_formatter_wrapper(formatted: String, was_wrapped: bool) -> Option<String> {
     if !was_wrapped {
-        return formatted;
+        return Some(formatted);
     }
 
     formatted
         .strip_prefix("<?php\n")
         .or_else(|| formatted.strip_prefix("<?php\r\n"))
-        .unwrap_or(&formatted)
-        .to_string()
+        .map(str::to_string)
 }
 
 fn formatting_source_line(source: &str, line: u32) -> Option<&str> {
@@ -383,7 +382,18 @@ impl PhpLspBackend {
         self.finish_formatter_run(&uri_str, &token).await;
 
         let formatted = match formatted {
-            Ok(Some(formatted)) => strip_range_formatter_wrapper(formatted, was_wrapped),
+            Ok(Some(formatted)) => {
+                let Some(formatted) = strip_range_formatter_wrapper(formatted, was_wrapped) else {
+                    let message = format!(
+                        "php-lsp range formatter output for {} did not preserve the synthetic <?php wrapper; discarded output",
+                        uri_str
+                    );
+                    tracing::warn!("{}", message);
+                    self.client.log_message(MessageType::WARNING, message).await;
+                    return Ok(Some(vec![]));
+                };
+                formatted
+            }
             Ok(None) => return Ok(Some(vec![])),
             Err(message) => {
                 if message.contains("command cancelled") {
@@ -459,3 +469,7 @@ impl PhpLspBackend {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "formatting_tests.rs"]
+mod tests;
