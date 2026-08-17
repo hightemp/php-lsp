@@ -306,23 +306,67 @@ pub fn local_variable_names_at_position(
     tree: &Tree,
     source: &str,
     line: u32,
-    character: u32,
+    byte_col: u32,
 ) -> Vec<String> {
     let root = tree.root_node();
-    let point = Point::new(line as usize, character.saturating_sub(1) as usize);
+    let point = Point::new(line as usize, byte_col.saturating_sub(1) as usize);
     let node = find_node_at_point(root, point)
-        .or_else(|| find_node_at_point(root, Point::new(line as usize, character as usize)))
+        .or_else(|| find_node_at_point(root, Point::new(line as usize, byte_col as usize)))
         .unwrap_or(root);
-    let usage_start = position_to_byte(source, line, character);
+    let usage_start = byte_position_to_offset(source, line, byte_col);
     let scope = find_enclosing_function(node).unwrap_or(root);
 
     let mut vars = Vec::new();
+    if is_this_available_at_node(node) {
+        vars.push((0, "$this".to_string()));
+    }
     collect_visible_variable_declarations_before(scope, usage_start, source, &mut vars);
 
     let mut seen = HashSet::new();
     vars.into_iter()
         .filter_map(|(_, name)| seen.insert(name.clone()).then_some(name))
         .collect()
+}
+
+fn byte_position_to_offset(source: &str, line: u32, byte_col: u32) -> usize {
+    let mut offset = 0usize;
+    for (current_line, row) in source.split_inclusive('\n').enumerate() {
+        if current_line as u32 == line {
+            let line_text = row.strip_suffix('\n').unwrap_or(row);
+            return offset + (byte_col as usize).min(line_text.len());
+        }
+        offset += row.len();
+    }
+    source.len()
+}
+
+fn is_this_available_at_node(node: Node) -> bool {
+    let mut current = Some(node);
+    while let Some(scope) = current {
+        match scope.kind() {
+            "arrow_function" | "anonymous_function" | "anonymous_function_creation_expression" => {
+                if has_static_modifier(scope) {
+                    return false;
+                }
+            }
+            "method_declaration" => return !has_static_modifier(scope),
+            "function_definition" | "program" => return false,
+            _ => {}
+        }
+        current = scope.parent();
+    }
+    false
+}
+
+fn has_static_modifier(node: Node) -> bool {
+    if node.child_by_field_name("static_modifier").is_some() {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let has_static = node
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "static_modifier");
+    has_static
 }
 
 /// Infer variable type by name before a given position.

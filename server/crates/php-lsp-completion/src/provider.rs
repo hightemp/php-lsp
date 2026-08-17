@@ -582,8 +582,12 @@ fn provide_variable_completions(
     // In PHP, common variables are $this, parameters, local vars
     let prefix_lower = prefix.to_lowercase();
 
-    // Add $this
-    if "this".starts_with(&prefix_lower) {
+    // `$this` exists only in a non-static method. The server applies a final
+    // AST-aware filter for nested static/non-static closures.
+    let can_complete_this = current_callable.is_some_and(|callable| {
+        callable.kind == PhpSymbolKind::Method && !callable.modifiers.is_static
+    });
+    if can_complete_this && "this".starts_with(&prefix_lower) {
         items.push(CompletionItem {
             label: "$this".to_string(),
             kind: Some(CompletionItemKind::VARIABLE),
@@ -1040,13 +1044,19 @@ fn current_callable_symbol_at_range(
     let mut current: Option<&SymbolInfo> = None;
     for symbol in file_symbols.symbols.iter().filter(|symbol| {
         matches!(symbol.kind, PhpSymbolKind::Function | PhpSymbolKind::Method)
-            && byte_range_contains(symbol.range, range)
+            && byte_range_contains_cursor(symbol.range, range)
     }) {
         if current.is_none_or(|candidate| byte_range_contains(candidate.range, symbol.range)) {
             current = Some(symbol);
         }
     }
     current
+}
+
+fn byte_range_contains_cursor(outer: (u32, u32, u32, u32), cursor: (u32, u32, u32, u32)) -> bool {
+    let point = (cursor.0, cursor.1);
+    (point.0 > outer.0 || (point.0 == outer.0 && point.1 >= outer.1))
+        && (point.0 < outer.2 || (point.0 == outer.2 && point.1 < outer.3))
 }
 
 fn byte_range_contains(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {

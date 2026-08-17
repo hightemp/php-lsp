@@ -344,6 +344,10 @@ fn test_variable_completion() {
             .and_then(|item| item.detail.as_deref()),
         Some("string")
     );
+    assert!(
+        !items.iter().any(|item| item.label == "$this"),
+        "`$this` must not be offered inside a free function"
+    );
 
     let range_less_items = provide_completions(&ctx, &index, &file_symbols);
     assert!(
@@ -466,6 +470,7 @@ fn test_variable_completion_uses_only_the_innermost_callable_parameters() {
         .find(|item| item.label == "$promotedParam")
         .expect("promoted constructor parameter");
     assert_eq!(promoted.detail.as_deref(), Some("string"));
+    assert!(constructor_items.iter().any(|item| item.label == "$this"));
     assert!(!constructor_items
         .iter()
         .any(|item| item.label == "$otherMethodParam"));
@@ -484,6 +489,98 @@ fn test_variable_completion_uses_only_the_innermost_callable_parameters() {
     ] {
         assert!(!global_labels.contains(&leaked.to_string()));
     }
+}
+
+#[test]
+fn test_callable_cursor_ranges_are_half_open_and_this_requires_instance_method() {
+    let first = with_params(
+        with_range(
+            make_symbol(
+                "first",
+                "first",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (0, 0, 5, 0),
+        ),
+        vec![test_param("firstParam", None, false)],
+    );
+    let second = with_params(
+        with_range(
+            make_symbol(
+                "second",
+                "second",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (5, 0, 10, 0),
+        ),
+        vec![test_param("secondParam", None, false)],
+    );
+    let static_method = with_params(
+        with_range(
+            make_symbol(
+                "staticMethod",
+                "App\\Subject::staticMethod",
+                PhpSymbolKind::Method,
+                Some("App\\Subject"),
+                Visibility::Public,
+                true,
+            ),
+            (12, 0, 16, 0),
+        ),
+        vec![test_param("staticParam", None, false)],
+    );
+    let instance_method = with_params(
+        with_range(
+            make_symbol(
+                "instanceMethod",
+                "App\\Subject::instanceMethod",
+                PhpSymbolKind::Method,
+                Some("App\\Subject"),
+                Visibility::Public,
+                false,
+            ),
+            (18, 0, 22, 0),
+        ),
+        vec![test_param("instanceParam", None, false)],
+    );
+    let file_symbols = FileSymbols {
+        symbols: vec![first, second, static_method, instance_method],
+        ..Default::default()
+    };
+    let index = WorkspaceIndex::new();
+    let context = CompletionContext::Variable {
+        prefix: String::new(),
+    };
+    let labels_at = |line, column| {
+        provide_completions_at_range(
+            &context,
+            &index,
+            &file_symbols,
+            (line, column, line, column),
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect::<Vec<_>>()
+    };
+
+    let adjacent_boundary = labels_at(5, 0);
+    assert!(adjacent_boundary.contains(&"$secondParam".to_string()));
+    assert!(!adjacent_boundary.contains(&"$firstParam".to_string()));
+    assert!(labels_at(10, 0).iter().all(|label| label != "$secondParam"));
+
+    let static_labels = labels_at(13, 0);
+    assert!(static_labels.contains(&"$staticParam".to_string()));
+    assert!(!static_labels.contains(&"$this".to_string()));
+
+    let instance_labels = labels_at(19, 0);
+    assert!(instance_labels.contains(&"$instanceParam".to_string()));
+    assert!(instance_labels.contains(&"$this".to_string()));
 }
 
 #[test]

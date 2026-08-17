@@ -2219,7 +2219,7 @@ function demo(string $value): void {
 #[test]
 fn test_local_variable_names_include_variadic_parameter() {
     let code = r#"<?php
-function collect(string ...$args): void {
+function collect(string &...$args): void {
     $cursorArgs
 }
 "#;
@@ -2307,6 +2307,144 @@ function outer(string $outerParam): void {
     assert!(
         !names.iter().any(|name| name == "$arrow"),
         "the variable receiving an arrow function must not capture itself, got: {names:?}"
+    );
+}
+
+#[test]
+fn test_local_variable_names_follow_this_visibility_through_nested_callables() {
+    let code = r#"<?php
+class Subject {
+    public function instanceMethod(): void {
+        $cursorInstance;
+    }
+
+    public static function staticMethod(): void {
+        $cursorStatic;
+    }
+
+    public function nestedClosures(): void {
+        $closure = function (): void {
+            $cursorClosure;
+        };
+        $staticClosure = static function (): void {
+            $cursorStaticClosure;
+        };
+        $arrow = fn (): mixed => $cursorArrow;
+        $staticArrow = static fn (): mixed => $cursorStaticArrow;
+    }
+
+    public static function closureInStaticMethod(): void {
+        $closure = function (): void {
+            $cursorClosureInStatic;
+        };
+    }
+}
+
+function plainFunction(): void {
+    $cursorFunction;
+}
+
+$cursorGlobal;
+"#;
+
+    for (marker, expected) in [
+        ("$cursorInstance", true),
+        ("$cursorStatic", false),
+        ("$cursorClosure", true),
+        ("$cursorStaticClosure", false),
+        ("$cursorArrow", true),
+        ("$cursorStaticArrow", false),
+        ("$cursorClosureInStatic", false),
+        ("$cursorFunction", false),
+        ("$cursorGlobal", false),
+    ] {
+        let (line, col) = find_line_col(code, marker);
+        let names = parse_and_local_variable_names(code, line, col + marker.len() as u32);
+        assert_eq!(
+            names.iter().any(|name| name == "$this"),
+            expected,
+            "unexpected `$this` visibility at {marker}: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn test_local_variable_names_handle_nested_arrow_and_closure_captures() {
+    let code = r#"<?php
+function outer(string $outerVisible, string $outerHidden): void {
+    $closure = function (string $closureParam) use ($outerVisible): void {
+        $closureLocal = 1;
+        $arrow = fn (string $arrowParam): string => $cursorNestedArrow;
+    };
+
+    $arrow = fn (string $arrowParam) => function (string $closureParam) use ($arrowParam): void {
+        $cursorNestedClosure
+    };
+}
+"#;
+
+    let (arrow_line, arrow_col) = find_line_col(code, "$cursorNestedArrow");
+    let arrow_names = parse_and_local_variable_names(
+        code,
+        arrow_line,
+        arrow_col + "$cursorNestedArrow".len() as u32,
+    );
+    for expected in [
+        "$outerVisible",
+        "$closureParam",
+        "$closureLocal",
+        "$arrowParam",
+    ] {
+        assert!(
+            arrow_names.iter().any(|name| name == expected),
+            "expected {expected} in nested arrow scope, got: {arrow_names:?}"
+        );
+    }
+    for leaked in ["$outerHidden", "$arrow"] {
+        assert!(
+            !arrow_names.iter().any(|name| name == leaked),
+            "unexpected {leaked} in nested arrow scope: {arrow_names:?}"
+        );
+    }
+
+    let (closure_line, closure_col) = find_line_col(code, "$cursorNestedClosure");
+    let closure_names = parse_and_local_variable_names(
+        code,
+        closure_line,
+        closure_col + "$cursorNestedClosure".len() as u32,
+    );
+    for expected in ["$arrowParam", "$closureParam"] {
+        assert!(
+            closure_names.iter().any(|name| name == expected),
+            "expected {expected} in nested closure scope, got: {closure_names:?}"
+        );
+    }
+    for leaked in ["$outerVisible", "$outerHidden"] {
+        assert!(
+            !closure_names.iter().any(|name| name == leaked),
+            "unexpected {leaked} in nested closure scope: {closure_names:?}"
+        );
+    }
+}
+
+#[test]
+fn test_local_variable_names_survive_non_ascii_and_incomplete_callable() {
+    let code = r#"<?php
+function incomplete(string $unicodeParam, string &$referenceParam, string &...$rest): void {
+    echo "😀"; $unicodeLocal = 1; $cursorIncomplete; $afterCursor = 2;
+"#;
+    let (line, col) = find_line_col(code, "$cursorIncomplete");
+    let names = parse_and_local_variable_names(code, line, col + "$cursorIncomplete".len() as u32);
+
+    for expected in ["$unicodeParam", "$referenceParam", "$rest", "$unicodeLocal"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "expected {expected} in incomplete unicode scope, got: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|name| name == "$afterCursor"),
+        "declaration after a non-ASCII cursor must not be included: {names:?}"
     );
 }
 

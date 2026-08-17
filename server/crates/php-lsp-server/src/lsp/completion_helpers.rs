@@ -2169,7 +2169,6 @@ pub(in crate::server) fn add_local_variable_completion_items(
         .collect::<HashSet<_>>();
     items.retain(|item| {
         item.kind != Some(lsp_types::CompletionItemKind::VARIABLE)
-            || item.label == "$this"
             || visible_labels.contains(item.label.as_str())
     });
     let mut seen: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
