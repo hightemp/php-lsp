@@ -309,13 +309,15 @@ pub fn local_variable_names_at_position(
     character: u32,
 ) -> Vec<String> {
     let root = tree.root_node();
-    let point = Point::new(line as usize, character as usize);
-    let node = find_node_at_point(root, point).unwrap_or(root);
+    let point = Point::new(line as usize, character.saturating_sub(1) as usize);
+    let node = find_node_at_point(root, point)
+        .or_else(|| find_node_at_point(root, Point::new(line as usize, character as usize)))
+        .unwrap_or(root);
     let usage_start = position_to_byte(source, line, character);
     let scope = find_enclosing_function(node).unwrap_or(root);
 
     let mut vars = Vec::new();
-    collect_variable_declarations_before(scope, usage_start, source, &mut vars);
+    collect_visible_variable_declarations_before(scope, usage_start, source, &mut vars);
 
     let mut seen = HashSet::new();
     vars.into_iter()
@@ -6169,7 +6171,7 @@ fn find_variable_definition_before(
                 }
             }
         }
-        "simple_parameter" | "property_promotion_parameter" => {
+        "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 if normalize_var_name(&source[name_node.byte_range()]) == var_name {
                     let start = name_node.start_byte();
@@ -6226,8 +6228,40 @@ fn find_variable_definition_before(
     }
 }
 
+fn collect_visible_variable_declarations_before(
+    scope: Node,
+    usage_start: usize,
+    source: &str,
+    vars: &mut Vec<(usize, String)>,
+) {
+    if scope.kind() == "arrow_function" {
+        let outer_scope = find_enclosing_function(scope).unwrap_or_else(|| find_root_node(scope));
+        let mut capture_start = scope.start_byte();
+        let mut current = scope.parent();
+        while let Some(parent) = current {
+            if parent.id() == outer_scope.id() {
+                break;
+            }
+            if matches!(
+                parent.kind(),
+                "assignment_expression" | "by_ref_assignment_expression"
+            ) && parent.child_by_field_name("right").is_some_and(|right| {
+                right.start_byte() <= scope.start_byte() && right.end_byte() >= scope.end_byte()
+            }) {
+                capture_start = parent.start_byte();
+                break;
+            }
+            current = parent.parent();
+        }
+        collect_visible_variable_declarations_before(outer_scope, capture_start, source, vars);
+    }
+
+    collect_variable_declarations_before(scope, scope.id(), usage_start, source, vars);
+}
+
 fn collect_variable_declarations_before(
     node: Node,
+    scope_id: usize,
     usage_start: usize,
     source: &str,
     vars: &mut Vec<(usize, String)>,
@@ -6235,12 +6269,24 @@ fn collect_variable_declarations_before(
     if node.start_byte() >= usage_start {
         return;
     }
+    if node.id() != scope_id
+        && matches!(
+            node.kind(),
+            "method_declaration"
+                | "function_definition"
+                | "arrow_function"
+                | "anonymous_function"
+                | "anonymous_function_creation_expression"
+        )
+    {
+        return;
+    }
 
     match node.kind() {
         "variable_name" if is_by_ref_output_argument_variable(node, source) => {
             collect_variable_node(node, usage_start, source, vars);
         }
-        "simple_parameter" | "property_promotion_parameter" => {
+        "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 collect_variable_node(name_node, usage_start, source, vars);
             }
@@ -6268,12 +6314,32 @@ fn collect_variable_declarations_before(
                 }
             }
         }
+        "anonymous_function_use_clause" => {
+            collect_variable_name_descendants(node, usage_start, source, vars);
+        }
         _ => {}
     }
 
     let cursor = &mut node.walk();
     for child in node.named_children(cursor) {
-        collect_variable_declarations_before(child, usage_start, source, vars);
+        collect_variable_declarations_before(child, scope_id, usage_start, source, vars);
+    }
+}
+
+fn collect_variable_name_descendants(
+    node: Node,
+    usage_start: usize,
+    source: &str,
+    vars: &mut Vec<(usize, String)>,
+) {
+    if node.kind() == "variable_name" {
+        collect_variable_node(node, usage_start, source, vars);
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_variable_name_descendants(child, usage_start, source, vars);
     }
 }
 

@@ -2162,9 +2162,19 @@ pub(in crate::server) fn add_local_variable_completion_items(
     prefix: &str,
 ) {
     let prefix_lower = prefix.to_ascii_lowercase();
+    let local_variable_names = local_variable_names_at_position(tree, source, line, byte_col);
+    let visible_labels = local_variable_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    items.retain(|item| {
+        item.kind != Some(lsp_types::CompletionItemKind::VARIABLE)
+            || item.label == "$this"
+            || visible_labels.contains(item.label.as_str())
+    });
     let mut seen: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
 
-    for var_name in local_variable_names_at_position(tree, source, line, byte_col) {
+    for var_name in local_variable_names {
         let name_without_dollar = var_name.trim_start_matches('$');
         if !name_without_dollar
             .to_ascii_lowercase()

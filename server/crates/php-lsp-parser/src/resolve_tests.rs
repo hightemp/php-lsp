@@ -2217,6 +2217,100 @@ function demo(string $value): void {
 }
 
 #[test]
+fn test_local_variable_names_include_variadic_parameter() {
+    let code = r#"<?php
+function collect(string ...$args): void {
+    $cursorArgs
+}
+"#;
+    let (line, col) = find_line_col(code, "$cursorArgs");
+    let names = parse_and_local_variable_names(code, line, col + "$cursorArgs".len() as u32);
+
+    assert!(
+        names.iter().any(|name| name == "$args"),
+        "expected variadic parameter in local variable names, got: {names:?}"
+    );
+}
+
+#[test]
+fn test_local_variable_names_do_not_cross_nested_named_callable_scopes() {
+    let code = r#"<?php
+function outer(string $outerParam): void {
+    $outerLocal = 1;
+    function nested(string $nestedParam): void {
+        $nestedLocal = 2;
+    }
+    $cursorOuter
+}
+"#;
+    let (line, col) = find_line_col(code, "$cursorOuter");
+    let names = parse_and_local_variable_names(code, line, col + "$cursorOuter".len() as u32);
+
+    for expected in ["$outerParam", "$outerLocal"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "expected {expected} in outer scope, got: {names:?}"
+        );
+    }
+    for leaked in ["$nestedParam", "$nestedLocal"] {
+        assert!(
+            !names.iter().any(|name| name == leaked),
+            "nested callable variable {leaked} must not leak, got: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn test_local_variable_names_include_only_explicit_anonymous_function_captures() {
+    let code = r#"<?php
+function outer(string $captured, string $notCaptured): void {
+    $outerLocal = 1;
+    $closure = function (bool $ownParam) use ($captured): void {
+        $cursorClosure
+    };
+}
+"#;
+    let (line, col) = find_line_col(code, "$cursorClosure");
+    let names = parse_and_local_variable_names(code, line, col + "$cursorClosure".len() as u32);
+
+    for expected in ["$captured", "$ownParam"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "expected {expected} in anonymous function scope, got: {names:?}"
+        );
+    }
+    for leaked in ["$notCaptured", "$outerLocal"] {
+        assert!(
+            !names.iter().any(|name| name == leaked),
+            "uncaptured outer variable {leaked} must not leak, got: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn test_local_variable_names_include_arrow_function_auto_captures() {
+    let code = r#"<?php
+function outer(string $outerParam): void {
+    $outerLocal = 1;
+    $arrow = fn (bool $ownParam): string => $cursorArrow;
+}
+"#;
+    let (line, col) = find_line_col(code, "$cursorArrow");
+    let names = parse_and_local_variable_names(code, line, col + "$cursorArrow".len() as u32);
+
+    for expected in ["$outerParam", "$outerLocal", "$ownParam"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "expected {expected} in arrow function scope, got: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|name| name == "$arrow"),
+        "the variable receiving an arrow function must not capture itself, got: {names:?}"
+    );
+}
+
+#[test]
 fn test_resolve_global_constant_in_method_body() {
     let code = "<?php\nnamespace App;\n\nconst BUILD = 'dev';\n\nclass Demo {\n    public const VERSION = '1.0';\n\n    public function run(): string {\n        $value = BUILD;\n        return self::VERSION . $value;\n    }\n}\n";
     let sym = parse_and_resolve(code, 9, 17).expect("BUILD symbol should resolve");

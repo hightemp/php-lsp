@@ -133,6 +133,7 @@ pub fn provide_completions(
         index,
         file_symbols,
         current_class_fqn.as_deref(),
+        None,
     )
 }
 
@@ -149,6 +150,7 @@ pub fn provide_completions_at_range(
         index,
         file_symbols,
         current_class_fqn.as_deref(),
+        Some(cursor_range),
     )
 }
 
@@ -157,6 +159,7 @@ fn provide_completions_with_current_class(
     index: &WorkspaceIndex,
     file_symbols: &FileSymbols,
     current_class_fqn: Option<&str>,
+    cursor_range: Option<(u32, u32, u32, u32)>,
 ) -> Vec<CompletionItem> {
     match context {
         CompletionContext::MemberAccess {
@@ -186,9 +189,10 @@ fn provide_completions_with_current_class(
             current_class_fqn,
         ),
         CompletionContext::ArrayKey { .. } => vec![],
-        CompletionContext::Variable { prefix } => {
-            provide_variable_completions(prefix, file_symbols)
-        }
+        CompletionContext::Variable { prefix } => provide_variable_completions(
+            prefix,
+            cursor_range.and_then(|range| current_callable_symbol_at_range(file_symbols, range)),
+        ),
         CompletionContext::Namespace { prefix } => provide_namespace_completions(prefix, index),
         CompletionContext::UseStatement { prefix } => {
             provide_use_statement_completions(prefix, index)
@@ -567,7 +571,10 @@ fn class_pseudo_constant_completion_item(class_fqn: &str, member_prefix: &str) -
 }
 
 /// Provide variable completions.
-fn provide_variable_completions(prefix: &str, file_symbols: &FileSymbols) -> Vec<CompletionItem> {
+fn provide_variable_completions(
+    prefix: &str,
+    current_callable: Option<&SymbolInfo>,
+) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -587,24 +594,20 @@ fn provide_variable_completions(prefix: &str, file_symbols: &FileSymbols) -> Vec
         seen.insert("$this".to_string());
     }
 
-    // Extract parameters from method/function symbols
-    for sym in &file_symbols.symbols {
-        if let Some(ref sig) = sym.signature {
-            for param in &sig.params {
-                let var_name = format!("${}", param.name);
-                if !seen.contains(&var_name) && param.name.to_lowercase().starts_with(&prefix_lower)
-                {
-                    let detail = param.type_info.as_ref().map(|t| t.to_string());
-                    items.push(CompletionItem {
-                        label: var_name.clone(),
-                        kind: Some(CompletionItemKind::VARIABLE),
-                        detail,
-                        sort_text: Some(format!("0101_{}", param.name.to_ascii_lowercase())),
-                        filter_text: Some(format!("{} {}", var_name, param.name)),
-                        ..Default::default()
-                    });
-                    seen.insert(var_name);
-                }
+    if let Some(signature) = current_callable.and_then(|callable| callable.signature.as_ref()) {
+        for param in &signature.params {
+            let var_name = format!("${}", param.name);
+            if !seen.contains(&var_name) && param.name.to_lowercase().starts_with(&prefix_lower) {
+                let detail = param.type_info.as_ref().map(|t| t.to_string());
+                items.push(CompletionItem {
+                    label: var_name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail,
+                    sort_text: Some(format!("0101_{}", param.name.to_ascii_lowercase())),
+                    filter_text: Some(format!("{} {}", var_name, param.name)),
+                    ..Default::default()
+                });
+                seen.insert(var_name);
             }
         }
     }
@@ -1025,6 +1028,22 @@ fn current_class_symbol_at_range(
     }) {
         if current.is_none_or(|candidate| byte_range_contains(candidate.range, sym.range)) {
             current = Some(sym);
+        }
+    }
+    current
+}
+
+fn current_callable_symbol_at_range(
+    file_symbols: &FileSymbols,
+    range: (u32, u32, u32, u32),
+) -> Option<&SymbolInfo> {
+    let mut current: Option<&SymbolInfo> = None;
+    for symbol in file_symbols.symbols.iter().filter(|symbol| {
+        matches!(symbol.kind, PhpSymbolKind::Function | PhpSymbolKind::Method)
+            && byte_range_contains(symbol.range, range)
+    }) {
+        if current.is_none_or(|candidate| byte_range_contains(candidate.range, symbol.range)) {
+            current = Some(symbol);
         }
     }
     current

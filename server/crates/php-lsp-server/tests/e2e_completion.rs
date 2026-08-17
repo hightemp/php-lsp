@@ -68,6 +68,128 @@ echo $
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_variable_completion_is_scoped_to_the_cursor_callable() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code_with_markers = r#"<?php
+function first(string $firstOnly, string ...$firstRest): void {
+    $firstLocal = 1;
+    $fi/*first*/;
+}
+
+function second(int $secondOnly, string $closureOuter): void {
+    $secondLocal = 2;
+    $se/*second*/;
+    $closure = function (bool $closureOnly): void {
+        $cl/*closure*/;
+    };
+}
+"#;
+    let markers = ["/*first*/", "/*second*/", "/*closure*/"];
+    let marker_position = |marker: &str| -> (u32, u32) {
+        let marker_offset = code_with_markers.find(marker).expect("completion marker");
+        let mut prefix = code_with_markers[..marker_offset].to_string();
+        for known_marker in markers {
+            prefix = prefix.replace(known_marker, "");
+        }
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let character = prefix[line_start..].encode_utf16().count() as u32;
+        (line, character)
+    };
+    let mut code = code_with_markers.to_string();
+    for marker in markers {
+        code = code.replace(marker, "");
+    }
+    let uri = "file:///test/scoped-variable-completion.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, &code))
+        .await
+        .unwrap();
+
+    for (request_id, marker, expected, rejected) in [
+        (
+            2,
+            "/*first*/",
+            &["$firstOnly", "$firstRest", "$firstLocal"][..],
+            &["$secondOnly", "$secondLocal"][..],
+        ),
+        (
+            3,
+            "/*second*/",
+            &["$secondOnly", "$secondLocal"][..],
+            &["$firstOnly", "$firstLocal"][..],
+        ),
+        (
+            4,
+            "/*closure*/",
+            &["$closureOnly"][..],
+            &["$closureOuter"][..],
+        ),
+    ] {
+        let (line, character) = marker_position(marker);
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(request_id, uri, line, character))
+            .await
+            .unwrap();
+        let result = extract_result(response);
+        let labels = completion_items_from_result(&result)
+            .into_iter()
+            .filter_map(|item| {
+                item.get("label")
+                    .and_then(|label| label.as_str())
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+
+        for label in expected {
+            assert!(
+                labels.iter().any(|candidate| candidate == label),
+                "completion at {marker} should contain {label}, got: {labels:?}"
+            );
+        }
+        for label in rejected {
+            assert!(
+                !labels.iter().any(|candidate| candidate == label),
+                "completion at {marker} must not leak {label}, got: {labels:?}"
+            );
+        }
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion_context_uses_utf16_lsp_position_after_non_ascii_text() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

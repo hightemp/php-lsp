@@ -5801,3 +5801,16 @@ change.
   - Validation target: focused semantic regressions, all parser tests, parser Clippy with `-D warnings`, fmt, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
   - Implemented: `is_null_coalesce_probe` now tracks the immediate ancestor branch and recognizes only exact AST operator fields for `binary_expression ??` and `augmented_assignment_expression ??=`, suppressing only the nearest operator's left operand without reading source text.
   - Validation: 4 focused null-coalesce regressions and all 286 parser tests passed; parser Clippy with `-D warnings`, fmt, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO.
+
+- [x] **AUDIT-M4-FIX-PLAN-2026-08-14** Detail the cursor-scoped parameter completion fix in `AUDIT-2026-08-07.md`. *(done 2026-08-14)*
+  - Started: 2026-08-14; trace range-aware and legacy completion entry points, callable symbol ranges, and the server AST-local-variable merge.
+  - Validation target: the plan selects only the innermost enclosing named callable, defines conservative behavior without a cursor, preserves closure/local-variable completion ownership, and covers cross-scope regressions; `git diff --check` passes.
+  - Implemented: documented cursor propagation, innermost `Function`/`Method` range selection, conservative range-less behavior, AST ownership for closure/local variables, and unit/E2E regression coverage.
+  - Validation: confirmed the production range-aware call and the additive AST-local merge, reviewed existing byte-range/class selection helpers and provider call sites, and passed `git diff --check`.
+
+- [x] **FIX-COMPLETION-CALLABLE-PARAM-SCOPE-2026-08-17** Prevent parameters from leaking across completion scopes. *(done 2026-08-17)*
+  - Started: 2026-08-17; propagate the byte-column cursor range into variable completion and select only the innermost enclosing named callable.
+  - Scope: functions, methods, nested named callables, global/range-less contexts, promoted constructor parameters, and compatibility with the server AST-local-variable merge; no first-symbol or name-based scope guesses.
+  - Validation target: completion unit regressions, focused completion E2E, completion/server Clippy with `-D warnings`, fmt, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
+  - Implemented: range-aware provider completion now selects only the innermost named callable, while the server validates variable items against the exact AST scope; local-variable collection stops at nested callables and supports simple/variadic/promoted parameters, explicit closure captures, and arrow auto-captures.
+  - Validation: 290 parser tests, 51 completion tests, 22 completion E2E, parser/completion/server Clippy with `-D warnings`, fmt, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO on the second pass after a variadic-parameter regression was added and fixed.

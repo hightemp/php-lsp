@@ -45,6 +45,25 @@ fn with_range(mut symbol: SymbolInfo, range: (u32, u32, u32, u32)) -> SymbolInfo
     symbol
 }
 
+fn with_params(mut symbol: SymbolInfo, params: Vec<ParamInfo>) -> SymbolInfo {
+    symbol.signature = Some(Signature {
+        params,
+        return_type: None,
+    });
+    symbol
+}
+
+fn test_param(name: &str, type_info: Option<TypeInfo>, is_promoted: bool) -> ParamInfo {
+    ParamInfo {
+        name: name.to_string(),
+        type_info,
+        default_value: None,
+        is_variadic: false,
+        is_by_ref: false,
+        is_promoted,
+    }
+}
+
 #[test]
 fn test_keyword_completion() {
     let index = WorkspaceIndex::new();
@@ -313,11 +332,158 @@ fn test_variable_completion() {
     let ctx = CompletionContext::Variable {
         prefix: "user".to_string(),
     };
-    let items = provide_completions(&ctx, &index, &file_symbols);
+    let items = provide_completions_at_range(&ctx, &index, &file_symbols, (2, 4, 2, 4));
     assert!(
         items.iter().any(|i| i.label == "$username"),
         "Should find $username"
     );
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.label == "$username")
+            .and_then(|item| item.detail.as_deref()),
+        Some("string")
+    );
+
+    let range_less_items = provide_completions(&ctx, &index, &file_symbols);
+    assert!(
+        !range_less_items
+            .iter()
+            .any(|item| item.label == "$username"),
+        "Range-less completion must not guess a callable scope"
+    );
+}
+
+#[test]
+fn test_variable_completion_uses_only_the_innermost_callable_parameters() {
+    let outer = with_params(
+        with_range(
+            make_symbol(
+                "outer",
+                "outer",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (0, 0, 20, 1),
+        ),
+        vec![test_param("outerParam", None, false)],
+    );
+    let nested = with_params(
+        with_range(
+            make_symbol(
+                "nested",
+                "nested",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (5, 4, 10, 5),
+        ),
+        vec![test_param("nestedParam", None, false)],
+    );
+    let sibling = with_params(
+        with_range(
+            make_symbol(
+                "sibling",
+                "sibling",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            (22, 0, 30, 1),
+        ),
+        vec![test_param("siblingParam", None, false)],
+    );
+    let constructor = with_params(
+        with_range(
+            make_symbol(
+                "__construct",
+                "App\\Subject::__construct",
+                PhpSymbolKind::Method,
+                Some("App\\Subject"),
+                Visibility::Public,
+                false,
+            ),
+            (32, 4, 40, 5),
+        ),
+        vec![test_param(
+            "promotedParam",
+            Some(TypeInfo::Simple("string".to_string())),
+            true,
+        )],
+    );
+    let other_method = with_params(
+        with_range(
+            make_symbol(
+                "other",
+                "App\\Subject::other",
+                PhpSymbolKind::Method,
+                Some("App\\Subject"),
+                Visibility::Public,
+                false,
+            ),
+            (42, 4, 48, 5),
+        ),
+        vec![test_param("otherMethodParam", None, false)],
+    );
+    let file_symbols = FileSymbols {
+        symbols: vec![outer, nested, sibling, constructor, other_method],
+        ..Default::default()
+    };
+    let index = WorkspaceIndex::new();
+    let context = CompletionContext::Variable {
+        prefix: String::new(),
+    };
+
+    let labels_at = |line| {
+        provide_completions_at_range(&context, &index, &file_symbols, (line, 8, line, 8))
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>()
+    };
+
+    let nested_labels = labels_at(7);
+    assert!(nested_labels.contains(&"$nestedParam".to_string()));
+    assert!(!nested_labels.contains(&"$outerParam".to_string()));
+    assert!(!nested_labels.contains(&"$siblingParam".to_string()));
+
+    let outer_labels = labels_at(15);
+    assert!(outer_labels.contains(&"$outerParam".to_string()));
+    assert!(!outer_labels.contains(&"$nestedParam".to_string()));
+
+    let sibling_labels = labels_at(25);
+    assert!(sibling_labels.contains(&"$siblingParam".to_string()));
+    assert!(!sibling_labels.contains(&"$outerParam".to_string()));
+
+    let constructor_items =
+        provide_completions_at_range(&context, &index, &file_symbols, (35, 8, 35, 8));
+    let promoted = constructor_items
+        .iter()
+        .find(|item| item.label == "$promotedParam")
+        .expect("promoted constructor parameter");
+    assert_eq!(promoted.detail.as_deref(), Some("string"));
+    assert!(!constructor_items
+        .iter()
+        .any(|item| item.label == "$otherMethodParam"));
+
+    let other_method_labels = labels_at(45);
+    assert!(other_method_labels.contains(&"$otherMethodParam".to_string()));
+    assert!(!other_method_labels.contains(&"$promotedParam".to_string()));
+
+    let global_labels = labels_at(50);
+    for leaked in [
+        "$outerParam",
+        "$nestedParam",
+        "$siblingParam",
+        "$promotedParam",
+        "$otherMethodParam",
+    ] {
+        assert!(!global_labels.contains(&leaked.to_string()));
+    }
 }
 
 #[test]
