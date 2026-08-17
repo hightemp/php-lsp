@@ -6200,6 +6200,58 @@ fn test_parse_psalm_json_diagnostics_maps_issues() {
     );
 }
 
+#[test]
+fn test_parse_psalm_json_diagnostics_clamps_inverted_ranges() {
+    let file_path = PathBuf::from("/tmp/php-lsp-psalm/src/Foo.php");
+    let file_path_json = file_path.to_string_lossy().to_string();
+    let output = serde_json::json!([
+        {
+            "message": "same-line inverted columns",
+            "file_path": file_path_json,
+            "line_from": 4,
+            "line_to": 4,
+            "column_from": 12,
+            "column_to": 1
+        },
+        {
+            "message": "end line before start",
+            "file_path": file_path_json,
+            "line_from": 4,
+            "line_to": 2,
+            "column_from": 12,
+            "column_to": 99
+        },
+        {
+            "message": "later line with lower column",
+            "file_path": file_path_json,
+            "line_from": 4,
+            "line_to": 5,
+            "column_from": 12,
+            "column_to": 1
+        },
+        {
+            "message": "missing end coordinates",
+            "file_path": file_path_json,
+            "line_from": 4,
+            "column_from": 12
+        }
+    ])
+    .to_string();
+
+    let diagnostics = parse_psalm_json_diagnostics(&output, &file_path).unwrap();
+    assert_eq!(diagnostics.len(), 4);
+
+    let start = Position::new(3, 11);
+    assert_eq!(diagnostics[0].range.start, start);
+    assert_eq!(diagnostics[0].range.end, start);
+    assert_eq!(diagnostics[1].range.start, start);
+    assert_eq!(diagnostics[1].range.end, start);
+    assert_eq!(diagnostics[2].range.start, start);
+    assert_eq!(diagnostics[2].range.end, Position::new(4, 0));
+    assert_eq!(diagnostics[3].range.start, start);
+    assert_eq!(diagnostics[3].range.end, Position::new(3, 12));
+}
+
 static ANALYZER_PARSE_CALLER_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
     std::sync::Mutex::new(None);
 

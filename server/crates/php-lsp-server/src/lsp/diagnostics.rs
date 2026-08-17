@@ -308,11 +308,14 @@ fn psalm_issue_to_diagnostic(issue: &serde_json::Value) -> Option<Diagnostic> {
     let end_character = psalm_issue_u32(issue, "column_to")
         .map(|column| column.saturating_sub(1))
         .unwrap_or(start_character + 1);
+    let start_line = line_from - 1;
+    let (end_line, end_character) =
+        std::cmp::max((line_to - 1, end_character), (start_line, start_character));
 
     Some(Diagnostic {
         range: Range {
-            start: Position::new(line_from - 1, start_character),
-            end: Position::new(line_to - 1, end_character),
+            start: Position::new(start_line, start_character),
+            end: Position::new(end_line, end_character),
         },
         severity: Some(psalm_severity(issue)),
         code: issue

@@ -5912,3 +5912,10 @@ change.
   - Validation target: focused flat unit tests, full `e2e_formatting`, server lib tests, Rustfmt, server Clippy with `-D warnings`, `git diff --check`, and Verifier GO using `CARGO_BUILD_JOBS=1`.
   - Implemented: wrapper removal now returns `Option`, accepts only the injected LF/CRLF PHP prefix for wrapped fragments, and discards malformed output with a bounded warning; added flat helper tests, corrected positive fake formatters, and added a no-edit protocol regression.
   - Validation: wrapper unit tests passed (3/3), `e2e_formatting` passed (6/6), server lib tests passed (209/209), Rustfmt, server Clippy `--all-targets -D warnings`, and `git diff --check` passed with one build job; Verifier returned GO.
+
+- [x] **FIX-PSALM-DIAGNOSTIC-RANGE-2026-08-17** Clamp malformed Psalm diagnostic end positions to the LSP range invariant. *(done 2026-08-17)*
+  - Started: 2026-08-17; normalize the complete zero-based end position against start after parsing Psalm's one-based line/column values.
+  - Scope: inverted same-line columns, earlier end lines, valid later-line ranges with smaller end columns, missing end coordinates, and unchanged valid Psalm output.
+  - Validation target: focused Psalm parser regressions, server lib tests, Rustfmt, server Clippy with `-D warnings`, `git diff --check`, and Verifier GO using `CARGO_BUILD_JOBS=1`.
+  - Implemented: Psalm parsing now lexicographically clamps the complete zero-based end position to start, collapsing malformed earlier positions without altering valid multiline ranges; added a four-case parser regression alongside the existing valid mapping test.
+  - Validation: focused regression passed (1/1), server lib tests passed (210/210), Rustfmt, server Clippy `--all-targets -D warnings`, and `git diff --check` passed with one build job; Verifier returned GO.
