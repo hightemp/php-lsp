@@ -219,7 +219,7 @@ pub(crate) fn load_configured_stubs(
 }
 
 fn unusable_stubs_path_reason(stubs_path: &Path) -> Option<String> {
-    let php_file_count = count_php_stub_files(stubs_path);
+    let php_file_count = stubs::count_php_stub_files(stubs_path);
     if php_file_count == 0 {
         return Some("contains no PHP stub files".to_string());
     }
@@ -227,7 +227,7 @@ fn unusable_stubs_path_reason(stubs_path: &Path) -> Option<String> {
     let missing: Vec<&str> = REQUIRED_STUB_FILES
         .iter()
         .copied()
-        .filter(|relative| !stubs_path.join(relative).is_file())
+        .filter(|relative| !stubs::is_real_stub_file(stubs_path, Path::new(relative)))
         .collect();
     if missing.is_empty() {
         return None;
@@ -237,27 +237,6 @@ fn unusable_stubs_path_reason(stubs_path: &Path) -> Option<String> {
         "missing required stub file(s): {}",
         missing.join(", ")
     ))
-}
-
-fn count_php_stub_files(stubs_path: &Path) -> usize {
-    let mut count = 0;
-    let mut pending = vec![stubs_path.to_path_buf()];
-
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().and_then(|ext| ext.to_str()) == Some("php") {
-                count += 1;
-            }
-        }
-    }
-
-    count
 }
 
 pub(crate) fn collect_stub_cache_sources(

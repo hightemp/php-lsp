@@ -40,6 +40,10 @@ pub(crate) fn stubs_index_cache_config_for_extensions(
     php_version: PhpVersion,
     extensions: Vec<String>,
 ) -> IndexCacheConfig {
+    let extensions = extensions
+        .into_iter()
+        .filter(|extension| stubs::is_valid_stub_extension_name(extension))
+        .collect::<Vec<_>>();
     IndexCacheConfig {
         namespace: CacheNamespace::Stubs,
         php_lsp_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -76,7 +80,11 @@ pub(crate) fn cache_path_label(path: &Path) -> String {
 
 pub(crate) fn effective_stub_extensions(stub_extensions: Option<&[String]>) -> Vec<String> {
     match stub_extensions {
-        Some(extensions) => extensions.to_vec(),
+        Some(extensions) => extensions
+            .iter()
+            .filter(|extension| stubs::is_valid_stub_extension_name(extension))
+            .cloned()
+            .collect(),
         None => stubs::DEFAULT_EXTENSIONS
             .iter()
             .map(|ext| (*ext).to_string())
@@ -151,12 +159,16 @@ pub(crate) fn stubs_cache_hash_for_path_with_extensions(
     }
 
     for extension in extensions {
-        let path = stubs_root.join(extension);
-        if path.exists() {
-            push_metadata_hash_part(&mut parts, "extension", extension, &path);
-        } else {
-            parts.push(format!("extension={}:missing", extension));
+        if !stubs::is_valid_stub_extension_name(extension) {
+            parts.push(format!("extension={extension}:invalid"));
+            continue;
         }
+        if !stubs::is_real_stub_extension_directory(stubs_root, extension) {
+            parts.push(format!("extension={extension}:missing"));
+            continue;
+        }
+        let path = stubs_root.join(extension);
+        push_metadata_hash_part(&mut parts, "extension", extension, &path);
     }
 
     cache::stable_hash_strings(parts.iter().map(String::as_str))

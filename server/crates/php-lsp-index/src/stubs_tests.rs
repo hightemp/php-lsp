@@ -64,6 +64,179 @@ fn test_discover_stub_extensions_skips_vendor_even_with_php_files() {
 }
 
 #[test]
+fn test_stub_walkers_collect_and_count_real_nested_php_files() {
+    let root = std::env::temp_dir().join(format!("php-lsp-real-stub-walk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("Core/nested")).expect("create nested stubs dir");
+    std::fs::write(
+        root.join("Core/Core.php"),
+        "<?php function core_fn(): void;",
+    )
+    .expect("write root stub");
+    std::fs::write(
+        root.join("Core/nested/Extra.php"),
+        "<?php function extra_fn(): void;",
+    )
+    .expect("write nested stub");
+    std::fs::write(root.join("Core/README.txt"), "not a stub").expect("write non-PHP file");
+
+    let files = collect_extension_stub_files(&root, "Core");
+    assert_eq!(
+        files,
+        vec![
+            root.join("Core/Core.php"),
+            root.join("Core/nested/Extra.php")
+        ]
+    );
+    assert_eq!(count_php_stub_files(&root), 2);
+    assert_eq!(discover_stub_extensions(&root), vec!["Core".to_string()]);
+    assert!(is_real_stub_extension_directory(&root, "Core"));
+    assert!(is_real_stub_file(&root, Path::new("Core/Core.php")));
+    assert!(!is_real_stub_file(&root, Path::new("../outside.php")));
+
+    std::fs::remove_dir_all(root).expect("remove nested stubs tree");
+}
+
+#[test]
+fn test_collect_extension_stub_files_rejects_path_components() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-extension-component-{}",
+        std::process::id()
+    ));
+    let external =
+        std::env::temp_dir().join(format!("php-lsp-extension-external-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&external);
+    std::fs::create_dir_all(root.join("Core/nested")).expect("create extension tree");
+    std::fs::create_dir_all(&external).expect("create external extension tree");
+    std::fs::write(
+        root.join("Core/Core.php"),
+        "<?php function core_fn(): void;",
+    )
+    .expect("write valid extension stub");
+    std::fs::write(
+        root.join("Core/nested/Nested.php"),
+        "<?php function nested_fn(): void;",
+    )
+    .expect("write nested extension stub");
+    std::fs::write(
+        external.join("Outside.php"),
+        "<?php function outside_fn(): void;",
+    )
+    .expect("write external extension stub");
+
+    assert_eq!(collect_extension_stub_files(&root, "Core").len(), 2);
+    for invalid in ["", ".", "..", "../Core", "Core/nested"] {
+        assert!(
+            collect_extension_stub_files(&root, invalid).is_empty(),
+            "path-like extension name must be rejected: {invalid:?}"
+        );
+    }
+    let external_extension = external.to_string_lossy();
+    assert!(collect_extension_stub_files(&root, external_extension.as_ref()).is_empty());
+    let index = WorkspaceIndex::new();
+    assert_eq!(load_stubs(&index, &root, &[external_extension.as_ref()]), 0);
+    assert!(load_stub_file(&index, &root, "../external", &external.join("Outside.php")).is_none());
+
+    std::fs::remove_dir_all(root).expect("remove extension tree");
+    std::fs::remove_dir_all(external).expect("remove external extension tree");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_stub_walkers_skip_cycles_external_links_and_broken_links() {
+    use std::os::unix::fs::symlink;
+
+    let root =
+        std::env::temp_dir().join(format!("php-lsp-symlink-stub-walk-{}", std::process::id()));
+    let external =
+        std::env::temp_dir().join(format!("php-lsp-external-stub-walk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&external);
+    std::fs::create_dir_all(root.join("Core/nested")).expect("create stubs tree");
+    std::fs::create_dir_all(&external).expect("create external tree");
+    std::fs::write(
+        root.join("Core/Core.php"),
+        "<?php function core_fn(): void;",
+    )
+    .expect("write real stub");
+    std::fs::write(
+        external.join("Outside.php"),
+        "<?php function outside_fn(): void;",
+    )
+    .expect("write external stub");
+
+    symlink(root.join("Core"), root.join("Core/nested/back-to-core"))
+        .expect("create directory cycle");
+    symlink(&external, root.join("Core/external-directory")).expect("link external directory");
+    symlink(
+        external.join("Outside.php"),
+        root.join("Core/ExternalFile.php"),
+    )
+    .expect("link external file");
+    symlink(root.join("missing"), root.join("Core/broken-link")).expect("create broken link");
+    symlink(&external, root.join("LinkedExtension")).expect("link top-level extension");
+
+    assert_eq!(
+        collect_extension_stub_files(&root, "Core"),
+        vec![root.join("Core/Core.php")]
+    );
+    assert!(collect_extension_stub_files(&root, "LinkedExtension").is_empty());
+    assert!(!is_real_stub_extension_directory(&root, "LinkedExtension"));
+    assert_eq!(count_php_stub_files(&root), 1);
+    assert_eq!(discover_stub_extensions(&root), vec!["Core".to_string()]);
+    assert!(!is_real_stub_file(
+        &root,
+        Path::new("Core/ExternalFile.php")
+    ));
+    assert!(!is_real_stub_file(
+        &root,
+        Path::new("Core/external-directory/Outside.php")
+    ));
+    assert!(!is_real_stub_file(
+        &root,
+        Path::new("LinkedExtension/Outside.php")
+    ));
+
+    std::fs::remove_dir_all(root).expect("remove symlink stubs tree");
+    std::fs::remove_dir_all(external).expect("remove external stubs tree");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_stub_walkers_accept_a_symlinked_configured_root() {
+    use std::os::unix::fs::symlink;
+
+    let actual =
+        std::env::temp_dir().join(format!("php-lsp-actual-stub-root-{}", std::process::id()));
+    let linked =
+        std::env::temp_dir().join(format!("php-lsp-linked-stub-root-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&actual);
+    let _ = std::fs::remove_file(&linked);
+    std::fs::create_dir_all(actual.join("Core")).expect("create actual root");
+    std::fs::write(
+        actual.join("Core/Core.php"),
+        "<?php function linked_root_fn(): void;",
+    )
+    .expect("write actual root stub");
+    symlink(&actual, &linked).expect("link configured root");
+
+    let files = collect_extension_stub_files(&linked, "Core");
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files[0].file_name().and_then(|name| name.to_str()),
+        Some("Core.php")
+    );
+    assert_eq!(count_php_stub_files(&linked), 1);
+    assert_eq!(discover_stub_extensions(&linked), vec!["Core".to_string()]);
+    assert!(is_real_stub_extension_directory(&linked, "Core"));
+    assert!(is_real_stub_file(&linked, Path::new("Core/Core.php")));
+
+    std::fs::remove_file(linked).expect("remove linked root");
+    std::fs::remove_dir_all(actual).expect("remove actual root");
+}
+
+#[test]
 fn test_collect_extension_stub_files_recurses_and_uri_preserves_relative_path() {
     let stubs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
     if !stubs_path.join("snappy/snappy/snappy.php").is_file() {

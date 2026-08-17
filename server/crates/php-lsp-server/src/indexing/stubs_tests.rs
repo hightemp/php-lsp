@@ -42,6 +42,63 @@ fn test_candidate_stubs_paths_include_packaged_extension_stubs_from_platform_bin
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_stub_bundle_validation_ignores_symlinked_php_entries_and_cycles() {
+    use std::os::unix::fs::symlink;
+
+    let root =
+        std::env::temp_dir().join(format!("php-lsp-server-stub-cycle-{}", std::process::id()));
+    let external = std::env::temp_dir().join(format!(
+        "php-lsp-server-external-stub-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&external);
+    std::fs::create_dir_all(&root).expect("create candidate root");
+    std::fs::create_dir_all(&external).expect("create external root");
+    std::fs::write(
+        external.join("Outside.php"),
+        "<?php function outside(): void;",
+    )
+    .expect("write external PHP file");
+    symlink(&root, root.join("cycle")).expect("create candidate cycle");
+    symlink(external.join("Outside.php"), root.join("Linked.php")).expect("link external PHP file");
+
+    assert_eq!(
+        unusable_stubs_path_reason(&root).as_deref(),
+        Some("contains no PHP stub files")
+    );
+
+    std::fs::write(root.join("Real.php"), "<?php function real(): void;")
+        .expect("write real PHP file");
+    std::fs::create_dir_all(root.join("Core")).expect("create required stub directory");
+    symlink(external.join("Outside.php"), root.join("Core/Core.php"))
+        .expect("link required PHP file");
+    let reason = unusable_stubs_path_reason(&root).expect("linked required file must be rejected");
+    assert!(
+        reason.contains("Core/Core.php"),
+        "linked required file should remain missing: {reason}"
+    );
+
+    std::fs::remove_file(root.join("Core/Core.php")).expect("remove linked required file");
+    std::fs::remove_dir(root.join("Core")).expect("remove required stub directory");
+    std::fs::write(
+        external.join("Core.php"),
+        "<?php function external_core(): void;",
+    )
+    .expect("write external required file");
+    symlink(&external, root.join("Core")).expect("link required extension directory");
+    let reason = unusable_stubs_path_reason(&root).expect("linked required directory must fail");
+    assert!(
+        reason.contains("Core/Core.php"),
+        "required file through linked directory should remain missing: {reason}"
+    );
+
+    std::fs::remove_dir_all(root).expect("remove candidate root");
+    std::fs::remove_dir_all(external).expect("remove external root");
+}
+
 #[test]
 fn test_load_configured_stubs_exposes_standard_builtin_functions_from_source_checkout() {
     let stubs_path = source_stubs_path();

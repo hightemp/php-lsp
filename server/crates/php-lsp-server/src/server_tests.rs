@@ -1716,6 +1716,40 @@ fn test_cache_configs_use_separate_namespaces() {
     assert_ne!(workspace_config.config_hash(), vendor_config.config_hash());
 }
 
+#[cfg(unix)]
+#[test]
+fn test_stubs_cache_hash_treats_linked_extension_as_missing() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-stubs-cache-linked-extension-{}",
+        std::process::id()
+    ));
+    let external = std::env::temp_dir().join(format!(
+        "php-lsp-stubs-cache-external-extension-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&external);
+    std::fs::create_dir_all(&root).expect("create cache stubs root");
+    std::fs::create_dir_all(&external).expect("create external extension");
+    std::fs::write(
+        external.join("Outside.php"),
+        "<?php function outside(): void;",
+    )
+    .expect("write external extension file");
+    symlink(&external, root.join("Linked")).expect("link external extension");
+
+    let extensions = vec!["Linked".to_string()];
+    let linked_hash = stubs_cache_hash_for_path_with_extensions(&root, &extensions);
+    std::fs::remove_file(root.join("Linked")).expect("remove linked extension");
+    let missing_hash = stubs_cache_hash_for_path_with_extensions(&root, &extensions);
+    assert_eq!(linked_hash, missing_hash);
+
+    std::fs::remove_dir_all(root).expect("remove cache stubs root");
+    std::fs::remove_dir_all(external).expect("remove external extension");
+}
+
 #[test]
 fn test_workspace_cache_config_preserves_stub_configuration_without_discovery() {
     let root = Path::new("/definitely/missing/project");
@@ -1758,6 +1792,17 @@ fn test_effective_stub_extensions_distinguishes_defaults_from_explicit_empty() {
     let custom = ["Core".to_string()];
     assert_eq!(
         effective_stub_extensions(Some(&custom)),
+        vec!["Core".to_string()]
+    );
+
+    let invalid = [
+        "Core".to_string(),
+        "../external".to_string(),
+        "/absolute".to_string(),
+        "nested/extension".to_string(),
+    ];
+    assert_eq!(
+        effective_stub_extensions(Some(&invalid)),
         vec!["Core".to_string()]
     );
 }

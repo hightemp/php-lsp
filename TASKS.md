@@ -5834,3 +5834,16 @@ change.
   - Validation target: completion unit regressions, completion E2E, completion/server Clippy with `-D warnings`, fmt, `git diff --check`, structural caller search, and Verifier GO with `CARGO_BUILD_JOBS=1`.
   - Implemented: removed first-symbol class inference; deprecated `provide_completions` now passes no class/callable scope, while internal callers/tests use the range-aware API except dedicated conservative compatibility regressions.
   - Validation: 53 completion tests, 23 completion E2E, completion/server Clippy with `-D warnings`, fmt, `git diff --check`, and structural searches for the removed helper and cursor-less callers passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO.
+
+- [x] **AUDIT-M6-FIX-PLAN-2026-08-17** Detail symlink-safe stub traversal in `AUDIT-2026-08-07.md`. *(done 2026-08-17)*
+  - Started: 2026-08-17; inspect collection, extension discovery, and bundle-validation walkers and define one cross-crate symlink policy.
+  - Validation target: the plan prevents cycles and traversal through linked extension/content directories, preserves an intentionally symlinked configured root, centralizes count/collection behavior, and covers broken/external links; `git diff --check` passes.
+  - Implemented: documented a shared non-following `DirEntry::file_type` visitor, linked-root versus linked-entry policy, centralized count/collection/discovery behavior, soft IO failures, and Unix cycle/external/broken-link regressions.
+  - Validation: confirmed all three traversal entry points and their current follow-link behavior; `git diff --check` passed.
+
+- [x] **FIX-STUB-SYMLINK-TRAVERSAL-2026-08-17** Prevent cycles and root escapes while walking stub trees. *(done 2026-08-17)*
+  - Started: 2026-08-17; centralize PHP stub collection/counting on a non-following directory-entry visitor and remove the server-side recursive duplicate.
+  - Scope: collection, extension discovery, bundle validation, linked configured roots, linked/broken nested entries, deterministic real-file output, and soft IO failures; no arbitrary depth cutoff.
+  - Validation target: focused Unix cycle/external-link regressions, cross-platform nested traversal tests, full index tests, index/server Clippy with `-D warnings`, fmt, `git diff --check`, and Verifier GO with `CARGO_BUILD_JOBS=1`.
+  - Implemented: centralized non-following collection/counting, rejected linked entries and path-like extension names before filesystem access, validated every required/source relative component below an optionally linked root, and reused the policy in server validation, cache hashing, and `phpstub://` reads.
+  - Validation: 66 index tests, 5 server stubs tests, focused effective-config/cache tests, index/server Clippy with `-D warnings`, fmt, and `git diff --check` passed with `CARGO_BUILD_JOBS=1`; Verifier returned GO after five review passes covering intermediate symlinks, configured extension escapes, cache metadata, and source reads.

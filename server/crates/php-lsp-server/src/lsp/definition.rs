@@ -956,8 +956,9 @@ impl PhpLspBackend {
     async fn stub_source_for_uri(&self, uri_str: &str, label: &'static str) -> Option<String> {
         let rest = uri_str.strip_prefix("phpstub://")?;
         let (extension, relative_file) = rest.split_once('/')?;
-        if extension.is_empty()
+        if !php_lsp_index::stubs::is_valid_stub_extension_name(extension)
             || relative_file.is_empty()
+            || relative_file.contains(':')
             || relative_file.contains('\\')
             || relative_file
                 .split('/')
@@ -973,13 +974,15 @@ impl PhpLspBackend {
             .await
             .clone()
             .or_else(|| std::env::current_dir().ok())?;
+        let relative_path = Path::new(extension).join(relative_file);
 
         for stubs_path in candidate_stubs_paths(&root, client_stubs_path.clone()) {
-            let path = stubs_path.join(extension).join(relative_file);
-            if path.is_file() {
-                if let Ok(source) = read_file_to_string_blocking(path, label).await {
-                    return Some(source);
-                }
+            if !php_lsp_index::stubs::is_real_stub_file(&stubs_path, &relative_path) {
+                continue;
+            }
+            let path = stubs_path.join(&relative_path);
+            if let Ok(source) = read_file_to_string_blocking(path, label).await {
+                return Some(source);
             }
         }
 
