@@ -5919,3 +5919,10 @@ change.
   - Validation target: focused Psalm parser regressions, server lib tests, Rustfmt, server Clippy with `-D warnings`, `git diff --check`, and Verifier GO using `CARGO_BUILD_JOBS=1`.
   - Implemented: Psalm parsing now lexicographically clamps the complete zero-based end position to start, collapsing malformed earlier positions without altering valid multiline ranges; added a four-case parser regression alongside the existing valid mapping test.
   - Validation: focused regression passed (1/1), server lib tests passed (210/210), Rustfmt, server Clippy `--all-targets -D warnings`, and `git diff --check` passed with one build job; Verifier returned GO.
+
+- [x] **FIX-BYTE-COLUMN-LINE-CLAMP-2026-08-17** Clamp parser byte-column positions to their requested line instead of EOF. *(done 2026-08-17)*
+  - Started: 2026-08-17; centralize byte line/column conversion and route code-action, template-resolution, and framework range helpers through it.
+  - Scope: oversized/stale columns, first/middle/final/trailing-empty lines, CRLF and non-ASCII byte columns, nonexistent lines, and the third equivalent framework helper found during project-wide search; LSP UTF-16 conversion remains separate.
+  - Validation target: focused shared-helper regressions, server lib tests, relevant template/code-action E2E, Rustfmt, server Clippy with `-D warnings`, `git diff --check`, and Verifier GO using `CARGO_BUILD_JOBS=1`.
+  - Implemented: added a shared parser byte-position converter that clamps before the requested line's LF and routed code-action, template-resolution, completion consumers, and the equivalent framework range helper through it; LSP UTF-16 conversion remains unchanged.
+  - Validation: focused helper test passed (1/1), code-action E2E passed (19/19), template E2E passed on full retry (25/25) after one existing `publishDiagnostics` timeout passed in isolation, server lib tests passed (211/211), Rustfmt, server Clippy `--all-targets -D warnings`, and `git diff --check` passed with one build job; Verifier returned GO.

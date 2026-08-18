@@ -2072,18 +2072,7 @@ fn containing_callable_byte_range(
 }
 
 fn byte_offset_from_line_col(source: &str, line: u32, col: u32) -> Option<usize> {
-    let mut current_line = 0u32;
-    let mut line_start = 0usize;
-    for (offset, byte) in source.bytes().enumerate() {
-        if current_line == line {
-            return Some((line_start + col as usize).min(source.len()));
-        }
-        if byte == b'\n' {
-            current_line += 1;
-            line_start = offset + 1;
-        }
-    }
-    (current_line == line).then_some((line_start + col as usize).min(source.len()))
+    crate::util::lsp_text::byte_offset_for_line_col(source, line, col)
 }
 
 fn find_php_statement_end(source: &str, start: usize, limit: usize) -> Option<usize> {

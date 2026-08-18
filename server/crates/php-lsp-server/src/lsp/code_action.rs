@@ -1931,9 +1931,7 @@ pub(crate) fn line_start_offsets(source: &str) -> Vec<usize> {
 }
 
 pub(crate) fn byte_offset_for_line_col(source: &str, line: u32, byte_col: u32) -> Option<usize> {
-    let offsets = line_start_offsets(source);
-    let start = *offsets.get(line as usize)?;
-    Some((start + byte_col as usize).min(source.len()))
+    crate::util::lsp_text::byte_offset_for_line_col(source, line, byte_col)
 }
 
 pub(crate) fn line_col_for_byte_offset(source: &str, offset: usize) -> (u32, u32) {

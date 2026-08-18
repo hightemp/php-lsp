@@ -3079,15 +3079,7 @@ fn source_text_for_range(source: &str, range: (u32, u32, u32, u32)) -> Option<&s
 }
 
 fn byte_offset_for_line_col(source: &str, line: u32, byte_col: u32) -> Option<usize> {
-    let mut offset = 0usize;
-    for (idx, segment) in source.split_inclusive('\n').enumerate() {
-        if idx == line as usize {
-            let candidate = offset + byte_col as usize;
-            return (candidate <= source.len()).then_some(candidate);
-        }
-        offset += segment.len();
-    }
-    (line == source.lines().count() as u32 && byte_col == 0).then_some(source.len())
+    crate::util::lsp_text::byte_offset_for_line_col(source, line, byte_col)
 }
 
 fn parse_array_string_values(text: &str) -> Vec<String> {
