@@ -2539,6 +2539,99 @@ function outside(): string
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_inline_variable_allows_prefix_variable_in_rhs() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+function inlinePrefix(int $ab): int
+{
+    $a = $ab + 1;
+    return $a; // inline target
+}
+"#;
+    let uri = "file:///test/InlinePrefixVariable.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let start = utf16_position_at(code, "$a; // inline target");
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            2,
+            uri,
+            (start, (start.0, start.1 + 2)),
+            json!([]),
+            vec!["refactor.inline"],
+        ))
+        .await
+        .unwrap();
+    let result = extract_result(response);
+    let action = result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| {
+            action.get("title").and_then(|value| value.as_str()) == Some("Inline variable `$a`")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected inline variable action, got: {result}"));
+
+    let resolve_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(3, action))
+        .await
+        .unwrap();
+    let resolved = extract_result(resolve_response);
+    let edits = resolved["edit"]["changes"][uri]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected inline variable edits, got: {resolved}"));
+    assert!(
+        edits
+            .iter()
+            .any(|edit| edit["newText"].as_str() == Some("($ab + 1)"))
+            && edits
+                .iter()
+                .any(|edit| edit["newText"].as_str() == Some("")),
+        "expected exact-token inline replacement and assignment deletion, got: {resolved}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_action_extract_variable_uses_utf16_range_after_complex_unicode_prefix() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

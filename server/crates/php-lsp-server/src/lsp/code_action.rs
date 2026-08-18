@@ -4129,6 +4129,72 @@ pub(crate) fn inline_replacement_text_for_node(
     }
 }
 
+pub(crate) fn node_references_variable(
+    node: tree_sitter::Node,
+    source: &str,
+    variable_name: &str,
+) -> bool {
+    let mut pending = vec![node];
+    while let Some(candidate) = pending.pop() {
+        if candidate.kind() == "variable_name"
+            && variable_text_for_node(source, candidate).as_deref() == Some(variable_name)
+        {
+            return true;
+        }
+        if legacy_dynamic_variable_references(candidate, source, variable_name) {
+            return true;
+        }
+
+        let mut cursor = candidate.walk();
+        pending.extend(candidate.named_children(&mut cursor));
+    }
+    false
+}
+
+fn legacy_dynamic_variable_references(
+    node: tree_sitter::Node,
+    source: &str,
+    variable_name: &str,
+) -> bool {
+    let Some(expected_name) = variable_name.strip_prefix('$') else {
+        return false;
+    };
+    if node.kind() != "dynamic_variable_name"
+        || !source
+            .get(node.byte_range())
+            .is_some_and(|text| text.starts_with("${"))
+    {
+        return false;
+    }
+
+    let Some(mut root) = node.named_child(0) else {
+        return false;
+    };
+    loop {
+        match root.kind() {
+            "name" => {
+                return source.get(root.byte_range()) == Some(expected_name);
+            }
+            "subscript_expression" => {
+                let Some(base) = root.named_child(0) else {
+                    return false;
+                };
+                root = base;
+            }
+            "member_access_expression"
+            | "member_call_expression"
+            | "nullsafe_member_access_expression"
+            | "nullsafe_member_call_expression" => {
+                let Some(object) = root.child_by_field_name("object") else {
+                    return false;
+                };
+                root = object;
+            }
+            _ => return false,
+        }
+    }
+}
+
 pub(crate) struct InlineVariablePlan {
     variable_name: String,
     assignment_delete: (usize, usize),
@@ -4178,10 +4244,7 @@ pub(crate) fn inline_variable_plan(
     let rhs_node = tree
         .root_node()
         .descendant_for_byte_range(assignment.rhs_start, assignment.rhs_end)?;
-    if source
-        .get(assignment.rhs_start..assignment.rhs_end)?
-        .contains(&selected_name)
-    {
+    if node_references_variable(rhs_node, source, &selected_name) {
         return None;
     }
     let replacement = inline_replacement_text_for_node(source, rhs_node)?;

@@ -6252,6 +6252,54 @@ fn test_parse_psalm_json_diagnostics_clamps_inverted_ranges() {
     assert_eq!(diagnostics[3].range.end, Position::new(3, 12));
 }
 
+#[test]
+fn test_inline_variable_plan_uses_exact_rhs_variable_tokens() {
+    fn plan_is_available(rhs: &str) -> bool {
+        let source = format!(
+            "<?php\nfunction test(int $ab): mixed\n{{\n    $a = {rhs};\n    return $a;\n}}\n"
+        );
+        let selected_offset = source.rfind("$a;").expect("inline target variable");
+        let (line, column) = line_col_for_byte_offset(&source, selected_offset);
+        let mut parser = FileParser::new();
+        parser.parse_full(&source);
+        let tree = parser.tree().expect("inline test source should parse");
+
+        inline_variable_plan(
+            tree,
+            &source,
+            (line, column, line, column + "$a".len() as u32),
+            None,
+        )
+        .is_some()
+    }
+
+    for rhs in [
+        "$ab + 1",
+        "'$a literal'",
+        r#""literal \$a""#,
+        "1 /* $a */ + 2",
+        r#""${ab}""#,
+        r#""${obj->a}""#,
+    ] {
+        assert!(
+            plan_is_available(rhs),
+            "non-reference text must not suppress inline variable for RHS {rhs:?}"
+        );
+    }
+    for rhs in [
+        "$a + 1",
+        r#""literal $a""#,
+        r#""${a}""#,
+        r#""${a[0]}""#,
+        r#""${a->p}""#,
+    ] {
+        assert!(
+            !plan_is_available(rhs),
+            "a true selected-variable read must suppress inline for RHS {rhs:?}"
+        );
+    }
+}
+
 static ANALYZER_PARSE_CALLER_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
     std::sync::Mutex::new(None);
 
