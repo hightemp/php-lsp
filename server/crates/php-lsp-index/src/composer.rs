@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Namespace mapping extracted from composer.json autoload config.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NamespaceMap {
     /// PSR-4: namespace prefix → directories
     pub psr4: Vec<(String, Vec<PathBuf>)>,

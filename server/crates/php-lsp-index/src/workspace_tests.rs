@@ -312,6 +312,41 @@ fn test_update_replaces_old() {
 }
 
 #[test]
+fn replacement_top_level_key_scan_ignores_large_member_volume() {
+    let uri = "file:///large-member-generation.php";
+    let mut symbols = vec![make_class("Owner", "App\\Owner", uri)];
+    symbols
+        .extend((0..10_000).map(|index| make_method(&format!("method{index}"), "App\\Owner", uri)));
+    let file_symbols = FileSymbols {
+        symbols,
+        ..Default::default()
+    };
+
+    let keys = top_level_generation_keys(&file_symbols);
+    assert_eq!(
+        keys.len(),
+        1,
+        "replacement diff must hash one class key rather than compare every member"
+    );
+    assert!(keys.contains(&(
+        TopLevelSymbolTable::Types,
+        case_insensitive_fqn_key("App\\Owner")
+    )));
+
+    let index = WorkspaceIndex::new();
+    index.update_file(uri, file_symbols);
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![make_class("Replacement", "App\\Replacement", uri)],
+            ..Default::default()
+        },
+    );
+    assert!(index.resolve_fqn("App\\Owner").is_none());
+    assert!(index.resolve_fqn("App\\Replacement").is_some());
+}
+
+#[test]
 fn direct_member_index_replaces_the_previous_file_generation() {
     let index = WorkspaceIndex::new();
     let uri = "file:///members.php";
@@ -500,6 +535,242 @@ fn concurrent_member_writers_are_serialized_and_readers_keep_an_immutable_snapsh
         .map(|member| member.name.clone())
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["fromWriterB"]);
+}
+
+#[test]
+fn member_resolution_waits_for_first_file_generation_commit() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let uri = "file:///first-generation.php";
+    let writer_index = Arc::clone(&index);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        writer_index.update_file_with_references_with_hook(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    make_class("Owner", "App\\Owner", uri),
+                    make_method("loaded", "App\\Owner", uri),
+                ],
+                ..Default::default()
+            },
+            Vec::new(),
+            || {
+                staged_tx.send(()).expect("report staged first generation");
+                release_rx.recv().expect("release first generation");
+            },
+        );
+    });
+
+    staged_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("first generation reached staged publication");
+    assert!(index.contains_type("App\\Owner"));
+    assert!(
+        index.get_direct_members("App\\Owner").is_empty(),
+        "the deterministic hook must expose the pre-fix publication gap"
+    );
+
+    let reader_index = Arc::clone(&index);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        result_tx
+            .send(reader_index.resolve_member("App\\Owner::loaded"))
+            .expect("return committed member resolution");
+    });
+    assert!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "member resolution must wait for the owning file generation"
+    );
+
+    release_tx.send(()).expect("release first generation");
+    writer.join().expect("first-generation writer joined");
+    let resolved = result_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("member resolution completed after commit")
+        .expect("committed member");
+    reader.join().expect("member reader joined");
+    assert_eq!(resolved.fqn, "App\\Owner::loaded");
+}
+
+#[test]
+fn member_resolution_does_not_mix_replacement_generations() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let uri = "file:///replacement-generation.php";
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![
+                make_class("Owner", "App\\Owner", uri),
+                make_method("oldMember", "App\\Owner", uri),
+            ],
+            ..Default::default()
+        },
+    );
+
+    let writer_index = Arc::clone(&index);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        writer_index.update_file_with_references_with_hook(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    make_class("Owner", "App\\Owner", uri),
+                    make_method("newMember", "App\\Owner", uri),
+                ],
+                ..Default::default()
+            },
+            Vec::new(),
+            || {
+                staged_tx.send(()).expect("report staged replacement");
+                release_rx.recv().expect("release replacement");
+            },
+        );
+    });
+    staged_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("replacement reached staged publication");
+
+    let reader_index = Arc::clone(&index);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        result_tx
+            .send(reader_index.resolve_member("App\\Owner::newMember"))
+            .expect("return replacement member resolution");
+    });
+    assert!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "resolution must not combine the new type with old members"
+    );
+
+    release_tx.send(()).expect("release replacement");
+    writer.join().expect("replacement writer joined");
+    let resolved = result_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("replacement resolution completed")
+        .expect("new generation member");
+    reader.join().expect("replacement reader joined");
+    assert_eq!(resolved.fqn, "App\\Owner::newMember");
+    assert!(index.resolve_member("App\\Owner::oldMember").is_none());
+}
+
+#[test]
+fn member_resolution_waits_before_replacement_top_level_publish() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let uri = "file:///pre-publish-replacement.php";
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![
+                make_class("Owner", "App\\Owner", uri),
+                make_method("oldMember", "App\\Owner", uri),
+            ],
+            ..Default::default()
+        },
+    );
+
+    let writer_index = Arc::clone(&index);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        writer_index.update_file_with_references_with_hooks(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    make_class("Owner", "App\\Owner", uri),
+                    make_method("newMember", "App\\Owner", uri),
+                ],
+                ..Default::default()
+            },
+            Vec::new(),
+            || {
+                staged_tx
+                    .send(())
+                    .expect("report replacement before top-level publish");
+                release_rx
+                    .recv()
+                    .expect("release replacement top-level publish");
+            },
+            || {},
+        );
+    });
+    staged_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("replacement paused before top-level publish");
+    assert_eq!(
+        index
+            .get_type("App\\Owner")
+            .map(|symbol| symbol.uri.clone()),
+        Some(uri.to_string()),
+        "old committed type must stay published while its replacement is staged"
+    );
+
+    let reader_index = Arc::clone(&index);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        result_tx
+            .send(reader_index.resolve_member("App\\Owner::newMember"))
+            .expect("return pre-publish replacement resolution");
+    });
+    assert!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "reader must wait rather than return transient None before type reinsertion"
+    );
+
+    release_tx
+        .send(())
+        .expect("release replacement top-level publish");
+    writer.join().expect("pre-publish writer joined");
+    let resolved = result_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("resolution completed after top-level publish")
+        .expect("replacement member resolved");
+    reader.join().expect("pre-publish reader joined");
+    assert_eq!(resolved.fqn, "App\\Owner::newMember");
+}
+
+#[test]
+fn committed_type_generation_detects_replacement_and_removal() {
+    let index = WorkspaceIndex::new();
+    let uri = "file:///generation-validation.php";
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![make_class("Owner", "App\\Owner", uri)],
+            ..Default::default()
+        },
+    );
+    let first = index
+        .get_committed_type("App\\Owner")
+        .expect("first committed generation");
+    assert!(index.type_generation_is_current(&first.generation));
+
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![
+                make_class("Owner", "App\\Owner", uri),
+                make_method("newMember", "App\\Owner", uri),
+            ],
+            ..Default::default()
+        },
+    );
+    assert!(!index.type_generation_is_current(&first.generation));
+    let second = index
+        .get_committed_type("App\\Owner")
+        .expect("replacement committed generation");
+    assert!(second.generation.generation() > first.generation.generation());
+    assert!(index.type_generation_is_current(&second.generation));
+
+    index.remove_file(uri);
+    assert!(!index.type_generation_is_current(&second.generation));
 }
 
 #[test]

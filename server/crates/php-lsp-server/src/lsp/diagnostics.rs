@@ -1068,13 +1068,16 @@ async fn vendor_namespace_exists_with_context(
         return false;
     }
 
+    let _epoch_guard = vendor_context.load_epoch.read().await;
+
     for config in &vendor_context.workspace_configs {
         let vendor_dir = config.root.join("vendor");
         if !vendor_dir.is_dir() {
             continue;
         }
         if let Some(vendor_map) =
-            cached_vendor_autoload_map(&vendor_context.vendor_autoload_cache, &vendor_dir).await
+            cached_vendor_autoload_map_pinned(&vendor_context.vendor_autoload_cache, &vendor_dir)
+                .await
         {
             if vendor_namespace_exists_from_map(fqn, &vendor_map) {
                 return true;

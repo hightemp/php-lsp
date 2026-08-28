@@ -271,6 +271,8 @@ impl PhpLspBackend {
         let diagnostics_publisher = self.diagnostics_publisher.clone();
         let reindex_index = self.index.clone();
         let vendor_autoload_cache = self.vendor_autoload_cache.clone();
+        let vendor_lazy_loads = self.vendor_lazy_loads.clone();
+        let vendor_load_epoch = self.vendor_load_epoch.clone();
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let runtime_state_handle = self.runtime_state.clone();
         let aggregate_rebuild = self.aggregate_rebuild.clone();
@@ -339,6 +341,7 @@ impl PhpLspBackend {
                         runtime.php_version,
                         &vendor_autoload_cache,
                         &config.vendor_file_lru,
+                        &vendor_load_epoch,
                     )
                     .await;
                 }
@@ -478,6 +481,8 @@ impl PhpLspBackend {
                         index_vendor: runtime.index_vendor,
                         vendor_autoload_cache: vendor_autoload_cache.clone(),
                         vendor_file_lru: config.vendor_file_lru.clone(),
+                        lazy_loads: vendor_lazy_loads.clone(),
+                        load_epoch: vendor_load_epoch.clone(),
                     };
                     let document_state = snapshot.document_state;
                     let version = document_state.map(|state| state.version);
@@ -1635,13 +1640,17 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
     php_version: PhpVersion,
     vendor_autoload_cache: &Arc<Mutex<VendorAutoloadCache>>,
     vendor_file_lru: &Arc<Mutex<VendorFileLru>>,
+    load_epoch: &Arc<tokio::sync::RwLock<u64>>,
 ) -> usize {
     let vendor_dir = root.join("vendor");
     if !vendor_dir.is_dir() {
         return 0;
     }
 
-    let Some(autoload) = cached_vendor_autoload_map(vendor_autoload_cache, &vendor_dir).await
+    let _epoch_guard = load_epoch.read().await;
+
+    let Some(autoload) =
+        cached_vendor_autoload_map_pinned(vendor_autoload_cache, &vendor_dir).await
     else {
         return 0;
     };

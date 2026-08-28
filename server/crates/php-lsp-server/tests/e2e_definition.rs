@@ -2,6 +2,44 @@ mod support;
 
 use support::*;
 
+fn copy_fixture_tree(source: &std::path::Path, destination: &std::path::Path) {
+    fs::create_dir_all(destination).unwrap();
+    let mut entries = fs::read_dir(source)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let file_type = entry.file_type().unwrap();
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_fixture_tree(&entry.path(), &target);
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn isolated_vendor_resolve_fixture() -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-vendor-definition-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    copy_fixture_tree(&support::vendor_resolve_fixture_root(), &root);
+    root
+}
+
+fn remove_index_cache_for_root(root: &std::path::Path) {
+    let cache_path = php_lsp_index::cache::cache_file_path(root);
+    if let Some(workspace_hash_dir) = cache_path.parent().and_then(std::path::Path::parent) {
+        let _ = fs::remove_dir_all(workspace_hash_dir);
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_multi_root_duplicate_fqns_remain_isolated_across_lsp_features() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
@@ -1593,8 +1631,8 @@ async fn test_goto_definition_vendor_inherited_method() {
         socket.collect::<Vec<_>>().await;
     });
 
-    let fixture_root = support::vendor_resolve_fixture_root();
-    let root_uri = format!("file://{}", fixture_root.display());
+    let fixture_root = isolated_vendor_resolve_fixture();
+    let root_uri = php_lsp_types::uri::path_to_uri(&fixture_root).unwrap();
 
     service
         .ready()
@@ -1614,7 +1652,7 @@ async fn test_goto_definition_vendor_inherited_method() {
 
     // Open SampleTest.php
     let test_path = fixture_root.join("tests/SampleTest.php");
-    let test_file_uri = format!("file://{}", test_path.display());
+    let test_file_uri = php_lsp_types::uri::path_to_uri(&test_path).unwrap();
     let content = fs::read_to_string(&test_path).unwrap();
     service
         .ready()
@@ -1626,26 +1664,42 @@ async fn test_goto_definition_vendor_inherited_method() {
 
     // Cursor on "createStub" in:  $stub = $this->createStub(TimerService::class);
     // Line 40, col 23 (0-indexed)
-    let resp = service
-        .ready()
-        .await
-        .unwrap()
-        .call(definition_request(10, &test_file_uri, 40, 23))
-        .await
-        .unwrap();
+    for request_offset in 0..100_i64 {
+        let resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(
+                10 + request_offset,
+                &test_file_uri,
+                40,
+                23,
+            ))
+            .await
+            .unwrap();
 
-    let result = extract_result(resp);
-    assert!(
-        !result.is_null(),
-        "go-to-definition on createStub() should resolve to vendor BaseAssert::createStub"
-    );
+        let result = extract_result(resp);
+        assert!(
+            !result.is_null(),
+            "go-to-definition on createStub() returned null at repetition {request_offset}"
+        );
 
-    let target_uri = result.get("uri").and_then(|u| u.as_str()).unwrap_or("");
-    assert!(
-        target_uri.contains("BaseAssert.php"),
-        "definition should point to BaseAssert.php, got: {}",
-        target_uri
-    );
+        let target_uri = result.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+        assert!(
+            target_uri.contains("BaseAssert.php"),
+            "definition should point to BaseAssert.php at repetition {request_offset}, got: {target_uri}"
+        );
+        assert_eq!(
+            result["range"]["start"]["line"].as_u64(),
+            Some(15),
+            "definition must select BaseAssert::createStub at repetition {request_offset}: {result}"
+        );
+        assert_eq!(
+            result["range"]["start"]["character"].as_u64(),
+            Some(20),
+            "definition must select the createStub identifier at repetition {request_offset}: {result}"
+        );
+    }
 
     service
         .ready()
@@ -1654,6 +1708,8 @@ async fn test_goto_definition_vendor_inherited_method() {
         .call(shutdown_request(99))
         .await
         .unwrap();
+    remove_index_cache_for_root(&fixture_root);
+    fs::remove_dir_all(fixture_root).unwrap();
 }
 
 /// Bug 1: go-to-definition on a vendor method via typed property in same file.

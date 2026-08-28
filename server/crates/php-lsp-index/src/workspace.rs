@@ -15,12 +15,37 @@ use std::{
 
 type TemplateSubstitutions = HashMap<String, TypeInfo>;
 const MAX_TYPE_ALIAS_EXPANSION_DEPTH: usize = 32;
+const MAX_COMMITTED_SNAPSHOT_RETRIES: usize = 8;
 
 #[derive(Clone)]
 struct DirectMemberSource {
     uri: Arc<str>,
     file_symbols: Arc<FileSymbols>,
     symbol_indices: Arc<[usize]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeIndexGeneration {
+    type_fqn: String,
+    uri: String,
+    generation: u64,
+}
+
+impl TypeIndexGeneration {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommittedTypeSnapshot {
+    pub symbol: Arc<SymbolInfo>,
+    pub generation: TypeIndexGeneration,
+}
+
+struct TypeResolutionSnapshot {
+    type_snapshot: CommittedTypeSnapshot,
+    direct_members: Vec<Arc<SymbolInfo>>,
 }
 
 fn member_kind_matches(kind: PhpSymbolKind, expected_kinds: Option<&[PhpSymbolKind]>) -> bool {
@@ -59,6 +84,34 @@ fn top_level_symbol_kinds_share_table(left: PhpSymbolKind, right: PhpSymbolKind)
         PhpSymbolKind::GlobalConstant => left == PhpSymbolKind::GlobalConstant,
         _ => false,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TopLevelSymbolTable {
+    Types,
+    Functions,
+    Constants,
+}
+
+fn top_level_generation_key(symbol: &SymbolInfo) -> Option<(TopLevelSymbolTable, String)> {
+    let table = match symbol.kind {
+        PhpSymbolKind::Class
+        | PhpSymbolKind::Interface
+        | PhpSymbolKind::Trait
+        | PhpSymbolKind::Enum => TopLevelSymbolTable::Types,
+        PhpSymbolKind::Function => TopLevelSymbolTable::Functions,
+        PhpSymbolKind::GlobalConstant => TopLevelSymbolTable::Constants,
+        _ => return None,
+    };
+    Some((table, top_level_symbol_key(symbol)))
+}
+
+fn top_level_generation_keys(file_symbols: &FileSymbols) -> HashSet<(TopLevelSymbolTable, String)> {
+    file_symbols
+        .symbols
+        .iter()
+        .filter_map(top_level_generation_key)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +192,26 @@ impl WorkspaceIndex {
     ) where
         F: FnOnce(),
     {
+        self.update_file_with_references_with_hooks(
+            uri,
+            file_symbols,
+            file_references,
+            || {},
+            before_direct_member_publish,
+        );
+    }
+
+    fn update_file_with_references_with_hooks<F, G>(
+        &self,
+        uri: &str,
+        file_symbols: FileSymbols,
+        file_references: Vec<SymbolReference>,
+        before_top_level_publish: F,
+        before_direct_member_publish: G,
+    ) where
+        F: FnOnce(),
+        G: FnOnce(),
+    {
         let uri_key = uri.to_string();
         // The mutable generation guard is the per-URI write barrier. Readers
         // use immutable snapshots, while other writers cannot interleave a commit.
@@ -146,7 +219,8 @@ impl WorkspaceIndex {
             .file_update_generations
             .entry(uri_key.clone())
             .or_insert(0);
-        let old_direct_member_parents = self.remove_file_snapshot(uri);
+        let (old_direct_member_parents, old_file_symbols) = self.take_file_snapshot(uri);
+        before_top_level_publish();
 
         let generation = self
             .next_file_symbol_generation
@@ -181,6 +255,9 @@ impl WorkspaceIndex {
                 // Members are stored through compact locators below.
                 _ => {}
             }
+        }
+        if let Some(old_file_symbols) = old_file_symbols.as_ref() {
+            self.remove_replaced_top_level_symbols(uri, old_file_symbols, &file_symbols);
         }
 
         // Publish the file snapshot and its generation before making locators visible.
@@ -228,13 +305,9 @@ impl WorkspaceIndex {
     }
 
     fn remove_file_snapshot(&self, uri: &str) -> HashSet<String> {
-        self.file_references.remove(uri);
-        let mut direct_member_parents = HashSet::new();
-        if let Some((_, old_symbols)) = self.file_symbols.remove(uri) {
+        let (direct_member_parents, old_file_symbols) = self.take_file_snapshot(uri);
+        if let Some(old_symbols) = old_file_symbols {
             for sym in &old_symbols.symbols {
-                if let Some(parent_fqn) = sym.parent_fqn.as_deref() {
-                    direct_member_parents.insert(case_insensitive_fqn_key(parent_fqn));
-                }
                 match sym.kind {
                     PhpSymbolKind::Class
                     | PhpSymbolKind::Interface
@@ -253,6 +326,50 @@ impl WorkspaceIndex {
             }
         }
         direct_member_parents
+    }
+
+    fn take_file_snapshot(&self, uri: &str) -> (HashSet<String>, Option<Arc<FileSymbols>>) {
+        self.file_references.remove(uri);
+        let old_file_symbols = self.file_symbols.remove(uri).map(|(_, symbols)| symbols);
+        let direct_member_parents = old_file_symbols
+            .iter()
+            .flat_map(|symbols| symbols.symbols.iter())
+            .filter_map(|symbol| symbol.parent_fqn.as_deref())
+            .map(case_insensitive_fqn_key)
+            .collect();
+        (direct_member_parents, old_file_symbols)
+    }
+
+    fn remove_replaced_top_level_symbols(
+        &self,
+        uri: &str,
+        old_file_symbols: &FileSymbols,
+        new_file_symbols: &FileSymbols,
+    ) {
+        let new_top_level_keys = top_level_generation_keys(new_file_symbols);
+        for old_symbol in &old_file_symbols.symbols {
+            let Some(old_key) = top_level_generation_key(old_symbol) else {
+                continue;
+            };
+            if new_top_level_keys.contains(&old_key) {
+                continue;
+            }
+            match old_symbol.kind {
+                PhpSymbolKind::Class
+                | PhpSymbolKind::Interface
+                | PhpSymbolKind::Trait
+                | PhpSymbolKind::Enum => {
+                    self.remove_top_level_symbol(uri, old_symbol, &self.types);
+                }
+                PhpSymbolKind::Function => {
+                    self.remove_top_level_symbol(uri, old_symbol, &self.functions);
+                }
+                PhpSymbolKind::GlobalConstant => {
+                    self.remove_top_level_symbol(uri, old_symbol, &self.constants);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn insert_direct_member_source(&self, parent_key: String, source: DirectMemberSource) {
@@ -421,6 +538,69 @@ impl WorkspaceIndex {
             .map(|entry| entry.value().clone())
     }
 
+    /// Return a type only after the complete file generation that published it
+    /// (including direct-member locators) is visible.
+    pub fn get_committed_type(&self, fqn: &str) -> Option<CommittedTypeSnapshot> {
+        self.committed_type_snapshot_with(fqn, || ())
+            .map(|(snapshot, ())| snapshot)
+    }
+
+    /// Check whether a previously observed committed type generation is still current.
+    pub fn type_generation_is_current(&self, expected: &TypeIndexGeneration) -> bool {
+        let Some(generation) = self.file_update_generations.get(&expected.uri) else {
+            return false;
+        };
+        if *generation != expected.generation {
+            return false;
+        }
+        self.get_type(&expected.type_fqn)
+            .is_some_and(|symbol| symbol.uri == expected.uri)
+    }
+
+    fn committed_type_resolution_snapshot(&self, fqn: &str) -> Option<TypeResolutionSnapshot> {
+        self.committed_type_snapshot_with(fqn, || self.get_direct_members(fqn))
+            .map(|(type_snapshot, direct_members)| TypeResolutionSnapshot {
+                type_snapshot,
+                direct_members,
+            })
+    }
+
+    fn committed_type_snapshot_with<T>(
+        &self,
+        fqn: &str,
+        capture: impl Fn() -> T,
+    ) -> Option<(CommittedTypeSnapshot, T)> {
+        for _ in 0..MAX_COMMITTED_SNAPSHOT_RETRIES {
+            let before = self.get_type(fqn)?;
+            let uri = before.uri.clone();
+            let generation_guard = self.file_update_generations.get(&uri)?;
+            if *generation_guard == 0 {
+                continue;
+            }
+            let Some(current) = self.get_type(fqn) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&before, &current) || current.uri != uri {
+                continue;
+            }
+
+            let captured = capture();
+            let generation = TypeIndexGeneration {
+                type_fqn: current.fqn.clone(),
+                uri,
+                generation: *generation_guard,
+            };
+            return Some((
+                CommittedTypeSnapshot {
+                    symbol: current,
+                    generation,
+                },
+                captured,
+            ));
+        }
+        None
+    }
+
     /// Resolve a `Class::member` FQN to the member symbol.
     ///
     /// First tries exact FQN match (e.g. `App\Foo::test`), then falls back
@@ -472,7 +652,8 @@ impl WorkspaceIndex {
             return None;
         }
 
-        let members = self.get_direct_members(class_fqn);
+        let snapshot = self.committed_type_resolution_snapshot(class_fqn)?;
+        let members = snapshot.direct_members;
         // Prefer exact FQN match first
         if let Some(sym) = members.iter().find(|member| {
             member_kind_matches(member.kind, expected_kinds)
@@ -489,7 +670,8 @@ impl WorkspaceIndex {
         }
 
         // Walk the class hierarchy: look up extends and implements
-        if let Some(class_sym) = self.get_type(class_fqn) {
+        {
+            let class_sym = snapshot.type_snapshot.symbol;
             // Try traits first: their members are mixed into the class/trait body.
             for trait_fqn in &class_sym.traits {
                 let edge_substitutions =
@@ -658,7 +840,10 @@ impl WorkspaceIndex {
         }
 
         // Collect direct members
-        let direct = self.get_direct_members(type_fqn);
+        let Some(snapshot) = self.committed_type_resolution_snapshot(type_fqn) else {
+            return;
+        };
+        let direct = snapshot.direct_members;
         members.extend(
             direct
                 .into_iter()
@@ -666,7 +851,8 @@ impl WorkspaceIndex {
         );
 
         // Recurse into parent classes and interfaces
-        if let Some(class_sym) = self.get_type(type_fqn) {
+        {
+            let class_sym = snapshot.type_snapshot.symbol;
             for trait_fqn in &class_sym.traits {
                 let edge_substitutions =
                     self.template_substitutions_for_edge(&class_sym, trait_fqn, substitutions);
@@ -709,7 +895,10 @@ impl WorkspaceIndex {
             return TemplateSubstitutions::new();
         };
 
-        let Some(target) = self.get_type(target_fqn) else {
+        let Some(target) = self
+            .get_committed_type(target_fqn)
+            .map(|snapshot| snapshot.symbol)
+        else {
             return TemplateSubstitutions::new();
         };
 
@@ -1051,7 +1240,10 @@ impl WorkspaceIndex {
             return;
         }
 
-        let Some(class_sym) = self.get_type(type_fqn) else {
+        let Some(class_sym) = self
+            .get_committed_type(type_fqn)
+            .map(|snapshot| snapshot.symbol)
+        else {
             return;
         };
         types.push(class_sym.clone());

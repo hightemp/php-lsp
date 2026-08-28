@@ -1959,6 +1959,621 @@ async fn test_lazy_index_class_returns_false_when_psr4_file_contains_different_c
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn concurrent_lazy_class_requests_share_one_index_generation() {
+    let root = unique_server_temp_dir("lazy-single-flight");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("Foo.php"),
+        "<?php\nnamespace App;\nclass Foo { public function run(): void {} }\n",
+    )
+    .unwrap();
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: Some(NamespaceMap {
+                psr4: vec![("App\\".to_string(), vec![src])],
+                ..Default::default()
+            }),
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: backend.index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
+
+    let context = backend.vendor_lazy_index_context().await;
+    let mut loads = tokio::task::JoinSet::new();
+    for _ in 0..64 {
+        let context = context.clone();
+        loads.spawn(async move { lazy_index_class_with_context(&context, "App\\Foo").await });
+    }
+    while let Some(result) = loads.join_next().await {
+        result.expect("single-flight caller completed");
+    }
+
+    let snapshot = backend
+        .index
+        .get_committed_type("App\\Foo")
+        .expect("committed Foo snapshot");
+    assert_eq!(
+        snapshot.generation.generation(),
+        1,
+        "one physical file publication must serve every concurrent caller"
+    );
+    assert!(backend.index.resolve_member("App\\Foo::run").is_some());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_first_lazy_waiter_does_not_cancel_shared_load() {
+    let root = unique_server_temp_dir("lazy-cancelled-waiter");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut source = "<?php\nnamespace App;\nclass LargeType {\n".to_string();
+    for index in 0..2_000 {
+        source.push_str(&format!("public function method{index}(): void {{}}\n"));
+    }
+    source.push_str("}\n");
+    std::fs::write(src.join("LargeType.php"), source).unwrap();
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: Some(NamespaceMap {
+                psr4: vec![("App\\".to_string(), vec![src])],
+                ..Default::default()
+            }),
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: backend.index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
+
+    let first_context = backend.vendor_lazy_index_context().await;
+    let first_waiter = tokio::spawn(async move {
+        lazy_index_class_with_context(&first_context, "App\\LargeType").await
+    });
+    let started = std::time::Instant::now();
+    while backend.vendor_lazy_loads.in_flight_class_loads() == 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "shared load did not enter the coordinator"
+        );
+        tokio::task::yield_now().await;
+    }
+    first_waiter.abort();
+    let _ = first_waiter.await;
+
+    let second_context = backend.vendor_lazy_index_context().await;
+    lazy_index_class_with_context(&second_context, "App\\LargeType").await;
+    let snapshot = backend
+        .index
+        .get_committed_type("App\\LargeType")
+        .expect("shared load survived first waiter cancellation");
+    assert_eq!(snapshot.generation.generation(), 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn composer_epoch_prevents_stale_in_flight_vendor_recommit() {
+    let root = unique_server_temp_dir("lazy-composer-epoch");
+    let composer_dir = root.join("vendor/composer");
+    let old_src = root.join("vendor/acme/old/src");
+    let new_src = root.join("vendor/acme/new/src");
+    std::fs::create_dir_all(&composer_dir).unwrap();
+    std::fs::create_dir_all(&old_src).unwrap();
+    std::fs::create_dir_all(&new_src).unwrap();
+    std::fs::write(
+        old_src.join("Foo.php"),
+        "<?php namespace Vendor; class Foo { public function oldMethod(): void {} }",
+    )
+    .unwrap();
+    std::fs::write(
+        new_src.join("Foo.php"),
+        "<?php namespace Vendor; class Foo { public function newMethod(): void {} }",
+    )
+    .unwrap();
+    let installed_path = composer_dir.join("installed.json");
+    let installed_json = |package: &str| {
+        serde_json::json!({
+            "packages": [{
+                "name": format!("acme/{package}"),
+                "version": "1.0.0",
+                "install-path": format!("../acme/{package}"),
+                "autoload": { "psr-4": { "Vendor\\": "src/" } }
+            }]
+        })
+        .to_string()
+    };
+    std::fs::write(&installed_path, installed_json("old")).unwrap();
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: backend.index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
+
+    let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    backend
+        .vendor_lazy_loads
+        .pause_next_load_after_path_resolution(reached_tx, release.clone())
+        .await;
+    let old_context = backend.vendor_lazy_index_context().await;
+    let old_waiter =
+        tokio::spawn(
+            async move { lazy_index_class_with_context(&old_context, "Vendor\\Foo").await },
+        );
+    reached_rx
+        .recv()
+        .await
+        .expect("old load paused after resolving Composer path");
+
+    std::fs::write(&installed_path, installed_json("new")).unwrap();
+    let release_task = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        release.notify_one();
+    });
+    let new_context = backend.vendor_lazy_index_context().await;
+    let ((), _) = tokio::join!(
+        backend.invalidate_composer_metadata(&installed_path, false),
+        lazy_index_class_with_context(&new_context, "Vendor\\Foo")
+    );
+    release_task.await.unwrap();
+    let _ = old_waiter.await;
+
+    let current = backend
+        .index
+        .get_committed_type("Vendor\\Foo")
+        .expect("new Composer epoch loaded Foo");
+    assert!(
+        current.symbol.uri.contains("/acme/new/src/Foo.php"),
+        "current epoch must resolve the new Composer path: {}",
+        current.symbol.uri
+    );
+    assert!(backend
+        .index
+        .resolve_member("Vendor\\Foo::newMethod")
+        .is_some());
+    assert!(backend
+        .index
+        .resolve_member("Vendor\\Foo::oldMethod")
+        .is_none());
+
+    let cache_path = cache::cache_file_path_for_namespace(&root, CacheNamespace::Vendor);
+    if let Some(cache_dir) = cache_path.parent().and_then(Path::parent) {
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn composer_epoch_prevents_stale_namespace_map_cache_insert() {
+    let root = unique_server_temp_dir("lazy-namespace-epoch");
+    let composer_dir = root.join("vendor/composer");
+    let old_src = root.join("vendor/acme/old/src");
+    let new_src = root.join("vendor/acme/new/src");
+    std::fs::create_dir_all(&composer_dir).unwrap();
+    std::fs::create_dir_all(&old_src).unwrap();
+    std::fs::create_dir_all(&new_src).unwrap();
+    let installed_path = composer_dir.join("installed.json");
+    let installed_json = |package: &str, prefix: &str| {
+        serde_json::json!({
+            "packages": [{
+                "name": format!("acme/{package}"),
+                "version": "1.0.0",
+                "install-path": format!("../acme/{package}"),
+                "autoload": { "psr-4": { (prefix): "src/" } }
+            }]
+        })
+        .to_string()
+    };
+    std::fs::write(&installed_path, installed_json("old", "OldVendor\\")).unwrap();
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: backend.index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
+
+    let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    backend
+        .vendor_autoload_cache
+        .lock()
+        .await
+        .before_insert_pause = Some(VendorCacheInsertPause {
+        reached: reached_tx,
+        release: release.clone(),
+    });
+    let cache = backend.vendor_autoload_cache.clone();
+    let epoch = backend.vendor_load_epoch.clone();
+    let vendor_dir = root.join("vendor");
+    let old_parse = tokio::spawn(async move {
+        cached_vendor_autoload_map_with_epoch(&cache, &vendor_dir, &epoch).await
+    });
+    reached_rx
+        .recv()
+        .await
+        .expect("old metadata parse paused before cache insert");
+
+    std::fs::write(&installed_path, installed_json("new", "NewVendor\\")).unwrap();
+    let release_task = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        release.notify_one();
+    });
+    let ((), old_map) = tokio::join!(
+        backend.invalidate_composer_metadata(&installed_path, false),
+        old_parse
+    );
+    release_task.await.unwrap();
+    assert!(old_map.unwrap().is_some());
+
+    let request_uri = php_lsp_types::uri::path_to_uri(&root.join("Request.php")).unwrap();
+    let request = backend.request_context_for_uri(&request_uri).await;
+    assert!(
+        !backend
+            .vendor_namespace_exists_lazy_in_request(&request, "OldVendor")
+            .await
+    );
+    assert!(
+        backend
+            .vendor_namespace_exists_lazy_in_request(&request, "NewVendor")
+            .await
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn composer_epoch_prevents_stale_vendor_preload_recommit() {
+    let root = unique_server_temp_dir("vendor-preload-epoch");
+    let composer_dir = root.join("vendor/composer");
+    let old_package = root.join("vendor/acme/old");
+    let new_package = root.join("vendor/acme/new");
+    std::fs::create_dir_all(&composer_dir).unwrap();
+    std::fs::create_dir_all(&old_package).unwrap();
+    std::fs::create_dir_all(&new_package).unwrap();
+    std::fs::write(
+        old_package.join("bootstrap.php"),
+        "<?php namespace Vendor; class OldEntrypoint {}",
+    )
+    .unwrap();
+    std::fs::write(
+        new_package.join("bootstrap.php"),
+        "<?php namespace Vendor; class NewEntrypoint {}",
+    )
+    .unwrap();
+    let installed_path = composer_dir.join("installed.json");
+    let installed_json = |package: &str| {
+        serde_json::json!({
+            "packages": [{
+                "name": format!("acme/{package}"),
+                "version": "1.0.0",
+                "install-path": format!("../acme/{package}"),
+                "autoload": { "files": ["bootstrap.php"] }
+            }]
+        })
+        .to_string()
+    };
+    std::fs::write(&installed_path, installed_json("old")).unwrap();
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let vendor_file_lru = Arc::new(Mutex::new(VendorFileLru::default()));
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: backend.index.clone(),
+            vendor_file_lru: vendor_file_lru.clone(),
+        }],
+        generation: 1,
+    });
+
+    let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    backend
+        .vendor_autoload_cache
+        .lock()
+        .await
+        .before_insert_pause = Some(VendorCacheInsertPause {
+        reached: reached_tx,
+        release: release.clone(),
+    });
+    let preload_index = backend.index.clone();
+    let preload_root = root.clone();
+    let preload_cache = backend.vendor_autoload_cache.clone();
+    let preload_lru = vendor_file_lru.clone();
+    let preload_epoch = backend.vendor_load_epoch.clone();
+    let old_preload = tokio::spawn(async move {
+        preload_vendor_entrypoints(
+            preload_index,
+            &preload_root,
+            &[],
+            PhpVersion::DEFAULT,
+            &preload_cache,
+            &preload_lru,
+            &preload_epoch,
+        )
+        .await
+    });
+    reached_rx
+        .recv()
+        .await
+        .expect("old preload paused during metadata parse");
+
+    std::fs::write(&installed_path, installed_json("new")).unwrap();
+    let release_task = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        release.notify_one();
+    });
+    let ((), old_loaded) = tokio::join!(
+        backend.invalidate_composer_metadata(&installed_path, false),
+        old_preload
+    );
+    release_task.await.unwrap();
+    assert_eq!(old_loaded.unwrap(), 1);
+    assert!(backend.index.resolve_fqn("Vendor\\OldEntrypoint").is_none());
+
+    let new_loaded = preload_vendor_entrypoints(
+        backend.index.clone(),
+        &root,
+        &[],
+        PhpVersion::DEFAULT,
+        &backend.vendor_autoload_cache,
+        &vendor_file_lru,
+        &backend.vendor_load_epoch,
+    )
+    .await;
+    assert_eq!(new_loaded, 1);
+    assert!(backend.index.resolve_fqn("Vendor\\NewEntrypoint").is_some());
+    assert!(backend.index.resolve_fqn("Vendor\\OldEntrypoint").is_none());
+
+    let cache_path = cache::cache_file_path_for_namespace(&root, CacheNamespace::Vendor);
+    if let Some(cache_dir) = cache_path.parent().and_then(Path::parent) {
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_inherited_member_requests_share_one_hierarchy_load() {
+    let root = unique_server_temp_dir("lazy-hierarchy-single-flight");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("Child.php"),
+        "<?php\nnamespace App;\nclass Child extends ParentType {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("ParentType.php"),
+        "<?php\nnamespace App;\nclass ParentType extends BaseType {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("BaseType.php"),
+        "<?php\nnamespace App;\nclass BaseType { public function inherited(): void {} }\n",
+    )
+    .unwrap();
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: Some(NamespaceMap {
+                psr4: vec![("App\\".to_string(), vec![src])],
+                ..Default::default()
+            }),
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: backend.index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
+
+    let mut resolutions = tokio::task::JoinSet::new();
+    for _ in 0..64 {
+        let context = backend.vendor_lazy_index_context().await;
+        resolutions.spawn(async move {
+            resolve_member_stable_with_context(
+                &context,
+                "App\\Child::inherited",
+                Some(&[php_lsp_types::PhpSymbolKind::Method]),
+            )
+            .await
+        });
+    }
+    while let Some(result) = resolutions.join_next().await {
+        let member = result
+            .expect("hierarchy resolver completed")
+            .expect("inherited method resolved");
+        assert_eq!(member.fqn, "App\\BaseType::inherited");
+    }
+
+    let mut generations = ["App\\Child", "App\\ParentType", "App\\BaseType"].map(|fqn| {
+        backend
+            .index
+            .get_committed_type(fqn)
+            .expect("committed hierarchy node")
+            .generation
+            .generation()
+    });
+    generations.sort_unstable();
+    assert_eq!(
+        generations,
+        [1, 2, 3],
+        "every hierarchy file must be physically published exactly once"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stable_member_resolution_retries_changed_hierarchy_generation() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let child_uri = "file:///generation-child.php";
+    let base_uri = "file:///generation-base.php";
+    parse_and_index_php_file(
+        &index,
+        child_uri,
+        "<?php namespace App; class Child extends BaseType {}",
+    );
+    parse_and_index_php_file(
+        &index,
+        base_uri,
+        "<?php namespace App; class BaseType { public function oldMethod(): void {} }",
+    );
+    let context = VendorLazyIndexContext {
+        index: index.clone(),
+        workspace_configs: Vec::new(),
+        exclude_paths: Vec::new(),
+        php_version: PhpVersion::DEFAULT,
+        index_vendor: false,
+        vendor_autoload_cache: Arc::new(Mutex::new(VendorAutoloadCache::default())),
+        vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        lazy_loads: Arc::new(VendorLazyLoadCoordinator::default()),
+        load_epoch: Arc::new(tokio::sync::RwLock::new(0)),
+    };
+    let lookup_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_attempts = lookup_attempts.clone();
+    let hook_index = index.clone();
+    let resolved = resolve_member_stable_with_hook(
+        &context,
+        "App\\Child::freshMethod",
+        Some(&[php_lsp_types::PhpSymbolKind::Method]),
+        move |attempt| {
+            hook_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                parse_and_index_php_file(
+                    &hook_index,
+                    base_uri,
+                    "<?php namespace App; class BaseType { public function freshMethod(): void {} }",
+                );
+            }
+        },
+    )
+    .await
+    .expect("member resolved after hierarchy retry");
+    assert_eq!(resolved.fqn, "App\\BaseType::freshMethod");
+    assert_eq!(
+        lookup_attempts.load(Ordering::SeqCst),
+        2,
+        "generation change must force exactly one complete hierarchy retry"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn same_fqn_lazy_loads_remain_isolated_per_index() {
+    let root_a = unique_server_temp_dir("lazy-root-a");
+    let root_b = unique_server_temp_dir("lazy-root-b");
+    let src_a = root_a.join("src");
+    let src_b = root_b.join("src");
+    std::fs::create_dir_all(&src_a).unwrap();
+    std::fs::create_dir_all(&src_b).unwrap();
+    std::fs::write(
+        src_a.join("Foo.php"),
+        "<?php\nnamespace App;\nclass Foo { public function onlyA(): void {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src_b.join("Foo.php"),
+        "<?php\nnamespace App;\nclass Foo { public function onlyB(): void {} }\n",
+    )
+    .unwrap();
+
+    let index_a = Arc::new(WorkspaceIndex::new());
+    let index_b = Arc::new(WorkspaceIndex::new());
+    let coordinator = Arc::new(VendorLazyLoadCoordinator::default());
+    let autoload_cache = Arc::new(Mutex::new(VendorAutoloadCache::default()));
+    let context =
+        |root: &Path, src: PathBuf, index: Arc<WorkspaceIndex>| -> VendorLazyIndexContext {
+            let vendor_file_lru = Arc::new(Mutex::new(VendorFileLru::default()));
+            let config = WorkspaceRootConfig {
+                workspace_folder: root.to_path_buf(),
+                root: root.to_path_buf(),
+                namespace_map: Some(NamespaceMap {
+                    psr4: vec![("App\\".to_string(), vec![src])],
+                    ..Default::default()
+                }),
+                runtime_config: ResolvedRuntimeConfiguration::default(),
+                index: index.clone(),
+                vendor_file_lru: vendor_file_lru.clone(),
+            };
+            VendorLazyIndexContext {
+                index,
+                workspace_configs: vec![config],
+                exclude_paths: Vec::new(),
+                php_version: PhpVersion::DEFAULT,
+                index_vendor: true,
+                vendor_autoload_cache: autoload_cache.clone(),
+                vendor_file_lru,
+                lazy_loads: coordinator.clone(),
+                load_epoch: Arc::new(tokio::sync::RwLock::new(0)),
+            }
+        };
+    let context_a = context(&root_a, src_a, index_a.clone());
+    let context_b = context(&root_b, src_b, index_b.clone());
+
+    let (loaded_a, loaded_b) = tokio::join!(
+        lazy_index_class_with_context(&context_a, "App\\Foo"),
+        lazy_index_class_with_context(&context_b, "App\\Foo")
+    );
+    assert!(loaded_a && loaded_b);
+    assert!(index_a.resolve_member("App\\Foo::onlyA").is_some());
+    assert!(index_a.resolve_member("App\\Foo::onlyB").is_none());
+    assert!(index_b.resolve_member("App\\Foo::onlyB").is_some());
+    assert!(index_b.resolve_member("App\\Foo::onlyA").is_none());
+
+    std::fs::remove_dir_all(root_a).unwrap();
+    std::fs::remove_dir_all(root_b).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_lazy_indexed_vendor_symbol_survives_restart_cache_load() {
     let root = unique_server_temp_dir("lazy-vendor-cache");
     let vendor_src = root.join("vendor/acme/package/src");
@@ -6432,6 +7047,44 @@ async fn test_configuration_change_is_atomic_and_replaces_only_the_affected_root
     ));
 
     std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test]
+async fn composer_namespace_map_change_replaces_the_root_index() {
+    let root = unique_server_temp_dir("composer-map-index-replacement");
+    let composer_json = root.join("composer.json");
+    std::fs::write(&composer_json, r#"{"autoload":{"psr-4":{"Old\\":"src/"}}}"#).unwrap();
+    let root_uri = php_lsp_types::uri::path_to_uri(&root).unwrap();
+    let settings = serde_json::json!({
+        "configurationVersion": 2,
+        "global": { "stubExtensions": [] },
+        "workspaceFolders": [{ "uri": root_uri, "settings": {} }]
+    });
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    backend
+        .apply_effective_configuration_settings(&settings, std::slice::from_ref(&root))
+        .await;
+    let before = backend.runtime_state_snapshot().await;
+    let old_config = before.configs.first().unwrap().clone();
+
+    std::fs::write(&composer_json, r#"{"autoload":{"psr-4":{"New\\":"lib/"}}}"#).unwrap();
+    let application = backend
+        .apply_effective_configuration_settings(&settings, std::slice::from_ref(&root))
+        .await;
+    let after = backend.runtime_state_snapshot().await;
+    let new_config = after.configs.first().unwrap();
+
+    assert!(!Arc::ptr_eq(&old_config.index, &new_config.index));
+    assert_eq!(application.indexing_workspace_folders, vec![root.clone()]);
+    assert_eq!(old_config.namespace_map.unwrap().psr4[0].0, "Old\\");
+    assert_eq!(
+        new_config.namespace_map.as_ref().unwrap().psr4[0].0,
+        "New\\"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

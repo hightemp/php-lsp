@@ -25,6 +25,9 @@ const FUNCTION_KINDS: &[php_lsp_types::PhpSymbolKind] = &[php_lsp_types::PhpSymb
 const GLOBAL_CONSTANT_KINDS: &[php_lsp_types::PhpSymbolKind] =
     &[php_lsp_types::PhpSymbolKind::GlobalConstant];
 const NAMESPACE_KINDS: &[php_lsp_types::PhpSymbolKind] = &[php_lsp_types::PhpSymbolKind::Namespace];
+const MAX_VENDOR_HIERARCHY_DEPTH: usize = 32;
+const MAX_STABLE_MEMBER_RESOLUTION_RETRIES: usize = 4;
+const MAX_VENDOR_EPOCH_RETRIES: usize = 4;
 
 fn member_kinds_for_ref_kind(ref_kind: RefKind) -> Option<&'static [php_lsp_types::PhpSymbolKind]> {
     match ref_kind {
@@ -75,6 +78,15 @@ pub(in crate::server) fn resolve_fqn_with_ref_kind(
 #[derive(Debug, Default)]
 pub(crate) struct VendorAutoloadCache {
     pub(crate) by_vendor_dir: HashMap<PathBuf, VendorAutoloadCacheEntry>,
+    #[cfg(test)]
+    pub(crate) before_insert_pause: Option<VendorCacheInsertPause>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct VendorCacheInsertPause {
+    pub(crate) reached: tokio::sync::mpsc::UnboundedSender<()>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 impl VendorAutoloadCache {
@@ -142,6 +154,140 @@ pub(in crate::server) struct VendorLazyIndexContext {
     pub(in crate::server) index_vendor: bool,
     pub(in crate::server) vendor_autoload_cache: Arc<Mutex<VendorAutoloadCache>>,
     pub(in crate::server) vendor_file_lru: Arc<Mutex<VendorFileLru>>,
+    pub(in crate::server) lazy_loads: Arc<VendorLazyLoadCoordinator>,
+    pub(in crate::server) load_epoch: Arc<tokio::sync::RwLock<u64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VendorLoadKey {
+    index_identity: usize,
+    epoch: u64,
+    class_fqn: String,
+}
+
+#[derive(Debug, Clone)]
+struct VendorClassLoadOutcome {
+    snapshot: Option<php_lsp_index::workspace::CommittedTypeSnapshot>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(in crate::server) struct VendorHierarchySnapshot {
+    generations: Vec<php_lsp_index::workspace::TypeIndexGeneration>,
+    complete: bool,
+}
+
+impl VendorHierarchySnapshot {
+    fn is_current(&self, index: &WorkspaceIndex) -> bool {
+        !self.generations.is_empty()
+            && self
+                .generations
+                .iter()
+                .all(|generation| index.type_generation_is_current(generation))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct VendorLazyLoadCoordinator {
+    class_loads:
+        DashMap<VendorLoadKey, tokio::sync::watch::Receiver<Option<VendorClassLoadOutcome>>>,
+    hierarchy_loads:
+        DashMap<VendorLoadKey, tokio::sync::watch::Receiver<Option<VendorHierarchySnapshot>>>,
+    #[cfg(test)]
+    after_path_resolution: Mutex<Option<VendorLoadPause>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct VendorLoadPause {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl VendorLazyLoadCoordinator {
+    #[cfg(test)]
+    pub(in crate::server) fn in_flight_class_loads(&self) -> usize {
+        self.class_loads.len()
+    }
+
+    #[cfg(test)]
+    pub(in crate::server) async fn pause_next_load_after_path_resolution(
+        &self,
+        reached: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.after_path_resolution.lock().await = Some(VendorLoadPause { reached, release });
+    }
+
+    #[cfg(test)]
+    async fn run_after_path_resolution_hook(&self) {
+        let pause = self.after_path_resolution.lock().await.take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            pause.release.notified().await;
+        }
+    }
+}
+
+fn remove_class_load_if_channel_matches(
+    coordinator: &VendorLazyLoadCoordinator,
+    key: &VendorLoadKey,
+    receiver: &tokio::sync::watch::Receiver<Option<VendorClassLoadOutcome>>,
+) {
+    if let dashmap::mapref::entry::Entry::Occupied(entry) =
+        coordinator.class_loads.entry(key.clone())
+    {
+        if entry.get().same_channel(receiver) {
+            entry.remove();
+        }
+    }
+}
+
+fn remove_hierarchy_load_if_channel_matches(
+    coordinator: &VendorLazyLoadCoordinator,
+    key: &VendorLoadKey,
+    receiver: &tokio::sync::watch::Receiver<Option<VendorHierarchySnapshot>>,
+) {
+    if let dashmap::mapref::entry::Entry::Occupied(entry) =
+        coordinator.hierarchy_loads.entry(key.clone())
+    {
+        if entry.get().same_channel(receiver) {
+            entry.remove();
+        }
+    }
+}
+
+fn vendor_load_key(context: &VendorLazyIndexContext, class_fqn: &str, epoch: u64) -> VendorLoadKey {
+    VendorLoadKey {
+        index_identity: Arc::as_ptr(&context.index) as usize,
+        epoch,
+        class_fqn: class_fqn.trim_start_matches('\\').to_ascii_lowercase(),
+    }
+}
+
+async fn wait_for_class_load(
+    mut receiver: tokio::sync::watch::Receiver<Option<VendorClassLoadOutcome>>,
+) -> Option<php_lsp_index::workspace::CommittedTypeSnapshot> {
+    loop {
+        if let Some(outcome) = receiver.borrow().clone() {
+            return outcome.snapshot;
+        }
+        if receiver.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
+async fn wait_for_hierarchy_load(
+    mut receiver: tokio::sync::watch::Receiver<Option<VendorHierarchySnapshot>>,
+) -> VendorHierarchySnapshot {
+    loop {
+        if let Some(outcome) = receiver.borrow().clone() {
+            return outcome;
+        }
+        if receiver.changed().await.is_err() {
+            return VendorHierarchySnapshot::default();
+        }
+    }
 }
 
 pub(crate) fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutoloadMap> {
@@ -191,13 +337,13 @@ pub(in crate::server) async fn parse_vendor_autoload_map_blocking(
     .flatten()
 }
 
-pub(in crate::server) async fn lazy_index_class_with_context(
+async fn index_class_uncached_with_context(
     context: &VendorLazyIndexContext,
     class_fqn: &str,
-) -> bool {
+) -> Option<php_lsp_index::workspace::CommittedTypeSnapshot> {
     let requested_class_fqn = class_fqn.trim_start_matches('\\');
-    if context.index.contains_type(requested_class_fqn) {
-        return false;
+    if let Some(snapshot) = context.index.get_committed_type(requested_class_fqn) {
+        return Some(snapshot);
     }
 
     for config in &context.workspace_configs {
@@ -210,7 +356,7 @@ pub(in crate::server) async fn lazy_index_class_with_context(
         let vendor_dir = config.root.join("vendor");
         if context.index_vendor && vendor_dir.is_dir() && all_paths.is_empty() {
             if let Some(vendor_map) =
-                cached_vendor_autoload_map(&context.vendor_autoload_cache, &vendor_dir).await
+                cached_vendor_autoload_map_pinned(&context.vendor_autoload_cache, &vendor_dir).await
             {
                 if let Some(vendor_paths) =
                     resolve_vendor_paths_from_map(requested_class_fqn, &vendor_map)
@@ -219,6 +365,9 @@ pub(in crate::server) async fn lazy_index_class_with_context(
                 }
             }
         }
+
+        #[cfg(test)]
+        context.lazy_loads.run_after_path_resolution_hook().await;
 
         for path in &all_paths {
             let abs = if path.is_absolute() {
@@ -246,8 +395,8 @@ pub(in crate::server) async fn lazy_index_class_with_context(
                 {
                     touch_vendor_file_lru(&context.index, &context.vendor_file_lru, &abs).await;
                     tracing::debug!("Lazy-indexed vendor file from cache: {}", abs.display());
-                    if context.index.contains_type(requested_class_fqn) {
-                        return true;
+                    if let Some(snapshot) = context.index.get_committed_type(requested_class_fqn) {
+                        return Some(snapshot);
                     }
                     tracing::debug!(
                         "Lazy vendor cache file {} did not contain requested class {}",
@@ -269,7 +418,7 @@ pub(in crate::server) async fn lazy_index_class_with_context(
                     touch_vendor_file_lru(&context.index, &context.vendor_file_lru, &abs).await;
                 }
                 tracing::debug!("Lazy-indexed file: {}", abs.display());
-                if context.index.contains_type(requested_class_fqn) {
+                if let Some(snapshot) = context.index.get_committed_type(requested_class_fqn) {
                     if is_vendor_file {
                         if let Some(cache_config) = vendor_cache_config {
                             save_vendor_index_cache_blocking(
@@ -280,7 +429,7 @@ pub(in crate::server) async fn lazy_index_class_with_context(
                             .await;
                         }
                     }
-                    return true;
+                    return Some(snapshot);
                 }
                 tracing::debug!(
                     "Lazy-indexed file {} did not contain requested class {}",
@@ -291,34 +440,255 @@ pub(in crate::server) async fn lazy_index_class_with_context(
         }
     }
 
-    false
+    None
+}
+
+async fn ensure_class_indexed_with_context(
+    context: &VendorLazyIndexContext,
+    class_fqn: &str,
+) -> Option<php_lsp_index::workspace::CommittedTypeSnapshot> {
+    for _ in 0..MAX_VENDOR_EPOCH_RETRIES {
+        let epoch_guard = context.load_epoch.clone().read_owned().await;
+        let epoch = *epoch_guard;
+        let result =
+            ensure_class_indexed_at_epoch(context, class_fqn, epoch, Some(epoch_guard)).await;
+        if *context.load_epoch.read().await == epoch {
+            return result;
+        }
+    }
+    None
+}
+
+async fn ensure_class_indexed_at_epoch(
+    context: &VendorLazyIndexContext,
+    class_fqn: &str,
+    epoch: u64,
+    epoch_guard: Option<tokio::sync::OwnedRwLockReadGuard<u64>>,
+) -> Option<php_lsp_index::workspace::CommittedTypeSnapshot> {
+    let requested_class_fqn = class_fqn.trim_start_matches('\\');
+    if let Some(snapshot) = context.index.get_committed_type(requested_class_fqn) {
+        return Some(snapshot);
+    }
+
+    let key = vendor_load_key(context, requested_class_fqn, epoch);
+    let (receiver, leader) = match context.lazy_loads.class_loads.entry(key.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => (entry.get().clone(), None),
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            entry.insert(receiver.clone());
+            (receiver, Some(sender))
+        }
+    };
+
+    if let Some(sender) = leader {
+        let load_context = context.clone();
+        let load_class_fqn = requested_class_fqn.to_string();
+        let coordinator = context.lazy_loads.clone();
+        let task_key = key.clone();
+        let task_receiver = sender.subscribe();
+        tokio::spawn(async move {
+            let snapshot = index_class_uncached_with_context(&load_context, &load_class_fqn).await;
+            let _ = sender.send(Some(VendorClassLoadOutcome { snapshot }));
+            remove_class_load_if_channel_matches(&coordinator, &task_key, &task_receiver);
+            drop(epoch_guard);
+        });
+    } else {
+        drop(epoch_guard);
+    }
+
+    let cleanup_receiver = receiver.clone();
+    let result = wait_for_class_load(receiver).await;
+    if result.is_none() {
+        remove_class_load_if_channel_matches(&context.lazy_loads, &key, &cleanup_receiver);
+    }
+    result
+}
+
+pub(in crate::server) async fn lazy_index_class_with_context(
+    context: &VendorLazyIndexContext,
+    class_fqn: &str,
+) -> bool {
+    let was_present = context.index.get_committed_type(class_fqn).is_some();
+    ensure_class_indexed_with_context(context, class_fqn)
+        .await
+        .is_some()
+        && !was_present
+}
+
+fn push_unique_type_fqn(fqns: &mut Vec<String>, fqn: &str) {
+    let normalized = fqn.trim_start_matches('\\');
+    if !fqns
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(normalized))
+    {
+        fqns.push(normalized.to_string());
+    }
+}
+
+fn hierarchy_dependencies(symbol: &php_lsp_types::SymbolInfo) -> Vec<String> {
+    let mut dependencies = Vec::new();
+    for dependency in &symbol.traits {
+        push_unique_type_fqn(&mut dependencies, dependency);
+    }
+    for dependency in symbol
+        .template_bindings
+        .iter()
+        .filter(|binding| binding.kind == php_lsp_types::TemplateBindingKind::Mixin)
+        .map(|binding| binding.target.as_str())
+    {
+        push_unique_type_fqn(&mut dependencies, dependency);
+    }
+    for dependency in &symbol.extends {
+        push_unique_type_fqn(&mut dependencies, dependency);
+    }
+    for dependency in &symbol.implements {
+        push_unique_type_fqn(&mut dependencies, dependency);
+    }
+    dependencies
+}
+
+fn load_hierarchy_recursive<'a>(
+    context: &'a VendorLazyIndexContext,
+    class_fqn: &'a str,
+    epoch: u64,
+    depth: usize,
+    visited: &'a mut HashSet<String>,
+    generations: &'a mut Vec<php_lsp_index::workspace::TypeIndexGeneration>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    Box::pin(async move {
+        if depth >= MAX_VENDOR_HIERARCHY_DEPTH {
+            return false;
+        }
+        let normalized = class_fqn.trim_start_matches('\\').to_ascii_lowercase();
+        if !visited.insert(normalized) {
+            return true;
+        }
+
+        let Some(snapshot) = ensure_class_indexed_at_epoch(context, class_fqn, epoch, None).await
+        else {
+            return false;
+        };
+        let dependencies = hierarchy_dependencies(&snapshot.symbol);
+        generations.push(snapshot.generation);
+
+        let mut complete = true;
+        for dependency in dependencies {
+            if !load_hierarchy_recursive(
+                context,
+                &dependency,
+                epoch,
+                depth + 1,
+                visited,
+                generations,
+            )
+            .await
+            {
+                complete = false;
+            }
+        }
+        complete
+    })
+}
+
+async fn load_hierarchy_uncached_with_context(
+    context: &VendorLazyIndexContext,
+    class_fqn: &str,
+    epoch: u64,
+) -> VendorHierarchySnapshot {
+    let mut generations = Vec::new();
+    let mut visited = HashSet::new();
+    let complete =
+        load_hierarchy_recursive(context, class_fqn, epoch, 0, &mut visited, &mut generations)
+            .await;
+    VendorHierarchySnapshot {
+        generations,
+        complete,
+    }
+}
+
+async fn ensure_hierarchy_indexed_with_context(
+    context: &VendorLazyIndexContext,
+    class_fqn: &str,
+) -> VendorHierarchySnapshot {
+    for _ in 0..MAX_VENDOR_EPOCH_RETRIES {
+        let epoch_guard = context.load_epoch.clone().read_owned().await;
+        let epoch = *epoch_guard;
+        let result =
+            ensure_hierarchy_indexed_at_epoch(context, class_fqn, epoch, Some(epoch_guard)).await;
+        if *context.load_epoch.read().await == epoch {
+            return result;
+        }
+    }
+    VendorHierarchySnapshot::default()
+}
+
+async fn ensure_hierarchy_indexed_at_epoch(
+    context: &VendorLazyIndexContext,
+    class_fqn: &str,
+    epoch: u64,
+    epoch_guard: Option<tokio::sync::OwnedRwLockReadGuard<u64>>,
+) -> VendorHierarchySnapshot {
+    let key = vendor_load_key(context, class_fqn, epoch);
+    let (receiver, leader) = match context.lazy_loads.hierarchy_loads.entry(key.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => (entry.get().clone(), None),
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            entry.insert(receiver.clone());
+            (receiver, Some(sender))
+        }
+    };
+
+    if let Some(sender) = leader {
+        let load_context = context.clone();
+        let load_class_fqn = class_fqn.to_string();
+        let coordinator = context.lazy_loads.clone();
+        let task_key = key.clone();
+        let task_receiver = sender.subscribe();
+        tokio::spawn(async move {
+            let snapshot =
+                load_hierarchy_uncached_with_context(&load_context, &load_class_fqn, epoch).await;
+            let _ = sender.send(Some(snapshot));
+            remove_hierarchy_load_if_channel_matches(&coordinator, &task_key, &task_receiver);
+            drop(epoch_guard);
+        });
+    } else {
+        drop(epoch_guard);
+    }
+
+    let cleanup_receiver = receiver.clone();
+    let result = wait_for_hierarchy_load(receiver).await;
+    if result.generations.is_empty() {
+        remove_hierarchy_load_if_channel_matches(&context.lazy_loads, &key, &cleanup_receiver);
+    }
+    result
 }
 
 pub(in crate::server) fn lazy_index_parents_with_context<'a>(
     context: &'a VendorLazyIndexContext,
     class_fqn: &'a str,
     depth: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorHierarchySnapshot> + Send + 'a>> {
     Box::pin(async move {
-        const MAX_DEPTH: usize = 10;
-        if depth >= MAX_DEPTH {
-            return;
+        if depth == 0 {
+            return ensure_hierarchy_indexed_with_context(context, class_fqn).await;
         }
-
-        let parent_fqns: Vec<String> = if let Some(sym) = context.index.get_type(class_fqn) {
-            sym.extends
-                .iter()
-                .chain(sym.implements.iter())
-                .chain(sym.traits.iter())
-                .cloned()
-                .collect()
-        } else {
-            return;
-        };
-
-        for parent_fqn in parent_fqns {
-            lazy_index_class_with_context(context, &parent_fqn).await;
-            lazy_index_parents_with_context(context, &parent_fqn, depth + 1).await;
+        let epoch_guard = context.load_epoch.clone().read_owned().await;
+        let epoch = *epoch_guard;
+        let mut generations = Vec::new();
+        let mut visited = HashSet::new();
+        let complete = load_hierarchy_recursive(
+            context,
+            class_fqn,
+            epoch,
+            depth,
+            &mut visited,
+            &mut generations,
+        )
+        .await;
+        drop(epoch_guard);
+        VendorHierarchySnapshot {
+            generations,
+            complete,
         }
     })
 }
@@ -335,22 +705,74 @@ pub(in crate::server) async fn lazy_index_member_return_types_with_context(
             let owner_fqn = sym.parent_fqn.as_deref().unwrap_or(class_fqn);
             symbol_return_type_fqn(&context.index, owner_fqn, &sym)
         })
-        .filter(|fqn| fqn.contains('\\') && !context.index.contains_type(fqn))
+        .filter(|fqn| fqn.contains('\\') && context.index.get_committed_type(fqn).is_none())
         .collect();
 
     for return_fqn in return_fqns {
-        lazy_index_class_with_context(context, &return_fqn).await;
-        lazy_index_parents_with_context(context, &return_fqn, 0).await;
+        ensure_hierarchy_indexed_with_context(context, &return_fqn).await;
     }
 }
 
 pub(in crate::server) async fn lazy_index_class_dependencies_with_context(
     context: &VendorLazyIndexContext,
     class_fqn: &str,
-) {
-    lazy_index_class_with_context(context, class_fqn).await;
-    lazy_index_parents_with_context(context, class_fqn, 0).await;
+) -> VendorHierarchySnapshot {
+    let hierarchy = ensure_hierarchy_indexed_with_context(context, class_fqn).await;
     lazy_index_member_return_types_with_context(context, class_fqn).await;
+    hierarchy
+}
+
+pub(in crate::server) async fn resolve_member_stable_with_context(
+    context: &VendorLazyIndexContext,
+    fqn: &str,
+    expected_kinds: Option<&[php_lsp_types::PhpSymbolKind]>,
+) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+    resolve_member_stable_with_context_and_hook(context, fqn, expected_kinds, |_| {}).await
+}
+
+async fn resolve_member_stable_with_context_and_hook(
+    context: &VendorLazyIndexContext,
+    fqn: &str,
+    expected_kinds: Option<&[php_lsp_types::PhpSymbolKind]>,
+    mut before_lookup: impl FnMut(usize),
+) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+    let (class_fqn, _) = fqn.rsplit_once("::")?;
+    if class_fqn.trim_start_matches('\\').is_empty() {
+        return None;
+    }
+    for attempt in 0..MAX_STABLE_MEMBER_RESOLUTION_RETRIES {
+        let hierarchy = ensure_hierarchy_indexed_with_context(context, class_fqn).await;
+        if hierarchy.generations.is_empty() {
+            return None;
+        }
+        if !hierarchy.complete {
+            tracing::debug!(
+                "Lazy vendor hierarchy for {} is incomplete; resolving from committed nodes",
+                class_fqn
+            );
+        }
+        before_lookup(attempt);
+        let resolved = match expected_kinds {
+            Some(expected_kinds) => context
+                .index
+                .resolve_member_matching_kinds(fqn, expected_kinds),
+            None => context.index.resolve_member(fqn),
+        };
+        if hierarchy.is_current(&context.index) {
+            return resolved;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(in crate::server) async fn resolve_member_stable_with_hook(
+    context: &VendorLazyIndexContext,
+    fqn: &str,
+    expected_kinds: Option<&[php_lsp_types::PhpSymbolKind]>,
+    before_lookup: impl FnMut(usize),
+) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+    resolve_member_stable_with_context_and_hook(context, fqn, expected_kinds, before_lookup).await
 }
 
 pub(in crate::server) fn append_vendor_autoload(
@@ -633,7 +1055,7 @@ fn is_php_file_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
 }
 
-pub(in crate::server) async fn cached_vendor_autoload_map(
+pub(in crate::server) async fn cached_vendor_autoload_map_pinned(
     cache: &Arc<Mutex<VendorAutoloadCache>>,
     vendor_dir: &Path,
 ) -> Option<VendorAutoloadMap> {
@@ -649,11 +1071,32 @@ pub(in crate::server) async fn cached_vendor_autoload_map(
         return None;
     };
 
+    #[cfg(test)]
+    {
+        let pause = cache.lock().await.before_insert_pause.take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            pause.release.notified().await;
+        }
+    }
+
     cache.lock().await.by_vendor_dir.insert(
         vendor_dir.to_path_buf(),
         VendorAutoloadCacheEntry { map: map.clone() },
     );
     Some(map)
+}
+
+#[cfg(test)]
+pub(in crate::server) async fn cached_vendor_autoload_map_with_epoch(
+    cache: &Arc<Mutex<VendorAutoloadCache>>,
+    vendor_dir: &Path,
+    load_epoch: &Arc<tokio::sync::RwLock<u64>>,
+) -> Option<VendorAutoloadMap> {
+    let epoch_guard = load_epoch.read().await;
+    let map = cached_vendor_autoload_map_pinned(cache, vendor_dir).await;
+    drop(epoch_guard);
+    map
 }
 
 /// Try to resolve a FQN to file paths by scanning vendor/composer installed packages.
@@ -681,6 +1124,8 @@ impl PhpLspBackend {
                 index_vendor: runtime.index_vendor,
                 vendor_autoload_cache: self.vendor_autoload_cache.clone(),
                 vendor_file_lru: config.vendor_file_lru.clone(),
+                lazy_loads: self.vendor_lazy_loads.clone(),
+                load_epoch: self.vendor_load_epoch.clone(),
             };
         }
         VendorLazyIndexContext {
@@ -691,6 +1136,8 @@ impl PhpLspBackend {
             index_vendor: false,
             vendor_autoload_cache: self.vendor_autoload_cache.clone(),
             vendor_file_lru: self.vendor_file_lru.clone(),
+            lazy_loads: self.vendor_lazy_loads.clone(),
+            load_epoch: self.vendor_load_epoch.clone(),
         }
     }
 
@@ -719,13 +1166,14 @@ impl PhpLspBackend {
         if !context.index_vendor {
             return false;
         }
+        let _epoch_guard = context.load_epoch.read().await;
         for config in &context.workspace_configs {
             let vendor_dir = config.root.join("vendor");
             if !vendor_dir.is_dir() {
                 continue;
             }
             if let Some(vendor_map) =
-                cached_vendor_autoload_map(&context.vendor_autoload_cache, &vendor_dir).await
+                cached_vendor_autoload_map_pinned(&context.vendor_autoload_cache, &vendor_dir).await
             {
                 if vendor_namespace_exists_from_map(fqn, &vendor_map) {
                     return true;
@@ -751,6 +1199,10 @@ impl PhpLspBackend {
         fqn: &str,
     ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
         let index = request.index(&self.index);
+        if fqn.contains("::") {
+            let context = self.vendor_lazy_index_context_from_request(request);
+            return resolve_member_stable_with_context(&context, fqn, None).await;
+        }
         if let Some(sym) = index.resolve_fqn(fqn) {
             return Some(sym);
         }
@@ -782,18 +1234,8 @@ impl PhpLspBackend {
         fqn: &str,
         expected_kinds: &[php_lsp_types::PhpSymbolKind],
     ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
-        if let Some(sym) = self
-            .index
-            .resolve_member_matching_kinds(fqn, expected_kinds)
-        {
-            return Some(sym);
-        }
-
-        let (class_fqn, _) = fqn.rsplit_once("::")?;
-        self.lazy_index_class_dependencies(class_fqn).await;
-
-        self.index
-            .resolve_member_matching_kinds(fqn, expected_kinds)
+        let context = self.vendor_lazy_index_context().await;
+        resolve_member_stable_with_context(&context, fqn, Some(expected_kinds)).await
     }
 
     /// Lazy-index a single class FQN by finding its file via PSR-4/vendor mappings.
@@ -960,29 +1402,20 @@ impl PhpLspBackend {
         allow_global_fallback: bool,
     ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
         let index = request.index(&self.index);
-        let expected_kinds = if let Some(member_kinds) = member_kinds_for_ref_kind(ref_kind) {
-            member_kinds
-        } else {
-            top_level_kinds_for_ref_kind(ref_kind)?
-        };
-        if let Some(sym) = if member_kinds_for_ref_kind(ref_kind).is_some() {
-            index.resolve_member_matching_kinds(fqn, expected_kinds)
-        } else {
-            index.resolve_fqn_matching_kinds(fqn, expected_kinds)
-        } {
+        if let Some(expected_kinds) = member_kinds_for_ref_kind(ref_kind) {
+            let context = self.vendor_lazy_index_context_from_request(request);
+            return resolve_member_stable_with_context(&context, fqn, Some(expected_kinds)).await;
+        }
+
+        let expected_kinds = top_level_kinds_for_ref_kind(ref_kind)?;
+        if let Some(sym) = index.resolve_fqn_matching_kinds(fqn, expected_kinds) {
             return Some(sym);
         }
 
         let class_fqn = fqn.rsplit_once("::").map_or(fqn, |(class, _)| class);
         let context = self.vendor_lazy_index_context_from_request(request);
         lazy_index_class_dependencies_with_context(&context, class_fqn).await;
-        let resolve = |candidate: &str| {
-            if member_kinds_for_ref_kind(ref_kind).is_some() {
-                index.resolve_member_matching_kinds(candidate, expected_kinds)
-            } else {
-                index.resolve_fqn_matching_kinds(candidate, expected_kinds)
-            }
-        };
+        let resolve = |candidate: &str| index.resolve_fqn_matching_kinds(candidate, expected_kinds);
         if let Some(sym) = resolve(fqn) {
             return Some(sym);
         }

@@ -2425,6 +2425,10 @@ pub struct PhpLspBackend {
     twig_context_disk_cache: Arc<Mutex<TwigContextDiskCache>>,
     /// Parsed Composer vendor metadata keyed by vendor directory.
     vendor_autoload_cache: Arc<Mutex<VendorAutoloadCache>>,
+    /// Index/FQN-scoped coordinator for concurrent lazy vendor loads.
+    vendor_lazy_loads: Arc<VendorLazyLoadCoordinator>,
+    /// Composer/autoload epoch barrier shared by request and invalidation paths.
+    vendor_load_epoch: Arc<tokio::sync::RwLock<u64>>,
     /// Bounded set of lazy-indexed vendor files currently kept in the symbol index.
     vendor_file_lru: Arc<Mutex<VendorFileLru>>,
 }
@@ -2502,6 +2506,8 @@ impl PhpLspBackend {
             framework_string_key_cache: Arc::new(Mutex::new(FrameworkStringKeyCache::default())),
             twig_context_disk_cache: Arc::new(Mutex::new(TwigContextDiskCache::default())),
             vendor_autoload_cache: Arc::new(Mutex::new(VendorAutoloadCache::default())),
+            vendor_lazy_loads: Arc::new(VendorLazyLoadCoordinator::default()),
+            vendor_load_epoch: Arc::new(tokio::sync::RwLock::new(0)),
             vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
         }
     }
@@ -3172,7 +3178,7 @@ impl PhpLspBackend {
             {
                 let mut changes =
                     runtime_configuration_changes(&previous.runtime_config, &config.runtime_config);
-                if previous.root != config.root {
+                if previous.root != config.root || previous.namespace_map != config.namespace_map {
                     changes = AppliedConfiguration {
                         diagnostics_changed: true,
                         stubs_changed: true,
@@ -3541,6 +3547,8 @@ impl PhpLspBackend {
         let diagnostics_publisher = self.diagnostics_publisher.clone();
         let reindex_index = self.index.clone();
         let vendor_autoload_cache = self.vendor_autoload_cache.clone();
+        let vendor_lazy_loads = self.vendor_lazy_loads.clone();
+        let vendor_load_epoch = self.vendor_load_epoch.clone();
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let indexing_run_state = self.indexing_run.clone();
         let runtime_state_handle = self.runtime_state.clone();
@@ -3617,6 +3625,7 @@ impl PhpLspBackend {
                         runtime.php_version,
                         &vendor_autoload_cache,
                         &config.vendor_file_lru,
+                        &vendor_load_epoch,
                     )
                     .await;
                 }
@@ -3774,6 +3783,8 @@ impl PhpLspBackend {
                         index_vendor: runtime.index_vendor,
                         vendor_autoload_cache: vendor_autoload_cache.clone(),
                         vendor_file_lru: config.vendor_file_lru.clone(),
+                        lazy_loads: vendor_lazy_loads.clone(),
+                        load_epoch: vendor_load_epoch.clone(),
                     };
                     let document_state = snapshot.document_state;
                     let version = document_state.map(|state| state.version);
@@ -3889,6 +3900,8 @@ impl PhpLspBackend {
 
     async fn invalidate_composer_metadata(&self, path: &Path, reindex_workspace: bool) {
         self.invalidate_request_fs_caches().await;
+        let mut vendor_epoch = self.vendor_load_epoch.write().await;
+        *vendor_epoch = vendor_epoch.wrapping_add(1);
         self.vendor_autoload_cache.lock().await.clear();
         let evicted = self.vendor_file_lru.lock().await.clear();
         for uri in evicted {
@@ -3931,6 +3944,7 @@ impl PhpLspBackend {
             })
             .await;
         }
+        drop(vendor_epoch);
         self.client
             .log_message(
                 MessageType::INFO,

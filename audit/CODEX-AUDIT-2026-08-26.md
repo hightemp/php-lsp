@@ -142,8 +142,11 @@ symlink, и не ведёт набор посещённых каталогов:
 
 ### CODEX-P1-02. Нестабильный переход к унаследованному vendor-методу
 
+> **Статус 2026-08-28:** исправлено. Находка сохранена как историческое
+> обоснование изменения.
+
 Тест
-[`test_goto_definition_vendor_inherited_method`](server/crates/php-lsp-server/tests/e2e_definition.rs#L1214)
+[`test_goto_definition_vendor_inherited_method`](../server/crates/php-lsp-server/tests/e2e_definition.rs#L1630)
 иногда получает `null` вместо `BaseAssert::createStub`.
 
 #### Подтверждение
@@ -156,9 +159,9 @@ symlink, и не ведёт набор посещённых каталогов:
 Таким образом, проблема не объясняется только старым дисковым кэшем.
 Подозрительная граница — lazy member resolution и публикация цепочки родителей:
 
-- [`resolve_member_lazy_matching_kinds`](server/crates/php-lsp-server/src/indexing/vendor.rs#L774)
-- [`lazy_index_class_dependencies_with_context`](server/crates/php-lsp-server/src/indexing/vendor.rs#L347)
-- [`lazy_index_parents_with_context`](server/crates/php-lsp-server/src/indexing/vendor.rs#L297)
+- прежний `resolve_member_lazy_matching_kinds`;
+- прежний `lazy_index_class_dependencies_with_context`;
+- прежний `lazy_index_parents_with_context`.
 
 #### Последствия
 
@@ -174,6 +177,32 @@ symlink, и не ведёт набор посещённых каталогов:
 - если запросы до `indexingStatus=ready` официально best-effort, явно
   документировать это и синхронизировать тест, но предпочтительнее сохранить
   работающий lazy fallback во время indexing.
+
+#### Реализовано
+
+- [`WorkspaceIndex`](../server/crates/php-lsp-index/src/workspace.rs#L28)
+  публикует committed type/member snapshot через существующий per-URI
+  generation barrier: member lookup больше не видит type до его direct-member
+  locators и не смешивает поколения при replacement;
+- [`VendorLazyLoadCoordinator`](../server/crates/php-lsp-server/src/indexing/vendor.rs#L190)
+  объединяет конкурентные cold class и hierarchy loads по identity конкретного
+  root index, Composer epoch и нормализованному FQN; отмена одного waiter не
+  отменяет общую загрузку, а одинаковые FQN разных roots не объединяются;
+- Composer metadata invalidation получает exclusive epoch barrier, дожидается
+  старых loads и удаляет их результаты до допуска новых запросов; изменение
+  project namespace map заменяет root index, поэтому старая task пишет только в
+  detached поколение;
+- class/hierarchy loads, Composer namespace checks и vendor entrypoint preload
+  держат общий read epoch от parse autoload map до cache/index/LRU commit, так
+  что stale map или entrypoint не могут вернуться после invalidation;
+- hierarchy snapshot включает поколения class, traits, PHPDoc mixins, parents и
+  interfaces; общий lazy member resolver выполняет bounded
+  `load -> lookup -> validate` и повторяет lookup при смене поколения;
+- definition/hover/completion/diagnostics используют общий стабильный index/lazy
+  contract без ожидания `indexingStatus=ready` и без sleeps;
+- deterministic unit-тесты фиксируют first-publish/replacement gaps,
+  single-flight, cancellation и multi-root isolation; cold-cache E2E выполняет
+  100 последовательных переходов к `BaseAssert::createStub`.
 
 ### CODEX-P1-03. Уязвимые npm-зависимости входят в extension bundle
 
