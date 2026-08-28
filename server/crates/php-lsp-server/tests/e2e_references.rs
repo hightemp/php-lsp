@@ -1205,6 +1205,360 @@ function run(string $name): void {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_local_variable_rename_respects_nested_callable_captures_and_shadows() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+function outer(string $value): void {
+    echo "😀"; echo $value;
+    function nested(string $value): void {
+        echo $value;
+    }
+    $plain = function (): void {
+        $value = 'local';
+        echo $value;
+    };
+    $captured = function () use (&$value): void {
+        echo $value;
+        $nestedCapture = fn (): string => $value;
+    };
+    $shadow = fn (string $value): string => $value;
+    echo $value;
+}
+"#;
+    let uri = "file:///test/VariableNestedScopeRename.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let outer_position = utf16_position_at(code, "echo $value;");
+    let outer_character = outer_position.1 + "echo ".encode_utf16().count() as u32 + 1;
+    let references = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(references_request(
+                2,
+                uri,
+                outer_position.0,
+                outer_character,
+                true,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        location_start_lines(&references),
+        BTreeSet::from([1, 2, 10, 11, 12, 15]),
+        "references must follow captures without entering shadow scopes: {references}"
+    );
+
+    let reads = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(references_request(
+                3,
+                uri,
+                outer_position.0,
+                outer_character,
+                false,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        location_start_lines(&reads),
+        BTreeSet::from([2, 10, 11, 12, 15]),
+        "capture token remains an outer read while the parameter declaration is excluded: {reads}"
+    );
+
+    let highlights = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(document_highlight_request(
+                4,
+                uri,
+                outer_position.0,
+                outer_character,
+            ))
+            .await
+            .unwrap(),
+    );
+    let highlight_lines: BTreeSet<u64> = highlights
+        .as_array()
+        .unwrap_or_else(|| panic!("highlight array: {highlights}"))
+        .iter()
+        .map(|highlight| {
+            highlight["range"]["start"]["line"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+        })
+        .collect();
+    assert_eq!(highlight_lines, BTreeSet::from([1, 2, 10, 11, 12, 15]));
+
+    let (use_line, use_col) = line_col(code, "use (&$value)");
+    let prepare = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(prepare_rename_request(
+                5,
+                uri,
+                use_line,
+                use_col + "use (&".len() as u32 + 1,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(!prepare.is_null(), "capture token must be renameable");
+
+    let rename = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(rename_request(
+                6,
+                uri,
+                outer_position.0,
+                outer_character,
+                "renamed",
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        workspace_edit_start_lines(&rename, uri),
+        BTreeSet::from([1, 2, 10, 11, 12, 15])
+    );
+    let edits = rename["changes"][uri].as_array().unwrap();
+    assert_eq!(edits.len(), 6);
+    assert!(edits
+        .iter()
+        .all(|edit| edit["newText"].as_str() == Some("$renamed")));
+    let expected_utf16 = utf16_position_at(code, "$value;");
+    let unicode_line_edit = edits
+        .iter()
+        .find(|edit| edit["range"]["start"]["line"].as_u64() == Some(2))
+        .expect("Unicode-line edit");
+    assert_eq!(
+        unicode_line_edit["range"]["start"]["character"].as_u64(),
+        Some(expected_utf16.1 as u64),
+        "rename edit must convert parser byte columns to UTF-16"
+    );
+
+    let (captured_line, captured_col) = line_col(code, "$nestedCapture =");
+    let captured_rename = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(rename_request(
+                7,
+                uri,
+                captured_line,
+                captured_col + "$nestedCapture = fn (): string => ".len() as u32 + 1,
+                "fromCapture",
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        workspace_edit_start_lines(&captured_rename, uri),
+        BTreeSet::from([1, 2, 10, 11, 12, 15]),
+        "rename initiated in a captured descendant must reach the outer binding"
+    );
+
+    let (plain_line, plain_col) = line_col(code, "$value = 'local'");
+    let plain_rename = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(rename_request(
+                8,
+                uri,
+                plain_line,
+                plain_col + 1,
+                "plainLocal",
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        workspace_edit_start_lines(&plain_rename, uri),
+        BTreeSet::from([7, 8]),
+        "uncaptured closure local must remain isolated"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_local_variable_rename_fails_closed_for_connected_global_alias() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+function outer(string $value): void {
+    $closure = function () use ($value): void {
+        if (false) {
+            global $value;
+        }
+        echo $value;
+    };
+    echo $value;
+}
+"#;
+    let uri = "file:///test/VariableGlobalAliasRename.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let positions = [
+        ("string $value", "string ".len() as u32 + 1),
+        ("use ($value)", "use (".len() as u32 + 1),
+        ("global $value", "global ".len() as u32 + 1),
+        ("echo $value;", "echo ".len() as u32 + 1),
+    ];
+    for (offset, (needle, character_offset)) in positions.into_iter().enumerate() {
+        let (line, col) = line_col(code, needle);
+        let prepare = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(prepare_rename_request(
+                    2 + offset as i64,
+                    uri,
+                    line,
+                    col + character_offset,
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            prepare.is_null(),
+            "prepareRename must reject {needle} in a binding component with global: {prepare}"
+        );
+    }
+
+    let (outer_line, outer_col) = line_col(code, "string $value");
+    let references = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(references_request(
+                10,
+                uri,
+                outer_line,
+                outer_col + "string ".len() as u32 + 1,
+                true,
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(references.is_null());
+
+    let rename = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(rename_request(
+                11,
+                uri,
+                outer_line,
+                outer_col + "string ".len() as u32 + 1,
+                "renamed",
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(rename.is_null());
+
+    let (global_line, global_col) = line_col(code, "global $value");
+    let global_rename = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(rename_request(
+                12,
+                uri,
+                global_line,
+                global_col + "global ".len() as u32 + 1,
+                "globalValue",
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(global_rename.is_null());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_foreach_wrapped_variable_references_and_rename() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

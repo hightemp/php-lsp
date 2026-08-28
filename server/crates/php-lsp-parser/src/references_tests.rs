@@ -700,6 +700,60 @@ function run(array $rows): void {
 }
 
 #[test]
+fn test_foreach_binding_roles_use_cst_structure_with_delimiters_in_iterable() {
+    let cases = [
+        r#"<?php
+function run(): void {
+    foreach (['{'] as $value) {
+        echo $value;
+    }
+}
+"#,
+        r#"<?php
+function run(): void {
+    foreach ([':' => 1] as $value):
+        echo $value;
+    endforeach;
+}
+"#,
+        r#"<?php
+function run(): void {
+    foreach ([function (): void {}] as $value) {
+        echo $value;
+    }
+}
+"#,
+        r#"<?php
+function run(array $items): void {
+    foreach (/* before iterable */ $items as $value) {
+        echo $value;
+    }
+}
+"#,
+        r#"<?php
+function run(array $items): void {
+    foreach ($items /* between iterable and as */ as $value) {
+        echo $value;
+    }
+}
+"#,
+    ];
+
+    for code in cases {
+        let (line, col) = find_line_col(code, "echo $value;");
+        let all = find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, true);
+        assert_eq!(all.len(), 2, "declaration plus read for:\n{code}");
+
+        let reads = find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, false);
+        assert_eq!(
+            reads.len(),
+            1,
+            "foreach CST target must remain a declaration for:\n{code}"
+        );
+    }
+}
+
+#[test]
 fn test_find_variable_references_do_not_cross_scope() {
     let code = r#"<?php
 $x = 1;
@@ -713,4 +767,491 @@ echo $x;
     let refs = find_var_refs_at(code, line, col + 6, true);
     // only inner assignment + inner usage
     assert_eq!(refs.len(), 2);
+}
+
+#[test]
+fn test_outer_variable_follows_only_real_nested_captures() {
+    let code = r#"<?php
+function outer(string $value): void {
+    echo $value;
+    function nested(string $value): void {
+        echo $value;
+    }
+    $plain = function (): void {
+        $value = 'local';
+        echo $value;
+    };
+    $captured = function () use (&$value): void {
+        echo $value;
+        $nestedCapture = fn (): string => $value;
+    };
+    $shadow = fn (string $value): string => $value;
+    echo $value;
+}
+"#;
+    let (line, col) = find_line_col(code, "echo $value;");
+    let refs = find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, true);
+    let lines: Vec<u32> = refs.iter().map(|reference| reference.range.0).collect();
+    assert_eq!(lines, vec![1, 2, 10, 11, 12, 15]);
+
+    let refs_without_declarations =
+        find_var_refs_at(code, line, col + "echo ".len() as u32 + 1, false);
+    let lines: Vec<u32> = refs_without_declarations
+        .iter()
+        .map(|reference| reference.range.0)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![2, 10, 11, 12, 15],
+        "closure use token is a read of the outer binding"
+    );
+}
+
+#[test]
+fn test_top_level_variable_does_not_enter_named_function_scope() {
+    let code = r#"<?php
+$value = 'global';
+function nested(string $value): void {
+    echo $value;
+}
+echo $value;
+"#;
+    let (line, col) = find_line_col(code, "$value = 'global'");
+    let refs = find_var_refs_at(code, line, col + 1, true);
+    let lines: Vec<u32> = refs.iter().map(|reference| reference.range.0).collect();
+    assert_eq!(lines, vec![1, 5]);
+}
+
+#[test]
+fn test_global_declaration_does_not_enable_cross_callable_local_rename() {
+    let code = r#"<?php
+$value = 'global';
+function nested(): void {
+    global $value;
+    echo $value;
+}
+echo $value;
+"#;
+    let (outer_line, outer_col) = find_line_col(code, "$value = 'global'");
+    let outer_refs = find_var_refs_at(code, outer_line, outer_col + 1, true);
+    let lines: Vec<u32> = outer_refs
+        .iter()
+        .map(|reference| reference.range.0)
+        .collect();
+    assert_eq!(lines, vec![1, 6]);
+
+    let (inner_line, inner_col) = find_line_col(code, "global $value");
+    let inner_refs = find_var_refs_at(
+        code,
+        inner_line,
+        inner_col + "global ".len() as u32 + 1,
+        true,
+    );
+    let lines: Vec<u32> = inner_refs
+        .iter()
+        .map(|reference| reference.range.0)
+        .collect();
+    assert!(
+        lines.is_empty(),
+        "function-local global alias cannot be renamed safely without global symbol expansion"
+    );
+}
+
+#[test]
+fn test_top_level_global_is_a_noop_for_local_binding_collection() {
+    let code = r#"<?php
+$value = 1;
+global $value;
+echo $value;
+"#;
+    let (line, col) = find_line_col(code, "$value = 1");
+    let refs = find_var_refs_at(code, line, col + 1, true);
+    let lines: Vec<u32> = refs.iter().map(|reference| reference.range.0).collect();
+    assert_eq!(lines, vec![1, 2, 3]);
+}
+
+#[test]
+fn test_global_in_capture_connected_callable_fails_closed() {
+    let code = r#"<?php
+function outer(string $value): void {
+    $closure = function () use ($value): void {
+        if (false) {
+            global $value;
+        }
+        echo $value;
+    };
+    echo $value;
+}
+"#;
+    let (outer_line, outer_col) = find_line_col(code, "string $value");
+    let outer_refs = find_var_refs_at(
+        code,
+        outer_line,
+        outer_col + "string ".len() as u32 + 1,
+        true,
+    );
+    assert!(
+        outer_refs.is_empty(),
+        "a runtime-conditional global makes the connected binding unsafe to rename"
+    );
+
+    let (global_line, global_col) = find_line_col(code, "global $value");
+    let global_refs = find_var_refs_at(
+        code,
+        global_line,
+        global_col + "global ".len() as u32 + 1,
+        true,
+    );
+    assert!(global_refs.is_empty());
+
+    let (body_line, body_col) = find_line_col(code, "        echo $value;");
+    let body_refs = find_var_refs_at(
+        code,
+        body_line,
+        body_col + "        echo ".len() as u32 + 1,
+        true,
+    );
+    assert!(body_refs.is_empty());
+}
+
+#[test]
+fn test_cursor_inside_captured_closure_reaches_outer_binding() {
+    let code = r#"<?php
+function outer(string $value): void {
+    echo $value;
+    $captured = function () use ($value): void {
+        echo $value;
+        $nested = fn (): string => $value;
+    };
+    echo $value;
+}
+"#;
+    let (line, col) = find_line_col(code, "$nested =");
+    let refs = find_var_refs_at(
+        code,
+        line,
+        col + "$nested = fn (): string => ".len() as u32 + 1,
+        true,
+    );
+    let lines: Vec<u32> = refs.iter().map(|reference| reference.range.0).collect();
+    assert_eq!(lines, vec![1, 2, 3, 4, 5, 7]);
+}
+
+#[test]
+fn test_uncaptured_closure_variable_stays_local() {
+    let code = r#"<?php
+function outer(string $value): void {
+    echo $value;
+    $plain = function (): void {
+        $value = 'local';
+        echo $value;
+        $child = fn (): string => $value;
+    };
+    echo $value;
+}
+"#;
+    let (line, col) = find_line_col(code, "$value = 'local'");
+    let refs = find_var_refs_at(code, line, col + 1, true);
+    let lines: Vec<u32> = refs.iter().map(|reference| reference.range.0).collect();
+    assert_eq!(lines, vec![4, 5, 6]);
+
+    let reads = find_var_refs_at(code, line, col + 1, false);
+    let lines: Vec<u32> = reads.iter().map(|reference| reference.range.0).collect();
+    assert_eq!(lines, vec![5, 6]);
+}
+
+#[test]
+fn test_arrow_parameter_shadows_outer_and_nested_arrow_captures_parameter() {
+    let code = r#"<?php
+function outer(string $value): void {
+    echo $value;
+    $arrow = fn (
+        string $value
+    ): callable => fn (): string => $value;
+    echo $value;
+}
+"#;
+    let (line, col) = find_line_col(code, "        string $value");
+    let refs = find_var_refs_at(code, line, col + "        string ".len() as u32 + 1, true);
+    let lines: Vec<u32> = refs.iter().map(|reference| reference.range.0).collect();
+    assert_eq!(lines, vec![4, 5]);
+
+    let (outer_line, outer_col) = find_line_col(code, "echo $value;");
+    let outer_refs = find_var_refs_at(code, outer_line, outer_col + "echo ".len() as u32 + 1, true);
+    let lines: Vec<u32> = outer_refs
+        .iter()
+        .map(|reference| reference.range.0)
+        .collect();
+    assert_eq!(lines, vec![1, 2, 6]);
+}
+
+#[test]
+fn test_anonymous_class_constructor_expression_keeps_outer_scope_but_method_does_not() {
+    let code = r#"<?php
+function outer(string $value): void {
+    $object = new class($value) {
+        public string $value;
+        public function run(string $value): void {
+            echo $value;
+        }
+    };
+    echo $value;
+}
+"#;
+    let (line, col) = find_line_col(code, "class($value)");
+    let refs = find_var_refs_at(code, line, col + "class(".len() as u32 + 1, true);
+    let lines: Vec<u32> = refs.iter().map(|reference| reference.range.0).collect();
+    assert_eq!(
+        lines,
+        vec![1, 2, 8],
+        "anonymous-class property and method scopes must remain isolated"
+    );
+}
+
+#[test]
+fn test_interpolated_variable_capture_respects_callable_scope() {
+    let code = r#"<?php
+function outer(string $value): void {
+    echo "😀 {$value}";
+    $captured = fn (): string => "{$value}";
+    $plain = function (): string {
+        return "{$value}";
+    };
+}
+"#;
+    let (line, col) = find_line_col(code, "{$value}");
+    let refs = find_var_refs_at(code, line, col + 3, true);
+    let lines: Vec<u32> = refs.iter().map(|reference| reference.range.0).collect();
+    assert_eq!(lines, vec![1, 2, 3]);
+}
+
+#[test]
+fn test_variable_declaration_filter_covers_nontrivial_local_declarations() {
+    let cases = [
+        (
+            r#"<?php
+function run(string ...$values): void {
+    echo count($values);
+}
+"#,
+            "count($values)",
+            2,
+            1,
+        ),
+        (
+            r#"<?php
+function run(array $row): void {
+    ['id' => $value] = $row;
+    echo $value;
+}
+"#,
+            "echo $value",
+            2,
+            1,
+        ),
+        (
+            r#"<?php
+function run(string $subject): void {
+    preg_match('/x/', $subject, $matches);
+    echo count($matches);
+}
+"#,
+            "count($matches)",
+            2,
+            1,
+        ),
+        (
+            r#"<?php
+function run(string $subject): void {
+    preg_match('/x/', $subject, /* before value */ $matches);
+    echo count($matches);
+}
+"#,
+            "count($matches)",
+            2,
+            1,
+        ),
+        (
+            r#"<?php
+function run(string $subject): void {
+    preg_match('/x/', $subject, $matches /* after value */);
+    echo count($matches);
+}
+"#,
+            "count($matches)",
+            2,
+            1,
+        ),
+        (
+            r#"<?php
+function run(): void {
+    try { throw new Exception(); } catch (Exception $error) {
+        echo $error->getMessage();
+    }
+}
+"#,
+            "$error->getMessage",
+            2,
+            1,
+        ),
+    ];
+
+    for (code, needle, all_count, read_count) in cases {
+        let (line, col) = find_line_col(code, needle);
+        let variable_offset = code
+            .lines()
+            .nth(line as usize)
+            .unwrap()
+            .get(col as usize..)
+            .and_then(|suffix| suffix.find('$'))
+            .unwrap_or(0) as u32;
+        assert_eq!(
+            find_var_refs_at(code, line, col + variable_offset + 1, true).len(),
+            all_count,
+            "all references for {needle}"
+        );
+        assert_eq!(
+            find_var_refs_at(code, line, col + variable_offset + 1, false).len(),
+            read_count,
+            "read references for {needle}"
+        );
+    }
+}
+
+#[test]
+fn test_assignment_and_output_target_nested_expressions_remain_reads() {
+    let cases = [
+        (
+            r#"<?php
+function run(array $arr, string $key): void {
+    $arr[$key] = 1;
+    echo $key;
+}
+"#,
+            "$arr[$key]",
+            "$key",
+            2,
+        ),
+        (
+            r#"<?php
+function run(object $obj): void {
+    $obj->property = 1;
+    var_dump($obj);
+}
+"#,
+            "$obj->property",
+            "$obj",
+            2,
+        ),
+        (
+            r#"<?php
+function run(string $subject, array $matches, string $key): void {
+    preg_match('/x/', $subject, $matches[$key]);
+    echo $key;
+}
+"#,
+            "$matches[$key]",
+            "$key",
+            2,
+        ),
+        (
+            r#"<?php
+function run(string $name): void {
+    $$name = 1;
+    echo $name;
+}
+"#,
+            "$$name = 1",
+            "$name",
+            2,
+        ),
+        (
+            r#"<?php
+function run(string $subject, string $name): void {
+    preg_match('/x/', $subject, $$name);
+    echo $name;
+}
+"#,
+            "$$name);",
+            "$name",
+            2,
+        ),
+    ];
+
+    for (code, line_needle, variable, expected_reads) in cases {
+        let (line, line_col) = find_line_col(code, line_needle);
+        let variable_col = code
+            .lines()
+            .nth(line as usize)
+            .unwrap()
+            .get(line_col as usize..)
+            .and_then(|suffix| suffix.find(variable))
+            .unwrap() as u32;
+        let reads = find_var_refs_at(code, line, line_col + variable_col + 1, false);
+        assert_eq!(
+            reads.len(),
+            expected_reads,
+            "nested read {variable} in {line_needle}: {reads:?}"
+        );
+    }
+
+    let matches_code = r#"<?php
+function run(string $subject, string $key): void {
+    preg_match('/x/', $subject, $matches[$key]);
+    echo count($matches);
+}
+"#;
+    let (line, col) = find_line_col(matches_code, "count($matches)");
+    let reads = find_var_refs_at(matches_code, line, col + "count(".len() as u32 + 1, false);
+    assert_eq!(reads.len(), 1, "output base remains a declaration");
+}
+
+#[test]
+fn test_keyed_destructuring_keys_are_reads_and_values_are_bindings() {
+    let cases = [
+        r#"<?php
+function run(array $row, string $key): void {
+    [$key => $value] = $row;
+    echo $key;
+    echo $value;
+}
+"#,
+        r#"<?php
+function run(array $row, string $key): void {
+    list($key => $value) = $row;
+    echo $key;
+    echo $value;
+}
+"#,
+        r#"<?php
+function run(array $row, string $key): void {
+    [$key /* key */ => /* value */ $value] = $row;
+    echo $key;
+    echo $value;
+}
+"#,
+    ];
+
+    for code in cases {
+        let (key_line, key_col) = find_line_col(code, "echo $key;");
+        let key_reads = find_var_refs_at(code, key_line, key_col + "echo ".len() as u32 + 1, false);
+        assert_eq!(
+            key_reads.len(),
+            2,
+            "dynamic destructuring key plus echo are reads for:\n{code}"
+        );
+
+        let (value_line, value_col) = find_line_col(code, "echo $value;");
+        let value_reads = find_var_refs_at(
+            code,
+            value_line,
+            value_col + "echo ".len() as u32 + 1,
+            false,
+        );
+        assert_eq!(
+            value_reads.len(),
+            1,
+            "destructuring value remains a binding for:\n{code}"
+        );
+    }
 }

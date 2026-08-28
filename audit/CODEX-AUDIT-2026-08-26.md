@@ -237,9 +237,12 @@ return clone($this, ['alpha' => $alpha]);
 
 ### CODEX-P1-05. Rename локальной переменной пересекает вложенные scopes
 
-[`find_variable_references_at_position`](server/crates/php-lsp-parser/src/references.rs#L29)
+> **Статус 2026-08-28:** исправлено. Находка сохранена как историческое
+> обоснование изменения.
+
+До исправления [`find_variable_references_at_position`](../server/crates/php-lsp-parser/src/references.rs#L33)
 выбирает ближайший scope, после чего
-[`walk_variable_refs`](server/crates/php-lsp-parser/src/references.rs#L1474)
+прежний `walk_variable_refs`
 рекурсивно проходит все вложенные функции, closures и arrow functions без
 scope barrier.
 
@@ -248,7 +251,7 @@ scope barrier.
 для cursor внутри вложенной функции; случай cursor во внешнем scope не покрыт.
 
 Это особенно опасно, потому что результат сразу превращается в `WorkspaceEdit`
-в [`lsp/rename.rs`](server/crates/php-lsp-server/src/lsp/rename.rs#L6).
+в [`lsp/rename.rs`](../server/crates/php-lsp-server/src/lsp/rename.rs#L6).
 
 #### Что исправить
 
@@ -258,6 +261,24 @@ scope barrier.
 - различать declaration/read роль capture-token в зависимости от
   рассматриваемого scope;
 - добавить E2E на shadowing во function/closure/arrow и на nested capture.
+
+#### Реализовано
+
+- [`walk_variable_binding_refs`](../server/crates/php-lsp-parser/src/references.rs#L1490)
+  останавливается на независимых named functions/methods, обычных closures и
+  class-member bodies, не смешивая local variable с одноимённым property;
+- explicit `use ($value)`/`use (&$value)` и implicit arrow captures образуют
+  направленную цепочку binding scopes, а одноимённый parameter её разрывает;
+- same-name `global` в capture-connected callable консервативно запрещает
+  rename всего binding component: runtime/control-flow alias нельзя безопасно
+  представить лексическим диапазоном без global/cross-file symbol expansion;
+- capture-token считается read внешнего binding, declaration filtering также
+  покрывает variadic parameters, destructuring, catch и output arguments, но
+  сохраняет reads в array keys/receivers и dynamic-variable names сложных write
+  targets; foreach bindings определяются по CST target, а не delimiters текста;
+- диапазоны сортируются и дедуплицируются до LSP-конвертации;
+- parser и protocol regressions проверяют outer/inner cursor, nested captures,
+  sibling shadows, anonymous classes, interpolation и UTF-16 edits.
 
 ### CODEX-P1-06. Конфигурации multi-root workspace смешиваются глобально
 

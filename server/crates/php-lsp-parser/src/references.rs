@@ -3,7 +3,7 @@
 //! Given a target FQN and the file's CST + symbols, returns all locations
 //! in the file that reference the target.
 
-use crate::cst::{ancestor_field_contains, is_foreach_header_declared_variable};
+use crate::cst::{ancestor_field_contains, is_by_ref_output_argument_variable, node_contains};
 use crate::resolve::{
     namespace_relative_function_call, resolve_class_name_pub, resolve_constant_name_pub,
     resolve_function_name_pub, resolve_scope_class_name_pub, symbol_at_position_with_resolvers,
@@ -22,10 +22,11 @@ pub struct ReferenceLocation {
     pub range: (u32, u32, u32, u32),
 }
 
-/// Find local variable references in the same lexical scope at cursor position.
+/// Find references in the local-variable binding component at cursor position.
 ///
-/// Scope is the nearest enclosing function/method/closure/arrow function,
-/// or the whole file if cursor is at top level.
+/// Named functions and methods are hard boundaries. Explicit anonymous-function
+/// `use` clauses and implicit arrow-function captures connect a child scope to
+/// its parent, while a same-named child parameter starts an independent binding.
 pub fn find_variable_references_at_position(
     tree: &Tree,
     source: &str,
@@ -68,10 +69,25 @@ pub fn find_variable_references_at_position(
 
     let var_name = normalize_var_name(&source[node.byte_range()]);
     let scope = find_variable_scope(node).unwrap_or(root);
+    let binding_root = variable_binding_root(scope, root, source, &var_name);
+    if binding_component_has_global_declaration(binding_root, source, &var_name) {
+        return vec![];
+    }
 
     let mut refs: Vec<ReferenceLocation> = Vec::new();
     let mut declarations: Vec<(u32, u32, u32, u32)> = Vec::new();
-    walk_variable_refs(scope, source, &var_name, &mut refs, &mut declarations);
+    walk_variable_binding_refs(
+        binding_root,
+        binding_root,
+        source,
+        &var_name,
+        &mut refs,
+        &mut declarations,
+    );
+    refs.sort_by_key(|reference| reference.range);
+    refs.dedup_by_key(|reference| reference.range);
+    declarations.sort_unstable();
+    declarations.dedup();
 
     if include_declaration {
         refs
@@ -1471,19 +1487,30 @@ fn walk_for_constant_refs(
     }
 }
 
-fn walk_variable_refs(
+fn walk_variable_binding_refs(
+    scope: Node,
     node: Node,
     source: &str,
     var_name: &str,
     refs: &mut Vec<ReferenceLocation>,
     declarations: &mut Vec<(u32, u32, u32, u32)>,
 ) {
+    if node.id() != scope.id() && is_class_member_body_kind(node.kind()) {
+        return;
+    }
+    if node.id() != scope.id() && is_variable_scope_node(node) {
+        if nested_scope_captures_binding(node, scope, source, var_name) {
+            walk_variable_binding_refs(node, node, source, var_name, refs, declarations);
+        }
+        return;
+    }
+
     if node.kind() == "variable_name" {
         let text = normalize_var_name(&source[node.byte_range()]);
         if text == var_name {
             let range = node_range(node);
             refs.push(ReferenceLocation { range });
-            if is_variable_declaration(node, source, var_name) {
+            if is_variable_declaration(node, source, var_name) && !is_closure_capture_token(node) {
                 declarations.push(range);
             }
         }
@@ -1491,13 +1518,131 @@ fn walk_variable_refs(
 
     let cursor = &mut node.walk();
     for child in node.named_children(cursor) {
-        walk_variable_refs(child, source, var_name, refs, declarations);
+        walk_variable_binding_refs(scope, child, source, var_name, refs, declarations);
     }
 }
 
+fn variable_binding_root<'tree>(
+    mut scope: Node<'tree>,
+    root: Node<'tree>,
+    source: &str,
+    var_name: &str,
+) -> Node<'tree> {
+    while scope.id() != root.id() {
+        if scope_parameter_declares(scope, source, var_name) {
+            break;
+        }
+        let captures_parent = match scope.kind() {
+            "arrow_function" => true,
+            "anonymous_function" | "anonymous_function_creation_expression" => {
+                closure_use_clause_contains(scope, source, var_name)
+            }
+            _ => false,
+        };
+        if !captures_parent {
+            break;
+        }
+        let parent = parent_variable_scope(scope).unwrap_or(root);
+        if parent.id() == scope.id() {
+            break;
+        }
+        scope = parent;
+    }
+    scope
+}
+
+fn binding_component_has_global_declaration(scope: Node, source: &str, var_name: &str) -> bool {
+    fn walk(scope: Node, node: Node, source: &str, var_name: &str) -> bool {
+        if node.id() != scope.id() && is_variable_scope_node(node) {
+            return nested_scope_captures_binding(node, scope, source, var_name)
+                && walk(node, node, source, var_name);
+        }
+        if scope.kind() != "program"
+            && node.kind() == "global_declaration"
+            && node_contains_variable(node, source, var_name)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .any(|child| walk(scope, child, source, var_name));
+        found
+    }
+
+    walk(scope, scope, source, var_name)
+}
+
+fn nested_scope_captures_binding(
+    nested_scope: Node,
+    current_scope: Node,
+    source: &str,
+    var_name: &str,
+) -> bool {
+    if scope_parameter_declares(nested_scope, source, var_name) {
+        return false;
+    }
+    let captures_parent = match nested_scope.kind() {
+        "arrow_function" => true,
+        "anonymous_function" | "anonymous_function_creation_expression" => {
+            closure_use_clause_contains(nested_scope, source, var_name)
+        }
+        _ => false,
+    };
+    captures_parent
+        && parent_variable_scope(nested_scope)
+            .is_some_and(|parent| parent.id() == current_scope.id())
+}
+
+fn scope_parameter_declares(scope: Node, source: &str, var_name: &str) -> bool {
+    scope
+        .child_by_field_name("parameters")
+        .is_some_and(|parameters| node_contains_variable(parameters, source, var_name))
+}
+
+fn closure_use_clause_contains(scope: Node, source: &str, var_name: &str) -> bool {
+    let mut cursor = scope.walk();
+    let contains = scope.named_children(&mut cursor).any(|child| {
+        child.kind() == "anonymous_function_use_clause"
+            && node_contains_variable(child, source, var_name)
+    });
+    contains
+}
+
+fn node_contains_variable(node: Node, source: &str, var_name: &str) -> bool {
+    if node.kind() == "variable_name" && normalize_var_name(&source[node.byte_range()]) == var_name
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let contains = node
+        .named_children(&mut cursor)
+        .any(|child| node_contains_variable(child, source, var_name));
+    contains
+}
+
+fn is_closure_capture_token(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "anonymous_function_use_clause" => return true,
+            "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function"
+            | "anonymous_function_creation_expression"
+            | "program" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
+}
+
 fn is_variable_declaration(node: Node, source: &str, var_name: &str) -> bool {
-    if ancestor_field_contains(node, "foreach_statement", &["key", "value"])
-        || is_foreach_header_declared_variable(node, source)
+    if is_foreach_binding_variable(node)
+        || is_by_ref_output_binding_variable(node, source)
+        || is_assignment_binding_variable(node)
+        || ancestor_field_contains(node, "catch_clause", &["name", "variable"])
     {
         return true;
     }
@@ -1508,11 +1653,11 @@ fn is_variable_declaration(node: Node, source: &str, var_name: &str) -> bool {
     };
 
     match parent.kind() {
-        "simple_parameter" | "property_promotion_parameter" => parent
+        "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => parent
             .child_by_field_name("name")
             .map(|n| n.id() == node.id())
             .unwrap_or(false),
-        "assignment_expression" => parent
+        "assignment_expression" | "by_ref_assignment_expression" => parent
             .child_by_field_name("left")
             .map(|n| normalize_var_name(&source[n.byte_range()]) == var_name)
             .unwrap_or(false),
@@ -1522,24 +1667,230 @@ fn is_variable_declaration(node: Node, source: &str, var_name: &str) -> bool {
                 .map(|n| n.id() == node.id())
                 .unwrap_or(false)
         }),
-        "anonymous_function_use_clause" => true,
+        "global_declaration" | "static_variable_declaration" => true,
         _ => false,
     }
+}
+
+fn is_foreach_binding_variable(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "foreach_statement" {
+            return foreach_binding_target(parent)
+                .filter(|target| node_contains(*target, node))
+                .is_some_and(|target| is_writable_target_variable(node, target));
+        }
+        if is_variable_scope_node(parent) || parent.kind() == "program" {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn foreach_binding_target(statement: Node) -> Option<Node> {
+    let mut after_as = false;
+    let mut cursor = statement.walk();
+    for child in statement.children(&mut cursor) {
+        if !after_as {
+            after_as = child.kind() == "as";
+            continue;
+        }
+        if child.is_named() && !child.is_extra() && !child.is_error() && !child.is_missing() {
+            return Some(child);
+        }
+    }
+    None
+}
+
+fn is_assignment_binding_variable(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "assignment_expression" | "by_ref_assignment_expression"
+        ) {
+            return parent
+                .child_by_field_name("left")
+                .filter(|left| node_contains(*left, node))
+                .is_some_and(|left| is_writable_target_variable(node, left));
+        }
+        if is_variable_scope_node(parent) || parent.kind() == "program" {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn is_by_ref_output_binding_variable(node: Node, source: &str) -> bool {
+    if !is_by_ref_output_argument_variable(node, source) {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "argument" {
+            return argument_value_node(parent)
+                .filter(|value| node_contains(*value, node))
+                .is_some_and(|value| is_writable_target_variable(node, value));
+        }
+        if is_variable_scope_node(parent) || parent.kind() == "program" {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn argument_value_node(argument: Node) -> Option<Node> {
+    let name_id = argument.child_by_field_name("name").map(|node| node.id());
+    let reference_modifier_id = argument
+        .child_by_field_name("reference_modifier")
+        .map(|node| node.id());
+    let mut cursor = argument.walk();
+    let value = argument.named_children(&mut cursor).find(|child| {
+        !child.is_extra()
+            && !child.is_error()
+            && !child.is_missing()
+            && Some(child.id()) != name_id
+            && Some(child.id()) != reference_modifier_id
+    });
+    value
+}
+
+fn is_writable_target_variable(node: Node, target: Node) -> bool {
+    let mut branch = node;
+    while branch.id() != target.id() {
+        let Some(parent) = branch.parent() else {
+            return false;
+        };
+        if !node_contains(target, parent) {
+            return false;
+        }
+        match parent.kind() {
+            "dynamic_variable_name" => return false,
+            "member_access_expression"
+            | "nullsafe_member_access_expression"
+            | "scoped_property_access_expression" => return false,
+            "subscript_expression" => {
+                if parent
+                    .child_by_field_name("index")
+                    .is_some_and(|index| node_contains(index, node))
+                {
+                    return false;
+                }
+                let object = parent
+                    .child_by_field_name("object")
+                    .or_else(|| parent.named_child(0));
+                if !object.is_some_and(|object| node_contains(object, node)) {
+                    return false;
+                }
+            }
+            "array_element_initializer" => {
+                if !array_element_initializer_has_writable_variable(parent, node) {
+                    return false;
+                }
+            }
+            "list_literal" => {
+                if !list_literal_has_writable_variable(parent, node) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        branch = parent;
+    }
+    true
+}
+
+fn array_element_initializer_has_writable_variable(element: Node, node: Node) -> bool {
+    let mut after_arrow = false;
+    let mut cursor = element.walk();
+    for child in element.children(&mut cursor) {
+        if child.kind() == "=>" {
+            after_arrow = true;
+            continue;
+        }
+        if !after_arrow
+            || !child.is_named()
+            || child.is_extra()
+            || child.is_error()
+            || child.is_missing()
+        {
+            continue;
+        }
+        return node_contains(child, node);
+    }
+    !after_arrow
+}
+
+fn list_literal_has_writable_variable(list: Node, node: Node) -> bool {
+    let mut segment_start = list.start_byte();
+    let mut segment_end = list.end_byte();
+    let mut cursor = list.walk();
+    for child in list.children(&mut cursor) {
+        if child.kind() != "," {
+            continue;
+        }
+        if child.end_byte() <= node.start_byte() {
+            segment_start = child.end_byte();
+        } else if child.start_byte() >= node.end_byte() {
+            segment_end = child.start_byte();
+            break;
+        }
+    }
+
+    let mut cursor = list.walk();
+    let arrow = list.children(&mut cursor).find(|child| {
+        child.kind() == "=>"
+            && child.start_byte() >= segment_start
+            && child.end_byte() <= segment_end
+    });
+    arrow.is_none_or(|arrow| node.start_byte() >= arrow.end_byte())
 }
 
 fn find_variable_scope(node: Node) -> Option<Node> {
     let mut current = node.parent();
     while let Some(n) = current {
         match n.kind() {
-            "method_declaration"
-            | "function_definition"
-            | "arrow_function"
-            | "anonymous_function"
-            | "anonymous_function_creation_expression" => return Some(n),
+            kind if is_variable_scope_kind(kind) => return Some(n),
             _ => current = n.parent(),
         }
     }
     None
+}
+
+fn parent_variable_scope(node: Node) -> Option<Node> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if is_variable_scope_node(parent) || parent.kind() == "program" {
+            return Some(parent);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn is_variable_scope_node(node: Node) -> bool {
+    is_variable_scope_kind(node.kind())
+}
+
+fn is_variable_scope_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function"
+            | "anonymous_function_creation_expression"
+    )
+}
+
+fn is_class_member_body_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "declaration_list" | "enum_declaration_list" | "class_body"
+    )
 }
 
 fn normalize_var_name(text: &str) -> String {

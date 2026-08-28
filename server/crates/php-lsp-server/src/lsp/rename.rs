@@ -274,6 +274,11 @@ impl PhpLspBackend {
                     if !is_renameable_variable(&sym.name) {
                         return Ok(None);
                     }
+                    if find_variable_references_at_position(tree, &source, pos.line, byte_col, true)
+                        .is_empty()
+                    {
+                        return Ok(None);
+                    }
                     let rng = range_byte_to_utf16(&source, sym.range);
                     let range = Range {
                         start: Position::new(rng.0, rng.1),
