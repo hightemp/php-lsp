@@ -261,7 +261,10 @@ scope barrier.
 
 ### CODEX-P1-06. Конфигурации multi-root workspace смешиваются глобально
 
-[`load_effective_configuration_settings`](server/crates/php-lsp-server/src/indexing/workspace.rs#L1050)
+> **Статус 2026-08-27:** исправлено. Находка сохранена как историческое
+> обоснование изменения.
+
+[`load_effective_configuration_settings`](../server/crates/php-lsp-server/src/indexing/workspace.rs#L915)
 последовательно объединяет project config всех workspace roots в один JSON.
 Последний root переопределяет PHP version, include/exclude, stubs, analyzers и
 formatter для всех остальных roots.
@@ -282,6 +285,34 @@ workspace-folder-specific values также не передаются корре
 Хранить `ResolvedRuntimeConfiguration` на каждый effective root, выбирать его
 через longest containing root для URI и отправлять resource-scoped client
 snapshot отдельно для каждой workspace folder.
+
+#### Реализовано
+
+- VS Code client отправляет versioned snapshot с отдельными explicit settings
+  для каждого workspace folder и обновляет его при configuration/folder change;
+- server независимо объединяет defaults → global config → project config →
+  resource-scoped client settings и применяет trust gate в контексте того же
+  root;
+- исходный workspace folder, Composer effective root, namespace map и
+  `ResolvedRuntimeConfiguration` публикуются одним root-context набором;
+- document URI выбирает самый специфичный содержащий root; URI вне workspace не
+  наследует первый root;
+- diagnostics/PHP version, code actions, inlay hints, formatter, analyzers,
+  framework namespace map, indexing/cache/include/exclude, vendor и stubs
+  orchestration переведены на root-scoped configuration;
+- каждый root владеет отдельным symbol/reference index; агрегированный index
+  оставлен для workspace-wide выдачи и не участвует в document-scoped
+  resolution, поэтому одинаковые FQN и `phpstub://` URI не перезаписывают
+  соседний root;
+- completion resolve и hierarchy items сохраняют URI исходного workspace,
+  request целиком удерживает одну опубликованную generation, а stub source
+  читается только из настроенного для этого root дерева;
+- side effects конфигурации заменяют/reindex только изменившийся root и не
+  удаляют nested workspace при снятии родительской папки;
+- добавлены unit/client/E2E regressions на PHP version/diagnostics runtime
+  update, одинаковые FQN/stub URI, includePaths, formatter commands, command
+  trust, Composer selection, nested/shared effective roots и vendor/stub
+  visibility.
 
 ### CODEX-P1-07. Auto formatter может исполнять код недоверенного workspace
 

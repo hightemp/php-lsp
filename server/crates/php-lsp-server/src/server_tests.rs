@@ -289,7 +289,13 @@ async fn staged_open_php_participates_in_reference_scans_before_global_commit() 
     assert!(!backend.index.file_symbols.contains_key(uri));
     assert!(!backend.index.file_references.contains_key(uri));
     assert!(backend.index.file_references.contains_key(template_uri));
-    let staged_matches = backend.reference_scan_matches("StagedTarget", PhpSymbolKind::Class, true);
+    let staged_matches = backend.reference_scan_matches(
+        &backend.index,
+        None,
+        "StagedTarget",
+        PhpSymbolKind::Class,
+        true,
+    );
     assert_eq!(staged_matches.len(), 1);
     assert_eq!(staged_matches[0].0, uri);
     assert!(staged_matches[0].1.len() >= 2);
@@ -300,8 +306,13 @@ async fn staged_open_php_participates_in_reference_scans_before_global_commit() 
         "an open template must hide stale indexed virtual-PHP references"
     );
 
-    let direct_locations =
-        backend.reference_locations_for_symbol("StagedTarget", PhpSymbolKind::Class, true);
+    let direct_locations = backend.reference_locations_for_symbol(
+        &backend.index,
+        None,
+        "StagedTarget",
+        PhpSymbolKind::Class,
+        true,
+    );
     assert!(
         direct_locations.len() >= 2,
         "definition-side reference scan should include declarations and uses from the staged parser"
@@ -350,14 +361,14 @@ async fn open_only_qualified_function_blocks_global_fallback_reference() {
     assert!(backend.index.file_references.is_empty());
 
     let global_nonempty_uris: Vec<_> = backend
-        .reference_scan_matches("f", PhpSymbolKind::Function, true)
+        .reference_scan_matches(&backend.index, None, "f", PhpSymbolKind::Function, true)
         .into_iter()
         .filter_map(|(uri, references)| (!references.is_empty()).then_some(uri))
         .collect();
     assert_eq!(global_nonempty_uris, vec![global_uri.to_string()]);
 
     let qualified_nonempty_uris: Vec<_> = backend
-        .reference_scan_matches("Ns\\f", PhpSymbolKind::Function, true)
+        .reference_scan_matches(&backend.index, None, "Ns\\f", PhpSymbolKind::Function, true)
         .into_iter()
         .filter_map(|(uri, references)| (!references.is_empty()).then_some(uri))
         .collect();
@@ -564,6 +575,7 @@ fn closed_index_restore_cannot_overwrite_a_reopened_document() {
                 document_versions: &restore_document_versions,
                 reload_tokens: &restore_reload_tokens,
                 index: &restore_index,
+                root_index: None,
                 uri_str: uri,
                 token,
             },
@@ -1539,78 +1551,6 @@ fn test_workspace_symbol_lsp_range_converts_byte_columns_to_utf16() {
 }
 
 #[test]
-fn test_workspace_reindex_keeps_vendor_and_stub_symbols() {
-    let index = WorkspaceIndex::new();
-    let workspace_uri = "file:///tmp/project/src/Foo.php";
-    index.update_file(
-        workspace_uri,
-        FileSymbols {
-            namespace: Some("App".to_string()),
-            use_statements: vec![],
-            symbols: vec![make_symbol_for_uri(
-                workspace_uri,
-                "Foo",
-                "App\\Foo",
-                PhpSymbolKind::Class,
-                (0, 0, 1, 0),
-                None,
-            )],
-            ..Default::default()
-        },
-    );
-    let vendor_uri = "file:///tmp/project/vendor/acme/pkg/Bar.php";
-    index.update_file(
-        vendor_uri,
-        FileSymbols {
-            namespace: Some("Vendor\\Pkg".to_string()),
-            use_statements: vec![],
-            symbols: vec![make_symbol_for_uri(
-                vendor_uri,
-                "Bar",
-                "Vendor\\Pkg\\Bar",
-                PhpSymbolKind::Class,
-                (0, 0, 1, 0),
-                None,
-            )],
-            ..Default::default()
-        },
-    );
-    let stub_uri = "phpstub://Core/Core.php";
-    index.update_file(
-        stub_uri,
-        FileSymbols {
-            namespace: None,
-            use_statements: vec![],
-            symbols: vec![make_symbol_for_uri(
-                stub_uri,
-                "stdClass",
-                "stdClass",
-                PhpSymbolKind::Class,
-                (0, 0, 1, 0),
-                None,
-            )],
-            ..Default::default()
-        },
-    );
-
-    let open_files = DashMap::new();
-    let template_documents = DashMap::new();
-    let document_versions = DashMap::new();
-    let removed = remove_indexed_file_symbols(
-        &index,
-        &open_files,
-        &template_documents,
-        &document_versions,
-        &[PathBuf::from("/tmp/project")],
-    );
-
-    assert_eq!(removed, 1);
-    assert!(index.resolve_fqn("App\\Foo").is_none());
-    assert!(index.resolve_fqn("Vendor\\Pkg\\Bar").is_some());
-    assert!(index.resolve_fqn("stdClass").is_some());
-}
-
-#[test]
 fn test_workspace_index_reads_non_utf8_php_lossily() {
     let tmp = std::env::temp_dir().join(format!("php-lsp-non-utf8-index-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1994,13 +1934,22 @@ async fn test_lazy_index_class_returns_false_when_psr4_file_contains_different_c
 
     let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
     let backend = service.inner();
-    *backend.workspace_configs.lock().await = vec![WorkspaceRootConfig {
-        root: root.clone(),
-        namespace_map: Some(NamespaceMap {
-            psr4: vec![("App\\".to_string(), vec![src])],
-            ..Default::default()
-        }),
-    }];
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: Some(NamespaceMap {
+                psr4: vec![("App\\".to_string(), vec![src])],
+                ..Default::default()
+            }),
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: backend.index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
 
     assert!(!backend.lazy_index_class("App\\Foo").await);
     assert!(backend.index.resolve_fqn("App\\Foo").is_none());
@@ -2026,13 +1975,22 @@ async fn test_lazy_indexed_vendor_symbol_survives_restart_cache_load() {
 
     let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
     let backend = service.inner();
-    *backend.workspace_configs.lock().await = vec![WorkspaceRootConfig {
-        root: root.clone(),
-        namespace_map: Some(NamespaceMap {
-            psr4: vec![("Vendor\\Package\\".to_string(), vec![vendor_src])],
-            ..Default::default()
-        }),
-    }];
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: Some(NamespaceMap {
+                psr4: vec![("Vendor\\Package\\".to_string(), vec![vendor_src])],
+                ..Default::default()
+            }),
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: backend.index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
 
     assert!(backend.lazy_index_class("Vendor\\Package\\Foo").await);
     assert!(
@@ -5649,6 +5607,527 @@ fn test_resolved_runtime_configuration_reveals_project_values_after_client_reset
 }
 
 #[test]
+fn test_runtime_configuration_change_classification_is_root_scoped() {
+    let baseline = ResolvedRuntimeConfiguration::default();
+
+    let mut diagnostics = baseline.clone();
+    diagnostics.diagnostics_mode = DiagnosticsMode::Off;
+    assert_eq!(
+        runtime_configuration_changes(&baseline, &diagnostics),
+        AppliedConfiguration {
+            diagnostics_changed: true,
+            stubs_changed: false,
+            indexing_changed: false,
+        }
+    );
+
+    let mut indexing = baseline.clone();
+    indexing.include_paths.push(PathBuf::from("packages"));
+    assert_eq!(
+        runtime_configuration_changes(&baseline, &indexing),
+        AppliedConfiguration {
+            diagnostics_changed: false,
+            stubs_changed: false,
+            indexing_changed: true,
+        }
+    );
+
+    let mut formatting = baseline.clone();
+    formatting.formatting =
+        FormattingConfig::from_options(Some("custom"), Some("vendor/bin/format {file}"), None);
+    assert_eq!(
+        runtime_configuration_changes(&baseline, &formatting),
+        AppliedConfiguration::default()
+    );
+}
+
+#[test]
+fn test_versioned_workspace_settings_match_exact_folder_identity() {
+    let outer = PathBuf::from("/workspace");
+    let nested = outer.join("nested");
+    let payload = serde_json::json!({
+        "configurationVersion": 2,
+        "global": {},
+        "workspaceFolders": [
+            {
+                "uri": php_lsp_types::uri::path_to_uri(&outer).unwrap(),
+                "settings": {
+                    "allowProjectCommands": true,
+                    "phpVersion": "7.4"
+                }
+            }
+        ]
+    });
+    let snapshot = ClientConfigurationSnapshot::from_value(&payload);
+    let outer_settings = snapshot.settings_for_workspace_folder(&outer);
+    let nested_settings = snapshot.settings_for_workspace_folder(&nested);
+    assert_eq!(project_command_trust_setting(&outer_settings), Some(true));
+    assert_eq!(project_command_trust_setting(&nested_settings), None);
+    assert_eq!(
+        nested_settings
+            .get("phpVersion")
+            .and_then(serde_json::Value::as_str),
+        None,
+        "a missing nested entry must not inherit outer resource settings"
+    );
+}
+
+#[test]
+fn test_workspace_runtime_configuration_is_isolated_per_root() {
+    let tmp = unique_server_temp_dir("root-runtime-config");
+    let root_a = tmp.join("root-a");
+    let root_b = tmp.join("root-b");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+    for root in [&root_a, &root_b] {
+        std::fs::write(
+            root.join("composer.json"),
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        root_a.join(PROJECT_CONFIG_FILE_NAME),
+        r#"[php]
+version = "7.4"
+[diagnostics]
+mode = "off"
+[indexing]
+vendor = false
+include = ["src-a"]
+[formatting]
+provider = "custom"
+command = "vendor/bin/root-a-format {file}"
+[phpstan]
+enabled = true
+command = "vendor/bin/root-a-phpstan {file}"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root_b.join(PROJECT_CONFIG_FILE_NAME),
+        r#"[php]
+version = "8.3"
+[diagnostics]
+mode = "basic-semantic"
+[indexing]
+vendor = true
+include = ["src-b"]
+[formatting]
+provider = "custom"
+command = "vendor/bin/root-b-format {file}"
+[phpstan]
+enabled = true
+command = "vendor/bin/root-b-phpstan {file}"
+"#,
+    )
+    .unwrap();
+
+    let payload = serde_json::json!({
+        "configurationVersion": 2,
+        "global": {},
+        "workspaceFolders": [
+            {
+                "uri": php_lsp_types::uri::path_to_uri(&root_a).unwrap(),
+                "settings": {
+                    "allowProjectCommands": true,
+                    "composerEnabled": false,
+                    "phpVersion": "8.0"
+                }
+            },
+            {
+                "uri": php_lsp_types::uri::path_to_uri(&root_b).unwrap(),
+                "settings": {
+                    "allowProjectCommands": false
+                }
+            }
+        ]
+    });
+    let loaded = load_workspace_runtime(&[root_a.clone(), root_b.clone()], &payload);
+    let config_a = loaded
+        .configs
+        .iter()
+        .find(|config| config.workspace_folder == root_a)
+        .unwrap();
+    let config_b = loaded
+        .configs
+        .iter()
+        .find(|config| config.workspace_folder == root_b)
+        .unwrap();
+
+    assert_eq!(
+        config_a.runtime_config.php_version,
+        PhpVersion::parse("8.0").unwrap()
+    );
+    assert_eq!(
+        config_a.runtime_config.diagnostics_mode,
+        DiagnosticsMode::Off
+    );
+    assert!(!config_a.runtime_config.index_vendor);
+    assert!(!config_a.runtime_config.composer_enabled);
+    assert!(config_a.namespace_map.is_none());
+    assert_eq!(
+        config_a.runtime_config.include_paths,
+        vec![PathBuf::from("src-a")]
+    );
+    assert_eq!(
+        config_a.runtime_config.formatting.command.as_deref(),
+        Some("vendor/bin/root-a-format {file}")
+    );
+    assert!(config_a.runtime_config.phpstan.enabled);
+    assert_eq!(
+        config_a.runtime_config.phpstan.command,
+        "vendor/bin/root-a-phpstan {file}"
+    );
+
+    assert_eq!(
+        config_b.runtime_config.php_version,
+        PhpVersion::parse("8.3").unwrap()
+    );
+    assert_eq!(
+        config_b.runtime_config.diagnostics_mode,
+        DiagnosticsMode::BasicSemantic
+    );
+    assert!(config_b.runtime_config.index_vendor);
+    assert!(config_b.runtime_config.composer_enabled);
+    assert!(config_b.namespace_map.is_some());
+    assert_eq!(
+        config_b.runtime_config.include_paths,
+        vec![PathBuf::from("src-b")]
+    );
+    assert_eq!(config_b.runtime_config.formatting.provider, "custom");
+    assert!(config_b.runtime_config.formatting.command.is_none());
+    assert!(!config_b.runtime_config.phpstan.enabled);
+    assert_eq!(config_b.runtime_config.phpstan, PhpStanConfig::default());
+    assert!(loaded.messages.iter().any(|message| {
+        message.contains("root-b") && message.starts_with("Ignored executable")
+    }));
+
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test]
+async fn test_runtime_config_for_uri_uses_longest_workspace_folder() {
+    let outer = PathBuf::from("/workspace");
+    let nested = outer.join("packages/nested");
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let outer_index = Arc::new(WorkspaceIndex::new());
+    let nested_index = Arc::new(WorkspaceIndex::new());
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![
+            WorkspaceRootConfig {
+                workspace_folder: outer.clone(),
+                root: outer.clone(),
+                namespace_map: None,
+                runtime_config: ResolvedRuntimeConfiguration {
+                    php_version: PhpVersion::parse("7.4").unwrap(),
+                    index_vendor: false,
+                    exclude_paths: vec![PathBuf::from("outer-cache")],
+                    stub_extensions: Some(Vec::new()),
+                    ..Default::default()
+                },
+                index: outer_index,
+                vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+            },
+            WorkspaceRootConfig {
+                workspace_folder: nested.clone(),
+                root: nested.clone(),
+                namespace_map: None,
+                runtime_config: ResolvedRuntimeConfiguration {
+                    php_version: PhpVersion::parse("8.3").unwrap(),
+                    stub_extensions: Some(vec!["Core".to_string()]),
+                    ..Default::default()
+                },
+                index: nested_index.clone(),
+                vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+            },
+        ],
+        generation: 1,
+    });
+
+    let nested_uri = php_lsp_types::uri::path_to_uri(&nested.join("src/Subject.php")).unwrap();
+    assert_eq!(
+        backend
+            .runtime_config_for_uri(&nested_uri)
+            .await
+            .php_version,
+        PhpVersion::parse("8.3").unwrap()
+    );
+    let nested_vendor = backend.vendor_lazy_index_context_for_uri(&nested_uri).await;
+    assert!(nested_vendor.index_vendor);
+    assert_eq!(nested_vendor.workspace_configs.len(), 1);
+    assert_eq!(nested_vendor.workspace_configs[0].workspace_folder, nested);
+
+    let outer_uri = php_lsp_types::uri::path_to_uri(&outer.join("src/Subject.php")).unwrap();
+    let outer_vendor = backend.vendor_lazy_index_context_for_uri(&outer_uri).await;
+    assert!(!outer_vendor.index_vendor);
+    assert_eq!(
+        outer_vendor.exclude_paths,
+        vec![PathBuf::from("outer-cache")]
+    );
+
+    let nested_vendor_uri =
+        php_lsp_types::uri::path_to_uri(&nested.join("vendor/acme/package/src/VendorOnly.php"))
+            .unwrap();
+    let vendor_symbol = make_symbol_for_uri(
+        &nested_vendor_uri,
+        "VendorOnly",
+        "Vendor\\VendorOnly",
+        PhpSymbolKind::Class,
+        (0, 0, 0, 10),
+        None,
+    );
+    nested_index.update_file(
+        &nested_vendor_uri,
+        FileSymbols {
+            symbols: vec![vendor_symbol],
+            ..Default::default()
+        },
+    );
+    assert!(
+        backend
+            .resolve_fqn_lazy_for_uri(&outer_uri, "Vendor\\VendorOnly")
+            .await
+            .is_none(),
+        "outer root must not see a nested workspace vendor symbol"
+    );
+    assert!(
+        backend
+            .resolve_fqn_lazy_for_uri(&nested_uri, "Vendor\\VendorOnly")
+            .await
+            .is_some(),
+        "owning nested root should resolve its vendor symbol"
+    );
+
+    let stub_uri = "phpstub://Core/Core.php";
+    nested_index.update_file(
+        stub_uri,
+        FileSymbols {
+            symbols: vec![make_symbol_for_uri(
+                stub_uri,
+                "RootScopedBuiltin",
+                "RootScopedBuiltin",
+                PhpSymbolKind::Class,
+                (0, 0, 0, 17),
+                None,
+            )],
+            ..Default::default()
+        },
+    );
+    assert!(
+        backend
+            .resolve_fqn_lazy_for_uri(&outer_uri, "RootScopedBuiltin")
+            .await
+            .is_none(),
+        "root with explicitly disabled stubs must not resolve a shared stub symbol"
+    );
+    assert!(
+        backend
+            .resolve_fqn_lazy_for_uri(&nested_uri, "RootScopedBuiltin")
+            .await
+            .is_some(),
+        "root with Core enabled should resolve the shared stub symbol"
+    );
+    let outside_uri = php_lsp_types::uri::path_to_uri(Path::new("/outside/Subject.php")).unwrap();
+    assert_eq!(
+        backend
+            .runtime_config_for_uri(&outside_uri)
+            .await
+            .php_version,
+        PhpVersion::DEFAULT
+    );
+    assert!(backend.workspace_root_for_uri(&outside_uri).await.is_none());
+}
+
+#[tokio::test]
+async fn test_outside_uri_uses_isolated_fallback_index() {
+    let root = PathBuf::from("/workspace");
+    let root_index = Arc::new(WorkspaceIndex::new());
+    let fallback_index = Arc::new(WorkspaceIndex::new());
+    let root_symbol_uri = "file:///workspace/RootOnly.php";
+    let fallback_symbol_uri = "phpstub://Core/Fallback.php";
+    root_index.update_file(
+        root_symbol_uri,
+        FileSymbols {
+            symbols: vec![make_symbol_for_uri(
+                root_symbol_uri,
+                "RootOnly",
+                "RootOnly",
+                PhpSymbolKind::Class,
+                (0, 0, 0, 8),
+                None,
+            )],
+            ..Default::default()
+        },
+    );
+    fallback_index.update_file(
+        fallback_symbol_uri,
+        FileSymbols {
+            symbols: vec![make_symbol_for_uri(
+                fallback_symbol_uri,
+                "FallbackOnly",
+                "FallbackOnly",
+                PhpSymbolKind::Class,
+                (0, 0, 0, 12),
+                None,
+            )],
+            ..Default::default()
+        },
+    );
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: fallback_index.clone(),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root,
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: root_index,
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
+    let request = backend
+        .request_context_for_uri("file:///outside/Subject.php")
+        .await;
+    let index = request.index(&backend.index);
+    assert!(Arc::ptr_eq(&index, &fallback_index));
+    assert!(index.resolve_fqn("FallbackOnly").is_some());
+    assert!(index.resolve_fqn("RootOnly").is_none());
+}
+
+#[tokio::test]
+async fn test_indexing_cancellation_is_scoped_to_workspace_folder() {
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let root_a = PathBuf::from("/workspace/a");
+    let root_b = PathBuf::from("/workspace/b");
+    let old_a = backend.start_indexing_run(&root_a).await;
+    let root_b_token = backend.start_indexing_run(&root_b).await;
+    let new_a = backend.start_indexing_run(&root_a).await;
+    assert!(old_a.is_cancelled());
+    assert!(!new_a.is_cancelled());
+    assert!(!root_b_token.is_cancelled());
+    assert!(indexing_run_is_active_for_workspace(&backend.indexing_run, Some(&root_b)).await);
+    finish_indexing_run_state(&backend.indexing_run, &new_a).await;
+    assert!(
+        indexing_run_is_active_for_workspace(&backend.indexing_run, Some(&root_b)).await,
+        "finishing root A must not clear root B's active state"
+    );
+}
+
+#[test]
+fn test_diagnostic_publish_validity_is_root_scoped_across_runtime_updates() {
+    let root_a = PathBuf::from("/workspace/a");
+    let root_b = PathBuf::from("/workspace/b");
+    let index_a = Arc::new(WorkspaceIndex::new());
+    let index_b = Arc::new(WorkspaceIndex::new());
+    let config_a = WorkspaceRootConfig {
+        workspace_folder: root_a.clone(),
+        root: root_a,
+        namespace_map: None,
+        runtime_config: ResolvedRuntimeConfiguration::default(),
+        index: index_a.clone(),
+        vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+    };
+    let config_b = WorkspaceRootConfig {
+        workspace_folder: root_b.clone(),
+        root: root_b.clone(),
+        namespace_map: None,
+        runtime_config: ResolvedRuntimeConfiguration::default(),
+        index: index_b.clone(),
+        vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+    };
+    let request = DiagnosticPublishRequest {
+        uri: "file:///workspace/b/Subject.php".parse().unwrap(),
+        diagnostics: Vec::new(),
+        version: Some(1),
+        expected_state: None,
+        expected_template: None,
+        require_idle_index: false,
+        expected_runtime_generation: 1,
+        indexing_workspace_folder: Some(root_b),
+        expected_runtime_config: config_b.runtime_config.clone(),
+        expected_index: index_b,
+        computation_sequence: 1,
+    };
+    let mut changed_a = config_a.clone();
+    changed_a.runtime_config.diagnostics_mode = DiagnosticsMode::Off;
+    let state = WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![changed_a, config_b],
+        generation: 2,
+    };
+    assert!(
+        diagnostic_runtime_request_is_current(&request, &state),
+        "changing root A must not invalidate an otherwise current root B publish"
+    );
+}
+
+#[tokio::test]
+async fn test_shared_effective_root_lifecycle_respects_each_root_excludes() {
+    let shared_root = PathBuf::from("/workspace/shared");
+    let index_a = Arc::new(WorkspaceIndex::new());
+    let index_b = Arc::new(WorkspaceIndex::new());
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![
+            WorkspaceRootConfig {
+                workspace_folder: PathBuf::from("/workspace/folder-a"),
+                root: shared_root.clone(),
+                namespace_map: None,
+                runtime_config: ResolvedRuntimeConfiguration {
+                    exclude_paths: vec![PathBuf::from("src")],
+                    ..Default::default()
+                },
+                index: index_a.clone(),
+                vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+            },
+            WorkspaceRootConfig {
+                workspace_folder: PathBuf::from("/workspace/folder-b"),
+                root: shared_root.clone(),
+                namespace_map: None,
+                runtime_config: ResolvedRuntimeConfiguration::default(),
+                index: index_b.clone(),
+                vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+            },
+        ],
+        generation: 1,
+    });
+    let uri = "file:///workspace/shared/src/Subject.php";
+    let symbols = FileSymbols {
+        symbols: vec![make_symbol_for_uri(
+            uri,
+            "SharedSubject",
+            "SharedSubject",
+            PhpSymbolKind::Class,
+            (0, 0, 0, 13),
+            None,
+        )],
+        ..Default::default()
+    };
+    assert!(
+        backend
+            .commit_closed_php_snapshot_to_current_runtime(uri, Some(symbols), Vec::new())
+            .await
+    );
+    assert!(index_a.resolve_fqn("SharedSubject").is_none());
+    assert!(index_b.resolve_fqn("SharedSubject").is_some());
+    backend.remove_uri_from_current_runtime_indexes(uri).await;
+    assert!(index_a.resolve_fqn("SharedSubject").is_none());
+    assert!(index_b.resolve_fqn("SharedSubject").is_none());
+}
+
+#[test]
 fn test_framework_string_key_cache_evicts_lru_entries() {
     fn key(root: &str, domain: &str) -> FrameworkStringKeyCacheKey {
         FrameworkStringKeyCacheKey {
@@ -5684,11 +6163,336 @@ fn test_framework_string_key_cache_evicts_lru_entries() {
     assert!(cache.get(&third).is_some());
 }
 
+#[tokio::test]
+async fn test_root_indices_isolate_duplicate_fqns_stub_versions_and_stub_sources() {
+    let tmp = unique_server_temp_dir("root-index-isolation");
+    let root_a = tmp.join("root-a");
+    let root_b = tmp.join("root-b");
+    let stubs_a = tmp.join("stubs-a");
+    let stubs_b = tmp.join("stubs-b");
+    std::fs::create_dir_all(stubs_a.join("Core")).unwrap();
+    std::fs::create_dir_all(stubs_b.join("Core")).unwrap();
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+    let stub_a_path = stubs_a.join("Core/Core.php");
+    let stub_b_path = stubs_b.join("Core/Core.php");
+    std::fs::write(
+        &stub_a_path,
+        "<?php // ROOT_A_STUB\n#[PhpStormStubsElementAvailable(to: '7.4')] function old_only(): void {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &stub_b_path,
+        "<?php // ROOT_B_STUB\n#[PhpStormStubsElementAvailable(from: '8.1')] function only_81(): void {}\n",
+    )
+    .unwrap();
+
+    let index_a = Arc::new(WorkspaceIndex::new());
+    let index_b = Arc::new(WorkspaceIndex::new());
+    assert!(stubs::load_stub_file_for_php_version(
+        &index_a,
+        &stubs_a,
+        "Core",
+        &stub_a_path,
+        Some(stubs::StubPhpVersion { major: 7, minor: 4 }),
+    )
+    .is_some());
+    assert!(stubs::load_stub_file_for_php_version(
+        &index_b,
+        &stubs_b,
+        "Core",
+        &stub_b_path,
+        Some(stubs::StubPhpVersion { major: 8, minor: 3 }),
+    )
+    .is_some());
+
+    let file_a = php_lsp_types::uri::path_to_uri(&root_a.join("Subject.php")).unwrap();
+    let file_b = php_lsp_types::uri::path_to_uri(&root_b.join("Subject.php")).unwrap();
+    for (index, uri, member) in [
+        (&index_a, file_a.as_str(), "rootAOnly"),
+        (&index_b, file_b.as_str(), "rootBOnly"),
+    ] {
+        index.update_file(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    make_symbol_for_uri(
+                        uri,
+                        "Subject",
+                        "Shared\\Subject",
+                        PhpSymbolKind::Class,
+                        (0, 0, 0, 7),
+                        None,
+                    ),
+                    make_symbol_for_uri(
+                        uri,
+                        member,
+                        &format!("Shared\\Subject::{member}"),
+                        PhpSymbolKind::Method,
+                        (1, 0, 1, member.len() as u32),
+                        Some("Shared\\Subject"),
+                    ),
+                ],
+                ..Default::default()
+            },
+        );
+    }
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![
+            WorkspaceRootConfig {
+                workspace_folder: root_a.clone(),
+                root: root_a,
+                namespace_map: None,
+                runtime_config: ResolvedRuntimeConfiguration {
+                    php_version: PhpVersion::parse("7.4").unwrap(),
+                    stubs_path: Some(stubs_a),
+                    ..Default::default()
+                },
+                index: index_a,
+                vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+            },
+            WorkspaceRootConfig {
+                workspace_folder: root_b.clone(),
+                root: root_b,
+                namespace_map: None,
+                runtime_config: ResolvedRuntimeConfiguration {
+                    php_version: PhpVersion::parse("8.3").unwrap(),
+                    stubs_path: Some(stubs_b),
+                    ..Default::default()
+                },
+                index: index_b,
+                vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+            },
+        ],
+        generation: 1,
+    });
+
+    let request_a = backend.request_context_for_uri(file_a.as_str()).await;
+    let request_b = backend.request_context_for_uri(file_b.as_str()).await;
+    let request_index_a = request_a.index(&backend.index);
+    let request_index_b = request_b.index(&backend.index);
+    assert_eq!(
+        request_index_a.resolve_fqn("Shared\\Subject").unwrap().uri,
+        file_a.as_str()
+    );
+    assert!(request_index_a
+        .resolve_fqn("Shared\\Subject::rootAOnly")
+        .is_some());
+    assert!(request_index_a
+        .resolve_fqn("Shared\\Subject::rootBOnly")
+        .is_none());
+    assert_eq!(
+        request_index_b.resolve_fqn("Shared\\Subject").unwrap().uri,
+        file_b.as_str()
+    );
+    assert!(request_index_b
+        .resolve_fqn("Shared\\Subject::rootBOnly")
+        .is_some());
+    assert!(request_index_b
+        .resolve_fqn("Shared\\Subject::rootAOnly")
+        .is_none());
+
+    assert!(request_index_a.resolve_fqn("old_only").is_some());
+    assert!(request_index_a.resolve_fqn("only_81").is_none());
+    assert!(request_index_b.resolve_fqn("only_81").is_some());
+    assert!(request_index_b.resolve_fqn("old_only").is_none());
+    let stub_uri = "phpstub://Core/Core.php";
+    let source_a = backend
+        .source_for_uri_in_request(&request_a, stub_uri, "root A stub test read")
+        .await
+        .unwrap();
+    let source_b = backend
+        .source_for_uri_in_request(&request_b, stub_uri, "root B stub test read")
+        .await
+        .unwrap();
+    assert!(source_a.contains("ROOT_A_STUB"));
+    assert!(!source_a.contains("ROOT_B_STUB"));
+    assert!(source_b.contains("ROOT_B_STUB"));
+    assert!(!source_b.contains("ROOT_A_STUB"));
+
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test]
+async fn test_configuration_change_is_atomic_and_replaces_only_the_affected_root_index() {
+    let tmp = unique_server_temp_dir("root-config-index-replacement");
+    let root_a = tmp.join("root-a");
+    let root_b = tmp.join("root-b");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+    let root_a_uri = php_lsp_types::uri::path_to_uri(&root_a).unwrap();
+    let root_b_uri = php_lsp_types::uri::path_to_uri(&root_b).unwrap();
+    let settings = |include_a: Option<&str>| {
+        serde_json::json!({
+            "configurationVersion": 2,
+            "global": { "composerEnabled": false, "stubExtensions": [] },
+            "workspaceFolders": [
+                {
+                    "uri": root_a_uri,
+                    "settings": include_a.map_or_else(
+                        || serde_json::json!({}),
+                        |include| serde_json::json!({ "includePaths": [include] }),
+                    )
+                },
+                { "uri": root_b_uri, "settings": {} }
+            ]
+        })
+    };
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    backend
+        .apply_effective_configuration_settings(&settings(None), &[root_a.clone(), root_b.clone()])
+        .await;
+    let before = backend.runtime_state_snapshot().await;
+    let index_a_before = before
+        .configs
+        .iter()
+        .find(|config| config.workspace_folder == root_a)
+        .unwrap()
+        .index
+        .clone();
+    let index_b_before = before
+        .configs
+        .iter()
+        .find(|config| config.workspace_folder == root_b)
+        .unwrap()
+        .index
+        .clone();
+    let request_before = backend
+        .request_context_for_uri(
+            php_lsp_types::uri::path_to_uri(&root_a.join("Request.php"))
+                .unwrap()
+                .as_str(),
+        )
+        .await;
+    let marker_uri = php_lsp_types::uri::path_to_uri(&root_b.join("Marker.php")).unwrap();
+    index_b_before.update_file(
+        marker_uri.as_str(),
+        FileSymbols {
+            symbols: vec![make_symbol_for_uri(
+                marker_uri.as_str(),
+                "RootBMarker",
+                "RootBMarker",
+                PhpSymbolKind::Class,
+                (0, 0, 0, 11),
+                None,
+            )],
+            ..Default::default()
+        },
+    );
+
+    let application = backend
+        .apply_effective_configuration_settings(
+            &settings(Some("packages")),
+            &[root_a.clone(), root_b.clone()],
+        )
+        .await;
+    let after = backend.runtime_state_snapshot().await;
+    let index_a_after = &after
+        .configs
+        .iter()
+        .find(|config| config.workspace_folder == root_a)
+        .unwrap()
+        .index;
+    let index_b_after = &after
+        .configs
+        .iter()
+        .find(|config| config.workspace_folder == root_b)
+        .unwrap()
+        .index;
+    assert!(!Arc::ptr_eq(&index_a_before, index_a_after));
+    assert!(Arc::ptr_eq(&index_b_before, index_b_after));
+    assert_eq!(application.indexing_workspace_folders, vec![root_a.clone()]);
+    assert!(index_b_after.resolve_fqn("RootBMarker").is_some());
+    assert!(request_before.runtime_config().include_paths.is_empty());
+    assert!(Arc::ptr_eq(
+        &request_before.index(&backend.index),
+        &index_a_before
+    ));
+    let request_after = backend
+        .request_context_for_uri(
+            php_lsp_types::uri::path_to_uri(&root_a.join("Request.php"))
+                .unwrap()
+                .as_str(),
+        )
+        .await;
+    assert_eq!(
+        request_after.runtime_config().include_paths,
+        vec![PathBuf::from("packages")]
+    );
+    assert!(Arc::ptr_eq(
+        &request_after.index(&backend.index),
+        index_a_after
+    ));
+
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test]
+async fn test_removing_outer_workspace_preserves_nested_shared_effective_root() {
+    let tmp = unique_server_temp_dir("nested-workspace-removal");
+    let outer = tmp.join("outer");
+    let nested = outer.join("project");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        nested.join("composer.json"),
+        r#"{"autoload":{"psr-4":{"Nested\\":"src/"}}}"#,
+    )
+    .unwrap();
+    let outer_uri = php_lsp_types::uri::path_to_uri(&outer).unwrap();
+    let nested_uri = php_lsp_types::uri::path_to_uri(&nested).unwrap();
+    let settings = serde_json::json!({
+        "configurationVersion": 2,
+        "global": { "stubExtensions": [] },
+        "workspaceFolders": [
+            { "uri": outer_uri, "settings": {} },
+            { "uri": nested_uri, "settings": {} }
+        ]
+    });
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    backend
+        .apply_effective_configuration_settings(&settings, &[outer.clone(), nested.clone()])
+        .await;
+    let before = backend.runtime_state_snapshot().await;
+    assert!(before.configs.iter().all(|config| config.root == nested));
+    let nested_index = before
+        .configs
+        .iter()
+        .find(|config| config.workspace_folder == nested)
+        .unwrap()
+        .index
+        .clone();
+    let nested_file = nested.join("src/Subject.php");
+    let selected = workspace_config_for_path_from_configs(&before.configs, &nested_file).unwrap();
+    assert_eq!(selected.workspace_folder, nested);
+
+    let application = backend
+        .apply_effective_configuration_settings(&settings, std::slice::from_ref(&nested))
+        .await;
+    let after = backend.runtime_state_snapshot().await;
+    assert_eq!(after.configs.len(), 1);
+    assert_eq!(after.configs[0].workspace_folder, nested);
+    assert!(Arc::ptr_eq(&nested_index, &after.configs[0].index));
+    assert!(application.indexing_workspace_folders.is_empty());
+    assert!(application.rebuild_aggregate);
+
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
 #[test]
 fn test_twig_context_disk_cache_evicts_lru_entries() {
     fn key(root: &str, template_name: &str) -> TwigContextDiskCacheKey {
         TwigContextDiskCacheKey {
             root: PathBuf::from(root),
+            index_identity: 0,
             template_name: template_name.to_string(),
         }
     }
@@ -5731,11 +6535,48 @@ fn test_twig_context_disk_cache_evicts_lru_entries() {
     assert!(cache.get(&third).is_some());
 }
 
+#[tokio::test]
+async fn test_twig_open_php_context_does_not_cross_root_indexes() {
+    let root = unique_server_temp_dir("twig-root-index-isolation");
+    let uri_a = php_lsp_types::uri::path_to_uri(&root.join("a/Controller.php")).unwrap();
+    let uri_b = php_lsp_types::uri::path_to_uri(&root.join("b/Controller.php")).unwrap();
+    let source_a = "<?php class AController { function show() { $this->render('page.html.twig', ['onlyA' => new AType()]); } }";
+    let source_b = "<?php class BController { function show() { $this->render('page.html.twig', ['onlyB' => new BType()]); } }";
+    let open_files = Arc::new(DashMap::new());
+    let index_a = Arc::new(WorkspaceIndex::new());
+    for (uri, source, own_index) in [
+        (uri_a.as_str(), source_a, Some(&index_a)),
+        (uri_b.as_str(), source_b, None),
+    ] {
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        if let Some(index) = own_index {
+            let file_symbols = extract_file_symbols(parser.tree().unwrap(), source, uri);
+            index.update_file(uri, file_symbols);
+        }
+        open_files.insert(uri.to_string(), parser);
+    }
+    let cache = Arc::new(Mutex::new(TwigContextDiskCache::default()));
+    let variables = direct_twig_variable_types_for_template_state(
+        &root,
+        "page.html.twig",
+        None,
+        &open_files,
+        &index_a,
+        &cache,
+    )
+    .await;
+    assert!(variables.iter().any(|variable| variable.name == "onlyA"));
+    assert!(variables.iter().all(|variable| variable.name != "onlyB"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn test_twig_context_disk_cache_evicts_entries_for_source_uri() {
     fn key(root: &str, template_name: &str) -> TwigContextDiskCacheKey {
         TwigContextDiskCacheKey {
             root: PathBuf::from(root),
+            index_identity: 0,
             template_name: template_name.to_string(),
         }
     }
@@ -5818,6 +6659,7 @@ async fn test_request_fs_cache_invalidation_clears_framework_and_twig_caches() {
     twig_cache.lock().await.insert(
         TwigContextDiskCacheKey {
             root: PathBuf::from("/workspace"),
+            index_identity: 0,
             template_name: "users/show.html.twig".to_string(),
         },
         vec![TwigContextFileVariables {

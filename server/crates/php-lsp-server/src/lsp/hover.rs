@@ -7,6 +7,8 @@ impl PhpLspBackend {
     pub(crate) async fn lsp_hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let uri_str = uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let original_pos = params.text_document_position_params.position;
         let Some(OpenDocumentSnapshot {
             tree,
@@ -43,18 +45,18 @@ impl PhpLspBackend {
                     (0, 0, 0, 0),
                     "member-type",
                     format!("{class_fqn}::{member_name}"),
-                    || self.resolve_member_type(class_fqn, member_name),
+                    || resolve_member_type_from_index(&request_index, class_fqn, member_name),
                 )
             };
             let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+                resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
             };
 
             let ctx = InlayHintContext {
                 tree,
                 source: &source,
                 file_symbols: &file_symbols,
-                index: &self.index,
+                index: &request_index,
                 type_cache: &type_cache,
                 utf16_index: &utf16_index,
                 requested_range: (0, 0, u32::MAX, u32::MAX),
@@ -92,7 +94,7 @@ impl PhpLspBackend {
             let sym_at_pos = match primary_sym_at_pos {
                 Some(s)
                     if matches!(s.ref_kind, RefKind::MethodCall | RefKind::PropertyAccess)
-                        && self.index.resolve_fqn(&s.fqn).is_none() =>
+                        && request_index.resolve_fqn(&s.fqn).is_none() =>
                 {
                     inferred_member_symbol.unwrap_or(s)
                 }
@@ -137,7 +139,8 @@ impl PhpLspBackend {
                 let info = if local_symbol_info.is_some() {
                     local_symbol_info
                 } else {
-                    self.resolve_fqn_lazy_with_fallback(
+                    self.resolve_fqn_lazy_with_fallback_in_request(
+                        &request,
                         &sym_at_pos.fqn,
                         sym_at_pos.ref_kind,
                         sym_at_pos.allows_global_fallback,
@@ -149,9 +152,14 @@ impl PhpLspBackend {
                 // not explicitly defined.
                 if info.is_none() && sym_at_pos.ref_kind == RefKind::Constructor {
                     if let Some(class_fqn) = sym_at_pos.fqn.strip_suffix("::__construct") {
-                        self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName, false)
-                            .await
-                            .filter(|symbol| symbol.uri != uri_str)
+                        self.resolve_fqn_lazy_with_fallback_in_request(
+                            &request,
+                            class_fqn,
+                            RefKind::ClassName,
+                            false,
+                        )
+                        .await
+                        .filter(|symbol| symbol.uri != uri_str)
                     } else {
                         None
                     }
@@ -163,20 +171,20 @@ impl PhpLspBackend {
         let twig_accessor_symbol = template_document
             .as_ref()
             .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig)
-            .then(|| twig_property_accessor_method_for_symbol(&self.index, &sym_at_pos))
+            .then(|| twig_property_accessor_method_for_symbol(&request_index, &sym_at_pos))
             .flatten();
         let twig_accessor_alias = (symbol_info.is_none() && twig_accessor_symbol.is_some())
             .then(|| sym_at_pos.name.trim_start_matches('$').to_string());
         let symbol_info = symbol_info.or(twig_accessor_symbol);
 
         let virtual_member = if symbol_info.is_none() {
-            phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)
+            phpdoc_virtual_member_for_symbol(&request_index, &sym_at_pos)
         } else {
             None
         };
         let framework_virtual_member = if symbol_info.is_none() && virtual_member.is_none() {
             framework_virtual_member_for_symbol(
-                &self.index,
+                &request_index,
                 &sym_at_pos,
                 Some(&uri_str),
                 Some(&file_symbols),
@@ -189,7 +197,7 @@ impl PhpLspBackend {
             && virtual_member.is_none()
             && framework_virtual_member.is_none()
         {
-            magic_property_hover_markdown(&self.index, &file_symbols, &sym_at_pos)
+            magic_property_hover_markdown(&request_index, &file_symbols, &sym_at_pos)
         } else {
             None
         };
@@ -199,7 +207,7 @@ impl PhpLspBackend {
             // Build hover content
             let mut content = String::new();
             let hover_file_symbols =
-                hover_file_symbols_for_uri(&self.index, &file_symbols, &uri_str, &sym.uri);
+                hover_file_symbols_for_uri(&request_index, &file_symbols, &uri_str, &sym.uri);
             let type_owner_fqn = hover_symbol_type_owner_fqn(&sym);
 
             // Symbol kind label
@@ -235,7 +243,7 @@ impl PhpLspBackend {
                 append_class_fqn_link_line(
                     &mut content,
                     "Declared in",
-                    &self.index,
+                    &request_index,
                     parent_fqn,
                     parent_fqn,
                 );
@@ -243,13 +251,13 @@ impl PhpLspBackend {
             append_hover_symbol_source_line(&mut content, &sym);
             append_hover_framework_metadata_lines(
                 &mut content,
-                &self.index,
+                &request_index,
                 &hover_file_symbols,
                 &sym,
             );
             append_hover_relation_and_template_lines(
                 &mut content,
-                &self.index,
+                &request_index,
                 &hover_file_symbols,
                 &sym,
             );
@@ -261,7 +269,7 @@ impl PhpLspBackend {
                     .unwrap_or(&[]);
                 append_signature_parameter_lines(
                     &mut content,
-                    &self.index,
+                    &request_index,
                     &hover_file_symbols,
                     type_owner_fqn,
                     &sym.uri,
@@ -277,7 +285,7 @@ impl PhpLspBackend {
                     append_type_link_line(
                         &mut content,
                         type_label,
-                        &self.index,
+                        &request_index,
                         &hover_file_symbols,
                         type_owner_fqn,
                         &sym.uri,
@@ -286,7 +294,7 @@ impl PhpLspBackend {
                 }
                 append_hover_resolved_return_line(
                     &mut content,
-                    &self.index,
+                    &request_index,
                     &hover_file_symbols,
                     &sym,
                     call_site_return_type.as_ref(),
@@ -305,7 +313,7 @@ impl PhpLspBackend {
                 if let Some(ref ret) = phpdoc.return_type {
                     content.push_str("\n**Returns:** ");
                     content.push_str(&type_info_raw_with_links(
-                        &self.index,
+                        &request_index,
                         &hover_file_symbols,
                         type_owner_fqn,
                         &sym.uri,
@@ -315,7 +323,7 @@ impl PhpLspBackend {
                 }
 
                 for section in phpdoc_extra_markdown_sections_with_links(
-                    &self.index,
+                    &request_index,
                     &hover_file_symbols,
                     type_owner_fqn,
                     &sym.uri,
@@ -349,9 +357,9 @@ impl PhpLspBackend {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: phpdoc_virtual_member_markdown_with_links(
-                        &self.index,
+                        &request_index,
                         &hover_file_symbols_for_uri(
-                            &self.index,
+                            &request_index,
                             &file_symbols,
                             &uri_str,
                             &virtual_member.owner.uri,
@@ -366,9 +374,9 @@ impl PhpLspBackend {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: framework_virtual_member_markdown_with_links(
-                        &self.index,
+                        &request_index,
                         &hover_file_symbols_for_owner_fqn(
-                            &self.index,
+                            &request_index,
                             &file_symbols,
                             &uri_str,
                             &virtual_member.owner_fqn,
@@ -388,7 +396,7 @@ impl PhpLspBackend {
             })
         } else if let Some(shape_member_hover) = shape_member_hover {
             let display = local_variable_type_info_display(
-                &self.index,
+                &request_index,
                 &shape_member_hover.owner_fqn,
                 &shape_member_hover.uri,
                 &shape_member_hover.type_info,
@@ -397,7 +405,7 @@ impl PhpLspBackend {
             let type_hint = LocalVariableInlayType {
                 display: display.clone(),
                 target_fqn: single_inlay_target_fqn_from_type_info(
-                    &self.index,
+                    &request_index,
                     &shape_member_hover.owner_fqn,
                     &shape_member_hover.uri,
                     &shape_member_hover.type_info,
@@ -410,7 +418,7 @@ impl PhpLspBackend {
             content.push_str(&shape_member_hover.member_name);
             content.push_str("\n```\n");
             content.push_str("\n**Type:** ");
-            content.push_str(&local_variable_type_markdown(&self.index, &type_hint));
+            content.push_str(&local_variable_type_markdown(&request_index, &type_hint));
             content.push('\n');
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
@@ -434,7 +442,7 @@ impl PhpLspBackend {
 
             if let Some(ref type_hint) = var_info.type_hint {
                 content.push_str("\n**Type:** ");
-                content.push_str(&local_variable_type_markdown(&self.index, type_hint));
+                content.push_str(&local_variable_type_markdown(&request_index, type_hint));
                 content.push('\n');
             }
 
@@ -450,7 +458,7 @@ impl PhpLspBackend {
                 if let Some(ref var_type) = phpdoc.var_type {
                     content.push_str("\n**@var** ");
                     content.push_str(&type_info_raw_with_links(
-                        &self.index,
+                        &request_index,
                         &file_symbols,
                         &local_type_owner_fqn,
                         &uri_str,

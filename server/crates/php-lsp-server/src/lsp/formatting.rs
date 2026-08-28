@@ -304,8 +304,9 @@ impl PhpLspBackend {
             parser.source()
         };
 
-        let workspace_root = self.workspace_root_for_uri(&uri_str).await;
-        let config = self.formatting_config.lock().await.clone();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let workspace_root = request.root().map(Path::to_path_buf);
+        let config = request.runtime_config().formatting.clone();
         let config = config
             .resolve_for_workspace_blocking(workspace_root.as_deref())
             .await;
@@ -365,8 +366,9 @@ impl PhpLspBackend {
             return Ok(Some(vec![]));
         }
 
-        let workspace_root = self.workspace_root_for_uri(&uri_str).await;
-        let config = self.formatting_config.lock().await.clone();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let workspace_root = request.root().map(Path::to_path_buf);
+        let config = request.runtime_config().formatting.clone();
         let config = config
             .resolve_for_workspace_blocking(workspace_root.as_deref())
             .await;

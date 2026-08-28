@@ -25,6 +25,22 @@ The VS Code client watches `**/.php-lsp.toml`; changes are sent as
 `workspace/didChangeWatchedFiles` and the server reloads effective
 configuration without requiring a restart.
 
+### Multi-root workspaces
+
+The VS Code extension resolves explicit settings separately with
+`workspace.getConfiguration("phpLsp", folder.uri)` for every workspace folder
+and sends a versioned snapshot to the server. The precedence above is applied
+independently per folder: project A's `.php-lsp.toml`, resource overrides, and
+command trust never become inputs for project B merely because B appears later
+in the workspace-folder list.
+
+For file-backed requests, the most specific containing workspace folder owns
+the request. This matters for nested folders. Composer effective roots,
+include/exclude paths, cache identity, PHP version, diagnostics, vendor/stubs
+policy, formatter, PHPStan/Psalm, and analyzer code actions come from that
+owner. A file outside all configured roots uses only global/client fallback
+settings instead of inheriting the first workspace folder.
+
 ## Command Trust
 
 Project `.php-lsp.toml` is treated as untrusted for executable settings by

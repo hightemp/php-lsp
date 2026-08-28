@@ -14,7 +14,8 @@ impl PhpLspBackend {
         params: InlayHintParams,
     ) -> Result<Option<Vec<InlayHint>>> {
         let uri_str = params.text_document.uri.as_str().to_string();
-        let php_version = *self.php_version.lock().await;
+        let request = self.request_context_for_uri(&uri_str).await;
+        let php_version = request.runtime_config().php_version;
         let Some(OpenDocumentSnapshot {
             tree,
             source,
@@ -27,7 +28,7 @@ impl PhpLspBackend {
         };
         let document_version = document_state.map(|state| state.version);
 
-        let index = self.index.clone();
+        let index = request.index(&self.index);
         let original_requested_range = params.range;
         let requested_range = if template_document.is_some() {
             full_document_range(&source)
@@ -61,7 +62,8 @@ impl PhpLspBackend {
             hints = map_inlay_hints_to_template_original(template, original_requested_range, hints);
         }
 
-        self.hydrate_inlay_hint_label_locations(&mut hints).await;
+        self.hydrate_inlay_hint_label_locations(&request, &mut hints)
+            .await;
 
         if hints.is_empty() {
             Ok(None)
@@ -70,7 +72,11 @@ impl PhpLspBackend {
         }
     }
 
-    async fn hydrate_inlay_hint_label_locations(&self, hints: &mut [InlayHint]) {
+    async fn hydrate_inlay_hint_label_locations(
+        &self,
+        request: &WorkspaceRequestContext,
+        hints: &mut [InlayHint],
+    ) {
         for hint in hints {
             let InlayHintLabel::LabelParts(parts) = &mut hint.label else {
                 continue;
@@ -82,7 +88,7 @@ impl PhpLspBackend {
                 let Some(InlayHintLabelPartTooltip::String(fqn)) = part.tooltip.as_ref() else {
                     continue;
                 };
-                if let Some(location) = self.location_for_type_fqn(fqn).await {
+                if let Some(location) = self.location_for_type_fqn(request, fqn).await {
                     part.location = Some(location);
                 }
             }

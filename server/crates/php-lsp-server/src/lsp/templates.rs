@@ -3510,6 +3510,7 @@ async fn cached_twig_context_file_variables_for_state(
 ) -> Vec<TwigContextFileVariables> {
     let key = TwigContextDiskCacheKey {
         root: root.to_path_buf(),
+        index_identity: Arc::as_ptr(&index) as usize,
         template_name: template_name.to_string(),
     };
     let use_disk_cache = open_php_sources.is_empty();
@@ -3599,7 +3600,7 @@ fn collect_cached_twig_context_file_variables(
     result
 }
 
-async fn direct_twig_variable_types_for_template_state(
+pub(in crate::server) async fn direct_twig_variable_types_for_template_state(
     root: &Path,
     template_name: &str,
     target_uri: Option<&str>,
@@ -3617,22 +3618,19 @@ async fn direct_twig_variable_types_for_template_state(
         if target_uri.is_some_and(|target_uri| source_uri == target_uri)
             || !source_uri.ends_with(".php")
             || is_blade_template_uri(source_uri.as_str())
+            || !index.file_symbols.contains_key(source_uri.as_str())
         {
             continue;
         }
         open_php_uris.insert(source_uri.to_string());
         let source = entry.value().source();
-        let file_symbols = index
+        let Some(file_symbols) = index
             .file_symbols
             .get(source_uri.as_str())
             .map(|symbols| symbols.value().as_ref().clone())
-            .or_else(|| {
-                entry
-                    .value()
-                    .tree()
-                    .map(|tree| extract_file_symbols(tree, &source, source_uri.as_str()))
-            })
-            .unwrap_or_default();
+        else {
+            continue;
+        };
         open_php_sources.insert(
             source_uri.to_string(),
             TwigContextPhpSource {
@@ -4475,7 +4473,11 @@ pub(in crate::server) struct OpenTwigContextRefreshState<'a> {
     pub(in crate::server) template_documents: &'a Arc<DashMap<String, TemplateDocument>>,
     pub(in crate::server) document_versions: &'a Arc<DashMap<String, OpenDocumentState>>,
     pub(in crate::server) index: &'a Arc<WorkspaceIndex>,
+    pub(in crate::server) fallback_index: &'a Arc<WorkspaceIndex>,
     pub(in crate::server) workspace_roots: &'a [PathBuf],
+    pub(in crate::server) workspace_configs: &'a [WorkspaceRootConfig],
+    pub(in crate::server) workspace_folders_filter: Option<&'a [PathBuf]>,
+    pub(in crate::server) indexing_cancellations: &'a [WorkspaceIndexingCancellation],
     pub(in crate::server) twig_context_disk_cache: &'a Arc<Mutex<TwigContextDiskCache>>,
     pub(in crate::server) semantic_tokens_cache: &'a Arc<Mutex<SemanticTokensCache>>,
 }
@@ -4488,7 +4490,11 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         template_documents,
         document_versions,
         index,
+        fallback_index,
         workspace_roots,
+        workspace_configs,
+        workspace_folders_filter,
+        indexing_cancellations,
         twig_context_disk_cache,
         semantic_tokens_cache,
     } = state;
@@ -4511,6 +4517,22 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
 
     let mut refreshed = Vec::new();
     for uri_str in candidates {
+        let workspace = workspace_config_for_uri_from_configs(workspace_configs, &uri_str);
+        if workspace_folders_filter.is_some_and(|workspace_folders| {
+            workspace
+                .as_ref()
+                .is_none_or(|config| !workspace_folders.contains(&config.workspace_folder))
+        }) {
+            continue;
+        }
+        if workspace.as_ref().is_some_and(|config| {
+            indexing_cancellations.iter().any(|cancellation| {
+                cancellation.workspace_folder == config.workspace_folder
+                    && cancellation.token.is_cancelled()
+            })
+        }) {
+            continue;
+        }
         let Some(template) = template_documents
             .get(&uri_str)
             .map(|document| document.value().clone())
@@ -4524,18 +4546,35 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
             continue;
         };
 
+        let workspace_index = workspace
+            .as_ref()
+            .map(|config| &config.index)
+            .unwrap_or(fallback_index);
+        let root = workspace.as_ref().map(|config| config.root.clone());
+        let roots = root
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(workspace_roots);
         let variable_types = twig_variable_types_for_template_state(
             &uri_str,
             open_files,
             template_documents,
-            index,
-            workspace_roots,
+            workspace_index,
+            roots,
             twig_context_disk_cache,
         )
         .await;
         let refreshed_template = template.with_twig_variable_types(&variable_types);
         let mut parser = FileParser::new();
         parser.parse_full(refreshed_template.virtual_source());
+        if workspace.as_ref().is_some_and(|config| {
+            indexing_cancellations.iter().any(|cancellation| {
+                cancellation.workspace_folder == config.workspace_folder
+                    && cancellation.token.is_cancelled()
+            })
+        }) {
+            continue;
+        }
         let replaced = replace_open_template_if_current(
             OpenTemplateRefreshSnapshot {
                 uri: &uri_str,
@@ -4551,7 +4590,7 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         if !replaced {
             continue;
         }
-        index.remove_file(&uri_str);
+        remove_from_aggregate_and_root_index(index, workspace_index, &uri_str);
         semantic_tokens_cache.lock().await.remove(&uri_str);
         refreshed.push(uri_str);
     }
@@ -4586,14 +4625,20 @@ impl PhpLspBackend {
 
     pub(in crate::server) async fn twig_variable_types_for_template(
         &self,
+        request: &WorkspaceRequestContext,
         uri_str: &str,
     ) -> Vec<TemplateVariableType> {
-        let roots = self.current_workspace_roots().await;
+        let index = request.index(&self.index);
+        let roots = request
+            .root()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect::<Vec<_>>();
         twig_variable_types_for_template_state(
             uri_str,
             &self.open_files,
             &self.template_documents,
-            &self.index,
+            &index,
             &roots,
             &self.twig_context_disk_cache,
         )
@@ -4601,13 +4646,18 @@ impl PhpLspBackend {
     }
 
     pub(in crate::server) async fn refresh_open_twig_contexts(&self) -> Vec<String> {
+        let runtime_state = self.runtime_state_snapshot().await;
         let roots = self.current_workspace_roots().await;
         refresh_open_twig_contexts_for_state(OpenTwigContextRefreshState {
             open_files: &self.open_files,
             template_documents: &self.template_documents,
             document_versions: &self.document_versions,
             index: &self.index,
+            fallback_index: &runtime_state.fallback_index,
             workspace_roots: &roots,
+            workspace_configs: &runtime_state.configs,
+            workspace_folders_filter: None,
+            indexing_cancellations: &[],
             twig_context_disk_cache: &self.twig_context_disk_cache,
             semantic_tokens_cache: &self.semantic_tokens_cache,
         })
@@ -4625,10 +4675,10 @@ impl PhpLspBackend {
 
     pub(in crate::server) async fn twig_template_location(
         &self,
-        uri_str: &str,
+        request: &WorkspaceRequestContext,
         key: &str,
     ) -> Option<Location> {
-        let root = self.workspace_root_for_uri(uri_str).await?;
+        let root = request.root()?.to_path_buf();
         let path = twig_template_path_for_key(&root, key)?;
         let uri = path_to_uri(&path).ok()?.parse::<Uri>().ok()?;
         Some(Location {

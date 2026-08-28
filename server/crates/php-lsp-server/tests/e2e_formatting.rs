@@ -241,6 +241,109 @@ async fn test_document_range_formatting_uses_custom_external_command() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_multi_root_formatting_uses_resource_scoped_commands() {
+    if cfg!(windows) {
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-multiroot-format-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let root_a = tmp.join("root-a");
+    let root_b = tmp.join("root-b");
+    fs::create_dir_all(&root_a).unwrap();
+    fs::create_dir_all(&root_b).unwrap();
+    let root_a_uri = php_lsp_types::uri::path_to_uri(&root_a).unwrap();
+    let root_b_uri = php_lsp_types::uri::path_to_uri(&root_b).unwrap();
+    let file_a_uri = php_lsp_types::uri::path_to_uri(&root_a.join("Format.php")).unwrap();
+    let file_b_uri = php_lsp_types::uri::path_to_uri(&root_b.join("Format.php")).unwrap();
+    let formatted_a = "<?php\necho \"root-a\";\n";
+    let formatted_b = "<?php\necho \"root-b\";\n";
+    let command_a = format!("printf '%s' '{}' > {{file}}", formatted_a);
+    let command_b = format!("printf '%s' '{}' > {{file}}", formatted_b);
+
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_workspace_folders_and_options(
+            1,
+            vec![("root-a", &root_a_uri), ("root-b", &root_b_uri)],
+            Some(json!({
+                "configurationVersion": 2,
+                "global": {},
+                "workspaceFolders": [
+                    {
+                        "uri": root_a_uri,
+                        "settings": {
+                            "formattingProvider": "custom",
+                            "formattingCommand": command_a
+                        }
+                    },
+                    {
+                        "uri": root_b_uri,
+                        "settings": {
+                            "formattingProvider": "custom",
+                            "formattingCommand": command_b
+                        }
+                    }
+                ]
+            })),
+        ))
+        .await
+        .unwrap();
+
+    let source = "<?php echo 'original';\n";
+    for uri in [&file_a_uri, &file_b_uri] {
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(uri, source))
+            .await
+            .unwrap();
+    }
+
+    for (id, uri, expected) in [(2, &file_a_uri, formatted_a), (3, &file_b_uri, formatted_b)] {
+        let result = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(formatting_request(id, uri))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            result
+                .as_array()
+                .and_then(|edits| edits.first())
+                .and_then(|edit| edit["newText"].as_str()),
+            Some(expected),
+            "formatter for {uri} must use its workspace-folder command, got: {result}"
+        );
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_document_range_formatting_uses_utf16_range_after_complex_unicode_prefix() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

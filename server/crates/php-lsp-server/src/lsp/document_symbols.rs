@@ -567,7 +567,33 @@ impl PhpLspBackend {
             return Ok(Some(WorkspaceSymbolResponse::Flat(vec![])));
         }
 
-        let candidates = workspace_symbol_candidates(&self.index, query);
+        let state = self.runtime_state_snapshot().await;
+        let mut candidates = if state.configs.is_empty() {
+            workspace_symbol_candidates(&self.index, query)
+        } else {
+            state
+                .configs
+                .iter()
+                .flat_map(|config| workspace_symbol_candidates(&config.index, query))
+                .collect::<Vec<_>>()
+        };
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| {
+                    workspace_symbol_kind_rank(left.symbol.kind)
+                        .cmp(&workspace_symbol_kind_rank(right.symbol.kind))
+                })
+                .then_with(|| left.symbol.fqn.cmp(&right.symbol.fqn))
+                .then_with(|| left.symbol.uri.cmp(&right.symbol.uri))
+        });
+        candidates.dedup_by(|left, right| {
+            left.symbol.kind == right.symbol.kind
+                && left.symbol.fqn == right.symbol.fqn
+                && left.symbol.uri == right.symbol.uri
+                && left.symbol.selection_range == right.symbol.selection_range
+        });
 
         // Limit results to avoid overwhelming the client.
         let mut source_cache = HashMap::new();

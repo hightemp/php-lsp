@@ -132,6 +132,8 @@ impl PhpLspBackend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let uri_str = uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let original_pos = params.text_document_position_params.position;
         let Some(OpenDocumentSnapshot {
             tree,
@@ -169,10 +171,10 @@ impl PhpLspBackend {
             let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-                self.resolve_member_type(class_fqn, member_name)
+                resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
             let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+                resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
             };
 
             let sym_at_pos = symbol_at_position_with_resolvers(
@@ -232,7 +234,7 @@ impl PhpLspBackend {
                     .map(&map_template_response));
             }
             return Ok(self
-                .location_for_type_fqn_excluding_uri(&type_fqn, &uri_str)
+                .location_for_type_fqn_excluding_uri(&request, &type_fqn, &uri_str)
                 .await
                 .map(GotoDefinitionResponse::Scalar)
                 .map(&map_template_response));
@@ -253,7 +255,7 @@ impl PhpLspBackend {
                     .map(&map_template_response));
             }
             return Ok(self
-                .location_for_type_fqn_excluding_uri(type_fqn, &uri_str)
+                .location_for_type_fqn_excluding_uri(&request, type_fqn, &uri_str)
                 .await
                 .map(GotoDefinitionResponse::Scalar)
                 .map(&map_template_response));
@@ -263,7 +265,8 @@ impl PhpLspBackend {
             if let Some(local_symbol) = local_symbol_for_reference(&file_symbols, &sym_at_pos) {
                 Some(local_symbol)
             } else {
-                self.resolve_fqn_lazy_with_fallback(
+                self.resolve_fqn_lazy_with_fallback_in_request(
+                    &request,
                     &sym_at_pos.fqn,
                     sym_at_pos.ref_kind,
                     sym_at_pos.allows_global_fallback,
@@ -289,7 +292,7 @@ impl PhpLspBackend {
                 symbol_info.parent_fqn.as_deref(),
             )
         } else {
-            self.type_definition_fqn_for_symbol(&symbol_info, &file_symbols)
+            self.type_definition_fqn_for_symbol(&request_index, &symbol_info, &file_symbols)
         };
         let Some(type_fqn) = type_fqn else {
             return Ok(None);
@@ -302,7 +305,7 @@ impl PhpLspBackend {
         }
 
         Ok(self
-            .location_for_type_fqn_excluding_uri(&type_fqn, &uri_str)
+            .location_for_type_fqn_excluding_uri(&request, &type_fqn, &uri_str)
             .await
             .map(GotoDefinitionResponse::Scalar)
             .map(map_template_response))
@@ -314,6 +317,8 @@ impl PhpLspBackend {
     ) -> Result<Option<GotoImplementationResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let uri_str = uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let original_pos = params.text_document_position_params.position;
         let Some(OpenDocumentSnapshot {
             tree,
@@ -344,10 +349,10 @@ impl PhpLspBackend {
             let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-                self.resolve_member_type(class_fqn, member_name)
+                resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
             let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+                resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
             };
             let Some(sym_at_pos) = symbol_at_position_with_resolvers(
                 tree,
@@ -409,7 +414,7 @@ impl PhpLspBackend {
         let target = if let Some(local_candidate) = local_candidate {
             Some(Arc::new(local_candidate))
         } else {
-            self.resolve_fqn_lazy_with_fallback(&target_fqn, ref_kind, false)
+            self.resolve_fqn_lazy_with_fallback_in_request(&request, &target_fqn, ref_kind, false)
                 .await
                 .filter(|symbol| symbol.uri != uri_str)
         };
@@ -422,10 +427,10 @@ impl PhpLspBackend {
             | php_lsp_types::PhpSymbolKind::Interface
             | php_lsp_types::PhpSymbolKind::Trait
             | php_lsp_types::PhpSymbolKind::Enum => {
-                implementation_symbols_for_type(&self.index, &target)
+                implementation_symbols_for_type(&request_index, &target)
             }
             php_lsp_types::PhpSymbolKind::Method => {
-                implementation_symbols_for_method(&self.index, &target)
+                implementation_symbols_for_method(&request_index, &target)
             }
             _ => Vec::new(),
         };
@@ -456,8 +461,12 @@ impl PhpLspBackend {
             let mut location = if symbol.uri == uri_str {
                 snapshot_symbol_location(&symbol, &source)
             } else {
-                self.location_for_symbol_selection(&symbol, "gotoImplementation source read")
-                    .await
+                self.location_for_symbol_selection_in_request(
+                    &request,
+                    &symbol,
+                    "gotoImplementation source read",
+                )
+                .await
             };
             if let Some(mut location) = location.take() {
                 if symbol.uri == uri_str {
@@ -494,6 +503,8 @@ impl PhpLspBackend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let uri_str = uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let original_pos = params.text_document_position_params.position;
         let Some(OpenDocumentSnapshot {
             tree,
@@ -515,7 +526,7 @@ impl PhpLspBackend {
                     path_context.prefix.as_str()
                 };
                 return Ok(self
-                    .twig_template_location(&uri_str, key)
+                    .twig_template_location(&request, key)
                     .await
                     .map(GotoDefinitionResponse::Scalar));
             }
@@ -528,7 +539,7 @@ impl PhpLspBackend {
                 original_byte_col,
             ) {
                 if let Some(location) = self
-                    .twig_template_location(&uri_str, &path_context.key)
+                    .twig_template_location(&request, &path_context.key)
                     .await
                 {
                     return Ok(Some(GotoDefinitionResponse::Scalar(location)));
@@ -542,7 +553,7 @@ impl PhpLspBackend {
                 let file_symbols = php_lsp_types::FileSymbols::default();
                 if let Some(location) = self
                     .framework_string_key_location(
-                        &uri_str,
+                        &request,
                         &file_symbols,
                         original_source,
                         &route_context,
@@ -581,10 +592,10 @@ impl PhpLspBackend {
 
             // Build a cross-file type resolver that uses the workspace index
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-                self.resolve_member_type(class_fqn, member_name)
+                resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
             let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+                resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
             };
 
             let local_var_def = variable_definition_at_position(tree, &source, pos.line, byte_col)
@@ -598,7 +609,7 @@ impl PhpLspBackend {
                 tree,
                 source: &source,
                 file_symbols: &file_symbols,
-                index: &self.index,
+                index: &request_index,
                 type_cache: &type_cache,
                 utf16_index: &utf16_index,
                 requested_range: (0, 0, u32::MAX, u32::MAX),
@@ -621,7 +632,7 @@ impl PhpLspBackend {
             let sym = match primary_sym {
                 Some(s)
                     if matches!(s.ref_kind, RefKind::MethodCall | RefKind::PropertyAccess)
-                        && self.index.resolve_fqn(&s.fqn).is_none() =>
+                        && request_index.resolve_fqn(&s.fqn).is_none() =>
                 {
                     inferred_member_symbol.or(Some(s))
                 }
@@ -762,7 +773,7 @@ impl PhpLspBackend {
         if let Some(ref framework_string_key_context) = framework_string_key_context {
             if let Some(location) = self
                 .framework_string_key_location(
-                    &uri_str,
+                    &request,
                     &file_symbols,
                     &source,
                     framework_string_key_context,
@@ -795,7 +806,8 @@ impl PhpLspBackend {
         let symbol_info = if local_symbol_info.is_some() {
             local_symbol_info
         } else {
-            self.resolve_fqn_lazy_with_fallback(
+            self.resolve_fqn_lazy_with_fallback_in_request(
+                &request,
                 &sym_at_pos.fqn,
                 sym_at_pos.ref_kind,
                 sym_at_pos.allows_global_fallback,
@@ -808,9 +820,14 @@ impl PhpLspBackend {
         // declaration when `__construct` is not explicitly defined.
         let symbol_info = if symbol_info.is_none() && sym_at_pos.ref_kind == RefKind::Constructor {
             if let Some(class_fqn) = sym_at_pos.fqn.strip_suffix("::__construct") {
-                self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName, false)
-                    .await
-                    .filter(|symbol| symbol.uri != uri_str)
+                self.resolve_fqn_lazy_with_fallback_in_request(
+                    &request,
+                    class_fqn,
+                    RefKind::ClassName,
+                    false,
+                )
+                .await
+                .filter(|symbol| symbol.uri != uri_str)
             } else {
                 None
             }
@@ -820,7 +837,7 @@ impl PhpLspBackend {
         let twig_accessor_symbol = template_document
             .as_ref()
             .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig)
-            .then(|| twig_property_accessor_method_for_symbol(&self.index, &sym_at_pos))
+            .then(|| twig_property_accessor_method_for_symbol(&request_index, &sym_at_pos))
             .flatten();
         let symbol_info = symbol_info.or(twig_accessor_symbol);
 
@@ -828,24 +845,28 @@ impl PhpLspBackend {
             if sym.uri == uri_str {
                 snapshot_symbol_location(&sym, &source).map(GotoDefinitionResponse::Scalar)
             } else {
-                self.location_for_symbol_selection(&sym, "gotoDefinition source read")
-                    .await
-                    .map(GotoDefinitionResponse::Scalar)
+                self.location_for_symbol_selection_in_request(
+                    &request,
+                    &sym,
+                    "gotoDefinition source read",
+                )
+                .await
+                .map(GotoDefinitionResponse::Scalar)
             }
         } else if let Some(virtual_member) =
-            phpdoc_virtual_member_for_symbol(&self.index, &sym_at_pos)
+            phpdoc_virtual_member_for_symbol(&request_index, &sym_at_pos)
         {
-            self.phpdoc_virtual_member_location(&virtual_member)
+            self.phpdoc_virtual_member_location(&request, &virtual_member)
                 .await
                 .map(GotoDefinitionResponse::Scalar)
         } else if let Some(virtual_member) = framework_virtual_member_for_symbol(
-            &self.index,
+            &request_index,
             &sym_at_pos,
             Some(&uri_str),
             Some(&file_symbols),
             Some(&source),
         ) {
-            self.framework_virtual_member_location(&virtual_member)
+            self.framework_virtual_member_location(&request, &virtual_member)
                 .await
                 .map(GotoDefinitionResponse::Scalar)
         } else {
@@ -868,6 +889,7 @@ impl PhpLspBackend {
                     // Only handle simple property access (no chaining)
                     if !prop_name.contains("->") {
                         self.try_property_assignment_type_fallback(
+                            &request,
                             &uri_str,
                             prop_name,
                             &sym_at_pos.name,
@@ -922,15 +944,16 @@ impl PhpLspBackend {
         }))
     }
 
-    pub(in crate::server) fn file_symbols_for_uri(
+    pub(in crate::server) fn file_symbols_for_uri_in_index(
         &self,
+        index: &WorkspaceIndex,
         uri_str: &str,
     ) -> Option<php_lsp_types::FileSymbols> {
         if let Some(snapshot) = self.open_document_snapshot(uri_str) {
             return Some(snapshot.file_symbols);
         }
 
-        if let Some(file_symbols) = self.index.file_symbols.get(uri_str) {
+        if let Some(file_symbols) = index.file_symbols.get(uri_str) {
             return Some(file_symbols.value().as_ref().clone());
         }
         None
@@ -953,6 +976,19 @@ impl PhpLspBackend {
         read_file_to_string_blocking(path, label).await.ok()
     }
 
+    pub(in crate::server) async fn source_for_uri_in_request(
+        &self,
+        request: &WorkspaceRequestContext,
+        uri_str: &str,
+        label: &'static str,
+    ) -> Option<String> {
+        if !uri_str.starts_with("phpstub://") {
+            return self.source_for_uri(uri_str, label).await;
+        }
+        self.stub_source_for_uri_in_request(request, uri_str, label)
+            .await
+    }
+
     async fn stub_source_for_uri(&self, uri_str: &str, label: &'static str) -> Option<String> {
         let rest = uri_str.strip_prefix("phpstub://")?;
         let (extension, relative_file) = rest.split_once('/')?;
@@ -967,34 +1003,95 @@ impl PhpLspBackend {
             return None;
         }
 
-        let client_stubs_path = self.stubs_path.lock().await.clone();
-        let root = self
-            .workspace_root
-            .lock()
-            .await
-            .clone()
-            .or_else(|| std::env::current_dir().ok())?;
         let relative_path = Path::new(extension).join(relative_file);
 
-        for stubs_path in candidate_stubs_paths(&root, client_stubs_path.clone()) {
-            if !php_lsp_index::stubs::is_real_stub_file(&stubs_path, &relative_path) {
-                continue;
-            }
-            let path = stubs_path.join(&relative_path);
-            if let Ok(source) = read_file_to_string_blocking(path, label).await {
-                return Some(source);
+        let runtime_state = self.runtime_state_snapshot().await;
+        let mut configs = runtime_state.configs.clone();
+        if configs.is_empty() {
+            let root = self
+                .workspace_root
+                .lock()
+                .await
+                .clone()
+                .or_else(|| std::env::current_dir().ok())?;
+            configs.push(WorkspaceRootConfig {
+                workspace_folder: root.clone(),
+                root,
+                namespace_map: None,
+                runtime_config: runtime_state.fallback.clone(),
+                index: self.index.clone(),
+                vendor_file_lru: self.vendor_file_lru.clone(),
+            });
+        }
+        for config in configs {
+            for stubs_path in
+                candidate_stubs_paths(&config.root, config.runtime_config.stubs_path.clone())
+            {
+                if !php_lsp_index::stubs::is_real_stub_file(&stubs_path, &relative_path) {
+                    continue;
+                }
+                let path = stubs_path.join(&relative_path);
+                if let Ok(source) = read_file_to_string_blocking(path, label).await {
+                    return Some(source);
+                }
             }
         }
 
         None
     }
 
-    pub(in crate::server) async fn location_for_symbol_selection(
+    async fn stub_source_for_uri_in_request(
         &self,
+        request: &WorkspaceRequestContext,
+        uri_str: &str,
+        label: &'static str,
+    ) -> Option<String> {
+        let rest = uri_str.strip_prefix("phpstub://")?;
+        let (extension, relative_file) = rest.split_once('/')?;
+        if !php_lsp_index::stubs::is_valid_stub_extension_name(extension)
+            || relative_file.is_empty()
+            || relative_file.contains(':')
+            || relative_file.contains('\\')
+            || relative_file
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == "..")
+        {
+            return None;
+        }
+        let (root, stubs_path) = if let Some(config) = request.workspace.as_ref() {
+            (
+                config.root.clone(),
+                config.runtime_config.stubs_path.clone(),
+            )
+        } else {
+            (
+                std::env::current_dir().ok()?,
+                request.state.fallback.stubs_path.clone(),
+            )
+        };
+        let relative_path = Path::new(extension).join(relative_file);
+        for stubs_path in candidate_stubs_paths(&root, stubs_path) {
+            if !php_lsp_index::stubs::is_real_stub_file(&stubs_path, &relative_path) {
+                continue;
+            }
+            if let Ok(source) =
+                read_file_to_string_blocking(stubs_path.join(&relative_path), label).await
+            {
+                return Some(source);
+            }
+        }
+        None
+    }
+
+    pub(in crate::server) async fn location_for_symbol_selection_in_request(
+        &self,
+        request: &WorkspaceRequestContext,
         symbol: &php_lsp_types::SymbolInfo,
         label: &'static str,
     ) -> Option<Location> {
-        let source = self.source_for_uri(&symbol.uri, label).await?;
+        let source = self
+            .source_for_uri_in_request(request, &symbol.uri, label)
+            .await?;
         Some(Location {
             uri: symbol.uri.parse::<Uri>().ok()?,
             range: range_from_byte_range(&source, symbol.selection_range),
@@ -1003,10 +1100,15 @@ impl PhpLspBackend {
 
     pub(in crate::server) async fn phpdoc_virtual_member_location(
         &self,
+        request: &WorkspaceRequestContext,
         member: &PhpDocVirtualMember,
     ) -> Option<Location> {
         let source = self
-            .source_for_uri(&member.owner.uri, "phpdoc virtual member source read")
+            .source_for_uri_in_request(
+                request,
+                &member.owner.uri,
+                "phpdoc virtual member source read",
+            )
             .await?;
         let doc_comment = member.owner.doc_comment.as_ref()?;
         let doc_start = source.find(doc_comment)?;
@@ -1023,6 +1125,7 @@ impl PhpLspBackend {
 
     pub(in crate::server) async fn framework_virtual_member_location(
         &self,
+        request: &WorkspaceRequestContext,
         member: &crate::framework::VirtualMember,
     ) -> Option<Location> {
         let (uri, range) = member.sources.iter().find_map(|source| match source {
@@ -1032,7 +1135,7 @@ impl PhpLspBackend {
             crate::framework::VirtualMemberSource::Synthetic { .. } => None,
         })?;
         let source = self
-            .source_for_uri(&uri, "framework virtual member source read")
+            .source_for_uri_in_request(request, &uri, "framework virtual member source read")
             .await?;
         let utf16_range = range_byte_to_utf16(&source, range);
         Some(Location {
@@ -1102,12 +1205,12 @@ impl PhpLspBackend {
 
     pub(in crate::server) async fn framework_string_key_location(
         &self,
-        uri_str: &str,
+        request: &WorkspaceRequestContext,
         _file_symbols: &php_lsp_types::FileSymbols,
         _source: &str,
         context: &FrameworkStringKeyAtPosition,
     ) -> Option<Location> {
-        let workspace_root = self.workspace_root_for_uri(uri_str).await?;
+        let workspace_root = request.root()?.to_path_buf();
         let source_range = self
             .cached_framework_string_keys(&workspace_root, context.domain)
             .await
@@ -1126,6 +1229,7 @@ impl PhpLspBackend {
 
     pub(in crate::server) fn type_definition_fqn_for_symbol(
         &self,
+        index: &WorkspaceIndex,
         symbol: &php_lsp_types::SymbolInfo,
         fallback_file_symbols: &php_lsp_types::FileSymbols,
     ) -> Option<String> {
@@ -1141,7 +1245,7 @@ impl PhpLspBackend {
 
         let return_type = symbol.signature.as_ref()?.return_type.as_ref()?;
         let declaring_file_symbols = self
-            .file_symbols_for_uri(&symbol.uri)
+            .file_symbols_for_uri_in_index(index, &symbol.uri)
             .unwrap_or_else(|| fallback_file_symbols.clone());
 
         first_type_definition_fqn(
@@ -1151,20 +1255,29 @@ impl PhpLspBackend {
         )
     }
 
-    pub(in crate::server) async fn location_for_type_fqn(&self, fqn: &str) -> Option<Location> {
+    pub(in crate::server) async fn location_for_type_fqn(
+        &self,
+        request: &WorkspaceRequestContext,
+        fqn: &str,
+    ) -> Option<Location> {
         if is_builtin_type_name(fqn) {
             return None;
         }
 
         let symbol = self
-            .resolve_fqn_lazy_with_fallback(fqn, RefKind::ClassName, false)
+            .resolve_fqn_lazy_with_fallback_in_request(request, fqn, RefKind::ClassName, false)
             .await?;
-        self.location_for_symbol_selection(&symbol, "type definition source read")
-            .await
+        self.location_for_symbol_selection_in_request(
+            request,
+            &symbol,
+            "type definition source read",
+        )
+        .await
     }
 
     async fn location_for_type_fqn_excluding_uri(
         &self,
+        request: &WorkspaceRequestContext,
         fqn: &str,
         excluded_uri: &str,
     ) -> Option<Location> {
@@ -1173,25 +1286,35 @@ impl PhpLspBackend {
         }
 
         let symbol = self
-            .resolve_fqn_lazy_with_fallback(fqn, RefKind::ClassName, false)
+            .resolve_fqn_lazy_with_fallback_in_request(request, fqn, RefKind::ClassName, false)
             .await?;
         if symbol.uri == excluded_uri {
             return None;
         }
-        self.location_for_symbol_selection(&symbol, "type definition source read")
-            .await
+        self.location_for_symbol_selection_in_request(
+            request,
+            &symbol,
+            "type definition source read",
+        )
+        .await
     }
 
     pub(in crate::server) fn reference_locations_for_symbol(
         &self,
+        index: &WorkspaceIndex,
+        request: Option<&WorkspaceRequestContext>,
         target_fqn: &str,
         target_kind: php_lsp_types::PhpSymbolKind,
         include_declaration: bool,
     ) -> Vec<Location> {
         let mut locations = Vec::new();
-        for (file_uri, references) in
-            self.reference_scan_matches(target_fqn, target_kind, include_declaration)
-        {
+        for (file_uri, references) in self.reference_scan_matches(
+            index,
+            request,
+            target_fqn,
+            target_kind,
+            include_declaration,
+        ) {
             for reference in references {
                 if let Ok(uri) = file_uri.parse::<Uri>() {
                     locations.push(Location {

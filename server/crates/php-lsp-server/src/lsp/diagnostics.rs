@@ -211,7 +211,6 @@ pub(in crate::server) fn parse_phpstan_json_diagnostics(
         else {
             continue;
         };
-
         diagnostics.extend(messages.iter().filter_map(phpstan_message_to_diagnostic));
     }
 
@@ -404,6 +403,8 @@ impl PhpLspBackend {
     pub(crate) async fn lsp_did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let uri_str = uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let text = &params.text_document.text;
         let version = params.text_document.version;
         let document_state = self.next_document_state(version);
@@ -429,7 +430,7 @@ impl PhpLspBackend {
                     self.document_versions
                         .insert(uri_str.clone(), document_state);
                     self.documents_requiring_full_sync.remove(&uri_str);
-                    self.index.remove_file(&uri_str);
+                    remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
                     entry.insert(parser);
                 }
                 dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -446,7 +447,7 @@ impl PhpLspBackend {
                     self.document_versions
                         .insert(uri_str.clone(), document_state);
                     self.documents_requiring_full_sync.remove(&uri_str);
-                    self.index.remove_file(&uri_str);
+                    remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
                     entry.insert(parser);
                 }
             }
@@ -478,7 +479,9 @@ impl PhpLspBackend {
             }
 
             if template_kind == TemplateKind::Twig {
-                let twig_variable_types = self.twig_variable_types_for_template(&uri_str).await;
+                let twig_variable_types = self
+                    .twig_variable_types_for_template(&request, &uri_str)
+                    .await;
                 let dashmap::mapref::entry::Entry::Occupied(mut open_entry) =
                     self.open_files.entry(uri_str.clone())
                 else {
@@ -509,6 +512,12 @@ impl PhpLspBackend {
             if self.current_document_state(&uri_str) != Some(document_state) {
                 return;
             }
+            if !self
+                .synchronize_open_document_index_to_current_runtime(&uri_str, document_state, false)
+                .await
+            {
+                return;
+            }
             self.publish_diagnostics(&uri).await;
             return;
         }
@@ -537,11 +546,16 @@ impl PhpLspBackend {
                 });
                 let indexed_symbol_count =
                     if let Some((file_symbols, references, sym_count)) = indexed_file {
-                        self.index
-                            .update_file_with_references(&uri_str, file_symbols, references);
+                        update_aggregate_and_root_index(
+                            &self.index,
+                            &request_index,
+                            &uri_str,
+                            file_symbols,
+                            references,
+                        );
                         Some(sym_count)
                     } else {
-                        self.index.remove_file(&uri_str);
+                        remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
                         None
                     };
                 self.template_documents.remove(&uri_str);
@@ -571,11 +585,16 @@ impl PhpLspBackend {
                 });
                 let indexed_symbol_count =
                     if let Some((file_symbols, references, sym_count)) = indexed_file {
-                        self.index
-                            .update_file_with_references(&uri_str, file_symbols, references);
+                        update_aggregate_and_root_index(
+                            &self.index,
+                            &request_index,
+                            &uri_str,
+                            file_symbols,
+                            references,
+                        );
                         Some(sym_count)
                     } else {
-                        self.index.remove_file(&uri_str);
+                        remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
                         None
                     };
                 self.template_documents.remove(&uri_str);
@@ -626,7 +645,7 @@ impl PhpLspBackend {
             if self.current_document_state(&uri_str) != Some(document_state) {
                 return;
             }
-            self.index.remove_file(&uri_str);
+            remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
             None
         } else {
             indexed_symbol_count
@@ -637,6 +656,12 @@ impl PhpLspBackend {
         }
 
         if self.current_document_state(&uri_str) != Some(document_state) {
+            return;
+        }
+        if !self
+            .synchronize_open_document_index_to_current_runtime(&uri_str, document_state, true)
+            .await
+        {
             return;
         }
         self.publish_diagnostics(&uri).await;
@@ -651,6 +676,8 @@ impl PhpLspBackend {
     pub(crate) async fn lsp_did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let uri_str = uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let version = params.text_document.version;
 
         tracing::debug!("didChange: {} version {}", uri_str, version);
@@ -720,7 +747,7 @@ impl PhpLspBackend {
                     let mut parser = FileParser::new();
                     parser.parse_full(updated.virtual_source());
                     self.template_documents.insert(uri_str.clone(), updated);
-                    self.index.remove_file(&uri_str);
+                    remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
                     entry.insert(parser);
                     refresh_twig_contexts
                 });
@@ -763,10 +790,15 @@ impl PhpLspBackend {
 
                 if template_change.is_none() {
                     if let Some((file_symbols, references)) = indexed_file {
-                        self.index
-                            .update_file_with_references(&uri_str, file_symbols, references);
+                        update_aggregate_and_root_index(
+                            &self.index,
+                            &request_index,
+                            &uri_str,
+                            file_symbols,
+                            references,
+                        );
                     } else {
-                        self.index.remove_file(&uri_str);
+                        remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
                     }
                 }
 
@@ -797,6 +829,12 @@ impl PhpLspBackend {
 
         if let Some(refresh_twig_contexts) = template_change {
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
+            if !self
+                .synchronize_open_document_index_to_current_runtime(&uri_str, document_state, false)
+                .await
+            {
+                return;
+            }
             self.schedule_fast_diagnostics(uri, document_state).await;
             if refresh_twig_contexts
                 && self.current_document_state(&uri_str) == Some(document_state)
@@ -822,7 +860,14 @@ impl PhpLspBackend {
             if self.current_document_state(&uri_str) != Some(document_state) {
                 return;
             }
-            self.index.remove_file(&uri_str);
+            remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
+        }
+
+        if !self
+            .synchronize_open_document_index_to_current_runtime(&uri_str, document_state, true)
+            .await
+        {
+            return;
         }
 
         let refresh_twig_contexts = uri_is_php_file(&uri);
@@ -838,6 +883,8 @@ impl PhpLspBackend {
     pub(crate) async fn lsp_did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         let uri_str = uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         tracing::debug!("didClose: {}", uri_str);
         let is_php_uri = uri_is_php_file(&uri);
         let (restore_token, refresh_twig_contexts) = match self.open_files.entry(uri_str.clone()) {
@@ -857,7 +904,7 @@ impl PhpLspBackend {
                         .insert(uri_str.clone(), token);
                     // Drop the unsaved open-document snapshot immediately. The
                     // on-disk snapshot is restored asynchronously below.
-                    self.index.remove_file(&uri_str);
+                    remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
                     token
                 });
                 entry.remove();
@@ -870,6 +917,9 @@ impl PhpLspBackend {
                 (None, false)
             }
         };
+        if restore_token.is_some() {
+            self.remove_uri_from_current_runtime_indexes(&uri_str).await;
+        }
         self.cancel_debounced_diagnostics_if_closed(&uri_str).await;
         self.cancel_analyzer_run_if_closed(&uri_str).await;
         self.cancel_formatter_run_if_closed(&uri_str).await;
@@ -886,7 +936,8 @@ impl PhpLspBackend {
 
     async fn restore_closed_php_index(&self, uri_str: &str, token: u64) {
         let parsed = if let Some(path) = uri_to_path(uri_str) {
-            if self.path_is_excluded_by_config(&path).await {
+            let state = self.runtime_state_snapshot().await;
+            if workspace_indexes_for_uri(&state, uri_str, true).is_empty() {
                 None
             } else {
                 match parse_workspace_file_for_index_blocking(path, "closed PHP document reindex")
@@ -906,18 +957,57 @@ impl PhpLspBackend {
         let (file_symbols, references) = parsed
             .map(|parsed| (parsed.file_symbols, parsed.references))
             .unwrap_or_else(|| (None, Vec::new()));
-        commit_closed_php_index_if_current(
+        let state = self.runtime_state_snapshot().await;
+        let indexes = workspace_indexes_for_uri(&state, uri_str, file_symbols.is_some());
+        let file_symbols_for_resync = file_symbols.clone();
+        let references_for_resync = references.clone();
+        let root_index = indexes.first().map(Arc::as_ref).unwrap_or(&self.index);
+        let committed = commit_closed_php_index_if_current(
             ClosedPhpIndexCommitContext {
                 open_files: &self.open_files,
                 document_versions: &self.document_versions,
                 reload_tokens: &self.closed_document_reload_tokens,
                 index: &self.index,
+                root_index: Some(root_index),
                 uri_str,
                 token,
             },
             file_symbols,
             references,
         );
+        if committed {
+            if let Some(symbols) = self
+                .index
+                .file_symbols
+                .get(uri_str)
+                .map(|entry| entry.value().as_ref().clone())
+            {
+                let references = self
+                    .index
+                    .file_references
+                    .get(uri_str)
+                    .map(|entry| entry.value().clone())
+                    .unwrap_or_default();
+                for index in indexes.iter().skip(1) {
+                    index.update_file_with_references(uri_str, symbols.clone(), references.clone());
+                }
+            } else {
+                for index in indexes.iter().skip(1) {
+                    index.remove_file(uri_str);
+                }
+            }
+            if !Arc::ptr_eq(&state, &self.runtime_state_snapshot().await)
+                && !self.closed_document_reload_tokens.contains_key(uri_str)
+                && self.current_document_state(uri_str).is_none()
+            {
+                self.commit_closed_php_snapshot_to_current_runtime(
+                    uri_str,
+                    file_symbols_for_resync,
+                    references_for_resync,
+                )
+                .await;
+            }
+        }
     }
 
     pub(crate) async fn lsp_did_save(&self, params: DidSaveTextDocumentParams) {
@@ -4547,9 +4637,10 @@ impl PhpLspBackend {
     pub(in crate::server) async fn phpstan_diagnostics_for_uri(
         &self,
         uri: &Uri,
+        request: &WorkspaceRequestContext,
         cancellation: OperationCancellationToken,
     ) -> Vec<Diagnostic> {
-        let config = self.phpstan_config.lock().await.clone();
+        let config = request.runtime_config().phpstan.clone();
         if !config.enabled {
             return vec![];
         }
@@ -4565,7 +4656,7 @@ impl PhpLspBackend {
             return vec![];
         }
 
-        let workspace_root = self.workspace_root_for_uri(uri.as_str()).await;
+        let workspace_root = request.root().map(Path::to_path_buf);
         match run_phpstan_for_file(config, file_path, workspace_root, Some(cancellation)).await {
             Ok(diagnostics) => diagnostics,
             Err(message) => {
@@ -4596,9 +4687,10 @@ impl PhpLspBackend {
     pub(in crate::server) async fn psalm_diagnostics_for_uri(
         &self,
         uri: &Uri,
+        request: &WorkspaceRequestContext,
         cancellation: OperationCancellationToken,
     ) -> Vec<Diagnostic> {
-        let config = self.psalm_config.lock().await.clone();
+        let config = request.runtime_config().psalm.clone();
         if !config.enabled {
             return vec![];
         }
@@ -4614,7 +4706,7 @@ impl PhpLspBackend {
             return vec![];
         }
 
-        let workspace_root = self.workspace_root_for_uri(uri.as_str()).await;
+        let workspace_root = request.root().map(Path::to_path_buf);
         match run_psalm_for_file(config, file_path, workspace_root, Some(cancellation)).await {
             Ok(diagnostics) => diagnostics,
             Err(message) => {
@@ -4640,6 +4732,7 @@ impl PhpLspBackend {
 
     pub(in crate::server) fn references_for_file(
         &self,
+        index: &WorkspaceIndex,
         file_uri: &str,
         target_fqn: &str,
         target_kind: php_lsp_types::PhpSymbolKind,
@@ -4648,7 +4741,7 @@ impl PhpLspBackend {
         let mut refs = if let Some(parser) = self.open_files.get(file_uri) {
             current_parser_symbol_references(file_uri, &parser)
         } else {
-            self.index
+            index
                 .file_references
                 .get(file_uri)
                 .map(|entry| entry.value().clone())
@@ -4656,7 +4749,7 @@ impl PhpLspBackend {
         };
         refs.retain(|reference| {
             symbol_reference_matches(
-                &self.index,
+                index,
                 reference,
                 target_fqn,
                 target_kind,
@@ -4669,6 +4762,7 @@ impl PhpLspBackend {
     /// Publish diagnostics for a file.
     pub(in crate::server) async fn publish_diagnostics(&self, uri: &Uri) {
         let uri_str = uri.as_str().to_string();
+        let computation_sequence = self.diagnostics_publisher.start_computation(&uri_str);
         let snapshot = self.open_document_snapshot(&uri_str);
         let document_state = snapshot
             .as_ref()
@@ -4678,20 +4772,31 @@ impl PhpLspBackend {
             .and_then(|snapshot| snapshot.template_document.clone());
         let source = snapshot.as_ref().map(|snapshot| snapshot.source.clone());
         let version = document_state.map(|state| state.version);
-        let diagnostics_mode = *self.diagnostics_mode.lock().await;
-        let indexing_active = indexing_run_is_active(&self.indexing_run).await;
+        let request = self.request_context_for_uri(&uri_str).await;
+        let runtime_config = request.runtime_config().clone();
+        let request_index = request.index(&self.index);
+        let indexing_workspace_folder = request
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.workspace_folder.clone());
+        let diagnostics_mode = runtime_config.diagnostics_mode;
+        let indexing_active = indexing_run_is_active_for_workspace(
+            &self.indexing_run,
+            indexing_workspace_folder.as_deref(),
+        )
+        .await;
         let mut effective_diagnostics_mode =
             diagnostics_mode_for_indexing_state(diagnostics_mode, indexing_active);
         let should_preresolve_dependencies = template_document.is_none()
             && diagnostics_mode == DiagnosticsMode::BasicSemantic
             && !indexing_active
-            && *self.index_vendor.lock().await;
+            && runtime_config.index_vendor;
 
         // Pre-resolve use statements via lazy indexing so that vendor classes
         // are available for the synchronous `compute_diagnostics` resolver.
         if should_preresolve_dependencies {
             if let Some(snapshot) = snapshot.as_ref() {
-                let vendor_context = self.vendor_lazy_index_context().await;
+                let vendor_context = self.vendor_lazy_index_context_from_request(&request);
                 preresolve_open_file_diagnostic_dependencies(
                     &snapshot.tree,
                     &snapshot.source,
@@ -4702,9 +4807,9 @@ impl PhpLspBackend {
             }
         }
 
-        let diagnostic_severity = *self.diagnostic_severity.lock().await;
-        let diagnostic_budget = *self.diagnostic_budget.lock().await;
-        let php_version = *self.php_version.lock().await;
+        let diagnostic_severity = runtime_config.diagnostic_severity;
+        let diagnostic_budget = runtime_config.diagnostic_budget;
+        let php_version = runtime_config.php_version;
         let mut diagnostics_config = DiagnosticsRuntimeConfig {
             mode: effective_diagnostics_mode,
             severity: diagnostic_severity,
@@ -4715,7 +4820,7 @@ impl PhpLspBackend {
             compute_source_diagnostics_blocking(
                 uri_str.clone(),
                 source.clone(),
-                self.index.clone(),
+                request_index.clone(),
                 diagnostics_config,
                 version,
             )
@@ -4730,11 +4835,15 @@ impl PhpLspBackend {
             );
         } else if should_preresolve_dependencies {
             diagnostics = self
-                .filter_lazy_resolved_symbol_diagnostics(diagnostics)
+                .filter_lazy_resolved_symbol_diagnostics(&request, diagnostics)
                 .await;
         }
         if effective_diagnostics_mode == DiagnosticsMode::BasicSemantic
-            && indexing_run_is_active(&self.indexing_run).await
+            && indexing_run_is_active_for_workspace(
+                &self.indexing_run,
+                indexing_workspace_folder.as_deref(),
+            )
+            .await
         {
             effective_diagnostics_mode = DiagnosticsMode::SyntaxOnly;
             diagnostics_config.mode = effective_diagnostics_mode;
@@ -4742,7 +4851,7 @@ impl PhpLspBackend {
                 compute_source_diagnostics_blocking(
                     uri_str.clone(),
                     source.clone(),
-                    self.index.clone(),
+                    request_index.clone(),
                     diagnostics_config,
                     version,
                 )
@@ -4771,7 +4880,7 @@ impl PhpLspBackend {
                 return;
             };
             diagnostics.extend(
-                self.phpstan_diagnostics_for_uri(uri, analyzer_token.clone())
+                self.phpstan_diagnostics_for_uri(uri, &request, analyzer_token.clone())
                     .await,
             );
             if analyzer_token.is_cancelled() {
@@ -4779,7 +4888,7 @@ impl PhpLspBackend {
                 return;
             }
             diagnostics.extend(
-                self.psalm_diagnostics_for_uri(uri, analyzer_token.clone())
+                self.psalm_diagnostics_for_uri(uri, &request, analyzer_token.clone())
                     .await,
             );
             if analyzer_token.is_cancelled() {
@@ -4799,7 +4908,11 @@ impl PhpLspBackend {
             return;
         }
         if effective_diagnostics_mode == DiagnosticsMode::BasicSemantic
-            && indexing_run_is_active(&self.indexing_run).await
+            && indexing_run_is_active_for_workspace(
+                &self.indexing_run,
+                indexing_workspace_folder.as_deref(),
+            )
+            .await
         {
             effective_diagnostics_mode = DiagnosticsMode::SyntaxOnly;
             diagnostics_config.mode = effective_diagnostics_mode;
@@ -4807,7 +4920,7 @@ impl PhpLspBackend {
                 compute_source_diagnostics_blocking(
                     uri_str.clone(),
                     source.clone(),
-                    self.index.clone(),
+                    request_index.clone(),
                     diagnostics_config,
                     version,
                 )
@@ -4840,13 +4953,20 @@ impl PhpLspBackend {
                 expected_state: document_state,
                 expected_template: template_document,
                 require_idle_index: effective_diagnostics_mode == DiagnosticsMode::BasicSemantic,
+                expected_runtime_generation: request.state.generation,
+                indexing_workspace_folder,
+                expected_runtime_config: runtime_config,
+                expected_index: request_index,
+                computation_sequence,
             });
     }
 
     pub(in crate::server) async fn filter_lazy_resolved_symbol_diagnostics(
         &self,
+        request: &WorkspaceRequestContext,
         diagnostics: Vec<Diagnostic>,
     ) -> Vec<Diagnostic> {
+        let index = request.index(&self.index);
         let mut filtered = Vec::with_capacity(diagnostics.len());
 
         for diagnostic in diagnostics {
@@ -4855,27 +4975,37 @@ impl PhpLspBackend {
                     let unresolved_use_statement =
                         diagnostic.message.starts_with("Unresolved use statement: ");
                     let lazily_resolved = if unresolved_use_statement {
-                        self.resolve_fqn_lazy(&fqn).await.is_some()
+                        self.resolve_fqn_lazy_in_request(request, &fqn)
+                            .await
+                            .is_some()
                     } else if let Some(ref_kind) =
                         lazy_resolvable_diagnostic_ref_kind(&diagnostic.message)
                     {
-                        self.resolve_fqn_lazy_with_fallback(&fqn, ref_kind, false)
+                        self.resolve_fqn_lazy_with_fallback_in_request(
+                            request, &fqn, ref_kind, false,
+                        )
+                        .await
+                        .is_some()
+                    } else {
+                        self.resolve_fqn_lazy_in_request(request, &fqn)
                             .await
                             .is_some()
-                    } else {
-                        self.resolve_fqn_lazy(&fqn).await.is_some()
                     };
                     if lazily_resolved {
                         continue;
                     }
                     if lazy_resolved_symbol_diagnostic_is_satisfied(
-                        &self.index,
+                        &index,
                         &diagnostic.message,
                         &fqn,
                     ) {
                         continue;
                     }
-                    if unresolved_use_statement && self.vendor_namespace_exists_lazy(&fqn).await {
+                    if unresolved_use_statement
+                        && self
+                            .vendor_namespace_exists_lazy_in_request(request, &fqn)
+                            .await
+                    {
                         continue;
                     }
                 }

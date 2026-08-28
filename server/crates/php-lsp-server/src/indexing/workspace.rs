@@ -67,6 +67,7 @@ struct DiskPhpIndexCommitContext<'a> {
     template_documents: &'a DashMap<String, TemplateDocument>,
     document_versions: &'a DashMap<String, OpenDocumentState>,
     index: &'a WorkspaceIndex,
+    root_index: Option<&'a WorkspaceIndex>,
     uri_str: &'a str,
 }
 
@@ -92,10 +93,24 @@ where
 
     before_index_commit();
     if let Some(file_symbols) = file_symbols {
+        let root_symbols = file_symbols.clone();
+        let root_references = references.clone();
         ctx.index
             .update_file_with_references(ctx.uri_str, file_symbols, references);
+        if let Some(root_index) = ctx
+            .root_index
+            .filter(|root_index| !std::ptr::eq(*root_index, ctx.index))
+        {
+            root_index.update_file_with_references(ctx.uri_str, root_symbols, root_references);
+        }
     } else {
         ctx.index.remove_file(ctx.uri_str);
+        if let Some(root_index) = ctx
+            .root_index
+            .filter(|root_index| !std::ptr::eq(*root_index, ctx.index))
+        {
+            root_index.remove_file(ctx.uri_str);
+        }
     }
     true
 }
@@ -128,6 +143,7 @@ fn commit_workspace_disk_file_preserving_open(
                 template_documents: ctx.template_documents,
                 document_versions: ctx.document_versions,
                 index: ctx.index,
+                root_index: ctx.root_index,
                 uri_str: ctx.uri_str,
             },
             &snapshot,
@@ -138,12 +154,12 @@ fn commit_workspace_disk_file_preserving_open(
 impl PhpLspBackend {
     pub(crate) async fn lsp_initialized(&self, _params: InitializedParams) {
         tracing::info!("php-lsp: initialized");
-        let indexing_run_state = self.indexing_run.clone();
-        let indexing_token = self.start_indexing_run().await;
 
         self.client
             .log_message(MessageType::INFO, "php-lsp server initialized")
             .await;
+
+        self.reload_fallback_stubs().await;
 
         let mut roots = self.workspace_roots.lock().await.clone();
         if roots.is_empty() {
@@ -166,39 +182,44 @@ impl PhpLspBackend {
                 }),
             )
             .await;
-            finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
             return;
         }
 
-        let composer_enabled = *self.composer_enabled.lock().await;
-        let configs = discover_workspace_root_configs_blocking(
-            roots,
-            composer_enabled,
-            "workspace discovery",
-        )
-        .await;
+        let configs = {
+            let current = self.runtime_state_snapshot().await;
+            if current.configs.is_empty() {
+                let _reload = self.configuration_reload.lock().await;
+                let client_settings = self.client_settings.lock().await.clone();
+                self.apply_effective_configuration_settings(&client_settings, &roots)
+                    .await;
+                self.runtime_state_snapshot().await.configs.clone()
+            } else {
+                current.configs.clone()
+            }
+        };
         let effective_roots: Vec<PathBuf> =
             configs.iter().map(|config| config.root.clone()).collect();
+        let runtime_state = self.runtime_state_snapshot().await;
+        let fallback_index = runtime_state.fallback_index.clone();
+        let runtime_generation = runtime_state.generation;
+        let indexing_run_state = self.indexing_run.clone();
+        let mut indexing_tokens = Vec::with_capacity(configs.len());
+        for config in &configs {
+            indexing_tokens.push(self.start_indexing_run(&config.workspace_folder).await);
+        }
 
         if let Some(first_root) = effective_roots.first() {
             *self.workspace_root.lock().await = Some(first_root.clone());
         }
-        *self.workspace_roots.lock().await = effective_roots;
-        *self.workspace_configs.lock().await = configs.clone();
         *self.namespace_map.lock().await = configs
             .iter()
             .find_map(|config| config.namespace_map.clone());
 
         // Load phpstorm-stubs for built-in PHP functions/classes.
-        let stubs_index = self.index.clone();
-        let stubs_root = configs
+        let stubs_root_label = configs
             .first()
-            .map(|config| config.root.clone())
+            .map(|config| config.root.display().to_string())
             .unwrap_or_default();
-        let stubs_root_label = stubs_root.display().to_string();
-        let client_stubs_path = self.stubs_path.lock().await.clone();
-        let stub_extensions = self.stub_extensions.lock().await.clone();
-        let php_version = *self.php_version.lock().await;
 
         send_indexing_status(
             &self.client,
@@ -210,17 +231,22 @@ impl PhpLspBackend {
         )
         .await;
 
-        let load_client_stubs_path = client_stubs_path.clone();
-        let load_stub_extensions = stub_extensions.clone();
+        let stub_configs = configs.clone();
         let loaded_stubs = tokio::task::spawn_blocking(move || {
-            load_configured_stubs(
-                &stubs_index,
-                &stubs_root,
-                load_client_stubs_path,
-                load_stub_extensions,
-                php_version,
-                false,
-            )
+            stub_configs
+                .iter()
+                .map(|config| {
+                    remove_stub_symbols(&config.index);
+                    load_configured_stubs(
+                        &config.index,
+                        &config.root,
+                        config.runtime_config.stubs_path.clone(),
+                        config.runtime_config.stub_extensions.clone(),
+                        config.runtime_config.php_version,
+                        false,
+                    )
+                })
+                .sum::<usize>()
         })
         .await
         .unwrap_or(0);
@@ -237,7 +263,6 @@ impl PhpLspBackend {
         .await;
 
         let client = self.client.clone();
-        let index = self.index.clone();
         let open_files = self.open_files.clone();
         let template_documents = self.template_documents.clone();
         let twig_context_disk_cache = self.twig_context_disk_cache.clone();
@@ -245,53 +270,36 @@ impl PhpLspBackend {
         let reindex_document_versions = self.document_versions.clone();
         let diagnostics_publisher = self.diagnostics_publisher.clone();
         let reindex_index = self.index.clone();
-        let diagnostics_mode = *self.diagnostics_mode.lock().await;
-        let diagnostic_severity = *self.diagnostic_severity.lock().await;
-        let diagnostic_budget = *self.diagnostic_budget.lock().await;
-        let diagnostics_config = DiagnosticsRuntimeConfig {
-            mode: diagnostics_mode,
-            severity: diagnostic_severity,
-            budget: diagnostic_budget,
-            php_version,
-        };
-        let index_vendor = *self.index_vendor.lock().await;
         let vendor_autoload_cache = self.vendor_autoload_cache.clone();
-        let vendor_file_lru = self.vendor_file_lru.clone();
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
-        let include_paths = self.include_paths.lock().await.clone();
-        let exclude_paths = self.exclude_paths.lock().await.clone();
-        let cache_config = workspace_index_cache_config(
-            configs.first().map(|config| config.root.as_path()),
-            php_version,
-            &include_paths,
-            &exclude_paths,
-            stub_extensions.as_deref(),
-            client_stubs_path.as_deref(),
-        );
-        let indexing_options = WorkspaceIndexingOptions {
-            include_paths,
-            exclude_paths,
-            cache_config,
-            work_done_progress_supported,
-        };
-        let vendor_lazy_context = VendorLazyIndexContext {
-            index: index.clone(),
-            workspace_configs: configs.clone(),
-            exclude_paths: indexing_options.exclude_paths.clone(),
-            php_version,
-            index_vendor,
-            vendor_autoload_cache: vendor_autoload_cache.clone(),
-            vendor_file_lru: vendor_file_lru.clone(),
-        };
+        let runtime_state_handle = self.runtime_state.clone();
+        let aggregate_rebuild = self.aggregate_rebuild.clone();
         tokio::spawn(async move {
-            for config in &configs {
-                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
-                    return;
+            let mut completed_configs = Vec::new();
+            let mut completed_tokens = Vec::new();
+            for (config, indexing_token) in configs.iter().zip(&indexing_tokens) {
+                if finish_indexing_run_if_cancelled(&indexing_run_state, indexing_token).await {
+                    continue;
                 }
+                let runtime = &config.runtime_config;
+                let indexing_options = WorkspaceIndexingOptions {
+                    include_paths: runtime.include_paths.clone(),
+                    exclude_paths: runtime.exclude_paths.clone(),
+                    cache_config: workspace_index_cache_config(
+                        Some(&config.root),
+                        runtime.php_version,
+                        &runtime.include_paths,
+                        &runtime.exclude_paths,
+                        runtime.stub_extensions.as_deref(),
+                        runtime.stubs_path.as_deref(),
+                    ),
+                    work_done_progress_supported,
+                };
                 if let Err(e) = index_workspace(
                     &client,
                     WorkspaceLiveIndexContext {
-                        index: &index,
+                        index: &config.index,
+                        root_index: &config.index,
                         open_files: &open_files,
                         template_documents: &template_documents,
                         document_versions: &reindex_document_versions,
@@ -299,7 +307,7 @@ impl PhpLspBackend {
                     &config.root,
                     config.namespace_map.as_ref(),
                     &indexing_options,
-                    &indexing_token,
+                    indexing_token,
                 )
                 .await
                 {
@@ -316,48 +324,108 @@ impl PhpLspBackend {
                     client
                         .log_message(MessageType::ERROR, format!("Indexing failed: {}", e))
                         .await;
-                    finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
-                    return;
+                    finish_indexing_run_state(&indexing_run_state, indexing_token).await;
+                    continue;
                 }
-                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
-                    return;
+                if finish_indexing_run_if_cancelled(&indexing_run_state, indexing_token).await {
+                    continue;
                 }
 
-                if index_vendor {
+                if runtime.index_vendor {
                     preload_vendor_entrypoints(
-                        index.clone(),
+                        config.index.clone(),
                         &config.root,
                         &indexing_options.exclude_paths,
-                        php_version,
+                        runtime.php_version,
                         &vendor_autoload_cache,
-                        &vendor_file_lru,
+                        &config.vendor_file_lru,
                     )
                     .await;
+                }
+                if !indexing_token.is_cancelled() {
+                    indexing_token.mark_indexing_complete();
+                    completed_configs.push(config.clone());
+                    completed_tokens.push(indexing_token.clone());
+                } else {
+                    finish_indexing_run_state(&indexing_run_state, indexing_token).await;
                 }
             }
 
             // Re-publish diagnostics for all open files now that the index is populated.
-            if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
+            let current_state = runtime_state_handle.lock().await.clone();
+            let mut configs = Vec::new();
+            let mut post_tokens = Vec::new();
+            for (config, token) in completed_configs.into_iter().zip(completed_tokens) {
+                let is_current = current_state.configs.iter().any(|current| {
+                    current.workspace_folder == config.workspace_folder
+                        && Arc::ptr_eq(&current.index, &config.index)
+                });
+                if !token.is_cancelled() && is_current {
+                    configs.push(config);
+                    post_tokens.push(token);
+                } else {
+                    finish_indexing_run_state(&indexing_run_state, &token).await;
+                }
+            }
+            if configs.is_empty() {
                 return;
             }
-            finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
+
+            {
+                let _aggregate_rebuild = aggregate_rebuild.lock().await;
+                let aggregate = reindex_index.clone();
+                let rebuild_configs = current_state.configs.clone();
+                let rebuild_open_files = open_files.clone();
+                let rebuild_templates = template_documents.clone();
+                let rebuild_versions = reindex_document_versions.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    rebuild_aggregate_index(
+                        &aggregate,
+                        &rebuild_configs,
+                        &rebuild_open_files,
+                        &rebuild_templates,
+                        &rebuild_versions,
+                    );
+                })
+                .await;
+            }
 
             let workspace_roots: Vec<PathBuf> =
                 configs.iter().map(|config| config.root.clone()).collect();
-            twig_context_disk_cache.lock().await.clear();
+            let active_workspace_folders: Vec<PathBuf> = configs
+                .iter()
+                .zip(&post_tokens)
+                .filter(|(_, token)| !token.is_cancelled())
+                .map(|(config, _)| config.workspace_folder.clone())
+                .collect();
+            {
+                let mut cache = twig_context_disk_cache.lock().await;
+                for config in &configs {
+                    cache.evict_index(&config.index);
+                }
+            }
+            let indexing_cancellations: Vec<WorkspaceIndexingCancellation> = configs
+                .iter()
+                .zip(&post_tokens)
+                .map(|(config, token)| WorkspaceIndexingCancellation {
+                    workspace_folder: config.workspace_folder.clone(),
+                    token: token.clone(),
+                })
+                .collect();
             refresh_open_twig_contexts_for_state(OpenTwigContextRefreshState {
                 open_files: &open_files,
                 template_documents: &template_documents,
                 document_versions: &reindex_document_versions,
                 index: &reindex_index,
+                fallback_index: &fallback_index,
                 workspace_roots: &workspace_roots,
+                workspace_configs: &configs,
+                workspace_folders_filter: Some(&active_workspace_folders),
+                indexing_cancellations: &indexing_cancellations,
                 twig_context_disk_cache: &twig_context_disk_cache,
                 semantic_tokens_cache: &semantic_tokens_cache,
             })
             .await;
-            if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
-                return;
-            }
             let open_file_uris: Vec<String> =
                 open_files.iter().map(|entry| entry.key().clone()).collect();
             for uri_str in open_file_uris {
@@ -369,23 +437,54 @@ impl PhpLspBackend {
                 ) else {
                     continue;
                 };
+                let Some(config) = workspace_config_for_uri_from_configs(&configs, &uri_str) else {
+                    continue;
+                };
+                let Some(post_token) = configs
+                    .iter()
+                    .position(|candidate| candidate.workspace_folder == config.workspace_folder)
+                    .and_then(|position| post_tokens.get(position))
+                else {
+                    continue;
+                };
+                if post_token.is_cancelled() {
+                    continue;
+                }
                 commit_open_document_index_snapshot_if_current(
                     OpenDocumentIndexCommitContext {
                         open_files: &open_files,
                         template_documents: &template_documents,
                         document_versions: &reindex_document_versions,
                         index: &reindex_index,
+                        root_index: Some(&config.index),
                         uri_str: &uri_str,
                     },
                     &snapshot,
                 );
                 if let Ok(uri) = uri_str.parse::<Uri>() {
+                    let computation_sequence = diagnostics_publisher.start_computation(&uri_str);
+                    let runtime = &config.runtime_config;
+                    let diagnostics_config = DiagnosticsRuntimeConfig {
+                        mode: runtime.diagnostics_mode,
+                        severity: runtime.diagnostic_severity,
+                        budget: runtime.diagnostic_budget,
+                        php_version: runtime.php_version,
+                    };
+                    let vendor_lazy_context = VendorLazyIndexContext {
+                        index: config.index.clone(),
+                        workspace_configs: vec![config.clone()],
+                        exclude_paths: runtime.exclude_paths.clone(),
+                        php_version: runtime.php_version,
+                        index_vendor: runtime.index_vendor,
+                        vendor_autoload_cache: vendor_autoload_cache.clone(),
+                        vendor_file_lru: config.vendor_file_lru.clone(),
+                    };
                     let document_state = snapshot.document_state;
                     let version = document_state.map(|state| state.version);
                     let template_document = snapshot.template_document.clone();
                     if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
                         && template_document.is_none()
-                        && index_vendor
+                        && runtime.index_vendor
                     {
                         preresolve_open_file_diagnostic_dependencies(
                             &snapshot.tree,
@@ -398,7 +497,7 @@ impl PhpLspBackend {
                     let mut diags = compute_source_diagnostics_blocking(
                         uri_str.clone(),
                         snapshot.source.clone(),
-                        reindex_index.clone(),
+                        config.index.clone(),
                         diagnostics_config,
                         version,
                     )
@@ -409,10 +508,10 @@ impl PhpLspBackend {
                             diagnostics_config.mode == DiagnosticsMode::Off,
                         );
                     } else if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
-                        && index_vendor
+                        && runtime.index_vendor
                     {
                         diags = filter_lazy_resolved_symbol_diagnostics_with_context(
-                            &reindex_index,
+                            &config.index,
                             &vendor_lazy_context,
                             diags,
                         )
@@ -426,8 +525,16 @@ impl PhpLspBackend {
                         expected_template: template_document,
                         require_idle_index: diagnostics_config.mode
                             == DiagnosticsMode::BasicSemantic,
+                        expected_runtime_generation: runtime_generation,
+                        indexing_workspace_folder: Some(config.workspace_folder.clone()),
+                        expected_runtime_config: runtime.clone(),
+                        expected_index: config.index.clone(),
+                        computation_sequence,
                     });
                 }
+            }
+            for token in post_tokens {
+                finish_indexing_run_state(&indexing_run_state, &token).await;
             }
         });
     }
@@ -444,178 +551,31 @@ impl PhpLspBackend {
             .iter()
             .filter_map(|folder| uri_to_path(folder.uri.as_str()))
             .collect();
-        if !removed_roots.is_empty() {
-            let first_root = {
-                let mut roots = self.workspace_roots.lock().await;
-                roots.retain(|root| {
-                    !removed_roots
-                        .iter()
-                        .any(|removed| root.starts_with(removed))
-                });
-                roots.first().cloned()
-            };
-            let first_namespace_map = {
-                let mut configs = self.workspace_configs.lock().await;
-                configs.retain(|config| {
-                    !removed_roots
-                        .iter()
-                        .any(|removed| config.root.starts_with(removed))
-                });
-                configs
-                    .iter()
-                    .find_map(|config| config.namespace_map.clone())
-            };
-            *self.workspace_root.lock().await = first_root;
-            *self.namespace_map.lock().await = first_namespace_map;
-
-            let removed_files = remove_indexed_files_under_roots(
-                &self.index,
-                &self.open_files,
-                &self.template_documents,
-                &self.document_versions,
-                &removed_roots,
-            );
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!(
-                        "php-lsp: removed {} indexed PHP files from detached workspace folder(s)",
-                        removed_files
-                    ),
-                )
-                .await;
-        }
-
         let added_roots: Vec<PathBuf> = params
             .event
             .added
             .iter()
             .filter_map(|folder| uri_to_path(folder.uri.as_str()))
             .collect();
-        if added_roots.is_empty() {
+        if removed_roots.is_empty() && added_roots.is_empty() {
             return;
         }
+        let _reload = self.configuration_reload.lock().await;
 
-        let composer_enabled = *self.composer_enabled.lock().await;
-        let added_configs = discover_workspace_root_configs_blocking(
-            added_roots,
-            composer_enabled,
-            "workspace folder discovery",
-        )
-        .await;
-
-        let first_root = {
+        let roots = {
             let mut roots = self.workspace_roots.lock().await;
-            for config in &added_configs {
-                push_unique_path(&mut roots, config.root.clone());
+            roots.retain(|root| !removed_roots.iter().any(|removed| root == removed));
+            for root in added_roots {
+                push_unique_path(&mut roots, root);
             }
-            roots.first().cloned()
+            roots.clone()
         };
-        let mut workspace_root = self.workspace_root.lock().await;
-        if workspace_root.is_none() {
-            *workspace_root = first_root;
-        }
-        drop(workspace_root);
 
-        let first_namespace_map = {
-            let mut configs = self.workspace_configs.lock().await;
-            for config in &added_configs {
-                if !configs.iter().any(|existing| existing.root == config.root) {
-                    configs.push(config.clone());
-                }
-            }
-            configs
-                .iter()
-                .find_map(|config| config.namespace_map.clone())
-        };
-        *self.namespace_map.lock().await = first_namespace_map;
-
-        let client = self.client.clone();
-        let index = self.index.clone();
-        let open_files = self.open_files.clone();
-        let template_documents = self.template_documents.clone();
-        let document_versions = self.document_versions.clone();
-        let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
-        let include_paths = self.include_paths.lock().await.clone();
-        let exclude_paths = self.exclude_paths.lock().await.clone();
-        let php_version = *self.php_version.lock().await;
-        let index_vendor = *self.index_vendor.lock().await;
-        let vendor_autoload_cache = self.vendor_autoload_cache.clone();
-        let vendor_file_lru = self.vendor_file_lru.clone();
-        let stub_extensions = self.stub_extensions.lock().await.clone();
-        let client_stubs_path = self.stubs_path.lock().await.clone();
-        let cache_config = workspace_index_cache_config(
-            added_configs.first().map(|config| config.root.as_path()),
-            php_version,
-            &include_paths,
-            &exclude_paths,
-            stub_extensions.as_deref(),
-            client_stubs_path.as_deref(),
-        );
-        let indexing_options = WorkspaceIndexingOptions {
-            include_paths,
-            exclude_paths,
-            cache_config,
-            work_done_progress_supported,
-        };
-        let indexing_run_state = self.indexing_run.clone();
-        let indexing_token = self.start_indexing_run().await;
-        tokio::spawn(async move {
-            for config in &added_configs {
-                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
-                    return;
-                }
-                if let Err(e) = index_workspace(
-                    &client,
-                    WorkspaceLiveIndexContext {
-                        index: &index,
-                        open_files: &open_files,
-                        template_documents: &template_documents,
-                        document_versions: &document_versions,
-                    },
-                    &config.root,
-                    config.namespace_map.as_ref(),
-                    &indexing_options,
-                    &indexing_token,
-                )
-                .await
-                {
-                    tracing::error!("Workspace folder indexing failed: {}", e);
-                    send_indexing_status(
-                        &client,
-                        serde_json::json!({
-                            "phase": "error",
-                            "root": config.root.display().to_string(),
-                            "message": format!("Workspace folder indexing failed: {}", e)
-                        }),
-                    )
-                    .await;
-                    client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!("Workspace folder indexing failed: {}", e),
-                        )
-                        .await;
-                    continue;
-                }
-                if finish_indexing_run_if_cancelled(&indexing_run_state, &indexing_token).await {
-                    return;
-                }
-
-                if index_vendor {
-                    preload_vendor_entrypoints(
-                        index.clone(),
-                        &config.root,
-                        &indexing_options.exclude_paths,
-                        php_version,
-                        &vendor_autoload_cache,
-                        &vendor_file_lru,
-                    )
-                    .await;
-                }
-            }
-            finish_indexing_run_state(&indexing_run_state, &indexing_token).await;
-        });
+        let client_settings = self.client_settings.lock().await.clone();
+        let applied = self
+            .apply_effective_configuration_settings(&client_settings, &roots)
+            .await;
+        self.apply_configuration_side_effects(applied).await;
     }
 
     pub(crate) async fn lsp_did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -655,7 +615,7 @@ impl PhpLspBackend {
             }
         }
 
-        if config_changed {
+        if config_changed || composer_requires_workspace_reindex {
             self.reload_effective_configuration().await;
         }
         if let Some(path) = composer_metadata_changed {
@@ -668,8 +628,9 @@ impl PhpLspBackend {
         tracing::debug!("didChangeConfiguration");
 
         self.invalidate_request_fs_caches().await;
+        let _reload = self.configuration_reload.lock().await;
         *self.client_settings.lock().await = params.settings.clone();
-        self.reload_effective_configuration().await;
+        self.reload_effective_configuration_under_lock().await;
     }
 
     pub(crate) async fn lsp_will_create_files(
@@ -1051,46 +1012,11 @@ pub(crate) fn load_effective_configuration_settings(
     workspace_roots: &[PathBuf],
     client_settings: &serde_json::Value,
 ) -> (serde_json::Value, Vec<String>) {
-    let mut effective = serde_json::json!({});
-    let mut messages = Vec::new();
-
-    if let Some(path) = global_config_candidates()
-        .into_iter()
-        .find(|path| path.exists())
-    {
-        match load_toml_settings(&path) {
-            Ok(settings) => {
-                merge_json_objects(&mut effective, &settings);
-                messages.push(format!("Loaded global config: {}", path.display()));
-            }
-            Err(message) => messages.push(message),
-        }
-    }
-
+    let (mut effective, mut messages) = load_global_configuration_settings();
     let client_settings = normalize_client_settings(client_settings);
-    let allow_project_commands = project_commands_are_trusted(&effective, &client_settings);
 
     for root in workspace_roots {
-        for path in project_config_candidates(root) {
-            if !path.exists() {
-                continue;
-            }
-            match load_toml_settings(&path) {
-                Ok(mut settings) => {
-                    if let Some(message) = sanitize_project_settings_for_command_trust(
-                        &mut settings,
-                        &path,
-                        allow_project_commands,
-                    ) {
-                        messages.push(message);
-                    }
-                    merge_json_objects(&mut effective, &settings);
-                    messages.push(format!("Loaded project config: {}", path.display()));
-                    break;
-                }
-                Err(message) => messages.push(message),
-            }
-        }
+        merge_project_configuration_for_root(&mut effective, &mut messages, root, &client_settings);
     }
 
     merge_json_objects(&mut effective, &client_settings);
@@ -1098,22 +1024,125 @@ pub(crate) fn load_effective_configuration_settings(
     (effective, messages)
 }
 
-pub(in crate::server) async fn load_effective_configuration_settings_blocking(
+fn load_global_configuration_settings() -> (serde_json::Value, Vec<String>) {
+    let mut settings = serde_json::json!({});
+    let mut messages = Vec::new();
+    if let Some(path) = global_config_candidates()
+        .into_iter()
+        .find(|path| path.exists())
+    {
+        match load_toml_settings(&path) {
+            Ok(global) => {
+                merge_json_objects(&mut settings, &global);
+                messages.push(format!("Loaded global config: {}", path.display()));
+            }
+            Err(message) => messages.push(message),
+        }
+    }
+    (settings, messages)
+}
+
+fn merge_project_configuration_for_root(
+    effective: &mut serde_json::Value,
+    messages: &mut Vec<String>,
+    root: &Path,
+    client_settings: &serde_json::Value,
+) {
+    let allow_project_commands = project_commands_are_trusted(effective, client_settings);
+    for path in project_config_candidates(root) {
+        if !path.exists() {
+            continue;
+        }
+        match load_toml_settings(&path) {
+            Ok(mut settings) => {
+                if let Some(message) = sanitize_project_settings_for_command_trust(
+                    &mut settings,
+                    &path,
+                    allow_project_commands,
+                ) {
+                    messages.push(message);
+                }
+                merge_json_objects(effective, &settings);
+                messages.push(format!("Loaded project config: {}", path.display()));
+                break;
+            }
+            Err(message) => messages.push(message),
+        }
+    }
+}
+
+pub(crate) fn load_workspace_runtime(
+    workspace_roots: &[PathBuf],
+    raw_client_settings: &serde_json::Value,
+) -> LoadedWorkspaceRuntime {
+    let client_snapshot = ClientConfigurationSnapshot::from_value(raw_client_settings);
+    let (global_settings, mut messages) = load_global_configuration_settings();
+
+    let mut fallback_settings = global_settings.clone();
+    merge_json_objects(&mut fallback_settings, &client_snapshot.fallback_settings());
+    let fallback = ResolvedRuntimeConfiguration::from_settings(&fallback_settings);
+
+    let mut configs = Vec::with_capacity(workspace_roots.len());
+    for workspace_folder in workspace_roots {
+        let client_settings = client_snapshot.settings_for_workspace_folder(workspace_folder);
+        let mut effective = global_settings.clone();
+        merge_project_configuration_for_root(
+            &mut effective,
+            &mut messages,
+            workspace_folder,
+            &client_settings,
+        );
+        merge_json_objects(&mut effective, &client_settings);
+        let runtime_config = ResolvedRuntimeConfiguration::from_settings(&effective);
+        let mut config =
+            discover_workspace_root_config(workspace_folder, runtime_config.composer_enabled);
+        config.workspace_folder = workspace_folder.clone();
+        config.runtime_config = runtime_config;
+        configs.push(config);
+    }
+
+    LoadedWorkspaceRuntime {
+        fallback,
+        configs: dedup_workspace_configs(configs),
+        messages,
+    }
+}
+
+pub(in crate::server) async fn load_workspace_runtime_blocking(
     workspace_roots: Vec<PathBuf>,
     client_settings: serde_json::Value,
-) -> (serde_json::Value, Vec<String>) {
-    let fallback_client_settings = client_settings.clone();
+    label: &'static str,
+) -> LoadedWorkspaceRuntime {
+    let fallback_roots = workspace_roots.clone();
+    let fallback_settings = client_settings.clone();
     let path_label = format!("{} workspace root(s)", workspace_roots.len());
-    match run_file_io_blocking("configuration load", path_label, move || {
-        load_effective_configuration_settings(&workspace_roots, &client_settings)
+    match run_file_io_blocking(label, path_label, move || {
+        load_workspace_runtime(&workspace_roots, &client_settings)
     })
     .await
     {
-        Ok(result) => result,
-        Err(message) => (
-            normalize_client_settings(&fallback_client_settings),
-            vec![message],
-        ),
+        Ok(runtime) => runtime,
+        Err(message) => {
+            let snapshot = ClientConfigurationSnapshot::from_value(&fallback_settings);
+            let fallback =
+                ResolvedRuntimeConfiguration::from_settings(&snapshot.fallback_settings());
+            let configs = fallback_roots
+                .into_iter()
+                .map(|root| WorkspaceRootConfig {
+                    workspace_folder: root.clone(),
+                    root,
+                    namespace_map: None,
+                    runtime_config: fallback.clone(),
+                    index: Arc::new(WorkspaceIndex::new()),
+                    vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+                })
+                .collect();
+            LoadedWorkspaceRuntime {
+                fallback,
+                configs,
+                messages: vec![message],
+            }
+        }
     }
 }
 
@@ -1203,15 +1232,23 @@ pub(crate) fn discover_workspace_root_config(
                     namespace_map.psr4.len()
                 );
                 WorkspaceRootConfig {
+                    workspace_folder: root.to_path_buf(),
                     root: effective_root,
                     namespace_map: Some(namespace_map),
+                    runtime_config: ResolvedRuntimeConfiguration::default(),
+                    index: Arc::new(WorkspaceIndex::new()),
+                    vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
                 }
             }
             Err(e) => {
                 tracing::warn!("Failed to parse composer.json: {}", e);
                 WorkspaceRootConfig {
+                    workspace_folder: root.to_path_buf(),
                     root: root.to_path_buf(),
                     namespace_map: None,
+                    runtime_config: ResolvedRuntimeConfiguration::default(),
+                    index: Arc::new(WorkspaceIndex::new()),
+                    vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
                 }
             }
         };
@@ -1224,129 +1261,33 @@ pub(crate) fn discover_workspace_root_config(
     }
 
     WorkspaceRootConfig {
+        workspace_folder: root.to_path_buf(),
         root: root.to_path_buf(),
         namespace_map: None,
-    }
-}
-
-pub(in crate::server) async fn discover_workspace_root_configs_blocking(
-    roots: Vec<PathBuf>,
-    composer_enabled: bool,
-    label: &'static str,
-) -> Vec<WorkspaceRootConfig> {
-    let fallback_roots = roots.clone();
-    let path_label = format!("{} workspace root(s)", roots.len());
-    match run_file_io_blocking(label, path_label, move || {
-        dedup_workspace_configs(
-            roots
-                .iter()
-                .map(|root| discover_workspace_root_config(root, composer_enabled))
-                .collect(),
-        )
-    })
-    .await
-    {
-        Ok(configs) => configs,
-        Err(message) => {
-            tracing::warn!("{}", message);
-            dedup_workspace_configs(
-                fallback_roots
-                    .into_iter()
-                    .map(|root| WorkspaceRootConfig {
-                        root,
-                        namespace_map: None,
-                    })
-                    .collect(),
-            )
-        }
+        runtime_config: ResolvedRuntimeConfiguration::default(),
+        index: Arc::new(WorkspaceIndex::new()),
+        vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
     }
 }
 
 pub(in crate::server) fn dedup_workspace_configs(
     configs: Vec<WorkspaceRootConfig>,
 ) -> Vec<WorkspaceRootConfig> {
-    let mut roots = Vec::new();
+    let mut workspace_folders = Vec::new();
     let mut unique = Vec::new();
 
     for config in configs {
-        if roots.iter().any(|root| root == &config.root) {
+        if workspace_folders
+            .iter()
+            .any(|root| root == &config.workspace_folder)
+        {
             continue;
         }
-        roots.push(config.root.clone());
+        workspace_folders.push(config.workspace_folder.clone());
         unique.push(config);
     }
 
     unique
-}
-
-pub(in crate::server) fn remove_indexed_files_under_roots(
-    index: &WorkspaceIndex,
-    open_files: &DashMap<String, FileParser>,
-    template_documents: &DashMap<String, TemplateDocument>,
-    document_versions: &DashMap<String, OpenDocumentState>,
-    roots: &[PathBuf],
-) -> usize {
-    let uris: Vec<String> = index
-        .file_symbols
-        .iter()
-        .filter_map(|entry| {
-            let path = uri_to_path(entry.key())?;
-            roots
-                .iter()
-                .any(|root| path.starts_with(root))
-                .then(|| entry.key().clone())
-        })
-        .collect();
-
-    let mut removed = 0;
-    for uri in uris {
-        let dashmap::mapref::entry::Entry::Vacant(_open_entry) = open_files.entry(uri.clone())
-        else {
-            continue;
-        };
-        if template_documents.contains_key(&uri) || document_versions.contains_key(&uri) {
-            continue;
-        }
-        index.remove_file(&uri);
-        removed += 1;
-    }
-
-    removed
-}
-
-pub(in crate::server) fn remove_indexed_file_symbols(
-    index: &WorkspaceIndex,
-    open_files: &DashMap<String, FileParser>,
-    template_documents: &DashMap<String, TemplateDocument>,
-    document_versions: &DashMap<String, OpenDocumentState>,
-    roots: &[PathBuf],
-) -> usize {
-    let uris: Vec<String> = index
-        .file_symbols
-        .iter()
-        .filter(|entry| {
-            entry.key().starts_with("file://")
-                && uri_to_path(entry.key())
-                    .map(|path| !path_is_under_vendor_roots(&path, roots))
-                    .unwrap_or(true)
-        })
-        .map(|entry| entry.key().clone())
-        .collect();
-
-    let mut removed = 0;
-    for uri in uris {
-        let dashmap::mapref::entry::Entry::Vacant(_open_entry) = open_files.entry(uri.clone())
-        else {
-            continue;
-        };
-        if template_documents.contains_key(&uri) || document_versions.contains_key(&uri) {
-            continue;
-        }
-        index.remove_file(&uri);
-        removed += 1;
-    }
-
-    removed
 }
 
 pub(in crate::server) fn remove_indexed_vendor_symbols(
@@ -1878,6 +1819,7 @@ pub(in crate::server) async fn index_workspace(
                 template_documents: live.template_documents,
                 document_versions: live.document_versions,
                 index: live.index,
+                root_index: Some(live.root_index),
                 uri_str: &uri_str,
             },
             file_symbols,
@@ -2005,6 +1947,7 @@ pub(in crate::server) async fn index_workspace(
                     template_documents: live.template_documents,
                     document_versions: live.document_versions,
                     index: live.index,
+                    root_index: Some(live.root_index),
                     uri_str: &parsed.uri,
                 },
                 file_symbols,
@@ -2131,29 +2074,87 @@ pub(in crate::server) async fn index_workspace(
 }
 
 impl PhpLspBackend {
-    pub(in crate::server) async fn path_is_excluded_by_config(&self, path: &Path) -> bool {
-        let exclude_paths = self.exclude_paths.lock().await.clone();
-        if exclude_paths.is_empty() {
-            return false;
-        }
-
-        let mut roots: Vec<PathBuf> = self
-            .workspace_configs
-            .lock()
-            .await
-            .iter()
-            .map(|config| config.root.clone())
-            .collect();
-
-        if roots.is_empty() {
-            if let Some(root) = self.workspace_root.lock().await.clone() {
-                roots.push(root);
+    pub(in crate::server) async fn remove_uri_from_current_runtime_indexes(&self, uri_str: &str) {
+        for _ in 0..4 {
+            let state = self.runtime_state_snapshot().await;
+            let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
+            self.index.remove_file(uri_str);
+            for index in workspace_indexes_for_uri(&state, uri_str, false) {
+                index.remove_file(uri_str);
+            }
+            if Arc::ptr_eq(&state, &self.runtime_state_snapshot().await) {
+                return;
             }
         }
+    }
 
-        roots
-            .iter()
-            .any(|root| path_is_excluded(path, root, &exclude_paths))
+    async fn remove_uri_from_current_vendor_lrus(&self, uri_str: &str) {
+        let Some(path) = uri_to_path(uri_str) else {
+            return;
+        };
+        let state = self.runtime_state_snapshot().await;
+        for config in workspace_configs_for_path_scope(&state.configs, &path) {
+            config.vendor_file_lru.lock().await.remove(uri_str);
+        }
+        self.vendor_file_lru.lock().await.remove(uri_str);
+    }
+
+    pub(in crate::server) async fn commit_closed_php_snapshot_to_current_runtime(
+        &self,
+        uri_str: &str,
+        file_symbols: Option<php_lsp_types::FileSymbols>,
+        references: Vec<php_lsp_types::SymbolReference>,
+    ) -> bool {
+        for _ in 0..4 {
+            let state = self.runtime_state_snapshot().await;
+            let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
+            let dashmap::mapref::entry::Entry::Vacant(_open_entry) =
+                self.open_files.entry(uri_str.to_string())
+            else {
+                return false;
+            };
+            if self.template_documents.contains_key(uri_str)
+                || self.document_versions.contains_key(uri_str)
+            {
+                return false;
+            }
+            if let Some(file_symbols) = file_symbols.as_ref() {
+                let indexes = workspace_indexes_for_uri(&state, uri_str, true);
+                if indexes.is_empty() {
+                    self.index.remove_file(uri_str);
+                } else {
+                    self.index.update_file_with_references(
+                        uri_str,
+                        file_symbols.clone(),
+                        references.clone(),
+                    );
+                    for index in indexes {
+                        index.update_file_with_references(
+                            uri_str,
+                            file_symbols.clone(),
+                            references.clone(),
+                        );
+                    }
+                }
+            } else {
+                self.index.remove_file(uri_str);
+                for index in workspace_indexes_for_uri(&state, uri_str, false) {
+                    index.remove_file(uri_str);
+                }
+            }
+            drop(_open_entry);
+            if Arc::ptr_eq(&state, &self.runtime_state_snapshot().await) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(in crate::server) async fn path_is_excluded_by_config(&self, path: &Path) -> bool {
+        let state = self.runtime_state_snapshot().await;
+        workspace_config_for_path_from_configs(&state.configs, path).is_some_and(|config| {
+            path_is_excluded(path, &config.root, &config.runtime_config.exclude_paths)
+        })
     }
 
     /// Reindex one changed PHP file from the open buffer when available,
@@ -2166,28 +2167,17 @@ impl PhpLspBackend {
         let refresh_twig_contexts = !is_blade_template_uri(&uri_str);
         if is_blade_template_uri(&uri_str) {
             let committed = if let Some(snapshot) = self.open_document_snapshot(&uri_str) {
-                commit_open_document_index_snapshot_if_current(
-                    OpenDocumentIndexCommitContext {
-                        open_files: &self.open_files,
-                        template_documents: &self.template_documents,
-                        document_versions: &self.document_versions,
-                        index: &self.index,
-                        uri_str: &uri_str,
-                    },
-                    &snapshot,
-                )
+                if let Some(expected) = snapshot.document_state {
+                    self.synchronize_open_document_index_to_current_runtime(
+                        &uri_str, expected, false,
+                    )
+                    .await
+                } else {
+                    false
+                }
             } else {
-                commit_disk_php_index_if_closed(
-                    DiskPhpIndexCommitContext {
-                        open_files: &self.open_files,
-                        template_documents: &self.template_documents,
-                        document_versions: &self.document_versions,
-                        index: &self.index,
-                        uri_str: &uri_str,
-                    },
-                    None,
-                    Vec::new(),
-                )
+                self.commit_closed_php_snapshot_to_current_runtime(&uri_str, None, Vec::new())
+                    .await
             };
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
             if committed && self.open_document_snapshot(&uri_str).is_some() {
@@ -2199,38 +2189,30 @@ impl PhpLspBackend {
         if let Some(path) = uri_to_path(&uri_str) {
             let roots = self.current_workspace_roots().await;
             if path_is_under_vendor_roots(&path, &roots)
-                && !self.index.file_symbols.contains_key(&uri_str)
+                && workspace_indexes_for_uri(
+                    self.runtime_state_snapshot().await.as_ref(),
+                    &uri_str,
+                    false,
+                )
+                .iter()
+                .all(|index| !index.file_symbols.contains_key(&uri_str))
             {
                 return;
             }
-            if self.path_is_excluded_by_config(&path).await {
-                commit_disk_php_index_if_closed(
-                    DiskPhpIndexCommitContext {
-                        open_files: &self.open_files,
-                        template_documents: &self.template_documents,
-                        document_versions: &self.document_versions,
-                        index: &self.index,
-                        uri_str: &uri_str,
-                    },
-                    None,
-                    Vec::new(),
-                );
+            let state = self.runtime_state_snapshot().await;
+            if workspace_indexes_for_uri(&state, &uri_str, true).is_empty() {
+                self.commit_closed_php_snapshot_to_current_runtime(&uri_str, None, Vec::new())
+                    .await;
                 self.semantic_tokens_cache.lock().await.remove(&uri_str);
                 return;
             }
         }
 
         if let Some(snapshot) = self.open_document_snapshot(&uri_str) {
-            commit_open_document_index_snapshot_if_current(
-                OpenDocumentIndexCommitContext {
-                    open_files: &self.open_files,
-                    template_documents: &self.template_documents,
-                    document_versions: &self.document_versions,
-                    index: &self.index,
-                    uri_str: &uri_str,
-                },
-                &snapshot,
-            );
+            if let Some(expected) = snapshot.document_state {
+                self.synchronize_open_document_index_to_current_runtime(&uri_str, expected, true)
+                    .await;
+            }
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
             self.publish_diagnostics(uri).await;
             if refresh_twig_contexts {
@@ -2268,29 +2250,17 @@ impl PhpLspBackend {
                 }
             };
 
-        let committed_disk = commit_disk_php_index_if_closed(
-            DiskPhpIndexCommitContext {
-                open_files: &self.open_files,
-                template_documents: &self.template_documents,
-                document_versions: &self.document_versions,
-                index: &self.index,
-                uri_str: &uri_str,
-            },
-            file_symbols,
-            references,
-        );
+        let committed_disk = self
+            .commit_closed_php_snapshot_to_current_runtime(&uri_str, file_symbols, references)
+            .await;
         if !committed_disk {
             if let Some(snapshot) = self.open_document_snapshot(&uri_str) {
-                commit_open_document_index_snapshot_if_current(
-                    OpenDocumentIndexCommitContext {
-                        open_files: &self.open_files,
-                        template_documents: &self.template_documents,
-                        document_versions: &self.document_versions,
-                        index: &self.index,
-                        uri_str: &uri_str,
-                    },
-                    &snapshot,
-                );
+                if let Some(expected) = snapshot.document_state {
+                    self.synchronize_open_document_index_to_current_runtime(
+                        &uri_str, expected, true,
+                    )
+                    .await;
+                }
             }
         }
 
@@ -2308,7 +2278,7 @@ impl PhpLspBackend {
         }
 
         let uri_str = uri.as_str().to_string();
-        self.vendor_file_lru.lock().await.remove(&uri_str);
+        self.remove_uri_from_current_vendor_lrus(&uri_str).await;
         match self.open_files.entry(uri_str.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 self.document_versions.remove(&uri_str);
@@ -2322,7 +2292,7 @@ impl PhpLspBackend {
                 self.template_documents.remove(&uri_str);
             }
         }
-        self.index.remove_file(&uri_str);
+        self.remove_uri_from_current_runtime_indexes(&uri_str).await;
         self.cancel_debounced_diagnostics(&uri_str).await;
         self.cancel_analyzer_run(&uri_str).await;
         self.cancel_formatter_run(&uri_str).await;
@@ -2387,8 +2357,9 @@ impl PhpLspBackend {
         self.cancel_formatter_run(&old_uri_str).await;
         self.cancel_formatter_run(new_uri.as_str()).await;
         if old_is_php {
-            self.index.remove_file(&old_uri_str);
-            self.vendor_file_lru.lock().await.remove(&old_uri_str);
+            self.remove_uri_from_current_runtime_indexes(&old_uri_str)
+                .await;
+            self.remove_uri_from_current_vendor_lrus(&old_uri_str).await;
             self.semantic_tokens_cache.lock().await.remove(&old_uri_str);
             self.publish_empty_diagnostics_if_closed(old_uri.clone())
                 .await;
@@ -2403,6 +2374,8 @@ impl PhpLspBackend {
         }
 
         let new_uri_str = new_uri.as_str().to_string();
+        let new_request = self.request_context_for_uri(&new_uri_str).await;
+        let new_index = new_request.index(&self.index);
         let new_excluded = if let Some(path) = uri_to_path(new_uri.as_str()) {
             self.path_is_excluded_by_config(&path).await
         } else {
@@ -2470,10 +2443,15 @@ impl PhpLspBackend {
             },
             || {
                 if let Some((file_symbols, references)) = indexed_file {
-                    self.index
-                        .update_file_with_references(&new_uri_str, file_symbols, references);
+                    update_aggregate_and_root_index(
+                        &self.index,
+                        &new_index,
+                        &new_uri_str,
+                        file_symbols,
+                        references,
+                    );
                 } else {
-                    self.index.remove_file(&new_uri_str);
+                    remove_from_aggregate_and_root_index(&self.index, &new_index, &new_uri_str);
                 }
             },
         );
@@ -2484,6 +2462,12 @@ impl PhpLspBackend {
             );
             return;
         }
+        self.synchronize_open_document_index_to_current_runtime(
+            &new_uri_str,
+            state,
+            !destination_is_template,
+        )
+        .await;
 
         self.semantic_tokens_cache.lock().await.remove(&new_uri_str);
         if !new_excluded {

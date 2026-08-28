@@ -10,6 +10,8 @@ impl PhpLspBackend {
             .uri
             .as_str()
             .to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let pos = params.text_document_position.position;
         let new_name = &params.new_name;
 
@@ -28,10 +30,10 @@ impl PhpLspBackend {
         let file_symbols = extract_file_symbols(&tree, &source, &uri_str);
 
         let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-            self.resolve_member_type(class_fqn, member_name)
+            resolve_member_type_from_index(&request_index, class_fqn, member_name)
         };
         let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-            resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+            resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
         };
         let sym = match symbol_at_position_with_resolvers(
             &tree,
@@ -95,10 +97,15 @@ impl PhpLspBackend {
 
         let resolved_for_rename =
             super::references::local_symbol_for_reference(&file_symbols, &sym).or_else(|| {
-                self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind, sym.allows_global_fallback)
-                    .filter(|symbol| symbol.uri != uri_str)
+                resolve_fqn_with_ref_kind(
+                    &request_index,
+                    &sym.fqn,
+                    sym.ref_kind,
+                    sym.allows_global_fallback,
+                )
+                .filter(|symbol| symbol.uri != uri_str)
             });
-        let phpdoc_virtual_member = phpdoc_virtual_member_for_symbol(&self.index, &sym);
+        let phpdoc_virtual_member = phpdoc_virtual_member_for_symbol(&request_index, &sym);
         if phpdoc_virtual_member.as_ref().is_some_and(|member| {
             should_reject_phpdoc_virtual_member_rename(&resolved_for_rename, member)
         }) {
@@ -108,7 +115,7 @@ impl PhpLspBackend {
         }
         if resolved_for_rename.is_none()
             && framework_virtual_member_for_symbol(
-                &self.index,
+                &request_index,
                 &sym,
                 Some(&uri_str),
                 Some(&file_symbols),
@@ -157,10 +164,7 @@ impl PhpLspBackend {
         };
 
         // Don't rename built-in symbols
-        if let Some(sym) = self
-            .index
-            .resolve_fqn_matching_kinds(&target_fqn, &[target_kind])
-        {
+        if let Some(sym) = request_index.resolve_fqn_matching_kinds(&target_fqn, &[target_kind]) {
             if sym.modifiers.is_builtin {
                 return Err(tower_lsp::jsonrpc::Error::invalid_params(
                     "Cannot rename built-in symbols",
@@ -171,7 +175,13 @@ impl PhpLspBackend {
         // Find all references (including declaration)
         let mut changes: std::collections::HashMap<Uri, Vec<TextEdit>> =
             std::collections::HashMap::new();
-        let reference_matches = self.reference_scan_matches(&target_fqn, target_kind, true);
+        let reference_matches = self.reference_scan_matches(
+            &request_index,
+            Some(&request),
+            &target_fqn,
+            target_kind,
+            true,
+        );
 
         for (scanned_files, (file_uri, refs)) in reference_matches.into_iter().enumerate() {
             cooperative_heavy_request_yield(scanned_files).await;
@@ -226,6 +236,8 @@ impl PhpLspBackend {
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
         let uri_str = params.text_document.uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let pos = params.position;
 
         let parser = match self.open_files.get(&uri_str) {
@@ -241,10 +253,10 @@ impl PhpLspBackend {
         let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
         let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-            self.resolve_member_type(class_fqn, member_name)
+            resolve_member_type_from_index(&request_index, class_fqn, member_name)
         };
         let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-            resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+            resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
         };
 
         match symbol_at_position_with_resolvers(
@@ -279,14 +291,15 @@ impl PhpLspBackend {
                 // Don't rename built-in or PHPDoc virtual symbols
                 let resolved = super::references::local_symbol_for_reference(&file_symbols, &sym)
                     .or_else(|| {
-                        self.resolve_fqn_with_fallback(
+                        resolve_fqn_with_ref_kind(
+                            &request_index,
                             &sym.fqn,
                             sym.ref_kind,
                             sym.allows_global_fallback,
                         )
                         .filter(|symbol| symbol.uri != uri_str)
                     });
-                let phpdoc_virtual_member = phpdoc_virtual_member_for_symbol(&self.index, &sym);
+                let phpdoc_virtual_member = phpdoc_virtual_member_for_symbol(&request_index, &sym);
                 if phpdoc_virtual_member.as_ref().is_some_and(|member| {
                     should_reject_phpdoc_virtual_member_rename(&resolved, member)
                 }) {
@@ -294,7 +307,7 @@ impl PhpLspBackend {
                 }
                 if resolved.is_none()
                     && framework_virtual_member_for_symbol(
-                        &self.index,
+                        &request_index,
                         &sym,
                         Some(&uri_str),
                         Some(&file_symbols),

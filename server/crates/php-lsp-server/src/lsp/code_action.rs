@@ -5909,11 +5909,14 @@ impl PhpLspBackend {
 
         let uri = params.text_document.uri;
         let uri_str = uri.as_str().to_string();
-        let php_version = *self.php_version.lock().await;
-        let analyzer_code_actions = *self.analyzer_code_actions.lock().await;
-        let diagnostics_mode = *self.diagnostics_mode.lock().await;
-        let diagnostic_severity = *self.diagnostic_severity.lock().await;
-        let diagnostic_budget = *self.diagnostic_budget.lock().await;
+        let request = self.request_context_for_uri(&uri_str).await;
+        let runtime_config = request.runtime_config().clone();
+        let request_index = request.index(&self.index);
+        let php_version = runtime_config.php_version;
+        let analyzer_code_actions = runtime_config.analyzer_code_actions;
+        let diagnostics_mode = runtime_config.diagnostics_mode;
+        let diagnostic_severity = runtime_config.diagnostic_severity;
+        let diagnostic_budget = runtime_config.diagnostic_budget;
         let Some(OpenDocumentSnapshot {
             tree,
             source,
@@ -5967,7 +5970,7 @@ impl PhpLspBackend {
                 if let Some(symbol) = visibility_symbol {
                     actions.extend(build_change_visibility_actions(
                         uri.clone(),
-                        &self.index,
+                        &request_index,
                         &file_symbols,
                         symbol,
                         params.range,
@@ -5997,7 +6000,7 @@ impl PhpLspBackend {
                     if parent_is_class {
                         actions.extend(build_generate_accessor_actions(
                             uri.clone(),
-                            &self.index,
+                            &request_index,
                             property,
                             params.range,
                             document_version,
@@ -6077,8 +6080,11 @@ impl PhpLspBackend {
                 let range = lsp_range_to_byte_range(&source, params.range);
                 concrete_class_symbol_at_range(&file_symbols, range)
                     .and_then(|class_sym| {
-                        let missing_methods =
-                            missing_implementation_methods(&self.index, &file_symbols, class_sym);
+                        let missing_methods = missing_implementation_methods(
+                            &request_index,
+                            &file_symbols,
+                            class_sym,
+                        );
                         build_implement_missing_methods_action(
                             uri.clone(),
                             class_sym,
@@ -6136,7 +6142,7 @@ impl PhpLspBackend {
             compute_diagnostics_with_config_for_version(
                 &uri_str,
                 &parser,
-                &self.index,
+                &request_index,
                 DiagnosticsRuntimeConfig {
                     mode: diagnostics_mode,
                     severity: diagnostic_severity,
@@ -6311,6 +6317,8 @@ impl PhpLspBackend {
             document_version,
             extra,
         } = data;
+        let request = self.request_context_for_uri(&uri).await;
+        let request_index = request.index(&self.index);
 
         match (action_kind, extra) {
             (
@@ -6375,13 +6383,17 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let php_version = *self.php_version.lock().await;
+                let php_version = request.runtime_config().php_version;
                 let missing_methods =
-                    missing_implementation_methods(&self.index, &file_symbols, class_sym);
+                    missing_implementation_methods(&request_index, &file_symbols, class_sym);
                 let mut metadata_by_fqn = HashMap::new();
                 for method in &missing_methods {
                     let declaration_source = self
-                        .source_for_uri(&method.uri, "implement missing methods source read")
+                        .source_for_uri_in_request(
+                            &request,
+                            &method.uri,
+                            "implement missing methods source read",
+                        )
                         .await;
                     metadata_by_fqn.insert(
                         method.fqn.clone(),
@@ -6429,7 +6441,7 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let php_version = *self.php_version.lock().await;
+                let php_version = request.runtime_config().php_version;
                 params.edit = generate_constructor_edit(
                     uri_value,
                     &source,
@@ -6474,7 +6486,7 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let php_version = *self.php_version.lock().await;
+                let php_version = request.runtime_config().php_version;
                 params.edit = generate_accessor_edit(
                     uri_value,
                     &source,
@@ -6524,7 +6536,7 @@ impl PhpLspBackend {
 
                 params.edit = change_visibility_edit(
                     uri_value,
-                    &self.index,
+                    &request_index,
                     &file_symbols,
                     &source,
                     symbol,

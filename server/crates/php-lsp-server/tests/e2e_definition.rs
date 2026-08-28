@@ -3,6 +3,385 @@ mod support;
 use support::*;
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_multi_root_duplicate_fqns_remain_isolated_across_lsp_features() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-multiroot-collision-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let root_a = tmp.join("root-a");
+    let root_b = tmp.join("root-b");
+    fs::create_dir_all(&root_a).unwrap();
+    fs::create_dir_all(&root_b).unwrap();
+    let subject_a_path = root_a.join("Subject.php");
+    let subject_b_path = root_b.join("Subject.php");
+    let use_a_path = root_a.join("Use.php");
+    let use_b_path = root_b.join("Use.php");
+    let subject_a = r#"<?php
+namespace Shared;
+/** ROOT_A_SUBJECT */
+class Subject {
+    public function rootAOnly(): void {}
+    /** ROOT_A_METHOD */
+    public function sharedMethod(): string { return "a"; }
+}
+class RootABase {}
+class Child extends RootABase {}
+"#;
+    let subject_b = r#"<?php
+namespace Shared;
+/** ROOT_B_SUBJECT */
+class Subject {
+    public function rootBOnly(): void {}
+    /** ROOT_B_METHOD */
+    public function sharedMethod(): int { return 2; }
+}
+class RootBBase {}
+class Child extends RootBBase {}
+"#;
+    let use_a = r#"<?php
+namespace Shared;
+$subject = new Subject();
+$subject->rootAOnly();
+"#;
+    let use_b = r#"<?php
+namespace Shared;
+$subject = new Subject();
+$subject->rootBOnly();
+"#;
+    for (path, source) in [
+        (&subject_a_path, subject_a),
+        (&subject_b_path, subject_b),
+        (&use_a_path, use_a),
+        (&use_b_path, use_b),
+    ] {
+        fs::write(path, source).unwrap();
+    }
+    let root_a_uri = php_lsp_types::uri::path_to_uri(&root_a).unwrap();
+    let root_b_uri = php_lsp_types::uri::path_to_uri(&root_b).unwrap();
+    let subject_a_uri = php_lsp_types::uri::path_to_uri(&subject_a_path).unwrap();
+    let subject_b_uri = php_lsp_types::uri::path_to_uri(&subject_b_path).unwrap();
+    let use_a_uri = php_lsp_types::uri::path_to_uri(&use_a_path).unwrap();
+    let use_b_uri = php_lsp_types::uri::path_to_uri(&use_b_path).unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_workspace_folders_and_options(
+            1,
+            vec![("root-a", &root_a_uri), ("root-b", &root_b_uri)],
+            Some(json!({
+                "configurationVersion": 2,
+                "global": { "composerEnabled": false, "stubExtensions": [] },
+                "workspaceFolders": [
+                    { "uri": root_a_uri, "settings": {} },
+                    { "uri": root_b_uri, "settings": {} }
+                ]
+            })),
+        ))
+        .await
+        .unwrap();
+    for (uri, source) in [
+        (subject_a_uri.as_str(), subject_a),
+        (subject_b_uri.as_str(), subject_b),
+    ] {
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(uri, source))
+            .await
+            .unwrap();
+    }
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(use_a_uri.as_str(), use_a))
+        .await
+        .unwrap();
+    let diagnostics_a = next_publish_diagnostics(
+        &mut notifications,
+        use_a_uri.as_str(),
+        Duration::from_secs(2),
+    )
+    .await;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(use_b_uri.as_str(), use_b))
+        .await
+        .unwrap();
+    let diagnostics_b = next_publish_diagnostics(
+        &mut notifications,
+        use_b_uri.as_str(),
+        Duration::from_secs(2),
+    )
+    .await;
+    for (root, diagnostics) in [("A", diagnostics_a), ("B", diagnostics_b)] {
+        let messages = published_diagnostic_messages(&diagnostics);
+        assert!(
+            messages.iter().all(|message| {
+                !message.contains("Unknown symbol") && !message.contains("Unknown method")
+            }),
+            "root {root} diagnostics used the duplicate FQN from another root: {messages:?}"
+        );
+    }
+
+    for (request_id, source, use_uri, expected_uri, forbidden_uri) in [
+        (10, use_a, &use_a_uri, &subject_a_uri, &subject_b_uri),
+        (11, use_b, &use_b_uri, &subject_b_uri, &subject_a_uri),
+    ] {
+        let (line, character) = utf16_position_at(source, "Subject");
+        let definition = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(definition_request(
+                    request_id,
+                    use_uri.as_str(),
+                    line,
+                    character + 2,
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            definition.get("uri").and_then(serde_json::Value::as_str),
+            Some(expected_uri.as_str()),
+            "definition must stay inside its owning root: {definition}"
+        );
+        assert!(
+            !definition.to_string().contains(forbidden_uri.as_str()),
+            "definition leaked the duplicate FQN from another root: {definition}"
+        );
+        let hover = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(hover_request(
+                    request_id + 2,
+                    use_uri.as_str(),
+                    line,
+                    character + 2,
+                ))
+                .await
+                .unwrap(),
+        );
+        let (expected_doc, forbidden_doc) = if use_uri.as_str() == use_a_uri.as_str() {
+            ("ROOT_A_SUBJECT", "ROOT_B_SUBJECT")
+        } else {
+            ("ROOT_B_SUBJECT", "ROOT_A_SUBJECT")
+        };
+        assert!(
+            hover.to_string().contains(expected_doc),
+            "hover missed root-owned PHPDoc `{expected_doc}`: {hover}"
+        );
+        assert!(
+            !hover.to_string().contains(forbidden_doc),
+            "hover leaked `{forbidden_doc}` from another root: {hover}"
+        );
+    }
+
+    for (
+        request_id,
+        source,
+        use_uri,
+        expected_member,
+        forbidden_member,
+        expected_doc,
+        forbidden_doc,
+    ) in [
+        (
+            20,
+            use_a,
+            &use_a_uri,
+            "rootAOnly",
+            "rootBOnly",
+            "ROOT_A_METHOD",
+            "ROOT_B_METHOD",
+        ),
+        (
+            21,
+            use_b,
+            &use_b_uri,
+            "rootBOnly",
+            "rootAOnly",
+            "ROOT_B_METHOD",
+            "ROOT_A_METHOD",
+        ),
+    ] {
+        let (line, character) = utf16_position_after(source, "$subject->");
+        let completion = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(completion_request(
+                    request_id,
+                    use_uri.as_str(),
+                    line,
+                    character,
+                ))
+                .await
+                .unwrap(),
+        );
+        let items = completion
+            .as_array()
+            .or_else(|| {
+                completion
+                    .get("items")
+                    .and_then(serde_json::Value::as_array)
+            })
+            .expect("completion items");
+        assert!(
+            items
+                .iter()
+                .any(|item| item.get("label").and_then(serde_json::Value::as_str)
+                    == Some(expected_member)),
+            "missing root-owned completion `{expected_member}`: {completion}"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| item.get("label").and_then(serde_json::Value::as_str)
+                    != Some(forbidden_member)),
+            "completion leaked `{forbidden_member}` from another root: {completion}"
+        );
+        let expected_item = items
+            .iter()
+            .find(|item| {
+                item.get("label").and_then(serde_json::Value::as_str) == Some(expected_member)
+            })
+            .unwrap();
+        assert_eq!(
+            expected_item
+                .get("data")
+                .and_then(|data| data.get("workspaceUri"))
+                .and_then(serde_json::Value::as_str),
+            Some(use_uri.as_str()),
+            "completion resolve data must retain the owning workspace URI: {completion}"
+        );
+        let shared_item = items
+            .iter()
+            .find(|item| {
+                item.get("label").and_then(serde_json::Value::as_str) == Some("sharedMethod")
+            })
+            .unwrap()
+            .clone();
+        let resolved = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(completion_resolve_request(request_id + 10, shared_item))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            resolved.to_string().contains(expected_doc),
+            "completion resolve missed root-owned PHPDoc `{expected_doc}`: {resolved}"
+        );
+        assert!(
+            !resolved.to_string().contains(forbidden_doc),
+            "completion resolve leaked `{forbidden_doc}` from another root: {resolved}"
+        );
+    }
+
+    for (request_id, source, subject_uri, expected_parent, forbidden_parent) in [
+        (40, subject_a, &subject_a_uri, "RootABase", "RootBBase"),
+        (42, subject_b, &subject_b_uri, "RootBBase", "RootABase"),
+    ] {
+        let (line, character) = utf16_position_at(source, "class Child");
+        let prepared = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(prepare_type_hierarchy_request(
+                    request_id,
+                    subject_uri.as_str(),
+                    line,
+                    character + "class ".len() as u32 + 2,
+                ))
+                .await
+                .unwrap(),
+        );
+        let item = prepared
+            .as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .unwrap_or_else(|| panic!("type hierarchy prepare item: {prepared}"));
+        assert_eq!(
+            item.get("data")
+                .and_then(|data| data.get("workspaceUri"))
+                .and_then(serde_json::Value::as_str),
+            Some(subject_uri.as_str())
+        );
+        let parents = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(type_hierarchy_supertypes_request(request_id + 1, item))
+                .await
+                .unwrap(),
+        );
+        assert!(parents.to_string().contains(expected_parent));
+        assert!(!parents.to_string().contains(forbidden_parent));
+    }
+
+    let (rename_line, rename_character) = utf16_position_at(subject_a, "class Subject");
+    let rename = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(rename_request(
+                30,
+                subject_a_uri.as_str(),
+                rename_line,
+                rename_character + "class ".len() as u32 + 2,
+                "RenamedSubject",
+            ))
+            .await
+            .unwrap(),
+    );
+    let changes = rename
+        .get("changes")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("rename changes: {rename}"));
+    assert!(changes.contains_key(subject_a_uri.as_str()));
+    assert!(changes.contains_key(use_a_uri.as_str()));
+    assert!(!changes.contains_key(subject_b_uri.as_str()));
+    assert!(!changes.contains_key(use_b_uri.as_str()));
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_goto_definition() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

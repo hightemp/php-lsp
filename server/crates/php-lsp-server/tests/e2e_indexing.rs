@@ -838,3 +838,109 @@ async fn test_workspace_folders_index_multiple_roots() {
 
     let _ = fs::remove_dir_all(&tmp_root);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_multi_root_include_paths_do_not_leak_between_roots() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-multiroot-include-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let root_a = tmp.join("root-a");
+    let root_b = tmp.join("root-b");
+    for root in [&root_a, &root_b] {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("extra-shared")).unwrap();
+        fs::write(
+            root.join("composer.json"),
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .unwrap();
+    }
+    let root_a_service = root_a.join("src/RootAService.php");
+    let root_b_service = root_b.join("src/RootBService.php");
+    let root_a_leak = root_a.join("extra-shared/RootALeak.php");
+    let root_b_extra = root_b.join("extra-shared/RootBExtra.php");
+    fs::write(&root_a_service, "<?php class RootAService {}\n").unwrap();
+    fs::write(&root_b_service, "<?php class RootBService {}\n").unwrap();
+    fs::write(&root_a_leak, "<?php class RootALeak {}\n").unwrap();
+    fs::write(&root_b_extra, "<?php class RootBExtra {}\n").unwrap();
+
+    let root_a_uri = path_to_uri(&root_a).unwrap();
+    let root_b_uri = path_to_uri(&root_b).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_workspace_folders_and_options(
+            1,
+            vec![("root-a", &root_a_uri), ("root-b", &root_b_uri)],
+            Some(json!({
+                "configurationVersion": 2,
+                "global": {},
+                "workspaceFolders": [
+                    { "uri": root_a_uri, "settings": {} },
+                    { "uri": root_b_uri, "settings": { "includePaths": ["extra-shared"] } }
+                ]
+            })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let expected_a = path_to_uri(&root_a_service).unwrap();
+    let expected_b = path_to_uri(&root_b_service).unwrap();
+    let expected_extra_b = path_to_uri(&root_b_extra).unwrap();
+    let forbidden_leak_a = path_to_uri(&root_a_leak).unwrap();
+    let mut result = json!(null);
+    for attempt in 0..80 {
+        result = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(workspace_symbol_request(10 + attempt, "Root"))
+                .await
+                .unwrap(),
+        );
+        let uris = workspace_symbol_uris(&result);
+        if uris.iter().any(|uri| uri == &expected_a)
+            && uris.iter().any(|uri| uri == &expected_b)
+            && uris.iter().any(|uri| uri == &expected_extra_b)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let uris = workspace_symbol_uris(&result);
+    assert!(uris.iter().any(|uri| uri == &expected_a));
+    assert!(uris.iter().any(|uri| uri == &expected_b));
+    assert!(uris.iter().any(|uri| uri == &expected_extra_b));
+    assert!(
+        uris.iter().all(|uri| uri != &forbidden_leak_a),
+        "root B includePaths must not scan the matching relative path in root A: {result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}

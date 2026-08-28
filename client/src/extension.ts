@@ -3,7 +3,7 @@ import * as os from "os";
 import * as fs from "fs";
 import type { ChildProcess } from "child_process";
 import { phpLspCacheDirForRoot } from "./cachePath";
-import { buildExplicitClientSettings } from "./configuration";
+import { buildClientConfigurationSnapshot } from "./configuration";
 import {
   childProcessIsRunning,
   type ManagedServerTerminationResult,
@@ -815,9 +815,23 @@ function getStubsPath(context: ExtensionContext): string | undefined {
   return undefined;
 }
 
+function clientConfigurationSnapshot(context: ExtensionContext) {
+  const folders = (workspace.workspaceFolders ?? []).map((folder) => ({
+    uri: folder.uri.toString(),
+    configuration: workspace.getConfiguration("phpLsp", {
+      uri: folder.uri,
+      languageId: "php",
+    }),
+  }));
+  return buildClientConfigurationSnapshot(
+    workspace.getConfiguration("phpLsp", { languageId: "php" }),
+    folders,
+    getStubsPath(context),
+  );
+}
+
 function createLanguageClient(context: ExtensionContext, binary: ServerBinaryResolution): LanguageClient {
   const config = workspace.getConfiguration("phpLsp");
-  const stubsPath = getStubsPath(context);
   const logLevel = config.get<string>("logLevel", "info");
   const serverEnvironment = getServerEnvironment(logLevel);
   let languageClient: LanguageClient | undefined;
@@ -854,7 +868,7 @@ function createLanguageClient(context: ExtensionContext, binary: ServerBinaryRes
     synchronize: {
       fileEvents,
     },
-    initializationOptions: buildExplicitClientSettings(config, stubsPath),
+    initializationOptions: clientConfigurationSnapshot(context),
     errorHandler: createClientErrorHandler(() => languageClient),
   };
 
@@ -890,9 +904,8 @@ async function notifyServerConfigurationChanged(context: ExtensionContext): Prom
     return;
   }
 
-  const config = workspace.getConfiguration("phpLsp");
   await client.sendNotification("workspace/didChangeConfiguration", {
-    settings: buildExplicitClientSettings(config, getStubsPath(context)),
+    settings: clientConfigurationSnapshot(context),
   });
 }
 
@@ -1164,6 +1177,9 @@ export function activate(context: ExtensionContext): void {
     }
     await enqueueLanguageClientReconciliation(context, "configuration changed");
   });
+  const workspaceFoldersSubscription = workspace.onDidChangeWorkspaceFolders(async () => {
+    await enqueueLanguageClientReconciliation(context, "workspace folders changed");
+  });
 
   context.subscriptions.push(
     controller,
@@ -1172,6 +1188,7 @@ export function activate(context: ExtensionContext): void {
     showStatusCommand,
     showServerVersionCommand,
     enableConfigSubscription,
+    workspaceFoldersSubscription,
   );
 
   // Re-read configuration inside the lifecycle queue before starting.

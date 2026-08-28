@@ -38,6 +38,19 @@ fn completion_item_ref_kind(kind: Option<CompletionItemKind>, fqn: &str) -> Opti
     }
 }
 
+fn completion_item_request_data(item: &CompletionItem) -> (Option<&str>, Option<&str>) {
+    let Some(data) = item.data.as_ref() else {
+        return (None, None);
+    };
+    if let Some(fqn) = data.as_str() {
+        return (Some(fqn), None);
+    }
+    (
+        data.get("fqn").and_then(serde_json::Value::as_str),
+        data.get("workspaceUri").and_then(serde_json::Value::as_str),
+    )
+}
+
 impl PhpLspBackend {
     pub(crate) async fn lsp_signature_help(
         &self,
@@ -49,6 +62,8 @@ impl PhpLspBackend {
             .uri
             .as_str()
             .to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let original_pos = params.text_document_position_params.position;
         let Some(OpenDocumentSnapshot {
             tree,
@@ -75,7 +90,7 @@ impl PhpLspBackend {
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
 
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-                self.resolve_member_type(class_fqn, member_name)
+                resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
 
             let context = match signature_help_context_at_position(
@@ -97,7 +112,8 @@ impl PhpLspBackend {
         let symbol_info = if local_symbol_info.is_some() {
             local_symbol_info
         } else {
-            self.resolve_fqn_lazy_with_fallback(
+            self.resolve_fqn_lazy_with_fallback_in_request(
+                &request,
                 &sym_at_pos.fqn,
                 sym_at_pos.ref_kind,
                 sym_at_pos.allows_global_fallback,
@@ -108,9 +124,14 @@ impl PhpLspBackend {
 
         let symbol_info = if symbol_info.is_none() && sym_at_pos.ref_kind == RefKind::Constructor {
             if let Some(class_fqn) = sym_at_pos.fqn.strip_suffix("::__construct") {
-                self.resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName, false)
-                    .await
-                    .filter(|symbol| symbol.uri != uri_str)
+                self.resolve_fqn_lazy_with_fallback_in_request(
+                    &request,
+                    class_fqn,
+                    RefKind::ClassName,
+                    false,
+                )
+                .await
+                .filter(|symbol| symbol.uri != uri_str)
             } else {
                 None
             }
@@ -131,6 +152,8 @@ impl PhpLspBackend {
             .uri
             .as_str()
             .to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let original_pos = params.text_document_position.position;
         let Some(OpenDocumentSnapshot {
             tree,
@@ -146,8 +169,8 @@ impl PhpLspBackend {
             if let Some(path_context) =
                 template.twig_template_path_context_at_position(original_pos)
             {
-                let workspace_root = self.workspace_root_for_uri(&uri_str).await;
-                let namespace_map = self.namespace_map.lock().await.clone();
+                let workspace_root = request.root().map(Path::to_path_buf);
+                let namespace_map = request.namespace_map().cloned();
                 let file_symbols = php_lsp_types::FileSymbols::default();
                 let context = FrameworkStringKeyAtPosition {
                     domain: "twig",
@@ -190,8 +213,8 @@ impl PhpLspBackend {
         let (framework_workspace_root, framework_namespace_map) =
             if framework_string_key_context.is_some() {
                 (
-                    self.workspace_root_for_uri(&uri_str).await,
-                    self.namespace_map.lock().await.clone(),
+                    request.root().map(Path::to_path_buf),
+                    request.namespace_map().cloned(),
                 )
             } else {
                 (None, None)
@@ -223,6 +246,7 @@ impl PhpLspBackend {
             } => php_lsp_completion::context::CompletionContext::MemberAccess {
                 class_fqn: class_fqn.or_else(|| {
                     self.infer_completion_object_type(
+                        &request_index,
                         &object_expr,
                         &tree,
                         &uri_str,
@@ -259,10 +283,12 @@ impl PhpLspBackend {
             };
 
         if let Some(class_fqn) = completion_class_fqn {
-            self.lazy_index_class_dependencies(&class_fqn).await;
+            self.lazy_index_class_dependencies_in_request(&request, &class_fqn)
+                .await;
         }
 
         let inference_ctx = CompletionInferenceContext {
+            index: &request_index,
             tree: &tree,
             source_uri: &uri_str,
             source: &source,
@@ -286,7 +312,7 @@ impl PhpLspBackend {
                 }
                 _ => provide_completions_at_range(
                     &context,
-                    &self.index,
+                    &request_index,
                     &file_symbols,
                     (pos.line, byte_col, pos.line, byte_col),
                 ),
@@ -325,7 +351,7 @@ impl PhpLspBackend {
                 let mut seen_labels: HashSet<String> =
                     lsp_items.iter().map(|item| item.label.clone()).collect();
                 for member in framework_virtual_member_candidates(
-                    &self.index,
+                    &request_index,
                     class_fqn,
                     Some(&uri_str),
                     Some(&file_symbols),
@@ -342,7 +368,11 @@ impl PhpLspBackend {
                 .as_ref()
                 .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig)
             {
-                add_twig_property_style_member_aliases(&self.index, &mut lsp_items, member_prefix);
+                add_twig_property_style_member_aliases(
+                    &request_index,
+                    &mut lsp_items,
+                    member_prefix,
+                );
             }
         }
         if let php_lsp_completion::context::CompletionContext::StaticAccess {
@@ -354,7 +384,7 @@ impl PhpLspBackend {
             let mut seen_labels: HashSet<String> =
                 lsp_items.iter().map(|item| item.label.clone()).collect();
             for member in framework_virtual_member_candidates(
-                &self.index,
+                &request_index,
                 class_fqn,
                 Some(&uri_str),
                 Some(&file_symbols),
@@ -382,7 +412,7 @@ impl PhpLspBackend {
             .into_iter()
             .map(|mut item| {
                 let auto_import_edit = if enable_auto_imports {
-                    completion_auto_import_symbol(&self.index, &item).and_then(|sym| {
+                    completion_auto_import_symbol(&request_index, &item).and_then(|sym| {
                         build_completion_auto_import_edit(
                             &source,
                             auto_import_file_symbols.as_ref(),
@@ -419,6 +449,20 @@ impl PhpLspBackend {
                 let additional_text_edits =
                     (!additional_text_edits.is_empty()).then_some(additional_text_edits);
 
+                let data = item.data.map(|data| match data {
+                    serde_json::Value::String(fqn) => serde_json::json!({
+                        "fqn": fqn,
+                        "workspaceUri": uri_str.clone(),
+                    }),
+                    serde_json::Value::Object(mut object) => {
+                        object.insert(
+                            "workspaceUri".to_string(),
+                            serde_json::Value::String(uri_str.clone()),
+                        );
+                        serde_json::Value::Object(object)
+                    }
+                    other => other,
+                });
                 CompletionItem {
                     label: item.label,
                     kind,
@@ -430,7 +474,7 @@ impl PhpLspBackend {
                     additional_text_edits,
                     commit_characters: item.commit_characters,
                     tags,
-                    data: item.data,
+                    data,
                     ..Default::default()
                 }
             })
@@ -447,9 +491,27 @@ impl PhpLspBackend {
         &self,
         mut item: CompletionItem,
     ) -> Result<CompletionItem> {
+        let (_, workspace_uri) = completion_item_request_data(&item);
+        let request = match workspace_uri {
+            Some(uri) => Some(self.request_context_for_uri(uri).await),
+            None => {
+                let state = self.runtime_state_snapshot().await;
+                (state.configs.len() == 1).then(|| WorkspaceRequestContext {
+                    workspace: state.configs.first().cloned(),
+                    state,
+                })
+            }
+        };
         if framework_virtual_completion_data(&item).is_some() {
             return Ok(item);
         }
+        let Some(request) = request else {
+            // Legacy completion data has no document URI. Resolving it against
+            // an arbitrary root in a multi-root workspace can attach details
+            // from a different project, so leave the item unchanged.
+            return Ok(item);
+        };
+        let request_index = request.index(&self.index);
 
         let virtual_data =
             phpdoc_virtual_completion_data(&item).map(|(owner_fqn, member_kind, member_name)| {
@@ -465,7 +527,8 @@ impl PhpLspBackend {
                 "method" => PhpDocVirtualMemberKind::Method,
                 _ => return Ok(item),
             };
-            if let Some(member) = phpdoc_virtual_member(&self.index, &owner_fqn, &member_name, kind)
+            if let Some(member) =
+                phpdoc_virtual_member(&request_index, &owner_fqn, &member_name, kind)
             {
                 item.detail = Some(match member.kind {
                     PhpDocVirtualMemberKind::Property => {
@@ -497,108 +560,105 @@ impl PhpLspBackend {
 
         // Try to resolve more details for the completion item
         // The FQN is stored in item.data
-        if let Some(ref data) = item.data {
-            if let Some(fqn) = data.as_str() {
-                let sym = if let Some(ref_kind) = completion_item_ref_kind(item.kind, fqn) {
-                    self.resolve_fqn_lazy_with_fallback(fqn, ref_kind, false)
-                        .await
-                } else {
-                    self.resolve_fqn_lazy(fqn).await
-                };
-                if let Some(sym) = sym {
-                    // Add full documentation
-                    let mut doc_parts = Vec::new();
+        if let (Some(fqn), _) = completion_item_request_data(&item) {
+            let sym = if let Some(ref_kind) = completion_item_ref_kind(item.kind, fqn) {
+                self.resolve_fqn_lazy_with_fallback_in_request(&request, fqn, ref_kind, false)
+                    .await
+            } else {
+                self.resolve_fqn_lazy_in_request(&request, fqn).await
+            };
+            if let Some(sym) = sym {
+                // Add full documentation
+                let mut doc_parts = Vec::new();
 
-                    // Signature
-                    if let Some(ref sig) = sym.signature {
-                        let params_str: Vec<String> = sig
-                            .params
-                            .iter()
-                            .map(|p| {
-                                let mut s = String::new();
-                                if let Some(ref t) = p.type_info {
-                                    s.push_str(&t.to_string());
-                                    s.push(' ');
-                                }
-                                if p.is_variadic {
-                                    s.push_str("...");
-                                }
-                                if p.is_by_ref {
-                                    s.push('&');
-                                }
-                                s.push('$');
-                                s.push_str(&p.name);
-                                if let Some(ref default) = p.default_value {
-                                    s.push_str(" = ");
-                                    s.push_str(default);
-                                }
-                                s
-                            })
-                            .collect();
-                        let mut sig_str = format!("({})", params_str.join(", "));
-                        if let Some(ref ret) = sig.return_type {
-                            sig_str.push_str(&format!(": {}", ret));
-                        }
-                        item.detail = Some(sig_str);
-                    }
-
-                    // PHPDoc
-                    if let Some(ref doc) = sym.doc_comment {
-                        let phpdoc = parse_phpdoc(doc);
-                        if let Some(ref summary) = phpdoc.summary {
-                            doc_parts.push(summary.clone());
-                        }
-
-                        if phpdoc.deprecated.is_some() {
-                            doc_parts.push("**@deprecated**".to_string());
-                            if let Some(ref tags) = item.tags {
-                                if !tags.contains(&CompletionItemTag::DEPRECATED) {
-                                    let mut tags = tags.clone();
-                                    tags.push(CompletionItemTag::DEPRECATED);
-                                    item.tags = Some(tags);
-                                }
-                            } else {
-                                item.tags = Some(vec![CompletionItemTag::DEPRECATED]);
+                // Signature
+                if let Some(ref sig) = sym.signature {
+                    let params_str: Vec<String> = sig
+                        .params
+                        .iter()
+                        .map(|p| {
+                            let mut s = String::new();
+                            if let Some(ref t) = p.type_info {
+                                s.push_str(&t.to_string());
+                                s.push(' ');
                             }
-                        }
-
-                        // Param docs
-                        if !phpdoc.params.is_empty() {
-                            doc_parts.push(String::new());
-                            for param in &phpdoc.params {
-                                let type_str = param
-                                    .type_info
-                                    .as_ref()
-                                    .map(|t| format!(" `{}`", t))
-                                    .unwrap_or_default();
-                                let desc = param
-                                    .description
-                                    .as_ref()
-                                    .map(|d| format!(" — {}", d))
-                                    .unwrap_or_default();
-                                doc_parts
-                                    .push(format!("@param{} `${}`{}", type_str, param.name, desc));
+                            if p.is_variadic {
+                                s.push_str("...");
                             }
-                        }
+                            if p.is_by_ref {
+                                s.push('&');
+                            }
+                            s.push('$');
+                            s.push_str(&p.name);
+                            if let Some(ref default) = p.default_value {
+                                s.push_str(" = ");
+                                s.push_str(default);
+                            }
+                            s
+                        })
+                        .collect();
+                    let mut sig_str = format!("({})", params_str.join(", "));
+                    if let Some(ref ret) = sig.return_type {
+                        sig_str.push_str(&format!(": {}", ret));
+                    }
+                    item.detail = Some(sig_str);
+                }
 
-                        // Return type
-                        if let Some(ref ret) = phpdoc.return_type {
-                            doc_parts.push(format!("\n@return `{}`", ret));
-                        }
+                // PHPDoc
+                if let Some(ref doc) = sym.doc_comment {
+                    let phpdoc = parse_phpdoc(doc);
+                    if let Some(ref summary) = phpdoc.summary {
+                        doc_parts.push(summary.clone());
+                    }
 
-                        let extra_sections = phpdoc_extra_markdown_sections(&phpdoc);
-                        if !extra_sections.is_empty() {
-                            doc_parts.push(String::new());
-                            doc_parts.extend(extra_sections);
+                    if phpdoc.deprecated.is_some() {
+                        doc_parts.push("**@deprecated**".to_string());
+                        if let Some(ref tags) = item.tags {
+                            if !tags.contains(&CompletionItemTag::DEPRECATED) {
+                                let mut tags = tags.clone();
+                                tags.push(CompletionItemTag::DEPRECATED);
+                                item.tags = Some(tags);
+                            }
+                        } else {
+                            item.tags = Some(vec![CompletionItemTag::DEPRECATED]);
                         }
                     }
 
-                    if !doc_parts.is_empty() {
-                        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: doc_parts.join("\n"),
-                        }));
+                    // Param docs
+                    if !phpdoc.params.is_empty() {
+                        doc_parts.push(String::new());
+                        for param in &phpdoc.params {
+                            let type_str = param
+                                .type_info
+                                .as_ref()
+                                .map(|t| format!(" `{}`", t))
+                                .unwrap_or_default();
+                            let desc = param
+                                .description
+                                .as_ref()
+                                .map(|d| format!(" — {}", d))
+                                .unwrap_or_default();
+                            doc_parts.push(format!("@param{} `${}`{}", type_str, param.name, desc));
+                        }
                     }
+
+                    // Return type
+                    if let Some(ref ret) = phpdoc.return_type {
+                        doc_parts.push(format!("\n@return `{}`", ret));
+                    }
+
+                    let extra_sections = phpdoc_extra_markdown_sections(&phpdoc);
+                    if !extra_sections.is_empty() {
+                        doc_parts.push(String::new());
+                        doc_parts.extend(extra_sections);
+                    }
+                }
+
+                if !doc_parts.is_empty() {
+                    item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: doc_parts.join("\n"),
+                    }));
                 }
             }
         }
@@ -608,23 +668,16 @@ impl PhpLspBackend {
 }
 
 impl PhpLspBackend {
-    pub(in crate::server) fn resolve_member_type(
-        &self,
-        class_fqn: &str,
-        member_name: &str,
-    ) -> Option<String> {
-        resolve_member_type_from_index(&self.index, class_fqn, member_name)
-    }
-
     pub(in crate::server) fn resolve_completion_member_type(
         &self,
+        index: &WorkspaceIndex,
         class_fqn: &str,
         member_name: &str,
         file_symbols: &php_lsp_types::FileSymbols,
         source_uri: Option<&str>,
         source: Option<&str>,
     ) -> Option<String> {
-        self.resolve_member_type(class_fqn, member_name)
+        resolve_member_type_from_index(index, class_fqn, member_name)
             .or_else(|| {
                 let member_fqn = format!("{}::{}", class_fqn, member_name);
                 let expected_kind = completion_member_type_lookup_kind(member_name);
@@ -637,7 +690,7 @@ impl PhpLspBackend {
                             && sym.matches_member_lookup_name(member_name))
                     {
                         if sym.kind == expected_kind {
-                            symbol_return_type_text_from_index(&self.index, class_fqn, sym)
+                            symbol_return_type_text_from_index(index, class_fqn, sym)
                         } else {
                             None
                         }
@@ -648,7 +701,7 @@ impl PhpLspBackend {
             })
             .or_else(|| {
                 framework_virtual_member_type_fqn(
-                    &self.index,
+                    index,
                     class_fqn,
                     member_name,
                     source_uri,
@@ -659,26 +712,30 @@ impl PhpLspBackend {
             .or_else(|| {
                 member_name
                     .starts_with('$')
-                    .then(|| phpdoc_virtual_property_type_fqn(&self.index, class_fqn, member_name))
+                    .then(|| phpdoc_virtual_property_type_fqn(index, class_fqn, member_name))
                     .flatten()
             })
     }
 
     pub(in crate::server) fn resolve_completion_member_type_cached(
         &self,
+        index: &WorkspaceIndex,
         class_fqn: &str,
         member_name: &str,
         file_symbols: &php_lsp_types::FileSymbols,
-        source_uri: Option<&str>,
-        source: Option<&str>,
+        source_context: Option<(&str, &str)>,
         type_cache: &RequestTypeCache,
     ) -> Option<String> {
+        let (source_uri, source) = source_context
+            .map(|(uri, source)| (Some(uri), Some(source)))
+            .unwrap_or((None, None));
         type_cache.cached_string(
             (0, 0, 0, 0),
             "completion-member-type",
             format!("{class_fqn}::{member_name}"),
             || {
                 self.resolve_completion_member_type(
+                    index,
                     class_fqn,
                     member_name,
                     file_symbols,
@@ -691,6 +748,7 @@ impl PhpLspBackend {
 
     pub(in crate::server) fn resolve_completion_member_call_type(
         &self,
+        index: &WorkspaceIndex,
         class_fqn: &str,
         member_name: &str,
         member_text: &str,
@@ -703,7 +761,7 @@ impl PhpLspBackend {
             format!("{class_fqn}::{member_name}:{member_text}"),
             || {
                 let symbol =
-                    self.index
+                    index
                         .resolve_member_matching_kinds(
                             &format!("{}::{}", class_fqn, member_name),
                             &[php_lsp_types::PhpSymbolKind::Method],
@@ -722,12 +780,8 @@ impl PhpLspBackend {
                         .filter(|sym| sym.kind == php_lsp_types::PhpSymbolKind::Method)?;
                 let signature = symbol.signature.as_ref()?;
                 let return_type = symbol_effective_return_type(&symbol)?;
-                let arguments = completion_call_arguments_by_param(
-                    member_text,
-                    signature,
-                    file_symbols,
-                    &self.index,
-                );
+                let arguments =
+                    completion_call_arguments_by_param(member_text, signature, file_symbols, index);
                 let template_names: HashSet<String> = symbol
                     .templates
                     .iter()
@@ -741,7 +795,7 @@ impl PhpLspBackend {
                     &template_names,
                     &substitutions,
                 );
-                type_info_resolved_text_from_index(&self.index, class_fqn, &symbol.uri, &resolved)
+                type_info_resolved_text_from_index(index, class_fqn, &symbol.uri, &resolved)
             },
         )
     }
@@ -749,6 +803,7 @@ impl PhpLspBackend {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::server) fn infer_completion_object_type(
         &self,
+        index: &WorkspaceIndex,
         object_expr: &str,
         tree: &tree_sitter::Tree,
         source_uri: &str,
@@ -776,15 +831,15 @@ impl PhpLspBackend {
                     completion_context_node_at_byte_col(tree, line, byte_col)?,
                     |class_fqn, method_name| {
                         self.resolve_completion_member_type_cached(
+                            index,
                             class_fqn,
                             method_name,
                             file_symbols,
-                            Some(source_uri),
-                            Some(source),
+                            Some((source_uri, source)),
                             type_cache,
                         )
                         .and_then(|type_text| {
-                            completion_member_type_text_to_object_fqn(&self.index, &type_text)
+                            completion_member_type_text_to_object_fqn(index, &type_text)
                         })
                     },
                 ) {
@@ -793,6 +848,7 @@ impl PhpLspBackend {
 
                 if object_expr.contains("->") || object_expr.contains("?->") {
                     return self.infer_completion_member_chain_type(
+                        index,
                         object_expr,
                         tree,
                         source_uri,
@@ -808,6 +864,7 @@ impl PhpLspBackend {
                     current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))
                 } else if object_expr.starts_with('$') {
                     self.infer_completion_variable_type(
+                        index,
                         tree,
                         source_uri,
                         source,
@@ -827,6 +884,7 @@ impl PhpLspBackend {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::server) fn infer_completion_variable_type(
         &self,
+        index: &WorkspaceIndex,
         tree: &tree_sitter::Tree,
         source_uri: &str,
         source: &str,
@@ -843,6 +901,7 @@ impl PhpLspBackend {
             || {
                 if crate::template::is_twig_template_uri(source_uri) {
                     if let Some(type_fqn) = self.infer_twig_completion_variable_type(
+                        index,
                         tree,
                         source_uri,
                         source,
@@ -858,17 +917,17 @@ impl PhpLspBackend {
 
                 let resolve_member_type = |class_fqn: &str, member_name: &str| {
                     self.resolve_completion_member_type_cached(
+                        index,
                         class_fqn,
                         member_name,
                         file_symbols,
-                        Some(source_uri),
-                        Some(source),
+                        Some((source_uri, source)),
                         type_cache,
                     )
                     .map(|type_text| completion_member_type_text_for_parser(&type_text))
                 };
                 let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-                    resolve_callable_parameter_type_from_index(&self.index, file_symbols, ctx)
+                    resolve_callable_parameter_type_from_index(index, file_symbols, ctx)
                 };
                 infer_variable_type_at_position_with_resolvers(
                     tree,
@@ -887,6 +946,7 @@ impl PhpLspBackend {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::server) fn infer_twig_completion_variable_type(
         &self,
+        index: &WorkspaceIndex,
         tree: &tree_sitter::Tree,
         _source_uri: &str,
         source: &str,
@@ -903,7 +963,7 @@ impl PhpLspBackend {
             tree,
             source,
             file_symbols,
-            index: &self.index,
+            index,
             type_cache,
             utf16_index: &utf16_index,
             requested_range: (0, 0, u32::MAX, u32::MAX),
@@ -912,7 +972,7 @@ impl PhpLspBackend {
         };
         let type_info = server_variable_type_info(&ctx, variable_node)?;
         type_info_fqn_from_index(
-            &self.index,
+            index,
             &type_info.owner_fqn,
             &type_info.uri,
             &type_info.type_info,
@@ -922,6 +982,7 @@ impl PhpLspBackend {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::server) fn infer_completion_member_chain_type(
         &self,
+        index: &WorkspaceIndex,
         object_expr: &str,
         tree: &tree_sitter::Tree,
         source_uri: &str,
@@ -945,6 +1006,7 @@ impl PhpLspBackend {
                     current_class_fqn_at_range(file_symbols, (line, byte_col, line, byte_col))?
                 } else if base_expr.starts_with('$') {
                     self.infer_completion_variable_type(
+                        index,
                         tree,
                         source_uri,
                         source,
@@ -963,18 +1025,15 @@ impl PhpLspBackend {
                             completion_context_node_at_byte_col(tree, line, byte_col)?,
                             |class_fqn, method_name| {
                                 self.resolve_completion_member_type_cached(
+                                    index,
                                     class_fqn,
                                     method_name,
                                     file_symbols,
-                                    Some(source_uri),
-                                    Some(source),
+                                    Some((source_uri, source)),
                                     type_cache,
                                 )
                                 .and_then(|type_text| {
-                                    completion_member_type_text_to_object_fqn(
-                                        &self.index,
-                                        &type_text,
-                                    )
+                                    completion_member_type_text_to_object_fqn(index, &type_text)
                                 })
                             },
                         )
@@ -1005,6 +1064,7 @@ impl PhpLspBackend {
                     };
                     let member_type_text = if is_method_call {
                         self.resolve_completion_member_call_type(
+                            index,
                             &class_fqn,
                             &lookup_name,
                             member,
@@ -1013,26 +1073,26 @@ impl PhpLspBackend {
                         )
                         .or_else(|| {
                             self.resolve_completion_member_type_cached(
+                                index,
                                 &class_fqn,
                                 &lookup_name,
                                 file_symbols,
-                                Some(source_uri),
-                                Some(source),
+                                Some((source_uri, source)),
                                 type_cache,
                             )
                         })?
                     } else {
                         self.resolve_completion_member_type_cached(
+                            index,
                             &class_fqn,
                             &lookup_name,
                             file_symbols,
-                            Some(source_uri),
-                            Some(source),
+                            Some((source_uri, source)),
                             type_cache,
                         )?
                     };
                     class_fqn =
-                        completion_member_type_text_to_object_fqn(&self.index, &member_type_text)?;
+                        completion_member_type_text_to_object_fqn(index, &member_type_text)?;
                 }
 
                 Some(class_fqn)
@@ -1052,18 +1112,18 @@ impl PhpLspBackend {
             || {
                 let resolve_member_type = |class_fqn: &str, member_name: &str| {
                     self.resolve_completion_member_type_cached(
+                        ctx.index,
                         class_fqn,
                         member_name,
                         ctx.file_symbols,
-                        Some(ctx.source_uri),
-                        Some(ctx.source),
+                        Some((ctx.source_uri, ctx.source)),
                         ctx.type_cache,
                     )
                     .map(|type_text| completion_member_type_text_for_parser(&type_text))
                 };
                 let callable_param_resolver = |callable_ctx: CallableParameterContext<'_>| {
                     resolve_callable_parameter_type_from_index(
-                        &self.index,
+                        ctx.index,
                         ctx.file_symbols,
                         callable_ctx,
                     )

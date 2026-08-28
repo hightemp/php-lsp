@@ -21,6 +21,7 @@ fn is_call_hierarchy_ref_kind(ref_kind: RefKind) -> bool {
 fn call_hierarchy_item_from_symbol(
     sym: &php_lsp_types::SymbolInfo,
     source: &str,
+    workspace_uri: &str,
 ) -> Option<CallHierarchyItem> {
     let uri = sym.uri.parse::<Uri>().ok()?;
     Some(CallHierarchyItem {
@@ -37,6 +38,7 @@ fn call_hierarchy_item_from_symbol(
         data: Some(serde_json::json!({
             "fqn": sym.fqn,
             "kind": call_hierarchy_kind_key(sym.kind),
+            "workspaceUri": workspace_uri,
         })),
     })
 }
@@ -105,6 +107,7 @@ fn is_type_hierarchy_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
 fn type_hierarchy_item_from_symbol(
     sym: &php_lsp_types::SymbolInfo,
     source: &str,
+    workspace_uri: &str,
 ) -> Option<TypeHierarchyItem> {
     if !is_type_hierarchy_symbol_kind(sym.kind) {
         return None;
@@ -121,12 +124,15 @@ fn type_hierarchy_item_from_symbol(
         data: Some(serde_json::json!({
             "fqn": sym.fqn,
             "kind": call_hierarchy_kind_key(sym.kind),
+            "workspaceUri": workspace_uri,
         })),
     })
 }
 
 async fn type_hierarchy_symbol_from_item(
     backend: &PhpLspBackend,
+    request: &WorkspaceRequestContext,
+    index: &WorkspaceIndex,
     item: &TypeHierarchyItem,
 ) -> Option<Arc<php_lsp_types::SymbolInfo>> {
     let uri = item.uri.as_str();
@@ -178,7 +184,7 @@ async fn type_hierarchy_symbol_from_item(
 
     if let Some(data) = item.data.as_ref() {
         if let Some(fqn) = data.get("fqn").and_then(|value| value.as_str()) {
-            if let Some(sym) = backend.index.resolve_fqn(fqn) {
+            if let Some(sym) = index.resolve_fqn(fqn) {
                 if is_type_hierarchy_symbol_kind(sym.kind) {
                     return Some(sym);
                 }
@@ -187,7 +193,7 @@ async fn type_hierarchy_symbol_from_item(
     }
 
     let source = backend
-        .source_for_uri(uri, "typeHierarchy item source read")
+        .source_for_uri_in_request(request, uri, "typeHierarchy item source read")
         .await?;
     let selection = (
         item.selection_range.start.line,
@@ -203,22 +209,18 @@ async fn type_hierarchy_symbol_from_item(
             item.selection_range.end.character,
         ),
     );
-    backend
-        .index
-        .file_symbols
-        .get(uri)
-        .and_then(|file_symbols| {
-            file_symbols
-                .symbols
-                .iter()
-                .find(|sym| {
-                    sym.name == item.name
-                        && sym.selection_range == selection
-                        && is_type_hierarchy_symbol_kind(sym.kind)
-                })
-                .cloned()
-                .map(Arc::new)
-        })
+    index.file_symbols.get(uri).and_then(|file_symbols| {
+        file_symbols
+            .symbols
+            .iter()
+            .find(|sym| {
+                sym.name == item.name
+                    && sym.selection_range == selection
+                    && is_type_hierarchy_symbol_kind(sym.kind)
+            })
+            .cloned()
+            .map(Arc::new)
+    })
 }
 
 fn direct_type_subtypes(
@@ -351,6 +353,8 @@ pub(super) fn implementation_symbols_for_method(
 
 async fn call_hierarchy_symbol_from_item(
     backend: &PhpLspBackend,
+    request: &WorkspaceRequestContext,
+    index: &WorkspaceIndex,
     item: &CallHierarchyItem,
 ) -> Option<Arc<php_lsp_types::SymbolInfo>> {
     let uri = item.uri.as_str();
@@ -402,14 +406,14 @@ async fn call_hierarchy_symbol_from_item(
 
     if let Some(data) = item.data.as_ref() {
         if let Some(fqn) = data.get("fqn").and_then(|value| value.as_str()) {
-            if let Some(sym) = backend.index.resolve_fqn(fqn) {
+            if let Some(sym) = index.resolve_fqn(fqn) {
                 return Some(sym);
             }
         }
     }
 
     let source = backend
-        .source_for_uri(uri, "callHierarchy item source read")
+        .source_for_uri_in_request(request, uri, "callHierarchy item source read")
         .await?;
     let selection = (
         item.selection_range.start.line,
@@ -425,29 +429,27 @@ async fn call_hierarchy_symbol_from_item(
             item.selection_range.end.character,
         ),
     );
-    backend
-        .index
-        .file_symbols
-        .get(uri)
-        .and_then(|file_symbols| {
-            file_symbols
-                .symbols
-                .iter()
-                .find(|sym| {
-                    sym.name == item.name
-                        && sym.selection_range == selection
-                        && is_call_hierarchy_symbol_kind(sym.kind)
-                })
-                .cloned()
-                .map(Arc::new)
-        })
+    index.file_symbols.get(uri).and_then(|file_symbols| {
+        file_symbols
+            .symbols
+            .iter()
+            .find(|sym| {
+                sym.name == item.name
+                    && sym.selection_range == selection
+                    && is_call_hierarchy_symbol_kind(sym.kind)
+            })
+            .cloned()
+            .map(Arc::new)
+    })
 }
 
 async fn call_hierarchy_target_from_item(
     backend: &PhpLspBackend,
+    request: &WorkspaceRequestContext,
+    index: &WorkspaceIndex,
     item: &CallHierarchyItem,
 ) -> Option<(Arc<php_lsp_types::SymbolInfo>, php_lsp_types::PhpSymbolKind)> {
-    let sym = call_hierarchy_symbol_from_item(backend, item).await?;
+    let sym = call_hierarchy_symbol_from_item(backend, request, index, item).await?;
     let kind = item
         .data
         .as_ref()
@@ -456,6 +458,12 @@ async fn call_hierarchy_target_from_item(
         .and_then(call_hierarchy_kind_from_key)
         .unwrap_or(sym.kind);
     Some((sym, kind))
+}
+
+fn hierarchy_workspace_uri<'a>(data: Option<&'a serde_json::Value>, fallback: &'a str) -> &'a str {
+    data.and_then(|data| data.get("workspaceUri"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback)
 }
 
 fn incoming_call_hierarchy_for_file(
@@ -570,20 +578,28 @@ fn collect_outgoing_call_hierarchy(
 impl PhpLspBackend {
     pub(in crate::server) async fn call_hierarchy_item_for_symbol(
         &self,
+        request: &WorkspaceRequestContext,
+        workspace_uri: &str,
         symbol: &php_lsp_types::SymbolInfo,
         label: &'static str,
     ) -> Option<CallHierarchyItem> {
-        let source = self.source_for_uri(&symbol.uri, label).await?;
-        call_hierarchy_item_from_symbol(symbol, &source)
+        let source = self
+            .source_for_uri_in_request(request, &symbol.uri, label)
+            .await?;
+        call_hierarchy_item_from_symbol(symbol, &source, workspace_uri)
     }
 
     pub(in crate::server) async fn type_hierarchy_item_for_symbol(
         &self,
+        request: &WorkspaceRequestContext,
+        workspace_uri: &str,
         symbol: &php_lsp_types::SymbolInfo,
         label: &'static str,
     ) -> Option<TypeHierarchyItem> {
-        let source = self.source_for_uri(&symbol.uri, label).await?;
-        type_hierarchy_item_from_symbol(symbol, &source)
+        let source = self
+            .source_for_uri_in_request(request, &symbol.uri, label)
+            .await?;
+        type_hierarchy_item_from_symbol(symbol, &source, workspace_uri)
     }
 
     pub(crate) async fn lsp_prepare_call_hierarchy(
@@ -596,6 +612,8 @@ impl PhpLspBackend {
             .uri
             .as_str()
             .to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let pos = params.text_document_position_params.position;
 
         let Some(OpenDocumentSnapshot {
@@ -611,10 +629,10 @@ impl PhpLspBackend {
             let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-                self.resolve_member_type(class_fqn, member_name)
+                resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
             let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+                resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
             };
             let sym_at_pos = symbol_at_position_with_resolvers(
                 tree,
@@ -655,14 +673,24 @@ impl PhpLspBackend {
             symbol = local_candidate.map(Arc::new);
             if symbol.is_none() {
                 symbol = self
-                    .resolve_fqn_lazy_with_fallback(&fqn, ref_kind, allow_global_fallback)
+                    .resolve_fqn_lazy_with_fallback_in_request(
+                        &request,
+                        &fqn,
+                        ref_kind,
+                        allow_global_fallback,
+                    )
                     .await
                     .filter(|symbol| symbol.uri != uri_str);
             }
             if symbol.is_none() && ref_kind == RefKind::Constructor {
                 if let Some(class_fqn) = fqn.strip_suffix("::__construct") {
                     symbol = self
-                        .resolve_fqn_lazy_with_fallback(class_fqn, RefKind::ClassName, false)
+                        .resolve_fqn_lazy_with_fallback_in_request(
+                            &request,
+                            class_fqn,
+                            RefKind::ClassName,
+                            false,
+                        )
                         .await
                         .filter(|symbol| symbol.uri != uri_str);
                 }
@@ -681,10 +709,15 @@ impl PhpLspBackend {
         }
 
         let item = if symbol.uri == uri_str {
-            call_hierarchy_item_from_symbol(&symbol, &source)
+            call_hierarchy_item_from_symbol(&symbol, &source, &uri_str)
         } else {
-            self.call_hierarchy_item_for_symbol(&symbol, "callHierarchy/prepare source read")
-                .await
+            self.call_hierarchy_item_for_symbol(
+                &request,
+                &uri_str,
+                &symbol,
+                "callHierarchy/prepare source read",
+            )
+            .await
         };
         Ok(item.map(|item| vec![item]))
     }
@@ -693,15 +726,19 @@ impl PhpLspBackend {
         &self,
         params: CallHierarchyIncomingCallsParams,
     ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
-        let Some((target, target_kind)) = call_hierarchy_target_from_item(self, &params.item).await
+        let workspace_uri =
+            hierarchy_workspace_uri(params.item.data.as_ref(), params.item.uri.as_str());
+        let request = self.request_context_for_uri(workspace_uri).await;
+        let request_index = request.index(&self.index);
+        let Some((target, target_kind)) =
+            call_hierarchy_target_from_item(self, &request, &request_index, &params.item).await
         else {
             return Ok(None);
         };
 
         let mut calls_by_caller: HashMap<String, (php_lsp_types::SymbolInfo, Vec<Range>)> =
             HashMap::new();
-        let mut file_uris: HashSet<String> = self
-            .index
+        let mut file_uris: HashSet<String> = request_index
             .file_symbols
             .iter()
             .map(|entry| entry.key().clone())
@@ -709,6 +746,7 @@ impl PhpLspBackend {
         let open_file_uris: Vec<String> = self
             .open_files
             .iter()
+            .filter(|entry| request_index.file_symbols.contains_key(entry.key()))
             .map(|entry| entry.key().clone())
             .collect();
         file_uris.extend(
@@ -740,8 +778,7 @@ impl PhpLspBackend {
                 continue;
             }
 
-            let Some(file_symbols) = self
-                .index
+            let Some(file_symbols) = request_index
                 .file_symbols
                 .get(&file_uri)
                 .map(|entry| entry.value().clone())
@@ -804,6 +841,8 @@ impl PhpLspBackend {
         for (caller, ranges) in calls_by_caller.into_values() {
             if let Some(from) = self
                 .call_hierarchy_item_for_symbol(
+                    &request,
+                    workspace_uri,
                     &caller,
                     "callHierarchy/incoming caller source read",
                 )
@@ -828,7 +867,13 @@ impl PhpLspBackend {
         &self,
         params: CallHierarchyOutgoingCallsParams,
     ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
-        let Some((caller, _)) = call_hierarchy_target_from_item(self, &params.item).await else {
+        let workspace_uri =
+            hierarchy_workspace_uri(params.item.data.as_ref(), params.item.uri.as_str());
+        let request = self.request_context_for_uri(workspace_uri).await;
+        let request_index = request.index(&self.index);
+        let Some((caller, _)) =
+            call_hierarchy_target_from_item(self, &request, &request_index, &params.item).await
+        else {
             return Ok(None);
         };
         if !is_call_hierarchy_symbol_kind(caller.kind) {
@@ -847,10 +892,9 @@ impl PhpLspBackend {
             if template_document.is_some() {
                 return Ok(None);
             }
-            outgoing_call_hierarchy_for_tree(&tree, &source, &file_symbols, &self.index, &caller)
+            outgoing_call_hierarchy_for_tree(&tree, &source, &file_symbols, &request_index, &caller)
         } else {
-            let file_symbols = self
-                .index
+            let file_symbols = request_index
                 .file_symbols
                 .get(&file_uri)
                 .map(|entry| entry.value().clone())
@@ -878,7 +922,7 @@ impl PhpLspBackend {
                     &tree,
                     &source,
                     &file_symbols,
-                    &self.index,
+                    &request_index,
                     &caller,
                 )
             } else {
@@ -892,7 +936,13 @@ impl PhpLspBackend {
                 let Some(tree) = parser.tree() else {
                     return Ok(None);
                 };
-                outgoing_call_hierarchy_for_tree(tree, &source, &file_symbols, &self.index, &caller)
+                outgoing_call_hierarchy_for_tree(
+                    tree,
+                    &source,
+                    &file_symbols,
+                    &request_index,
+                    &caller,
+                )
             }
         };
 
@@ -900,6 +950,8 @@ impl PhpLspBackend {
         for (target, ranges) in call_targets {
             if let Some(to) = self
                 .call_hierarchy_item_for_symbol(
+                    &request,
+                    workspace_uri,
                     &target,
                     "callHierarchy/outgoing target source read",
                 )
@@ -930,6 +982,8 @@ impl PhpLspBackend {
             .uri
             .as_str()
             .to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let pos = params.text_document_position_params.position;
 
         let Some(OpenDocumentSnapshot {
@@ -945,10 +999,10 @@ impl PhpLspBackend {
             let tree = &tree;
             let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-                self.resolve_member_type(class_fqn, member_name)
+                resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
             let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+                resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
             };
             let sym_at_pos = symbol_at_position_with_resolvers(
                 tree,
@@ -1000,7 +1054,12 @@ impl PhpLspBackend {
             symbol = local_candidate.map(Arc::new);
             if symbol.is_none() {
                 symbol = self
-                    .resolve_fqn_lazy_with_fallback(&fqn, RefKind::ClassName, false)
+                    .resolve_fqn_lazy_with_fallback_in_request(
+                        &request,
+                        &fqn,
+                        RefKind::ClassName,
+                        false,
+                    )
                     .await
                     .filter(|symbol| symbol.uri != uri_str);
             }
@@ -1012,7 +1071,12 @@ impl PhpLspBackend {
         if symbol.is_none() {
             if let Some(class_fqn) = containing_class_fqn {
                 symbol = self
-                    .resolve_fqn_lazy_with_fallback(&class_fqn, RefKind::ClassName, false)
+                    .resolve_fqn_lazy_with_fallback_in_request(
+                        &request,
+                        &class_fqn,
+                        RefKind::ClassName,
+                        false,
+                    )
                     .await
                     .filter(|symbol| symbol.uri != uri_str);
             }
@@ -1023,10 +1087,15 @@ impl PhpLspBackend {
         };
 
         let item = if symbol.uri == uri_str {
-            type_hierarchy_item_from_symbol(&symbol, &source)
+            type_hierarchy_item_from_symbol(&symbol, &source, &uri_str)
         } else {
-            self.type_hierarchy_item_for_symbol(&symbol, "typeHierarchy/prepare source read")
-                .await
+            self.type_hierarchy_item_for_symbol(
+                &request,
+                &uri_str,
+                &symbol,
+                "typeHierarchy/prepare source read",
+            )
+            .await
         };
         Ok(item.map(|item| vec![item]))
     }
@@ -1035,20 +1104,37 @@ impl PhpLspBackend {
         &self,
         params: TypeHierarchySupertypesParams,
     ) -> Result<Option<Vec<TypeHierarchyItem>>> {
-        let Some(symbol) = type_hierarchy_symbol_from_item(self, &params.item).await else {
+        let workspace_uri =
+            hierarchy_workspace_uri(params.item.data.as_ref(), params.item.uri.as_str());
+        let request = self.request_context_for_uri(workspace_uri).await;
+        let request_index = request.index(&self.index);
+        let Some(symbol) =
+            type_hierarchy_symbol_from_item(self, &request, &request_index, &params.item).await
+        else {
             return Ok(None);
         };
 
         let parent_fqns = direct_type_parent_fqns(&symbol);
         let mut parents = Vec::new();
         for parent_fqn in parent_fqns {
-            self.lazy_index_class(&parent_fqn).await;
+            self.lazy_index_class_dependencies_in_request(&request, &parent_fqn)
+                .await;
             if let Some(parent) = self
-                .resolve_fqn_lazy_with_fallback(&parent_fqn, RefKind::ClassName, false)
+                .resolve_fqn_lazy_with_fallback_in_request(
+                    &request,
+                    &parent_fqn,
+                    RefKind::ClassName,
+                    false,
+                )
                 .await
             {
                 if let Some(item) = self
-                    .type_hierarchy_item_for_symbol(&parent, "typeHierarchy/supertypes source read")
+                    .type_hierarchy_item_for_symbol(
+                        &request,
+                        workspace_uri,
+                        &parent,
+                        "typeHierarchy/supertypes source read",
+                    )
                     .await
                 {
                     parents.push(item);
@@ -1068,14 +1154,25 @@ impl PhpLspBackend {
         &self,
         params: TypeHierarchySubtypesParams,
     ) -> Result<Option<Vec<TypeHierarchyItem>>> {
-        let Some(symbol) = type_hierarchy_symbol_from_item(self, &params.item).await else {
+        let workspace_uri =
+            hierarchy_workspace_uri(params.item.data.as_ref(), params.item.uri.as_str());
+        let request = self.request_context_for_uri(workspace_uri).await;
+        let request_index = request.index(&self.index);
+        let Some(symbol) =
+            type_hierarchy_symbol_from_item(self, &request, &request_index, &params.item).await
+        else {
             return Ok(None);
         };
 
         let mut subtypes = Vec::new();
-        for symbol in direct_type_subtypes(&self.index, &symbol.fqn) {
+        for symbol in direct_type_subtypes(&request_index, &symbol.fqn) {
             if let Some(item) = self
-                .type_hierarchy_item_for_symbol(&symbol, "typeHierarchy/subtypes source read")
+                .type_hierarchy_item_for_symbol(
+                    &request,
+                    workspace_uri,
+                    &symbol,
+                    "typeHierarchy/subtypes source read",
+                )
                 .await
             {
                 subtypes.push(item);

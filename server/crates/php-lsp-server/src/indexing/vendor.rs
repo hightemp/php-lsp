@@ -667,95 +667,100 @@ pub(in crate::server) fn resolve_vendor_paths(
 }
 
 impl PhpLspBackend {
-    pub(in crate::server) async fn vendor_lazy_index_context(&self) -> VendorLazyIndexContext {
-        let mut workspace_configs = self.workspace_configs.lock().await.clone();
-        let exclude_paths = self.exclude_paths.lock().await.clone();
-        let php_version = *self.php_version.lock().await;
-        let index_vendor = *self.index_vendor.lock().await;
-        if workspace_configs.is_empty() {
-            let root = self.workspace_root.lock().await.clone();
-            let namespace_map = self.namespace_map.lock().await.clone();
-            if let Some(root) = root {
-                workspace_configs.push(WorkspaceRootConfig {
-                    root,
-                    namespace_map,
-                });
-            }
+    pub(in crate::server) fn vendor_lazy_index_context_from_request(
+        &self,
+        request: &WorkspaceRequestContext,
+    ) -> VendorLazyIndexContext {
+        if let Some(config) = request.workspace.as_ref() {
+            let runtime = &config.runtime_config;
+            return VendorLazyIndexContext {
+                index: config.index.clone(),
+                workspace_configs: vec![config.clone()],
+                exclude_paths: runtime.exclude_paths.clone(),
+                php_version: runtime.php_version,
+                index_vendor: runtime.index_vendor,
+                vendor_autoload_cache: self.vendor_autoload_cache.clone(),
+                vendor_file_lru: config.vendor_file_lru.clone(),
+            };
         }
-
         VendorLazyIndexContext {
             index: self.index.clone(),
-            workspace_configs,
-            exclude_paths,
-            php_version,
-            index_vendor,
+            workspace_configs: Vec::new(),
+            exclude_paths: request.state.fallback.exclude_paths.clone(),
+            php_version: request.state.fallback.php_version,
+            index_vendor: false,
             vendor_autoload_cache: self.vendor_autoload_cache.clone(),
             vendor_file_lru: self.vendor_file_lru.clone(),
         }
     }
 
-    pub(in crate::server) async fn vendor_namespace_exists_lazy(&self, fqn: &str) -> bool {
-        let index_vendor = *self.index_vendor.lock().await;
-        if !index_vendor {
+    #[cfg(test)]
+    pub(in crate::server) async fn vendor_lazy_index_context_for_uri(
+        &self,
+        uri_str: &str,
+    ) -> VendorLazyIndexContext {
+        let request = self.request_context_for_uri(uri_str).await;
+        self.vendor_lazy_index_context_from_request(&request)
+    }
+
+    #[cfg(test)]
+    pub(in crate::server) async fn vendor_lazy_index_context(&self) -> VendorLazyIndexContext {
+        let state = self.runtime_state_snapshot().await;
+        let workspace = state.configs.first().cloned();
+        self.vendor_lazy_index_context_from_request(&WorkspaceRequestContext { state, workspace })
+    }
+
+    pub(in crate::server) async fn vendor_namespace_exists_lazy_in_request(
+        &self,
+        request: &WorkspaceRequestContext,
+        fqn: &str,
+    ) -> bool {
+        let context = self.vendor_lazy_index_context_from_request(request);
+        if !context.index_vendor {
             return false;
         }
-
-        let mut configs = self.workspace_configs.lock().await.clone();
-        if configs.is_empty() {
-            let root = self.workspace_root.lock().await.clone();
-            let namespace_map = self.namespace_map.lock().await.clone();
-            if let Some(root) = root {
-                configs.push(WorkspaceRootConfig {
-                    root,
-                    namespace_map,
-                });
-            }
-        }
-
-        for config in configs {
+        for config in &context.workspace_configs {
             let vendor_dir = config.root.join("vendor");
             if !vendor_dir.is_dir() {
                 continue;
             }
             if let Some(vendor_map) =
-                cached_vendor_autoload_map(&self.vendor_autoload_cache, &vendor_dir).await
+                cached_vendor_autoload_map(&context.vendor_autoload_cache, &vendor_dir).await
             {
                 if vendor_namespace_exists_from_map(fqn, &vendor_map) {
                     return true;
                 }
             }
         }
-
         false
     }
 
-    pub(in crate::server) async fn resolve_fqn_lazy(
+    #[cfg(test)]
+    pub(in crate::server) async fn resolve_fqn_lazy_for_uri(
         &self,
+        uri_str: &str,
         fqn: &str,
     ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
-        // Try direct lookup first
-        if let Some(sym) = self.index.resolve_fqn(fqn) {
-            return Some(sym);
-        }
-
-        // For member FQNs like "Class::method", extract the class part
-        // so PSR-4 resolution works (PSR-4 maps class names, not members).
-        let class_fqn = if let Some((cls, _member)) = fqn.rsplit_once("::") {
-            cls
-        } else {
-            fqn
-        };
-
-        self.lazy_index_class_dependencies(class_fqn).await;
-
-        // Retry resolution with the full FQN
-        if let Some(sym) = self.index.resolve_fqn(fqn) {
-            return Some(sym);
-        }
-
-        None
+        let request = self.request_context_for_uri(uri_str).await;
+        self.resolve_fqn_lazy_in_request(&request, fqn).await
     }
 
+    pub(in crate::server) async fn resolve_fqn_lazy_in_request(
+        &self,
+        request: &WorkspaceRequestContext,
+        fqn: &str,
+    ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+        let index = request.index(&self.index);
+        if let Some(sym) = index.resolve_fqn(fqn) {
+            return Some(sym);
+        }
+        let class_fqn = fqn.rsplit_once("::").map_or(fqn, |(class, _)| class);
+        let context = self.vendor_lazy_index_context_from_request(request);
+        lazy_index_class_dependencies_with_context(&context, class_fqn).await;
+        index.resolve_fqn(fqn)
+    }
+
+    #[cfg(test)]
     async fn resolve_fqn_lazy_matching_kinds(
         &self,
         fqn: &str,
@@ -771,6 +776,7 @@ impl PhpLspBackend {
         self.index.resolve_fqn_matching_kinds(fqn, expected_kinds)
     }
 
+    #[cfg(test)]
     async fn resolve_member_lazy_matching_kinds(
         &self,
         fqn: &str,
@@ -792,17 +798,29 @@ impl PhpLspBackend {
 
     /// Lazy-index a single class FQN by finding its file via PSR-4/vendor mappings.
     /// Returns true only when the requested class is present in the index after loading.
+    #[cfg(test)]
     pub(in crate::server) async fn lazy_index_class(&self, class_fqn: &str) -> bool {
         let context = self.vendor_lazy_index_context().await;
         lazy_index_class_with_context(&context, class_fqn).await
     }
 
+    #[cfg(test)]
     pub(in crate::server) async fn lazy_index_class_dependencies(&self, class_fqn: &str) {
         let context = self.vendor_lazy_index_context().await;
         lazy_index_class_dependencies_with_context(&context, class_fqn).await;
     }
 
+    pub(in crate::server) async fn lazy_index_class_dependencies_in_request(
+        &self,
+        request: &WorkspaceRequestContext,
+        class_fqn: &str,
+    ) {
+        let context = self.vendor_lazy_index_context_from_request(request);
+        lazy_index_class_dependencies_with_context(&context, class_fqn).await;
+    }
+
     /// Resolve symbol from index with fallback for global built-ins.
+    #[cfg(test)]
     pub(in crate::server) fn resolve_fqn_with_fallback(
         &self,
         fqn: &str,
@@ -818,11 +836,13 @@ impl PhpLspBackend {
     /// type instead.
     pub(in crate::server) async fn try_property_assignment_type_fallback(
         &self,
+        request: &WorkspaceRequestContext,
         uri_str: &str,
         prop_name: &str,
         member_name: &str,
     ) -> Option<GotoDefinitionResponse> {
         use php_lsp_parser::resolve::infer_property_type_from_assignments;
+        let request_index = request.index(&self.index);
 
         let inferred_types = {
             let parser = match self.open_files.get(uri_str) {
@@ -841,15 +861,14 @@ impl PhpLspBackend {
             };
             let source = parser.source();
 
-            let file_symbols = self
-                .index
+            let file_symbols = request_index
                 .file_symbols
                 .get(uri_str)
                 .map(|entry| entry.value().clone())
                 .unwrap_or_default();
 
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-                self.resolve_member_type(class_fqn, member_name)
+                resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
 
             let result = infer_property_type_from_assignments(
@@ -876,9 +895,13 @@ impl PhpLspBackend {
                 fallback_fqn
             );
 
-            if let Some(sym) = self.resolve_fqn_lazy(&fallback_fqn).await {
+            if let Some(sym) = self
+                .resolve_fqn_lazy_in_request(request, &fallback_fqn)
+                .await
+            {
                 if let Some(location) = self
-                    .location_for_symbol_selection(
+                    .location_for_symbol_selection_in_request(
+                        request,
                         &sym,
                         "property assignment fallback target source read",
                     )
@@ -894,6 +917,7 @@ impl PhpLspBackend {
 
     /// Resolve a symbol lazily, applying PHP's global function/constant
     /// fallback only when the original source name permits it.
+    #[cfg(test)]
     pub(in crate::server) async fn resolve_fqn_lazy_with_fallback(
         &self,
         fqn: &str,
@@ -923,6 +947,50 @@ impl PhpLspBackend {
                 {
                     return Some(sym);
                 }
+            }
+        }
+        None
+    }
+
+    pub(in crate::server) async fn resolve_fqn_lazy_with_fallback_in_request(
+        &self,
+        request: &WorkspaceRequestContext,
+        fqn: &str,
+        ref_kind: RefKind,
+        allow_global_fallback: bool,
+    ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
+        let index = request.index(&self.index);
+        let expected_kinds = if let Some(member_kinds) = member_kinds_for_ref_kind(ref_kind) {
+            member_kinds
+        } else {
+            top_level_kinds_for_ref_kind(ref_kind)?
+        };
+        if let Some(sym) = if member_kinds_for_ref_kind(ref_kind).is_some() {
+            index.resolve_member_matching_kinds(fqn, expected_kinds)
+        } else {
+            index.resolve_fqn_matching_kinds(fqn, expected_kinds)
+        } {
+            return Some(sym);
+        }
+
+        let class_fqn = fqn.rsplit_once("::").map_or(fqn, |(class, _)| class);
+        let context = self.vendor_lazy_index_context_from_request(request);
+        lazy_index_class_dependencies_with_context(&context, class_fqn).await;
+        let resolve = |candidate: &str| {
+            if member_kinds_for_ref_kind(ref_kind).is_some() {
+                index.resolve_member_matching_kinds(candidate, expected_kinds)
+            } else {
+                index.resolve_fqn_matching_kinds(candidate, expected_kinds)
+            }
+        };
+        if let Some(sym) = resolve(fqn) {
+            return Some(sym);
+        }
+        if allow_global_fallback
+            && matches!(ref_kind, RefKind::FunctionCall | RefKind::GlobalConstant)
+        {
+            if let Some((_, short_name)) = fqn.rsplit_once('\\') {
+                return resolve(short_name);
             }
         }
         None

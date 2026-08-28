@@ -20,7 +20,7 @@ vm.runInNewContext(result.outputFiles[0].text, {
   filename: "configuration.bundle.cjs",
 });
 
-const { buildExplicitClientSettings } = module.exports;
+const { buildClientConfigurationSnapshot, buildExplicitClientSettings } = module.exports;
 
 class FakeConfiguration {
   constructor(defaults = {}) {
@@ -86,3 +86,36 @@ assert.equal("diagnosticsMode" in snapshot, false, "language override reset must
 assert.equal(snapshot.indexVendor, false, "unrelated explicit override must remain");
 assert.deepEqual(snapshot.stubExtensions, [], "explicit empty list must remain distinguishable");
 assert.equal(snapshot.bundledStubsPath, "/bundled/stubs");
+
+const rootA = new FakeConfiguration({ phpVersion: "8.2", indexVendor: true });
+rootA.set("phpVersion", "7.4", "workspaceFolderValue");
+rootA.set("indexVendor", false, "workspaceFolderValue");
+const rootB = new FakeConfiguration({ phpVersion: "8.2", indexVendor: true });
+rootB.set("diagnostics.mode", "off", "workspaceFolderValue");
+
+const multiRoot = JSON.parse(JSON.stringify(buildClientConfigurationSnapshot(
+  config,
+  [
+    { uri: "file:///workspace/a", configuration: rootA },
+    { uri: "file:///workspace/b", configuration: rootB },
+  ],
+  "/bundled/stubs",
+)));
+assert.deepEqual(multiRoot, {
+  configurationVersion: 2,
+  global: {
+    indexVendor: false,
+    stubExtensions: [],
+  },
+  workspaceFolders: [
+    {
+      uri: "file:///workspace/a",
+      settings: { phpVersion: "7.4", indexVendor: false },
+    },
+    {
+      uri: "file:///workspace/b",
+      settings: { diagnosticsMode: "off" },
+    },
+  ],
+  bundledStubsPath: "/bundled/stubs",
+});

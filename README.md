@@ -173,7 +173,9 @@ phpstorm-stubs support.
 - Additional include and exclude paths from extension configuration.
 - Built-in phpstorm-stubs bundle with configurable extension stubs.
 - Lazy `vendor/` indexing.
-- Multi-root workspace support.
+- Multi-root workspace support with resource-scoped PHP version, diagnostics,
+  Composer/vendor, include/exclude, stubs, formatter, analyzer, and project
+  command-trust settings selected independently for each workspace folder.
 - Watched PHP file changes and LSP file-operation notifications.
 - Create/change/delete PHP file events reindex or remove symbols from the
   workspace index.
@@ -300,6 +302,12 @@ explicit VS Code settings. Executable analyzer and formatter settings from
 project config are ignored unless `phpLsp.allowProjectCommands` is enabled in
 VS Code or `allowProjectCommands = true` is set in global php-lsp config. See
 [Configuration](docs/configuration.md).
+
+In a multi-root VS Code workspace, the extension sends one explicit-settings
+snapshot per workspace folder. A document uses the most specific containing
+folder; settings and trusted project commands from one root do not become
+defaults for another root. Files outside every workspace root use only global
+and client-wide fallback settings.
 
 Example external diagnostics setup:
 

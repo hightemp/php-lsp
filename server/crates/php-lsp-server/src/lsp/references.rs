@@ -33,6 +33,11 @@ enum OpenSymbolAuthority {
     Closed,
 }
 
+struct OpenReferenceOverlay<'a> {
+    symbol_cache: &'a mut HashMap<String, OpenSymbolAuthority>,
+    qualified_targets: &'a HashSet<(php_lsp_types::PhpSymbolKind, String)>,
+}
+
 fn reference_target_key(fqn: &str, kind: php_lsp_types::PhpSymbolKind) -> String {
     match kind {
         php_lsp_types::PhpSymbolKind::Function => fqn.trim_start_matches('\\').to_ascii_lowercase(),
@@ -164,6 +169,7 @@ impl PhpLspBackend {
 
     fn reference_snapshot_for_scan(
         &self,
+        index: &WorkspaceIndex,
         uri: &str,
     ) -> Option<Vec<php_lsp_types::SymbolReference>> {
         if let Some(snapshot) = self.open_reference_snapshot(uri) {
@@ -173,8 +179,7 @@ impl PhpLspBackend {
             };
         }
 
-        let indexed_references = self
-            .index
+        let indexed_references = index
             .file_references
             .get(uri)
             .map(|entry| entry.value().clone());
@@ -196,12 +201,12 @@ impl PhpLspBackend {
 
     fn reference_matches_with_open_overlay(
         &self,
+        index: &WorkspaceIndex,
         reference: &php_lsp_types::SymbolReference,
         target_fqn: &str,
         target_kind: php_lsp_types::PhpSymbolKind,
         include_declaration: bool,
-        open_symbol_cache: &mut HashMap<String, OpenSymbolAuthority>,
-        open_qualified_targets: &HashSet<(php_lsp_types::PhpSymbolKind, String)>,
+        overlay: &mut OpenReferenceOverlay<'_>,
     ) -> bool {
         if reference.is_declaration && !include_declaration {
             return false;
@@ -219,7 +224,7 @@ impl PhpLspBackend {
                     php_lsp_types::symbol_fqn_eq(short_name, target_fqn, target_kind)
                 });
         if is_global_fallback_candidate
-            && open_qualified_targets.contains(&(
+            && overlay.qualified_targets.contains(&(
                 target_kind,
                 reference_target_key(&reference.target_fqn, target_kind),
             ))
@@ -227,7 +232,7 @@ impl PhpLspBackend {
             return false;
         }
         if symbol_reference_matches(
-            &self.index,
+            index,
             reference,
             target_fqn,
             target_kind,
@@ -240,14 +245,14 @@ impl PhpLspBackend {
         }
 
         let target_key = reference_target_key(&reference.target_fqn, target_kind);
-        let qualified_target_exists = open_qualified_targets.contains(&(target_kind, target_key))
-            || match self
-                .index
-                .resolve_fqn_matching_kinds(&reference.target_fqn, &[target_kind])
-            {
+        let qualified_target_exists = overlay
+            .qualified_targets
+            .contains(&(target_kind, target_key))
+            || match index.resolve_fqn_matching_kinds(&reference.target_fqn, &[target_kind]) {
                 None => false,
                 Some(resolved) => {
-                    let authority = open_symbol_cache
+                    let authority = overlay
+                        .symbol_cache
                         .entry(resolved.uri.clone())
                         .or_insert_with(|| self.open_symbol_authority(&resolved.uri));
                     match authority {
@@ -271,12 +276,13 @@ impl PhpLspBackend {
 
     pub(in crate::server) fn reference_scan_matches(
         &self,
+        index: &WorkspaceIndex,
+        request: Option<&WorkspaceRequestContext>,
         target_fqn: &str,
         target_kind: php_lsp_types::PhpSymbolKind,
         include_declaration: bool,
     ) -> Vec<(String, Vec<php_lsp_types::SymbolReference>)> {
-        let mut uris: HashSet<String> = self
-            .index
+        let mut uris: HashSet<String> = index
             .file_references
             .iter()
             .map(|entry| entry.key().clone())
@@ -284,6 +290,23 @@ impl PhpLspBackend {
         let open_uris: Vec<String> = self
             .open_files
             .iter()
+            .filter(|entry| {
+                std::ptr::eq(index, self.index.as_ref())
+                    || index.file_symbols.contains_key(entry.key())
+                    || request.is_none_or(|request| {
+                        if let Some(config) = request.workspace.as_ref() {
+                            return uri_to_path(entry.key()).is_some_and(|path| {
+                                workspace_config_for_path_from_configs(
+                                    std::slice::from_ref(config),
+                                    &path,
+                                )
+                                .is_some()
+                            });
+                        }
+                        workspace_config_for_uri_from_configs(&request.state.configs, entry.key())
+                            .is_none()
+                    })
+            })
             .map(|entry| entry.key().clone())
             .collect();
         uris.extend(open_uris.iter().cloned());
@@ -315,15 +338,19 @@ impl PhpLspBackend {
         }
         uris.into_iter()
             .filter_map(|uri| {
-                let mut references = self.reference_snapshot_for_scan(&uri)?;
+                let mut references = self.reference_snapshot_for_scan(index, &uri)?;
+                let mut overlay = OpenReferenceOverlay {
+                    symbol_cache: &mut open_symbol_cache,
+                    qualified_targets: &open_qualified_targets,
+                };
                 references.retain(|reference| {
                     self.reference_matches_with_open_overlay(
+                        index,
                         reference,
                         target_fqn,
                         target_kind,
                         include_declaration,
-                        &mut open_symbol_cache,
-                        &open_qualified_targets,
+                        &mut overlay,
                     )
                 });
                 Some((uri, references))
@@ -341,6 +368,8 @@ impl PhpLspBackend {
             .uri
             .as_str()
             .to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let pos = params.text_document_position_params.position;
 
         let parser = match self.open_files.get(&uri_str) {
@@ -379,8 +408,13 @@ impl PhpLspBackend {
         let resolved = if local_symbol.is_some() {
             local_symbol
         } else {
-            self.resolve_fqn_with_fallback(&sym.fqn, sym.ref_kind, sym.allows_global_fallback)
-                .filter(|symbol| symbol.uri != uri_str)
+            resolve_fqn_with_ref_kind(
+                &request_index,
+                &sym.fqn,
+                sym.ref_kind,
+                sym.allows_global_fallback,
+            )
+            .filter(|symbol| symbol.uri != uri_str)
         };
         let (target_fqn, target_kind) = if let Some(resolved) = resolved {
             (resolved.fqn.clone(), resolved.kind)
@@ -393,7 +427,7 @@ impl PhpLspBackend {
             php_lsp_types::PhpSymbolKind::Function | php_lsp_types::PhpSymbolKind::GlobalConstant
         ) {
             let highlights: Vec<DocumentHighlight> = self
-                .references_for_file(&uri_str, &target_fqn, target_kind, true)
+                .references_for_file(&request_index, &uri_str, &target_fqn, target_kind, true)
                 .into_iter()
                 .map(|reference| DocumentHighlight {
                     range: range_from_lsp_tuple(reference.range),
@@ -434,6 +468,8 @@ impl PhpLspBackend {
             .uri
             .as_str()
             .to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let pos = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
 
@@ -452,10 +488,10 @@ impl PhpLspBackend {
             let file_symbols = extract_file_symbols(tree, &source, &uri_str);
 
             let resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-                self.resolve_member_type(class_fqn, member_name)
+                resolve_member_type_from_index(&request_index, class_fqn, member_name)
             };
             let callable_param_resolver = |ctx: CallableParameterContext<'_>| {
-                resolve_callable_parameter_type_from_index(&self.index, &file_symbols, ctx)
+                resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
             };
 
             match symbol_at_position_with_resolvers(
@@ -520,7 +556,8 @@ impl PhpLspBackend {
                     let resolved = if local_symbol.is_some() {
                         local_symbol
                     } else {
-                        self.resolve_fqn_with_fallback(
+                        resolve_fqn_with_ref_kind(
+                            &request_index,
                             &sym.fqn,
                             sym.ref_kind,
                             sym.allows_global_fallback,
@@ -539,8 +576,13 @@ impl PhpLspBackend {
 
         // Search all indexed files for references
         let mut locations = Vec::new();
-        let scanned_files =
-            self.reference_scan_matches(&target_fqn, target_kind, include_declaration);
+        let scanned_files = self.reference_scan_matches(
+            &request_index,
+            Some(&request),
+            &target_fqn,
+            target_kind,
+            include_declaration,
+        );
 
         for (scanned_file_count, (file_uri, references)) in scanned_files.into_iter().enumerate() {
             cooperative_heavy_request_yield(scanned_file_count).await;
@@ -567,6 +609,8 @@ impl PhpLspBackend {
         params: CodeLensParams,
     ) -> Result<Option<Vec<CodeLens>>> {
         let uri_str = params.text_document.uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let request_index = request.index(&self.index);
         let document_uri = match uri_str.parse::<Uri>() {
             Ok(uri) => uri,
             Err(_) => return Ok(None),
@@ -579,8 +623,7 @@ impl PhpLspBackend {
             let source = parser.source();
             (extract_file_symbols(tree, &source, &uri_str), source)
         } else {
-            let Some(file_symbols) = self
-                .index
+            let Some(file_symbols) = request_index
                 .file_symbols
                 .get(&uri_str)
                 .map(|entry| entry.value().as_ref().clone())
@@ -603,7 +646,13 @@ impl PhpLspBackend {
             .iter()
             .filter(|symbol| is_code_lens_symbol_kind(symbol.kind))
         {
-            let locations = self.reference_locations_for_symbol(&symbol.fqn, symbol.kind, false);
+            let locations = self.reference_locations_for_symbol(
+                &request_index,
+                Some(&request),
+                &symbol.fqn,
+                symbol.kind,
+                false,
+            );
             let range_tuple = range_byte_to_utf16(&source, symbol.selection_range);
             let start = Position::new(range_tuple.0, range_tuple.1);
             let end = if range_tuple.0 == range_tuple.2 {

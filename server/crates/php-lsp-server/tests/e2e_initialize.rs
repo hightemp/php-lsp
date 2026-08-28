@@ -849,3 +849,245 @@ class Demo {
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_multi_root_resource_settings_select_php_version_by_document_uri() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-multiroot-config-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let root_a = tmp.join("root-a");
+    let root_b = tmp.join("root-b");
+    fs::create_dir_all(&root_a).unwrap();
+    fs::create_dir_all(&root_b).unwrap();
+    let root_a_uri = php_lsp_types::uri::path_to_uri(&root_a).unwrap();
+    let root_b_uri = php_lsp_types::uri::path_to_uri(&root_b).unwrap();
+    let file_a_uri = php_lsp_types::uri::path_to_uri(&root_a.join("Subject.php")).unwrap();
+    let file_b_uri = php_lsp_types::uri::path_to_uri(&root_b.join("Subject.php")).unwrap();
+    let vendor_uri = php_lsp_types::uri::path_to_uri(&root_b.join("VendorBar.php")).unwrap();
+    let source = r#"<?php
+namespace App;
+
+/**
+ * @return string|null
+ */
+function label($value) {
+    return $value;
+}
+
+class Demo {
+    public function run(): void {
+        new Bar();
+    }
+}
+"#;
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_workspace_folders_and_options(
+            1,
+            vec![("root-a", &root_a_uri), ("root-b", &root_b_uri)],
+            Some(json!({
+                "configurationVersion": 2,
+                "global": { "diagnosticsMode": "basic-semantic" },
+                "workspaceFolders": [
+                    {
+                        "uri": root_a_uri,
+                        "settings": { "phpVersion": "7.4", "diagnosticsMode": "off" }
+                    },
+                    { "uri": root_b_uri, "settings": { "phpVersion": "8.2" } }
+                ]
+            })),
+        ))
+        .await
+        .unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            &vendor_uri,
+            "<?php\nnamespace Vendor;\nclass Bar {}\n",
+        ))
+        .await
+        .unwrap();
+
+    for uri in [&file_a_uri, &file_b_uri] {
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(uri, source))
+            .await
+            .unwrap();
+    }
+
+    let php74 = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(add_return_type_request(2, &file_a_uri, ((0, 0), (15, 0))))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        php74
+            .as_array()
+            .is_some_and(|actions| actions.iter().all(|action| {
+                action.get("title").and_then(serde_json::Value::as_str)
+                    != Some("Add return type `string|null`")
+            })),
+        "root A PHP 7.4 must not offer a union return type, got: {php74}"
+    );
+
+    let php82 = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(add_return_type_request(3, &file_b_uri, ((0, 0), (15, 0))))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        php82
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|action| {
+                action.get("title").and_then(serde_json::Value::as_str)
+                    == Some("Add return type `string|null`")
+            })),
+        "root B PHP 8.2 must offer a union return type, got: {php82}"
+    );
+
+    let diagnostics_off = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(code_action_request(
+                4,
+                &file_a_uri,
+                12,
+                12,
+                12,
+                15,
+                json!([]),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        diagnostics_off
+            .as_array()
+            .is_some_and(|actions| actions.is_empty()),
+        "root A diagnostics=off must not offer computed fixes, got: {diagnostics_off}"
+    );
+
+    let diagnostics_on = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(code_action_request(
+                5,
+                &file_b_uri,
+                12,
+                12,
+                12,
+                15,
+                json!([]),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        diagnostics_on
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|action| {
+                action.get("title").and_then(serde_json::Value::as_str)
+                    == Some("Import Vendor\\Bar")
+            })),
+        "root B basic-semantic diagnostics must offer the import fix, got: {diagnostics_on}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_configuration_notification(json!({
+            "configurationVersion": 2,
+            "global": { "diagnosticsMode": "basic-semantic" },
+            "workspaceFolders": [
+                {
+                    "uri": root_a_uri,
+                    "settings": { "phpVersion": "8.2" }
+                },
+                {
+                    "uri": root_b_uri,
+                    "settings": { "phpVersion": "7.4", "diagnosticsMode": "off" }
+                }
+            ]
+        })))
+        .await
+        .unwrap();
+
+    let updated_a = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(add_return_type_request(6, &file_a_uri, ((0, 0), (15, 0))))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        updated_a
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|action| {
+                action.get("title").and_then(serde_json::Value::as_str)
+                    == Some("Add return type `string|null`")
+            })),
+        "updated root A PHP 8.2 config must be visible immediately, got: {updated_a}"
+    );
+    let updated_b = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(add_return_type_request(7, &file_b_uri, ((0, 0), (15, 0))))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        updated_b
+            .as_array()
+            .is_some_and(|actions| actions.iter().all(|action| {
+                action.get("title").and_then(serde_json::Value::as_str)
+                    != Some("Add return type `string|null`")
+            })),
+        "updated root B PHP 7.4 config must not inherit root A, got: {updated_b}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}

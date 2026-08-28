@@ -1022,13 +1022,13 @@ namespace App\Lsp;
 
 StRlEn("x");
 "#;
-    let uri = "file:///test/BuiltinRename.php";
+    let uri = format!("{root_uri}/BuiltinRename.php");
 
     service
         .ready()
         .await
         .unwrap()
-        .call(did_open_notification(uri, code))
+        .call(did_open_notification(&uri, code))
         .await
         .unwrap();
 
@@ -1037,7 +1037,7 @@ StRlEn("x");
         .ready()
         .await
         .unwrap()
-        .call(definition_request(2, uri, 3, 2))
+        .call(definition_request(2, &uri, 3, 2))
         .await
         .unwrap();
     let def_result = extract_result(def_resp);
@@ -1051,7 +1051,7 @@ StRlEn("x");
         .ready()
         .await
         .unwrap()
-        .call(prepare_rename_request(3, uri, 3, 2))
+        .call(prepare_rename_request(3, &uri, 3, 2))
         .await
         .unwrap();
     let prepare_result = extract_result(prepare_resp);
@@ -1064,7 +1064,7 @@ StRlEn("x");
         .ready()
         .await
         .unwrap()
-        .call(rename_request(4, uri, 3, 2, "str_len"))
+        .call(rename_request(4, &uri, 3, 2, "str_len"))
         .await
         .unwrap();
     let err = extract_error_message(rename_resp).unwrap_or_default();

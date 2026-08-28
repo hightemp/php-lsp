@@ -3,6 +3,107 @@ mod support;
 use support::*;
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_outside_workspace_uses_isolated_global_fallback_stubs() {
+    let stubs_path_raw = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/stubs");
+    if !stubs_path_raw.join("PhpStormStubsMap.php").is_file() {
+        eprintln!(
+            "Skipping fallback stubs test: stubs are not initialized at {}",
+            stubs_path_raw.display()
+        );
+        return;
+    }
+    let stubs_path = stubs_path_raw.canonicalize().unwrap();
+    let tmp_root =
+        std::env::temp_dir().join(format!("php-lsp-fallback-stubs-{}", std::process::id()));
+    fs::create_dir_all(&tmp_root).unwrap();
+    let root_uri = php_lsp_types::uri::path_to_uri(&tmp_root).unwrap();
+    let inside_uri = php_lsp_types::uri::path_to_uri(&tmp_root.join("Inside.php")).unwrap();
+    let outside_uri = "file:///php-lsp-outside/Fallback.php";
+    let code = "<?php new \\ReflectionClass('stdClass');\n";
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            Some(root_uri.as_str()),
+            Some(json!({
+                "configurationVersion": 2,
+                "global": { "stubExtensions": ["Reflection"] },
+                "workspaceFolders": [
+                    { "uri": root_uri.as_str(), "settings": { "stubExtensions": [] } }
+                ],
+                "bundledStubsPath": stubs_path.to_string_lossy().to_string()
+            })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(outside_uri, code))
+        .await
+        .unwrap();
+    let outside = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(2, outside_uri, 0, 13))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        outside
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|uri| uri.starts_with("phpstub://Reflection/")),
+        "outside document should resolve from fallback stubs: {outside}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(inside_uri.as_str(), code))
+        .await
+        .unwrap();
+    let inside = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(definition_request(3, inside_uri.as_str(), 0, 13))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        inside.is_null(),
+        "root with disabled stubs must not borrow fallback symbols: {inside}"
+    );
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(tmp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_completion() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -1945,12 +2046,12 @@ function validate(object $object, mixed $method): void
     let marker_line = marker_prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
     let marker_line_start = marker_prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
     let marker_character = (marker_prefix.len() - marker_line_start) as u32;
-    let uri = "file:///test/ReflectionCompletion.php";
+    let uri = format!("{root_uri}/ReflectionCompletion.php");
     service
         .ready()
         .await
         .unwrap()
-        .call(did_open_notification(uri, &code))
+        .call(did_open_notification(&uri, &code))
         .await
         .unwrap();
 
@@ -1958,7 +2059,7 @@ function validate(object $object, mixed $method): void
         .ready()
         .await
         .unwrap()
-        .call(completion_request(2, uri, 16, 29))
+        .call(completion_request(2, &uri, 16, 29))
         .await
         .unwrap();
     let result = extract_result(resp);
@@ -1983,7 +2084,7 @@ function validate(object $object, mixed $method): void
         .ready()
         .await
         .unwrap()
-        .call(completion_request(3, uri, marker_line, marker_character))
+        .call(completion_request(3, &uri, marker_line, marker_character))
         .await
         .unwrap();
     let result = extract_result(resp);
@@ -2008,6 +2109,7 @@ function validate(object $object, mixed $method): void
         .call(shutdown_request(99))
         .await
         .unwrap();
+    let _ = fs::remove_dir_all(tmp_root);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3541,7 +3643,10 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         write_completion_result
     );
 
-    let static_usage_uri = "file:///test/PhpDocStaticVirtualMembers.php";
+    let static_usage_uri = php_lsp_types::uri::path_to_uri(
+        &fixture_root.join("src/PhpDoc/PhpDocStaticVirtualMembers.php"),
+    )
+    .unwrap();
     let static_usage_content =
         "<?php\nnamespace App\\PhpDoc;\nfunction makeSupported(): void\n{\n    SupportedTags::\n}\n";
     let static_completion_position = utf16_position_after(static_usage_content, "SupportedTags::");
@@ -3550,7 +3655,7 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .await
         .unwrap()
         .call(did_open_notification(
-            static_usage_uri,
+            static_usage_uri.as_str(),
             static_usage_content,
         ))
         .await
@@ -3561,7 +3666,7 @@ async fn test_phpdoc_fixture_hover_completion_definition_and_diagnostics() {
         .unwrap()
         .call(completion_request(
             42,
-            static_usage_uri,
+            static_usage_uri.as_str(),
             static_completion_position.0,
             static_completion_position.1,
         ))

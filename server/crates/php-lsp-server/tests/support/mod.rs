@@ -39,6 +39,14 @@ pub fn initialize_request_with_options(
 }
 
 pub fn initialize_request_with_workspace_folders(id: i64, folders: Vec<(&str, &str)>) -> Request {
+    initialize_request_with_workspace_folders_and_options(id, folders, None)
+}
+
+pub fn initialize_request_with_workspace_folders_and_options(
+    id: i64,
+    folders: Vec<(&str, &str)>,
+    initialization_options: Option<serde_json::Value>,
+) -> Request {
     let workspace_folders: Vec<_> = folders
         .into_iter()
         .map(|(name, uri)| {
@@ -49,18 +57,19 @@ pub fn initialize_request_with_workspace_folders(id: i64, folders: Vec<(&str, &s
         })
         .collect();
 
-    Request::build("initialize")
-        .params(json!({
-            "capabilities": {
-                "workspace": {
-                    "workspaceFolders": true
-                }
-            },
-            "rootUri": null,
-            "workspaceFolders": workspace_folders
-        }))
-        .id(id)
-        .finish()
+    let mut params = json!({
+        "capabilities": {
+            "workspace": {
+                "workspaceFolders": true
+            }
+        },
+        "rootUri": null,
+        "workspaceFolders": workspace_folders
+    });
+    if let Some(options) = initialization_options {
+        params["initializationOptions"] = options;
+    }
+    Request::build("initialize").params(params).id(id).finish()
 }
 
 pub fn initialized_notification() -> Request {

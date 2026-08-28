@@ -12,6 +12,21 @@ export interface ConfigurationReader {
   get<T>(key: string, defaultValue: T): T;
 }
 
+export interface WorkspaceConfigurationSource {
+  uri: string;
+  configuration: ConfigurationReader;
+}
+
+export interface ClientConfigurationSnapshot {
+  configurationVersion: 2;
+  global: Record<string, unknown>;
+  workspaceFolders: Array<{
+    uri: string;
+    settings: Record<string, unknown>;
+  }>;
+  bundledStubsPath?: string;
+}
+
 function hasExplicitValue(config: ConfigurationReader, key: string): boolean {
   const inspected = config.inspect<unknown>(key);
   return inspected !== undefined && (
@@ -100,4 +115,32 @@ export function buildExplicitClientSettings(
   }
 
   return options;
+}
+
+/**
+ * Build the versioned configuration payload consumed by the server.
+ *
+ * VS Code resource settings are resolved independently for every workspace
+ * folder. Schema defaults remain omitted so a project `.php-lsp.toml` value is
+ * revealed again when a user override is removed.
+ */
+export function buildClientConfigurationSnapshot(
+  globalConfiguration: ConfigurationReader,
+  workspaceFolders: readonly WorkspaceConfigurationSource[],
+  stubsPath: string | undefined,
+): ClientConfigurationSnapshot {
+  const snapshot: ClientConfigurationSnapshot = {
+    configurationVersion: 2,
+    global: buildExplicitClientSettings(globalConfiguration, undefined),
+    workspaceFolders: workspaceFolders.map((folder) => ({
+      uri: folder.uri,
+      settings: buildExplicitClientSettings(folder.configuration, undefined),
+    })),
+  };
+
+  if (stubsPath) {
+    snapshot.bundledStubsPath = stubsPath;
+  }
+
+  return snapshot;
 }

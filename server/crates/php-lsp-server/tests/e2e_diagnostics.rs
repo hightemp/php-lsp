@@ -230,8 +230,36 @@ final class ImmediateOpen
         backend.did_open(open_params)
     );
 
-    let early_diagnostics =
-        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(3)).await;
+    let started = std::time::Instant::now();
+    let mut early_diagnostics = None;
+    let mut indexing_ready = false;
+    while early_diagnostics.is_none() || !indexing_ready {
+        let remaining = Duration::from_secs(10)
+            .checked_sub(started.elapsed())
+            .expect("timed out waiting for diagnostics and indexing ready");
+        let notification = tokio::time::timeout(remaining, notifications.recv())
+            .await
+            .expect("timed out waiting for diagnostics and indexing ready")
+            .expect("notification channel closed");
+        if notification.method() == "textDocument/publishDiagnostics"
+            && notification
+                .params()
+                .and_then(|params| params.get("uri"))
+                .and_then(serde_json::Value::as_str)
+                == Some(app_uri.as_str())
+        {
+            early_diagnostics = notification.params().cloned();
+        } else if notification.method() == "phpLsp/indexingStatus"
+            && notification
+                .params()
+                .and_then(|params| params.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                == Some("ready")
+        {
+            indexing_ready = true;
+        }
+    }
+    let early_diagnostics = early_diagnostics.expect("early diagnostics");
     let early_messages = published_diagnostic_messages(&early_diagnostics);
     assert!(
         !early_messages
@@ -240,9 +268,6 @@ final class ImmediateOpen
         "diagnostics published during initialized setup should not report unresolved symbols, got: {:?}",
         early_messages
     );
-
-    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
-
     service
         .ready()
         .await
@@ -1175,8 +1200,6 @@ async fn test_php_version_filters_version_gated_stubs() {
     let code = r#"<?php
 sodium_crypto_stream_xchacha20_xor_ic('a', 'b', 0, 'c');
 "#;
-    let uri = "file:///test/PhpVersionStubs.php";
-
     let (mut service81, socket81) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
         socket81.collect::<Vec<_>>().await;
@@ -1185,6 +1208,7 @@ sodium_crypto_stream_xchacha20_xor_ic('a', 'b', 0, 'c');
         std::env::temp_dir().join(format!("php-lsp-version-stubs-81-{}", std::process::id()));
     fs::create_dir_all(&tmp_root81).unwrap();
     let root_uri81 = format!("file://{}", tmp_root81.to_string_lossy());
+    let uri81 = format!("{root_uri81}/PhpVersionStubs.php");
     service81
         .ready()
         .await
@@ -1211,14 +1235,14 @@ sodium_crypto_stream_xchacha20_xor_ic('a', 'b', 0, 'c');
         .ready()
         .await
         .unwrap()
-        .call(did_open_notification(uri, code))
+        .call(did_open_notification(&uri81, code))
         .await
         .unwrap();
     let php81_definition = service81
         .ready()
         .await
         .unwrap()
-        .call(definition_request(2, uri, 1, 5))
+        .call(definition_request(2, &uri81, 1, 5))
         .await
         .unwrap();
     assert!(
@@ -1242,6 +1266,7 @@ sodium_crypto_stream_xchacha20_xor_ic('a', 'b', 0, 'c');
         std::env::temp_dir().join(format!("php-lsp-version-stubs-82-{}", std::process::id()));
     fs::create_dir_all(&tmp_root82).unwrap();
     let root_uri82 = format!("file://{}", tmp_root82.to_string_lossy());
+    let uri82 = format!("{root_uri82}/PhpVersionStubs.php");
     service82
         .ready()
         .await
@@ -1268,14 +1293,14 @@ sodium_crypto_stream_xchacha20_xor_ic('a', 'b', 0, 'c');
         .ready()
         .await
         .unwrap()
-        .call(did_open_notification(uri, code))
+        .call(did_open_notification(&uri82, code))
         .await
         .unwrap();
     let php82_definition = service82
         .ready()
         .await
         .unwrap()
-        .call(definition_request(4, uri, 1, 5))
+        .call(definition_request(4, &uri82, 1, 5))
         .await
         .unwrap();
     let php82_result = extract_result(php82_definition);
@@ -1295,4 +1320,102 @@ sodium_crypto_stream_xchacha20_xor_ic('a', 'b', 0, 'c');
         .await
         .unwrap();
     let _ = fs::remove_dir_all(&tmp_root82);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_config_change_cancels_pending_old_generation_diagnostics() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+    let tmp_root = std::env::temp_dir().join(format!(
+        "php-lsp-diagnostic-config-race-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&tmp_root).unwrap();
+    let root_uri = path_to_uri(&tmp_root).unwrap();
+    let file_uri = path_to_uri(&tmp_root.join("Subject.php")).unwrap();
+    let settings = |mode: &str| {
+        json!({
+            "configurationVersion": 2,
+            "global": { "composerEnabled": false, "stubExtensions": [] },
+            "workspaceFolders": [
+                {
+                    "uri": root_uri.as_str(),
+                    "settings": { "diagnosticsMode": mode }
+                }
+            ]
+        })
+    };
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            Some(root_uri.as_str()),
+            Some(settings("basic-semantic")),
+        ))
+        .await
+        .unwrap();
+    let valid = "<?php\nclass Subject {}\n";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(file_uri.as_str(), valid))
+        .await
+        .unwrap();
+    let _ = next_publish_diagnostics(
+        &mut notifications,
+        file_uri.as_str(),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_full_notification(
+            file_uri.as_str(),
+            2,
+            "<?php\nnew MissingFromOldConfig();\n",
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_configuration_notification(settings("off")))
+        .await
+        .unwrap();
+    let after_change = next_publish_diagnostics(
+        &mut notifications,
+        file_uri.as_str(),
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        published_diagnostic_messages(&after_change).is_empty(),
+        "diagnostics=off should publish an empty replacement: {after_change}"
+    );
+    expect_no_publish_diagnostics(
+        &mut notifications,
+        file_uri.as_str(),
+        Duration::from_millis(400),
+    )
+    .await;
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(tmp_root);
 }

@@ -331,13 +331,15 @@ edited file and an indexed cross-file call follow the same type path.
    - Otherwise `client/bin/<platform>/php-lsp` or `php-lsp.exe`.
    - If the bundled binary is missing and no custom path is configured,
      `php-lsp` from `PATH`.
-3. The client sends `initialize` with explicit `phpLsp.*` settings plus the
-   bundled stubs fallback path. VS Code default values are not sent as
-   overrides, so `.php-lsp.toml` can define shared project defaults.
-4. The server loads effective configuration in this order: built-in defaults,
-   global config, project `.php-lsp.toml`, then explicit client settings.
-   Executable analyzer and formatter settings from project config are ignored
-   unless command trust is enabled from VS Code or global config.
+3. The client sends `initialize` with a versioned configuration snapshot:
+   client-wide explicit `phpLsp.*` settings, one resource-scoped settings object
+   per workspace folder, and the bundled stubs fallback path. VS Code defaults
+   are omitted so `.php-lsp.toml` can define shared project defaults.
+4. For every workspace folder independently, the server loads configuration in
+   this order: built-in defaults, global config, that root's project
+   `.php-lsp.toml`, then that folder's explicit client settings. Executable
+   analyzer and formatter settings are sanitized with the trust value of the
+   same root.
 5. The server stores the settings and advertises capabilities.
 6. After `initialized`, the server:
    - Discovers effective workspace roots, including Composer roots.
@@ -367,9 +369,25 @@ to an effective root:
 - `phpLsp.excludePaths` removes relative or absolute paths from indexing and
   lazy vendor work.
 
-Workspace folder changes update the root list and remove disk-derived symbols
-for removed roots while retaining authoritative open-buffer index state.
-Configuration changes that affect indexing trigger a workspace reindex.
+Each mapping keeps the original workspace-folder path, its Composer effective
+root, namespace map, immutable `ResolvedRuntimeConfiguration`, and a root-owned
+symbol/reference index. Document requests prefer the most specific explicit
+workspace-folder match, capture the whole generation before asynchronous work,
+and use only that root index. A file outside all roots does not fall back to the
+first root; it receives only the client/global fallback configuration.
+
+The server also maintains a workspace-wide aggregate for `workspace/symbol`.
+It is not used for document-scoped definition, hover, completion, diagnostics,
+references, rename, or hierarchy resolution. This separation permits two roots
+to define the same FQN and to load the same `phpstub://` URI from different stub
+trees/PHP versions without overwriting each other's request view. Indexing,
+cache inputs, Twig context inference, vendor lazy loads, formatter/analyzer
+commands, and configuration side effects are selected per owning root.
+
+Workspace folder removal drops only the exact folder context; a nested folder
+or another folder sharing the same Composer effective root remains live.
+Configuration changes replace and reindex only affected root indexes while
+preserving unchanged root indexes.
 
 ## Open File Model
 
@@ -831,7 +849,10 @@ Non-LSP command-line entry points are `analyze::run_analyze_cli` and
 ## Configuration Updates
 
 `workspace/didChangeConfiguration` and watched `.php-lsp.toml` changes are
-applied at runtime:
+applied at runtime. The client resends the complete versioned per-folder
+snapshot after configuration and workspace-folder changes; the server builds
+all root contexts off-lock and publishes the replacement set together before
+starting side effects:
 
 | Changed setting group | Server action |
 |---|---|
