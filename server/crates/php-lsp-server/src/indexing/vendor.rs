@@ -1,5 +1,7 @@
 //! Vendor indexing helpers.
 
+use crate::util::fs_walk::{symlink_aliases_on_path, walk_files};
+
 use super::super::*;
 
 #[derive(Debug, Clone)]
@@ -150,12 +152,15 @@ pub(in crate::server) struct VendorLazyIndexContext {
     pub(in crate::server) index: Arc<WorkspaceIndex>,
     pub(in crate::server) workspace_configs: Vec<WorkspaceRootConfig>,
     pub(in crate::server) exclude_paths: Vec<PathBuf>,
+    pub(in crate::server) traversal_limits: TraversalLimits,
     pub(in crate::server) php_version: PhpVersion,
     pub(in crate::server) index_vendor: bool,
     pub(in crate::server) vendor_autoload_cache: Arc<Mutex<VendorAutoloadCache>>,
     pub(in crate::server) vendor_file_lru: Arc<Mutex<VendorFileLru>>,
     pub(in crate::server) lazy_loads: Arc<VendorLazyLoadCoordinator>,
     pub(in crate::server) load_epoch: Arc<tokio::sync::RwLock<u64>>,
+    pub(in crate::server) external_symlinks: Option<Arc<ExternalSymlinkManager>>,
+    pub(in crate::server) runtime_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -358,10 +363,33 @@ async fn index_class_uncached_with_context(
             if let Some(vendor_map) =
                 cached_vendor_autoload_map_pinned(&context.vendor_autoload_cache, &vendor_dir).await
             {
-                if let Some(vendor_paths) =
-                    resolve_vendor_paths_from_map(requested_class_fqn, &vendor_map)
-                {
-                    all_paths.extend(vendor_paths);
+                if let Some(vendor_resolution) = resolve_vendor_paths_from_map_with_limits(
+                    requested_class_fqn,
+                    &vendor_map,
+                    context.traversal_limits,
+                    Some(&config.root),
+                    &context.exclude_paths,
+                ) {
+                    if let Some(external_symlinks) = context.external_symlinks.as_ref() {
+                        let external_symlinks = external_symlinks.clone();
+                        let workspace_folder = config.workspace_folder.clone();
+                        let logical_root = config.root.clone();
+                        let runtime_generation = context.runtime_generation;
+                        let aliases = vendor_resolution.symlink_aliases.clone();
+                        let physical_files = vendor_resolution.physical_files.clone();
+                        tokio::spawn(async move {
+                            external_symlinks
+                                .publish_additional_aliases(
+                                    workspace_folder,
+                                    logical_root,
+                                    runtime_generation,
+                                    aliases,
+                                    physical_files,
+                                )
+                                .await;
+                        });
+                    }
+                    all_paths.extend(vendor_resolution.paths);
                 }
             }
         }
@@ -382,7 +410,12 @@ async fn index_class_uncached_with_context(
 
             let is_vendor_file = abs.starts_with(config.root.join("vendor"));
             let vendor_cache_config = is_vendor_file.then(|| {
-                vendor_index_cache_config(&config.root, context.php_version, &context.exclude_paths)
+                vendor_index_cache_config(
+                    &config.root,
+                    context.php_version,
+                    &context.exclude_paths,
+                    context.traversal_limits,
+                )
             });
             if let Some(cache_config) = vendor_cache_config.as_ref() {
                 if load_cached_vendor_file_blocking(
@@ -836,25 +869,71 @@ pub(crate) fn resolve_vendor_paths_from_map(
     fqn: &str,
     map: &VendorAutoloadMap,
 ) -> Option<Vec<PathBuf>> {
+    resolve_vendor_paths_from_map_with_limits(
+        fqn,
+        map,
+        TraversalLimits {
+            max_files: Some(DEFAULT_INDEXING_MAX_FILES),
+            max_entries: Some(DEFAULT_INDEXING_MAX_ENTRIES),
+        },
+        None,
+        &[],
+    )
+    .map(|resolution| resolution.paths)
+}
+
+struct VendorPathResolution {
+    paths: Vec<PathBuf>,
+    symlink_aliases: Vec<crate::util::fs_walk::SymlinkAlias>,
+    physical_files: Vec<crate::util::fs_walk::PhysicalFileGroup>,
+}
+
+fn resolve_vendor_paths_from_map_with_limits(
+    fqn: &str,
+    map: &VendorAutoloadMap,
+    traversal_limits: TraversalLimits,
+    project_root: Option<&Path>,
+    exclude_paths: &[PathBuf],
+) -> Option<VendorPathResolution> {
     let normalized_fqn = fqn.trim_start_matches('\\');
     let mut paths = Vec::new();
+    let mut symlink_aliases = Vec::new();
     for mapping in &map.psr4 {
         let Some(relative) = normalized_fqn.strip_prefix(mapping.prefix.as_str()) else {
             continue;
         };
         let relative_path = relative.replace('\\', "/") + ".php";
         for directory in &mapping.directories {
-            push_unique_path(&mut paths, directory.join(&relative_path));
+            let candidate = directory.join(&relative_path);
+            if project_root.is_some_and(|root| path_is_excluded(&candidate, root, exclude_paths)) {
+                continue;
+            }
+            symlink_aliases.extend(symlink_aliases_on_path(&candidate));
+            push_unique_path(&mut paths, candidate);
         }
     }
-    for path in classmap_candidate_paths_for_fqn(normalized_fqn, map) {
+    let classmap = classmap_candidate_paths_for_fqn(
+        normalized_fqn,
+        map,
+        traversal_limits,
+        project_root,
+        exclude_paths,
+    );
+    for path in classmap.paths {
         push_unique_path(&mut paths, path);
     }
+    symlink_aliases.extend(classmap.symlink_aliases);
+    symlink_aliases.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
+    symlink_aliases.dedup();
 
     if paths.is_empty() {
         None
     } else {
-        Some(paths)
+        Some(VendorPathResolution {
+            paths,
+            symlink_aliases,
+            physical_files: classmap.physical_files,
+        })
     }
 }
 
@@ -987,44 +1066,40 @@ pub(crate) fn vendor_namespace_exists_from_map(fqn: &str, map: &VendorAutoloadMa
     false
 }
 
-fn classmap_candidate_paths_for_fqn(fqn: &str, map: &VendorAutoloadMap) -> Vec<PathBuf> {
+fn classmap_candidate_paths_for_fqn(
+    fqn: &str,
+    map: &VendorAutoloadMap,
+    traversal_limits: TraversalLimits,
+    project_root: Option<&Path>,
+    exclude_paths: &[PathBuf],
+) -> VendorPathResolution {
     let class_basename = fqn.rsplit('\\').next().unwrap_or(fqn);
     let mut matching = Vec::new();
     let mut fallback = Vec::new();
 
-    for path in &map.classmap {
-        collect_classmap_php_files(path, class_basename, &mut matching, &mut fallback);
+    let outcome = walk_files(
+        &map.classmap,
+        traversal_limits,
+        |path| project_root.is_some_and(|root| path_is_excluded(path, root, exclude_paths)),
+        |_, _| true,
+        is_php_file_path,
+        || None,
+    );
+    if outcome.truncated() {
+        tracing::warn!(
+            "Vendor classmap traversal was truncated after {} entries",
+            outcome.stats.visited_entries
+        );
+    }
+    for path in &outcome.files {
+        push_classmap_candidate(path, class_basename, &mut matching, &mut fallback);
     }
 
     matching.extend(fallback);
-    matching
-}
-
-fn collect_classmap_php_files(
-    path: &Path,
-    class_basename: &str,
-    matching: &mut Vec<PathBuf>,
-    fallback: &mut Vec<PathBuf>,
-) {
-    if path.is_file() {
-        push_classmap_candidate(path, class_basename, matching, fallback);
-        return;
-    }
-
-    if !path.is_dir() {
-        return;
-    }
-
-    let mut entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .collect::<Vec<_>>(),
-        Err(_) => return,
-    };
-    entries.sort();
-
-    for entry in entries {
-        collect_classmap_php_files(&entry, class_basename, matching, fallback);
+    VendorPathResolution {
+        paths: matching,
+        symlink_aliases: outcome.symlink_aliases,
+        physical_files: outcome.physical_files,
     }
 }
 
@@ -1120,24 +1195,30 @@ impl PhpLspBackend {
                 index: config.index.clone(),
                 workspace_configs: vec![config.clone()],
                 exclude_paths: runtime.exclude_paths.clone(),
+                traversal_limits: runtime.traversal_limits,
                 php_version: runtime.php_version,
                 index_vendor: runtime.index_vendor,
                 vendor_autoload_cache: self.vendor_autoload_cache.clone(),
                 vendor_file_lru: config.vendor_file_lru.clone(),
                 lazy_loads: self.vendor_lazy_loads.clone(),
                 load_epoch: self.vendor_load_epoch.clone(),
+                external_symlinks: Some(self.external_symlinks.clone()),
+                runtime_generation: request.state.generation,
             };
         }
         VendorLazyIndexContext {
             index: self.index.clone(),
             workspace_configs: Vec::new(),
             exclude_paths: request.state.fallback.exclude_paths.clone(),
+            traversal_limits: request.state.fallback.traversal_limits,
             php_version: request.state.fallback.php_version,
             index_vendor: false,
             vendor_autoload_cache: self.vendor_autoload_cache.clone(),
             vendor_file_lru: self.vendor_file_lru.clone(),
             lazy_loads: self.vendor_lazy_loads.clone(),
             load_epoch: self.vendor_load_epoch.clone(),
+            external_symlinks: Some(self.external_symlinks.clone()),
+            runtime_generation: request.state.generation,
         }
     }
 

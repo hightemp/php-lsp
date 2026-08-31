@@ -2,6 +2,8 @@ use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
 pub const PROJECT_CONFIG_FILE_NAME: &str = ".php-lsp.toml";
+pub const DEFAULT_INDEXING_MAX_FILES: usize = 100_000;
+pub const DEFAULT_INDEXING_MAX_ENTRIES: usize = 1_000_000;
 
 pub const DEFAULT_PROJECT_CONFIG: &str = r#"# PHP Language Server project configuration.
 # VS Code settings override these shared defaults when explicitly configured.
@@ -30,6 +32,11 @@ composer = true
 vendor = true
 include = []
 exclude = []
+# Maximum unique matching files and inspected filesystem entries per traversal.
+# Project config may lower these defaults; trusted global/client config may raise
+# them or set either value to 0 to disable that limit.
+# maxFiles = 100000
+# maxEntries = 1000000
 
 [stubs]
 # Omit `extensions` to discover all available stub extension directories. Set `extensions = []` to disable stubs.
@@ -217,6 +224,12 @@ pub fn normalize_project_config_settings(raw: &Value) -> Value {
         }
         if let Some(exclude) = string_array_value(indexing.get("exclude")) {
             settings.insert("excludePaths".to_string(), exclude);
+        }
+        if let Some(max_files) = indexing.get("maxFiles").and_then(Value::as_u64) {
+            settings.insert("indexingMaxFiles".to_string(), Value::from(max_files));
+        }
+        if let Some(max_entries) = indexing.get("maxEntries").and_then(Value::as_u64) {
+            settings.insert("indexingMaxEntries".to_string(), Value::from(max_entries));
         }
         if let Some(vendor) = indexing.get("vendor").and_then(Value::as_bool) {
             settings.insert("indexVendor".to_string(), Value::Bool(vendor));

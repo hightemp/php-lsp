@@ -127,6 +127,8 @@ composer = true
 vendor = true
 include = ["src", "tests"]
 exclude = ["var/cache", "storage/framework/cache"]
+maxFiles = 50000
+maxEntries = 500000
 
 [stubs]
 extensions = ["Core", "SPL", "standard", "PDO", "json", "mbstring"]
@@ -159,7 +161,7 @@ enabled = false
 | `[php]` | `version` |
 | `[diagnostics]` | `mode`, `memberTypeNodeBudget`, `partialAnalysisDiagnostic` |
 | `[diagnostics.severity]` | `unknownSymbols`, `unused`, `duplicateSymbols`, `members`, `typeCompatibility`, `overrideSignatures`, `phpVersion` |
-| `[indexing]` | `composer`, `vendor`, `include`, `exclude`, `stubs` |
+| `[indexing]` | `composer`, `vendor`, `include`, `exclude`, `maxFiles`, `maxEntries`, `stubs` |
 | `[stubs]` | `path`, `extensions` |
 | `[formatting]` | `provider`, `command`, `timeoutMs` |
 | `[phpstan]` | `enabled`, `command`, `timeoutMs`, `memory_limit` |
@@ -174,6 +176,29 @@ informational `partial-analysis` diagnostic in addition to logging the skipped
 categories. The deprecated `diagnostics.memberTypeBudget` spelling remains an
 accepted project-config alias for compatibility; new files should use
 `memberTypeNodeBudget`.
+
+## Filesystem traversal limits and symlinks
+
+`indexing.maxFiles` defaults to `100000` unique matching files and
+`indexing.maxEntries` defaults to `1000000` inspected entries per traversal.
+VS Code exposes the same controls as `phpLsp.indexing.maxFiles` and
+`phpLsp.indexing.maxEntries`. A trusted global or explicit VS Code value of `0`
+disables the corresponding cap. Because project configuration is untrusted, a
+project `.php-lsp.toml` may lower these limits but cannot raise or disable the
+trusted baseline.
+
+When a limit is reached, php-lsp retains the files found in deterministic path
+order, marks the index as partial in `phpLsp/indexingStatus`, logs a warning,
+and keeps the server usable. Changing either limit invalidates the workspace
+cache and starts a clean reindex.
+
+Filesystem traversal follows file and directory symlinks, including external
+targets used by shared packages and Composer path repositories. Physical file
+IDs prevent cycles and duplicate aliases; exclusions are evaluated against the
+logical project path. VS Code clients supporting LSP 3.17 relative dynamic file
+watchers receive live updates for discovered external targets. Other clients
+still receive safe initial indexing and a warning that external changes require
+a reindex.
 
 ## Stubs
 

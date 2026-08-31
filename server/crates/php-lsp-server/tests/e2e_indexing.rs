@@ -944,3 +944,134 @@ async fn test_multi_root_include_paths_do_not_leak_between_roots() {
         .unwrap();
     fs::remove_dir_all(tmp).unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_external_symlink_is_indexed_and_physical_watch_event_updates_logical_uri() {
+    use std::os::unix::fs::symlink;
+
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-e2e-external-symlink-{}-{nanos}",
+        std::process::id()
+    ));
+    let root = tmp.join("workspace");
+    let external = tmp.join("external-src");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&external).unwrap();
+    fs::write(
+        root.join("composer.json"),
+        r#"{"autoload":{"psr-4":{"Linked\\":"src/"}}}"#,
+    )
+    .unwrap();
+    let physical_file = external.join("Subject.php");
+    fs::write(
+        &physical_file,
+        "<?php namespace Linked; class BeforePhysicalWatch {}",
+    )
+    .unwrap();
+    symlink(&external, root.join("src")).unwrap();
+
+    let root_uri = path_to_uri(&root).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let logical_uri = path_to_uri(&root.join("src/Subject.php")).unwrap();
+    let mut before = json!(null);
+    for request_id in 10..90 {
+        before = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(workspace_symbol_request(request_id, "BeforePhysicalWatch"))
+                .await
+                .unwrap(),
+        );
+        if workspace_symbol_uris(&before)
+            .iter()
+            .any(|uri| uri == &logical_uri)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        workspace_symbol_uris(&before)
+            .iter()
+            .any(|uri| uri == &logical_uri),
+        "external file should be indexed through its logical symlink URI: {before}"
+    );
+
+    fs::write(
+        &physical_file,
+        "<?php namespace Linked; class AfterPhysicalWatch {}",
+    )
+    .unwrap();
+    let physical_uri = path_to_uri(&physical_file).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &physical_uri,
+            2,
+        )]))
+        .await
+        .unwrap();
+
+    let after = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(workspace_symbol_request(100, "AfterPhysicalWatch"))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        workspace_symbol_uris(&after)
+            .iter()
+            .any(|uri| uri == &logical_uri),
+        "physical watcher event should update the logical indexed URI: {after}"
+    );
+    let stale = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(workspace_symbol_request(101, "BeforePhysicalWatch"))
+            .await
+            .unwrap(),
+    );
+    assert!(workspace_symbol_names(&stale).is_empty());
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(999))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}

@@ -1152,9 +1152,20 @@ impl PhpLspBackend {
         workspace_root: &Path,
         domain: &str,
     ) -> Vec<crate::framework::FrameworkStringKey> {
+        let runtime_state = self.runtime_state_snapshot().await;
+        let runtime_config = runtime_state
+            .configs
+            .iter()
+            .find(|config| config.root == workspace_root)
+            .map(|config| &config.runtime_config)
+            .unwrap_or(&runtime_state.fallback);
+        let traversal_limits = runtime_config.traversal_limits;
+        let exclude_paths = runtime_config.exclude_paths.clone();
         let key = FrameworkStringKeyCacheKey {
             root: workspace_root.to_path_buf(),
             domain: domain.to_string(),
+            traversal_limits,
+            exclude_paths: exclude_paths.clone(),
         };
         if let Some(keys) = self.framework_string_key_cache.lock().await.get(&key) {
             return keys;
@@ -1164,7 +1175,12 @@ impl PhpLspBackend {
         let domain = domain.to_string();
         let path_label = format!("{} ({})", root.display(), domain);
         let keys = match run_file_io_blocking("framework string-key scan", path_label, move || {
-            crate::framework::framework_string_keys_for_workspace(&root, &domain)
+            crate::framework::framework_string_keys_for_workspace_with_limits(
+                &root,
+                &domain,
+                traversal_limits,
+                &exclude_paths,
+            )
         })
         .await
         {

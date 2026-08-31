@@ -55,6 +55,8 @@ class FakeConfiguration {
 const config = new FakeConfiguration({
   phpVersion: "8.2",
   "diagnostics.mode": "basic-semantic",
+  "indexing.maxFiles": 100000,
+  "indexing.maxEntries": 1000000,
   indexVendor: true,
   "phpstan.enabled": false,
 });
@@ -69,11 +71,15 @@ config.set("phpVersion", "7.4", "globalValue");
 config.set("diagnostics.mode", "off", "workspaceLanguageValue");
 config.set("indexVendor", false, "workspaceFolderValue");
 config.set("stubs.extensions", [], "workspaceValue");
+config.set("indexing.maxFiles", 250000, "workspaceFolderValue");
+config.set("indexing.maxEntries", 0, "workspaceFolderValue");
 let snapshot = JSON.parse(JSON.stringify(buildExplicitClientSettings(config, "/bundled/stubs")));
 assert.deepEqual(snapshot, {
   phpVersion: "7.4",
   diagnosticsMode: "off",
   indexVendor: false,
+  indexingMaxFiles: 250000,
+  indexingMaxEntries: 0,
   stubExtensions: [],
   bundledStubsPath: "/bundled/stubs",
 });
@@ -84,6 +90,8 @@ snapshot = JSON.parse(JSON.stringify(buildExplicitClientSettings(config, "/bundl
 assert.equal("phpVersion" in snapshot, false, "reset override must disappear from snapshot");
 assert.equal("diagnosticsMode" in snapshot, false, "language override reset must disappear");
 assert.equal(snapshot.indexVendor, false, "unrelated explicit override must remain");
+assert.equal(snapshot.indexingMaxFiles, 250000);
+assert.equal(snapshot.indexingMaxEntries, 0);
 assert.deepEqual(snapshot.stubExtensions, [], "explicit empty list must remain distinguishable");
 assert.equal(snapshot.bundledStubsPath, "/bundled/stubs");
 
@@ -105,6 +113,8 @@ assert.deepEqual(multiRoot, {
   configurationVersion: 2,
   global: {
     indexVendor: false,
+    indexingMaxFiles: 250000,
+    indexingMaxEntries: 0,
     stubExtensions: [],
   },
   workspaceFolders: [

@@ -55,6 +55,8 @@ pub struct IndexCacheConfig {
     pub php_version: String,
     pub include_paths: Vec<String>,
     pub exclude_paths: Vec<String>,
+    pub traversal_max_files: Option<usize>,
+    pub traversal_max_entries: Option<usize>,
     pub stub_extensions: Vec<String>,
     pub stubs_hash: u64,
 }
@@ -66,6 +68,16 @@ impl IndexCacheConfig {
             format!("php-lsp-version={}", self.php_lsp_version),
             format!("php-version={}", self.php_version),
             format!("stubs-hash={:016x}", self.stubs_hash),
+            format!(
+                "traversal-max-files={}",
+                self.traversal_max_files
+                    .map_or_else(|| "unlimited".to_string(), |limit| limit.to_string())
+            ),
+            format!(
+                "traversal-max-entries={}",
+                self.traversal_max_entries
+                    .map_or_else(|| "unlimited".to_string(), |limit| limit.to_string())
+            ),
         ];
         extend_sorted(&mut parts, "include", &self.include_paths);
         extend_sorted(&mut parts, "exclude", &self.exclude_paths);

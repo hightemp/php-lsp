@@ -1,6 +1,7 @@
 //! Template-aware LSP helpers extracted from `server.rs`.
 
 use crate::template::{TemplateShapeDefinitionTarget, TemplateShapeKeyDefinition};
+use crate::util::fs_walk::{walk_files, TraversalLimits};
 use crate::util::uri::path_to_uri;
 
 use super::super::*;
@@ -142,91 +143,60 @@ pub(in crate::server) fn normalize_twig_template_name(path: &Path) -> Option<Str
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-pub(in crate::server) fn collect_twig_context_php_files(root: &Path, limit: usize) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for base in [root.join("src"), root.join("app"), root.join("tests")] {
-        collect_twig_context_php_files_recursive(&base, limit, &mut files);
-        if files.len() >= limit {
-            break;
-        }
-    }
-    files.sort();
-    files
-}
-
-fn collect_twig_context_template_files(root: &Path, limit: usize) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for base in [
-        root.join("templates"),
-        root.join("resources/views"),
-        root.join("app/templates"),
-    ] {
-        collect_twig_context_template_files_recursive(&base, limit, &mut files);
-        if files.len() >= limit {
-            break;
-        }
-    }
-    files.sort();
-    files
-}
-
-fn collect_twig_context_template_files_recursive(
-    dir: &Path,
-    limit: usize,
-    files: &mut Vec<PathBuf>,
-) {
-    if files.len() >= limit || !dir.is_dir() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if files.len() >= limit {
-            break;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            collect_twig_context_template_files_recursive(&path, limit, files);
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("twig") {
-            files.push(path);
-        }
-    }
-}
-
-pub(in crate::server) fn collect_twig_context_php_files_recursive(
+fn collect_twig_context_php_files_with_limits(
     root: &Path,
     limit: usize,
-    files: &mut Vec<PathBuf>,
-) {
-    if files.len() >= limit || !root.is_dir() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if files.len() >= limit {
-            return;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.')
-                || matches!(name.as_ref(), "vendor" | "node_modules" | "target" | "var")
-            {
-                continue;
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    walk_files(
+        &[root.join("src"), root.join("app"), root.join("tests")],
+        traversal_limits.capped_files(limit),
+        |path| crate::server::path_is_excluded(path, root, exclude_paths),
+        |path, is_root| {
+            if is_root {
+                return true;
             }
-            collect_twig_context_php_files_recursive(&path, limit, files);
-        } else if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("php"))
-        {
-            files.push(path);
-        }
-    }
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            !name.starts_with('.')
+                && !matches!(name.as_ref(), "vendor" | "node_modules" | "target" | "var")
+        },
+        |path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
+        },
+        || None,
+    )
+    .files
+}
+
+fn collect_twig_context_template_files(
+    root: &Path,
+    limit: usize,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    walk_files(
+        &[
+            root.join("templates"),
+            root.join("resources/views"),
+            root.join("app/templates"),
+        ],
+        traversal_limits.capped_files(limit),
+        |path| crate::server::path_is_excluded(path, root, exclude_paths),
+        |_, _| true,
+        |path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("twig"))
+        },
+        || None,
+    )
+    .files
 }
 
 fn collect_twig_render_context_types(
@@ -3507,6 +3477,8 @@ async fn cached_twig_context_file_variables_for_state(
     index: Arc<WorkspaceIndex>,
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
     open_php_sources: HashMap<String, TwigContextPhpSource>,
+    traversal_limits: TraversalLimits,
+    exclude_paths: Vec<PathBuf>,
 ) -> Vec<TwigContextFileVariables> {
     let key = TwigContextDiskCacheKey {
         root: root.to_path_buf(),
@@ -3529,6 +3501,8 @@ async fn cached_twig_context_file_variables_for_state(
             &template_name,
             index.as_ref(),
             &open_php_sources,
+            traversal_limits,
+            &exclude_paths,
         )
     })
     .await
@@ -3554,13 +3528,20 @@ fn collect_cached_twig_context_file_variables(
     template_name: &str,
     index: &WorkspaceIndex,
     open_php_sources: &HashMap<String, TwigContextPhpSource>,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<TwigContextFileVariables> {
     let mut result = Vec::new();
     let php_sources = TwigContextPhpSourceResolver {
         sources: open_php_sources,
         allow_disk_read: true,
     };
-    for path in collect_twig_context_php_files(root, TWIG_CONTEXT_PHP_FILE_SCAN_LIMIT) {
+    for path in collect_twig_context_php_files_with_limits(
+        root,
+        TWIG_CONTEXT_PHP_FILE_SCAN_LIMIT,
+        traversal_limits,
+        exclude_paths,
+    ) {
         let Ok(source_uri) = path_to_uri(&path) else {
             continue;
         };
@@ -3600,6 +3581,7 @@ fn collect_cached_twig_context_file_variables(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::server) async fn direct_twig_variable_types_for_template_state(
     root: &Path,
     template_name: &str,
@@ -3607,6 +3589,8 @@ pub(in crate::server) async fn direct_twig_variable_types_for_template_state(
     open_files: &Arc<DashMap<String, FileParser>>,
     index: &Arc<WorkspaceIndex>,
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<TemplateVariableType> {
     let mut variables = HashMap::<String, String>::new();
     let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
@@ -3696,6 +3680,8 @@ pub(in crate::server) async fn direct_twig_variable_types_for_template_state(
         index.clone(),
         twig_context_disk_cache,
         open_php_sources_for_disk_scan,
+        traversal_limits,
+        exclude_paths.to_vec(),
     )
     .await
     {
@@ -3735,6 +3721,7 @@ struct SymfonyFormField {
     key_range: (usize, usize),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn twig_include_variable_types_for_template_state(
     root: &Path,
     target_template_name: &str,
@@ -3743,6 +3730,8 @@ async fn twig_include_variable_types_for_template_state(
     template_documents: &Arc<DashMap<String, TemplateDocument>>,
     index: &Arc<WorkspaceIndex>,
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<TemplateVariableType> {
     let mut variables = HashMap::<String, String>::new();
     let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
@@ -3781,6 +3770,8 @@ async fn twig_include_variable_types_for_template_state(
             open_files,
             index,
             twig_context_disk_cache,
+            traversal_limits,
+            exclude_paths,
         )
         .await;
         collect_twig_include_context_types_from_ranges(
@@ -3796,6 +3787,7 @@ async fn twig_include_variable_types_for_template_state(
     let root_for_names = root.to_path_buf();
     let target_template_name_for_scan = target_template_name.to_string();
     let target_uri_for_scan = target_uri.to_string();
+    let exclude_paths_for_scan = exclude_paths.to_vec();
     let path_label = format!("{} ({})", root.display(), target_template_name);
     let disk_sources =
         match run_file_io_blocking("twig include context scan", path_label, move || {
@@ -3803,6 +3795,8 @@ async fn twig_include_variable_types_for_template_state(
             for path in collect_twig_context_template_files(
                 &root_for_scan,
                 TWIG_CONTEXT_TEMPLATE_FILE_SCAN_LIMIT,
+                traversal_limits,
+                &exclude_paths_for_scan,
             ) {
                 let Ok(source_uri) = path_to_uri(&path) else {
                     continue;
@@ -3848,6 +3842,8 @@ async fn twig_include_variable_types_for_template_state(
             open_files,
             index,
             twig_context_disk_cache,
+            traversal_limits,
+            exclude_paths,
         )
         .await;
         collect_twig_include_context_types_from_ranges(
@@ -4305,6 +4301,7 @@ fn is_twig_context_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn twig_variable_types_for_template_state(
     uri_str: &str,
     open_files: &Arc<DashMap<String, FileParser>>,
@@ -4312,6 +4309,8 @@ async fn twig_variable_types_for_template_state(
     index: &Arc<WorkspaceIndex>,
     workspace_roots: &[PathBuf],
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<TemplateVariableType> {
     let Some(root) = workspace_root_for_template_context_uri(uri_str, workspace_roots) else {
         return Vec::new();
@@ -4330,6 +4329,8 @@ async fn twig_variable_types_for_template_state(
         open_files,
         index,
         twig_context_disk_cache,
+        traversal_limits,
+        exclude_paths,
     )
     .await
     {
@@ -4344,6 +4345,8 @@ async fn twig_variable_types_for_template_state(
         template_documents,
         index,
         twig_context_disk_cache,
+        traversal_limits,
+        exclude_paths,
     )
     .await
     {
@@ -4555,6 +4558,17 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
             .as_ref()
             .map(std::slice::from_ref)
             .unwrap_or(workspace_roots);
+        let traversal_limits = workspace
+            .as_ref()
+            .map(|config| config.runtime_config.traversal_limits)
+            .unwrap_or(TraversalLimits {
+                max_files: Some(DEFAULT_INDEXING_MAX_FILES),
+                max_entries: Some(DEFAULT_INDEXING_MAX_ENTRIES),
+            });
+        let exclude_paths = workspace
+            .as_ref()
+            .map(|config| config.runtime_config.exclude_paths.clone())
+            .unwrap_or_default();
         let variable_types = twig_variable_types_for_template_state(
             &uri_str,
             open_files,
@@ -4562,6 +4576,8 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
             workspace_index,
             roots,
             twig_context_disk_cache,
+            traversal_limits,
+            &exclude_paths,
         )
         .await;
         let refreshed_template = template.with_twig_variable_types(&variable_types);
@@ -4634,6 +4650,11 @@ impl PhpLspBackend {
             .map(Path::to_path_buf)
             .into_iter()
             .collect::<Vec<_>>();
+        let runtime_config = request
+            .workspace
+            .as_ref()
+            .map(|config| &config.runtime_config)
+            .unwrap_or(&request.state.fallback);
         twig_variable_types_for_template_state(
             uri_str,
             &self.open_files,
@@ -4641,6 +4662,8 @@ impl PhpLspBackend {
             &index,
             &roots,
             &self.twig_context_disk_cache,
+            runtime_config.traversal_limits,
+            &runtime_config.exclude_paths,
         )
         .await
     }

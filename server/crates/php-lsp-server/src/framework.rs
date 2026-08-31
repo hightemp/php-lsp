@@ -4,6 +4,7 @@
 //! workspace/index context and must not bootstrap applications, open databases,
 //! or execute user code.
 
+use crate::util::fs_walk::{walk_files, TraversalLimits};
 use crate::util::uri::{path_to_uri, uri_to_path};
 use php_lsp_index::composer::NamespaceMap;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -216,6 +217,8 @@ pub(crate) struct FrameworkProviderContext<'a> {
     pub(crate) file_symbols: Option<&'a FileSymbols>,
     pub(crate) source: Option<&'a str>,
     pub(crate) relevant_files: &'a [PathBuf],
+    pub(crate) traversal_limits: TraversalLimits,
+    pub(crate) exclude_paths: &'a [PathBuf],
 }
 
 impl<'a> FrameworkProviderContext<'a> {
@@ -228,6 +231,11 @@ impl<'a> FrameworkProviderContext<'a> {
             file_symbols: None,
             source: None,
             relevant_files: &[],
+            traversal_limits: TraversalLimits {
+                max_files: Some(crate::config::DEFAULT_INDEXING_MAX_FILES),
+                max_entries: Some(crate::config::DEFAULT_INDEXING_MAX_ENTRIES),
+            },
+            exclude_paths: &[],
         }
     }
 
@@ -258,6 +266,16 @@ impl<'a> FrameworkProviderContext<'a> {
 
     pub(crate) fn with_relevant_files(mut self, relevant_files: &'a [PathBuf]) -> Self {
         self.relevant_files = relevant_files;
+        self
+    }
+
+    pub(crate) fn with_traversal_limits(mut self, traversal_limits: TraversalLimits) -> Self {
+        self.traversal_limits = traversal_limits;
+        self
+    }
+
+    pub(crate) fn with_exclude_paths(mut self, exclude_paths: &'a [PathBuf]) -> Self {
+        self.exclude_paths = exclude_paths;
         self
     }
 
@@ -517,13 +535,17 @@ pub(crate) fn default_framework_provider_registry() -> FrameworkProviderRegistry
     ])
 }
 
-pub(crate) fn framework_string_keys_for_workspace(
+pub(crate) fn framework_string_keys_for_workspace_with_limits(
     root: &Path,
     domain: &str,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<FrameworkStringKey> {
     let index = WorkspaceIndex::new();
     let ctx = FrameworkProviderContext::new(&index)
         .with_workspace(Some(root), None)
+        .with_traversal_limits(traversal_limits)
+        .with_exclude_paths(exclude_paths)
         .with_relevant_files(&[]);
     let registry = default_framework_provider_registry();
     let query = FrameworkStringKeyQuery {
@@ -637,8 +659,20 @@ impl VirtualMemberProvider for SymfonyStringKeyProvider {
         }
 
         let mut keys = match query.domain.as_str() {
-            "twig" => collect_symfony_twig_template_keys(self.id(), root, &query.prefix),
-            "route" => collect_symfony_route_keys(self.id(), root, &query.prefix),
+            "twig" => collect_symfony_twig_template_keys(
+                self.id(),
+                root,
+                &query.prefix,
+                ctx.traversal_limits,
+                ctx.exclude_paths,
+            ),
+            "route" => collect_symfony_route_keys(
+                self.id(),
+                root,
+                &query.prefix,
+                ctx.traversal_limits,
+                ctx.exclude_paths,
+            ),
             _ => Vec::new(),
         };
         keys.sort_by(|left, right| left.key.cmp(&right.key));
@@ -914,10 +948,34 @@ impl VirtualMemberProvider for LaravelStringKeyProvider {
         }
 
         let mut keys = match query.domain.as_str() {
-            "config" => collect_laravel_config_keys(self.id(), root, &query.prefix),
-            "route" => collect_laravel_route_keys(self.id(), root, &query.prefix),
-            "translation" => collect_laravel_translation_keys(self.id(), root, &query.prefix),
-            "view" => collect_laravel_view_keys(self.id(), root, &query.prefix),
+            "config" => collect_laravel_config_keys(
+                self.id(),
+                root,
+                &query.prefix,
+                ctx.traversal_limits,
+                ctx.exclude_paths,
+            ),
+            "route" => collect_laravel_route_keys(
+                self.id(),
+                root,
+                &query.prefix,
+                ctx.traversal_limits,
+                ctx.exclude_paths,
+            ),
+            "translation" => collect_laravel_translation_keys(
+                self.id(),
+                root,
+                &query.prefix,
+                ctx.traversal_limits,
+                ctx.exclude_paths,
+            ),
+            "view" => collect_laravel_view_keys(
+                self.id(),
+                root,
+                &query.prefix,
+                ctx.traversal_limits,
+                ctx.exclude_paths,
+            ),
             _ => Vec::new(),
         };
         keys.sort_by(|left, right| left.key.cmp(&right.key));
@@ -3364,10 +3422,19 @@ fn collect_laravel_config_keys(
     provider_id: &'static str,
     root: &Path,
     prefix: &str,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<FrameworkStringKey> {
     let config_dir = root.join("config");
     let mut keys = Vec::new();
-    for path in collect_static_files(&config_dir, &["php"], 512) {
+    for path in collect_static_files(
+        &config_dir,
+        root,
+        exclude_paths,
+        &["php"],
+        512,
+        traversal_limits,
+    ) {
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
@@ -3397,10 +3464,19 @@ fn collect_laravel_route_keys(
     provider_id: &'static str,
     root: &Path,
     prefix: &str,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<FrameworkStringKey> {
     let routes_dir = root.join("routes");
     let mut keys = Vec::new();
-    for path in collect_static_files(&routes_dir, &["php"], 512) {
+    for path in collect_static_files(
+        &routes_dir,
+        root,
+        exclude_paths,
+        &["php"],
+        512,
+        traversal_limits,
+    ) {
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -3426,13 +3502,22 @@ fn collect_laravel_translation_keys(
     provider_id: &'static str,
     root: &Path,
     prefix: &str,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<FrameworkStringKey> {
     let mut keys = Vec::new();
     for lang_root in [root.join("resources/lang"), root.join("lang")] {
         if !lang_root.is_dir() {
             continue;
         }
-        for path in collect_static_files(&lang_root, &["php"], 2048) {
+        for path in collect_static_files(
+            &lang_root,
+            root,
+            exclude_paths,
+            &["php"],
+            2048,
+            traversal_limits,
+        ) {
             let Ok(relative) = path.strip_prefix(&lang_root) else {
                 continue;
             };
@@ -3471,10 +3556,19 @@ fn collect_laravel_view_keys(
     provider_id: &'static str,
     root: &Path,
     prefix: &str,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<FrameworkStringKey> {
     let view_dir = root.join("resources/views");
     let mut keys = Vec::new();
-    for path in collect_static_files(&view_dir, &["php"], 4096) {
+    for path in collect_static_files(
+        &view_dir,
+        root,
+        exclude_paths,
+        &["php"],
+        4096,
+        traversal_limits,
+    ) {
         let Ok(relative) = path.strip_prefix(&view_dir) else {
             continue;
         };
@@ -3501,10 +3595,19 @@ fn collect_symfony_twig_template_keys(
     provider_id: &'static str,
     root: &Path,
     prefix: &str,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<FrameworkStringKey> {
     let template_dir = root.join("templates");
     let mut keys = Vec::new();
-    for path in collect_static_files(&template_dir, &["twig"], 4096) {
+    for path in collect_static_files(
+        &template_dir,
+        root,
+        exclude_paths,
+        &["twig"],
+        4096,
+        traversal_limits,
+    ) {
         let Ok(relative) = path.strip_prefix(&template_dir) else {
             continue;
         };
@@ -3531,10 +3634,19 @@ fn collect_symfony_route_keys(
     provider_id: &'static str,
     root: &Path,
     prefix: &str,
+    traversal_limits: TraversalLimits,
+    exclude_paths: &[PathBuf],
 ) -> Vec<FrameworkStringKey> {
     let src_dir = root.join("src");
     let mut keys = Vec::new();
-    for path in collect_static_files(&src_dir, &["php"], 4096) {
+    for path in collect_static_files(
+        &src_dir,
+        root,
+        exclude_paths,
+        &["php"],
+        4096,
+        traversal_limits,
+    ) {
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -3571,44 +3683,31 @@ fn framework_string_key(
     }
 }
 
-fn collect_static_files(root: &Path, extensions: &[&str], limit: usize) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect_static_files_recursive(root, extensions, limit, &mut files);
-    files.sort();
-    files
-}
-
-fn collect_static_files_recursive(
+fn collect_static_files(
     root: &Path,
+    workspace_root: &Path,
+    exclude_paths: &[PathBuf],
     extensions: &[&str],
     limit: usize,
-    files: &mut Vec<PathBuf>,
-) {
-    if files.len() >= limit || !root.is_dir() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if files.len() >= limit {
-            return;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            collect_static_files_recursive(&path, extensions, limit, files);
-        } else if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| {
-                extensions
-                    .iter()
-                    .any(|expected| ext.eq_ignore_ascii_case(expected))
-            })
-        {
-            files.push(path);
-        }
-    }
+    traversal_limits: TraversalLimits,
+) -> Vec<PathBuf> {
+    walk_files(
+        &[root.to_path_buf()],
+        traversal_limits.capped_files(limit),
+        |path| crate::server::path_is_excluded(path, workspace_root, exclude_paths),
+        |_, _| true,
+        |path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extensions
+                        .iter()
+                        .any(|expected| extension.eq_ignore_ascii_case(expected))
+                })
+        },
+        || None,
+    )
+    .files
 }
 
 fn parse_php_array_key_paths(source: &str) -> Vec<StaticStringKey> {

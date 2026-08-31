@@ -1,5 +1,10 @@
 # Repository Guidelines
 
+## Важно
+
+- читать файлы полностью, иначе ты не видишь картины полностью
+- проверять наличие существующих методов, прежде чем создать новые
+
 ## Project Structure & Module Organization
 - `server/` contains the Rust workspace for the language server.
   Key crates live in `server/crates/`: `php-lsp-server` (binary), `php-lsp-parser`, `php-lsp-index`, `php-lsp-completion`, and `php-lsp-types`.

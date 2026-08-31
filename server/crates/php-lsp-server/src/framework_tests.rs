@@ -1427,3 +1427,49 @@ fn query_maps_supported_ref_kinds() {
     );
     assert!(VirtualMemberQuery::from_ref_kind("App\\User", "User", RefKind::ClassName).is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn framework_string_scan_follows_external_template_symlink_without_cycles() {
+    use std::os::unix::fs::symlink;
+
+    let root =
+        std::env::temp_dir().join(format!("php-lsp-framework-symlink-{}", std::process::id()));
+    let external = std::env::temp_dir().join(format!(
+        "php-lsp-framework-symlink-external-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&external);
+    fs::create_dir_all(external.join("nested")).expect("create external templates");
+    fs::create_dir_all(&root).expect("create workspace");
+    fs::write(external.join("nested/page.html.twig"), "{{ value }}")
+        .expect("write external Twig template");
+    symlink(&external, root.join("templates")).expect("link external templates");
+    symlink(&root, external.join("nested/back")).expect("create template cycle");
+
+    let keys = framework_string_keys_for_workspace_with_limits(
+        &root,
+        "twig",
+        TraversalLimits {
+            max_files: Some(32),
+            max_entries: Some(256),
+        },
+        &[],
+    );
+    assert!(keys.iter().any(|key| key.key == "nested/page.html.twig"));
+    let excluded = framework_string_keys_for_workspace_with_limits(
+        &root,
+        "twig",
+        TraversalLimits {
+            max_files: Some(32),
+            max_entries: Some(256),
+        },
+        &[PathBuf::from("templates")],
+    );
+    assert!(excluded.is_empty());
+
+    fs::remove_file(external.join("nested/back")).expect("remove cycle link");
+    fs::remove_dir_all(root).expect("remove workspace");
+    fs::remove_dir_all(external).expect("remove external templates");
+}

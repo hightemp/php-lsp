@@ -251,9 +251,23 @@ fn test_config() -> IndexCacheConfig {
         php_version: "8.2".to_string(),
         include_paths: vec!["src".to_string()],
         exclude_paths: vec!["vendor".to_string()],
+        traversal_max_files: Some(100_000),
+        traversal_max_entries: Some(1_000_000),
         stub_extensions: vec!["Core".to_string()],
         stubs_hash: 42,
     }
+}
+
+#[test]
+fn traversal_limits_participate_in_cache_config_hash() {
+    let baseline = test_config();
+    let mut different_files = baseline.clone();
+    different_files.traversal_max_files = Some(50_000);
+    let mut unlimited_entries = baseline.clone();
+    unlimited_entries.traversal_max_entries = None;
+
+    assert_ne!(baseline.config_hash(), different_files.config_hash());
+    assert_ne!(baseline.config_hash(), unlimited_entries.config_hash());
 }
 
 #[test]

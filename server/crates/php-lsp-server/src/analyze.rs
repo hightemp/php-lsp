@@ -1,13 +1,15 @@
 use crate::server::{
-    collect_php_files, compute_diagnostics_with_runtime_config,
-    diagnostic_budget_config_from_settings, discover_workspace_root_config,
-    lazy_resolvable_diagnostic_fqn, lazy_resolved_symbol_diagnostic_is_satisfied,
-    load_configured_stubs, load_effective_configuration_settings, normalize_config_paths,
-    parse_vendor_autoload_map, path_is_excluded, resolve_vendor_paths_from_map,
+    collect_php_files_with_control, collect_php_files_with_explicit_control,
+    compute_diagnostics_with_runtime_config, diagnostic_budget_config_from_settings,
+    discover_workspace_root_config, lazy_resolvable_diagnostic_fqn,
+    lazy_resolved_symbol_diagnostic_is_satisfied, load_configured_stubs,
+    load_effective_configuration_settings, normalize_config_paths, parse_vendor_autoload_map,
+    path_is_excluded, resolve_vendor_paths_from_map, traversal_limits_from_settings,
     vendor_autoload_file_paths_from_map, vendor_namespace_exists_from_map,
     workspace_index_directories, DiagnosticBudgetConfig, DiagnosticSeverityConfig, DiagnosticsMode,
     DiagnosticsRuntimeConfig, PhpVersion, VendorAutoloadMap,
 };
+use crate::util::fs_walk::TraversalLimits;
 use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::parser::FileParser;
@@ -152,6 +154,7 @@ struct AnalyzeRuntimeConfig {
     stub_extensions: Option<Vec<String>>,
     include_paths: Vec<PathBuf>,
     exclude_paths: Vec<PathBuf>,
+    traversal_limits: TraversalLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -360,18 +363,26 @@ fn run_analyze(args: &AnalyzeArgs) -> Result<AnalyzeReport, AnalyzeError> {
         workspace_config.namespace_map.as_ref(),
         &runtime_config.include_paths,
         &runtime_config.exclude_paths,
+        runtime_config.traversal_limits,
     );
     let target_files = collect_target_analyze_files(
         &requested_target,
         &project_root,
         &runtime_config.exclude_paths,
+        runtime_config.traversal_limits,
     )?;
 
-    let mut all_files = workspace_files.clone();
-    for file in &target_files {
-        push_unique_path(&mut all_files, file.clone());
-    }
-    all_files.sort();
+    let mut all_file_candidates = workspace_files.clone();
+    all_file_candidates.extend(target_files.iter().cloned());
+    let all_files = collect_php_files_with_explicit_control(
+        &[],
+        &all_file_candidates,
+        &project_root,
+        &runtime_config.exclude_paths,
+        TraversalLimits::default(),
+        || None,
+    )
+    .files;
 
     let index = WorkspaceIndex::new();
     load_configured_stubs(
@@ -503,6 +514,7 @@ fn analyze_runtime_config(settings: &serde_json::Value) -> AnalyzeRuntimeConfig 
     let exclude_paths = settings_string_array(settings, "excludePaths", &["excludePaths"])
         .map(normalize_config_paths)
         .unwrap_or_default();
+    let traversal_limits = traversal_limits_from_settings(settings);
 
     AnalyzeRuntimeConfig {
         php_version,
@@ -515,6 +527,7 @@ fn analyze_runtime_config(settings: &serde_json::Value) -> AnalyzeRuntimeConfig 
         stub_extensions,
         include_paths,
         exclude_paths,
+        traversal_limits,
     }
 }
 
@@ -595,29 +608,28 @@ fn collect_workspace_analyze_files(
     namespace_map: Option<&php_lsp_index::composer::NamespaceMap>,
     include_paths: &[PathBuf],
     exclude_paths: &[PathBuf],
+    traversal_limits: TraversalLimits,
 ) -> Vec<PathBuf> {
     let source_dirs = workspace_index_directories(project_root, namespace_map, include_paths);
-    let mut files = collect_php_files(&source_dirs, project_root, exclude_paths);
-    if let Some(namespace_map) = namespace_map {
-        for file_path in &namespace_map.files {
-            let abs = if file_path.is_absolute() {
-                file_path.clone()
-            } else {
-                project_root.join(file_path)
-            };
-            if abs.exists() {
-                push_unique_path(&mut files, abs);
-            }
-        }
-    }
-    files.sort();
-    files
+    let explicit_files = namespace_map
+        .map(|namespace_map| namespace_map.files.as_slice())
+        .unwrap_or_default();
+    collect_php_files_with_explicit_control(
+        &source_dirs,
+        explicit_files,
+        project_root,
+        exclude_paths,
+        traversal_limits,
+        || None,
+    )
+    .files
 }
 
 fn collect_target_analyze_files(
     target: &Path,
     project_root: &Path,
     exclude_paths: &[PathBuf],
+    traversal_limits: TraversalLimits,
 ) -> Result<Vec<PathBuf>, AnalyzeError> {
     if target.is_file() {
         return if target.extension().and_then(|ext| ext.to_str()) == Some("php") {
@@ -630,9 +642,14 @@ fn collect_target_analyze_files(
         };
     }
     if target.is_dir() {
-        let mut files = collect_php_files(&[target.to_path_buf()], project_root, exclude_paths);
-        files.sort();
-        return Ok(files);
+        return Ok(collect_php_files_with_control(
+            &[target.to_path_buf()],
+            project_root,
+            exclude_paths,
+            traversal_limits,
+            || None,
+        )
+        .files);
     }
 
     Err(AnalyzeError::new(format!(
@@ -850,12 +867,6 @@ fn analyze_lazy_class_fqn(fqn: &str) -> String {
         .map(|(class_fqn, _)| class_fqn)
         .unwrap_or(fqn)
         .to_string()
-}
-
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
-    }
 }
 
 fn push_unique_string(values: &mut Vec<String>, value: String) {

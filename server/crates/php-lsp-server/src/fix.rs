@@ -1,10 +1,13 @@
 use crate::server::{
-    build_organize_imports_edit, collect_php_files, compute_diagnostics_with_runtime_config,
+    build_organize_imports_edit, collect_php_files_with_control,
+    collect_php_files_with_explicit_control, compute_diagnostics_with_runtime_config,
     diagnostic_budget_config_from_settings, discover_workspace_root_config,
     is_unused_import_diagnostic, load_configured_stubs, load_effective_configuration_settings,
-    normalize_config_paths, return_type_hint, workspace_index_directories, DiagnosticBudgetConfig,
-    DiagnosticSeverityConfig, DiagnosticsMode, DiagnosticsRuntimeConfig, PhpVersion,
+    normalize_config_paths, return_type_hint, traversal_limits_from_settings,
+    workspace_index_directories, DiagnosticBudgetConfig, DiagnosticSeverityConfig, DiagnosticsMode,
+    DiagnosticsRuntimeConfig, PhpVersion,
 };
+use crate::util::fs_walk::TraversalLimits;
 use crate::util::lsp_text::{lsp_position_to_byte, text_at_lsp_range};
 use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -132,6 +135,7 @@ struct FixRuntimeConfig {
     stub_extensions: Option<Vec<String>>,
     include_paths: Vec<PathBuf>,
     exclude_paths: Vec<PathBuf>,
+    traversal_limits: TraversalLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -389,18 +393,26 @@ fn run_fix(args: &FixArgs) -> Result<FixReport, FixError> {
         workspace_config.namespace_map.as_ref(),
         &runtime_config.include_paths,
         &runtime_config.exclude_paths,
+        runtime_config.traversal_limits,
     );
     let target_files = collect_target_fix_files(
         &requested_target,
         &project_root,
         &runtime_config.exclude_paths,
+        runtime_config.traversal_limits,
     )?;
 
-    let mut all_files = workspace_files.clone();
-    for file in &target_files {
-        push_unique_path(&mut all_files, file.clone());
-    }
-    all_files.sort();
+    let mut all_file_candidates = workspace_files.clone();
+    all_file_candidates.extend(target_files.iter().cloned());
+    let all_files = collect_php_files_with_explicit_control(
+        &[],
+        &all_file_candidates,
+        &project_root,
+        &runtime_config.exclude_paths,
+        TraversalLimits::default(),
+        || None,
+    )
+    .files;
 
     let index = WorkspaceIndex::new();
     load_configured_stubs(
@@ -690,6 +702,7 @@ fn fix_runtime_config(settings: &serde_json::Value) -> FixRuntimeConfig {
     let exclude_paths = settings_string_array(settings, "excludePaths", &["excludePaths"])
         .map(normalize_config_paths)
         .unwrap_or_default();
+    let traversal_limits = traversal_limits_from_settings(settings);
 
     FixRuntimeConfig {
         php_version,
@@ -701,6 +714,7 @@ fn fix_runtime_config(settings: &serde_json::Value) -> FixRuntimeConfig {
         stub_extensions,
         include_paths,
         exclude_paths,
+        traversal_limits,
     }
 }
 
@@ -781,29 +795,28 @@ fn collect_workspace_fix_files(
     namespace_map: Option<&php_lsp_index::composer::NamespaceMap>,
     include_paths: &[PathBuf],
     exclude_paths: &[PathBuf],
+    traversal_limits: TraversalLimits,
 ) -> Vec<PathBuf> {
     let source_dirs = workspace_index_directories(project_root, namespace_map, include_paths);
-    let mut files = collect_php_files(&source_dirs, project_root, exclude_paths);
-    if let Some(namespace_map) = namespace_map {
-        for file_path in &namespace_map.files {
-            let abs = if file_path.is_absolute() {
-                file_path.clone()
-            } else {
-                project_root.join(file_path)
-            };
-            if abs.exists() {
-                push_unique_path(&mut files, abs);
-            }
-        }
-    }
-    files.sort();
-    files
+    let explicit_files = namespace_map
+        .map(|namespace_map| namespace_map.files.as_slice())
+        .unwrap_or_default();
+    collect_php_files_with_explicit_control(
+        &source_dirs,
+        explicit_files,
+        project_root,
+        exclude_paths,
+        traversal_limits,
+        || None,
+    )
+    .files
 }
 
 fn collect_target_fix_files(
     target: &Path,
     project_root: &Path,
     exclude_paths: &[PathBuf],
+    traversal_limits: TraversalLimits,
 ) -> Result<Vec<PathBuf>, FixError> {
     if target.is_file() {
         return if target.extension().and_then(|ext| ext.to_str()) == Some("php") {
@@ -816,9 +829,14 @@ fn collect_target_fix_files(
         };
     }
     if target.is_dir() {
-        let mut files = collect_php_files(&[target.to_path_buf()], project_root, exclude_paths);
-        files.sort();
-        return Ok(files);
+        return Ok(collect_php_files_with_control(
+            &[target.to_path_buf()],
+            project_root,
+            exclude_paths,
+            traversal_limits,
+            || None,
+        )
+        .files);
     }
 
     Err(FixError::new(format!(
@@ -847,12 +865,6 @@ fn parse_fix_file(path: &Path) -> Result<ParsedFixFile, FixError> {
         parser,
         file_symbols,
     })
-}
-
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
-    }
 }
 
 fn push_unique_rule(rules: &mut Vec<FixRule>, rule: FixRule) {

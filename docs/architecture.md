@@ -368,6 +368,15 @@ to an effective root:
 - `phpLsp.includePaths` adds explicit directories or files.
 - `phpLsp.excludePaths` removes relative or absolute paths from indexing and
   lazy vendor work.
+- `phpLsp.indexing.maxFiles` and `phpLsp.indexing.maxEntries` bound each
+  traversal; exhaustion publishes a deterministic partial-index status.
+
+Workspace, Twig, framework, and vendor classmap discovery share one iterative
+filesystem visitor. It follows useful external symlinks, deduplicates files and
+directories by platform file identity, applies exclusions to logical paths,
+and records physical-to-logical aliases. Clients with LSP relative-pattern
+support receive dynamic watchers for external physical roots; incoming events
+are translated back to the deterministic logical URI before normal indexing.
 
 Each mapping keeps the original workspace-folder path, its Composer effective
 root, namespace map, immutable `ResolvedRuntimeConfiguration`, and a root-owned

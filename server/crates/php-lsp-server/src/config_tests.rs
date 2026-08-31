@@ -15,7 +15,9 @@ fn normalizes_project_config_sections_to_runtime_settings() {
             "composer": false,
             "vendor": false,
             "include": ["src"],
-            "exclude": ["vendor"]
+            "exclude": ["vendor"],
+            "maxFiles": 50000,
+            "maxEntries": 250000
         },
         "stubs": { "path": "/tmp/stubs", "extensions": ["Core"] },
         "security": { "allowProjectCommands": true },
@@ -38,6 +40,8 @@ fn normalizes_project_config_sections_to_runtime_settings() {
     assert_eq!(settings["indexVendor"], false);
     assert_eq!(settings["includePaths"][0], "src");
     assert_eq!(settings["excludePaths"][0], "vendor");
+    assert_eq!(settings["indexingMaxFiles"], 50000);
+    assert_eq!(settings["indexingMaxEntries"], 250000);
     assert_eq!(settings["stubs"]["path"], "/tmp/stubs");
     assert_eq!(settings["stubs"]["extensions"][0], "Core");
     assert_eq!(settings["formatting"]["provider"], "custom");

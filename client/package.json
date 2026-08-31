@@ -77,6 +77,20 @@
           "scope": "resource",
           "description": "Relative or absolute paths to exclude from workspace indexing"
         },
+        "phpLsp.indexing.maxFiles": {
+          "type": "number",
+          "default": 100000,
+          "minimum": 0,
+          "scope": "resource",
+          "description": "Maximum unique matching files collected by one filesystem traversal. Set to 0 in trusted global or VS Code configuration to disable this limit."
+        },
+        "phpLsp.indexing.maxEntries": {
+          "type": "number",
+          "default": 1000000,
+          "minimum": 0,
+          "scope": "resource",
+          "description": "Maximum filesystem entries inspected by one traversal. Set to 0 in trusted global or VS Code configuration to disable this limit."
+        },
         "phpLsp.stubs.extensions": {
           "type": "array",
           "items": {

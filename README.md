@@ -274,6 +274,8 @@ Runtime environment:
 | `phpLsp.serverPath` | `""` | Custom server binary path. Empty uses the bundled binary, then falls back to `php-lsp` from `PATH` if the bundled binary is missing. |
 | `phpLsp.includePaths` | `[]` | Additional relative or absolute directories/files to include in workspace indexing. |
 | `phpLsp.excludePaths` | `[]` | Relative or absolute directories/files to exclude from workspace indexing. |
+| `phpLsp.indexing.maxFiles` | `100000` | Maximum unique matching files per traversal. Set `0` in trusted global/VS Code config to disable the cap. |
+| `phpLsp.indexing.maxEntries` | `1000000` | Maximum filesystem entries inspected per traversal. Set `0` in trusted global/VS Code config to disable the cap. |
 | `phpLsp.stubs.extensions` | All available stubs | PHP stub extension set to index from the bundled stubs. Leave unset to discover all extension directories; set `[]` to disable stubs. |
 | `phpLsp.composer.enabled` | `true` | Enable `composer.json` autoload indexing. |
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
@@ -302,6 +304,14 @@ explicit VS Code settings. Executable analyzer and formatter settings from
 project config are ignored unless `phpLsp.allowProjectCommands` is enabled in
 VS Code or `allowProjectCommands = true` is set in global php-lsp config. See
 [Configuration](docs/configuration.md).
+
+File and directory symlinks, including external targets, are followed
+deliberately. Physical file identities stop cycles and duplicate aliases while
+preserving the first deterministic logical URI. VS Code dynamically watches
+discovered external targets. If a traversal limit is reached, php-lsp retains
+a deterministic partial index and shows a warning in the status item; project
+config may lower the limits, while raising or disabling them requires trusted
+global or explicit VS Code configuration.
 
 In a multi-root VS Code workspace, the extension sends one explicit-settings
 snapshot per workspace folder. A document uses the most specific containing

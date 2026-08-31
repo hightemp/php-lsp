@@ -1640,14 +1640,22 @@ fn test_open_document_generation_orders_reused_lsp_versions() {
 #[test]
 fn test_cache_configs_use_separate_namespaces() {
     let root = Path::new("/tmp/project");
-    let workspace_config =
-        workspace_index_cache_config(Some(root), PhpVersion::DEFAULT, &[], &[], None, None);
+    let workspace_config = workspace_index_cache_config(
+        Some(root),
+        PhpVersion::DEFAULT,
+        &[],
+        &[],
+        TraversalLimits::default(),
+        None,
+        None,
+    );
     let stubs_config = stubs_index_cache_config_for_extensions(
         Path::new("/tmp/project/stubs"),
         PhpVersion::DEFAULT,
         vec!["Core".to_string()],
     );
-    let vendor_config = vendor_index_cache_config(root, PhpVersion::DEFAULT, &[]);
+    let vendor_config =
+        vendor_index_cache_config(root, PhpVersion::DEFAULT, &[], TraversalLimits::default());
 
     assert_eq!(workspace_config.namespace, CacheNamespace::Workspace);
     assert_eq!(stubs_config.namespace, CacheNamespace::Stubs);
@@ -1699,6 +1707,7 @@ fn test_workspace_cache_config_preserves_stub_configuration_without_discovery() 
         PhpVersion::DEFAULT,
         &[],
         &[],
+        TraversalLimits::default(),
         None,
         Some(stubs_path),
     );
@@ -1714,6 +1723,7 @@ fn test_workspace_cache_config_preserves_stub_configuration_without_discovery() 
         PhpVersion::DEFAULT,
         &[],
         &[],
+        TraversalLimits::default(),
         Some(&disabled),
         Some(stubs_path),
     );
@@ -1919,6 +1929,47 @@ fn test_vendor_autoload_map_parses_psr4_and_files() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_vendor_classmap_uses_safe_external_symlink_walker() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-vendor-classmap-symlink-{}",
+        std::process::id()
+    ));
+    let external = std::env::temp_dir().join(format!(
+        "php-lsp-vendor-classmap-external-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&external);
+    std::fs::create_dir_all(&root).expect("create classmap root");
+    std::fs::create_dir_all(&external).expect("create external classmap");
+    std::fs::write(
+        external.join("ExternalSubject.php"),
+        "<?php class ExternalSubject {}",
+    )
+    .expect("write external classmap file");
+    symlink(&external, root.join("linked-classmap")).expect("link external classmap");
+    symlink(&external, external.join("cycle")).expect("create classmap cycle");
+    let map = VendorAutoloadMap {
+        classmap: vec![root.join("linked-classmap")],
+        ..Default::default()
+    };
+
+    let paths = resolve_vendor_paths_from_map("ExternalSubject", &map)
+        .expect("external classmap candidate");
+    assert_eq!(
+        paths,
+        vec![root.join("linked-classmap/ExternalSubject.php")]
+    );
+
+    std::fs::remove_file(external.join("cycle")).expect("remove cycle link");
+    std::fs::remove_dir_all(root).expect("remove classmap root");
+    std::fs::remove_dir_all(external).expect("remove external classmap");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2330,6 +2381,7 @@ async fn composer_epoch_prevents_stale_vendor_preload_recommit() {
             preload_index,
             &preload_root,
             &[],
+            TraversalLimits::default(),
             PhpVersion::DEFAULT,
             &preload_cache,
             &preload_lru,
@@ -2359,6 +2411,7 @@ async fn composer_epoch_prevents_stale_vendor_preload_recommit() {
         backend.index.clone(),
         &root,
         &[],
+        TraversalLimits::default(),
         PhpVersion::DEFAULT,
         &backend.vendor_autoload_cache,
         &vendor_file_lru,
@@ -2472,12 +2525,15 @@ async fn stable_member_resolution_retries_changed_hierarchy_generation() {
         index: index.clone(),
         workspace_configs: Vec::new(),
         exclude_paths: Vec::new(),
+        traversal_limits: TraversalLimits::default(),
         php_version: PhpVersion::DEFAULT,
         index_vendor: false,
         vendor_autoload_cache: Arc::new(Mutex::new(VendorAutoloadCache::default())),
         vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
         lazy_loads: Arc::new(VendorLazyLoadCoordinator::default()),
         load_epoch: Arc::new(tokio::sync::RwLock::new(0)),
+        external_symlinks: None,
+        runtime_generation: 0,
     };
     let lookup_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hook_attempts = lookup_attempts.clone();
@@ -2548,12 +2604,15 @@ async fn same_fqn_lazy_loads_remain_isolated_per_index() {
                 index,
                 workspace_configs: vec![config],
                 exclude_paths: Vec::new(),
+                traversal_limits: TraversalLimits::default(),
                 php_version: PhpVersion::DEFAULT,
                 index_vendor: true,
                 vendor_autoload_cache: autoload_cache.clone(),
                 vendor_file_lru,
                 lazy_loads: coordinator.clone(),
                 load_epoch: Arc::new(tokio::sync::RwLock::new(0)),
+                external_symlinks: None,
+                runtime_generation: 0,
             }
         };
     let context_a = context(&root_a, src_a, index_a.clone());
@@ -2615,7 +2674,15 @@ async fn test_lazy_indexed_vendor_symbol_survives_restart_cache_load() {
     );
 
     let restarted_index = WorkspaceIndex::new();
-    let cache_config = vendor_index_cache_config(&root, PhpVersion::DEFAULT, &[]);
+    let cache_config = vendor_index_cache_config(
+        &root,
+        PhpVersion::DEFAULT,
+        &[],
+        TraversalLimits {
+            max_files: Some(DEFAULT_INDEXING_MAX_FILES),
+            max_entries: Some(DEFAULT_INDEXING_MAX_ENTRIES),
+        },
+    );
     assert!(load_cached_vendor_file(
         &restarted_index,
         &root,
@@ -4250,6 +4317,33 @@ fn test_diagnostic_budget_config_parses_nested_settings_and_zero_budget() {
     }));
     assert_eq!(disabled.member_type_node_budget, None);
     assert!(disabled.partial_analysis_diagnostic);
+}
+
+#[test]
+fn test_traversal_limits_parse_defaults_flat_nested_and_unlimited_values() {
+    assert_eq!(
+        traversal_limits_from_settings(&serde_json::json!({})),
+        TraversalLimits {
+            max_files: Some(DEFAULT_INDEXING_MAX_FILES),
+            max_entries: Some(DEFAULT_INDEXING_MAX_ENTRIES),
+        }
+    );
+    assert_eq!(
+        traversal_limits_from_settings(&serde_json::json!({
+            "indexing": { "maxFiles": 2048, "maxEntries": 8192 }
+        })),
+        TraversalLimits {
+            max_files: Some(2048),
+            max_entries: Some(8192),
+        }
+    );
+    assert_eq!(
+        traversal_limits_from_settings(&serde_json::json!({
+            "indexingMaxFiles": 0,
+            "indexingMaxEntries": 0
+        })),
+        TraversalLimits::default()
+    );
 }
 
 #[test]
@@ -6748,6 +6842,8 @@ fn test_framework_string_key_cache_evicts_lru_entries() {
         FrameworkStringKeyCacheKey {
             root: PathBuf::from(root),
             domain: domain.to_string(),
+            traversal_limits: TraversalLimits::default(),
+            exclude_paths: Vec::new(),
         }
     }
 
@@ -7217,6 +7313,8 @@ async fn test_twig_open_php_context_does_not_cross_root_indexes() {
         &open_files,
         &index_a,
         &cache,
+        TraversalLimits::default(),
+        &[],
     )
     .await;
     assert!(variables.iter().any(|variable| variable.name == "onlyA"));
@@ -7296,6 +7394,8 @@ async fn test_request_fs_cache_invalidation_clears_framework_and_twig_caches() {
         FrameworkStringKeyCacheKey {
             root: PathBuf::from("/workspace"),
             domain: "config".to_string(),
+            traversal_limits: TraversalLimits::default(),
+            exclude_paths: Vec::new(),
         },
         vec![crate::framework::FrameworkStringKey {
             key: "app.name".to_string(),

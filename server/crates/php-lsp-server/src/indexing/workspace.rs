@@ -1,5 +1,6 @@
 //! Workspace LSP handlers extracted from `server.rs`.
 
+use crate::util::fs_walk::{walk_files, FileWalkOutcome, TraversalLimits, TraversalStopReason};
 use crate::util::uri::path_to_uri;
 
 use super::super::*;
@@ -276,6 +277,7 @@ impl PhpLspBackend {
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
         let runtime_state_handle = self.runtime_state.clone();
         let aggregate_rebuild = self.aggregate_rebuild.clone();
+        let external_symlinks = self.external_symlinks.clone();
         tokio::spawn(async move {
             let mut completed_configs = Vec::new();
             let mut completed_tokens = Vec::new();
@@ -287,11 +289,13 @@ impl PhpLspBackend {
                 let indexing_options = WorkspaceIndexingOptions {
                     include_paths: runtime.include_paths.clone(),
                     exclude_paths: runtime.exclude_paths.clone(),
+                    traversal_limits: runtime.traversal_limits,
                     cache_config: workspace_index_cache_config(
                         Some(&config.root),
                         runtime.php_version,
                         &runtime.include_paths,
                         &runtime.exclude_paths,
+                        runtime.traversal_limits,
                         runtime.stub_extensions.as_deref(),
                         runtime.stubs_path.as_deref(),
                     ),
@@ -310,6 +314,9 @@ impl PhpLspBackend {
                     config.namespace_map.as_ref(),
                     &indexing_options,
                     indexing_token,
+                    &external_symlinks,
+                    &config.workspace_folder,
+                    runtime_generation,
                 )
                 .await
                 {
@@ -338,6 +345,7 @@ impl PhpLspBackend {
                         config.index.clone(),
                         &config.root,
                         &indexing_options.exclude_paths,
+                        runtime.traversal_limits,
                         runtime.php_version,
                         &vendor_autoload_cache,
                         &config.vendor_file_lru,
@@ -477,12 +485,15 @@ impl PhpLspBackend {
                         index: config.index.clone(),
                         workspace_configs: vec![config.clone()],
                         exclude_paths: runtime.exclude_paths.clone(),
+                        traversal_limits: runtime.traversal_limits,
                         php_version: runtime.php_version,
                         index_vendor: runtime.index_vendor,
                         vendor_autoload_cache: vendor_autoload_cache.clone(),
                         vendor_file_lru: config.vendor_file_lru.clone(),
                         lazy_loads: vendor_lazy_loads.clone(),
                         load_epoch: vendor_load_epoch.clone(),
+                        external_symlinks: Some(external_symlinks.clone()),
+                        runtime_generation,
                     };
                     let document_state = snapshot.document_state;
                     let version = document_state.map(|state| state.version);
@@ -584,9 +595,13 @@ impl PhpLspBackend {
     }
 
     pub(crate) async fn lsp_did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        tracing::debug!("didChangeWatchedFiles: {} change(s)", params.changes.len());
+        let changes = self
+            .external_symlinks
+            .translate_events(params.changes)
+            .await;
+        tracing::debug!("didChangeWatchedFiles: {} change(s)", changes.len());
 
-        if !params.changes.is_empty() {
+        if !changes.is_empty() {
             self.invalidate_request_fs_caches().await;
         }
 
@@ -594,7 +609,8 @@ impl PhpLspBackend {
         let mut config_changed = false;
         let mut composer_metadata_changed: Option<PathBuf> = None;
         let mut composer_requires_workspace_reindex = false;
-        for event in params.changes {
+        let mut template_context_changed = false;
+        for event in changes {
             if uri_is_project_config_file(&event.uri) {
                 config_changed = true;
                 continue;
@@ -608,6 +624,11 @@ impl PhpLspBackend {
                 if change == ComposerMetadataChange::ProjectAutoload {
                     composer_requires_workspace_reindex = true;
                 }
+                continue;
+            }
+
+            if is_twig_template_uri(event.uri.as_str()) {
+                template_context_changed = true;
                 continue;
             }
 
@@ -625,6 +646,10 @@ impl PhpLspBackend {
         }
         if let Some(path) = composer_metadata_changed {
             self.invalidate_composer_metadata(&path, composer_requires_workspace_reindex)
+                .await;
+        }
+        if template_context_changed {
+            self.refresh_open_twig_contexts_and_republish_diagnostics()
                 .await;
         }
     }
@@ -769,74 +794,173 @@ pub(crate) fn workspace_index_directories(
 }
 
 /// Collect all .php files from the given directories.
+#[cfg(test)]
 pub(crate) fn collect_php_files(
     directories: &[PathBuf],
     root: &Path,
     exclude_paths: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for dir in directories {
-        let abs_dir = if dir.is_absolute() {
-            dir.to_path_buf()
-        } else {
-            root.join(dir)
-        };
-        if path_is_excluded(&abs_dir, root, exclude_paths) {
-            continue;
-        }
-        if abs_dir.is_dir() {
-            collect_php_files_recursive(&abs_dir, root, exclude_paths, &mut files);
-        } else if abs_dir.extension().and_then(|e| e.to_str()) == Some("php") {
-            push_unique_path(&mut files, abs_dir);
-        }
-    }
-    files
+    collect_php_files_with_control(
+        directories,
+        root,
+        exclude_paths,
+        TraversalLimits::default(),
+        || None,
+    )
+    .files
+}
+
+pub(crate) fn collect_php_files_with_control<Control>(
+    directories: &[PathBuf],
+    root: &Path,
+    exclude_paths: &[PathBuf],
+    limits: TraversalLimits,
+    control: Control,
+) -> FileWalkOutcome
+where
+    Control: FnMut() -> Option<TraversalStopReason>,
+{
+    collect_php_files_with_explicit_control(directories, &[], root, exclude_paths, limits, control)
+}
+
+pub(crate) fn collect_php_files_with_explicit_control<Control>(
+    directories: &[PathBuf],
+    explicit_files: &[PathBuf],
+    root: &Path,
+    exclude_paths: &[PathBuf],
+    limits: TraversalLimits,
+    control: Control,
+) -> FileWalkOutcome
+where
+    Control: FnMut() -> Option<TraversalStopReason>,
+{
+    let mut roots = directories
+        .iter()
+        .map(|directory| {
+            if directory.is_absolute() {
+                directory.clone()
+            } else {
+                root.join(directory)
+            }
+        })
+        .collect::<Vec<_>>();
+    let explicit_files = explicit_files
+        .iter()
+        .map(|file| {
+            if file.is_absolute() {
+                file.clone()
+            } else {
+                root.join(file)
+            }
+        })
+        .collect::<HashSet<_>>();
+    roots.extend(explicit_files.iter().cloned());
+
+    walk_files(
+        &roots,
+        limits,
+        |path| path_is_excluded(path, root, exclude_paths),
+        |path, is_root| {
+            if is_root {
+                return true;
+            }
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            !name.starts_with('.') && !matches!(name.as_ref(), "vendor" | "node_modules")
+        },
+        |path| {
+            explicit_files.contains(path)
+                || path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
+        },
+        control,
+    )
 }
 
 pub(in crate::server) async fn collect_php_files_blocking(
     directories: Vec<PathBuf>,
     root: PathBuf,
     exclude_paths: Vec<PathBuf>,
-) -> std::result::Result<Vec<PathBuf>, String> {
+    explicit_files: Vec<PathBuf>,
+    limits: TraversalLimits,
+    cancellation: OperationCancellationToken,
+) -> std::result::Result<FileWalkOutcome, String> {
     let path_label = root.display().to_string();
+    let deadline = Instant::now() + Duration::from_millis(FILE_IO_TIMEOUT_MS);
     run_file_io_blocking("workspace PHP file discovery", path_label, move || {
-        collect_php_files(&directories, &root, &exclude_paths)
+        collect_php_files_with_explicit_control(
+            &directories,
+            &explicit_files,
+            &root,
+            &exclude_paths,
+            limits,
+            || {
+                if cancellation.is_cancelled() {
+                    Some(TraversalStopReason::Cancelled)
+                } else if Instant::now() >= deadline {
+                    Some(TraversalStopReason::DeadlineExceeded)
+                } else {
+                    None
+                }
+            },
+        )
     })
     .await
 }
 
-/// Recursively collect .php files from a directory.
-pub(in crate::server) fn collect_php_files_recursive(
-    dir: &Path,
-    root: &Path,
-    exclude_paths: &[PathBuf],
-    files: &mut Vec<PathBuf>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            tracing::warn!("Failed to read directory {}: {}", dir.display(), e);
-            return;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path_is_excluded(&path, root, exclude_paths) {
-            continue;
-        }
-        if path.is_dir() {
-            // Skip hidden directories and vendor
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || name_str == "vendor" || name_str == "node_modules" {
-                continue;
-            }
-            collect_php_files_recursive(&path, root, exclude_paths, files);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("php") {
-            push_unique_path(files, path);
-        }
-    }
+async fn collect_feature_symlink_aliases_blocking(
+    root: PathBuf,
+    exclude_paths: Vec<PathBuf>,
+    limits: TraversalLimits,
+    cancellation: OperationCancellationToken,
+) -> std::result::Result<FileWalkOutcome, String> {
+    let roots = [
+        root.join("app"),
+        root.join("tests"),
+        root.join("templates"),
+        root.join("resources"),
+        root.join("config"),
+        root.join("routes"),
+        root.join("lang"),
+    ];
+    let path_label = root.display().to_string();
+    let deadline = Instant::now() + Duration::from_millis(FILE_IO_TIMEOUT_MS);
+    run_file_io_blocking("feature symlink discovery", path_label, move || {
+        walk_files(
+            &roots,
+            TraversalLimits {
+                max_files: None,
+                max_entries: limits.max_entries,
+            },
+            |path| path_is_excluded(path, &root, &exclude_paths),
+            |path, is_root| {
+                if is_root {
+                    return true;
+                }
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .unwrap_or_default();
+                !name.starts_with('.')
+                    && !matches!(name.as_ref(), "vendor" | "node_modules" | "target")
+            },
+            |_| false,
+            || {
+                if cancellation.is_cancelled() {
+                    Some(TraversalStopReason::Cancelled)
+                } else if Instant::now() >= deadline {
+                    Some(TraversalStopReason::DeadlineExceeded)
+                } else {
+                    None
+                }
+            },
+        )
+    })
+    .await
 }
 
 pub(in crate::server) fn uri_is_php_file(uri: &Uri) -> bool {
@@ -1060,6 +1184,9 @@ fn merge_project_configuration_for_root(
         }
         match load_toml_settings(&path) {
             Ok(mut settings) => {
+                for message in clamp_project_traversal_limits(&mut settings, effective, &path) {
+                    messages.push(message);
+                }
                 if let Some(message) = sanitize_project_settings_for_command_trust(
                     &mut settings,
                     &path,
@@ -1074,6 +1201,49 @@ fn merge_project_configuration_for_root(
             Err(message) => messages.push(message),
         }
     }
+}
+
+fn clamp_project_traversal_limits(
+    settings: &mut serde_json::Value,
+    trusted_baseline: &serde_json::Value,
+    path: &Path,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    for (key, label, default_limit) in [
+        (
+            "indexingMaxFiles",
+            "indexing.maxFiles",
+            DEFAULT_INDEXING_MAX_FILES as u64,
+        ),
+        (
+            "indexingMaxEntries",
+            "indexing.maxEntries",
+            DEFAULT_INDEXING_MAX_ENTRIES as u64,
+        ),
+    ] {
+        let baseline = trusted_baseline
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(default_limit);
+        let Some(requested) = settings.get(key).and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let raises_limit = baseline != 0 && (requested == 0 || requested > baseline);
+        if !raises_limit {
+            continue;
+        }
+        if let Some(settings) = settings.as_object_mut() {
+            settings.insert(key.to_string(), serde_json::Value::from(baseline));
+        }
+        messages.push(format!(
+            "Ignored project indexing limit increase from {}: {}={} exceeds trusted cap {}. Raise it in global or VS Code configuration instead.",
+            path.display(),
+            label,
+            requested,
+            baseline
+        ));
+    }
+    messages
 }
 
 pub(crate) fn load_workspace_runtime(
@@ -1633,10 +1803,12 @@ pub(in crate::server) fn indexed_vendor_cache_sources(
     sources
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::server) async fn preload_vendor_entrypoints(
     index: Arc<WorkspaceIndex>,
     root: &Path,
     exclude_paths: &[PathBuf],
+    traversal_limits: TraversalLimits,
     php_version: PhpVersion,
     vendor_autoload_cache: &Arc<Mutex<VendorAutoloadCache>>,
     vendor_file_lru: &Arc<Mutex<VendorFileLru>>,
@@ -1664,7 +1836,8 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
         return 0;
     }
 
-    let cache_config = vendor_index_cache_config(root, php_version, exclude_paths);
+    let cache_config =
+        vendor_index_cache_config(root, php_version, exclude_paths, traversal_limits);
     let mut loaded = 0;
     for file_path in entrypoint_files {
         if !file_path.is_file() {
@@ -1705,6 +1878,7 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
 /// Background workspace indexing.
 ///
 /// Scans PHP files in the workspace and adds their symbols to the index.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::server) async fn index_workspace(
     client: &Client,
     live: WorkspaceLiveIndexContext<'_>,
@@ -1712,6 +1886,9 @@ pub(in crate::server) async fn index_workspace(
     namespace_map: Option<&NamespaceMap>,
     options: &WorkspaceIndexingOptions,
     cancellation: &OperationCancellationToken,
+    external_symlinks: &Arc<ExternalSymlinkManager>,
+    workspace_folder: &Path,
+    runtime_generation: u64,
 ) -> std::result::Result<(), String> {
     let root_label = root.display().to_string();
     let started_at = Instant::now();
@@ -1762,12 +1939,25 @@ pub(in crate::server) async fn index_workspace(
 
     // Collect PHP files
     let source_dirs = workspace_index_directories(root, namespace_map, &options.include_paths);
-    let php_files = collect_php_files_blocking(
+    let explicit_files = namespace_map
+        .map(|namespace_map| namespace_map.files.clone())
+        .unwrap_or_default();
+    let php_discovery = collect_php_files_blocking(
         source_dirs,
         root.to_path_buf(),
         options.exclude_paths.clone(),
+        explicit_files,
+        options.traversal_limits,
+        cancellation.clone(),
     )
     .await?;
+    if php_discovery.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
+        return Err(format!(
+            "Workspace PHP file discovery exceeded {} ms for {}",
+            FILE_IO_TIMEOUT_MS,
+            root.display()
+        ));
+    }
     if cancellation.is_cancelled() {
         tracing::debug!(
             "Workspace indexing cancelled after discovery: {}",
@@ -1775,25 +1965,61 @@ pub(in crate::server) async fn index_workspace(
         );
         return Ok(());
     }
-
-    // Also add explicit files from composer.json
-    let mut all_files = php_files;
-    if let Some(ns_map) = namespace_map {
-        for file_path in &ns_map.files {
-            let abs = if file_path.is_absolute() {
-                file_path.clone()
-            } else {
-                root.join(file_path)
-            };
-            if abs.exists()
-                && !path_is_excluded(&abs, root, &options.exclude_paths)
-                && !all_files.contains(&abs)
-            {
-                all_files.push(abs);
+    let mut watcher_aliases = php_discovery.symlink_aliases.clone();
+    match collect_feature_symlink_aliases_blocking(
+        root.to_path_buf(),
+        options.exclude_paths.clone(),
+        options.traversal_limits,
+        cancellation.clone(),
+    )
+    .await
+    {
+        Ok(feature_discovery) => {
+            if feature_discovery.stop_reason.is_some() {
+                tracing::warn!(
+                    "Feature symlink discovery for {} stopped after {} entries: {:?}",
+                    root.display(),
+                    feature_discovery.stats.visited_entries,
+                    feature_discovery.stop_reason
+                );
             }
+            watcher_aliases.extend(feature_discovery.symlink_aliases);
         }
+        Err(message) => tracing::warn!("{}", message),
     }
-    all_files.sort();
+    if cancellation.is_cancelled() {
+        return Ok(());
+    }
+    external_symlinks
+        .publish_workspace(
+            workspace_folder.to_path_buf(),
+            root.to_path_buf(),
+            runtime_generation,
+            watcher_aliases,
+            php_discovery.physical_files.clone(),
+        )
+        .await;
+    let traversal_stop_reason = php_discovery.stop_reason;
+    let traversal_stats = php_discovery.stats;
+    let traversal_truncated = php_discovery.truncated();
+    let (truncation_reason, truncation_limit) = match traversal_stop_reason {
+        Some(TraversalStopReason::MaxFiles { limit }) => (Some("maxFiles"), Some(limit)),
+        Some(TraversalStopReason::MaxEntries { limit }) => (Some("maxEntries"), Some(limit)),
+        _ => (None, None),
+    };
+    if let (Some(reason), Some(limit)) = (truncation_reason, truncation_limit) {
+        let message = format!(
+            "Workspace file discovery for {} was truncated by indexing.{}={} after visiting {} entries",
+            root.display(),
+            reason,
+            limit,
+            traversal_stats.visited_entries
+        );
+        tracing::warn!("{}", message);
+        client.log_message(MessageType::WARNING, message).await;
+    }
+
+    let all_files = php_discovery.files;
 
     let total = all_files.len();
     tracing::info!("Indexing {} PHP files", total);
@@ -1889,7 +2115,11 @@ pub(in crate::server) async fn index_workspace(
             "cacheFilesLoaded": loaded_from_cache,
             "cacheFilesStale": cache_report.stale_files,
             "cacheFilesMissing": cache_report.missing_files,
-            "parseConcurrency": indexing_parse_concurrency()
+            "parseConcurrency": indexing_parse_concurrency(),
+            "truncated": traversal_truncated,
+            "truncationReason": truncation_reason,
+            "truncationLimit": truncation_limit,
+            "visitedEntries": traversal_stats.visited_entries
         }),
     )
     .await;
@@ -2065,7 +2295,11 @@ pub(in crate::server) async fn index_workspace(
             "cacheFilesMissing": cache_report.missing_files,
             "indexingErrors": parse_errors,
             "parseConcurrency": parse_concurrency,
-            "cachePath": cache_path.display().to_string()
+            "cachePath": cache_path.display().to_string(),
+            "truncated": traversal_truncated,
+            "truncationReason": truncation_reason,
+            "truncationLimit": truncation_limit,
+            "visitedEntries": traversal_stats.visited_entries
         }),
     )
     .await;

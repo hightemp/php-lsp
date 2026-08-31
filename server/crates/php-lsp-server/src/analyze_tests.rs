@@ -84,6 +84,31 @@ fn analyze_exit_codes_report_clean_diagnostics_and_errors() {
 }
 
 #[test]
+fn explicit_analyze_target_is_not_dropped_by_workspace_file_limit() {
+    let root = temp_dir("explicit-target-limit");
+    std::fs::write(
+        root.join(".php-lsp.toml"),
+        "[indexing]\ncomposer = false\nmaxFiles = 1\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("A.php"), "<?php class A {}\n").unwrap();
+    std::fs::write(root.join("Z.php"), "<?php class Z {}\n").unwrap();
+
+    let result = run_analyze_cli(vec![
+        "Z.php".to_string(),
+        "--project-root".to_string(),
+        root.display().to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ]);
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(value["summary"]["filesAnalyzed"], 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn analyze_resolves_vendor_psr4_symbols_from_composer_installed_metadata() {
     let root = temp_dir("vendor-psr4");
     std::fs::create_dir_all(root.join("src")).unwrap();

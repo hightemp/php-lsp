@@ -104,7 +104,16 @@ client, конфигурации, file watchers, release и cache-path parity. �
 
 ## P1 — высокий приоритет
 
-### CODEX-P1-01. Рекурсивная индексация следует по символическим ссылкам
+### CODEX-P1-01. Рекурсивная индексация следует по symlink без защиты от циклов
+
+> **Статус 2026-08-28:** исправлено. Внешние symlink остаются поддерживаемым
+> поведением; исправлены небезопасный обход, дубли и live-update внешних целей.
+
+> **Принятое решение 2026-08-28:** индексирование symlink-файлов и директорий,
+> включая цели вне workspace, нужно сохранить — это поддерживает shared packages,
+> monorepo-модули, Composer path repositories и смонтированные исходники. Дефектом
+> считается не сам выход за границы workspace, а отсутствие cycle detection,
+> дедупликации, управляемых exclusions и ограничений обхода.
 
 Основной workspace walker использует `path.is_dir()`, который следует по
 symlink, и не ведёт набор посещённых каталогов:
@@ -123,9 +132,9 @@ symlink, и не ведёт набор посещённых каталогов:
 
 #### Последствия
 
-- индексирование файлов вне workspace;
-- обход настроенных exclusions;
-- лишнее раскрытие локальных имён и типов через LSP;
+- случайная ссылка на слишком большое внешнее дерево может резко расширить
+  индекс и раскрываемые через LSP имена;
+- symlink-ветка может обходить ожидаемые разработчиком exclusions;
 - повторный обход деревьев и потенциальные циклы;
 - продолжающиеся фоновые задачи после timeout.
 
@@ -133,12 +142,49 @@ symlink, и не ведёт набор посещённых каталогов:
 
 Создать единый общий filesystem visitor:
 
-1. Проверять `DirEntry::file_type()` и не следовать вложенным symlink.
-2. При необходимости разрешать symlink только для явно заданного корня.
-3. Проверять canonical containment для каждого реально открываемого файла.
-4. Хранить посещённые device/inode или platform file-id.
-5. Применить одинаковую политику к workspace, templates, framework и vendor.
-6. Добавить Unix-тесты на cycle, external link и broken link.
+1. Проверять `DirEntry::file_type()`, явно распознавать symlink и продолжать
+   обход доступной цели, даже если она находится вне workspace.
+2. Хранить identity посещённых директорий: device/inode на Unix, platform
+   file-id на Windows, canonical path как fallback; повторный identity не
+   обходить.
+3. Дедуплицировать один физический файл, доступный через несколько ссылок,
+   сохраняя детерминированный первый логический URI для навигации.
+4. Применять exclusions к видимому в проекте логическому пути, чтобы отдельную
+   symlink-ветку можно было исключить без запрета внешних целей в целом.
+5. Broken и недоступные ссылки пропускать с диагностическим log-сообщением, не
+   прерывая остальную индексацию.
+6. Проверять cancellation и traversal/file budgets во время внешнего обхода;
+   не полагаться на фиксированную глубину как средство против циклов.
+7. Применить одинаковую политику к workspace, templates, framework и vendor и
+   учесть обновление внешних целей, которые VS Code watcher может не видеть.
+8. Добавить тесты: внешний symlink индексируется, cycle завершается, несколько
+   aliases не дублируют файл, exclusion работает, broken link безопасно
+   пропускается.
+
+#### Реализовано
+
+- workspace, CLI `analyze`/`fix`, Twig, framework и vendor classmap используют
+  единый итеративный filesystem visitor с platform file ID (`file-id`) и
+  canonical fallback;
+- каталоги и файлы дедуплицируются по физической identity, входные roots и
+  записи обходятся в стабильном порядке, а первым URI остаётся
+  детерминированный логический symlink-путь;
+- exclusions применяются к логическому пути, broken/недоступные ссылки
+  пропускаются, cancellation и deadline проверяются внутри blocking traversal;
+- добавлены root-specific `indexing.maxFiles=100000` и
+  `indexing.maxEntries=1000000`; `0` отключает cap только из trusted
+  global/VS Code config, а project config может лишь уменьшить лимит;
+- исчерпание лимита сохраняет частичный индекс и публикует `truncated`,
+  `truncationReason`, `truncationLimit`, `visitedEntries` в indexing status;
+- generation-aware реестр переводит события physical target обратно в
+  logical URI, поддерживает alias promotion и multi-root isolation; для
+  внешних roots используется стандартная LSP dynamic registration с
+  `RelativePattern`, без custom protocol или polling;
+- regressions покрывают внешний file/directory symlink, cycles, hardlinks,
+  aliases, exclusions, broken links, limits/deadline/cancellation, stale
+  generation, multi-root routing, Twig/framework/vendor adapters, cache/config
+  parity, физический watched event и 10 000 файлов с линейным числом identity
+  lookups.
 
 ### CODEX-P1-02. Нестабильный переход к унаследованному vendor-методу
 
@@ -1165,6 +1211,8 @@ workspace даже без symlink.
 
 ### CODEX-P2-42. Сбор PHP-файлов имеет квадратичную сложность
 
+> **Статус 2026-08-28:** исправлено вместе с `CODEX-P1-01`.
+
 [`push_unique_path`](server/crates/php-lsp-server/src/indexing/workspace.rs#L887)
 для каждой вставки линейно просматривает уже накопленный `Vec<PathBuf>` через
 `paths.iter().any(...)`. Рекурсивный walker вызывает его для каждого найденного
@@ -1203,6 +1251,16 @@ include/exclude correctness на двух файлах
   общей canonical containment/non-following policy;
 - добавить regression/benchmark на 10–50 тысяч файлов, overlapping Composer
   mappings и ограничение количества path comparisons/directory visits.
+
+#### Реализовано
+
+`push_unique_path` больше не вызывается на каждый найденный PHP-файл.
+Filesystem visitor хранит физические file/directory identities в `HashSet` и
+группирует aliases через hash maps; overlapping Composer roots прекращают
+обход после первого directory identity. Regression на 10 000 файлов получает
+10 001 visited entry и 10 001 identity lookup (root + files), без
+`N * (N - 1) / 2` сравнений путей. Та же линейная physical-дедупликация
+используется при объединении workspace и CLI target lists.
 
 ### CODEX-P2-43. Framework string scanner повреждает Unicode
 

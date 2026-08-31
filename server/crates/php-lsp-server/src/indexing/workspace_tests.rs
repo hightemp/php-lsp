@@ -415,3 +415,89 @@ fn delayed_workspace_disk_index_never_overwrites_an_unsaved_open_document() {
 
     assert_eq!(indexed_symbol_names(&index, uri), vec!["unsavedName"]);
 }
+
+#[test]
+fn project_traversal_limits_can_only_reduce_the_trusted_baseline() {
+    let mut settings = serde_json::json!({
+        "indexingMaxFiles": 0,
+        "indexingMaxEntries": 2_000_000
+    });
+    let trusted = serde_json::json!({
+        "indexingMaxFiles": 250_000,
+        "indexingMaxEntries": 500_000
+    });
+    let messages = clamp_project_traversal_limits(
+        &mut settings,
+        &trusted,
+        Path::new("/workspace/.php-lsp.toml"),
+    );
+
+    assert_eq!(settings["indexingMaxFiles"], 250_000);
+    assert_eq!(settings["indexingMaxEntries"], 500_000);
+    assert_eq!(messages.len(), 2);
+
+    let mut reductions = serde_json::json!({
+        "indexingMaxFiles": 50_000,
+        "indexingMaxEntries": 100_000
+    });
+    assert!(clamp_project_traversal_limits(
+        &mut reductions,
+        &trusted,
+        Path::new("/workspace/.php-lsp.toml"),
+    )
+    .is_empty());
+    assert_eq!(reductions["indexingMaxFiles"], 50_000);
+    assert_eq!(reductions["indexingMaxEntries"], 100_000);
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_collection_follows_external_symlinks_without_cycles() {
+    use std::os::unix::fs::symlink;
+
+    let root =
+        std::env::temp_dir().join(format!("php-lsp-workspace-symlink-{}", std::process::id()));
+    let external = std::env::temp_dir().join(format!(
+        "php-lsp-workspace-symlink-external-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&external);
+    std::fs::create_dir_all(root.join("nested")).expect("create workspace tree");
+    std::fs::create_dir_all(&external).expect("create external tree");
+    std::fs::write(external.join("External.php"), "<?php class External {}")
+        .expect("write external PHP file");
+    symlink(&external, root.join("linked")).expect("link external tree");
+    symlink(&root, root.join("nested/back")).expect("link workspace cycle");
+
+    let files = collect_php_files(std::slice::from_ref(&root), &root, &[]);
+    assert_eq!(files, vec![root.join("linked/External.php")]);
+
+    std::fs::remove_dir_all(root).expect("remove workspace tree");
+    std::fs::remove_dir_all(external).expect("remove external tree");
+}
+
+#[test]
+fn explicit_composer_file_is_kept_even_without_php_extension() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-composer-explicit-file-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create workspace");
+    let bootstrap = root.join("bootstrap.inc");
+    std::fs::write(&bootstrap, "<?php function bootstrap_helper(): void {}")
+        .expect("write Composer file");
+
+    let outcome = collect_php_files_with_explicit_control(
+        &[],
+        std::slice::from_ref(&bootstrap),
+        &root,
+        &[],
+        TraversalLimits::default(),
+        || None,
+    );
+    assert_eq!(outcome.files, vec![bootstrap]);
+
+    std::fs::remove_dir_all(root).expect("remove workspace");
+}

@@ -566,3 +566,51 @@ fn resolves_twig_template_paths_under_app_templates() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[cfg(unix)]
+#[test]
+fn twig_context_file_collection_uses_safe_external_symlink_walker() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-context-symlink-{}",
+        std::process::id()
+    ));
+    let external = std::env::temp_dir().join(format!(
+        "php-lsp-twig-context-external-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&external);
+    std::fs::create_dir_all(&root).expect("create workspace");
+    std::fs::create_dir_all(&external).expect("create external source");
+    std::fs::write(external.join("Controller.php"), "<?php class Controller {}")
+        .expect("write external PHP file");
+    symlink(&external, root.join("src")).expect("link external source");
+    symlink(&root, external.join("back")).expect("create source cycle");
+
+    let files = collect_twig_context_php_files_with_limits(
+        &root,
+        16,
+        TraversalLimits {
+            max_files: Some(16),
+            max_entries: Some(128),
+        },
+        &[],
+    );
+    assert_eq!(files, vec![root.join("src/Controller.php")]);
+    let excluded = collect_twig_context_php_files_with_limits(
+        &root,
+        16,
+        TraversalLimits {
+            max_files: Some(16),
+            max_entries: Some(128),
+        },
+        &[PathBuf::from("src")],
+    );
+    assert!(excluded.is_empty());
+
+    std::fs::remove_file(external.join("back")).expect("remove cycle link");
+    std::fs::remove_dir_all(root).expect("remove workspace");
+    std::fs::remove_dir_all(external).expect("remove external source");
+}

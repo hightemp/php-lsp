@@ -72,6 +72,18 @@
           "type": "array",
           "items": { "type": "string" }
         },
+        "maxFiles": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 100000,
+          "description": "Maximum unique matching files per traversal. Project config may lower the trusted baseline; use trusted global or VS Code configuration to raise it or set 0."
+        },
+        "maxEntries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1000000,
+          "description": "Maximum filesystem entries inspected per traversal. Project config may lower the trusted baseline; use trusted global or VS Code configuration to raise it or set 0."
+        },
         "stubs": {
           "type": "array",
           "items": { "type": "string" }

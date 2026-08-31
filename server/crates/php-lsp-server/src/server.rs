@@ -12,13 +12,14 @@
 
 use crate::config::{
     global_config_candidates, load_toml_settings, merge_json_objects, normalize_client_settings,
-    PROJECT_CONFIG_FILE_NAME,
+    DEFAULT_INDEXING_MAX_ENTRIES, DEFAULT_INDEXING_MAX_FILES, PROJECT_CONFIG_FILE_NAME,
 };
 use crate::template::{
     is_blade_template_language_id, is_blade_template_uri, is_twig_template_language_id,
     is_twig_template_uri, preprocess_blade_template, preprocess_twig_template, TemplateDocument,
     TemplateKind, TemplateVariableType,
 };
+use crate::util::fs_walk::TraversalLimits;
 use crate::util::lsp_text::{
     lsp_position_to_byte, range_from_byte_range, range_from_lsp_tuple, text_at_lsp_range,
 };
@@ -78,15 +79,19 @@ mod lsp;
 use indexing::cache::*;
 pub(crate) use indexing::stubs::load_configured_stubs;
 use indexing::stubs::*;
+use indexing::symlinks::*;
 use indexing::vendor::*;
 pub(crate) use indexing::vendor::{
     parse_vendor_autoload_map, resolve_vendor_paths_from_map, vendor_autoload_file_paths_from_map,
     vendor_namespace_exists_from_map,
 };
+#[cfg(test)]
+pub(crate) use indexing::workspace::collect_php_files;
 use indexing::workspace::*;
 pub(crate) use indexing::workspace::{
-    collect_php_files, discover_workspace_root_config, load_effective_configuration_settings,
-    path_is_excluded, workspace_index_directories,
+    collect_php_files_with_control, collect_php_files_with_explicit_control,
+    discover_workspace_root_config, load_effective_configuration_settings, path_is_excluded,
+    workspace_index_directories,
 };
 pub(crate) use lsp::code_action::*;
 use lsp::completion_helpers::*;
@@ -1302,6 +1307,7 @@ struct ResolvedRuntimeConfiguration {
     index_vendor: bool,
     include_paths: Vec<PathBuf>,
     exclude_paths: Vec<PathBuf>,
+    traversal_limits: TraversalLimits,
     stub_extensions: Option<Vec<String>>,
     log_level: String,
     stubs_path: Option<PathBuf>,
@@ -1429,6 +1435,10 @@ impl Default for ResolvedRuntimeConfiguration {
             index_vendor: true,
             include_paths: Vec::new(),
             exclude_paths: Vec::new(),
+            traversal_limits: TraversalLimits {
+                max_files: Some(DEFAULT_INDEXING_MAX_FILES),
+                max_entries: Some(DEFAULT_INDEXING_MAX_ENTRIES),
+            },
             stub_extensions: None,
             log_level: "info".to_string(),
             stubs_path: None,
@@ -1485,6 +1495,7 @@ impl ResolvedRuntimeConfiguration {
         if let Some(paths) = settings_string_array(settings, "excludePaths", &["excludePaths"]) {
             resolved.exclude_paths = normalize_config_paths(paths);
         }
+        resolved.traversal_limits = traversal_limits_from_settings(settings);
         resolved.stub_extensions =
             settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
         if let Some(level) = settings_string(settings, "logLevel", &["logLevel"]) {
@@ -1637,7 +1648,8 @@ fn runtime_configuration_changes(
         indexing_changed: previous.composer_enabled != current.composer_enabled
             || previous.index_vendor != current.index_vendor
             || previous.include_paths != current.include_paths
-            || previous.exclude_paths != current.exclude_paths,
+            || previous.exclude_paths != current.exclude_paths
+            || previous.traversal_limits != current.traversal_limits,
     }
 }
 
@@ -1645,6 +1657,7 @@ fn runtime_configuration_changes(
 struct WorkspaceIndexingOptions {
     include_paths: Vec<PathBuf>,
     exclude_paths: Vec<PathBuf>,
+    traversal_limits: TraversalLimits,
     cache_config: IndexCacheConfig,
     work_done_progress_supported: bool,
 }
@@ -1674,6 +1687,8 @@ struct SemanticTokensCache {
 struct FrameworkStringKeyCacheKey {
     root: PathBuf,
     domain: String,
+    traversal_limits: TraversalLimits,
+    exclude_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -2301,6 +2316,44 @@ fn diagnostic_member_type_node_budget_from_u64(raw_budget: u64) -> Option<Option
     usize::try_from(raw_budget).ok().map(Some)
 }
 
+fn traversal_limit_from_u64(raw_limit: u64) -> Option<Option<usize>> {
+    if raw_limit == 0 {
+        return Some(None);
+    }
+    usize::try_from(raw_limit).ok().map(Some)
+}
+
+pub(crate) fn traversal_limits_from_settings(settings: &serde_json::Value) -> TraversalLimits {
+    let settings = php_lsp_settings(settings);
+    let mut limits = TraversalLimits {
+        max_files: Some(DEFAULT_INDEXING_MAX_FILES),
+        max_entries: Some(DEFAULT_INDEXING_MAX_ENTRIES),
+    };
+
+    if let Some(raw_limit) =
+        settings_u64_aliases(settings, "indexingMaxFiles", &[&["indexing", "maxFiles"]])
+    {
+        if let Some(limit) = traversal_limit_from_u64(raw_limit) {
+            limits.max_files = limit;
+        } else {
+            tracing::warn!("Ignoring indexing.maxFiles outside this platform's usize range");
+        }
+    }
+    if let Some(raw_limit) = settings_u64_aliases(
+        settings,
+        "indexingMaxEntries",
+        &[&["indexing", "maxEntries"]],
+    ) {
+        if let Some(limit) = traversal_limit_from_u64(raw_limit) {
+            limits.max_entries = limit;
+        } else {
+            tracing::warn!("Ignoring indexing.maxEntries outside this platform's usize range");
+        }
+    }
+
+    limits
+}
+
 pub(crate) fn diagnostic_budget_config_from_settings(
     settings: &serde_json::Value,
 ) -> DiagnosticBudgetConfig {
@@ -2403,6 +2456,9 @@ pub struct PhpLspBackend {
     /// Files/directories excluded from workspace indexing.
     #[cfg(test)]
     exclude_paths: Mutex<Vec<PathBuf>>,
+    /// Resource limits for filesystem traversal.
+    #[cfg(test)]
+    traversal_limits: Mutex<TraversalLimits>,
     /// Configured phpstorm-stubs extension directory names.
     ///
     /// `None` means use defaults. `Some([])` means stubs were explicitly disabled
@@ -2431,6 +2487,8 @@ pub struct PhpLspBackend {
     vendor_load_epoch: Arc<tokio::sync::RwLock<u64>>,
     /// Bounded set of lazy-indexed vendor files currently kept in the symbol index.
     vendor_file_lru: Arc<Mutex<VendorFileLru>>,
+    /// Physical/logical symlink aliases and dynamic external watcher registrations.
+    external_symlinks: Arc<ExternalSymlinkManager>,
 }
 
 impl PhpLspBackend {
@@ -2449,7 +2507,7 @@ impl PhpLspBackend {
             runtime_state.clone(),
         );
         PhpLspBackend {
-            client,
+            client: client.clone(),
             open_files,
             template_documents,
             document_versions,
@@ -2496,6 +2554,11 @@ impl PhpLspBackend {
             #[cfg(test)]
             exclude_paths: Mutex::new(Vec::new()),
             #[cfg(test)]
+            traversal_limits: Mutex::new(TraversalLimits {
+                max_files: Some(DEFAULT_INDEXING_MAX_FILES),
+                max_entries: Some(DEFAULT_INDEXING_MAX_ENTRIES),
+            }),
+            #[cfg(test)]
             stub_extensions: Mutex::new(None),
             #[cfg(test)]
             log_level: Mutex::new("info".to_string()),
@@ -2509,6 +2572,7 @@ impl PhpLspBackend {
             vendor_lazy_loads: Arc::new(VendorLazyLoadCoordinator::default()),
             vendor_load_epoch: Arc::new(tokio::sync::RwLock::new(0)),
             vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+            external_symlinks: ExternalSymlinkManager::new(client.clone()),
         }
     }
 
@@ -2989,6 +3053,7 @@ impl PhpLspBackend {
             index_vendor,
             include_paths,
             exclude_paths,
+            traversal_limits,
             stub_extensions,
             log_level,
             stubs_path,
@@ -3073,6 +3138,13 @@ impl PhpLspBackend {
             }
         }
         {
+            let mut current = self.traversal_limits.lock().await;
+            if *current != traversal_limits {
+                *current = traversal_limits;
+                applied.indexing_changed = true;
+            }
+        }
+        {
             let mut current = self.stub_extensions.lock().await;
             if *current != stub_extensions {
                 *current = stub_extensions;
@@ -3131,7 +3203,10 @@ impl PhpLspBackend {
         )
         .await;
         for message in &loaded.messages {
-            if message.contains("failed") || message.starts_with("Ignored executable") {
+            if message.contains("failed")
+                || message.starts_with("Ignored executable")
+                || message.starts_with("Ignored project indexing")
+            {
                 tracing::warn!("{}", message);
                 self.client
                     .log_message(MessageType::WARNING, message.clone())
@@ -3260,6 +3335,18 @@ impl PhpLspBackend {
         &self,
         application: WorkspaceConfigurationApplication,
     ) {
+        let runtime_state = self.runtime_state_snapshot().await;
+        let active_workspace_folders = runtime_state
+            .configs
+            .iter()
+            .map(|config| (config.workspace_folder.clone(), runtime_state.generation))
+            .collect::<Vec<_>>();
+        self.external_symlinks
+            .set_active_workspaces(
+                &active_workspace_folders,
+                &application.indexing_workspace_folders,
+            )
+            .await;
         self.cancel_indexing_runs_for_workspace_folders(&application.removed_workspace_folders)
             .await;
         let mut runtime_sensitive_folders = application.diagnostics_workspace_folders.clone();
@@ -3553,6 +3640,7 @@ impl PhpLspBackend {
         let indexing_run_state = self.indexing_run.clone();
         let runtime_state_handle = self.runtime_state.clone();
         let aggregate_rebuild = self.aggregate_rebuild.clone();
+        let external_symlinks = self.external_symlinks.clone();
         let mut indexing_tokens = Vec::with_capacity(configs.len());
         for config in &configs {
             indexing_tokens.push(self.start_indexing_run(&config.workspace_folder).await);
@@ -3568,11 +3656,13 @@ impl PhpLspBackend {
                 let indexing_options = WorkspaceIndexingOptions {
                     include_paths: runtime.include_paths.clone(),
                     exclude_paths: runtime.exclude_paths.clone(),
+                    traversal_limits: runtime.traversal_limits,
                     cache_config: workspace_index_cache_config(
                         Some(&config.root),
                         runtime.php_version,
                         &runtime.include_paths,
                         &runtime.exclude_paths,
+                        runtime.traversal_limits,
                         runtime.stub_extensions.as_deref(),
                         runtime.stubs_path.as_deref(),
                     ),
@@ -3591,6 +3681,9 @@ impl PhpLspBackend {
                     config.namespace_map.as_ref(),
                     &indexing_options,
                     indexing_token,
+                    &external_symlinks,
+                    &config.workspace_folder,
+                    runtime_generation,
                 )
                 .await
                 {
@@ -3622,6 +3715,7 @@ impl PhpLspBackend {
                         config.index.clone(),
                         &config.root,
                         &indexing_options.exclude_paths,
+                        runtime.traversal_limits,
                         runtime.php_version,
                         &vendor_autoload_cache,
                         &config.vendor_file_lru,
@@ -3779,12 +3873,15 @@ impl PhpLspBackend {
                         index: config.index.clone(),
                         workspace_configs: vec![config.clone()],
                         exclude_paths: runtime.exclude_paths.clone(),
+                        traversal_limits: runtime.traversal_limits,
                         php_version: runtime.php_version,
                         index_vendor: runtime.index_vendor,
                         vendor_autoload_cache: vendor_autoload_cache.clone(),
                         vendor_file_lru: config.vendor_file_lru.clone(),
                         lazy_loads: vendor_lazy_loads.clone(),
                         load_epoch: vendor_load_epoch.clone(),
+                        external_symlinks: Some(external_symlinks.clone()),
+                        runtime_generation,
                     };
                     let document_state = snapshot.document_state;
                     let version = document_state.map(|state| state.version);

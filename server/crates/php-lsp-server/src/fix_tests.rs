@@ -136,6 +136,32 @@ fn fix_cli_requires_dry_run() {
     assert!(result.stderr.contains("requires --dry-run"));
 }
 
+#[test]
+fn explicit_fix_target_is_not_dropped_by_workspace_file_limit() {
+    let root = temp_dir("explicit-target-limit");
+    std::fs::write(
+        root.join(".php-lsp.toml"),
+        "[indexing]\ncomposer = false\nmaxFiles = 1\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("A.php"), "<?php class A {}\n").unwrap();
+    std::fs::write(root.join("Z.php"), "<?php class Z {}\n").unwrap();
+
+    let result = run_fix_cli(vec![
+        "Z.php".to_string(),
+        "--dry-run".to_string(),
+        "--project-root".to_string(),
+        root.display().to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ]);
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(value["summary"]["filesAnalyzed"], 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "php-lsp-fix-{label}-{}",

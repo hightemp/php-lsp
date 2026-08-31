@@ -15,6 +15,7 @@ pub(crate) fn workspace_index_cache_config(
     php_version: PhpVersion,
     include_paths: &[PathBuf],
     exclude_paths: &[PathBuf],
+    traversal_limits: TraversalLimits,
     stub_extensions: Option<&[String]>,
     client_stubs_path: Option<&Path>,
 ) -> IndexCacheConfig {
@@ -30,6 +31,8 @@ pub(crate) fn workspace_index_cache_config(
             .iter()
             .map(|path| cache_path_label(path))
             .collect(),
+        traversal_max_files: traversal_limits.max_files,
+        traversal_max_entries: traversal_limits.max_entries,
         stub_extensions: workspace_stub_extensions_for_cache(stub_extensions),
         stubs_hash: workspace_stubs_cache_hash(stub_extensions, client_stubs_path),
     }
@@ -50,6 +53,8 @@ pub(crate) fn stubs_index_cache_config_for_extensions(
         php_version: php_version_label(php_version),
         include_paths: vec![cache_path_label(stubs_path)],
         exclude_paths: Vec::new(),
+        traversal_max_files: None,
+        traversal_max_entries: None,
         stubs_hash: stubs_cache_hash_for_path_with_extensions(stubs_path, &extensions),
         stub_extensions: extensions,
     }
@@ -59,6 +64,7 @@ pub(crate) fn vendor_index_cache_config(
     root: &Path,
     php_version: PhpVersion,
     exclude_paths: &[PathBuf],
+    traversal_limits: TraversalLimits,
 ) -> IndexCacheConfig {
     IndexCacheConfig {
         namespace: CacheNamespace::Vendor,
@@ -69,6 +75,8 @@ pub(crate) fn vendor_index_cache_config(
             .iter()
             .map(|path| cache_path_label(path))
             .collect(),
+        traversal_max_files: traversal_limits.max_files,
+        traversal_max_entries: traversal_limits.max_entries,
         stub_extensions: Vec::new(),
         stubs_hash: vendor_cache_hash(root),
     }

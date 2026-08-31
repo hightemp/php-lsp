@@ -81,6 +81,10 @@ interface IndexingStatus {
   percentage?: number;
   elapsedMs?: number;
   stubFiles?: number;
+  truncated?: boolean;
+  truncationReason?: "maxFiles" | "maxEntries";
+  truncationLimit?: number;
+  visitedEntries?: number;
   lastUpdatedAt?: number;
 }
 
@@ -144,8 +148,17 @@ class PhpLspStatusController implements Disposable {
   }
 
   update(status: IndexingStatus): void {
+    const traversalReset = status.phase === "discovering"
+      ? {
+        truncated: false,
+        truncationReason: undefined,
+        truncationLimit: undefined,
+        visitedEntries: undefined,
+      }
+      : {};
     this.status = {
       ...this.status,
+      ...traversalReset,
       ...status,
       lastUpdatedAt: Date.now(),
     };
@@ -157,7 +170,7 @@ class PhpLspStatusController implements Disposable {
     const status = this.status;
     const items: StatusQuickPickItem[] = [
       {
-        label: `${phaseIcon(status.phase)} ${phaseTitle(status.phase)}`,
+        label: `${phaseIcon(status.phase, status.truncated)} ${phaseTitle(status.phase, status.truncated)}`,
         description: percentDescription(status),
         detail: status.message ?? "PHP Language Server is running",
       },
@@ -266,7 +279,9 @@ class PhpLspStatusController implements Disposable {
     this.statusBar.tooltip = statusTooltip(status, this.snapshotProvider());
     this.statusBar.backgroundColor = status.phase === "error"
       ? new ThemeColor("statusBarItem.errorBackground")
-      : undefined;
+      : status.truncated
+        ? new ThemeColor("statusBarItem.warningBackground")
+        : undefined;
   }
 }
 
@@ -281,13 +296,16 @@ function statusText(status: IndexingStatus): string {
   if (status.phase === "error") {
     return "$(error) PHP LSP";
   }
+  if (status.truncated) {
+    return "$(warning) PHP LSP";
+  }
   return "$(check) PHP LSP";
 }
 
 function statusTooltip(status: IndexingStatus, snapshot: ExtensionSnapshot): MarkdownString {
   const tooltip = new MarkdownString();
   tooltip.appendMarkdown("**PHP Language Server**\n\n");
-  tooltip.appendMarkdown(phaseTitle(status.phase));
+  tooltip.appendMarkdown(phaseTitle(status.phase, status.truncated));
   if (status.message) {
     tooltip.appendMarkdown(`: ${status.message}`);
   }
@@ -300,21 +318,33 @@ function statusTooltip(status: IndexingStatus, snapshot: ExtensionSnapshot): Mar
     tooltip.appendMarkdown(`Symbols: ${formatCount(status.indexedSymbols)}\n\n`);
   }
   tooltip.appendMarkdown(`Diagnostics: ${snapshot.diagnosticsMode}\n\n`);
+  if (status.truncated) {
+    tooltip.appendMarkdown(
+      `⚠️ Partial index: ${status.truncationReason ?? "traversal limit"}`
+      + `${typeof status.truncationLimit === "number" ? ` = ${formatCount(status.truncationLimit)}` : ""}\n\n`,
+    );
+  }
   tooltip.appendMarkdown("Click to show details.");
   return tooltip;
 }
 
-function phaseIcon(phase: string): string {
+function phaseIcon(phase: string, truncated = false): string {
   if (phase === "indexing" || phase === "discovering" || phase === "loadingStubs") {
     return "$(sync~spin)";
   }
   if (phase === "error") {
     return "$(error)";
   }
+  if (truncated) {
+    return "$(warning)";
+  }
   return "$(check)";
 }
 
-function phaseTitle(phase: string): string {
+function phaseTitle(phase: string, truncated = false): string {
+  if (truncated && phase === "ready") {
+    return "Ready (partial index)";
+  }
   switch (phase) {
     case "starting":
       return "Starting";

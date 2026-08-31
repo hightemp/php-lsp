@@ -34,6 +34,21 @@ impl PhpLspBackend {
             .as_ref()
             .and_then(|window| window.work_done_progress)
             .unwrap_or(false);
+        let watched_files = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref());
+        self.external_symlinks
+            .set_capabilities(ExternalWatcherCapabilities {
+                dynamic_registration: watched_files
+                    .and_then(|capabilities| capabilities.dynamic_registration)
+                    .unwrap_or(false),
+                relative_pattern_support: watched_files
+                    .and_then(|capabilities| capabilities.relative_pattern_support)
+                    .unwrap_or(false),
+            })
+            .await;
 
         let workspace_roots = workspace_roots_from_initialize(&params);
 
@@ -50,6 +65,15 @@ impl PhpLspBackend {
             .unwrap_or_else(|| serde_json::json!({}));
         *self.client_settings.lock().await = client_settings.clone();
         self.apply_effective_configuration_settings(&client_settings, &workspace_roots)
+            .await;
+        let runtime_state = self.runtime_state_snapshot().await;
+        let active_workspaces = runtime_state
+            .configs
+            .iter()
+            .map(|config| (config.workspace_folder.clone(), runtime_state.generation))
+            .collect::<Vec<_>>();
+        self.external_symlinks
+            .set_active_workspaces(&active_workspaces, &[])
             .await;
 
         Ok(InitializeResult {
@@ -169,6 +193,7 @@ impl PhpLspBackend {
 
     pub(crate) async fn lsp_shutdown(&self) -> Result<()> {
         tracing::info!("php-lsp: shutdown");
+        self.external_symlinks.shutdown().await;
         Ok(())
     }
 

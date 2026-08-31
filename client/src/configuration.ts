@@ -78,6 +78,8 @@ export function buildExplicitClientSettings(
   setExplicitValue(options, config, "indexVendor", "indexVendor", true);
   setExplicitValue(options, config, "includePaths", "includePaths", []);
   setExplicitValue(options, config, "excludePaths", "excludePaths", []);
+  setExplicitValue(options, config, "indexing.maxFiles", "indexingMaxFiles", 100000);
+  setExplicitValue(options, config, "indexing.maxEntries", "indexingMaxEntries", 1000000);
   setExplicitValue(options, config, "stubs.extensions", "stubExtensions", []);
   setExplicitValue(options, config, "logLevel", "logLevel", "info");
   setExplicitValue(options, config, "allowProjectCommands", "allowProjectCommands", false);
