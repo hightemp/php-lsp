@@ -85,6 +85,12 @@
   - Server-side stub loading and stub cache-source helpers.
 - `src/indexing/vendor.rs`
   - Vendor autoload metadata cache, lazy vendor file LRU helpers, vendor path resolution, and lazy FQN/class/member indexing helpers.
+- `src/indexing/symlinks.rs`
+  - Generation-aware physical/logical symlink alias registry, external watcher capability lifecycle, dynamic LSP `RelativePattern` registration, and physical-to-logical watched-event routing.
+- `src/util/fs_walk.rs`
+  - Shared deterministic filesystem visitor for workspace, CLI, Twig, framework, and vendor discovery; owns physical-identity cycle/duplicate protection, logical-path filtering, symlink metadata, traversal limits, cancellation, and deadlines.
+- `src/util/fs_walk_tests.rs`
+  - Unit coverage for the shared visitor, including external links, cycles, hardlinks/aliases, logical exclusions, traversal budgets, cancellation/deadlines, overlapping roots, and the 10k linearity regression.
 - `src/util/uri.rs`
   - Re-exports shared path/URI helpers from `php-lsp-types`; use these instead of raw `file://` string formatting.
 - `src/util/lsp_text.rs`
@@ -134,6 +140,13 @@
 - Do not add unbounded blocking filesystem or process work directly in async LSP request handlers.
 - Use existing blocking helpers or `tokio::task::spawn_blocking` for expensive filesystem/parser/diagnostic work.
 - Drop `DashMap` guards and other locks before any `.await`.
+
+### Filesystem Traversal And Symlinks
+- Reuse `util::fs_walk::walk_files` for recursive first-party filesystem discovery. Do not add another recursive `read_dir` walker in workspace, CLI, Twig, framework, or vendor code.
+- External file and directory symlinks are intentionally supported. Do not replace this policy with blanket canonical-containment rejection or unconditional symlink skipping.
+- Apply project exclusions to the logical path visible through the workspace, but detect cycles and duplicate files/directories by physical identity. Preserve deterministic first-logical-URI selection.
+- Keep traversal cancellation/deadline checks and the configured `indexing.maxFiles`/`indexing.maxEntries` budgets when adding a new visitor consumer.
+- External watcher publications must match the exact active workspace generation. Preserve removed-root tombstones, non-indexing generation promotion, nested-alias cleanup, register-before-unregister ordering, and pending failed unregister IDs.
 
 ### Security
 - Project `.php-lsp.toml` is not trusted to execute commands by default.
@@ -222,6 +235,9 @@
   - `server/crates/php-lsp-index/src/cache.rs`
   - `server/crates/php-lsp-server/src/indexing/workspace.rs`
   - `server/crates/php-lsp-server/src/indexing/vendor.rs`
+  - `server/crates/php-lsp-server/src/indexing/symlinks.rs`
+  - `server/crates/php-lsp-server/src/util/fs_walk.rs`
+  - `server/crates/php-lsp-server/src/util/fs_walk_tests.rs`
   - `server/crates/php-lsp-server/src/indexing/stubs.rs`
   - `server/crates/php-lsp-server/src/indexing/cache.rs`
   - `server/crates/php-lsp-server/tests/e2e_indexing.rs`

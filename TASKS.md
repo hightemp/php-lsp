@@ -6059,3 +6059,10 @@ change.
   - Validation target: focused `fs_walk` tests, Rustfmt, Clippy `-D warnings`, `git diff --check`, and Verifier GO.
   - Implemented: replaced the inline test module with `#[path = "fs_walk_tests.rs"] mod tests;` and moved all five existing visitor tests unchanged into the sibling file.
   - Validation: focused `util::fs_walk::tests` passed 5/5 (including the 10k regression), Rustfmt, Clippy `--all-targets -D warnings`, `git diff --check`, and Verifier review all passed; Verifier returned GO.
+
+- [x] **DOC-AGENTS-SYMLINK-ARCHITECTURE-2026-08-31** Document the shared filesystem visitor and external symlink watcher architecture in `AGENTS.md`. *(done 2026-08-31)*
+  - Started: 2026-08-31; add concise module-map, reuse and invariant guidance for `util/fs_walk.rs`, `util/fs_walk_tests.rs`, and `indexing/symlinks.rs`.
+  - Scope: contributor instructions only; no runtime or test behavior changes.
+  - Validation target: instructions name the canonical modules, prohibit duplicate recursive walkers, preserve external-symlink/logical-exclusion/generation invariants, and pass `git diff --check`.
+  - Implemented: added `indexing/symlinks.rs`, `util/fs_walk.rs`, and `util/fs_walk_tests.rs` to the server layout and bug-routing map; documented the mandatory shared-walker policy plus external-symlink, logical-exclusion, physical-identity, traversal-budget, generation/tombstone, alias-cleanup, and watcher unregister invariants.
+  - Validation: reviewed the rendered surrounding sections and `git diff --check` passed; no runtime code or tests changed.
