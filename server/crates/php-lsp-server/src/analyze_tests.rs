@@ -1,5 +1,5 @@
 use super::*;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn parse_analyze_args_accepts_path_project_root_severity_and_format() {
@@ -102,8 +102,32 @@ fn explicit_analyze_target_is_not_dropped_by_workspace_file_limit() {
         "json".to_string(),
     ]);
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert!(result.stderr.contains("indexing.maxFiles=1"));
     let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
     assert_eq!(value["summary"]["filesAnalyzed"], 1);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn analyze_directory_discovery_deadline_is_an_explicit_error() {
+    let root = temp_dir("discovery-deadline");
+    std::fs::write(root.join("Subject.php"), "<?php class Subject {}\n").unwrap();
+
+    let outcome = collect_target_analyze_files(
+        &root,
+        &root,
+        &[],
+        TraversalLimits::default(),
+        Instant::now() - Duration::from_millis(1),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.stop_reason,
+        Some(TraversalStopReason::DeadlineExceeded)
+    );
+    let error = analyze_traversal_warning("Analyze target discovery", &outcome).unwrap_err();
+    assert!(error.to_string().contains("traversal deadline"));
 
     std::fs::remove_dir_all(root).unwrap();
 }

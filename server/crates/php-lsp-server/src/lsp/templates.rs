@@ -1,7 +1,7 @@
 //! Template-aware LSP helpers extracted from `server.rs`.
 
 use crate::template::{TemplateShapeDefinitionTarget, TemplateShapeKeyDefinition};
-use crate::util::fs_walk::{walk_files, TraversalLimits};
+use crate::util::fs_walk::{walk_files, TraversalLimits, TraversalStopReason};
 use crate::util::uri::path_to_uri;
 
 use super::super::*;
@@ -149,7 +149,8 @@ fn collect_twig_context_php_files_with_limits(
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
 ) -> Vec<PathBuf> {
-    walk_files(
+    let deadline = file_io_walk_deadline();
+    let outcome = walk_files(
         &[root.join("src"), root.join("app"), root.join("tests")],
         traversal_limits.capped_files(limit),
         |path| crate::server::path_is_excluded(path, root, exclude_paths),
@@ -169,9 +170,15 @@ fn collect_twig_context_php_files_with_limits(
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
         },
-        || None,
-    )
-    .files
+        || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
+    );
+    if outcome.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
+        tracing::warn!(
+            "Twig PHP-context traversal stopped at the file-I/O deadline after {} entries",
+            outcome.stats.visited_entries
+        );
+    }
+    outcome.files
 }
 
 fn collect_twig_context_template_files(
@@ -180,7 +187,8 @@ fn collect_twig_context_template_files(
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
 ) -> Vec<PathBuf> {
-    walk_files(
+    let deadline = file_io_walk_deadline();
+    let outcome = walk_files(
         &[
             root.join("templates"),
             root.join("resources/views"),
@@ -194,9 +202,15 @@ fn collect_twig_context_template_files(
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("twig"))
         },
-        || None,
-    )
-    .files
+        || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
+    );
+    if outcome.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
+        tracing::warn!(
+            "Twig template traversal stopped at the file-I/O deadline after {} entries",
+            outcome.stats.visited_entries
+        );
+    }
+    outcome.files
 }
 
 fn collect_twig_render_context_types(

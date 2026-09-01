@@ -8,7 +8,7 @@ which paths affect latency.
 
 | Component | Path | Responsibility |
 |---|---|---|
-| VS Code client | `client/src/extension.ts`, `client/src/lifecycle.ts` | Resolves the bundled or configured server, reconciles serialized start/stop/restart state, forwards `phpLsp.*` settings, owns file watchers, shows status UI, clears disk cache, and registers VS Code commands. |
+| VS Code client | `client/src/extension.ts`, `client/src/lifecycle.ts`, `client/src/indexingStatus.ts` | Resolves the bundled or configured server, reconciles serialized start/stop/restart state, forwards `phpLsp.*` settings, owns file watchers, shows status UI, clears disk cache, and registers VS Code commands. |
 | Server binary | `server/crates/php-lsp-server` | Implements LSP 3.17 over stdio with `tower-lsp-server`, owns request handlers and orchestration. |
 | Parser | `server/crates/php-lsp-parser` | Wraps tree-sitter PHP, incremental edits, symbol extraction, diagnostics helpers, references, semantic tokens, PHPDoc parsing, and type helpers. |
 | Index | `server/crates/php-lsp-index` | Stores global workspace symbols, Composer namespace maps, phpstorm-stubs, vendor metadata, and disk cache snapshots. |
@@ -63,7 +63,10 @@ server/crates/php-lsp-server/src/
     cache.rs                 # runtime cache config/hash inputs for php-lsp-index
     stubs.rs                 # stub path discovery/validation and reload orchestration
     vendor.rs                # vendor autoload cache and lazy vendor LRU helpers
+    symlinks.rs              # physical/logical aliases and external watcher lifecycle
   util/
+    fs_walk.rs               # deterministic identity-aware shared filesystem visitor
+    fs_walk_tests.rs         # focused visitor budgets/symlink/linearity regressions
     uri.rs                   # shared URI/path helpers
     lsp_text.rs              # LSP UTF-16 range/position to byte-offset helpers
 ```
@@ -374,7 +377,9 @@ to an effective root:
 Workspace, Twig, framework, and vendor classmap discovery share one iterative
 filesystem visitor. It follows useful external symlinks, deduplicates files and
 directories by platform file identity, applies exclusions to logical paths,
-and records physical-to-logical aliases. Clients with LSP relative-pattern
+records physical-to-logical aliases, and stages a directory batch until its
+children are complete so an entry-budget stop remains deterministic. One
+bounded, unqueued EOF lookahead distinguishes an exact budget fit. Clients with LSP relative-pattern
 support receive dynamic watchers for external physical roots; incoming events
 are translated back to the deterministic logical URI before normal indexing.
 

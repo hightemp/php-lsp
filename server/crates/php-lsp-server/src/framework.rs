@@ -4,7 +4,7 @@
 //! workspace/index context and must not bootstrap applications, open databases,
 //! or execute user code.
 
-use crate::util::fs_walk::{walk_files, TraversalLimits};
+use crate::util::fs_walk::{walk_files, TraversalLimits, TraversalStopReason};
 use crate::util::uri::{path_to_uri, uri_to_path};
 use php_lsp_index::composer::NamespaceMap;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -3691,7 +3691,8 @@ fn collect_static_files(
     limit: usize,
     traversal_limits: TraversalLimits,
 ) -> Vec<PathBuf> {
-    walk_files(
+    let deadline = crate::server::file_io_walk_deadline();
+    let outcome = walk_files(
         &[root.to_path_buf()],
         traversal_limits.capped_files(limit),
         |path| crate::server::path_is_excluded(path, workspace_root, exclude_paths),
@@ -3705,9 +3706,15 @@ fn collect_static_files(
                         .any(|expected| extension.eq_ignore_ascii_case(expected))
                 })
         },
-        || None,
-    )
-    .files
+        || (std::time::Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
+    );
+    if outcome.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
+        tracing::warn!(
+            "Framework filesystem traversal stopped at the file-I/O deadline after {} entries",
+            outcome.stats.visited_entries
+        );
+    }
+    outcome.files
 }
 
 fn parse_php_array_key_paths(source: &str) -> Vec<StaticStringKey> {

@@ -1,13 +1,13 @@
 use crate::server::{
     build_organize_imports_edit, collect_php_files_with_control,
     collect_php_files_with_explicit_control, compute_diagnostics_with_runtime_config,
-    diagnostic_budget_config_from_settings, discover_workspace_root_config,
+    diagnostic_budget_config_from_settings, discover_workspace_root_config, file_io_walk_deadline,
     is_unused_import_diagnostic, load_configured_stubs, load_effective_configuration_settings,
     normalize_config_paths, return_type_hint, traversal_limits_from_settings,
     workspace_index_directories, DiagnosticBudgetConfig, DiagnosticSeverityConfig, DiagnosticsMode,
     DiagnosticsRuntimeConfig, PhpVersion,
 };
-use crate::util::fs_walk::TraversalLimits;
+use crate::util::fs_walk::{FileWalkOutcome, TraversalLimits, TraversalStopReason};
 use crate::util::lsp_text::{lsp_position_to_byte, text_at_lsp_range};
 use crate::util::uri::path_to_uri;
 use php_lsp_index::workspace::WorkspaceIndex;
@@ -19,6 +19,7 @@ use php_lsp_parser::utf16::Utf16LineIndex;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tower_lsp::ls_types::{Diagnostic, Position, Range, TextEdit, Uri, WorkspaceEdit};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +168,7 @@ struct FixReport {
     requested_rules: Vec<FixRule>,
     files_analyzed: usize,
     files: Vec<FixFileReport>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,7 +347,7 @@ pub fn run_fix_cli(raw_args: Vec<String>) -> FixCliResult {
             FixCliResult {
                 exit_code,
                 stdout,
-                stderr: String::new(),
+                stderr: render_cli_warnings(&report.warnings),
             }
         }
         Err(err) => FixCliResult {
@@ -388,19 +390,32 @@ fn run_fix(args: &FixArgs) -> Result<FixReport, FixError> {
     } else {
         requested_target
     };
-    let workspace_files = collect_workspace_fix_files(
+    let workspace_discovery = collect_workspace_fix_files(
         &project_root,
         workspace_config.namespace_map.as_ref(),
         &runtime_config.include_paths,
         &runtime_config.exclude_paths,
         runtime_config.traversal_limits,
+        file_io_walk_deadline(),
     );
-    let target_files = collect_target_fix_files(
+    let target_discovery = collect_target_fix_files(
         &requested_target,
         &project_root,
         &runtime_config.exclude_paths,
         runtime_config.traversal_limits,
+        file_io_walk_deadline(),
     )?;
+    let mut warnings = Vec::new();
+    if let Some(warning) = fix_traversal_warning("Workspace discovery", &workspace_discovery)? {
+        warnings.push(warning);
+    }
+    if let Some(warning) = fix_traversal_warning("Fix target discovery", &target_discovery)? {
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
+    let workspace_files = workspace_discovery.files;
+    let target_files = target_discovery.files;
 
     let mut all_file_candidates = workspace_files.clone();
     all_file_candidates.extend(target_files.iter().cloned());
@@ -455,7 +470,43 @@ fn run_fix(args: &FixArgs) -> Result<FixReport, FixError> {
         requested_rules: args.rules.clone(),
         files_analyzed: target_files.len(),
         files,
+        warnings,
     })
+}
+
+fn render_cli_warnings(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", warnings.join("\n"))
+    }
+}
+
+fn fix_traversal_warning(
+    label: &str,
+    outcome: &FileWalkOutcome,
+) -> Result<Option<String>, FixError> {
+    let message = match outcome.stop_reason {
+        None => return Ok(None),
+        Some(TraversalStopReason::MaxFiles { limit }) => format!(
+            "Warning: {label} is partial because indexing.maxFiles={limit} was reached after visiting {} filesystem entries.",
+            outcome.stats.visited_entries
+        ),
+        Some(TraversalStopReason::MaxEntries { limit }) => format!(
+            "Warning: {label} is partial because indexing.maxEntries={limit} was reached after visiting {} filesystem entries.",
+            outcome.stats.visited_entries
+        ),
+        Some(TraversalStopReason::DeadlineExceeded) => {
+            return Err(FixError::new(format!(
+                "{label} exceeded the filesystem traversal deadline after visiting {} entries",
+                outcome.stats.visited_entries
+            )));
+        }
+        Some(TraversalStopReason::Cancelled) => {
+            return Err(FixError::new(format!("{label} was cancelled")));
+        }
+    };
+    Ok(Some(message))
 }
 
 fn collect_file_fixes(
@@ -796,7 +847,8 @@ fn collect_workspace_fix_files(
     include_paths: &[PathBuf],
     exclude_paths: &[PathBuf],
     traversal_limits: TraversalLimits,
-) -> Vec<PathBuf> {
+    deadline: Instant,
+) -> FileWalkOutcome {
     let source_dirs = workspace_index_directories(project_root, namespace_map, include_paths);
     let explicit_files = namespace_map
         .map(|namespace_map| namespace_map.files.as_slice())
@@ -807,9 +859,8 @@ fn collect_workspace_fix_files(
         project_root,
         exclude_paths,
         traversal_limits,
-        || None,
+        || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
     )
-    .files
 }
 
 fn collect_target_fix_files(
@@ -817,10 +868,14 @@ fn collect_target_fix_files(
     project_root: &Path,
     exclude_paths: &[PathBuf],
     traversal_limits: TraversalLimits,
-) -> Result<Vec<PathBuf>, FixError> {
+    deadline: Instant,
+) -> Result<FileWalkOutcome, FixError> {
     if target.is_file() {
         return if target.extension().and_then(|ext| ext.to_str()) == Some("php") {
-            Ok(vec![target.to_path_buf()])
+            Ok(FileWalkOutcome {
+                files: vec![target.to_path_buf()],
+                ..FileWalkOutcome::default()
+            })
         } else {
             Err(FixError::new(format!(
                 "Fix target is not a PHP file: {}",
@@ -834,9 +889,8 @@ fn collect_target_fix_files(
             project_root,
             exclude_paths,
             traversal_limits,
-            || None,
-        )
-        .files);
+            || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
+        ));
     }
 
     Err(FixError::new(format!(

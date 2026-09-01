@@ -1,6 +1,6 @@
 //! Vendor indexing helpers.
 
-use crate::util::fs_walk::{symlink_aliases_on_path, walk_files};
+use crate::util::fs_walk::{symlink_aliases_on_path, walk_files, TraversalStopReason};
 
 use super::super::*;
 
@@ -363,13 +363,15 @@ async fn index_class_uncached_with_context(
             if let Some(vendor_map) =
                 cached_vendor_autoload_map_pinned(&context.vendor_autoload_cache, &vendor_dir).await
             {
-                if let Some(vendor_resolution) = resolve_vendor_paths_from_map_with_limits(
+                if let Some(vendor_resolution) = resolve_vendor_paths_from_map_with_limits_blocking(
                     requested_class_fqn,
-                    &vendor_map,
+                    vendor_map,
                     context.traversal_limits,
-                    Some(&config.root),
-                    &context.exclude_paths,
-                ) {
+                    config.root.clone(),
+                    context.exclude_paths.clone(),
+                )
+                .await
+                {
                     if let Some(external_symlinks) = context.external_symlinks.as_ref() {
                         let external_symlinks = external_symlinks.clone();
                         let workspace_folder = config.workspace_folder.clone();
@@ -937,6 +939,38 @@ fn resolve_vendor_paths_from_map_with_limits(
     }
 }
 
+async fn resolve_vendor_paths_from_map_with_limits_blocking(
+    fqn: &str,
+    map: VendorAutoloadMap,
+    traversal_limits: TraversalLimits,
+    project_root: PathBuf,
+    exclude_paths: Vec<PathBuf>,
+) -> Option<VendorPathResolution> {
+    let fqn = fqn.to_string();
+    let path_label = project_root.display().to_string();
+    match run_file_io_blocking("vendor classmap discovery", path_label.clone(), move || {
+        resolve_vendor_paths_from_map_with_limits(
+            &fqn,
+            &map,
+            traversal_limits,
+            Some(&project_root),
+            &exclude_paths,
+        )
+    })
+    .await
+    {
+        Ok(resolution) => resolution,
+        Err(message) => {
+            tracing::warn!(
+                "Vendor classmap discovery failed for {}: {}",
+                path_label,
+                message
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn vendor_autoload_file_paths_from_map(
     map: &VendorAutoloadMap,
     project_root: &Path,
@@ -1077,15 +1111,16 @@ fn classmap_candidate_paths_for_fqn(
     let mut matching = Vec::new();
     let mut fallback = Vec::new();
 
+    let deadline = file_io_walk_deadline();
     let outcome = walk_files(
         &map.classmap,
         traversal_limits,
         |path| project_root.is_some_and(|root| path_is_excluded(path, root, exclude_paths)),
         |_, _| true,
         is_php_file_path,
-        || None,
+        || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
     );
-    if outcome.truncated() {
+    if outcome.truncated() || outcome.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
         tracing::warn!(
             "Vendor classmap traversal was truncated after {} entries",
             outcome.stats.visited_entries

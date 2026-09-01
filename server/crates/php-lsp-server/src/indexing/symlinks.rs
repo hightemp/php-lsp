@@ -558,21 +558,30 @@ impl ExternalSymlinkState {
                 continue;
             };
 
-            let mut matched_external = false;
+            let mut handled_by_snapshot = false;
             let mut matched_direct_workspace = false;
             for snapshot in self.workspaces.values_mut() {
-                if path.starts_with(&snapshot.logical_root) {
+                let is_direct_workspace_path = path.starts_with(&snapshot.logical_root);
+                let mut snapshot_handled = false;
+                if is_direct_workspace_path {
                     matched_direct_workspace = true;
                     if change.typ == FileChangeType::DELETED {
-                        translated.extend(handle_logical_delete(snapshot, &path));
+                        let events = handle_logical_delete(snapshot, &path);
+                        snapshot_handled |= !events.is_empty();
+                        translated.extend(events);
                     }
-                    continue;
                 }
+                let had_physical_route = snapshot_has_physical_route(snapshot, &path);
                 let events = translate_event_for_snapshot(snapshot, &path, change.typ);
-                matched_external |= !events.is_empty();
+                snapshot_handled |= had_physical_route || !events.is_empty();
                 translated.extend(events);
+                if is_direct_workspace_path && !snapshot_handled {
+                    translated.push(change.clone());
+                    snapshot_handled = true;
+                }
+                handled_by_snapshot |= snapshot_handled;
             }
-            if !matched_external || matched_direct_workspace {
+            if !matched_direct_workspace && !handled_by_snapshot {
                 translated.push(change);
             }
         }
@@ -587,6 +596,15 @@ impl ExternalSymlinkState {
         });
         translated
     }
+}
+
+fn snapshot_has_physical_route(snapshot: &WorkspaceSymlinkSnapshot, physical_path: &Path) -> bool {
+    snapshot.physical_files.iter().any(|group| {
+        group
+            .paths
+            .iter()
+            .any(|candidate| candidate.physical_path == physical_path)
+    }) || !logical_paths_for_physical(snapshot, physical_path).is_empty()
 }
 
 fn handle_logical_delete(
@@ -697,7 +715,7 @@ fn is_relevant_external_file(path: &Path) -> bool {
     }
     matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some("composer.json" | "composer.lock" | ".php-lsp.toml")
+        Some("composer.json" | "composer.lock" | "installed.json" | ".php-lsp.toml")
     )
 }
 
@@ -716,7 +734,7 @@ fn translate_event_for_snapshot(
     let identity = (change_type != FileChangeType::DELETED)
         .then(|| file_id::get_file_id(physical_path).ok())
         .flatten();
-    let routed_logical_path = logical_path_for_physical(snapshot, physical_path);
+    let routed_logical_paths = logical_paths_for_physical(snapshot, physical_path);
     if let Some(identity) = identity {
         if let Some(group) = snapshot.physical_files.iter_mut().find(|group| {
             matches!(
@@ -726,21 +744,21 @@ fn translate_event_for_snapshot(
         }) {
             let old_representative = group.representative().to_path_buf();
             if change_type == FileChangeType::CREATED {
-                if let Some(logical_path) = routed_logical_path.clone() {
+                for logical_path in &routed_logical_paths {
                     if !group
                         .paths
                         .iter()
-                        .any(|candidate| candidate.logical_path == logical_path)
+                        .any(|candidate| candidate.logical_path == *logical_path)
                     {
                         group.paths.push(PhysicalFilePath {
-                            logical_path,
+                            logical_path: logical_path.clone(),
                             physical_path: physical_path.to_path_buf(),
                         });
-                        group
-                            .paths
-                            .sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
                     }
                 }
+                group
+                    .paths
+                    .sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
             }
             let new_representative = group.representative().to_path_buf();
             if new_representative != old_representative {
@@ -758,17 +776,20 @@ fn translate_event_for_snapshot(
         }
     }
 
-    let Some(logical_path) = routed_logical_path else {
+    let Some(logical_path) = routed_logical_paths.first().cloned() else {
         return Vec::new();
     };
     if change_type == FileChangeType::CREATED {
         if let Some(identity) = identity {
             snapshot.physical_files.push(PhysicalFileGroup {
                 identity: crate::util::fs_walk::PhysicalIdentity::FileId(identity),
-                paths: vec![PhysicalFilePath {
-                    logical_path: logical_path.clone(),
-                    physical_path: physical_path.to_path_buf(),
-                }],
+                paths: routed_logical_paths
+                    .into_iter()
+                    .map(|logical_path| PhysicalFilePath {
+                        logical_path,
+                        physical_path: physical_path.to_path_buf(),
+                    })
+                    .collect(),
             });
             snapshot
                 .physical_files
@@ -821,34 +842,28 @@ fn remove_physical_file(
     Vec::new()
 }
 
-fn logical_path_for_physical(
+fn logical_paths_for_physical(
     snapshot: &WorkspaceSymlinkSnapshot,
     physical_path: &Path,
-) -> Option<PathBuf> {
-    let mut candidates = Vec::<(usize, PathBuf)>::new();
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::<PathBuf>::new();
     for alias in &snapshot.aliases {
         match alias.target_kind {
             SymlinkTargetKind::Directory => {
                 let Ok(relative) = physical_path.strip_prefix(&alias.physical_target) else {
                     continue;
                 };
-                candidates.push((
-                    alias.physical_target.components().count(),
-                    alias.logical_path.join(relative),
-                ));
+                candidates.push(alias.logical_path.join(relative));
             }
             SymlinkTargetKind::File if alias.physical_target == physical_path => {
-                candidates.push((usize::MAX, alias.logical_path.clone()));
+                candidates.push(alias.logical_path.clone());
             }
             SymlinkTargetKind::File => {}
         }
     }
-    let deepest = candidates.iter().map(|(depth, _)| *depth).max()?;
+    candidates.sort();
+    candidates.dedup();
     candidates
-        .into_iter()
-        .filter(|(depth, _)| *depth == deepest)
-        .map(|(_, logical)| logical)
-        .min()
 }
 
 fn logical_file_event(path: &Path, typ: FileChangeType) -> Option<FileEvent> {
@@ -887,6 +902,26 @@ mod tests {
             .expect("path URI")
             .parse::<Uri>()
             .expect("LSP URI")
+    }
+
+    #[test]
+    fn external_watcher_fallback_requires_both_lsp_capabilities() {
+        assert!(!ExternalWatcherCapabilities::default().supported());
+        assert!(!ExternalWatcherCapabilities {
+            dynamic_registration: true,
+            relative_pattern_support: false,
+        }
+        .supported());
+        assert!(!ExternalWatcherCapabilities {
+            dynamic_registration: false,
+            relative_pattern_support: true,
+        }
+        .supported());
+        assert!(ExternalWatcherCapabilities {
+            dynamic_registration: true,
+            relative_pattern_support: true,
+        }
+        .supported());
     }
 
     #[test]
@@ -930,7 +965,36 @@ mod tests {
     }
 
     #[test]
-    fn physical_events_map_to_the_deepest_deterministic_logical_alias() {
+    fn direct_external_installed_json_symlink_gets_a_file_watcher() {
+        let mut state = ExternalSymlinkState::default();
+        state.workspaces.insert(
+            PathBuf::from("/workspace"),
+            WorkspaceSymlinkSnapshot {
+                generation: 1,
+                logical_root: PathBuf::from("/workspace"),
+                aliases: vec![SymlinkAlias {
+                    logical_path: PathBuf::from("/workspace/vendor/composer/installed.json"),
+                    physical_target: PathBuf::from("/external/installed.json"),
+                    target_identity: PhysicalIdentity::CanonicalPath(PathBuf::from(
+                        "/external/installed.json",
+                    )),
+                    target_kind: SymlinkTargetKind::File,
+                }],
+                physical_files: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            state.desired_watch_specs(),
+            vec![WatchSpec {
+                base: PathBuf::from("/external"),
+                pattern: "installed.json".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn physical_events_map_to_the_lexicographically_first_logical_alias() {
         let mut snapshot = WorkspaceSymlinkSnapshot {
             generation: 1,
             logical_root: PathBuf::from("/workspace"),
@@ -1253,6 +1317,75 @@ mod tests {
         assert_eq!(
             events[1].uri,
             uri(Path::new("/workspace-b/shared/Changed.php"))
+        );
+    }
+
+    #[test]
+    fn physical_event_inside_workspace_also_updates_its_logical_alias() {
+        let physical_file = PathBuf::from("/workspace/z-real/Changed.php");
+        let logical_file = PathBuf::from("/workspace/a-linked/Changed.php");
+        let mut state = ExternalSymlinkState::default();
+        state.workspaces.insert(
+            PathBuf::from("/workspace"),
+            WorkspaceSymlinkSnapshot {
+                generation: 1,
+                logical_root: PathBuf::from("/workspace"),
+                aliases: vec![SymlinkAlias {
+                    logical_path: PathBuf::from("/workspace/a-linked"),
+                    physical_target: PathBuf::from("/workspace/z-real"),
+                    target_identity: PhysicalIdentity::CanonicalPath(PathBuf::from(
+                        "/workspace/z-real",
+                    )),
+                    target_kind: SymlinkTargetKind::Directory,
+                }],
+                physical_files: vec![PhysicalFileGroup {
+                    identity: PhysicalIdentity::CanonicalPath(PathBuf::from("identity")),
+                    paths: vec![PhysicalFilePath {
+                        logical_path: logical_file.clone(),
+                        physical_path: physical_file.clone(),
+                    }],
+                }],
+            },
+        );
+
+        let events = state.translate_events(vec![FileEvent {
+            uri: uri(&physical_file),
+            typ: FileChangeType::CHANGED,
+        }]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uri, uri(&logical_file));
+    }
+
+    #[test]
+    fn logical_candidates_keep_every_alias_in_lexical_order() {
+        let snapshot = WorkspaceSymlinkSnapshot {
+            generation: 1,
+            logical_root: PathBuf::from("/workspace"),
+            aliases: vec![
+                SymlinkAlias {
+                    logical_path: PathBuf::from("/workspace/z-nested"),
+                    physical_target: PathBuf::from("/external/nested"),
+                    target_identity: PhysicalIdentity::CanonicalPath(PathBuf::from(
+                        "/external/nested",
+                    )),
+                    target_kind: SymlinkTargetKind::Directory,
+                },
+                SymlinkAlias {
+                    logical_path: PathBuf::from("/workspace/a-parent"),
+                    physical_target: PathBuf::from("/external"),
+                    target_identity: PhysicalIdentity::CanonicalPath(PathBuf::from("/external")),
+                    target_kind: SymlinkTargetKind::Directory,
+                },
+            ],
+            physical_files: Vec::new(),
+        };
+
+        assert_eq!(
+            logical_paths_for_physical(&snapshot, Path::new("/external/nested/New.php")),
+            vec![
+                PathBuf::from("/workspace/a-parent/nested/New.php"),
+                PathBuf::from("/workspace/z-nested/New.php"),
+            ]
         );
     }
 }

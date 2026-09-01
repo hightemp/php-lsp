@@ -275,7 +275,7 @@ Runtime environment:
 | `phpLsp.includePaths` | `[]` | Additional relative or absolute directories/files to include in workspace indexing. |
 | `phpLsp.excludePaths` | `[]` | Relative or absolute directories/files to exclude from workspace indexing. |
 | `phpLsp.indexing.maxFiles` | `100000` | Maximum unique matching files per traversal. Set `0` in trusted global/VS Code config to disable the cap. |
-| `phpLsp.indexing.maxEntries` | `1000000` | Maximum filesystem entries inspected per traversal. Set `0` in trusted global/VS Code config to disable the cap. |
+| `phpLsp.indexing.maxEntries` | `1000000` | Maximum filesystem entries admitted per traversal. Set `0` in trusted global/VS Code config to disable the cap. |
 | `phpLsp.stubs.extensions` | All available stubs | PHP stub extension set to index from the bundled stubs. Leave unset to discover all extension directories; set `[]` to disable stubs. |
 | `phpLsp.composer.enabled` | `true` | Enable `composer.json` autoload indexing. |
 | `phpLsp.indexVendor` | `true` | Index `vendor/` lazily. |
@@ -369,6 +369,10 @@ php-lsp fix [PATH] --dry-run --project-root <DIR> --rule unused-imports --format
 effective project root. CLI commands load the same global/project
 `.php-lsp.toml` configuration used by the language server for PHP version,
 diagnostic mode/severity, Composer discovery, and include/exclude paths.
+Recursive CLI discovery also applies `indexing.maxFiles` and
+`indexing.maxEntries`: a configured cap produces an explicit partial-result
+warning on stderr, while an internal traversal deadline aborts the command with
+exit code `1` instead of silently returning an incomplete result.
 
 Analyze exit codes:
 

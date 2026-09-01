@@ -321,8 +321,9 @@ impl PhpLspBackend {
                 .await
                 {
                     tracing::error!("Background indexing failed: {}", e);
-                    send_indexing_status(
+                    send_indexing_status_for_generation(
                         &client,
+                        runtime_generation,
                         serde_json::json!({
                             "phase": "error",
                             "root": config.root.display().to_string(),
@@ -890,7 +891,7 @@ pub(in crate::server) async fn collect_php_files_blocking(
     cancellation: OperationCancellationToken,
 ) -> std::result::Result<FileWalkOutcome, String> {
     let path_label = root.display().to_string();
-    let deadline = Instant::now() + Duration::from_millis(FILE_IO_TIMEOUT_MS);
+    let deadline = file_io_walk_deadline();
     run_file_io_blocking("workspace PHP file discovery", path_label, move || {
         collect_php_files_with_explicit_control(
             &directories,
@@ -928,7 +929,7 @@ async fn collect_feature_symlink_aliases_blocking(
         root.join("lang"),
     ];
     let path_label = root.display().to_string();
-    let deadline = Instant::now() + Duration::from_millis(FILE_IO_TIMEOUT_MS);
+    let deadline = file_io_walk_deadline();
     run_file_io_blocking("feature symlink discovery", path_label, move || {
         walk_files(
             &roots,
@@ -1897,8 +1898,9 @@ pub(in crate::server) async fn index_workspace(
         return Ok(());
     }
 
-    send_indexing_status(
+    send_indexing_status_for_generation(
         client,
+        runtime_generation,
         serde_json::json!({
             "phase": "discovering",
             "root": root_label,
@@ -2089,8 +2091,9 @@ pub(in crate::server) async fn index_workspace(
     let loaded_from_cache = cache_report.loaded_files;
     let mut indexed_symbols = cache_report.indexed_symbols;
 
-    send_indexing_status(
+    send_indexing_status_for_generation(
         client,
+        runtime_generation,
         serde_json::json!({
             "phase": "indexing",
             "root": root_label,
@@ -2157,8 +2160,9 @@ pub(in crate::server) async fn index_workspace(
             Ok(parsed) => parsed,
             Err(err) => {
                 let message = format!("Workspace indexing task failed: {}", err);
-                send_indexing_status(
+                send_indexing_status_for_generation(
                     client,
+                    runtime_generation,
                     serde_json::json!({
                         "phase": "error",
                         "root": root_label,
@@ -2240,8 +2244,9 @@ pub(in crate::server) async fn index_workspace(
             } else {
                 100
             };
-            send_indexing_status(
+            send_indexing_status_for_generation(
                 client,
+                runtime_generation,
                 serde_json::json!({
                     "phase": "indexing",
                     "root": root_label,
@@ -2279,8 +2284,9 @@ pub(in crate::server) async fn index_workspace(
         );
     }
 
-    send_indexing_status(
+    send_indexing_status_for_generation(
         client,
+        runtime_generation,
         serde_json::json!({
             "phase": "ready",
             "root": root_label,

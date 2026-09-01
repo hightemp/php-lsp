@@ -116,6 +116,7 @@ const DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS: u64 = 180;
 const HEAVY_REQUEST_YIELD_INTERVAL: usize = 32;
 const FILE_IO_SLOW_WARNING_MS: u64 = 100;
 const FILE_IO_TIMEOUT_MS: u64 = 15_000;
+const FILE_IO_WALK_DEADLINE_MARGIN_MS: u64 = 250;
 const DIAGNOSTIC_PHASE_SLOW_WARNING_MS: u64 = 500;
 const DIAGNOSTIC_PUBLISHER_MAX_SHARDS: usize = 16;
 
@@ -743,6 +744,11 @@ async fn cooperative_heavy_request_yield(index: usize) {
     }
 }
 
+pub(crate) fn file_io_walk_deadline() -> Instant {
+    Instant::now()
+        + Duration::from_millis(FILE_IO_TIMEOUT_MS.saturating_sub(FILE_IO_WALK_DEADLINE_MARGIN_MS))
+}
+
 async fn run_file_io_blocking<T, F>(
     label: &'static str,
     path_label: String,
@@ -908,6 +914,31 @@ async fn send_indexing_status(client: &Client, params: serde_json::Value) {
     client
         .send_notification::<PhpLspIndexingStatusNotification>(params)
         .await;
+}
+
+fn indexing_status_with_runtime_generation(
+    mut params: serde_json::Value,
+    runtime_generation: u64,
+) -> serde_json::Value {
+    if let Some(params) = params.as_object_mut() {
+        params.insert(
+            "runtimeGeneration".to_string(),
+            serde_json::Value::from(runtime_generation),
+        );
+    }
+    params
+}
+
+async fn send_indexing_status_for_generation(
+    client: &Client,
+    runtime_generation: u64,
+    params: serde_json::Value,
+) {
+    send_indexing_status(
+        client,
+        indexing_status_with_runtime_generation(params, runtime_generation),
+    )
+    .await;
 }
 
 async fn clear_request_fs_caches(
@@ -3688,8 +3719,9 @@ impl PhpLspBackend {
                 .await
                 {
                     tracing::error!("Workspace reindexing failed: {}", e);
-                    send_indexing_status(
+                    send_indexing_status_for_generation(
                         &client,
+                        runtime_generation,
                         serde_json::json!({
                             "phase": "error",
                             "root": config.root.display().to_string(),

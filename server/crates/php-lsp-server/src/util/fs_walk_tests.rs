@@ -48,7 +48,27 @@ fn walk_is_deterministic_and_deduplicates_overlapping_roots() {
             root.join("src/nested/B.php"),
         ]
     );
-    assert!(outcome.stats.duplicate_directories >= 1);
+    assert_eq!(outcome.stats.visited_directories, 2);
+    std::fs::remove_dir_all(root).expect("remove tree");
+}
+
+#[test]
+fn max_entries_exactly_fits_a_complete_directory() {
+    let root = temp_root("exact-entry-budget");
+    std::fs::create_dir_all(&root).expect("create tree");
+    std::fs::write(root.join("A.php"), "<?php").expect("write PHP file");
+
+    let outcome = php_walk(
+        std::slice::from_ref(&root),
+        TraversalLimits {
+            max_files: None,
+            max_entries: Some(2),
+        },
+    );
+    assert_eq!(outcome.files, vec![root.join("A.php")]);
+    assert_eq!(outcome.stats.visited_entries, 2);
+    assert_eq!(outcome.stop_reason, None);
+
     std::fs::remove_dir_all(root).expect("remove tree");
 }
 
@@ -85,6 +105,8 @@ fn walk_honors_file_entry_and_cancellation_limits() {
         Some(TraversalStopReason::MaxEntries { limit: 2 })
     );
     assert_eq!(entries.stats.visited_entries, 2);
+    assert!(entries.files.is_empty());
+    assert!(entries.stats.peak_pending_entries <= 2);
 
     let checks = AtomicUsize::new(0);
     let cancelled = walk_files(
@@ -109,6 +131,56 @@ fn walk_honors_file_entry_and_cancellation_limits() {
         deadline.stop_reason,
         Some(TraversalStopReason::DeadlineExceeded)
     );
+
+    std::fs::remove_dir_all(root).expect("remove tree");
+}
+
+#[test]
+fn max_entries_stops_at_a_deterministic_directory_boundary() {
+    let root = temp_root("wide-entry-budget");
+    std::fs::create_dir_all(root.join("wide")).expect("create tree");
+    std::fs::write(root.join("A.php"), "<?php").expect("write retained PHP file");
+    for name in ["Z.php", "M.php", "B.php", "Q.php"] {
+        std::fs::write(root.join("wide").join(name), "<?php").expect("write PHP file");
+    }
+
+    let limits = TraversalLimits {
+        max_files: None,
+        max_entries: Some(5),
+    };
+    let first = php_walk(std::slice::from_ref(&root), limits);
+    let second = php_walk(std::slice::from_ref(&root), limits);
+    assert_eq!(first.files, vec![root.join("A.php")]);
+    assert_eq!(first.files, second.files);
+    assert_eq!(
+        first.stop_reason,
+        Some(TraversalStopReason::MaxEntries { limit: 5 })
+    );
+    assert_eq!(first.stats.visited_entries, 5);
+    assert!(first.stats.peak_pending_entries <= 5);
+
+    std::fs::remove_dir_all(root).expect("remove tree");
+}
+
+#[cfg(unix)]
+#[test]
+fn walk_skips_special_files_without_stopping() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
+
+    let root = temp_root("special-file");
+    std::fs::create_dir_all(&root).expect("create tree");
+    std::fs::write(root.join("Subject.php"), "<?php").expect("write PHP file");
+    let socket = root.join("events.sock");
+    let _listener = UnixListener::bind(&socket).expect("bind Unix socket");
+    assert!(std::fs::symlink_metadata(&socket)
+        .expect("socket metadata")
+        .file_type()
+        .is_socket());
+
+    let outcome = php_walk(std::slice::from_ref(&root), TraversalLimits::default());
+    assert_eq!(outcome.files, vec![root.join("Subject.php")]);
+    assert_eq!(outcome.stats.skipped_special_files, 1);
 
     std::fs::remove_dir_all(root).expect("remove tree");
 }
@@ -166,6 +238,35 @@ fn walk_follows_external_links_without_cycles_and_deduplicates_aliases() {
     assert!(symlink_aliases_on_path(&root.join("a-linked/Outside.php"))
         .iter()
         .any(|alias| alias.logical_path == root.join("a-linked")));
+
+    std::fs::remove_dir_all(root).expect("remove workspace tree");
+    std::fs::remove_dir_all(external).expect("remove external tree");
+}
+
+#[cfg(unix)]
+#[test]
+fn walk_records_symlink_ancestors_of_a_nested_explicit_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_root("nested-root-symlink");
+    let external = temp_root("nested-root-external");
+    std::fs::create_dir_all(&root).expect("create workspace tree");
+    std::fs::create_dir_all(external.join("package/src")).expect("create external tree");
+    std::fs::write(external.join("package/src/Subject.php"), "<?php")
+        .expect("write external PHP file");
+    symlink(&external, root.join("linked")).expect("link external ancestor");
+
+    let nested_root = root.join("linked/package/src");
+    let outcome = php_walk(
+        std::slice::from_ref(&nested_root),
+        TraversalLimits::default(),
+    );
+    assert_eq!(outcome.files, vec![nested_root.join("Subject.php")]);
+    assert!(outcome.symlink_aliases.iter().any(|alias| {
+        alias.logical_path == root.join("linked")
+            && alias.physical_target == external
+            && alias.target_kind == SymlinkTargetKind::Directory
+    }));
 
     std::fs::remove_dir_all(root).expect("remove workspace tree");
     std::fs::remove_dir_all(external).expect("remove external tree");

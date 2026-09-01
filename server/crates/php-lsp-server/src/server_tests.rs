@@ -856,6 +856,30 @@ async fn test_file_io_blocking_yields_current_thread_runtime() {
     assert_eq!(handle.await.unwrap().unwrap(), 7);
 }
 
+#[test]
+fn test_file_io_walk_deadline_precedes_outer_blocking_timeout() {
+    let before = Instant::now();
+    let deadline = file_io_walk_deadline();
+    let outer_timeout = before + Duration::from_millis(FILE_IO_TIMEOUT_MS);
+
+    assert!(deadline > before);
+    assert!(deadline < outer_timeout);
+}
+
+#[test]
+fn test_indexing_run_status_always_carries_runtime_generation() {
+    let status = indexing_status_with_runtime_generation(
+        serde_json::json!({
+            "phase": "indexing",
+            "message": "Indexed 1/2 files"
+        }),
+        17,
+    );
+
+    assert_eq!(status["runtimeGeneration"], 17);
+    assert_eq!(status["phase"], "indexing");
+}
+
 fn diagnostic_messages(diagnostics: &[Diagnostic]) -> Vec<String> {
     diagnostics
         .iter()

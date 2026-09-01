@@ -180,7 +180,7 @@ accepted project-config alias for compatibility; new files should use
 ## Filesystem traversal limits and symlinks
 
 `indexing.maxFiles` defaults to `100000` unique matching files and
-`indexing.maxEntries` defaults to `1000000` inspected entries per traversal.
+`indexing.maxEntries` defaults to `1000000` admitted entries per traversal.
 VS Code exposes the same controls as `phpLsp.indexing.maxFiles` and
 `phpLsp.indexing.maxEntries`. A trusted global or explicit VS Code value of `0`
 disables the corresponding cap. Because project configuration is untrusted, a
@@ -191,6 +191,18 @@ When a limit is reached, php-lsp retains the files found in deterministic path
 order, marks the index as partial in `phpLsp/indexingStatus`, logs a warning,
 and keeps the server usable. Changing either limit invalidates the workspace
 cache and starts a clean reindex.
+
+The `analyze` and `fix --dry-run` commands report configured limit truncation
+as an explicit stderr warning. A recursive CLI traversal that reaches its
+internal deadline fails with exit code `1` instead of silently presenting a
+partial result as complete.
+
+Directory children are admitted only after the directory batch is complete.
+The visitor uses at most one unqueued iterator lookahead to distinguish an
+exactly full directory from a truncated one; an incomplete batch is discarded.
+This keeps the configured admitted-entry cap and the resulting partial index
+deterministic even when the operating system returns directory entries in a
+different order.
 
 Filesystem traversal follows file and directory symlinks, including external
 targets used by shared packages and Composer path repositories. Physical file

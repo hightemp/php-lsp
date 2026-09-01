@@ -5,6 +5,13 @@ import type { ChildProcess } from "child_process";
 import { phpLspCacheDirForRoot } from "./cachePath";
 import { buildClientConfigurationSnapshot } from "./configuration";
 import {
+  mergeIndexingStatus,
+  phaseIcon,
+  phaseTitle,
+  statusText,
+  type IndexingStatus,
+} from "./indexingStatus";
+import {
   childProcessIsRunning,
   type ManagedServerTerminationResult,
   terminateManagedServerProcess,
@@ -61,32 +68,6 @@ const WATCHED_FILE_GLOBS = [
   "**/vendor/composer/autoload_*.php",
   "**/.php-lsp.toml",
 ] as const;
-
-type IndexingPhase =
-  | "starting"
-  | "discovering"
-  | "loadingStubs"
-  | "stubsLoaded"
-  | "indexing"
-  | "ready"
-  | "error";
-
-interface IndexingStatus {
-  phase: IndexingPhase | string;
-  root?: string;
-  message?: string;
-  indexedFiles?: number;
-  totalFiles?: number;
-  indexedSymbols?: number;
-  percentage?: number;
-  elapsedMs?: number;
-  stubFiles?: number;
-  truncated?: boolean;
-  truncationReason?: "maxFiles" | "maxEntries";
-  truncationLimit?: number;
-  visitedEntries?: number;
-  lastUpdatedAt?: number;
-}
 
 interface ExtensionSnapshot {
   extensionVersion: string;
@@ -148,20 +129,7 @@ class PhpLspStatusController implements Disposable {
   }
 
   update(status: IndexingStatus): void {
-    const traversalReset = status.phase === "discovering"
-      ? {
-        truncated: false,
-        truncationReason: undefined,
-        truncationLimit: undefined,
-        visitedEntries: undefined,
-      }
-      : {};
-    this.status = {
-      ...this.status,
-      ...traversalReset,
-      ...status,
-      lastUpdatedAt: Date.now(),
-    };
+    this.status = mergeIndexingStatus(this.status, status);
     this.render();
   }
 
@@ -285,23 +253,6 @@ class PhpLspStatusController implements Disposable {
   }
 }
 
-function statusText(status: IndexingStatus): string {
-  if (status.phase === "indexing") {
-    const percent = typeof status.percentage === "number" ? ` ${Math.round(status.percentage)}%` : "";
-    return `$(sync~spin) PHP LSP${percent}`;
-  }
-  if (status.phase === "discovering" || status.phase === "loadingStubs") {
-    return "$(sync~spin) PHP LSP";
-  }
-  if (status.phase === "error") {
-    return "$(error) PHP LSP";
-  }
-  if (status.truncated) {
-    return "$(warning) PHP LSP";
-  }
-  return "$(check) PHP LSP";
-}
-
 function statusTooltip(status: IndexingStatus, snapshot: ExtensionSnapshot): MarkdownString {
   const tooltip = new MarkdownString();
   tooltip.appendMarkdown("**PHP Language Server**\n\n");
@@ -326,43 +277,6 @@ function statusTooltip(status: IndexingStatus, snapshot: ExtensionSnapshot): Mar
   }
   tooltip.appendMarkdown("Click to show details.");
   return tooltip;
-}
-
-function phaseIcon(phase: string, truncated = false): string {
-  if (phase === "indexing" || phase === "discovering" || phase === "loadingStubs") {
-    return "$(sync~spin)";
-  }
-  if (phase === "error") {
-    return "$(error)";
-  }
-  if (truncated) {
-    return "$(warning)";
-  }
-  return "$(check)";
-}
-
-function phaseTitle(phase: string, truncated = false): string {
-  if (truncated && phase === "ready") {
-    return "Ready (partial index)";
-  }
-  switch (phase) {
-    case "starting":
-      return "Starting";
-    case "discovering":
-      return "Discovering files";
-    case "loadingStubs":
-      return "Loading stubs";
-    case "stubsLoaded":
-      return "Stubs loaded";
-    case "indexing":
-      return "Indexing";
-    case "ready":
-      return "Ready";
-    case "error":
-      return "Error";
-    default:
-      return phase;
-  }
 }
 
 function percentDescription(status: IndexingStatus): string | undefined {

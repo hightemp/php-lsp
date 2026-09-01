@@ -8,7 +8,7 @@
 ## Project Structure & Module Organization
 - `server/` contains the Rust workspace for the language server.
   Key crates live in `server/crates/`: `php-lsp-server` (binary), `php-lsp-parser`, `php-lsp-index`, `php-lsp-completion`, and `php-lsp-types`.
-- `client/` contains the VS Code extension (`src/extension.ts`, build output in `out/`).
+- `client/` contains the VS Code extension (`src/extension.ts`, pure indexing-status state/render helpers in `src/indexingStatus.ts`, build output in `out/`).
 - `test-fixtures/` contains PHP sample projects used by tests and parser/index scenarios.
 - `scripts/` contains release helpers such as `build-server.sh` and `bundle-stubs.sh`.
 - `server/data/stubs/` is a git submodule (phpstorm-stubs) used for bundled PHP symbols.
@@ -145,8 +145,9 @@
 - Reuse `util::fs_walk::walk_files` for recursive first-party filesystem discovery. Do not add another recursive `read_dir` walker in workspace, CLI, Twig, framework, or vendor code.
 - External file and directory symlinks are intentionally supported. Do not replace this policy with blanket canonical-containment rejection or unconditional symlink skipping.
 - Apply project exclusions to the logical path visible through the workspace, but detect cycles and duplicate files/directories by physical identity. Preserve deterministic first-logical-URI selection.
-- Keep traversal cancellation/deadline checks and the configured `indexing.maxFiles`/`indexing.maxEntries` budgets when adding a new visitor consumer.
-- External watcher publications must match the exact active workspace generation. Preserve removed-root tombstones, non-indexing generation promotion, nested-alias cleanup, register-before-unregister ordering, and pending failed unregister IDs.
+- Keep traversal cancellation/deadline checks active while both processing paths and enumerating directory entries. The pending set must remain deterministically bounded by `indexing.maxEntries`; do not reintroduce an eager unbounded directory queue.
+- External watcher publications must match the exact active workspace generation. Preserve all logical aliases for each physical file, including targets located inside another/current workspace, plus removed-root tombstones, non-indexing generation promotion, nested-alias cleanup, register-before-unregister ordering, and pending failed unregister IDs.
+- Every status notification emitted by a concrete indexing run must use `send_indexing_status_for_generation`; the client keeps partial state sticky within one generation and rejects older generations. Leave notifications unversioned only for global lifecycle/stub states that do not belong to a workspace indexing run.
 
 ### Security
 - Project `.php-lsp.toml` is not trusted to execute commands by default.
