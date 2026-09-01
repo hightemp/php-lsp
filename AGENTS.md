@@ -85,8 +85,12 @@
   - Server-side stub loading and stub cache-source helpers.
 - `src/indexing/vendor.rs`
   - Vendor autoload metadata cache, lazy vendor file LRU helpers, vendor path resolution, and lazy FQN/class/member indexing helpers.
+- `src/indexing/vendor_symlink_tests.rs`
+  - Unix-specific regression coverage for lazy vendor PSR-4 physical deduplication, deterministic logical aliases, and future files under external symlink targets.
 - `src/indexing/symlinks.rs`
   - Generation-aware physical/logical symlink alias registry, external watcher capability lifecycle, dynamic LSP `RelativePattern` registration, and physical-to-logical watched-event routing.
+- `src/indexing/symlinks_tests.rs`
+  - Unit coverage for watcher capability fallback, registration specs, event routing, alias promotion, multi-root isolation, and generation/tombstone handling.
 - `src/util/fs_walk.rs`
   - Shared deterministic filesystem visitor for workspace, CLI, Twig, framework, and vendor discovery; owns physical-identity cycle/duplicate protection, logical-path filtering, symlink metadata, traversal limits, cancellation, and deadlines.
 - `src/util/fs_walk_tests.rs`
@@ -237,7 +241,9 @@
   - `server/crates/php-lsp-index/src/cache.rs`
   - `server/crates/php-lsp-server/src/indexing/workspace.rs`
   - `server/crates/php-lsp-server/src/indexing/vendor.rs`
+  - `server/crates/php-lsp-server/src/indexing/vendor_symlink_tests.rs`
   - `server/crates/php-lsp-server/src/indexing/symlinks.rs`
+  - `server/crates/php-lsp-server/src/indexing/symlinks_tests.rs`
   - `server/crates/php-lsp-server/src/util/fs_walk.rs`
   - `server/crates/php-lsp-server/src/util/fs_walk_tests.rs`
   - `server/crates/php-lsp-server/src/indexing/stubs.rs`
