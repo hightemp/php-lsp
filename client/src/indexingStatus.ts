@@ -25,9 +25,13 @@ export interface IndexingStatus {
   lastUpdatedAt?: number;
 }
 
+export interface IndexingStatusUpdate extends IndexingStatus {
+  resetTraversal?: boolean;
+}
+
 export function mergeIndexingStatus(
   current: IndexingStatus,
-  incoming: IndexingStatus,
+  incoming: IndexingStatusUpdate,
   now = Date.now(),
 ): IndexingStatus {
   if (
@@ -42,7 +46,9 @@ export function mergeIndexingStatus(
       current.runtimeGeneration === undefined
       || incoming.runtimeGeneration > current.runtimeGeneration
     );
-  const traversalReset = incoming.phase === "starting" || generationChanged
+  const traversalReset = incoming.phase === "starting"
+    || incoming.resetTraversal === true
+    || generationChanged
     ? {
       truncated: false,
       truncationReason: undefined,
@@ -51,15 +57,17 @@ export function mergeIndexingStatus(
       runtimeGeneration: undefined,
     }
     : {};
+  const { resetTraversal: _resetTraversal, ...incomingStatus } = incoming;
   const merged = {
     ...current,
     ...traversalReset,
-    ...incoming,
+    ...incomingStatus,
     lastUpdatedAt: now,
   };
   if (
     !generationChanged
     && incoming.phase !== "starting"
+    && incoming.resetTraversal !== true
     && incoming.truncated !== true
     && current.truncated
   ) {

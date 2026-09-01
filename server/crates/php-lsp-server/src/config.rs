@@ -32,7 +32,7 @@ composer = true
 vendor = true
 include = []
 exclude = []
-# Maximum unique matching files and inspected filesystem entries per traversal.
+# Maximum unique matching files and admitted filesystem entries per traversal.
 # Project config may lower these defaults; trusted global/client config may raise
 # them or set either value to 0 to disable that limit.
 # maxFiles = 100000

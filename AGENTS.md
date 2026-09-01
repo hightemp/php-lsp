@@ -147,6 +147,7 @@
 - Apply project exclusions to the logical path visible through the workspace, but detect cycles and duplicate files/directories by physical identity. Preserve deterministic first-logical-URI selection.
 - Keep traversal cancellation/deadline checks active while both processing paths and enumerating directory entries. The pending set must remain deterministically bounded by `indexing.maxEntries`; do not reintroduce an eager unbounded directory queue.
 - External watcher publications must match the exact active workspace generation. Preserve all logical aliases for each physical file, including targets located inside another/current workspace, plus removed-root tombstones, non-indexing generation promotion, nested-alias cleanup, register-before-unregister ordering, and pending failed unregister IDs.
+- Lazy vendor PSR-4 candidates and classmap results must publish the same physical file groups as workspace discovery; do not index one logical URI while routing watcher events to another alias. Feature-alias discovery must also cover project config and Composer metadata links outside the PHP source roots.
 - Every status notification emitted by a concrete indexing run must use `send_indexing_status_for_generation`; the client keeps partial state sticky within one generation and rejects older generations. Leave notifications unversioned only for global lifecycle/stub states that do not belong to a workspace indexing run.
 
 ### Security

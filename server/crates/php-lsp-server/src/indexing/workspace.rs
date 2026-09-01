@@ -915,11 +915,17 @@ pub(in crate::server) async fn collect_php_files_blocking(
 
 async fn collect_feature_symlink_aliases_blocking(
     root: PathBuf,
+    workspace_folder: PathBuf,
     exclude_paths: Vec<PathBuf>,
     limits: TraversalLimits,
     cancellation: OperationCancellationToken,
 ) -> std::result::Result<FileWalkOutcome, String> {
     let roots = [
+        workspace_folder.join(PROJECT_CONFIG_FILE_NAME),
+        root.join(PROJECT_CONFIG_FILE_NAME),
+        root.join("composer.json"),
+        root.join("composer.lock"),
+        root.join("vendor/composer"),
         root.join("app"),
         root.join("tests"),
         root.join("templates"),
@@ -1970,6 +1976,7 @@ pub(in crate::server) async fn index_workspace(
     let mut watcher_aliases = php_discovery.symlink_aliases.clone();
     match collect_feature_symlink_aliases_blocking(
         root.to_path_buf(),
+        workspace_folder.to_path_buf(),
         options.exclude_paths.clone(),
         options.traversal_limits,
         cancellation.clone(),

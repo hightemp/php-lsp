@@ -1,6 +1,9 @@
 //! External symlink alias tracking and dynamic LSP file-watcher registration.
 
-use crate::util::fs_walk::{PhysicalFileGroup, PhysicalFilePath, SymlinkAlias, SymlinkTargetKind};
+use crate::util::fs_walk::{
+    merge_physical_file_groups, PhysicalFileGroup, PhysicalFilePath, SymlinkAlias,
+    SymlinkTargetKind,
+};
 use crate::util::uri::{path_to_uri, uri_to_path};
 use serde_json::to_value;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -22,6 +25,7 @@ const EXTERNAL_WATCH_PATTERNS: &[&str] = &[
     "**/composer.json",
     "**/composer.lock",
     "**/vendor/composer/installed.json",
+    "**/installed.json",
     "**/vendor/composer/installed.php",
     "**/vendor/composer/autoload_*.php",
     "**/.php-lsp.toml",
@@ -361,34 +365,6 @@ fn expand_physical_file_aliases(
     }
 }
 
-fn merge_physical_files(
-    current: &mut Vec<PhysicalFileGroup>,
-    physical_files: Vec<PhysicalFileGroup>,
-) {
-    for mut group in physical_files {
-        if let Some(existing) = current
-            .iter_mut()
-            .find(|existing| existing.identity == group.identity)
-        {
-            for path in group.paths.drain(..) {
-                if !existing
-                    .paths
-                    .iter()
-                    .any(|candidate| candidate.logical_path == path.logical_path)
-                {
-                    existing.paths.push(path);
-                }
-            }
-            existing
-                .paths
-                .sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
-        } else {
-            current.push(group);
-        }
-    }
-    current.sort_by(|left, right| left.representative().cmp(right.representative()));
-}
-
 impl ExternalSymlinkState {
     fn set_active_generations(&mut self, active: &[(PathBuf, u64)], reset_snapshots: &[PathBuf]) {
         self.active_workspaces = active.iter().cloned().collect();
@@ -469,7 +445,10 @@ impl ExternalSymlinkState {
                     return false;
                 }
                 merge_aliases(&mut entry.get_mut().aliases, snapshot.aliases);
-                merge_physical_files(&mut entry.get_mut().physical_files, snapshot.physical_files);
+                merge_physical_file_groups(
+                    &mut entry.get_mut().physical_files,
+                    snapshot.physical_files,
+                );
                 let snapshot = entry.get_mut();
                 expand_physical_file_aliases(&snapshot.aliases, &mut snapshot.physical_files);
             }
@@ -991,6 +970,31 @@ mod tests {
                 pattern: "installed.json".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn external_vendor_composer_directory_watches_root_installed_json() {
+        let mut state = ExternalSymlinkState::default();
+        state.workspaces.insert(
+            PathBuf::from("/workspace"),
+            WorkspaceSymlinkSnapshot {
+                generation: 1,
+                logical_root: PathBuf::from("/workspace"),
+                aliases: vec![SymlinkAlias {
+                    logical_path: PathBuf::from("/workspace/vendor/composer"),
+                    physical_target: PathBuf::from("/external/composer"),
+                    target_identity: PhysicalIdentity::CanonicalPath(PathBuf::from(
+                        "/external/composer",
+                    )),
+                    target_kind: SymlinkTargetKind::Directory,
+                }],
+                physical_files: Vec::new(),
+            },
+        );
+
+        assert!(state.desired_watch_specs().iter().any(|spec| {
+            spec.base == Path::new("/external/composer") && spec.pattern == "**/installed.json"
+        }));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Vendor indexing helpers.
 
-use crate::util::fs_walk::{symlink_aliases_on_path, walk_files, TraversalStopReason};
+use crate::util::fs_walk::{merge_physical_file_groups, walk_files, TraversalStopReason};
 
 use super::super::*;
 
@@ -871,7 +871,13 @@ pub(crate) fn resolve_vendor_paths_from_map(
     fqn: &str,
     map: &VendorAutoloadMap,
 ) -> Option<Vec<PathBuf>> {
-    resolve_vendor_paths_from_map_with_limits(
+    let psr4_candidates = vendor_psr4_candidate_paths(fqn, map, None, &[]);
+    let mut paths = psr4_candidates
+        .iter()
+        .filter(|candidate| !candidate.is_file())
+        .cloned()
+        .collect::<Vec<_>>();
+    let resolution = resolve_vendor_paths_from_map_with_limits(
         fqn,
         map,
         TraversalLimits {
@@ -880,8 +886,13 @@ pub(crate) fn resolve_vendor_paths_from_map(
         },
         None,
         &[],
-    )
-    .map(|resolution| resolution.paths)
+    );
+    if let Some(resolution) = resolution {
+        for path in resolution.paths {
+            push_unique_path(&mut paths, path);
+        }
+    }
+    (!paths.is_empty()).then_some(paths)
 }
 
 struct VendorPathResolution {
@@ -898,8 +909,74 @@ fn resolve_vendor_paths_from_map_with_limits(
     exclude_paths: &[PathBuf],
 ) -> Option<VendorPathResolution> {
     let normalized_fqn = fqn.trim_start_matches('\\');
-    let mut paths = Vec::new();
-    let mut symlink_aliases = Vec::new();
+    let psr4_candidates = vendor_psr4_candidate_paths(fqn, map, project_root, exclude_paths);
+
+    let deadline = file_io_walk_deadline();
+    let psr4 = walk_files(
+        &psr4_candidates,
+        traversal_limits,
+        |path| project_root.is_some_and(|root| path_is_excluded(path, root, exclude_paths)),
+        |_, _| false,
+        is_php_file_path,
+        || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
+    );
+    if psr4.truncated() || psr4.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
+        tracing::warn!(
+            "Vendor PSR-4 candidate traversal was truncated after {} entries",
+            psr4.stats.visited_entries
+        );
+    }
+
+    let classmap = classmap_candidate_paths_for_fqn(
+        normalized_fqn,
+        map,
+        traversal_limits,
+        project_root,
+        exclude_paths,
+    );
+    let mut priority_identities = ordered_physical_identities(&psr4.files, &psr4.physical_files);
+    priority_identities.extend(ordered_physical_identities(
+        &classmap.paths,
+        &classmap.physical_files,
+    ));
+
+    let mut physical_files = psr4.physical_files;
+    merge_physical_file_groups(&mut physical_files, classmap.physical_files);
+    let representatives_by_identity = physical_files
+        .iter()
+        .map(|group| (group.identity.clone(), group.representative().to_path_buf()))
+        .collect::<HashMap<_, _>>();
+    let mut seen_identities = HashSet::new();
+    let paths = priority_identities
+        .into_iter()
+        .filter(|identity| seen_identities.insert(identity.clone()))
+        .filter_map(|identity| representatives_by_identity.get(&identity).cloned())
+        .collect::<Vec<_>>();
+
+    let mut symlink_aliases = psr4.symlink_aliases;
+    symlink_aliases.extend(classmap.symlink_aliases);
+    symlink_aliases.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
+    symlink_aliases.dedup();
+
+    if paths.is_empty() && symlink_aliases.is_empty() {
+        None
+    } else {
+        Some(VendorPathResolution {
+            paths,
+            symlink_aliases,
+            physical_files,
+        })
+    }
+}
+
+fn vendor_psr4_candidate_paths(
+    fqn: &str,
+    map: &VendorAutoloadMap,
+    project_root: Option<&Path>,
+    exclude_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let normalized_fqn = fqn.trim_start_matches('\\');
+    let mut candidates = Vec::new();
     for mapping in &map.psr4 {
         let Some(relative) = normalized_fqn.strip_prefix(mapping.prefix.as_str()) else {
             continue;
@@ -910,33 +987,29 @@ fn resolve_vendor_paths_from_map_with_limits(
             if project_root.is_some_and(|root| path_is_excluded(&candidate, root, exclude_paths)) {
                 continue;
             }
-            symlink_aliases.extend(symlink_aliases_on_path(&candidate));
-            push_unique_path(&mut paths, candidate);
+            push_unique_path(&mut candidates, candidate);
         }
     }
-    let classmap = classmap_candidate_paths_for_fqn(
-        normalized_fqn,
-        map,
-        traversal_limits,
-        project_root,
-        exclude_paths,
-    );
-    for path in classmap.paths {
-        push_unique_path(&mut paths, path);
-    }
-    symlink_aliases.extend(classmap.symlink_aliases);
-    symlink_aliases.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
-    symlink_aliases.dedup();
+    candidates
+}
 
-    if paths.is_empty() {
-        None
-    } else {
-        Some(VendorPathResolution {
-            paths,
-            symlink_aliases,
-            physical_files: classmap.physical_files,
+fn ordered_physical_identities(
+    paths: &[PathBuf],
+    groups: &[crate::util::fs_walk::PhysicalFileGroup],
+) -> Vec<crate::util::fs_walk::PhysicalIdentity> {
+    let identities_by_path = groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .paths
+                .iter()
+                .map(|path| (path.logical_path.clone(), group.identity.clone()))
         })
-    }
+        .collect::<HashMap<_, _>>();
+    paths
+        .iter()
+        .filter_map(|path| identities_by_path.get(path).cloned())
+        .collect()
 }
 
 async fn resolve_vendor_paths_from_map_with_limits_blocking(
@@ -948,7 +1021,7 @@ async fn resolve_vendor_paths_from_map_with_limits_blocking(
 ) -> Option<VendorPathResolution> {
     let fqn = fqn.to_string();
     let path_label = project_root.display().to_string();
-    match run_file_io_blocking("vendor classmap discovery", path_label.clone(), move || {
+    match run_file_io_blocking("vendor path discovery", path_label.clone(), move || {
         resolve_vendor_paths_from_map_with_limits(
             &fqn,
             &map,
@@ -962,7 +1035,7 @@ async fn resolve_vendor_paths_from_map_with_limits_blocking(
         Ok(resolution) => resolution,
         Err(message) => {
             tracing::warn!(
-                "Vendor classmap discovery failed for {}: {}",
+                "Vendor path discovery failed for {}: {}",
                 path_label,
                 message
             );
@@ -1543,5 +1616,121 @@ impl PhpLspBackend {
             }
         }
         None
+    }
+}
+
+#[cfg(all(test, unix))]
+mod symlink_resolution_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn psr4_aliases_choose_one_physical_file_and_lexical_logical_uri() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "php-lsp-vendor-psr4-alias-{}-{nonce}",
+            std::process::id()
+        ));
+        let external = std::env::temp_dir().join(format!(
+            "php-lsp-vendor-psr4-external-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("vendor/a-package")).expect("create a package");
+        std::fs::create_dir_all(root.join("vendor/z-package")).expect("create z package");
+        std::fs::create_dir_all(&external).expect("create external source");
+        std::fs::write(
+            external.join("Subject.php"),
+            "<?php namespace Vendor\\Package; class Subject {}",
+        )
+        .expect("write vendor class");
+        symlink(&external, root.join("vendor/a-package/src")).expect("create a alias");
+        symlink(&external, root.join("vendor/z-package/src")).expect("create z alias");
+
+        let map = VendorAutoloadMap {
+            psr4: vec![VendorPsr4Mapping {
+                prefix: "Vendor\\Package\\".to_string(),
+                directories: vec![
+                    root.join("vendor/z-package/src"),
+                    root.join("vendor/a-package/src"),
+                ],
+            }],
+            ..VendorAutoloadMap::default()
+        };
+        let resolution = resolve_vendor_paths_from_map_with_limits(
+            "Vendor\\Package\\Subject",
+            &map,
+            TraversalLimits::default(),
+            Some(&root),
+            &[],
+        )
+        .expect("vendor resolution");
+
+        assert_eq!(
+            resolution.paths,
+            vec![root.join("vendor/a-package/src/Subject.php")]
+        );
+        assert_eq!(resolution.physical_files.len(), 1);
+        assert_eq!(
+            resolution.physical_files[0]
+                .paths
+                .iter()
+                .map(|path| path.logical_path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                root.join("vendor/a-package/src/Subject.php"),
+                root.join("vendor/z-package/src/Subject.php"),
+            ]
+        );
+
+        std::fs::remove_dir_all(root).expect("remove workspace");
+        std::fs::remove_dir_all(external).expect("remove external source");
+    }
+
+    #[test]
+    fn missing_psr4_class_keeps_external_directory_alias_for_future_create_events() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "php-lsp-vendor-psr4-missing-{}-{nonce}",
+            std::process::id()
+        ));
+        let external = std::env::temp_dir().join(format!(
+            "php-lsp-vendor-psr4-missing-external-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("vendor/package")).expect("create package");
+        std::fs::create_dir_all(&external).expect("create external source");
+        symlink(&external, root.join("vendor/package/src")).expect("create source alias");
+
+        let map = VendorAutoloadMap {
+            psr4: vec![VendorPsr4Mapping {
+                prefix: "Vendor\\Package\\".to_string(),
+                directories: vec![root.join("vendor/package/src")],
+            }],
+            ..VendorAutoloadMap::default()
+        };
+        let resolution = resolve_vendor_paths_from_map_with_limits(
+            "Vendor\\Package\\CreatedLater",
+            &map,
+            TraversalLimits::default(),
+            Some(&root),
+            &[],
+        )
+        .expect("alias-only vendor resolution");
+
+        assert!(resolution.paths.is_empty());
+        assert!(resolution
+            .symlink_aliases
+            .iter()
+            .any(|alias| alias.logical_path == root.join("vendor/package/src")));
+
+        std::fs::remove_dir_all(root).expect("remove workspace");
+        std::fs::remove_dir_all(external).expect("remove external source");
     }
 }

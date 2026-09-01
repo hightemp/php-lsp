@@ -1940,12 +1940,6 @@ impl WorkspaceRequestContext {
             .as_ref()
             .map(|workspace| workspace.root.as_path())
     }
-
-    fn namespace_map(&self) -> Option<&NamespaceMap> {
-        self.workspace
-            .as_ref()
-            .and_then(|workspace| workspace.namespace_map.as_ref())
-    }
 }
 
 fn workspace_config_for_path_from_configs(

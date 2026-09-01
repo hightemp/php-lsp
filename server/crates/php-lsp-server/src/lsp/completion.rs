@@ -169,23 +169,13 @@ impl PhpLspBackend {
             if let Some(path_context) =
                 template.twig_template_path_context_at_position(original_pos)
             {
-                let workspace_root = request.root().map(Path::to_path_buf);
-                let namespace_map = request.namespace_map().cloned();
-                let file_symbols = php_lsp_types::FileSymbols::default();
                 let context = FrameworkStringKeyAtPosition {
                     domain: "twig",
                     prefix: path_context.prefix,
                     key: path_context.key,
                 };
                 let items: Vec<CompletionItem> = self
-                    .framework_string_key_items(
-                        workspace_root.as_deref(),
-                        namespace_map.as_ref(),
-                        &uri_str,
-                        &file_symbols,
-                        template.original_source(),
-                        &context,
-                    )
+                    .framework_string_key_items(&request, &context)
                     .await
                     .into_iter()
                     .map(framework_string_key_completion_item_to_ls)
@@ -210,26 +200,10 @@ impl PhpLspBackend {
         let byte_col = utf16_col_to_byte(&source, pos.line, pos.character);
         let framework_string_key_context =
             framework_string_key_context_at_position(&source, pos.line, byte_col);
-        let (framework_workspace_root, framework_namespace_map) =
-            if framework_string_key_context.is_some() {
-                (
-                    request.root().map(Path::to_path_buf),
-                    request.namespace_map().cloned(),
-                )
-            } else {
-                (None, None)
-            };
         let framework_string_key_items =
             if let Some(ref framework_string_key_context) = framework_string_key_context {
-                self.framework_string_key_items(
-                    framework_workspace_root.as_deref(),
-                    framework_namespace_map.as_ref(),
-                    &uri_str,
-                    &file_symbols,
-                    &source,
-                    framework_string_key_context,
-                )
-                .await
+                self.framework_string_key_items(&request, framework_string_key_context)
+                    .await
             } else {
                 Vec::new()
             };

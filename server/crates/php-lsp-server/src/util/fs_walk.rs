@@ -68,6 +68,58 @@ impl PhysicalFileGroup {
     }
 }
 
+pub(crate) fn merge_physical_file_groups(
+    current: &mut Vec<PhysicalFileGroup>,
+    incoming: Vec<PhysicalFileGroup>,
+) {
+    let mut group_indices = current
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (group.identity.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut paths_by_identity = current
+        .iter()
+        .map(|group| {
+            (
+                group.identity.clone(),
+                group
+                    .paths
+                    .iter()
+                    .map(|path| (path.logical_path.clone(), path.physical_path.clone()))
+                    .collect::<HashSet<_>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for mut group in incoming {
+        if let Some(index) = group_indices.get(&group.identity).copied() {
+            let existing = &mut current[index];
+            let existing_paths = paths_by_identity.entry(group.identity.clone()).or_default();
+            for path in group.paths.drain(..) {
+                if existing_paths.insert((path.logical_path.clone(), path.physical_path.clone())) {
+                    existing.paths.push(path);
+                }
+            }
+            existing.paths.sort_by(|left, right| {
+                left.logical_path
+                    .cmp(&right.logical_path)
+                    .then(left.physical_path.cmp(&right.physical_path))
+            });
+        } else {
+            group_indices.insert(group.identity.clone(), current.len());
+            paths_by_identity.insert(
+                group.identity.clone(),
+                group
+                    .paths
+                    .iter()
+                    .map(|path| (path.logical_path.clone(), path.physical_path.clone()))
+                    .collect(),
+            );
+            current.push(group);
+        }
+    }
+    current.sort_by(|left, right| left.representative().cmp(right.representative()));
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TraversalStats {
     pub(crate) visited_entries: usize,

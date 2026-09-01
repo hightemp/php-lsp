@@ -82,6 +82,21 @@ assert.equal(status, currentGenerationStatus, "a stale runtime generation must b
 assert.equal(status.runtimeGeneration, 8);
 assert.equal(status.truncated, false);
 
+status = mergeIndexingStatus({
+  ...status,
+  phase: "ready",
+  truncated: true,
+  truncationReason: "maxFiles",
+  truncationLimit: 10,
+  visitedEntries: 10,
+}, {
+  phase: "ready",
+  message: "Language server is disabled",
+  resetTraversal: true,
+});
+assert.equal(status.truncated, false, "disabling the server must clear partial-index state");
+assert.equal(status.runtimeGeneration, undefined);
+
 status = mergeIndexingStatus(status, {
   phase: "ready",
   message: "Index ready",

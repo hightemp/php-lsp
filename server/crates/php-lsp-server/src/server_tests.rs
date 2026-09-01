@@ -6899,6 +6899,58 @@ fn test_framework_string_key_cache_evicts_lru_entries() {
 }
 
 #[tokio::test]
+async fn test_framework_string_key_scan_uses_request_scoped_shared_root_config() {
+    let root = unique_server_temp_dir("framework-shared-root-config");
+    std::fs::create_dir_all(root.join("templates")).unwrap();
+    std::fs::write(root.join("templates/page.html.twig"), "{{ value }}").unwrap();
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let make_config = |workspace_folder: PathBuf, exclude_paths: Vec<PathBuf>| {
+        let runtime_config = ResolvedRuntimeConfiguration {
+            exclude_paths,
+            ..ResolvedRuntimeConfiguration::default()
+        };
+        WorkspaceRootConfig {
+            workspace_folder,
+            root: root.clone(),
+            namespace_map: None,
+            runtime_config,
+            index: Arc::new(WorkspaceIndex::new()),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }
+    };
+    let visible = make_config(root.join("outer-folder"), Vec::new());
+    let excluded = make_config(root.join("nested-folder"), vec![PathBuf::from("templates")]);
+    let state = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![visible.clone(), excluded.clone()],
+        generation: 1,
+    });
+
+    let visible_request = WorkspaceRequestContext {
+        state: state.clone(),
+        workspace: Some(visible),
+    };
+    let excluded_request = WorkspaceRequestContext {
+        state,
+        workspace: Some(excluded),
+    };
+    let visible_keys = backend
+        .cached_framework_string_keys(&visible_request, "twig")
+        .await;
+    let excluded_keys = backend
+        .cached_framework_string_keys(&excluded_request, "twig")
+        .await;
+
+    assert!(visible_keys.iter().any(|key| key.key == "page.html.twig"));
+    assert!(excluded_keys.is_empty());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn test_root_indices_isolate_duplicate_fqns_stub_versions_and_stub_sources() {
     let tmp = unique_server_temp_dir("root-index-isolation");
     let root_a = tmp.join("root-a");

@@ -10,6 +10,7 @@ import {
   phaseTitle,
   statusText,
   type IndexingStatus,
+  type IndexingStatusUpdate,
 } from "./indexingStatus";
 import {
   childProcessIsRunning,
@@ -128,7 +129,7 @@ class PhpLspStatusController implements Disposable {
     this.statusBar.show();
   }
 
-  update(status: IndexingStatus): void {
+  update(status: IndexingStatusUpdate): void {
     this.status = mergeIndexingStatus(this.status, status);
     this.render();
   }
@@ -980,6 +981,7 @@ async function reconcileLanguageClient(
       statusController?.update({
         phase: "ready",
         message: "Language server is disabled",
+        resetTraversal: true,
       });
     },
     onRunning: () => notifyServerConfigurationChanged(context),
@@ -1013,6 +1015,7 @@ async function restartLanguageClient(context: ExtensionContext): Promise<void> {
       statusController?.update({
         phase: "ready",
         message: "Language server is disabled",
+        resetTraversal: true,
       });
       window.showInformationMessage("PHP Language Server is disabled");
       return;
@@ -1075,6 +1078,7 @@ async function clearCacheAndRestartLanguageClient(context: ExtensionContext): Pr
       statusController?.update({
         phase: "ready",
         message: "Language server is disabled",
+        resetTraversal: true,
       });
       window.showInformationMessage(
         `PHP LSP cache cleared (${cacheDirectoryCountLabel(removed)} removed). Language server is disabled.`,

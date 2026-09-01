@@ -501,3 +501,63 @@ fn explicit_composer_file_is_kept_even_without_php_extension() {
 
     std::fs::remove_dir_all(root).expect("remove workspace");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn feature_alias_discovery_covers_project_config_and_vendor_composer_links() {
+    use std::os::unix::fs::symlink;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-feature-alias-{}-{nonce}",
+        std::process::id()
+    ));
+    let external = std::env::temp_dir().join(format!(
+        "php-lsp-feature-alias-external-{}-{nonce}",
+        std::process::id()
+    ));
+    let effective_root = root.join("app");
+    std::fs::create_dir_all(effective_root.join("vendor")).expect("create workspace vendor");
+    std::fs::create_dir_all(external.join("composer")).expect("create external composer");
+    std::fs::write(external.join("project.toml"), "[indexing]\nmaxFiles = 10\n")
+        .expect("write external config");
+    std::fs::write(external.join("composer/installed.json"), "[]")
+        .expect("write installed metadata");
+    symlink(
+        external.join("project.toml"),
+        root.join(PROJECT_CONFIG_FILE_NAME),
+    )
+    .expect("link project config");
+    symlink(
+        external.join("composer"),
+        effective_root.join("vendor/composer"),
+    )
+    .expect("link Composer metadata directory");
+
+    let outcome = collect_feature_symlink_aliases_blocking(
+        effective_root.clone(),
+        root.clone(),
+        Vec::new(),
+        TraversalLimits {
+            max_files: Some(100),
+            max_entries: Some(1_000),
+        },
+        OperationCancellationToken::new(),
+    )
+    .await
+    .expect("feature alias discovery");
+    assert!(outcome
+        .symlink_aliases
+        .iter()
+        .any(|alias| alias.logical_path == root.join(PROJECT_CONFIG_FILE_NAME)));
+    assert!(outcome
+        .symlink_aliases
+        .iter()
+        .any(|alias| alias.logical_path == effective_root.join("vendor/composer")));
+
+    std::fs::remove_dir_all(root).expect("remove workspace");
+    std::fs::remove_dir_all(external).expect("remove external files");
+}

@@ -203,6 +203,32 @@ fn ten_thousand_files_require_only_linear_identity_lookups() {
     std::fs::remove_dir_all(root).expect("remove scale tree");
 }
 
+#[test]
+fn merging_ten_thousand_alias_paths_deduplicates_one_identity() {
+    let identity = PhysicalIdentity::CanonicalPath(PathBuf::from("physical-identity"));
+    let path = |index: usize| PhysicalFilePath {
+        logical_path: PathBuf::from(format!("/logical/File{index:05}.php")),
+        physical_path: PathBuf::from(format!("/physical/File{index:05}.php")),
+    };
+    let mut current = vec![PhysicalFileGroup {
+        identity: identity.clone(),
+        paths: (0..5_000).map(path).collect(),
+    }];
+    let incoming = vec![PhysicalFileGroup {
+        identity,
+        paths: (2_500..10_000).map(path).collect(),
+    }];
+
+    merge_physical_file_groups(&mut current, incoming);
+
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].paths.len(), 10_000);
+    assert_eq!(
+        current[0].representative(),
+        Path::new("/logical/File00000.php")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn walk_follows_external_links_without_cycles_and_deduplicates_aliases() {

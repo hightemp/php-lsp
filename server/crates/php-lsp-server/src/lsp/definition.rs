@@ -1147,18 +1147,15 @@ impl PhpLspBackend {
         })
     }
 
-    async fn cached_framework_string_keys(
+    pub(in crate::server) async fn cached_framework_string_keys(
         &self,
-        workspace_root: &Path,
+        request: &WorkspaceRequestContext,
         domain: &str,
     ) -> Vec<crate::framework::FrameworkStringKey> {
-        let runtime_state = self.runtime_state_snapshot().await;
-        let runtime_config = runtime_state
-            .configs
-            .iter()
-            .find(|config| config.root == workspace_root)
-            .map(|config| &config.runtime_config)
-            .unwrap_or(&runtime_state.fallback);
+        let Some(workspace_root) = request.root() else {
+            return Vec::new();
+        };
+        let runtime_config = request.runtime_config();
         let traversal_limits = runtime_config.traversal_limits;
         let exclude_paths = runtime_config.exclude_paths.clone();
         let key = FrameworkStringKeyCacheKey {
@@ -1200,18 +1197,10 @@ impl PhpLspBackend {
 
     pub(in crate::server) async fn framework_string_key_items(
         &self,
-        workspace_root: Option<&Path>,
-        _namespace_map: Option<&NamespaceMap>,
-        _uri_str: &str,
-        _file_symbols: &php_lsp_types::FileSymbols,
-        _source: &str,
+        request: &WorkspaceRequestContext,
         context: &FrameworkStringKeyAtPosition,
     ) -> Vec<lsp_types::CompletionItem> {
-        let Some(workspace_root) = workspace_root else {
-            return Vec::new();
-        };
-
-        self.cached_framework_string_keys(workspace_root, context.domain)
+        self.cached_framework_string_keys(request, context.domain)
             .await
             .into_iter()
             .filter(|key| key.key.starts_with(&context.prefix))
@@ -1226,9 +1215,8 @@ impl PhpLspBackend {
         _source: &str,
         context: &FrameworkStringKeyAtPosition,
     ) -> Option<Location> {
-        let workspace_root = request.root()?.to_path_buf();
         let source_range = self
-            .cached_framework_string_keys(&workspace_root, context.domain)
+            .cached_framework_string_keys(request, context.domain)
             .await
             .into_iter()
             .find(|key| key.key == context.key)
