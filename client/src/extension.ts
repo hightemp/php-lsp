@@ -3,7 +3,10 @@ import * as os from "os";
 import * as fs from "fs";
 import type { ChildProcess } from "child_process";
 import { phpLspCacheDirForRoot } from "./cachePath";
-import { buildClientConfigurationSnapshot } from "./configuration";
+import {
+  buildClientConfigurationSnapshot,
+  selectStatusConfiguration,
+} from "./configuration";
 import {
   mergeIndexingStatus,
   phaseIcon,
@@ -83,6 +86,8 @@ interface ExtensionSnapshot {
   lastBinaryResolutionError?: string;
   lastStartError?: string;
   workspaceFolders: string[];
+  configurationScope: string;
+  configurationResource?: string;
   phpVersion: string;
   diagnosticsMode: string;
   composerEnabled: boolean;
@@ -134,6 +139,10 @@ class PhpLspStatusController implements Disposable {
     this.render();
   }
 
+  refresh(): void {
+    this.render();
+  }
+
   async showPopup(): Promise<void> {
     const snapshot = this.snapshotProvider();
     const status = this.status;
@@ -147,6 +156,12 @@ class PhpLspStatusController implements Disposable {
         label: "$(folder) Workspace",
         description: compactPath(status.root) ?? folderCountLabel(snapshot.workspaceFolders.length),
         detail: status.root ?? (snapshot.workspaceFolders.join("; ") || "No workspace folder"),
+      },
+      {
+        label: "$(settings-gear) Settings scope",
+        description: snapshot.configurationScope,
+        detail: snapshot.configurationResource
+          ?? "No active editor; showing client-wide workspace settings",
       },
       {
         label: "$(files) Indexed files",
@@ -270,6 +285,7 @@ function statusTooltip(status: IndexingStatus, snapshot: ExtensionSnapshot): Mar
     tooltip.appendMarkdown(`Symbols: ${formatCount(status.indexedSymbols)}\n\n`);
   }
   tooltip.appendMarkdown(`Diagnostics: ${snapshot.diagnosticsMode}\n\n`);
+  tooltip.appendMarkdown(`Settings scope: ${snapshot.configurationScope}\n\n`);
   if (status.truncated) {
     tooltip.appendMarkdown(
       `⚠️ Partial index: ${status.truncationReason ?? "traversal limit"}`
@@ -348,7 +364,24 @@ function formatterDetail(provider: string): string {
 }
 
 function getExtensionSnapshot(context: ExtensionContext): ExtensionSnapshot {
-  const config = workspace.getConfiguration("phpLsp");
+  const activeResource = window.activeTextEditor?.document.uri;
+  const activeWorkspaceFolder = activeResource
+    ? workspace.getWorkspaceFolder(activeResource)
+    : undefined;
+  const selectedConfiguration = selectStatusConfiguration(
+    workspace.getConfiguration("phpLsp", { languageId: "php" }),
+    activeResource
+      ? {
+        configuration: workspace.getConfiguration("phpLsp", {
+          uri: activeResource,
+          languageId: "php",
+        }),
+        resourceUri: activeResource.toString(),
+        workspaceFolderLabel: activeWorkspaceFolder?.name,
+      }
+      : undefined,
+  );
+  const config = selectedConfiguration.configuration;
   const binary = resolveServerBinary(context);
   if (binary.error) {
     lastBinaryResolutionError = binary.error;
@@ -367,6 +400,8 @@ function getExtensionSnapshot(context: ExtensionContext): ExtensionSnapshot {
     lastBinaryResolutionError,
     lastStartError,
     workspaceFolders: workspace.workspaceFolders?.map((folder) => folder.uri.fsPath) ?? [],
+    configurationScope: selectedConfiguration.scopeLabel,
+    configurationResource: selectedConfiguration.resourceUri,
     phpVersion: config.get<string>("phpVersion", "8.2"),
     diagnosticsMode: config.get<string>("diagnostics.mode", "basic-semantic"),
     composerEnabled: config.get<boolean>("composer.enabled", true),
@@ -1123,10 +1158,15 @@ export function activate(context: ExtensionContext): void {
     if (!event.affectsConfiguration("phpLsp")) {
       return;
     }
+    controller.refresh();
     await enqueueLanguageClientReconciliation(context, "configuration changed");
   });
   const workspaceFoldersSubscription = workspace.onDidChangeWorkspaceFolders(async () => {
+    controller.refresh();
     await enqueueLanguageClientReconciliation(context, "workspace folders changed");
+  });
+  const activeEditorSubscription = window.onDidChangeActiveTextEditor(() => {
+    controller.refresh();
   });
 
   context.subscriptions.push(
@@ -1137,6 +1177,7 @@ export function activate(context: ExtensionContext): void {
     showServerVersionCommand,
     enableConfigSubscription,
     workspaceFoldersSubscription,
+    activeEditorSubscription,
   );
 
   // Re-read configuration inside the lifecycle queue before starting.

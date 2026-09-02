@@ -27,6 +27,36 @@ export interface ClientConfigurationSnapshot {
   bundledStubsPath?: string;
 }
 
+export interface StatusConfigurationResource<TConfiguration> {
+  configuration: TConfiguration;
+  resourceUri: string;
+  workspaceFolderLabel?: string;
+}
+
+export interface StatusConfigurationSelection<TConfiguration> {
+  configuration: TConfiguration;
+  scopeLabel: string;
+  resourceUri?: string;
+}
+
+export function selectStatusConfiguration<TConfiguration>(
+  fallbackConfiguration: TConfiguration,
+  activeResource?: StatusConfigurationResource<TConfiguration>,
+): StatusConfigurationSelection<TConfiguration> {
+  if (!activeResource) {
+    return {
+      configuration: fallbackConfiguration,
+      scopeLabel: "workspace defaults",
+    };
+  }
+
+  return {
+    configuration: activeResource.configuration,
+    scopeLabel: activeResource.workspaceFolderLabel ?? "outside workspace fallback",
+    resourceUri: activeResource.resourceUri,
+  };
+}
+
 function hasExplicitValue(config: ConfigurationReader, key: string): boolean {
   const inspected = config.inspect<unknown>(key);
   return inspected !== undefined && (

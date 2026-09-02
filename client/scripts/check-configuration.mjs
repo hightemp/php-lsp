@@ -20,7 +20,11 @@ vm.runInNewContext(result.outputFiles[0].text, {
   filename: "configuration.bundle.cjs",
 });
 
-const { buildClientConfigurationSnapshot, buildExplicitClientSettings } = module.exports;
+const {
+  buildClientConfigurationSnapshot,
+  buildExplicitClientSettings,
+  selectStatusConfiguration,
+} = module.exports;
 
 class FakeConfiguration {
   constructor(defaults = {}) {
@@ -129,3 +133,36 @@ assert.deepEqual(multiRoot, {
   ],
   bundledStubsPath: "/bundled/stubs",
 });
+
+const fallbackStatusConfiguration = { name: "fallback" };
+const rootAStatusConfiguration = { name: "root-a" };
+assert.deepEqual(
+  JSON.parse(JSON.stringify(selectStatusConfiguration(fallbackStatusConfiguration))),
+  {
+    configuration: fallbackStatusConfiguration,
+    scopeLabel: "workspace defaults",
+  },
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(selectStatusConfiguration(fallbackStatusConfiguration, {
+    configuration: rootAStatusConfiguration,
+    resourceUri: "file:///workspace/a/Subject.php",
+    workspaceFolderLabel: "root-a",
+  }))),
+  {
+    configuration: rootAStatusConfiguration,
+    scopeLabel: "root-a",
+    resourceUri: "file:///workspace/a/Subject.php",
+  },
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(selectStatusConfiguration(fallbackStatusConfiguration, {
+    configuration: fallbackStatusConfiguration,
+    resourceUri: "file:///outside/Subject.php",
+  }))),
+  {
+    configuration: fallbackStatusConfiguration,
+    scopeLabel: "outside workspace fallback",
+    resourceUri: "file:///outside/Subject.php",
+  },
+);
