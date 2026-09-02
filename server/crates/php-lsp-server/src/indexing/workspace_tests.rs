@@ -561,3 +561,67 @@ async fn feature_alias_discovery_covers_project_config_and_vendor_composer_links
     std::fs::remove_dir_all(root).expect("remove workspace");
     std::fs::remove_dir_all(external).expect("remove external files");
 }
+
+#[test]
+fn client_only_runtime_fallback_preserves_resource_scoped_settings() {
+    let root_a = PathBuf::from("/workspace/root-a");
+    let root_b = PathBuf::from("/workspace/root-b");
+    let payload = serde_json::json!({
+        "configurationVersion": 2,
+        "global": {
+            "phpVersion": "8.1",
+            "diagnosticsMode": "basic-semantic"
+        },
+        "workspaceFolders": [
+            {
+                "uri": php_lsp_types::uri::path_to_uri(&root_a).unwrap(),
+                "settings": {
+                    "phpVersion": "7.4",
+                    "diagnosticsMode": "off"
+                }
+            },
+            {
+                "uri": php_lsp_types::uri::path_to_uri(&root_b).unwrap(),
+                "settings": {
+                    "phpVersion": "8.3",
+                    "indexVendor": false
+                }
+            }
+        ]
+    });
+
+    let loaded = load_client_only_workspace_runtime(
+        &[root_a.clone(), root_b.clone()],
+        &payload,
+        vec!["configuration load timed out".to_string()],
+    );
+    let config_a = loaded
+        .configs
+        .iter()
+        .find(|config| config.workspace_folder == root_a)
+        .expect("root A fallback config");
+    let config_b = loaded
+        .configs
+        .iter()
+        .find(|config| config.workspace_folder == root_b)
+        .expect("root B fallback config");
+
+    assert_eq!(
+        loaded.fallback.php_version,
+        PhpVersion::parse("8.1").unwrap()
+    );
+    assert_eq!(
+        config_a.runtime_config.php_version,
+        PhpVersion::parse("7.4").unwrap()
+    );
+    assert_eq!(
+        config_a.runtime_config.diagnostics_mode,
+        DiagnosticsMode::Off
+    );
+    assert_eq!(
+        config_b.runtime_config.php_version,
+        PhpVersion::parse("8.3").unwrap()
+    );
+    assert!(!config_b.runtime_config.index_vendor);
+    assert_eq!(loaded.messages, vec!["configuration load timed out"]);
+}

@@ -3,6 +3,116 @@ mod support;
 use support::*;
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_multi_root_import_quick_fixes_do_not_use_other_root_symbols() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    let root_a = "file:///tmp/php-lsp-code-action-root-a";
+    let root_b = "file:///tmp/php-lsp-code-action-root-b";
+    let file_a = "file:///tmp/php-lsp-code-action-root-a/Use.php";
+    let file_b = "file:///tmp/php-lsp-code-action-root-b/OnlyB.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_workspace_folders_and_options(
+            1,
+            vec![("root-a", root_a), ("root-b", root_b)],
+            Some(json!({
+                "configurationVersion": 2,
+                "global": { "composerEnabled": false, "stubExtensions": [] },
+                "workspaceFolders": [
+                    { "uri": root_a, "settings": {} },
+                    { "uri": root_b, "settings": {} }
+                ]
+            })),
+        ))
+        .await
+        .unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            file_b,
+            "<?php\nnamespace Vendor;\nclass RootBOnly {}\nfunction root_b_helper(): void {}\nconst ROOT_B_CONST = 1;\n",
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            file_a,
+            "<?php\nnamespace App;\nnew RootBOnly();\nroot_b_helper();\necho ROOT_B_CONST;\n",
+        ))
+        .await
+        .unwrap();
+
+    let diagnostics = json!([
+        {
+            "range": {
+                "start": { "line": 2, "character": 4 },
+                "end": { "line": 2, "character": 13 }
+            },
+            "severity": 2,
+            "source": "php-lsp",
+            "message": "Unknown class: App\\RootBOnly"
+        },
+        {
+            "range": {
+                "start": { "line": 3, "character": 0 },
+                "end": { "line": 3, "character": 13 }
+            },
+            "severity": 2,
+            "source": "php-lsp",
+            "message": "Unknown function: App\\root_b_helper"
+        },
+        {
+            "range": {
+                "start": { "line": 4, "character": 5 },
+                "end": { "line": 4, "character": 17 }
+            },
+            "severity": 2,
+            "source": "php-lsp",
+            "message": "Unknown constant: App\\ROOT_B_CONST"
+        }
+    ]);
+    let result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(code_action_request(2, file_a, 2, 0, 4, 17, diagnostics))
+            .await
+            .unwrap(),
+    );
+    let import_titles = result
+        .as_array()
+        .expect("code actions")
+        .iter()
+        .filter_map(|action| action.get("title").and_then(serde_json::Value::as_str))
+        .filter(|title| title.starts_with("Import "))
+        .collect::<Vec<_>>();
+    assert!(
+        import_titles.is_empty(),
+        "root A must not offer imports for symbols indexed only in root B: {result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_code_action_add_use_for_unknown_class_and_function() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

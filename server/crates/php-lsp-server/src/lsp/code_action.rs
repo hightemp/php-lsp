@@ -6216,8 +6216,7 @@ impl PhpLspBackend {
             let unresolved_short = short_name(&unresolved_fqn);
 
             let mut candidates: Vec<std::sync::Arc<php_lsp_types::SymbolInfo>> = match import_kind {
-                ImportKind::Class => self
-                    .index
+                ImportKind::Class => request_index
                     .types
                     .iter()
                     .filter(|entry| {
@@ -6228,8 +6227,7 @@ impl PhpLspBackend {
                     })
                     .map(|entry| entry.value().clone())
                     .collect(),
-                ImportKind::Function => self
-                    .index
+                ImportKind::Function => request_index
                     .functions
                     .iter()
                     .filter(|entry| {
@@ -6240,8 +6238,7 @@ impl PhpLspBackend {
                     })
                     .map(|entry| entry.value().clone())
                     .collect(),
-                ImportKind::Constant => self
-                    .index
+                ImportKind::Constant => request_index
                     .constants
                     .iter()
                     .filter(|entry| {

@@ -1290,6 +1290,34 @@ pub(crate) fn load_workspace_runtime(
     }
 }
 
+fn load_client_only_workspace_runtime(
+    workspace_roots: &[PathBuf],
+    raw_client_settings: &serde_json::Value,
+    messages: Vec<String>,
+) -> LoadedWorkspaceRuntime {
+    let client_snapshot = ClientConfigurationSnapshot::from_value(raw_client_settings);
+    let fallback =
+        ResolvedRuntimeConfiguration::from_settings(&client_snapshot.fallback_settings());
+    let configs = workspace_roots
+        .iter()
+        .map(|workspace_folder| WorkspaceRootConfig {
+            workspace_folder: workspace_folder.clone(),
+            root: workspace_folder.clone(),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration::from_settings(
+                &client_snapshot.settings_for_workspace_folder(workspace_folder),
+            ),
+            index: Arc::new(WorkspaceIndex::new()),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        })
+        .collect();
+    LoadedWorkspaceRuntime {
+        fallback,
+        configs: dedup_workspace_configs(configs),
+        messages,
+    }
+}
+
 pub(in crate::server) async fn load_workspace_runtime_blocking(
     workspace_roots: Vec<PathBuf>,
     client_settings: serde_json::Value,
@@ -1305,25 +1333,7 @@ pub(in crate::server) async fn load_workspace_runtime_blocking(
     {
         Ok(runtime) => runtime,
         Err(message) => {
-            let snapshot = ClientConfigurationSnapshot::from_value(&fallback_settings);
-            let fallback =
-                ResolvedRuntimeConfiguration::from_settings(&snapshot.fallback_settings());
-            let configs = fallback_roots
-                .into_iter()
-                .map(|root| WorkspaceRootConfig {
-                    workspace_folder: root.clone(),
-                    root,
-                    namespace_map: None,
-                    runtime_config: fallback.clone(),
-                    index: Arc::new(WorkspaceIndex::new()),
-                    vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
-                })
-                .collect();
-            LoadedWorkspaceRuntime {
-                fallback,
-                configs,
-                messages: vec![message],
-            }
+            load_client_only_workspace_runtime(&fallback_roots, &fallback_settings, vec![message])
         }
     }
 }

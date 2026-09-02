@@ -954,24 +954,51 @@ class Foo {
 
     let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
     let backend = service.inner();
-    parse_and_index_php_file(&backend.index, uri, code);
+    let index = Arc::new(WorkspaceIndex::new());
+    parse_and_index_php_file(&index, uri, code);
+    let workspace = WorkspaceRootConfig {
+        workspace_folder: PathBuf::from("/"),
+        root: PathBuf::from("/"),
+        namespace_map: None,
+        runtime_config: ResolvedRuntimeConfiguration::default(),
+        index: index.clone(),
+        vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+    };
+    let request = WorkspaceRequestContext {
+        state: Arc::new(WorkspaceRuntimeState {
+            fallback: ResolvedRuntimeConfiguration::default(),
+            fallback_index: Arc::new(WorkspaceIndex::new()),
+            configs: vec![workspace.clone()],
+            generation: 1,
+        }),
+        workspace: Some(workspace),
+    };
 
-    let non_lazy_method = backend
-        .resolve_fqn_with_fallback("App\\Foo::stateready", RefKind::MethodCall, false)
-        .expect("non-lazy method lookup should ignore ASCII case");
+    let non_lazy_method =
+        resolve_fqn_with_ref_kind(&index, "App\\Foo::stateready", RefKind::MethodCall, false)
+            .expect("non-lazy method lookup should ignore ASCII case");
     assert_eq!(
         (non_lazy_method.kind, non_lazy_method.name.as_str()),
         (php_lsp_types::PhpSymbolKind::Method, "stateReady"),
         "non-lazy method lookup must skip same-named properties"
     );
     assert!(
-        backend
-            .resolve_fqn_with_fallback("App\\Foo::stateready", RefKind::ClassConstant, false,)
-            .is_none(),
+        resolve_fqn_with_ref_kind(
+            &index,
+            "App\\Foo::stateready",
+            RefKind::ClassConstant,
+            false,
+        )
+        .is_none(),
         "non-lazy method lookup must not satisfy class constant lookup"
     );
     let lazy_method = backend
-        .resolve_fqn_lazy_with_fallback("App\\Foo::stateready", RefKind::MethodCall, false)
+        .resolve_fqn_lazy_with_fallback_in_request(
+            &request,
+            "App\\Foo::stateready",
+            RefKind::MethodCall,
+            false,
+        )
         .await
         .expect("method lookup should ignore ASCII case");
     assert_eq!(
@@ -981,14 +1008,19 @@ class Foo {
     );
     assert!(
         backend
-            .resolve_fqn_lazy_with_fallback("App\\Foo::stateready", RefKind::ClassConstant, false,)
+            .resolve_fqn_lazy_with_fallback_in_request(
+                &request,
+                "App\\Foo::stateready",
+                RefKind::ClassConstant,
+                false,
+            )
             .await
             .is_none(),
         "case-insensitive method lookup must not satisfy class constant lookup"
     );
     assert!(
         !lazy_resolved_symbol_diagnostic_is_satisfied(
-            &backend.index,
+            &index,
             "Unknown class constant: App\\Foo::stateready",
             "App\\Foo::stateready",
         ),
@@ -6682,20 +6714,28 @@ async fn test_outside_uri_uses_isolated_fallback_index() {
     let fallback_index = Arc::new(WorkspaceIndex::new());
     let root_symbol_uri = "file:///workspace/RootOnly.php";
     let fallback_symbol_uri = "phpstub://Core/Fallback.php";
-    root_index.update_file(
-        root_symbol_uri,
-        FileSymbols {
-            symbols: vec![make_symbol_for_uri(
+    let root_symbols = FileSymbols {
+        symbols: vec![
+            make_symbol_for_uri(
                 root_symbol_uri,
                 "RootOnly",
                 "RootOnly",
                 PhpSymbolKind::Class,
                 (0, 0, 0, 8),
                 None,
-            )],
-            ..Default::default()
-        },
-    );
+            ),
+            make_symbol_for_uri(
+                root_symbol_uri,
+                "workspaceOnly",
+                "RootOnly::workspaceOnly",
+                PhpSymbolKind::Method,
+                (1, 0, 1, 13),
+                Some("RootOnly"),
+            ),
+        ],
+        ..Default::default()
+    };
+    root_index.update_file(root_symbol_uri, root_symbols.clone());
     fallback_index.update_file(
         fallback_symbol_uri,
         FileSymbols {
@@ -6712,6 +6752,7 @@ async fn test_outside_uri_uses_isolated_fallback_index() {
     );
     let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
     let backend = service.inner();
+    backend.index.update_file(root_symbol_uri, root_symbols);
     *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
         fallback: ResolvedRuntimeConfiguration::default(),
         fallback_index: fallback_index.clone(),
@@ -6732,6 +6773,15 @@ async fn test_outside_uri_uses_isolated_fallback_index() {
     assert!(Arc::ptr_eq(&index, &fallback_index));
     assert!(index.resolve_fqn("FallbackOnly").is_some());
     assert!(index.resolve_fqn("RootOnly").is_none());
+    let vendor_context = backend.vendor_lazy_index_context_from_request(&request);
+    assert!(Arc::ptr_eq(&vendor_context.index, &fallback_index));
+    assert!(
+        backend
+            .resolve_fqn_lazy_in_request(&request, "RootOnly::workspaceOnly")
+            .await
+            .is_none(),
+        "outside-workspace lazy member resolution must not use the workspace aggregate index"
+    );
 }
 
 #[tokio::test]

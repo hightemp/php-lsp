@@ -1315,7 +1315,7 @@ impl PhpLspBackend {
             };
         }
         VendorLazyIndexContext {
-            index: self.index.clone(),
+            index: request.state.fallback_index.clone(),
             workspace_configs: Vec::new(),
             exclude_paths: request.state.fallback.exclude_paths.clone(),
             traversal_limits: request.state.fallback.traversal_limits,
@@ -1401,44 +1401,12 @@ impl PhpLspBackend {
         index.resolve_fqn(fqn)
     }
 
-    #[cfg(test)]
-    async fn resolve_fqn_lazy_matching_kinds(
-        &self,
-        fqn: &str,
-        expected_kinds: &[php_lsp_types::PhpSymbolKind],
-    ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
-        if let Some(sym) = self.index.resolve_fqn_matching_kinds(fqn, expected_kinds) {
-            return Some(sym);
-        }
-
-        let class_fqn = fqn.rsplit_once("::").map_or(fqn, |(class, _)| class);
-        self.lazy_index_class_dependencies(class_fqn).await;
-
-        self.index.resolve_fqn_matching_kinds(fqn, expected_kinds)
-    }
-
-    #[cfg(test)]
-    async fn resolve_member_lazy_matching_kinds(
-        &self,
-        fqn: &str,
-        expected_kinds: &[php_lsp_types::PhpSymbolKind],
-    ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
-        let context = self.vendor_lazy_index_context().await;
-        resolve_member_stable_with_context(&context, fqn, Some(expected_kinds)).await
-    }
-
     /// Lazy-index a single class FQN by finding its file via PSR-4/vendor mappings.
     /// Returns true only when the requested class is present in the index after loading.
     #[cfg(test)]
     pub(in crate::server) async fn lazy_index_class(&self, class_fqn: &str) -> bool {
         let context = self.vendor_lazy_index_context().await;
         lazy_index_class_with_context(&context, class_fqn).await
-    }
-
-    #[cfg(test)]
-    pub(in crate::server) async fn lazy_index_class_dependencies(&self, class_fqn: &str) {
-        let context = self.vendor_lazy_index_context().await;
-        lazy_index_class_dependencies_with_context(&context, class_fqn).await;
     }
 
     pub(in crate::server) async fn lazy_index_class_dependencies_in_request(
@@ -1448,17 +1416,6 @@ impl PhpLspBackend {
     ) {
         let context = self.vendor_lazy_index_context_from_request(request);
         lazy_index_class_dependencies_with_context(&context, class_fqn).await;
-    }
-
-    /// Resolve symbol from index with fallback for global built-ins.
-    #[cfg(test)]
-    pub(in crate::server) fn resolve_fqn_with_fallback(
-        &self,
-        fqn: &str,
-        ref_kind: RefKind,
-        allow_global_fallback: bool,
-    ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
-        resolve_fqn_with_ref_kind(&self.index, fqn, ref_kind, allow_global_fallback)
     }
 
     /// Fallback for `$this->prop->member()` when the declared property type
@@ -1543,43 +1500,6 @@ impl PhpLspBackend {
             }
         }
 
-        None
-    }
-
-    /// Resolve a symbol lazily, applying PHP's global function/constant
-    /// fallback only when the original source name permits it.
-    #[cfg(test)]
-    pub(in crate::server) async fn resolve_fqn_lazy_with_fallback(
-        &self,
-        fqn: &str,
-        ref_kind: RefKind,
-        allow_global_fallback: bool,
-    ) -> Option<std::sync::Arc<php_lsp_types::SymbolInfo>> {
-        if let Some(expected_kinds) = member_kinds_for_ref_kind(ref_kind) {
-            return self
-                .resolve_member_lazy_matching_kinds(fqn, expected_kinds)
-                .await;
-        }
-
-        let expected_kinds = top_level_kinds_for_ref_kind(ref_kind)?;
-        if let Some(sym) = self
-            .resolve_fqn_lazy_matching_kinds(fqn, expected_kinds)
-            .await
-        {
-            return Some(sym);
-        }
-        if allow_global_fallback
-            && (ref_kind == RefKind::FunctionCall || ref_kind == RefKind::GlobalConstant)
-        {
-            if let Some((_, short_name)) = fqn.rsplit_once('\\') {
-                if let Some(sym) = self
-                    .resolve_fqn_lazy_matching_kinds(short_name, expected_kinds)
-                    .await
-                {
-                    return Some(sym);
-                }
-            }
-        }
         None
     }
 

@@ -361,8 +361,10 @@ scope barrier.
 
 ### CODEX-P1-06. Конфигурации multi-root workspace смешиваются глобально
 
-> **Статус 2026-08-27:** исправлено. Находка сохранена как историческое
-> обоснование изменения.
+> **Статус 2026-09-02:** исправлено после повторной проверки. Находка сохранена
+> как историческое обоснование изменения; дополнительно закрыты aggregate-index
+> утечки import quick-fix и outside-workspace member resolution, а аварийный
+> fallback конфигурационного I/O сохраняет настройки каждого workspace folder.
 
 [`load_effective_configuration_settings`](../server/crates/php-lsp-server/src/indexing/workspace.rs#L915)
 последовательно объединяет project config всех workspace roots в один JSON.
@@ -409,10 +411,16 @@ snapshot отдельно для каждой workspace folder.
   читается только из настроенного для этого root дерева;
 - side effects конфигурации заменяют/reindex только изменившийся root и не
   удаляют nested workspace при снятии родительской папки;
+- import quick-fix ищет классы, функции и константы только в request-owned
+  index, а lazy member resolution вне workspace использует изолированный
+  fallback index вместо workspace-wide aggregate;
+- при timeout/error загрузки project/global config client-only fallback
+  продолжает применять отдельные resource-scoped настройки каждого root;
 - добавлены unit/client/E2E regressions на PHP version/diagnostics runtime
   update, одинаковые FQN/stub URI, includePaths, formatter commands, command
-  trust, Composer selection, nested/shared effective roots и vendor/stub
-  visibility.
+  trust, Composer selection, nested/shared effective roots, vendor/stub
+  visibility, cross-root import candidates, outside member resolution и
+  конфигурационный fallback.
 
 ### CODEX-P1-07. Auto formatter может исполнять код недоверенного workspace
 
