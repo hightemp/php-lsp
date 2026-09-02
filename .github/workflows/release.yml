@@ -196,6 +196,10 @@ jobs:
         working-directory: client
         run: npm ci
 
+      - name: Audit client runtime dependencies
+        working-directory: client
+        run: npm run check:runtime-dependencies
+
       - name: Build client
         working-directory: client
         run: npm run build

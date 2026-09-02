@@ -252,6 +252,10 @@ symlink, и не ведёт набор посещённых каталогов:
 
 ### CODEX-P1-03. Уязвимые npm-зависимости входят в extension bundle
 
+> **Статус 2026-09-02:** исправлено. При сохранении VS Code 1.82 и
+> `vscode-languageclient 9.0.1` lockfile обновлён до `minimatch 5.1.9` и
+> `brace-expansion 2.1.4`; runtime-аудит добавлен в CI и release-сборку.
+
 `npm audit --omit=dev` обнаружил две high transitive vulnerabilities:
 
 | Пакет | Версия | Проблема |

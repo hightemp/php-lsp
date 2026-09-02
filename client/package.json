@@ -413,6 +413,7 @@
     "vscode:prepublish": "npm run prepare:package && npm run build",
     "build": "node esbuild.mjs --production",
     "watch": "node esbuild.mjs --watch",
+    "check:runtime-dependencies": "npm audit --omit=dev",
     "check:cache-path": "node scripts/check-cache-path.mjs",
     "check:configuration": "node scripts/check-configuration.mjs",
     "check:indexing-status": "node scripts/check-indexing-status.mjs",
