@@ -1777,3 +1777,56 @@ fn test_recursive_type_alias_falls_back_to_raw_alias() {
         Some(TypeInfo::Simple("A".to_string()))
     );
 }
+
+#[test]
+fn staged_aggregate_replacement_requires_unchanged_source_revisions() {
+    let source = Arc::new(WorkspaceIndex::new());
+    source.update_file(
+        "file:///source.php",
+        FileSymbols {
+            symbols: vec![make_class("Before", "Before", "file:///source.php")],
+            ..Default::default()
+        },
+    );
+    let destination = WorkspaceIndex::new();
+    destination.update_file(
+        "file:///current.php",
+        FileSymbols {
+            symbols: vec![make_class("Current", "Current", "file:///current.php")],
+            ..Default::default()
+        },
+    );
+    let staged = WorkspaceIndex::new();
+    staged.update_file(
+        "file:///staged.php",
+        FileSymbols {
+            symbols: vec![make_class("Staged", "Staged", "file:///staged.php")],
+            ..Default::default()
+        },
+    );
+    let expected = source.revision_snapshot();
+
+    source.update_file(
+        "file:///source.php",
+        FileSymbols {
+            symbols: vec![make_class("After", "After", "file:///source.php")],
+            ..Default::default()
+        },
+    );
+    assert!(!destination.replace_from_staged_if_sources_current(
+        &staged,
+        std::slice::from_ref(&source),
+        &[expected],
+    ));
+    assert!(destination.resolve_fqn("Current").is_some());
+    assert!(destination.resolve_fqn("Staged").is_none());
+
+    let current = source.revision_snapshot();
+    assert!(destination.replace_from_staged_if_sources_current(
+        &staged,
+        std::slice::from_ref(&source),
+        &[current],
+    ));
+    assert!(destination.resolve_fqn("Current").is_none());
+    assert!(destination.resolve_fqn("Staged").is_some());
+}

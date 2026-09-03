@@ -1075,3 +1075,472 @@ async fn test_external_symlink_is_indexed_and_physical_watch_event_updates_logic
         .unwrap();
     fs::remove_dir_all(tmp).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_repeated_composer_reindex_only_publishes_latest_ready_run() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-reindex-generation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let src = tmp.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let composer = tmp.join("composer.json");
+    let composer_source = r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#;
+    fs::write(&composer, composer_source).unwrap();
+    for index in 0..256 {
+        fs::write(
+            src.join(format!("Subject{index:03}.php")),
+            format!("<?php namespace App; class Subject{index:03} {{}}\n"),
+        )
+        .unwrap();
+    }
+    let root_uri = path_to_uri(&tmp).unwrap();
+    let composer_uri = path_to_uri(&composer).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
+
+    fs::write(&composer, composer_source).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &composer_uri,
+            2,
+        )]))
+        .await
+        .unwrap();
+    let first =
+        next_indexing_status_for_phase(&mut notifications, "discovering", Duration::from_secs(5))
+            .await;
+
+    fs::write(&composer, composer_source).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &composer_uri,
+            2,
+        )]))
+        .await
+        .unwrap();
+    let second =
+        next_indexing_status_for_phase(&mut notifications, "discovering", Duration::from_secs(5))
+            .await;
+    let first_run = first["indexingRunId"].as_u64().expect("first run id");
+    let second_run = second["indexingRunId"].as_u64().expect("second run id");
+    assert!(second_run > first_run);
+    assert_eq!(
+        second["workspaceFolder"].as_str(),
+        Some(tmp.to_string_lossy().as_ref())
+    );
+
+    let ready =
+        next_indexing_status_for_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
+    assert_eq!(ready["indexingRunId"].as_u64(), Some(second_run));
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(999))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_removed_workspace_rejects_late_indexing_publication() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-removed-indexing-root-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+    for index in 0..256 {
+        fs::write(
+            tmp.join(format!("Removed{index:03}.php")),
+            format!("<?php class Removed{index:03} {{}}\n"),
+        )
+        .unwrap();
+    }
+    let root_uri = path_to_uri(&tmp).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_workspace_folders(
+            1,
+            vec![("removed", &root_uri)],
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    let discovering =
+        next_indexing_status_for_phase(&mut notifications, "discovering", Duration::from_secs(5))
+            .await;
+    let removed_run = discovering["indexingRunId"]
+        .as_u64()
+        .expect("removed workspace run id");
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_workspace_folders_notification(
+            Vec::new(),
+            vec![("removed", &root_uri)],
+        ))
+        .await
+        .unwrap();
+    let symbols = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(workspace_symbol_request(10, "Removed"))
+            .await
+            .unwrap(),
+    );
+    assert!(workspace_symbol_names(&symbols).is_empty());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    while let Ok(Some(notification)) = tokio::time::timeout_at(deadline, notifications.recv()).await
+    {
+        if notification.method() != "phpLsp/indexingStatus" {
+            continue;
+        }
+        let params = notification.params().expect("indexing status params");
+        assert!(
+            params["phase"] != "ready" || params["indexingRunId"].as_u64() != Some(removed_run),
+            "removed workspace run published a late ready status: {params}"
+        );
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(999))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_reindexing_one_workspace_does_not_cancel_other_root_run() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-root-scoped-reindex-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let root_a = tmp.join("a");
+    let root_b = tmp.join("b");
+    let composer_source = r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#;
+    for root in [&root_a, &root_b] {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("composer.json"), composer_source).unwrap();
+        for index in 0..64 {
+            fs::write(
+                root.join(format!("src/Subject{index:03}.php")),
+                format!("<?php class Subject{index:03} {{}}\n"),
+            )
+            .unwrap();
+        }
+    }
+    let root_a_uri = path_to_uri(&root_a).unwrap();
+    let root_b_uri = path_to_uri(&root_b).unwrap();
+    let composer_a_uri = path_to_uri(&root_a.join("composer.json")).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_workspace_folders(
+            1,
+            vec![("a", &root_a_uri), ("b", &root_b_uri)],
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    let initial_a =
+        next_indexing_status_for_phase(&mut notifications, "discovering", Duration::from_secs(5))
+            .await;
+    let initial_b =
+        next_indexing_status_for_phase(&mut notifications, "discovering", Duration::from_secs(5))
+            .await;
+    assert_eq!(
+        initial_a["workspaceFolder"].as_str(),
+        Some(root_a.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        initial_b["workspaceFolder"].as_str(),
+        Some(root_b.to_string_lossy().as_ref())
+    );
+    let initial_a_run = initial_a["indexingRunId"].as_u64().unwrap();
+    let initial_b_run = initial_b["indexingRunId"].as_u64().unwrap();
+
+    fs::write(root_a.join("composer.json"), composer_source).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_watched_files_notification(vec![(
+            &composer_a_uri,
+            2,
+        )]))
+        .await
+        .unwrap();
+    let mut ready_runs = std::collections::HashMap::new();
+    let replacement_a = loop {
+        let notification = tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+            .await
+            .expect("timed out waiting for replacement root A run")
+            .expect("notification channel closed");
+        if notification.method() != "phpLsp/indexingStatus" {
+            continue;
+        }
+        let params = notification.params().cloned().unwrap();
+        if params["phase"] == "ready" {
+            ready_runs.insert(
+                params["workspaceFolder"].as_str().unwrap().to_string(),
+                params["indexingRunId"].as_u64().unwrap(),
+            );
+        }
+        if params["phase"] == "discovering"
+            && params["workspaceFolder"].as_str() == Some(root_a.to_string_lossy().as_ref())
+            && params["indexingRunId"].as_u64().unwrap_or_default() > initial_a_run
+        {
+            break params;
+        }
+    };
+    let replacement_a_run = replacement_a["indexingRunId"].as_u64().unwrap();
+    assert!(replacement_a_run > initial_a_run);
+
+    while ready_runs.len() < 2 {
+        let ready =
+            next_indexing_status_for_phase(&mut notifications, "ready", Duration::from_secs(10))
+                .await;
+        ready_runs.insert(
+            ready["workspaceFolder"].as_str().unwrap().to_string(),
+            ready["indexingRunId"].as_u64().unwrap(),
+        );
+    }
+    assert_eq!(
+        ready_runs.get(root_b.to_string_lossy().as_ref()),
+        Some(&initial_b_run)
+    );
+    assert_eq!(
+        ready_runs.get(root_a.to_string_lossy().as_ref()),
+        Some(&replacement_a_run)
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(999))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_initial_indexing_statuses_keep_run_fifo_order() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-indexing-status-order-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("Subject.php"), "<?php class Subject {}\n").unwrap();
+    let root_uri = path_to_uri(&tmp).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let mut phases = Vec::new();
+    let mut run_id = None;
+    while phases.last().map(String::as_str) != Some("ready") {
+        let notification = tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+            .await
+            .expect("timed out waiting for ordered indexing statuses")
+            .expect("notification channel closed");
+        if notification.method() != "phpLsp/indexingStatus" {
+            continue;
+        }
+        let params = notification.params().expect("indexing status params");
+        let Some(current_run) = params["indexingRunId"].as_u64() else {
+            continue;
+        };
+        if run_id.get_or_insert(current_run) != &current_run {
+            continue;
+        }
+        phases.push(params["phase"].as_str().unwrap().to_string());
+    }
+    let position = |phase: &str| {
+        phases
+            .iter()
+            .position(|candidate| candidate == phase)
+            .unwrap()
+    };
+    assert!(position("discovering") < position("loadingStubs"));
+    assert!(position("loadingStubs") < position("stubsLoaded"));
+    assert!(position("stubsLoaded") < position("indexing"));
+    assert!(position("indexing") < position("ready"));
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(999))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_shutdown_cancels_active_indexing_without_late_ready() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-indexing-shutdown-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+    for index in 0..512 {
+        fs::write(
+            tmp.join(format!("Subject{index:03}.php")),
+            format!("<?php class Subject{index:03} {{}}\n"),
+        )
+        .unwrap();
+    }
+    let root_uri = path_to_uri(&tmp).unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(1, Some(&root_uri), None))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    let discovering =
+        next_indexing_status_for_phase(&mut notifications, "discovering", Duration::from_secs(5))
+            .await;
+    let run_id = discovering["indexingRunId"].as_u64().unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    while let Ok(Some(notification)) = tokio::time::timeout_at(deadline, notifications.recv()).await
+    {
+        if notification.method() != "phpLsp/indexingStatus" {
+            continue;
+        }
+        let params = notification.params().expect("indexing status params");
+        assert!(
+            params["phase"] != "ready" || params["indexingRunId"].as_u64() != Some(run_id),
+            "shutdown run published a late ready status: {params}"
+        );
+    }
+    fs::remove_dir_all(tmp).unwrap();
+}

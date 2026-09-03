@@ -360,6 +360,14 @@ async fn test_blade_template_reports_safe_mapped_expression_diagnostics() {
         .ready()
         .await
         .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+    service
+        .ready()
+        .await
+        .unwrap()
         .call(did_open_notification(&php_uri, php_code))
         .await
         .unwrap();
@@ -1743,9 +1751,36 @@ final class DataRequestController
         .call(initialized_notification())
         .await
         .unwrap();
-    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
-    let refreshed_diagnostics =
-        next_publish_diagnostics(&mut notifications, &twig_uri, Duration::from_secs(2)).await;
+    let started = std::time::Instant::now();
+    let mut indexing_ready = false;
+    let mut refreshed_diagnostics = None;
+    while !indexing_ready || refreshed_diagnostics.is_none() {
+        let remaining = Duration::from_secs(5)
+            .checked_sub(started.elapsed())
+            .expect("timed out waiting for ready and refreshed Twig diagnostics");
+        let notification = tokio::time::timeout(remaining, notifications.recv())
+            .await
+            .expect("timed out waiting for ready and refreshed Twig diagnostics")
+            .expect("notification channel closed");
+        if notification.method() == "phpLsp/indexingStatus"
+            && notification
+                .params()
+                .and_then(|params| params.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                == Some("ready")
+        {
+            indexing_ready = true;
+        } else if notification.method() == "textDocument/publishDiagnostics"
+            && notification
+                .params()
+                .and_then(|params| params.get("uri"))
+                .and_then(serde_json::Value::as_str)
+                == Some(twig_uri.as_str())
+        {
+            refreshed_diagnostics = notification.params().cloned();
+        }
+    }
+    let refreshed_diagnostics = refreshed_diagnostics.expect("refreshed Twig diagnostics");
     assert_eq!(
         refreshed_diagnostics["diagnostics"]
             .as_array()

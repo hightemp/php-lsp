@@ -417,6 +417,153 @@ fn delayed_workspace_disk_index_never_overwrites_an_unsaved_open_document() {
 }
 
 #[test]
+fn superseded_workspace_run_cannot_restore_removed_symbols() {
+    let root = PathBuf::from("/workspace/a");
+    let uri = "file:///workspace/a/Stale.php";
+    let open_files = DashMap::new();
+    let template_documents = DashMap::new();
+    let document_versions = DashMap::new();
+    let index = WorkspaceIndex::new();
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let old_guard = coordinator.start(root.clone());
+    let old_run = old_guard.lease();
+    let (_, stale_symbols, stale_references) =
+        parsed_document(uri, "<?php function staleName(): void {}");
+
+    let new_guard = coordinator.start(root);
+    new_guard
+        .lease()
+        .commit_if_current(|| index.remove_file(uri))
+        .expect("new run owns the index");
+    assert!(old_run
+        .commit_if_current(|| {
+            commit_workspace_disk_file_preserving_open(
+                DiskPhpIndexCommitContext {
+                    open_files: &open_files,
+                    template_documents: &template_documents,
+                    document_versions: &document_versions,
+                    index: &index,
+                    root_index: None,
+                    uri_str: uri,
+                },
+                stale_symbols,
+                stale_references,
+            );
+        })
+        .is_none());
+
+    assert!(indexed_symbol_names(&index, uri).is_empty());
+}
+
+#[test]
+fn superseded_initial_run_cannot_publish_staged_stubs() {
+    let root = PathBuf::from("/workspace/a");
+    let live = WorkspaceIndex::new();
+    let staged = WorkspaceIndex::new();
+    let uri = "phpstub://Core/Stale.php";
+    let (_, stale_symbols, stale_references) =
+        parsed_document(uri, "<?php function stale_builtin(): void {}");
+    staged.update_file_with_references(uri, stale_symbols, stale_references);
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let old = coordinator.start(root.clone());
+    let old_run = old.lease();
+    let _new = coordinator.start(root);
+
+    assert!(!commit_staged_stubs(&old_run, &staged, &live));
+    assert!(live.resolve_fqn("stale_builtin").is_none());
+}
+
+#[test]
+fn superseded_run_cannot_publish_prepared_aggregate_snapshot() {
+    let root = PathBuf::from("/workspace/a");
+    let current_uri = "file:///workspace/a/Current.php";
+    let stale_uri = "file:///workspace/a/Stale.php";
+    let live = WorkspaceIndex::new();
+    let staged = WorkspaceIndex::new();
+    let (_, current_symbols, current_references) =
+        parsed_document(current_uri, "<?php class Current {}");
+    live.update_file_with_references(current_uri, current_symbols, current_references);
+    let (_, stale_symbols, stale_references) = parsed_document(stale_uri, "<?php class Stale {}");
+    staged.update_file_with_references(stale_uri, stale_symbols, stale_references);
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let old = coordinator.start(root.clone());
+    let old_run = old.lease();
+    let revision = coordinator.aggregate_source_revision();
+
+    let _new = coordinator.start(root);
+    assert!(coordinator
+        .commit_aggregate_if_current(std::slice::from_ref(&old_run), revision, || {
+            live.replace_from_staged_if_sources_current(&staged, &[], &[]);
+        })
+        .is_none());
+    assert!(live.resolve_fqn("Current").is_some());
+    assert!(live.resolve_fqn("Stale").is_none());
+}
+
+#[test]
+fn aggregate_snapshot_is_rejected_when_another_root_changes_during_staging() {
+    let root_a = PathBuf::from("/workspace/a");
+    let root_b = PathBuf::from("/workspace/b");
+    let current_uri = "file:///workspace/b/Current.php";
+    let stale_uri = "file:///workspace/b/Stale.php";
+    let live = WorkspaceIndex::new();
+    let staged = WorkspaceIndex::new();
+    let (_, current_symbols, current_references) =
+        parsed_document(current_uri, "<?php class Current {}");
+    live.update_file_with_references(current_uri, current_symbols, current_references);
+    let (_, stale_symbols, stale_references) = parsed_document(stale_uri, "<?php class Stale {}");
+    staged.update_file_with_references(stale_uri, stale_symbols, stale_references);
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let guard_a = coordinator.start(root_a);
+    let guard_b = coordinator.start(root_b);
+    let run_a = guard_a.lease();
+    let run_b = guard_b.lease();
+    let revision_before_staging = coordinator.aggregate_source_revision();
+
+    run_b
+        .commit_index_if_current(|| {})
+        .expect("root B mutation must commit");
+    assert!(coordinator
+        .commit_aggregate_if_current(
+            std::slice::from_ref(&run_a),
+            revision_before_staging,
+            || live.replace_from_staged_if_sources_current(&staged, &[], &[]),
+        )
+        .is_none());
+    assert!(live.resolve_fqn("Current").is_some());
+    assert!(live.resolve_fqn("Stale").is_none());
+}
+
+#[tokio::test]
+async fn superseded_vendor_preload_cannot_publish_staged_file() {
+    let root = PathBuf::from("/workspace/a");
+    let uri = "file:///workspace/a/vendor/package/Stale.php";
+    let live_index = WorkspaceIndex::new();
+    let staged_index = WorkspaceIndex::new();
+    let (_, symbols, references) = parsed_document(uri, "<?php namespace Vendor; class Stale {}");
+    staged_index.update_file_with_references(uri, symbols, references);
+    let lru = Arc::new(Mutex::new(VendorFileLru::default()));
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let old = coordinator.start(root.clone());
+    let old_run = old.lease();
+    let _new = coordinator.start(root);
+
+    assert!(
+        !commit_staged_vendor_file(
+            &live_index,
+            &lru,
+            &staged_index,
+            uri.to_string(),
+            true,
+            Some(&old_run),
+            Some(&coordinator),
+        )
+        .await
+    );
+    assert!(live_index.resolve_fqn("Vendor\\Stale").is_none());
+}
+
+#[test]
 fn project_traversal_limits_can_only_reduce_the_trusted_baseline() {
     let mut settings = serde_json::json!({
         "indexingMaxFiles": 0,

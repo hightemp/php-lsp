@@ -1,6 +1,7 @@
 //! Vendor indexing helpers.
 
 use crate::util::fs_walk::{merge_physical_file_groups, walk_files, TraversalStopReason};
+use crate::util::uri::path_to_uri;
 
 use super::super::*;
 
@@ -161,12 +162,15 @@ pub(in crate::server) struct VendorLazyIndexContext {
     pub(in crate::server) load_epoch: Arc<tokio::sync::RwLock<u64>>,
     pub(in crate::server) external_symlinks: Option<Arc<ExternalSymlinkManager>>,
     pub(in crate::server) runtime_generation: u64,
+    pub(in crate::server) indexing_run: Option<IndexingRunLease>,
+    pub(in crate::server) indexing_runs: Option<Arc<IndexingRunCoordinator>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VendorLoadKey {
     index_identity: usize,
     epoch: u64,
+    indexing_run_id: Option<u64>,
     class_fqn: String,
 }
 
@@ -265,6 +269,7 @@ fn vendor_load_key(context: &VendorLazyIndexContext, class_fqn: &str, epoch: u64
     VendorLoadKey {
         index_identity: Arc::as_ptr(&context.index) as usize,
         epoch,
+        indexing_run_id: context.indexing_run.as_ref().map(IndexingRunLease::run_id),
         class_fqn: class_fqn.trim_start_matches('\\').to_ascii_lowercase(),
     }
 }
@@ -346,6 +351,13 @@ async fn index_class_uncached_with_context(
     context: &VendorLazyIndexContext,
     class_fqn: &str,
 ) -> Option<php_lsp_index::workspace::CommittedTypeSnapshot> {
+    if context
+        .indexing_run
+        .as_ref()
+        .is_some_and(|run| !run.is_current())
+    {
+        return None;
+    }
     let requested_class_fqn = class_fqn.trim_start_matches('\\');
     if let Some(snapshot) = context.index.get_committed_type(requested_class_fqn) {
         return Some(snapshot);
@@ -379,6 +391,7 @@ async fn index_class_uncached_with_context(
                         let runtime_generation = context.runtime_generation;
                         let aliases = vendor_resolution.symlink_aliases.clone();
                         let physical_files = vendor_resolution.physical_files.clone();
+                        let indexing_run = context.indexing_run.clone();
                         tokio::spawn(async move {
                             external_symlinks
                                 .publish_additional_aliases(
@@ -387,6 +400,7 @@ async fn index_class_uncached_with_context(
                                     runtime_generation,
                                     aliases,
                                     physical_files,
+                                    indexing_run.as_ref(),
                                 )
                                 .await;
                         });
@@ -400,6 +414,13 @@ async fn index_class_uncached_with_context(
         context.lazy_loads.run_after_path_resolution_hook().await;
 
         for path in &all_paths {
+            if context
+                .indexing_run
+                .as_ref()
+                .is_some_and(|run| !run.is_current())
+            {
+                return None;
+            }
             let abs = if path.is_absolute() {
                 path.clone()
             } else {
@@ -420,15 +441,31 @@ async fn index_class_uncached_with_context(
                 )
             });
             if let Some(cache_config) = vendor_cache_config.as_ref() {
+                let staged_index = Arc::new(WorkspaceIndex::new());
                 if load_cached_vendor_file_blocking(
-                    context.index.clone(),
+                    staged_index.clone(),
                     config.root.clone(),
                     abs.clone(),
                     cache_config.clone(),
                 )
                 .await
                 {
-                    touch_vendor_file_lru(&context.index, &context.vendor_file_lru, &abs).await;
+                    let Ok(uri) = path_to_uri(&abs) else {
+                        continue;
+                    };
+                    if !commit_staged_vendor_file(
+                        &context.index,
+                        &context.vendor_file_lru,
+                        &staged_index,
+                        uri,
+                        true,
+                        context.indexing_run.as_ref(),
+                        context.indexing_runs.as_deref(),
+                    )
+                    .await
+                    {
+                        return None;
+                    }
                     tracing::debug!("Lazy-indexed vendor file from cache: {}", abs.display());
                     if let Some(snapshot) = context.index.get_committed_type(requested_class_fqn) {
                         return Some(snapshot);
@@ -442,26 +479,50 @@ async fn index_class_uncached_with_context(
                 }
             }
 
+            let staged_index = Arc::new(WorkspaceIndex::new());
             if parse_and_index_php_file_blocking(
-                context.index.clone(),
+                staged_index.clone(),
                 abs.clone(),
                 "lazy PHP file index",
             )
             .await
             {
-                if is_vendor_file {
-                    touch_vendor_file_lru(&context.index, &context.vendor_file_lru, &abs).await;
+                let Ok(uri) = path_to_uri(&abs) else {
+                    continue;
+                };
+                if !commit_staged_vendor_file(
+                    &context.index,
+                    &context.vendor_file_lru,
+                    &staged_index,
+                    uri,
+                    is_vendor_file,
+                    context.indexing_run.as_ref(),
+                    context.indexing_runs.as_deref(),
+                )
+                .await
+                {
+                    return None;
                 }
                 tracing::debug!("Lazy-indexed file: {}", abs.display());
                 if let Some(snapshot) = context.index.get_committed_type(requested_class_fqn) {
                     if is_vendor_file {
                         if let Some(cache_config) = vendor_cache_config {
-                            save_vendor_index_cache_blocking(
-                                context.index.clone(),
-                                config.root.clone(),
-                                cache_config,
-                            )
-                            .await;
+                            if let Some(run) = context.indexing_run.as_ref() {
+                                save_vendor_index_cache_for_run_blocking(
+                                    context.index.clone(),
+                                    config.root.clone(),
+                                    cache_config,
+                                    run,
+                                )
+                                .await;
+                            } else {
+                                save_vendor_index_cache_blocking(
+                                    context.index.clone(),
+                                    config.root.clone(),
+                                    cache_config,
+                                )
+                                .await;
+                            }
                         }
                     }
                     return Some(snapshot);
@@ -1312,6 +1373,8 @@ impl PhpLspBackend {
                 load_epoch: self.vendor_load_epoch.clone(),
                 external_symlinks: Some(self.external_symlinks.clone()),
                 runtime_generation: request.state.generation,
+                indexing_run: None,
+                indexing_runs: Some(self.indexing_run.clone()),
             };
         }
         VendorLazyIndexContext {
@@ -1327,6 +1390,8 @@ impl PhpLspBackend {
             load_epoch: self.vendor_load_epoch.clone(),
             external_symlinks: Some(self.external_symlinks.clone()),
             runtime_generation: request.state.generation,
+            indexing_run: None,
+            indexing_runs: Some(self.indexing_run.clone()),
         }
     }
 

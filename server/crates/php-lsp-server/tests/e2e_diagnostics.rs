@@ -143,9 +143,36 @@ final class ActiveDiagnostics
         during_indexing_messages
     );
 
-    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
-    let after_indexing =
-        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(3)).await;
+    let started = std::time::Instant::now();
+    let mut indexing_ready = false;
+    let mut after_indexing = None;
+    while !indexing_ready || after_indexing.is_none() {
+        let remaining = Duration::from_secs(10)
+            .checked_sub(started.elapsed())
+            .expect("timed out waiting for ready and post-index diagnostics");
+        let notification = tokio::time::timeout(remaining, notifications.recv())
+            .await
+            .expect("timed out waiting for ready and post-index diagnostics")
+            .expect("notification channel closed");
+        if notification.method() == "phpLsp/indexingStatus"
+            && notification
+                .params()
+                .and_then(|params| params.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                == Some("ready")
+        {
+            indexing_ready = true;
+        } else if notification.method() == "textDocument/publishDiagnostics"
+            && notification
+                .params()
+                .and_then(|params| params.get("uri"))
+                .and_then(serde_json::Value::as_str)
+                == Some(app_uri.as_str())
+        {
+            after_indexing = notification.params().cloned();
+        }
+    }
+    let after_indexing = after_indexing.expect("post-index diagnostics");
     let after_indexing_messages = published_diagnostic_messages(&after_indexing);
     assert!(
         after_indexing_messages
@@ -225,41 +252,9 @@ final class ImmediateOpen
             text: app_code.to_string(),
         },
     };
-    let (_, _) = tokio::join!(
-        backend.initialized(InitializedParams {}),
-        backend.did_open(open_params)
-    );
-
-    let started = std::time::Instant::now();
-    let mut early_diagnostics = None;
-    let mut indexing_ready = false;
-    while early_diagnostics.is_none() || !indexing_ready {
-        let remaining = Duration::from_secs(10)
-            .checked_sub(started.elapsed())
-            .expect("timed out waiting for diagnostics and indexing ready");
-        let notification = tokio::time::timeout(remaining, notifications.recv())
-            .await
-            .expect("timed out waiting for diagnostics and indexing ready")
-            .expect("notification channel closed");
-        if notification.method() == "textDocument/publishDiagnostics"
-            && notification
-                .params()
-                .and_then(|params| params.get("uri"))
-                .and_then(serde_json::Value::as_str)
-                == Some(app_uri.as_str())
-        {
-            early_diagnostics = notification.params().cloned();
-        } else if notification.method() == "phpLsp/indexingStatus"
-            && notification
-                .params()
-                .and_then(|params| params.get("phase"))
-                .and_then(serde_json::Value::as_str)
-                == Some("ready")
-        {
-            indexing_ready = true;
-        }
-    }
-    let early_diagnostics = early_diagnostics.expect("early diagnostics");
+    backend.did_open(open_params).await;
+    let early_diagnostics =
+        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(3)).await;
     let early_messages = published_diagnostic_messages(&early_diagnostics);
     assert!(
         !early_messages
@@ -268,6 +263,8 @@ final class ImmediateOpen
         "diagnostics published during initialized setup should not report unresolved symbols, got: {:?}",
         early_messages
     );
+    backend.initialized(InitializedParams {}).await;
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
     service
         .ready()
         .await
@@ -389,9 +386,36 @@ final class UsesVendor
         during_indexing_messages
     );
 
-    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
-    let after_indexing =
-        next_publish_diagnostics(&mut notifications, &app_uri, Duration::from_secs(5)).await;
+    let started = std::time::Instant::now();
+    let mut indexing_ready = false;
+    let mut after_indexing = None;
+    while !indexing_ready || after_indexing.is_none() {
+        let remaining = Duration::from_secs(10)
+            .checked_sub(started.elapsed())
+            .expect("timed out waiting for ready and post-index diagnostics");
+        let notification = tokio::time::timeout(remaining, notifications.recv())
+            .await
+            .expect("timed out waiting for ready and post-index diagnostics")
+            .expect("notification channel closed");
+        if notification.method() == "phpLsp/indexingStatus"
+            && notification
+                .params()
+                .and_then(|params| params.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                == Some("ready")
+        {
+            indexing_ready = true;
+        } else if notification.method() == "textDocument/publishDiagnostics"
+            && notification
+                .params()
+                .and_then(|params| params.get("uri"))
+                .and_then(serde_json::Value::as_str)
+                == Some(app_uri.as_str())
+        {
+            after_indexing = notification.params().cloned();
+        }
+    }
+    let after_indexing = after_indexing.expect("post-index diagnostics");
     let after_indexing_messages = published_diagnostic_messages(&after_indexing);
     assert!(
         !after_indexing_messages

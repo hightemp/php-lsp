@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
 };
 
@@ -151,6 +151,18 @@ pub struct WorkspaceIndex {
 
     /// Monotonic source for file symbol snapshot generations.
     next_file_symbol_generation: AtomicU64,
+
+    /// File writers share this barrier; aggregate publication briefly takes it exclusively.
+    mutation_barrier: RwLock<()>,
+
+    /// Monotonic whole-index revision for staged aggregate validation.
+    mutation_revision: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceIndexRevision {
+    identity: usize,
+    revision: u64,
 }
 
 impl WorkspaceIndex {
@@ -165,6 +177,8 @@ impl WorkspaceIndex {
             direct_members_by_parent: DashMap::new(),
             file_update_generations: DashMap::new(),
             next_file_symbol_generation: AtomicU64::new(1),
+            mutation_barrier: RwLock::new(()),
+            mutation_revision: AtomicU64::new(0),
         }
     }
 
@@ -202,6 +216,30 @@ impl WorkspaceIndex {
     }
 
     fn update_file_with_references_with_hooks<F, G>(
+        &self,
+        uri: &str,
+        file_symbols: FileSymbols,
+        file_references: Vec<SymbolReference>,
+        before_top_level_publish: F,
+        before_direct_member_publish: G,
+    ) where
+        F: FnOnce(),
+        G: FnOnce(),
+    {
+        let _mutation = self
+            .mutation_barrier
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.update_file_with_references_unguarded(
+            uri,
+            file_symbols,
+            file_references,
+            before_top_level_publish,
+            before_direct_member_publish,
+        );
+    }
+
+    fn update_file_with_references_unguarded<F, G>(
         &self,
         uri: &str,
         file_symbols: FileSymbols,
@@ -286,10 +324,19 @@ impl WorkspaceIndex {
             );
         }
         *generation_guard = generation;
+        self.mutation_revision.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Remove all symbols from a file.
     pub fn remove_file(&self, uri: &str) {
+        let _mutation = self
+            .mutation_barrier
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.remove_file_unguarded(uri);
+    }
+
+    fn remove_file_unguarded(&self, uri: &str) {
         match self.file_update_generations.entry(uri.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 let direct_member_parents = self.remove_file_snapshot(uri);
@@ -302,6 +349,72 @@ impl WorkspaceIndex {
                 drop(entry);
             }
         }
+        self.mutation_revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn revision_snapshot(&self) -> WorkspaceIndexRevision {
+        WorkspaceIndexRevision {
+            identity: self as *const Self as usize,
+            revision: self.mutation_revision.load(Ordering::SeqCst),
+        }
+    }
+
+    pub fn replace_from_staged_if_sources_current(
+        &self,
+        staged: &WorkspaceIndex,
+        source_indexes: &[Arc<WorkspaceIndex>],
+        expected_revisions: &[WorkspaceIndexRevision],
+    ) -> bool {
+        let staged_files = staged
+            .file_symbols
+            .iter()
+            .map(|entry| {
+                let uri = entry.key().clone();
+                let references = staged
+                    .file_references
+                    .get(&uri)
+                    .map(|references| references.value().clone())
+                    .unwrap_or_default();
+                (uri, entry.value().as_ref().clone(), references)
+            })
+            .collect::<Vec<_>>();
+
+        let mut indexes = source_indexes
+            .iter()
+            .map(Arc::as_ref)
+            .chain(std::iter::once(self))
+            .collect::<Vec<_>>();
+        indexes.sort_by_key(|index| *index as *const Self as usize);
+        indexes.dedup_by_key(|index| *index as *const Self as usize);
+        let _guards = indexes
+            .iter()
+            .map(|index| {
+                index
+                    .mutation_barrier
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect::<Vec<_>>();
+
+        if source_indexes.iter().any(|index| {
+            let actual = index.revision_snapshot();
+            !expected_revisions.contains(&actual)
+        }) {
+            return false;
+        }
+
+        let destination_uris = self
+            .file_symbols
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for uri in destination_uris {
+            self.remove_file_unguarded(&uri);
+        }
+        for (uri, symbols, references) in staged_files {
+            self.update_file_with_references_unguarded(&uri, symbols, references, || {}, || {});
+        }
+        true
     }
 
     fn remove_file_snapshot(&self, uri: &str) -> HashSet<String> {

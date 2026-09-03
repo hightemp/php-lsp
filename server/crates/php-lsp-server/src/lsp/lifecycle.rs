@@ -75,6 +75,16 @@ impl PhpLspBackend {
         self.external_symlinks
             .set_active_workspaces(&active_workspaces, &[])
             .await;
+        let pending_runs = runtime_state
+            .configs
+            .iter()
+            .map(|config| PendingInitialIndexingRun {
+                workspace_folder: config.workspace_folder.clone(),
+                index: config.index.clone(),
+                guard: self.start_indexing_run(&config.workspace_folder),
+            })
+            .collect();
+        *self.pending_initial_indexing_runs.lock().await = pending_runs;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -193,6 +203,10 @@ impl PhpLspBackend {
 
     pub(crate) async fn lsp_shutdown(&self) -> Result<()> {
         tracing::info!("php-lsp: shutdown");
+        self.pending_initial_indexing_runs.lock().await.clear();
+        self.indexing_run.cancel_all();
+        self.indexing_status_publisher.shutdown().await;
+        self.diagnostics_publisher.shutdown().await;
         self.external_symlinks.shutdown().await;
         Ok(())
     }

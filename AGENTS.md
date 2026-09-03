@@ -87,6 +87,10 @@
   - Vendor autoload metadata cache, lazy vendor file LRU helpers, vendor path resolution, and lazy FQN/class/member indexing helpers.
 - `src/indexing/vendor_symlink_tests.rs`
   - Unix-specific regression coverage for lazy vendor PSR-4 physical deduplication, deterministic logical aliases, and future files under external symlink targets.
+- `src/indexing/run.rs`
+  - Per-workspace indexing run coordinator, monotonic run identities, cancellation ownership, RAII cleanup, and atomic latest-run commit leases.
+- `src/indexing/run_tests.rs`
+  - Deterministic lifecycle and race coverage for superseded commits, unwind/abort cleanup, root isolation, and guarded cache publication.
 - `src/indexing/symlinks.rs`
   - Generation-aware physical/logical symlink alias registry, external watcher capability lifecycle, dynamic LSP `RelativePattern` registration, and physical-to-logical watched-event routing.
 - `src/indexing/symlinks_tests.rs`
@@ -152,7 +156,10 @@
 - Keep traversal cancellation/deadline checks active while both processing paths and enumerating directory entries. The pending set must remain deterministically bounded by `indexing.maxEntries`; do not reintroduce an eager unbounded directory queue.
 - External watcher publications must match the exact active workspace generation. Preserve all logical aliases for each physical file, including targets located inside another/current workspace, plus removed-root tombstones, non-indexing generation promotion, nested-alias cleanup, register-before-unregister ordering, and pending failed unregister IDs.
 - Lazy vendor PSR-4 candidates and classmap results must publish the same physical file groups as workspace discovery; do not index one logical URI while routing watcher events to another alias. Feature-alias discovery must also cover project config and Composer metadata links outside the PHP source roots.
-- Every status notification emitted by a concrete indexing run must use `send_indexing_status_for_generation`; the client keeps partial state sticky within one generation and rejects older generations. Leave notifications unversioned only for global lifecycle/stub states that do not belong to a workspace indexing run.
+- Leave status notifications unversioned only for global lifecycle/stub states that are not owned by a concrete indexing run.
+- Register a replacement indexing run before clearing or rebuilding live state. Route workspace/cache/vendor/Twig/open-document/diagnostic commits through its `IndexingRunLease`; keep the owning guard alive through final post-processing and `ready` publication.
+- Concrete indexing status must use `IndexingStatusPublisher::publish_for_run`, carrying both runtime generation and per-workspace run identity. The client rejects superseded same-workspace updates even when runtime configuration did not change.
+- Build aggregate indexes in staging. Final publication must validate every contributing `WorkspaceIndex` revision and take its mutation barrier; never bypass `WorkspaceIndex::update_file_with_references`/`remove_file` by writing symbol tables directly.
 
 ### Security
 - Project `.php-lsp.toml` is not trusted to execute commands by default.

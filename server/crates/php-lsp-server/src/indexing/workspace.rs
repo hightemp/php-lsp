@@ -5,6 +5,15 @@ use crate::util::uri::path_to_uri;
 
 use super::super::*;
 
+fn commit_staged_stubs(
+    run: &IndexingRunLease,
+    staged: &WorkspaceIndex,
+    destination: &WorkspaceIndex,
+) -> bool {
+    run.commit_index_if_current(|| replace_stub_symbols_from(staged, destination))
+        .is_some()
+}
+
 struct RenamedOpenDocument {
     parser: FileParser,
     template: Option<TemplateDocument>,
@@ -170,6 +179,7 @@ impl PhpLspBackend {
         }
 
         if roots.is_empty() {
+            self.pending_initial_indexing_runs.lock().await.clear();
             tracing::warn!("No workspace root, skipping indexing");
             send_indexing_status(
                 &self.client,
@@ -201,12 +211,28 @@ impl PhpLspBackend {
         let effective_roots: Vec<PathBuf> =
             configs.iter().map(|config| config.root.clone()).collect();
         let runtime_state = self.runtime_state_snapshot().await;
-        let fallback_index = runtime_state.fallback_index.clone();
         let runtime_generation = runtime_state.generation;
-        let indexing_run_state = self.indexing_run.clone();
-        let mut indexing_tokens = Vec::with_capacity(configs.len());
+        let mut indexing_guards = Vec::with_capacity(configs.len());
+        let mut pending_initial_runs = {
+            let mut pending = self.pending_initial_indexing_runs.lock().await;
+            std::mem::take(&mut *pending)
+        };
         for config in &configs {
-            indexing_tokens.push(self.start_indexing_run(&config.workspace_folder).await);
+            let guard = pending_initial_runs
+                .iter()
+                .position(|pending| {
+                    pending.workspace_folder == config.workspace_folder
+                        && Arc::ptr_eq(&pending.index, &config.index)
+                        && pending.guard.lease().is_current()
+                })
+                .map(|position| pending_initial_runs.swap_remove(position).guard)
+                .unwrap_or_else(|| self.start_indexing_run(&config.workspace_folder));
+            self.indexing_status_publisher.publish_for_run(
+                &guard.lease(),
+                runtime_generation,
+                workspace_discovery_indexing_status(&config.root),
+            );
+            indexing_guards.push(guard);
         }
 
         if let Some(first_root) = effective_roots.first() {
@@ -216,52 +242,62 @@ impl PhpLspBackend {
             .iter()
             .find_map(|config| config.namespace_map.clone());
 
-        // Load phpstorm-stubs for built-in PHP functions/classes.
-        let stubs_root_label = configs
-            .first()
-            .map(|config| config.root.display().to_string())
-            .unwrap_or_default();
-
-        send_indexing_status(
-            &self.client,
-            serde_json::json!({
-                "phase": "loadingStubs",
-                "root": stubs_root_label,
-                "message": "Loading PHP stubs"
-            }),
-        )
-        .await;
-
-        let stub_configs = configs.clone();
+        // Load into per-root staging indexes, then publish only through the reserved run lease.
+        for (config, guard) in configs.iter().zip(&indexing_guards) {
+            self.indexing_status_publisher.publish_for_run(
+                &guard.lease(),
+                runtime_generation,
+                serde_json::json!({
+                    "phase": "loadingStubs",
+                    "root": config.root.display().to_string(),
+                    "message": "Loading PHP stubs"
+                }),
+            );
+        }
+        let stub_jobs = configs
+            .iter()
+            .zip(&indexing_guards)
+            .map(|(config, guard)| (config.clone(), guard.lease()))
+            .collect::<Vec<_>>();
         let loaded_stubs = tokio::task::spawn_blocking(move || {
-            stub_configs
-                .iter()
-                .map(|config| {
-                    remove_stub_symbols(&config.index);
-                    load_configured_stubs(
-                        &config.index,
+            stub_jobs
+                .into_iter()
+                .map(|(config, run)| {
+                    if !run.is_current() {
+                        return 0;
+                    }
+                    let staged = WorkspaceIndex::new();
+                    let loaded = load_configured_stubs(
+                        &staged,
                         &config.root,
                         config.runtime_config.stubs_path.clone(),
                         config.runtime_config.stub_extensions.clone(),
                         config.runtime_config.php_version,
                         false,
-                    )
+                    );
+                    if commit_staged_stubs(&run, &staged, &config.index) {
+                        loaded
+                    } else {
+                        0
+                    }
                 })
-                .sum::<usize>()
+                .collect::<Vec<_>>()
         })
         .await
-        .unwrap_or(0);
+        .unwrap_or_else(|_| vec![0; configs.len()]);
 
-        send_indexing_status(
-            &self.client,
-            serde_json::json!({
-                "phase": "stubsLoaded",
-                "root": stubs_root_label,
-                "message": format!("Loaded {} stub files", loaded_stubs),
-                "stubFiles": loaded_stubs
-            }),
-        )
-        .await;
+        for ((config, guard), loaded) in configs.iter().zip(&indexing_guards).zip(loaded_stubs) {
+            self.indexing_status_publisher.publish_for_run(
+                &guard.lease(),
+                runtime_generation,
+                serde_json::json!({
+                    "phase": "stubsLoaded",
+                    "root": config.root.display().to_string(),
+                    "message": format!("Loaded {} stub files", loaded),
+                    "stubFiles": loaded
+                }),
+            );
+        }
 
         let client = self.client.clone();
         let open_files = self.open_files.clone();
@@ -270,6 +306,7 @@ impl PhpLspBackend {
         let semantic_tokens_cache = self.semantic_tokens_cache.clone();
         let reindex_document_versions = self.document_versions.clone();
         let diagnostics_publisher = self.diagnostics_publisher.clone();
+        let indexing_status_publisher = self.indexing_status_publisher.clone();
         let reindex_index = self.index.clone();
         let vendor_autoload_cache = self.vendor_autoload_cache.clone();
         let vendor_lazy_loads = self.vendor_lazy_loads.clone();
@@ -280,9 +317,12 @@ impl PhpLspBackend {
         let external_symlinks = self.external_symlinks.clone();
         tokio::spawn(async move {
             let mut completed_configs = Vec::new();
-            let mut completed_tokens = Vec::new();
-            for (config, indexing_token) in configs.iter().zip(&indexing_tokens) {
-                if finish_indexing_run_if_cancelled(&indexing_run_state, indexing_token).await {
+            let mut completed_runs = Vec::new();
+            let mut completed_reports = Vec::new();
+            let mut completed_guards = Vec::new();
+            for (config, indexing_guard) in configs.iter().zip(indexing_guards) {
+                let indexing_run = indexing_guard.lease();
+                if !indexing_run.is_current() {
                     continue;
                 }
                 let runtime = &config.runtime_config;
@@ -301,8 +341,9 @@ impl PhpLspBackend {
                     ),
                     work_done_progress_supported,
                 };
-                if let Err(e) = index_workspace(
+                let indexing_report = match index_workspace(
                     &client,
+                    &indexing_status_publisher,
                     WorkspaceLiveIndexContext {
                         index: &config.index,
                         root_index: &config.index,
@@ -313,31 +354,32 @@ impl PhpLspBackend {
                     &config.root,
                     config.namespace_map.as_ref(),
                     &indexing_options,
-                    indexing_token,
+                    &indexing_run,
                     &external_symlinks,
-                    &config.workspace_folder,
                     runtime_generation,
                 )
                 .await
                 {
-                    tracing::error!("Background indexing failed: {}", e);
-                    send_indexing_status_for_generation(
-                        &client,
-                        runtime_generation,
-                        serde_json::json!({
-                            "phase": "error",
-                            "root": config.root.display().to_string(),
-                            "message": format!("Indexing failed: {}", e)
-                        }),
-                    )
-                    .await;
-                    client
-                        .log_message(MessageType::ERROR, format!("Indexing failed: {}", e))
-                        .await;
-                    finish_indexing_run_state(&indexing_run_state, indexing_token).await;
-                    continue;
-                }
-                if finish_indexing_run_if_cancelled(&indexing_run_state, indexing_token).await {
+                    Ok(Some(report)) => report,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!("Background indexing failed: {}", e);
+                        indexing_status_publisher.publish_for_run(
+                            &indexing_run,
+                            runtime_generation,
+                            serde_json::json!({
+                                "phase": "error",
+                                "root": config.root.display().to_string(),
+                                "message": format!("Indexing failed: {}", e)
+                            }),
+                        );
+                        client
+                            .log_message(MessageType::ERROR, format!("Indexing failed: {}", e))
+                            .await;
+                        continue;
+                    }
+                };
+                if !indexing_run.is_current() {
                     continue;
                 }
 
@@ -351,208 +393,52 @@ impl PhpLspBackend {
                         &vendor_autoload_cache,
                         &config.vendor_file_lru,
                         &vendor_load_epoch,
+                        Some(&indexing_run),
                     )
                     .await;
                 }
-                if !indexing_token.is_cancelled() {
-                    indexing_token.mark_indexing_complete();
+                if indexing_run.is_current() {
                     completed_configs.push(config.clone());
-                    completed_tokens.push(indexing_token.clone());
-                } else {
-                    finish_indexing_run_state(&indexing_run_state, indexing_token).await;
+                    completed_runs.push(indexing_run);
+                    completed_reports.push(indexing_report);
+                    completed_guards.push(indexing_guard);
                 }
             }
 
-            // Re-publish diagnostics for all open files now that the index is populated.
-            let current_state = runtime_state_handle.lock().await.clone();
-            let mut configs = Vec::new();
-            let mut post_tokens = Vec::new();
-            for (config, token) in completed_configs.into_iter().zip(completed_tokens) {
-                let is_current = current_state.configs.iter().any(|current| {
-                    current.workspace_folder == config.workspace_folder
-                        && Arc::ptr_eq(&current.index, &config.index)
-                });
-                if !token.is_cancelled() && is_current {
-                    configs.push(config);
-                    post_tokens.push(token);
-                } else {
-                    finish_indexing_run_state(&indexing_run_state, &token).await;
-                }
-            }
-            if configs.is_empty() {
-                return;
-            }
-
-            {
-                let _aggregate_rebuild = aggregate_rebuild.lock().await;
-                let aggregate = reindex_index.clone();
-                let rebuild_configs = current_state.configs.clone();
-                let rebuild_open_files = open_files.clone();
-                let rebuild_templates = template_documents.clone();
-                let rebuild_versions = reindex_document_versions.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    rebuild_aggregate_index(
-                        &aggregate,
-                        &rebuild_configs,
-                        &rebuild_open_files,
-                        &rebuild_templates,
-                        &rebuild_versions,
-                    );
-                })
-                .await;
-            }
-
-            let workspace_roots: Vec<PathBuf> =
-                configs.iter().map(|config| config.root.clone()).collect();
-            let active_workspace_folders: Vec<PathBuf> = configs
-                .iter()
-                .zip(&post_tokens)
-                .filter(|(_, token)| !token.is_cancelled())
-                .map(|(config, _)| config.workspace_folder.clone())
-                .collect();
-            {
-                let mut cache = twig_context_disk_cache.lock().await;
-                for config in &configs {
-                    cache.evict_index(&config.index);
-                }
-            }
-            let indexing_cancellations: Vec<WorkspaceIndexingCancellation> = configs
-                .iter()
-                .zip(&post_tokens)
-                .map(|(config, token)| WorkspaceIndexingCancellation {
-                    workspace_folder: config.workspace_folder.clone(),
-                    token: token.clone(),
-                })
-                .collect();
-            refresh_open_twig_contexts_for_state(OpenTwigContextRefreshState {
-                open_files: &open_files,
-                template_documents: &template_documents,
-                document_versions: &reindex_document_versions,
-                index: &reindex_index,
-                fallback_index: &fallback_index,
-                workspace_roots: &workspace_roots,
-                workspace_configs: &configs,
-                workspace_folders_filter: Some(&active_workspace_folders),
-                indexing_cancellations: &indexing_cancellations,
-                twig_context_disk_cache: &twig_context_disk_cache,
-                semantic_tokens_cache: &semantic_tokens_cache,
-            })
-            .await;
-            let open_file_uris: Vec<String> =
-                open_files.iter().map(|entry| entry.key().clone()).collect();
-            for uri_str in open_file_uris {
-                let Some(snapshot) = open_document_snapshot_from_state(
-                    &open_files,
-                    &template_documents,
-                    &reindex_document_versions,
-                    &uri_str,
-                ) else {
-                    continue;
-                };
-                let Some(config) = workspace_config_for_uri_from_configs(&configs, &uri_str) else {
-                    continue;
-                };
-                let Some(post_token) = configs
-                    .iter()
-                    .position(|candidate| candidate.workspace_folder == config.workspace_folder)
-                    .and_then(|position| post_tokens.get(position))
-                else {
-                    continue;
-                };
-                if post_token.is_cancelled() {
-                    continue;
-                }
-                commit_open_document_index_snapshot_if_current(
-                    OpenDocumentIndexCommitContext {
-                        open_files: &open_files,
-                        template_documents: &template_documents,
-                        document_versions: &reindex_document_versions,
-                        index: &reindex_index,
-                        root_index: Some(&config.index),
-                        uri_str: &uri_str,
+            let completed = completed_configs
+                .into_iter()
+                .zip(completed_runs)
+                .zip(completed_reports)
+                .zip(completed_guards)
+                .map(
+                    |(((expected_config, run), report), guard)| CompletedWorkspaceIndexingRun {
+                        expected_config,
+                        run,
+                        _guard: guard,
+                        report,
                     },
-                    &snapshot,
-                );
-                if let Ok(uri) = uri_str.parse::<Uri>() {
-                    let computation_sequence = diagnostics_publisher.start_computation(&uri_str);
-                    let runtime = &config.runtime_config;
-                    let diagnostics_config = DiagnosticsRuntimeConfig {
-                        mode: runtime.diagnostics_mode,
-                        severity: runtime.diagnostic_severity,
-                        budget: runtime.diagnostic_budget,
-                        php_version: runtime.php_version,
-                    };
-                    let vendor_lazy_context = VendorLazyIndexContext {
-                        index: config.index.clone(),
-                        workspace_configs: vec![config.clone()],
-                        exclude_paths: runtime.exclude_paths.clone(),
-                        traversal_limits: runtime.traversal_limits,
-                        php_version: runtime.php_version,
-                        index_vendor: runtime.index_vendor,
-                        vendor_autoload_cache: vendor_autoload_cache.clone(),
-                        vendor_file_lru: config.vendor_file_lru.clone(),
-                        lazy_loads: vendor_lazy_loads.clone(),
-                        load_epoch: vendor_load_epoch.clone(),
-                        external_symlinks: Some(external_symlinks.clone()),
-                        runtime_generation,
-                    };
-                    let document_state = snapshot.document_state;
-                    let version = document_state.map(|state| state.version);
-                    let template_document = snapshot.template_document.clone();
-                    if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
-                        && template_document.is_none()
-                        && runtime.index_vendor
-                    {
-                        preresolve_open_file_diagnostic_dependencies(
-                            &snapshot.tree,
-                            &snapshot.source,
-                            &snapshot.file_symbols,
-                            &vendor_lazy_context,
-                        )
-                        .await;
-                    }
-                    let mut diags = compute_source_diagnostics_blocking(
-                        uri_str.clone(),
-                        snapshot.source.clone(),
-                        config.index.clone(),
-                        diagnostics_config,
-                        version,
-                    )
-                    .await;
-                    if let Some(template) = &template_document {
-                        diags = template.map_diagnostics_to_original(
-                            diags,
-                            diagnostics_config.mode == DiagnosticsMode::Off,
-                        );
-                    } else if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
-                        && runtime.index_vendor
-                    {
-                        diags = filter_lazy_resolved_symbol_diagnostics_with_context(
-                            &config.index,
-                            &vendor_lazy_context,
-                            diags,
-                        )
-                        .await;
-                    }
-                    diagnostics_publisher.publish(DiagnosticPublishRequest {
-                        uri,
-                        diagnostics: diags,
-                        version,
-                        expected_state: document_state,
-                        expected_template: template_document,
-                        require_idle_index: diagnostics_config.mode
-                            == DiagnosticsMode::BasicSemantic,
-                        expected_runtime_generation: runtime_generation,
-                        indexing_workspace_folder: Some(config.workspace_folder.clone()),
-                        expected_runtime_config: runtime.clone(),
-                        expected_index: config.index.clone(),
-                        computation_sequence,
-                    });
-                }
-            }
-            for token in post_tokens {
-                finish_indexing_run_state(&indexing_run_state, &token).await;
-            }
+                )
+                .collect();
+            postprocess_workspace_indexing_runs(
+                WorkspaceIndexingPostprocessContext {
+                    open_files,
+                    template_documents,
+                    document_versions: reindex_document_versions,
+                    diagnostics_publisher,
+                    indexing_status_publisher,
+                    aggregate_index: reindex_index,
+                    aggregate_rebuild,
+                    runtime_state: runtime_state_handle,
+                    twig_context_disk_cache,
+                    semantic_tokens_cache,
+                    vendor_autoload_cache,
+                    vendor_lazy_loads,
+                    vendor_load_epoch,
+                    external_symlinks,
+                },
+                completed,
+            )
+            .await;
         });
     }
 
@@ -1744,24 +1630,6 @@ pub(in crate::server) async fn load_cached_vendor_file_blocking(
     }
 }
 
-pub(in crate::server) async fn touch_vendor_file_lru(
-    index: &WorkspaceIndex,
-    vendor_file_lru: &Arc<Mutex<VendorFileLru>>,
-    file_path: &Path,
-) {
-    let uri = match path_to_uri(file_path) {
-        Ok(uri) => uri,
-        Err(err) => {
-            tracing::debug!("{}", err);
-            return;
-        }
-    };
-    let evicted = vendor_file_lru.lock().await.touch(uri);
-    for uri in evicted {
-        index.remove_file(&uri);
-    }
-}
-
 pub(in crate::server) fn save_vendor_index_cache(
     index: &WorkspaceIndex,
     root: &Path,
@@ -1798,6 +1666,90 @@ pub(in crate::server) async fn save_vendor_index_cache_blocking(
     }
 }
 
+pub(in crate::server) async fn commit_staged_vendor_file(
+    index: &WorkspaceIndex,
+    vendor_file_lru: &Arc<Mutex<VendorFileLru>>,
+    staged_index: &WorkspaceIndex,
+    uri: String,
+    track_in_vendor_lru: bool,
+    indexing_run: Option<&IndexingRunLease>,
+    indexing_runs: Option<&IndexingRunCoordinator>,
+) -> bool {
+    let Some(file_symbols) = staged_index
+        .file_symbols
+        .get(&uri)
+        .map(|symbols| symbols.value().as_ref().clone())
+    else {
+        return false;
+    };
+    let references = staged_index
+        .file_references
+        .get(&uri)
+        .map(|references| references.value().clone())
+        .unwrap_or_default();
+    let mut lru = vendor_file_lru.lock().await;
+    let commit = || {
+        index.update_file_with_references(&uri, file_symbols, references);
+        if track_in_vendor_lru {
+            let evicted = lru.touch(uri);
+            for uri in evicted {
+                index.remove_file(&uri);
+            }
+        }
+    };
+    match indexing_run {
+        Some(run) => run.commit_index_if_current(commit).is_some(),
+        None if indexing_runs.is_some() => {
+            indexing_runs
+                .expect("checked indexing coordinator")
+                .commit_unleased_index_mutation(commit);
+            true
+        }
+        None => {
+            commit();
+            true
+        }
+    }
+}
+
+pub(in crate::server) async fn save_vendor_index_cache_for_run_blocking(
+    index: Arc<WorkspaceIndex>,
+    root: PathBuf,
+    config: IndexCacheConfig,
+    indexing_run: &IndexingRunLease,
+) {
+    let cache_path = cache::cache_file_path_for_namespace(&root, CacheNamespace::Vendor);
+    let cache_path_for_prepare = cache_path.clone();
+    let path_label = root.display().to_string();
+    let prepared = run_file_io_blocking("vendor cache prepare", path_label, move || {
+        let sources = indexed_vendor_cache_sources(&index, &root);
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        let cache_to_save = cache::build_cache_from_sources(&index, &root, &sources, &config);
+        cache::prepare_cache_write(&cache_path_for_prepare, &cache_to_save).map(Some)
+    })
+    .await;
+    match prepared {
+        Ok(Ok(Some(prepared))) => {
+            if let Some(Err(error)) = indexing_run.commit_if_current(|| prepared.commit()) {
+                tracing::warn!(
+                    "Failed to save vendor index cache at {}: {}",
+                    cache_path.display(),
+                    error
+                );
+            }
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => tracing::warn!(
+            "Failed to prepare vendor index cache at {}: {}",
+            cache_path.display(),
+            error
+        ),
+        Err(message) => tracing::warn!("{}", message),
+    }
+}
+
 pub(in crate::server) fn indexed_vendor_cache_sources(
     index: &WorkspaceIndex,
     root: &Path,
@@ -1830,6 +1782,7 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
     vendor_autoload_cache: &Arc<Mutex<VendorAutoloadCache>>,
     vendor_file_lru: &Arc<Mutex<VendorFileLru>>,
     load_epoch: &Arc<tokio::sync::RwLock<u64>>,
+    indexing_run: Option<&IndexingRunLease>,
 ) -> usize {
     let vendor_dir = root.join("vendor");
     if !vendor_dir.is_dir() {
@@ -1857,12 +1810,16 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
         vendor_index_cache_config(root, php_version, exclude_paths, traversal_limits);
     let mut loaded = 0;
     for file_path in entrypoint_files {
+        if indexing_run.is_some_and(|run| !run.is_current()) {
+            break;
+        }
         if !file_path.is_file() {
             continue;
         }
 
+        let staged_index = Arc::new(WorkspaceIndex::new());
         let from_cache = load_cached_vendor_file_blocking(
-            index.clone(),
+            staged_index.clone(),
             root.to_path_buf(),
             file_path.clone(),
             cache_config.clone(),
@@ -1870,19 +1827,44 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
         .await;
         if from_cache
             || parse_and_index_php_file_blocking(
-                index.clone(),
+                staged_index.clone(),
                 file_path.clone(),
                 "vendor preload PHP file index",
             )
             .await
         {
-            touch_vendor_file_lru(&index, vendor_file_lru, &file_path).await;
+            let Ok(uri) = path_to_uri(&file_path) else {
+                continue;
+            };
+            if !commit_staged_vendor_file(
+                &index,
+                vendor_file_lru,
+                &staged_index,
+                uri,
+                true,
+                indexing_run,
+                None,
+            )
+            .await
+            {
+                break;
+            }
             loaded += 1;
         }
     }
 
     if loaded > 0 {
-        save_vendor_index_cache_blocking(index, root.to_path_buf(), cache_config).await;
+        if let Some(indexing_run) = indexing_run {
+            save_vendor_index_cache_for_run_blocking(
+                index,
+                root.to_path_buf(),
+                cache_config,
+                indexing_run,
+            )
+            .await;
+        } else {
+            save_vendor_index_cache_blocking(index, root.to_path_buf(), cache_config).await;
+        }
         tracing::debug!(
             "Preloaded {} vendor autoload entrypoint file(s) for {}",
             loaded,
@@ -1892,41 +1874,380 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
     loaded
 }
 
+pub(in crate::server) struct WorkspaceIndexingReport {
+    ready_status: serde_json::Value,
+    started_at: Instant,
+}
+
+pub(in crate::server) struct CompletedWorkspaceIndexingRun {
+    pub(in crate::server) expected_config: WorkspaceRootConfig,
+    pub(in crate::server) run: IndexingRunLease,
+    pub(in crate::server) _guard: IndexingRunGuard,
+    pub(in crate::server) report: WorkspaceIndexingReport,
+}
+
+pub(in crate::server) struct WorkspaceIndexingPostprocessContext {
+    pub(in crate::server) open_files: Arc<DashMap<String, FileParser>>,
+    pub(in crate::server) template_documents: Arc<DashMap<String, TemplateDocument>>,
+    pub(in crate::server) document_versions: Arc<DashMap<String, OpenDocumentState>>,
+    pub(in crate::server) diagnostics_publisher: DiagnosticsPublisher,
+    pub(in crate::server) indexing_status_publisher: IndexingStatusPublisher,
+    pub(in crate::server) aggregate_index: Arc<WorkspaceIndex>,
+    pub(in crate::server) aggregate_rebuild: Arc<Mutex<()>>,
+    pub(in crate::server) runtime_state: Arc<Mutex<Arc<WorkspaceRuntimeState>>>,
+    pub(in crate::server) twig_context_disk_cache: Arc<Mutex<TwigContextDiskCache>>,
+    pub(in crate::server) semantic_tokens_cache: Arc<Mutex<SemanticTokensCache>>,
+    pub(in crate::server) vendor_autoload_cache: Arc<Mutex<VendorAutoloadCache>>,
+    pub(in crate::server) vendor_lazy_loads: Arc<VendorLazyLoadCoordinator>,
+    pub(in crate::server) vendor_load_epoch: Arc<tokio::sync::RwLock<u64>>,
+    pub(in crate::server) external_symlinks: Arc<ExternalSymlinkManager>,
+}
+
+fn current_completed_indexing_runs(
+    completed: Vec<CompletedWorkspaceIndexingRun>,
+    state: &WorkspaceRuntimeState,
+) -> Vec<CompletedWorkspaceIndexingRun> {
+    completed
+        .into_iter()
+        .filter_map(|mut completed| {
+            if !completed.run.is_current() {
+                return None;
+            }
+            let current = state.configs.iter().find(|current| {
+                current.workspace_folder == completed.expected_config.workspace_folder
+                    && Arc::ptr_eq(&current.index, &completed.expected_config.index)
+            })?;
+            completed.expected_config = current.clone();
+            Some(completed)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::server) async fn rebuild_aggregate_for_indexing_runs(
+    coordinator: &Arc<IndexingRunCoordinator>,
+    aggregate_rebuild: &Arc<Mutex<()>>,
+    aggregate_index: &Arc<WorkspaceIndex>,
+    configs: Vec<WorkspaceRootConfig>,
+    open_files: Arc<DashMap<String, FileParser>>,
+    template_documents: Arc<DashMap<String, TemplateDocument>>,
+    document_versions: Arc<DashMap<String, OpenDocumentState>>,
+    runs: &[IndexingRunLease],
+) -> bool {
+    let _aggregate_rebuild = aggregate_rebuild.lock().await;
+    if runs.iter().any(|run| !run.is_current()) {
+        return false;
+    }
+    let expected_source_revision = coordinator.aggregate_source_revision();
+    let mut source_indexes = configs
+        .iter()
+        .map(|config| config.index.clone())
+        .collect::<Vec<_>>();
+    source_indexes.sort_by_key(|index| Arc::as_ptr(index) as usize);
+    source_indexes.dedup_by(|left, right| Arc::ptr_eq(left, right));
+    let expected_index_revisions = source_indexes
+        .iter()
+        .map(|index| index.revision_snapshot())
+        .collect::<Vec<_>>();
+    let staged = Arc::new(WorkspaceIndex::new());
+    let staged_for_build = staged.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        rebuild_aggregate_index(
+            &staged_for_build,
+            &configs,
+            &open_files,
+            &template_documents,
+            &document_versions,
+        );
+    })
+    .await
+    .is_ok();
+    if !built {
+        return false;
+    }
+    let coordinator = coordinator.clone();
+    let runs = runs.to_vec();
+    let aggregate_index = aggregate_index.clone();
+    tokio::task::spawn_blocking(move || {
+        coordinator
+            .commit_aggregate_if_current(&runs, expected_source_revision, || {
+                aggregate_index.replace_from_staged_if_sources_current(
+                    &staged,
+                    &source_indexes,
+                    &expected_index_revisions,
+                )
+            })
+            .is_some_and(|committed| committed)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+pub(in crate::server) async fn postprocess_workspace_indexing_runs(
+    context: WorkspaceIndexingPostprocessContext,
+    completed: Vec<CompletedWorkspaceIndexingRun>,
+) {
+    let WorkspaceIndexingPostprocessContext {
+        open_files,
+        template_documents,
+        document_versions,
+        diagnostics_publisher,
+        indexing_status_publisher,
+        aggregate_index,
+        aggregate_rebuild,
+        runtime_state,
+        twig_context_disk_cache,
+        semantic_tokens_cache,
+        vendor_autoload_cache,
+        vendor_lazy_loads,
+        vendor_load_epoch,
+        external_symlinks,
+    } = context;
+
+    let state = runtime_state.lock().await.clone();
+    let completed = current_completed_indexing_runs(completed, &state);
+    if completed.is_empty() {
+        return;
+    }
+
+    let current_state = runtime_state.lock().await.clone();
+    let runs = completed
+        .iter()
+        .map(|completed| completed.run.clone())
+        .collect::<Vec<_>>();
+    if !rebuild_aggregate_for_indexing_runs(
+        &runs[0].coordinator(),
+        &aggregate_rebuild,
+        &aggregate_index,
+        current_state.configs.clone(),
+        open_files.clone(),
+        template_documents.clone(),
+        document_versions.clone(),
+        &runs,
+    )
+    .await
+    {
+        return;
+    }
+
+    let state = runtime_state.lock().await.clone();
+    let completed = current_completed_indexing_runs(completed, &state);
+    if completed.is_empty() {
+        return;
+    }
+    let runtime_generation = state.generation;
+    let workspace_roots = state
+        .configs
+        .iter()
+        .map(|config| config.root.clone())
+        .collect::<Vec<_>>();
+    let configs = completed
+        .iter()
+        .map(|completed| completed.expected_config.clone())
+        .collect::<Vec<_>>();
+    let runs = completed
+        .iter()
+        .map(|completed| completed.run.clone())
+        .collect::<Vec<_>>();
+    let workspace_folders = configs
+        .iter()
+        .map(|config| config.workspace_folder.clone())
+        .collect::<Vec<_>>();
+
+    {
+        let mut cache = twig_context_disk_cache.lock().await;
+        for (config, run) in configs.iter().zip(&runs) {
+            run.commit_if_current(|| {
+                cache.evict_index(&config.index);
+            });
+        }
+    }
+    refresh_open_twig_contexts_for_state(OpenTwigContextRefreshState {
+        open_files: &open_files,
+        template_documents: &template_documents,
+        document_versions: &document_versions,
+        index: &aggregate_index,
+        fallback_index: &state.fallback_index,
+        workspace_roots: &workspace_roots,
+        workspace_configs: &state.configs,
+        workspace_folders_filter: Some(&workspace_folders),
+        indexing_runs: &runs,
+        twig_context_disk_cache: &twig_context_disk_cache,
+        semantic_tokens_cache: &semantic_tokens_cache,
+    })
+    .await;
+
+    let open_file_uris = open_files
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    for uri_str in open_file_uris {
+        let Some(snapshot) = open_document_snapshot_from_state(
+            &open_files,
+            &template_documents,
+            &document_versions,
+            &uri_str,
+        ) else {
+            continue;
+        };
+        let Some(config) = workspace_config_for_uri_from_configs(&configs, &uri_str) else {
+            continue;
+        };
+        let Some(completed_run) = completed
+            .iter()
+            .find(|completed| completed.run.workspace_folder() == config.workspace_folder)
+        else {
+            continue;
+        };
+        let run = &completed_run.run;
+        if !run.is_current() {
+            continue;
+        }
+        let committed = run
+            .commit_index_if_current(|| {
+                commit_open_document_index_snapshot_if_current(
+                    OpenDocumentIndexCommitContext {
+                        open_files: &open_files,
+                        template_documents: &template_documents,
+                        document_versions: &document_versions,
+                        index: &aggregate_index,
+                        root_index: Some(&config.index),
+                        uri_str: &uri_str,
+                    },
+                    &snapshot,
+                )
+            })
+            .unwrap_or(false);
+        if !committed {
+            continue;
+        }
+        let Ok(uri) = uri_str.parse::<Uri>() else {
+            continue;
+        };
+        let Some(computation_sequence) =
+            run.commit_if_current(|| diagnostics_publisher.start_computation(&uri_str))
+        else {
+            continue;
+        };
+        let runtime = &config.runtime_config;
+        let diagnostics_config = DiagnosticsRuntimeConfig {
+            mode: runtime.diagnostics_mode,
+            severity: runtime.diagnostic_severity,
+            budget: runtime.diagnostic_budget,
+            php_version: runtime.php_version,
+        };
+        let vendor_lazy_context = VendorLazyIndexContext {
+            index: config.index.clone(),
+            workspace_configs: vec![config.clone()],
+            exclude_paths: runtime.exclude_paths.clone(),
+            traversal_limits: runtime.traversal_limits,
+            php_version: runtime.php_version,
+            index_vendor: runtime.index_vendor,
+            vendor_autoload_cache: vendor_autoload_cache.clone(),
+            vendor_file_lru: config.vendor_file_lru.clone(),
+            lazy_loads: vendor_lazy_loads.clone(),
+            load_epoch: vendor_load_epoch.clone(),
+            external_symlinks: Some(external_symlinks.clone()),
+            runtime_generation,
+            indexing_run: Some(run.clone()),
+            indexing_runs: Some(run.coordinator()),
+        };
+        let document_state = snapshot.document_state;
+        let version = document_state.map(|state| state.version);
+        let template_document = snapshot.template_document.clone();
+        if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+            && template_document.is_none()
+            && runtime.index_vendor
+        {
+            preresolve_open_file_diagnostic_dependencies(
+                &snapshot.tree,
+                &snapshot.source,
+                &snapshot.file_symbols,
+                &vendor_lazy_context,
+            )
+            .await;
+            if !run.is_current() {
+                continue;
+            }
+        }
+        let mut diagnostics = compute_source_diagnostics_blocking(
+            uri_str.clone(),
+            snapshot.source.clone(),
+            config.index.clone(),
+            diagnostics_config,
+            version,
+        )
+        .await;
+        if !run.is_current() {
+            continue;
+        }
+        if let Some(template) = &template_document {
+            diagnostics = template.map_diagnostics_to_original(
+                diagnostics,
+                diagnostics_config.mode == DiagnosticsMode::Off,
+            );
+        } else if diagnostics_config.mode == DiagnosticsMode::BasicSemantic && runtime.index_vendor
+        {
+            diagnostics = filter_lazy_resolved_symbol_diagnostics_with_context(
+                &config.index,
+                &vendor_lazy_context,
+                diagnostics,
+            )
+            .await;
+            if !run.is_current() {
+                continue;
+            }
+        }
+        let publish = DiagnosticPublishRequest {
+            uri,
+            diagnostics,
+            version,
+            expected_state: document_state,
+            expected_template: template_document,
+            require_idle_index: false,
+            expected_runtime_generation: runtime_generation,
+            indexing_workspace_folder: Some(config.workspace_folder.clone()),
+            expected_indexing_run: Some(run.identity()),
+            expected_runtime_config: runtime.clone(),
+            expected_index: config.index.clone(),
+            computation_sequence,
+        };
+        run.commit_if_current(|| diagnostics_publisher.publish(publish));
+    }
+
+    for completed in completed {
+        let mut ready_status = completed.report.ready_status;
+        if let Some(status) = ready_status.as_object_mut() {
+            status.insert(
+                "elapsedMs".to_string(),
+                serde_json::Value::from(elapsed_ms(completed.report.started_at)),
+            );
+        }
+        indexing_status_publisher.publish_for_run(&completed.run, runtime_generation, ready_status);
+    }
+}
+
 /// Background workspace indexing.
 ///
 /// Scans PHP files in the workspace and adds their symbols to the index.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::server) async fn index_workspace(
     client: &Client,
+    indexing_status_publisher: &IndexingStatusPublisher,
     live: WorkspaceLiveIndexContext<'_>,
     root: &Path,
     namespace_map: Option<&NamespaceMap>,
     options: &WorkspaceIndexingOptions,
-    cancellation: &OperationCancellationToken,
+    indexing_run: &IndexingRunLease,
     external_symlinks: &Arc<ExternalSymlinkManager>,
-    workspace_folder: &Path,
     runtime_generation: u64,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<Option<WorkspaceIndexingReport>, String> {
     let root_label = root.display().to_string();
     let started_at = Instant::now();
-    if cancellation.is_cancelled() {
+    if !indexing_run.is_current() {
         tracing::debug!("Workspace indexing cancelled before start: {}", root_label);
-        return Ok(());
+        return Ok(None);
     }
-
-    send_indexing_status_for_generation(
-        client,
-        runtime_generation,
-        serde_json::json!({
-            "phase": "discovering",
-            "root": root_label,
-            "message": "Discovering PHP files",
-            "indexedFiles": 0,
-            "indexedSymbols": 0,
-            "percentage": 0
-        }),
-    )
-    .await;
 
     // Create progress token
     let progress_token = ProgressToken::String(format!("php-lsp-indexing-{}", root.display()));
@@ -1966,7 +2287,7 @@ pub(in crate::server) async fn index_workspace(
         options.exclude_paths.clone(),
         explicit_files,
         options.traversal_limits,
-        cancellation.clone(),
+        indexing_run.token().clone(),
     )
     .await?;
     if php_discovery.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
@@ -1976,20 +2297,20 @@ pub(in crate::server) async fn index_workspace(
             root.display()
         ));
     }
-    if cancellation.is_cancelled() {
+    if !indexing_run.is_current() {
         tracing::debug!(
             "Workspace indexing cancelled after discovery: {}",
             root_label
         );
-        return Ok(());
+        return Ok(None);
     }
     let mut watcher_aliases = php_discovery.symlink_aliases.clone();
     match collect_feature_symlink_aliases_blocking(
         root.to_path_buf(),
-        workspace_folder.to_path_buf(),
+        indexing_run.workspace_folder().to_path_buf(),
         options.exclude_paths.clone(),
         options.traversal_limits,
-        cancellation.clone(),
+        indexing_run.token().clone(),
     )
     .await
     {
@@ -2006,16 +2327,16 @@ pub(in crate::server) async fn index_workspace(
         }
         Err(message) => tracing::warn!("{}", message),
     }
-    if cancellation.is_cancelled() {
-        return Ok(());
+    if !indexing_run.is_current() {
+        return Ok(None);
     }
     external_symlinks
         .publish_workspace(
-            workspace_folder.to_path_buf(),
+            indexing_run.workspace_folder().to_path_buf(),
             root.to_path_buf(),
-            runtime_generation,
             watcher_aliases,
             php_discovery.physical_files.clone(),
+            indexing_run,
         )
         .await;
     let traversal_stop_reason = php_discovery.stop_reason;
@@ -2067,29 +2388,37 @@ pub(in crate::server) async fn index_workspace(
         else {
             continue;
         };
-        commit_workspace_disk_file_preserving_open(
-            DiskPhpIndexCommitContext {
-                open_files: live.open_files,
-                template_documents: live.template_documents,
-                document_versions: live.document_versions,
-                index: live.index,
-                root_index: Some(live.root_index),
-                uri_str: &uri_str,
-            },
-            file_symbols,
-            disk_index
-                .file_references
-                .get(&uri_str)
-                .map(|references| references.value().clone())
-                .unwrap_or_default(),
-        );
+        let references = disk_index
+            .file_references
+            .get(&uri_str)
+            .map(|references| references.value().clone())
+            .unwrap_or_default();
+        if indexing_run
+            .commit_index_if_current(|| {
+                commit_workspace_disk_file_preserving_open(
+                    DiskPhpIndexCommitContext {
+                        open_files: live.open_files,
+                        template_documents: live.template_documents,
+                        document_versions: live.document_versions,
+                        index: live.index,
+                        root_index: Some(live.root_index),
+                        uri_str: &uri_str,
+                    },
+                    file_symbols,
+                    references,
+                );
+            })
+            .is_none()
+        {
+            return Ok(None);
+        }
     }
-    if cancellation.is_cancelled() {
+    if !indexing_run.is_current() {
         tracing::debug!(
             "Workspace indexing cancelled after cache load: {}",
             root_label
         );
-        return Ok(());
+        return Ok(None);
     }
     if let Some(reason) = cache_report.miss_reason.as_deref() {
         tracing::debug!(
@@ -2108,8 +2437,8 @@ pub(in crate::server) async fn index_workspace(
     let loaded_from_cache = cache_report.loaded_files;
     let mut indexed_symbols = cache_report.indexed_symbols;
 
-    send_indexing_status_for_generation(
-        client,
+    indexing_status_publisher.publish_for_run(
+        indexing_run,
         runtime_generation,
         serde_json::json!({
             "phase": "indexing",
@@ -2141,8 +2470,7 @@ pub(in crate::server) async fn index_workspace(
             "truncationLimit": truncation_limit,
             "visitedEntries": traversal_stats.visited_entries
         }),
-    )
-    .await;
+    );
 
     if let Some(ref p) = ongoing {
         p.report_with_message(format!("Indexing {} files...", total), 0)
@@ -2162,7 +2490,7 @@ pub(in crate::server) async fn index_workspace(
     let mut done = loaded_from_cache;
     let mut parse_errors = 0usize;
     while let Some(result) = parse_tasks.join_next().await {
-        if cancellation.is_cancelled() {
+        if !indexing_run.is_current() {
             parse_tasks.abort_all();
             tracing::debug!(
                 "Workspace indexing cancelled after {}/{} files: {}",
@@ -2170,15 +2498,15 @@ pub(in crate::server) async fn index_workspace(
                 total,
                 root_label
             );
-            return Ok(());
+            return Ok(None);
         }
 
         let parsed = match result {
             Ok(parsed) => parsed,
             Err(err) => {
                 let message = format!("Workspace indexing task failed: {}", err);
-                send_indexing_status_for_generation(
-                    client,
+                indexing_status_publisher.publish_for_run(
+                    indexing_run,
                     runtime_generation,
                     serde_json::json!({
                         "phase": "error",
@@ -2189,8 +2517,7 @@ pub(in crate::server) async fn index_workspace(
                         "indexedSymbols": indexed_symbols,
                         "elapsedMs": elapsed_ms(started_at)
                     }),
-                )
-                .await;
+                );
                 return Err(message);
             }
         };
@@ -2201,18 +2528,26 @@ pub(in crate::server) async fn index_workspace(
                 file_symbols.clone(),
                 parsed.references.clone(),
             );
-            commit_workspace_disk_file_preserving_open(
-                DiskPhpIndexCommitContext {
-                    open_files: live.open_files,
-                    template_documents: live.template_documents,
-                    document_versions: live.document_versions,
-                    index: live.index,
-                    root_index: Some(live.root_index),
-                    uri_str: &parsed.uri,
-                },
-                file_symbols,
-                parsed.references,
-            );
+            if indexing_run
+                .commit_index_if_current(|| {
+                    commit_workspace_disk_file_preserving_open(
+                        DiskPhpIndexCommitContext {
+                            open_files: live.open_files,
+                            template_documents: live.template_documents,
+                            document_versions: live.document_versions,
+                            index: live.index,
+                            root_index: Some(live.root_index),
+                            uri_str: &parsed.uri,
+                        },
+                        file_symbols,
+                        parsed.references,
+                    );
+                })
+                .is_none()
+            {
+                parse_tasks.abort_all();
+                return Ok(None);
+            }
             indexed_symbols += parsed.symbol_count;
 
             if parsed.symbol_count > 0 {
@@ -2230,13 +2565,13 @@ pub(in crate::server) async fn index_workspace(
         done += 1;
 
         while parse_tasks.len() < parse_concurrency {
-            if cancellation.is_cancelled() {
+            if !indexing_run.is_current() {
                 parse_tasks.abort_all();
                 tracing::debug!(
                     "Workspace indexing cancelled before scheduling more parse tasks: {}",
                     root_label
                 );
-                return Ok(());
+                return Ok(None);
             }
             let Some(file_path) = pending_files.next() else {
                 break;
@@ -2261,8 +2596,8 @@ pub(in crate::server) async fn index_workspace(
             } else {
                 100
             };
-            send_indexing_status_for_generation(
-                client,
+            indexing_status_publisher.publish_for_run(
+                indexing_run,
                 runtime_generation,
                 serde_json::json!({
                     "phase": "indexing",
@@ -2276,8 +2611,7 @@ pub(in crate::server) async fn index_workspace(
                     "elapsedMs": elapsed_ms(started_at),
                     "parseConcurrency": parse_concurrency
                 }),
-            )
-            .await;
+            );
         }
 
         if done % 50 == 0 {
@@ -2293,50 +2627,56 @@ pub(in crate::server) async fn index_workspace(
 
     let cache_to_save =
         cache::build_cache_from_index(&disk_index, root, &all_files, &options.cache_config);
-    if let Err(e) = cache::save_cache_atomic(&cache_path, &cache_to_save) {
-        tracing::warn!(
-            "Failed to save workspace index cache at {}: {}",
-            cache_path.display(),
-            e
-        );
-    }
-
-    send_indexing_status_for_generation(
-        client,
-        runtime_generation,
-        serde_json::json!({
-            "phase": "ready",
-            "root": root_label,
-            "message": format!("Indexed {} PHP files", total),
-            "indexedFiles": total,
-            "totalFiles": total,
-            "indexedSymbols": indexed_symbols,
-            "percentage": 100,
-            "elapsedMs": elapsed_ms(started_at),
-            "cacheFilesLoaded": loaded_from_cache,
-            "cacheFilesStale": cache_report.stale_files,
-            "cacheFilesMissing": cache_report.missing_files,
-            "indexingErrors": parse_errors,
-            "parseConcurrency": parse_concurrency,
-            "cachePath": cache_path.display().to_string(),
-            "truncated": traversal_truncated,
-            "truncationReason": truncation_reason,
-            "truncationLimit": truncation_limit,
-            "visitedEntries": traversal_stats.visited_entries
-        }),
+    let cache_path_for_prepare = cache_path.clone();
+    let prepared = run_file_io_blocking(
+        "workspace cache prepare",
+        cache_path.display().to_string(),
+        move || cache::prepare_cache_write(&cache_path_for_prepare, &cache_to_save),
     )
     .await;
+    match prepared {
+        Ok(Ok(prepared)) => {
+            if let Some(Err(error)) = indexing_run.commit_if_current(|| prepared.commit()) {
+                tracing::warn!(
+                    "Failed to save workspace index cache at {}: {}",
+                    cache_path.display(),
+                    error
+                );
+            }
+        }
+        Ok(Err(error)) => tracing::warn!(
+            "Failed to prepare workspace index cache at {}: {}",
+            cache_path.display(),
+            error
+        ),
+        Err(message) => tracing::warn!("{}", message),
+    }
 
-    client
-        .log_message(
-            MessageType::INFO,
-            format!("php-lsp: indexed {} PHP files", total),
-        )
-        .await;
+    let ready_status = serde_json::json!({
+        "phase": "ready",
+        "root": root_label,
+        "message": format!("Indexed {} PHP files", total),
+        "indexedFiles": total,
+        "totalFiles": total,
+        "indexedSymbols": indexed_symbols,
+        "percentage": 100,
+        "elapsedMs": elapsed_ms(started_at),
+        "cacheFilesLoaded": loaded_from_cache,
+        "cacheFilesStale": cache_report.stale_files,
+        "cacheFilesMissing": cache_report.missing_files,
+        "indexingErrors": parse_errors,
+        "parseConcurrency": parse_concurrency,
+        "cachePath": cache_path.display().to_string(),
+        "truncated": traversal_truncated,
+        "truncationReason": truncation_reason,
+        "truncationLimit": truncation_limit,
+        "visitedEntries": traversal_stats.visited_entries
+    });
 
-    tracing::info!("Workspace indexing complete: {} files", total);
-
-    Ok(())
+    Ok(Some(WorkspaceIndexingReport {
+        ready_status,
+        started_at,
+    }))
 }
 
 impl PhpLspBackend {

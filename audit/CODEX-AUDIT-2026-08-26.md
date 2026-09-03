@@ -449,6 +449,13 @@ workspace executable не проходит через `allowProjectCommands`. Cl
 
 ### CODEX-P1-08. Старый reindex может дописать состояние после запуска нового
 
+> **Статус 2026-09-03: исправлено (Codex).** На момент исправления часть
+> исходной находки уже была закрыта: прежний token удалялся после
+> post-processing, а symlink snapshots и diagnostics имели собственные
+> generation-проверки. Эти проверки не обеспечивали общей линейной границы для
+> всех записей одного reindex-run, поэтому проблема сохранялась для индекса,
+> Composer/vendor state, caches и части post-processing.
+
 В `reindex_workspaces` старый run отменяется только после discovery, смены
 workspace-конфигурации и удаления индексированных файлов:
 
@@ -480,14 +487,32 @@ refresh Twig-контекстов, повторного commit открытых 
 индекса в `ready` от порядка/нагрузки и необходимость детерминированных
 generation-barrier тестов.
 
-#### Что исправить
+#### Исправлено
 
-- создавать/заменять token в самом начале reindex до любых mutation;
-- держать run активным до завершения **всего** post-processing;
-- перед каждым index/template/diagnostic commit проверять generation run;
-- завершать state через guard/finally, включая error/cancel paths;
-- добавить детерминированный тест с барьерами: run A останавливается перед
-  post-processing, запускается B, после чего A не имеет права менять state.
+- lifecycle вынесен в `indexing/run.rs`: монотонный `run_id`, отдельный
+  координатор на каждый исходный workspace folder, RAII guard и клонируемая
+  lease с атомарными `commit_if_current`/`commit_index_if_current`;
+- run регистрируется до initial/reindex mutation и остаётся активным до
+  завершения Twig refresh, повторного commit открытых документов, постановки
+  diagnostics и финального `ready`; новый run немедленно отменяет и лишает
+  права commit только старый run того же folder;
+- workspace/stub/vendor данные и cache-файлы сначала строятся во временном
+  staging state. Публикация в live index и atomic rename выполняются коротким
+  guarded commit; stale staging автоматически отбрасывается;
+- aggregate rebuild проверяет run snapshot и revisions всех участвующих root
+  indexes под общей mutation barrier, поэтому изменения другого root во время
+  построения также не теряются;
+- symlink aliases, Twig documents/cache, semantic-token invalidation,
+  open-document recommit, diagnostics и status защищены той же run identity;
+  `DiagnosticPublishRequest` отличает повторные Composer reindex даже при
+  одинаковом runtime generation;
+- status и diagnostics publishers корректно останавливаются при shutdown:
+  queued state очищается, workers abort/await-ятся, а coordinator invalidates
+  все latest identities;
+- добавлены детерминированные unit/integration/E2E регрессии для supersession,
+  commit linearization, panic/abort/error cleanup, staged cache/vendor/stubs,
+  Twig/diagnostics, удаления folder, быстрого Composer reindex, shutdown и
+  независимости multi-root.
 
 ### CODEX-P1-09. Extract/inline variable могут менять семантику программы
 

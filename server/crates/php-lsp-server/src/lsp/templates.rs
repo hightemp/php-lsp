@@ -3485,6 +3485,7 @@ pub(in crate::server) fn map_location_for_template(
     location
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cached_twig_context_file_variables_for_state(
     root: &Path,
     template_name: &str,
@@ -3493,6 +3494,7 @@ async fn cached_twig_context_file_variables_for_state(
     open_php_sources: HashMap<String, TwigContextPhpSource>,
     traversal_limits: TraversalLimits,
     exclude_paths: Vec<PathBuf>,
+    indexing_run: Option<&IndexingRunLease>,
 ) -> Vec<TwigContextFileVariables> {
     let key = TwigContextDiskCacheKey {
         root: root.to_path_buf(),
@@ -3529,10 +3531,14 @@ async fn cached_twig_context_file_variables_for_state(
     };
 
     if use_disk_cache {
-        twig_context_disk_cache
-            .lock()
-            .await
-            .insert(key, files.clone());
+        let mut cache = twig_context_disk_cache.lock().await;
+        let commit = || cache.insert(key, files.clone());
+        match indexing_run {
+            Some(run) => {
+                run.commit_if_current(commit);
+            }
+            None => commit(),
+        }
     }
     files
 }
@@ -3605,6 +3611,7 @@ pub(in crate::server) async fn direct_twig_variable_types_for_template_state(
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    indexing_run: Option<&IndexingRunLease>,
 ) -> Vec<TemplateVariableType> {
     let mut variables = HashMap::<String, String>::new();
     let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
@@ -3696,6 +3703,7 @@ pub(in crate::server) async fn direct_twig_variable_types_for_template_state(
         open_php_sources_for_disk_scan,
         traversal_limits,
         exclude_paths.to_vec(),
+        indexing_run,
     )
     .await
     {
@@ -3746,6 +3754,7 @@ async fn twig_include_variable_types_for_template_state(
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    indexing_run: Option<&IndexingRunLease>,
 ) -> Vec<TemplateVariableType> {
     let mut variables = HashMap::<String, String>::new();
     let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
@@ -3786,6 +3795,7 @@ async fn twig_include_variable_types_for_template_state(
             twig_context_disk_cache,
             traversal_limits,
             exclude_paths,
+            indexing_run,
         )
         .await;
         collect_twig_include_context_types_from_ranges(
@@ -3858,6 +3868,7 @@ async fn twig_include_variable_types_for_template_state(
             twig_context_disk_cache,
             traversal_limits,
             exclude_paths,
+            indexing_run,
         )
         .await;
         collect_twig_include_context_types_from_ranges(
@@ -4325,6 +4336,7 @@ async fn twig_variable_types_for_template_state(
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    indexing_run: Option<&IndexingRunLease>,
 ) -> Vec<TemplateVariableType> {
     let Some(root) = workspace_root_for_template_context_uri(uri_str, workspace_roots) else {
         return Vec::new();
@@ -4345,6 +4357,7 @@ async fn twig_variable_types_for_template_state(
         twig_context_disk_cache,
         traversal_limits,
         exclude_paths,
+        indexing_run,
     )
     .await
     {
@@ -4361,6 +4374,7 @@ async fn twig_variable_types_for_template_state(
         twig_context_disk_cache,
         traversal_limits,
         exclude_paths,
+        indexing_run,
     )
     .await
     {
@@ -4494,7 +4508,7 @@ pub(in crate::server) struct OpenTwigContextRefreshState<'a> {
     pub(in crate::server) workspace_roots: &'a [PathBuf],
     pub(in crate::server) workspace_configs: &'a [WorkspaceRootConfig],
     pub(in crate::server) workspace_folders_filter: Option<&'a [PathBuf]>,
-    pub(in crate::server) indexing_cancellations: &'a [WorkspaceIndexingCancellation],
+    pub(in crate::server) indexing_runs: &'a [IndexingRunLease],
     pub(in crate::server) twig_context_disk_cache: &'a Arc<Mutex<TwigContextDiskCache>>,
     pub(in crate::server) semantic_tokens_cache: &'a Arc<Mutex<SemanticTokensCache>>,
 }
@@ -4511,7 +4525,7 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         workspace_roots,
         workspace_configs,
         workspace_folders_filter,
-        indexing_cancellations,
+        indexing_runs,
         twig_context_disk_cache,
         semantic_tokens_cache,
     } = state;
@@ -4542,12 +4556,12 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         }) {
             continue;
         }
-        if workspace.as_ref().is_some_and(|config| {
-            indexing_cancellations.iter().any(|cancellation| {
-                cancellation.workspace_folder == config.workspace_folder
-                    && cancellation.token.is_cancelled()
-            })
-        }) {
+        let indexing_run = workspace.as_ref().and_then(|config| {
+            indexing_runs
+                .iter()
+                .find(|run| run.workspace_folder() == config.workspace_folder)
+        });
+        if indexing_run.is_some_and(|run| !run.is_current()) {
             continue;
         }
         let Some(template) = template_documents
@@ -4592,36 +4606,42 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
             twig_context_disk_cache,
             traversal_limits,
             &exclude_paths,
+            indexing_run,
         )
         .await;
         let refreshed_template = template.with_twig_variable_types(&variable_types);
         let mut parser = FileParser::new();
         parser.parse_full(refreshed_template.virtual_source());
-        if workspace.as_ref().is_some_and(|config| {
-            indexing_cancellations.iter().any(|cancellation| {
-                cancellation.workspace_folder == config.workspace_folder
-                    && cancellation.token.is_cancelled()
-            })
-        }) {
+        if indexing_run.is_some_and(|run| !run.is_current()) {
             continue;
         }
-        let replaced = replace_open_template_if_current(
-            OpenTemplateRefreshSnapshot {
-                uri: &uri_str,
-                state,
-                document: &template,
-            },
-            parser,
-            refreshed_template,
-            open_files,
-            template_documents,
-            document_versions,
-        );
+        let mut semantic_tokens = semantic_tokens_cache.lock().await;
+        let commit_refresh = || {
+            let replaced = replace_open_template_if_current(
+                OpenTemplateRefreshSnapshot {
+                    uri: &uri_str,
+                    state,
+                    document: &template,
+                },
+                parser,
+                refreshed_template,
+                open_files,
+                template_documents,
+                document_versions,
+            );
+            if replaced {
+                remove_from_aggregate_and_root_index(index, workspace_index, &uri_str);
+                semantic_tokens.remove(&uri_str);
+            }
+            replaced
+        };
+        let replaced = match indexing_run {
+            Some(run) => run.commit_index_if_current(commit_refresh).unwrap_or(false),
+            None => commit_refresh(),
+        };
         if !replaced {
             continue;
         }
-        remove_from_aggregate_and_root_index(index, workspace_index, &uri_str);
-        semantic_tokens_cache.lock().await.remove(&uri_str);
         refreshed.push(uri_str);
     }
 
@@ -4678,6 +4698,7 @@ impl PhpLspBackend {
             &self.twig_context_disk_cache,
             runtime_config.traversal_limits,
             &runtime_config.exclude_paths,
+            None,
         )
         .await
     }
@@ -4694,7 +4715,7 @@ impl PhpLspBackend {
             workspace_roots: &roots,
             workspace_configs: &runtime_state.configs,
             workspace_folders_filter: None,
-            indexing_cancellations: &[],
+            indexing_runs: &[],
             twig_context_disk_cache: &self.twig_context_disk_cache,
             semantic_tokens_cache: &self.semantic_tokens_cache,
         })

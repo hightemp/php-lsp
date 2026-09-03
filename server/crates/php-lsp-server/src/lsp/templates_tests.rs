@@ -231,6 +231,62 @@ fn older_twig_context_refresh_cannot_replace_newer_context_generation() {
 }
 
 #[test]
+fn superseded_indexing_run_cannot_publish_twig_refresh() {
+    let root = PathBuf::from("/workspace");
+    let uri = "file:///workspace/templates/page.html.twig";
+    let source = "{{ value }}";
+    let current_template = preprocess_twig_template(source, &[]);
+    let stale_refresh = preprocess_twig_template(
+        source,
+        &[TemplateVariableType {
+            name: "value".to_string(),
+            type_text: "App\\Stale".to_string(),
+            shape_definitions: Vec::new(),
+        }],
+    );
+    let mut current_parser = FileParser::new();
+    current_parser.parse_full(current_template.virtual_source());
+    let mut stale_parser = FileParser::new();
+    stale_parser.parse_full(stale_refresh.virtual_source());
+    let open_files = DashMap::new();
+    open_files.insert(uri.to_string(), current_parser);
+    let template_documents = DashMap::new();
+    template_documents.insert(uri.to_string(), current_template.clone());
+    let document_versions = DashMap::new();
+    let state = OpenDocumentState {
+        version: 1,
+        generation: 1,
+    };
+    document_versions.insert(uri.to_string(), state);
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let old = coordinator.start(root.clone());
+    let old_run = old.lease();
+    let _new = coordinator.start(root);
+
+    assert!(old_run
+        .commit_if_current(|| replace_open_template_if_current(
+            OpenTemplateRefreshSnapshot {
+                uri,
+                state,
+                document: &current_template,
+            },
+            stale_parser,
+            stale_refresh,
+            &open_files,
+            &template_documents,
+            &document_versions,
+        ))
+        .is_none());
+    assert_eq!(
+        template_documents
+            .get(uri)
+            .expect("current template remains")
+            .virtual_source(),
+        current_template.virtual_source()
+    );
+}
+
+#[test]
 fn infers_nested_literal_array_shape_type_for_twig_context() {
     let source = concat!(
         "[\n",

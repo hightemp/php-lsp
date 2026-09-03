@@ -19,7 +19,13 @@ vm.runInNewContext(result.outputFiles[0].text, {
   filename: "indexing-status.bundle.cjs",
 });
 
-const { mergeIndexingStatus, phaseIcon, phaseTitle, statusText } = module.exports;
+const {
+  indexingStatusUpdateIsCurrent,
+  mergeIndexingStatus,
+  phaseIcon,
+  phaseTitle,
+  statusText,
+} = module.exports;
 
 let status = {
   phase: "ready",
@@ -103,3 +109,28 @@ status = mergeIndexingStatus(status, {
   runtimeGeneration: 8,
 });
 assert.equal(phaseTitle(status.phase, status.truncated), "Ready");
+
+const latestRuns = new Map();
+assert.equal(indexingStatusUpdateIsCurrent(latestRuns, {
+  phase: "discovering",
+  workspaceFolder: "/workspace/a",
+  runtimeGeneration: 9,
+  indexingRunId: 12,
+}), true);
+assert.equal(indexingStatusUpdateIsCurrent(latestRuns, {
+  phase: "ready",
+  workspaceFolder: "/workspace/a",
+  runtimeGeneration: 9,
+  indexingRunId: 11,
+}), false, "an older run for the same workspace must be ignored");
+assert.equal(indexingStatusUpdateIsCurrent(latestRuns, {
+  phase: "ready",
+  workspaceFolder: "/workspace/b",
+  runtimeGeneration: 9,
+  indexingRunId: 10,
+}), true, "run ordering must remain isolated across workspace folders");
+assert.equal(indexingStatusUpdateIsCurrent(latestRuns, {
+  phase: "starting",
+  resetTraversal: true,
+}), true);
+assert.equal(latestRuns.size, 0, "server restart must reset remembered run identities");

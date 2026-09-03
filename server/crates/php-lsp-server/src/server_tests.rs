@@ -2442,6 +2442,7 @@ async fn composer_epoch_prevents_stale_vendor_preload_recommit() {
             &preload_cache,
             &preload_lru,
             &preload_epoch,
+            None,
         )
         .await
     });
@@ -2472,6 +2473,7 @@ async fn composer_epoch_prevents_stale_vendor_preload_recommit() {
         &backend.vendor_autoload_cache,
         &vendor_file_lru,
         &backend.vendor_load_epoch,
+        None,
     )
     .await;
     assert_eq!(new_loaded, 1);
@@ -2590,6 +2592,8 @@ async fn stable_member_resolution_retries_changed_hierarchy_generation() {
         load_epoch: Arc::new(tokio::sync::RwLock::new(0)),
         external_symlinks: None,
         runtime_generation: 0,
+        indexing_run: None,
+        indexing_runs: None,
     };
     let lookup_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hook_attempts = lookup_attempts.clone();
@@ -2669,6 +2673,8 @@ async fn same_fqn_lazy_loads_remain_isolated_per_index() {
                 load_epoch: Arc::new(tokio::sync::RwLock::new(0)),
                 external_symlinks: None,
                 runtime_generation: 0,
+                indexing_run: None,
+                indexing_runs: None,
             }
         };
     let context_a = context(&root_a, src_a, index_a.clone());
@@ -6790,14 +6796,14 @@ async fn test_indexing_cancellation_is_scoped_to_workspace_folder() {
     let backend = service.inner();
     let root_a = PathBuf::from("/workspace/a");
     let root_b = PathBuf::from("/workspace/b");
-    let old_a = backend.start_indexing_run(&root_a).await;
-    let root_b_token = backend.start_indexing_run(&root_b).await;
-    let new_a = backend.start_indexing_run(&root_a).await;
-    assert!(old_a.is_cancelled());
-    assert!(!new_a.is_cancelled());
-    assert!(!root_b_token.is_cancelled());
+    let old_a = backend.start_indexing_run(&root_a);
+    let root_b_run = backend.start_indexing_run(&root_b);
+    let new_a = backend.start_indexing_run(&root_a);
+    assert!(old_a.lease().token().is_cancelled());
+    assert!(new_a.lease().is_current());
+    assert!(root_b_run.lease().is_current());
     assert!(indexing_run_is_active_for_workspace(&backend.indexing_run, Some(&root_b)).await);
-    finish_indexing_run_state(&backend.indexing_run, &new_a).await;
+    drop(new_a);
     assert!(
         indexing_run_is_active_for_workspace(&backend.indexing_run, Some(&root_b)).await,
         "finishing root A must not clear root B's active state"
@@ -6835,6 +6841,7 @@ fn test_diagnostic_publish_validity_is_root_scoped_across_runtime_updates() {
         require_idle_index: false,
         expected_runtime_generation: 1,
         indexing_workspace_folder: Some(root_b),
+        expected_indexing_run: None,
         expected_runtime_config: config_b.runtime_config.clone(),
         expected_index: index_b,
         computation_sequence: 1,
@@ -6851,6 +6858,37 @@ fn test_diagnostic_publish_validity_is_root_scoped_across_runtime_updates() {
         diagnostic_runtime_request_is_current(&request, &state),
         "changing root A must not invalidate an otherwise current root B publish"
     );
+}
+
+#[test]
+fn test_diagnostic_publish_rejects_superseded_indexing_run() {
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let root = PathBuf::from("/workspace/a");
+    let first = coordinator.start(root.clone());
+    let first_identity = first.lease().identity();
+    drop(first);
+    let mut request = DiagnosticPublishRequest {
+        uri: "file:///workspace/a/Subject.php".parse().unwrap(),
+        diagnostics: Vec::new(),
+        version: Some(1),
+        expected_state: None,
+        expected_template: None,
+        require_idle_index: false,
+        expected_runtime_generation: 1,
+        indexing_workspace_folder: Some(root.clone()),
+        expected_indexing_run: Some(first_identity),
+        expected_runtime_config: ResolvedRuntimeConfiguration::default(),
+        expected_index: Arc::new(WorkspaceIndex::new()),
+        computation_sequence: 1,
+    };
+
+    assert!(diagnostic_indexing_run_is_latest(&request, &coordinator));
+    let second = coordinator.start(root);
+    assert!(!diagnostic_indexing_run_is_latest(&request, &coordinator));
+    request.expected_indexing_run = Some(second.lease().identity());
+    assert!(diagnostic_indexing_run_is_latest(&request, &coordinator));
+    coordinator.cancel_all();
+    assert!(!diagnostic_indexing_run_is_latest(&request, &coordinator));
 }
 
 #[tokio::test]
@@ -7441,6 +7479,7 @@ async fn test_twig_open_php_context_does_not_cross_root_indexes() {
         &cache,
         TraversalLimits::default(),
         &[],
+        None,
     )
     .await;
     assert!(variables.iter().any(|variable| variable.name == "onlyA"));

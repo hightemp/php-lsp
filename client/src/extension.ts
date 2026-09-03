@@ -8,6 +8,7 @@ import {
   selectStatusConfiguration,
 } from "./configuration";
 import {
+  indexingStatusUpdateIsCurrent,
   mergeIndexingStatus,
   phaseIcon,
   phaseTitle,
@@ -116,6 +117,10 @@ type ServerBinarySource = "custom" | "bundled" | "path" | "unsupported";
 
 class PhpLspStatusController implements Disposable {
   private readonly statusBar: StatusBarItem;
+  private readonly latestIndexingRuns = new Map<string, {
+    runtimeGeneration?: number;
+    indexingRunId: number;
+  }>();
   private status: IndexingStatus = {
     phase: "starting",
     message: "Starting language server",
@@ -135,6 +140,9 @@ class PhpLspStatusController implements Disposable {
   }
 
   update(status: IndexingStatusUpdate): void {
+    if (!indexingStatusUpdateIsCurrent(this.latestIndexingRuns, status)) {
+      return;
+    }
     this.status = mergeIndexingStatus(this.status, status);
     this.render();
   }

@@ -34,6 +34,22 @@ pub(crate) fn remove_stub_symbols(index: &WorkspaceIndex) {
     }
 }
 
+pub(crate) fn replace_stub_symbols_from(staged: &WorkspaceIndex, destination: &WorkspaceIndex) {
+    remove_stub_symbols(destination);
+    for entry in staged.file_symbols.iter() {
+        if !entry.key().starts_with("phpstub://") {
+            continue;
+        }
+        let uri = entry.key().clone();
+        let references = staged
+            .file_references
+            .get(&uri)
+            .map(|references| references.value().clone())
+            .unwrap_or_default();
+        destination.update_file_with_references(&uri, entry.value().as_ref().clone(), references);
+    }
+}
+
 pub(crate) fn candidate_stubs_paths(
     root: &Path,
     client_stubs_path: Option<PathBuf>,

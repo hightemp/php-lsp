@@ -1,5 +1,6 @@
 //! External symlink alias tracking and dynamic LSP file-watcher registration.
 
+use super::run::IndexingRunLease;
 use crate::util::fs_walk::{
     merge_physical_file_groups, PhysicalFileGroup, PhysicalFilePath, SymlinkAlias,
     SymlinkTargetKind,
@@ -97,24 +98,32 @@ impl ExternalSymlinkManager {
         self: &Arc<Self>,
         workspace_folder: PathBuf,
         logical_root: PathBuf,
-        generation: u64,
         mut aliases: Vec<SymlinkAlias>,
         mut physical_files: Vec<PhysicalFileGroup>,
+        indexing_run: &IndexingRunLease,
     ) {
         normalize_alias_snapshot(&mut aliases, &mut physical_files);
-        {
+        let published = {
             let mut state = self.state.lock().await;
-            if !state.publish_workspace_snapshot(
-                workspace_folder,
-                WorkspaceSymlinkSnapshot {
-                    generation,
-                    logical_root,
-                    aliases,
-                    physical_files,
-                },
-            ) {
+            let Some(generation) = state.active_workspaces.get(&workspace_folder).copied() else {
                 return;
-            }
+            };
+            indexing_run
+                .commit_if_current(|| {
+                    state.publish_workspace_snapshot(
+                        workspace_folder,
+                        WorkspaceSymlinkSnapshot {
+                            generation,
+                            logical_root,
+                            aliases,
+                            physical_files,
+                        },
+                    )
+                })
+                .unwrap_or(false)
+        };
+        if !published {
+            return;
         }
         self.refresh_registration().await;
     }
@@ -138,21 +147,29 @@ impl ExternalSymlinkManager {
         generation: u64,
         mut aliases: Vec<SymlinkAlias>,
         mut physical_files: Vec<PhysicalFileGroup>,
+        indexing_run: Option<&IndexingRunLease>,
     ) {
         normalize_alias_snapshot(&mut aliases, &mut physical_files);
-        {
+        let published = {
             let mut state = self.state.lock().await;
-            if !state.publish_additional_snapshot(
-                workspace_folder,
-                WorkspaceSymlinkSnapshot {
-                    generation,
-                    logical_root,
-                    aliases,
-                    physical_files,
-                },
-            ) {
-                return;
+            let publish = || {
+                state.publish_additional_snapshot(
+                    workspace_folder,
+                    WorkspaceSymlinkSnapshot {
+                        generation,
+                        logical_root,
+                        aliases,
+                        physical_files,
+                    },
+                )
+            };
+            match indexing_run {
+                Some(run) => run.commit_if_current(publish).unwrap_or(false),
+                None => publish(),
             }
+        };
+        if !published {
+            return;
         }
         self.refresh_registration().await;
     }

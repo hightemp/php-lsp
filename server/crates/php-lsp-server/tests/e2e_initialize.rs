@@ -483,6 +483,14 @@ async fn test_untrusted_project_config_does_not_execute_phpstan_command() {
         .ready()
         .await
         .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+    service
+        .ready()
+        .await
+        .unwrap()
         .call(did_open_notification(
             &file_uri,
             "<?php\nclass Subject {}\n",
@@ -554,6 +562,14 @@ async fn test_trusted_project_config_can_execute_phpstan_command() {
         ))
         .await
         .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
     service
         .ready()
         .await

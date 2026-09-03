@@ -4958,6 +4958,7 @@ impl PhpLspBackend {
                 require_idle_index: effective_diagnostics_mode == DiagnosticsMode::BasicSemantic,
                 expected_runtime_generation: request.state.generation,
                 indexing_workspace_folder,
+                expected_indexing_run: None,
                 expected_runtime_config: runtime_config,
                 expected_index: request_index,
                 computation_sequence,

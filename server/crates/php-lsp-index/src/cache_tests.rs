@@ -832,3 +832,34 @@ fn cache_invalidates_legacy_raw_file_uri_for_encoded_path() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn prepared_cache_write_does_not_replace_destination_until_commit() {
+    let root = unique_temp_dir("prepared-write");
+    fs::create_dir_all(&root).unwrap();
+    let cache_path = root.join("index.bin");
+    fs::write(&cache_path, b"current").unwrap();
+    let cache = IndexCache {
+        schema_version: CACHE_SCHEMA_VERSION,
+        namespace: CacheNamespace::Workspace.as_str().to_string(),
+        php_lsp_version: "test".to_string(),
+        workspace_root: normalized_path_string(&root),
+        config_hash: 1,
+        stubs_hash: 2,
+        created_at_unix_ms: 3,
+        files: Vec::new(),
+        top_level: CachedTopLevelSymbols::default(),
+    };
+
+    let prepared = prepare_cache_write(&cache_path, &cache).unwrap();
+    assert_eq!(fs::read(&cache_path).unwrap(), b"current");
+    drop(prepared);
+    assert_eq!(fs::read(&cache_path).unwrap(), b"current");
+
+    prepare_cache_write(&cache_path, &cache)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(load_cache(&cache_path).unwrap().config_hash, 1);
+    fs::remove_dir_all(root).unwrap();
+}

@@ -77,6 +77,7 @@ mod indexing;
 #[path = "lsp/mod.rs"]
 mod lsp;
 use indexing::cache::*;
+use indexing::run::*;
 pub(crate) use indexing::stubs::load_configured_stubs;
 use indexing::stubs::*;
 use indexing::symlinks::*;
@@ -112,6 +113,141 @@ use lsp::templates::*;
 
 struct PhpLspIndexingStatusNotification;
 
+#[derive(Clone)]
+struct IndexingStatusPublisher {
+    pending: Arc<StdMutex<VecDeque<serde_json::Value>>>,
+    wake: mpsc::Sender<()>,
+    stopped: Arc<AtomicBool>,
+    worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
+}
+
+impl IndexingStatusPublisher {
+    fn new(client: Client) -> Self {
+        let pending = Arc::new(StdMutex::new(VecDeque::<serde_json::Value>::new()));
+        let worker_pending = pending.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = stopped.clone();
+        let (wake, mut receiver) = mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            while receiver.recv().await.is_some() {
+                if worker_stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                loop {
+                    if worker_stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let params = worker_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .pop_front();
+                    let Some(params) = params else {
+                        break;
+                    };
+                    send_indexing_status(&client, params).await;
+                }
+            }
+        });
+        Self {
+            pending,
+            wake,
+            stopped,
+            worker: Arc::new(StdMutex::new(Some(worker))),
+        }
+    }
+
+    fn publish_for_run(
+        &self,
+        run: &IndexingRunLease,
+        runtime_generation: u64,
+        mut params: serde_json::Value,
+    ) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(params) = params.as_object_mut() {
+            params.insert(
+                "indexingRunId".to_string(),
+                serde_json::Value::from(run.run_id()),
+            );
+            params.insert(
+                "workspaceFolder".to_string(),
+                serde_json::Value::String(run.workspace_folder().display().to_string()),
+            );
+        }
+        let params = indexing_status_with_runtime_generation(params, runtime_generation);
+        run.commit_if_current(|| {
+            if self.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            let workspace = params
+                .get("workspaceFolder")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let run_id = params
+                .get("indexingRunId")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let phase = params
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.retain(|queued| {
+                let queued_workspace = queued
+                    .get("workspaceFolder")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if queued_workspace != workspace {
+                    return true;
+                }
+                let queued_run_id = queued
+                    .get("indexingRunId")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let queued_phase = queued
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                queued_run_id > run_id || (queued_run_id == run_id && queued_phase != phase)
+            });
+            pending.push_back(params);
+            while pending.len() > INDEXING_STATUS_PENDING_LIMIT {
+                pending.pop_front();
+            }
+            drop(pending);
+            match self.wake.try_send(()) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    tracing::debug!("Skipping indexing status because the publisher stopped");
+                }
+            }
+        });
+    }
+
+    async fn shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            worker.abort();
+            let _ = worker.await;
+        }
+    }
+}
+
 const DID_CHANGE_DIAGNOSTICS_DEBOUNCE_MS: u64 = 180;
 const HEAVY_REQUEST_YIELD_INTERVAL: usize = 32;
 const FILE_IO_SLOW_WARNING_MS: u64 = 100;
@@ -119,6 +255,7 @@ const FILE_IO_TIMEOUT_MS: u64 = 15_000;
 const FILE_IO_WALK_DEADLINE_MARGIN_MS: u64 = 250;
 const DIAGNOSTIC_PHASE_SLOW_WARNING_MS: u64 = 500;
 const DIAGNOSTIC_PUBLISHER_MAX_SHARDS: usize = 16;
+const INDEXING_STATUS_PENDING_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OpenDocumentState {
@@ -318,6 +455,7 @@ struct DiagnosticPublishRequest {
     require_idle_index: bool,
     expected_runtime_generation: u64,
     indexing_workspace_folder: Option<PathBuf>,
+    expected_indexing_run: Option<IndexingRunIdentity>,
     expected_runtime_config: ResolvedRuntimeConfiguration,
     expected_index: Arc<WorkspaceIndex>,
     computation_sequence: u64,
@@ -331,11 +469,13 @@ struct DiagnosticsPublisher {
     template_documents: Arc<DashMap<String, TemplateDocument>>,
     next_computation_sequence: Arc<AtomicU64>,
     current_computation_sequences: Arc<DashMap<String, u64>>,
+    stopped: Arc<AtomicBool>,
 }
 
 struct DiagnosticsPublisherShard {
     pending: Arc<StdMutex<HashMap<String, DiagnosticPublishRequest>>>,
     wake: mpsc::Sender<()>,
+    worker: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl DiagnosticsPublisher {
@@ -344,7 +484,7 @@ impl DiagnosticsPublisher {
         open_files: Arc<DashMap<String, FileParser>>,
         document_versions: Arc<DashMap<String, OpenDocumentState>>,
         template_documents: Arc<DashMap<String, TemplateDocument>>,
-        indexing_run: Arc<Mutex<HashMap<PathBuf, OperationCancellationToken>>>,
+        indexing_run: Arc<IndexingRunCoordinator>,
         runtime_state: Arc<Mutex<Arc<WorkspaceRuntimeState>>>,
     ) -> Self {
         let shard_count = std::thread::available_parallelism()
@@ -353,6 +493,7 @@ impl DiagnosticsPublisher {
             .clamp(1, DIAGNOSTIC_PUBLISHER_MAX_SHARDS);
         let next_computation_sequence = Arc::new(AtomicU64::new(1));
         let current_computation_sequences = Arc::new(DashMap::new());
+        let stopped = Arc::new(AtomicBool::new(false));
         let shards = (0..shard_count)
             .map(|_| {
                 spawn_diagnostics_publish_worker(
@@ -363,6 +504,7 @@ impl DiagnosticsPublisher {
                     indexing_run.clone(),
                     runtime_state.clone(),
                     current_computation_sequences.clone(),
+                    stopped.clone(),
                 )
             })
             .collect();
@@ -373,10 +515,14 @@ impl DiagnosticsPublisher {
             template_documents,
             next_computation_sequence,
             current_computation_sequences,
+            stopped,
         }
     }
 
     fn start_computation(&self, uri_str: &str) -> u64 {
+        if self.stopped.load(Ordering::SeqCst) {
+            return 0;
+        }
         let sequence = self
             .next_computation_sequence
             .fetch_add(1, Ordering::Relaxed);
@@ -386,12 +532,18 @@ impl DiagnosticsPublisher {
     }
 
     fn publish(&self, request: DiagnosticPublishRequest) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
         let mut hasher = DefaultHasher::new();
         request.uri.as_str().hash(&mut hasher);
         let shard = &self.shards[hasher.finish() as usize % self.shards.len()];
         let uri_str = request.uri.as_str().to_string();
         match shard.pending.lock() {
             Ok(mut pending) => {
+                if self.stopped.load(Ordering::SeqCst) {
+                    return;
+                }
                 if pending.get(&uri_str).is_some_and(|current| {
                     current.computation_sequence > request.computation_sequence
                         || current.expected_runtime_generation > request.expected_runtime_generation
@@ -413,6 +565,9 @@ impl DiagnosticsPublisher {
             }
             Err(poisoned) => {
                 let mut pending = poisoned.into_inner();
+                if self.stopped.load(Ordering::SeqCst) {
+                    return;
+                }
                 if pending.get(&uri_str).is_some_and(|current| {
                     current.computation_sequence > request.computation_sequence
                         || current.expected_runtime_generation > request.expected_runtime_generation
@@ -438,6 +593,31 @@ impl DiagnosticsPublisher {
             Err(mpsc::error::TrySendError::Closed(())) => {
                 tracing::debug!("Skipping diagnostics because the publisher has stopped");
             }
+        }
+    }
+
+    async fn shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.current_computation_sequences.clear();
+        let mut workers = Vec::new();
+        for shard in self.shards.iter() {
+            shard
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            if let Some(worker) = shard
+                .worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                worker.abort();
+                workers.push(worker);
+            }
+        }
+        for worker in workers {
+            let _ = worker.await;
         }
     }
 }
@@ -468,22 +648,31 @@ fn diagnostic_publish_request_is_current(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_diagnostics_publish_worker(
     client: Client,
     open_files: Arc<DashMap<String, FileParser>>,
     document_versions: Arc<DashMap<String, OpenDocumentState>>,
     template_documents: Arc<DashMap<String, TemplateDocument>>,
-    indexing_run: Arc<Mutex<HashMap<PathBuf, OperationCancellationToken>>>,
+    indexing_run: Arc<IndexingRunCoordinator>,
     runtime_state: Arc<Mutex<Arc<WorkspaceRuntimeState>>>,
     current_computation_sequences: Arc<DashMap<String, u64>>,
+    stopped: Arc<AtomicBool>,
 ) -> DiagnosticsPublisherShard {
     let pending: Arc<StdMutex<HashMap<String, DiagnosticPublishRequest>>> =
         Arc::new(StdMutex::new(HashMap::new()));
     let worker_pending = pending.clone();
     let (wake, mut receiver) = mpsc::channel(1);
-    tokio::spawn(async move {
+    let worker_stopped = stopped.clone();
+    let worker = tokio::spawn(async move {
         while receiver.recv().await.is_some() {
+            if worker_stopped.load(Ordering::SeqCst) {
+                break;
+            }
             loop {
+                if worker_stopped.load(Ordering::SeqCst) {
+                    return;
+                }
                 let requests: Vec<_> = match worker_pending.lock() {
                     Ok(mut pending) => pending.drain().map(|(_, request)| request).collect(),
                     Err(poisoned) => poisoned
@@ -513,6 +702,9 @@ fn spawn_diagnostics_publish_worker(
                     }
                     let runtime_snapshot = runtime_state.lock().await.clone();
                     if !diagnostic_runtime_request_is_current(&request, &runtime_snapshot) {
+                        continue;
+                    }
+                    if !diagnostic_indexing_run_is_latest(&request, &indexing_run) {
                         continue;
                     }
                     if request.require_idle_index
@@ -550,7 +742,11 @@ fn spawn_diagnostics_publish_worker(
             }
         }
     });
-    DiagnosticsPublisherShard { pending, wake }
+    DiagnosticsPublisherShard {
+        pending,
+        wake,
+        worker: StdMutex::new(Some(worker)),
+    }
 }
 
 fn diagnostic_runtime_request_is_current(
@@ -569,6 +765,16 @@ fn diagnostic_runtime_request_is_current(
         && runtime_config.phpstan == request.expected_runtime_config.phpstan
         && runtime_config.psalm == request.expected_runtime_config.psalm
         && Arc::ptr_eq(index, &request.expected_index)
+}
+
+fn diagnostic_indexing_run_is_latest(
+    request: &DiagnosticPublishRequest,
+    indexing_runs: &IndexingRunCoordinator,
+) -> bool {
+    request
+        .expected_indexing_run
+        .as_ref()
+        .is_none_or(|identity| indexing_runs.is_latest(identity))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -812,21 +1018,19 @@ async fn read_file_to_string_blocking(
 #[derive(Clone, Debug)]
 struct OperationCancellationToken {
     cancelled: Arc<AtomicBool>,
-    indexing_active: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
 
-#[derive(Clone)]
-struct WorkspaceIndexingCancellation {
+struct PendingInitialIndexingRun {
     workspace_folder: PathBuf,
-    token: OperationCancellationToken,
+    index: Arc<WorkspaceIndex>,
+    guard: IndexingRunGuard,
 }
 
 impl OperationCancellationToken {
     fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
-            indexing_active: Arc::new(AtomicBool::new(true)),
             notify: Arc::new(Notify::new()),
         }
     }
@@ -840,14 +1044,6 @@ impl OperationCancellationToken {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    fn mark_indexing_complete(&self) {
-        self.indexing_active.store(false, Ordering::SeqCst);
-    }
-
-    fn is_indexing_active(&self) -> bool {
-        self.indexing_active.load(Ordering::SeqCst) && !self.is_cancelled()
-    }
-
     fn is_same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.cancelled, &other.cancelled)
     }
@@ -859,38 +1055,14 @@ impl OperationCancellationToken {
     }
 }
 
-async fn finish_indexing_run_state(
-    indexing_run: &Arc<Mutex<HashMap<PathBuf, OperationCancellationToken>>>,
-    token: &OperationCancellationToken,
-) {
-    let mut current = indexing_run.lock().await;
-    current.retain(|_, active| !active.is_same(token));
-}
-
-async fn finish_indexing_run_if_cancelled(
-    indexing_run: &Arc<Mutex<HashMap<PathBuf, OperationCancellationToken>>>,
-    token: &OperationCancellationToken,
-) -> bool {
-    if token.is_cancelled() {
-        finish_indexing_run_state(indexing_run, token).await;
-        true
-    } else {
-        false
-    }
-}
-
 async fn indexing_run_is_active_for_workspace(
-    indexing_run: &Arc<Mutex<HashMap<PathBuf, OperationCancellationToken>>>,
+    indexing_run: &Arc<IndexingRunCoordinator>,
     workspace_folder: Option<&Path>,
 ) -> bool {
     let Some(workspace_folder) = workspace_folder else {
         return false;
     };
-    indexing_run
-        .lock()
-        .await
-        .get(workspace_folder)
-        .is_some_and(OperationCancellationToken::is_indexing_active)
+    indexing_run.is_active(workspace_folder)
 }
 
 fn diagnostics_mode_for_indexing_state(
@@ -929,18 +1101,6 @@ fn indexing_status_with_runtime_generation(
     params
 }
 
-async fn send_indexing_status_for_generation(
-    client: &Client,
-    runtime_generation: u64,
-    params: serde_json::Value,
-) {
-    send_indexing_status(
-        client,
-        indexing_status_with_runtime_generation(params, runtime_generation),
-    )
-    .await;
-}
-
 async fn clear_request_fs_caches(
     framework_string_key_cache: &Arc<Mutex<FrameworkStringKeyCache>>,
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
@@ -951,6 +1111,17 @@ async fn clear_request_fs_caches(
 
 fn elapsed_ms(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn workspace_discovery_indexing_status(root: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "phase": "discovering",
+        "root": root.display().to_string(),
+        "message": "Discovering PHP files",
+        "indexedFiles": 0,
+        "indexedSymbols": 0,
+        "percentage": 0
+    })
 }
 
 fn indexing_parse_concurrency() -> usize {
@@ -2422,12 +2593,15 @@ pub struct PhpLspBackend {
     diagnostic_debounce_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     /// Serializes diagnostic notifications per document without blocking handlers on client I/O.
     diagnostics_publisher: DiagnosticsPublisher,
+    indexing_status_publisher: IndexingStatusPublisher,
     /// Per-document external analyzer runs that can be cancelled by newer document events.
     analyzer_runs: Arc<Mutex<HashMap<String, OperationCancellationToken>>>,
     /// Per-document external formatter runs that can be cancelled by newer document events.
     formatter_runs: Arc<Mutex<HashMap<String, OperationCancellationToken>>>,
     /// Current background workspace indexing run.
-    indexing_run: Arc<Mutex<HashMap<PathBuf, OperationCancellationToken>>>,
+    indexing_run: Arc<IndexingRunCoordinator>,
+    /// Runs reserved during initialize so early document diagnostics stay syntax-only.
+    pending_initial_indexing_runs: Mutex<Vec<PendingInitialIndexingRun>>,
     /// Global workspace symbol index.
     index: Arc<WorkspaceIndex>,
     aggregate_rebuild: Arc<Mutex<()>>,
@@ -2521,7 +2695,8 @@ impl PhpLspBackend {
         let open_files = Arc::new(DashMap::new());
         let template_documents = Arc::new(DashMap::new());
         let document_versions = Arc::new(DashMap::new());
-        let indexing_run = Arc::new(Mutex::new(HashMap::new()));
+        let indexing_run = Arc::new(IndexingRunCoordinator::default());
+        let indexing_status_publisher = IndexingStatusPublisher::new(client.clone());
         let runtime_state = Arc::new(Mutex::new(Arc::new(WorkspaceRuntimeState::default())));
         let diagnostics_publisher = DiagnosticsPublisher::new(
             client.clone(),
@@ -2541,9 +2716,11 @@ impl PhpLspBackend {
             next_document_generation: AtomicU64::new(1),
             diagnostic_debounce_tasks: Arc::new(Mutex::new(HashMap::new())),
             diagnostics_publisher,
+            indexing_status_publisher,
             analyzer_runs: Arc::new(Mutex::new(HashMap::new())),
             formatter_runs: Arc::new(Mutex::new(HashMap::new())),
             indexing_run,
+            pending_initial_indexing_runs: Mutex::new(Vec::new()),
             index: Arc::new(WorkspaceIndex::new()),
             aggregate_rebuild: Arc::new(Mutex::new(())),
             workspace_root: Mutex::new(None),
@@ -2919,6 +3096,7 @@ impl PhpLspBackend {
                 require_idle_index: false,
                 expected_runtime_generation,
                 indexing_workspace_folder: None,
+                expected_indexing_run: None,
                 expected_runtime_config,
                 expected_index,
                 computation_sequence,
@@ -2926,13 +3104,8 @@ impl PhpLspBackend {
         true
     }
 
-    async fn start_indexing_run(&self, workspace_folder: &Path) -> OperationCancellationToken {
-        let token = OperationCancellationToken::new();
-        let mut runs = self.indexing_run.lock().await;
-        if let Some(previous) = runs.insert(workspace_folder.to_path_buf(), token.clone()) {
-            previous.cancel();
-        }
-        token
+    fn start_indexing_run(&self, workspace_folder: &Path) -> IndexingRunGuard {
+        self.indexing_run.start(workspace_folder.to_path_buf())
     }
 
     async fn schedule_fast_diagnostics(&self, uri: Uri, expected: OpenDocumentState) {
@@ -3039,6 +3212,7 @@ impl PhpLspBackend {
                 require_idle_index: diagnostics_config.mode == DiagnosticsMode::BasicSemantic,
                 expected_runtime_generation,
                 indexing_workspace_folder,
+                expected_indexing_run: None,
                 expected_runtime_config,
                 expected_index,
                 computation_sequence,
@@ -3331,6 +3505,12 @@ impl PhpLspBackend {
             application.republish_all_diagnostics = true;
             application.rebuild_aggregate = true;
         }
+        let mut superseded_indexing_runs = application.indexing_workspace_folders.clone();
+        for workspace_folder in &application.removed_workspace_folders {
+            push_unique_path(&mut superseded_indexing_runs, workspace_folder.clone());
+        }
+        self.cancel_indexing_runs_for_workspace_folders(&superseded_indexing_runs)
+            .await;
         let generation = self.next_runtime_generation.fetch_add(1, Ordering::Relaxed);
         let runtime_state = Arc::new(WorkspaceRuntimeState {
             fallback: loaded.fallback,
@@ -3371,8 +3551,6 @@ impl PhpLspBackend {
                 &active_workspace_folders,
                 &application.indexing_workspace_folders,
             )
-            .await;
-        self.cancel_indexing_runs_for_workspace_folders(&application.removed_workspace_folders)
             .await;
         let mut runtime_sensitive_folders = application.diagnostics_workspace_folders.clone();
         for folder in &application.stubs_workspace_folders {
@@ -3429,11 +3607,8 @@ impl PhpLspBackend {
     }
 
     async fn cancel_indexing_runs_for_workspace_folders(&self, workspace_folders: &[PathBuf]) {
-        let mut runs = self.indexing_run.lock().await;
         for workspace_folder in workspace_folders {
-            if let Some(token) = runs.remove(workspace_folder) {
-                token.cancel();
-            }
+            self.indexing_run.cancel_and_remove(workspace_folder);
         }
     }
 
@@ -3602,6 +3777,16 @@ impl PhpLspBackend {
         if configs.is_empty() {
             return;
         }
+        let mut indexing_guards = Vec::with_capacity(configs.len());
+        for config in &configs {
+            let guard = self.start_indexing_run(&config.workspace_folder);
+            self.indexing_status_publisher.publish_for_run(
+                &guard.lease(),
+                runtime_generation,
+                workspace_discovery_indexing_status(&config.root),
+            );
+            indexing_guards.push(guard);
+        }
         let effective_roots: Vec<PathBuf> = all_configs
             .iter()
             .map(|config| config.root.clone())
@@ -3615,30 +3800,37 @@ impl PhpLspBackend {
             .find_map(|config| config.namespace_map.clone());
 
         let clear_configs = configs.clone();
+        let clear_runs = indexing_guards
+            .iter()
+            .map(IndexingRunGuard::lease)
+            .collect::<Vec<_>>();
         let clear_open_files = self.open_files.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            for config in &clear_configs {
-                clear_non_stub_symbols(&config.index, Some(&clear_open_files));
+            for (config, run) in clear_configs.iter().zip(&clear_runs) {
+                run.commit_index_if_current(|| {
+                    clear_non_stub_symbols(&config.index, Some(&clear_open_files));
+                });
             }
         })
         .await;
+        let aggregate_runs = indexing_guards
+            .iter()
+            .map(IndexingRunGuard::lease)
+            .collect::<Vec<_>>();
+        let current_configs = self.runtime_state_snapshot().await.configs.clone();
+        if !rebuild_aggregate_for_indexing_runs(
+            &self.indexing_run,
+            &self.aggregate_rebuild,
+            &self.index,
+            current_configs,
+            self.open_files.clone(),
+            self.template_documents.clone(),
+            self.document_versions.clone(),
+            &aggregate_runs,
+        )
+        .await
         {
-            let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
-            let aggregate = self.index.clone();
-            let rebuild_configs = all_configs.clone();
-            let open_files = self.open_files.clone();
-            let template_documents = self.template_documents.clone();
-            let document_versions = self.document_versions.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                rebuild_aggregate_index(
-                    &aggregate,
-                    &rebuild_configs,
-                    &open_files,
-                    &template_documents,
-                    &document_versions,
-                );
-            })
-            .await;
+            return;
         }
         self.client
             .log_message(
@@ -3657,24 +3849,23 @@ impl PhpLspBackend {
         let semantic_tokens_cache = self.semantic_tokens_cache.clone();
         let reindex_document_versions = self.document_versions.clone();
         let diagnostics_publisher = self.diagnostics_publisher.clone();
+        let indexing_status_publisher = self.indexing_status_publisher.clone();
         let reindex_index = self.index.clone();
         let vendor_autoload_cache = self.vendor_autoload_cache.clone();
         let vendor_lazy_loads = self.vendor_lazy_loads.clone();
         let vendor_load_epoch = self.vendor_load_epoch.clone();
         let work_done_progress_supported = *self.work_done_progress_supported.lock().await;
-        let indexing_run_state = self.indexing_run.clone();
         let runtime_state_handle = self.runtime_state.clone();
         let aggregate_rebuild = self.aggregate_rebuild.clone();
         let external_symlinks = self.external_symlinks.clone();
-        let mut indexing_tokens = Vec::with_capacity(configs.len());
-        for config in &configs {
-            indexing_tokens.push(self.start_indexing_run(&config.workspace_folder).await);
-        }
         tokio::spawn(async move {
             let mut completed_configs = Vec::new();
-            let mut completed_tokens = Vec::new();
-            for (config, indexing_token) in configs.iter().zip(&indexing_tokens) {
-                if finish_indexing_run_if_cancelled(&indexing_run_state, indexing_token).await {
+            let mut completed_runs = Vec::new();
+            let mut completed_reports = Vec::new();
+            let mut completed_guards = Vec::new();
+            for (config, indexing_guard) in configs.iter().zip(indexing_guards) {
+                let indexing_run = indexing_guard.lease();
+                if !indexing_run.is_current() {
                     continue;
                 }
                 let runtime = &config.runtime_config;
@@ -3693,8 +3884,9 @@ impl PhpLspBackend {
                     ),
                     work_done_progress_supported,
                 };
-                if let Err(e) = index_workspace(
+                let indexing_report = match index_workspace(
                     &client,
+                    &indexing_status_publisher,
                     WorkspaceLiveIndexContext {
                         index: &config.index,
                         root_index: &config.index,
@@ -3705,34 +3897,35 @@ impl PhpLspBackend {
                     &config.root,
                     config.namespace_map.as_ref(),
                     &indexing_options,
-                    indexing_token,
+                    &indexing_run,
                     &external_symlinks,
-                    &config.workspace_folder,
                     runtime_generation,
                 )
                 .await
                 {
-                    tracing::error!("Workspace reindexing failed: {}", e);
-                    send_indexing_status_for_generation(
-                        &client,
-                        runtime_generation,
-                        serde_json::json!({
-                            "phase": "error",
-                            "root": config.root.display().to_string(),
-                            "message": format!("Workspace reindexing failed: {}", e)
-                        }),
-                    )
-                    .await;
-                    client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!("Workspace reindexing failed: {}", e),
-                        )
-                        .await;
-                    finish_indexing_run_state(&indexing_run_state, indexing_token).await;
-                    continue;
-                }
-                if finish_indexing_run_if_cancelled(&indexing_run_state, indexing_token).await {
+                    Ok(Some(report)) => report,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!("Workspace reindexing failed: {}", e);
+                        indexing_status_publisher.publish_for_run(
+                            &indexing_run,
+                            runtime_generation,
+                            serde_json::json!({
+                                "phase": "error",
+                                "root": config.root.display().to_string(),
+                                "message": format!("Workspace reindexing failed: {}", e)
+                            }),
+                        );
+                        client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!("Workspace reindexing failed: {}", e),
+                            )
+                            .await;
+                        continue;
+                    }
+                };
+                if !indexing_run.is_current() {
                     continue;
                 }
 
@@ -3746,226 +3939,52 @@ impl PhpLspBackend {
                         &vendor_autoload_cache,
                         &config.vendor_file_lru,
                         &vendor_load_epoch,
+                        Some(&indexing_run),
                     )
                     .await;
                 }
-                if !indexing_token.is_cancelled() {
-                    indexing_token.mark_indexing_complete();
+                if indexing_run.is_current() {
                     completed_configs.push(config.clone());
-                    completed_tokens.push(indexing_token.clone());
-                } else {
-                    finish_indexing_run_state(&indexing_run_state, indexing_token).await;
+                    completed_runs.push(indexing_run);
+                    completed_reports.push(indexing_report);
+                    completed_guards.push(indexing_guard);
                 }
             }
 
-            let current_state = runtime_state_handle.lock().await.clone();
-            let mut configs = Vec::new();
-            let mut post_tokens = Vec::new();
-            for (config, token) in completed_configs.into_iter().zip(completed_tokens) {
-                let is_current = current_state.configs.iter().any(|current| {
-                    current.workspace_folder == config.workspace_folder
-                        && Arc::ptr_eq(&current.index, &config.index)
-                });
-                if !token.is_cancelled() && is_current {
-                    configs.push(config);
-                    post_tokens.push(token);
-                } else {
-                    finish_indexing_run_state(&indexing_run_state, &token).await;
-                }
-            }
-            if configs.is_empty() {
-                return;
-            }
-
-            let current_state = runtime_state_handle.lock().await.clone();
-            let active_workspace_folders: HashSet<PathBuf> = configs
-                .iter()
-                .zip(&post_tokens)
-                .filter(|(config, token)| {
-                    !token.is_cancelled()
-                        && current_state.configs.iter().any(|current| {
-                            current.workspace_folder == config.workspace_folder
-                                && Arc::ptr_eq(&current.index, &config.index)
-                        })
-                })
-                .map(|(config, _)| config.workspace_folder.clone())
-                .collect();
-            if active_workspace_folders.is_empty() {
-                for token in post_tokens {
-                    finish_indexing_run_state(&indexing_run_state, &token).await;
-                }
-                return;
-            }
-
-            {
-                let _aggregate_rebuild = aggregate_rebuild.lock().await;
-                let aggregate = reindex_index.clone();
-                let rebuild_configs = current_state.configs.clone();
-                let rebuild_open_files = open_files.clone();
-                let rebuild_templates = template_documents.clone();
-                let rebuild_versions = reindex_document_versions.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    rebuild_aggregate_index(
-                        &aggregate,
-                        &rebuild_configs,
-                        &rebuild_open_files,
-                        &rebuild_templates,
-                        &rebuild_versions,
-                    );
-                })
-                .await;
-            }
-
-            let workspace_roots: Vec<PathBuf> = current_state
-                .configs
-                .iter()
-                .map(|config| config.root.clone())
-                .collect();
-            let completed_workspace_folders: Vec<PathBuf> =
-                active_workspace_folders.into_iter().collect();
-            {
-                let mut cache = twig_context_disk_cache.lock().await;
-                for config in &configs {
-                    cache.evict_index(&config.index);
-                }
-            }
-            let indexing_cancellations: Vec<WorkspaceIndexingCancellation> = configs
-                .iter()
-                .zip(&post_tokens)
-                .map(|(config, token)| WorkspaceIndexingCancellation {
-                    workspace_folder: config.workspace_folder.clone(),
-                    token: token.clone(),
-                })
-                .collect();
-            refresh_open_twig_contexts_for_state(OpenTwigContextRefreshState {
-                open_files: &open_files,
-                template_documents: &template_documents,
-                document_versions: &reindex_document_versions,
-                index: &reindex_index,
-                fallback_index: &current_state.fallback_index,
-                workspace_roots: &workspace_roots,
-                workspace_configs: &current_state.configs,
-                workspace_folders_filter: Some(&completed_workspace_folders),
-                indexing_cancellations: &indexing_cancellations,
-                twig_context_disk_cache: &twig_context_disk_cache,
-                semantic_tokens_cache: &semantic_tokens_cache,
-            })
-            .await;
-            let open_file_uris: Vec<String> =
-                open_files.iter().map(|entry| entry.key().clone()).collect();
-            for uri_str in open_file_uris {
-                let Some(snapshot) = open_document_snapshot_from_state(
-                    &open_files,
-                    &template_documents,
-                    &reindex_document_versions,
-                    &uri_str,
-                ) else {
-                    continue;
-                };
-                let Some(config) = workspace_config_for_uri_from_configs(&configs, &uri_str) else {
-                    continue;
-                };
-                let Some(post_token) = configs
-                    .iter()
-                    .position(|candidate| candidate.workspace_folder == config.workspace_folder)
-                    .and_then(|position| post_tokens.get(position))
-                else {
-                    continue;
-                };
-                if post_token.is_cancelled() {
-                    continue;
-                }
-                commit_open_document_index_snapshot_if_current(
-                    OpenDocumentIndexCommitContext {
-                        open_files: &open_files,
-                        template_documents: &template_documents,
-                        document_versions: &reindex_document_versions,
-                        index: &reindex_index,
-                        root_index: Some(&config.index),
-                        uri_str: &uri_str,
+            let completed = completed_configs
+                .into_iter()
+                .zip(completed_runs)
+                .zip(completed_reports)
+                .zip(completed_guards)
+                .map(
+                    |(((expected_config, run), report), guard)| CompletedWorkspaceIndexingRun {
+                        expected_config,
+                        run,
+                        _guard: guard,
+                        report,
                     },
-                    &snapshot,
-                );
-                if let Ok(uri) = uri_str.parse::<Uri>() {
-                    let computation_sequence = diagnostics_publisher.start_computation(&uri_str);
-                    let runtime = &config.runtime_config;
-                    let diagnostics_config = DiagnosticsRuntimeConfig {
-                        mode: runtime.diagnostics_mode,
-                        severity: runtime.diagnostic_severity,
-                        budget: runtime.diagnostic_budget,
-                        php_version: runtime.php_version,
-                    };
-                    let vendor_lazy_context = VendorLazyIndexContext {
-                        index: config.index.clone(),
-                        workspace_configs: vec![config.clone()],
-                        exclude_paths: runtime.exclude_paths.clone(),
-                        traversal_limits: runtime.traversal_limits,
-                        php_version: runtime.php_version,
-                        index_vendor: runtime.index_vendor,
-                        vendor_autoload_cache: vendor_autoload_cache.clone(),
-                        vendor_file_lru: config.vendor_file_lru.clone(),
-                        lazy_loads: vendor_lazy_loads.clone(),
-                        load_epoch: vendor_load_epoch.clone(),
-                        external_symlinks: Some(external_symlinks.clone()),
-                        runtime_generation,
-                    };
-                    let document_state = snapshot.document_state;
-                    let version = document_state.map(|state| state.version);
-                    let template_document = snapshot.template_document.clone();
-                    if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
-                        && template_document.is_none()
-                        && runtime.index_vendor
-                    {
-                        preresolve_open_file_diagnostic_dependencies(
-                            &snapshot.tree,
-                            &snapshot.source,
-                            &snapshot.file_symbols,
-                            &vendor_lazy_context,
-                        )
-                        .await;
-                    }
-                    let mut diags = compute_source_diagnostics_blocking(
-                        uri_str.clone(),
-                        snapshot.source.clone(),
-                        config.index.clone(),
-                        diagnostics_config,
-                        version,
-                    )
-                    .await;
-                    if let Some(template) = &template_document {
-                        diags = template.map_diagnostics_to_original(
-                            diags,
-                            diagnostics_config.mode == DiagnosticsMode::Off,
-                        );
-                    } else if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
-                        && runtime.index_vendor
-                    {
-                        diags = filter_lazy_resolved_symbol_diagnostics_with_context(
-                            &config.index,
-                            &vendor_lazy_context,
-                            diags,
-                        )
-                        .await;
-                    }
-                    diagnostics_publisher.publish(DiagnosticPublishRequest {
-                        uri,
-                        diagnostics: diags,
-                        version,
-                        expected_state: document_state,
-                        expected_template: template_document,
-                        require_idle_index: diagnostics_config.mode
-                            == DiagnosticsMode::BasicSemantic,
-                        expected_runtime_generation: runtime_generation,
-                        indexing_workspace_folder: Some(config.workspace_folder.clone()),
-                        expected_runtime_config: runtime.clone(),
-                        expected_index: config.index.clone(),
-                        computation_sequence,
-                    });
-                }
-            }
-            for token in post_tokens {
-                finish_indexing_run_state(&indexing_run_state, &token).await;
-            }
+                )
+                .collect();
+            postprocess_workspace_indexing_runs(
+                WorkspaceIndexingPostprocessContext {
+                    open_files,
+                    template_documents,
+                    document_versions: reindex_document_versions,
+                    diagnostics_publisher,
+                    indexing_status_publisher,
+                    aggregate_index: reindex_index,
+                    aggregate_rebuild,
+                    runtime_state: runtime_state_handle,
+                    twig_context_disk_cache,
+                    semantic_tokens_cache,
+                    vendor_autoload_cache,
+                    vendor_lazy_loads,
+                    vendor_load_epoch,
+                    external_symlinks,
+                },
+                completed,
+            )
+            .await;
         });
     }
 
@@ -4026,10 +4045,7 @@ impl PhpLspBackend {
         let mut vendor_epoch = self.vendor_load_epoch.write().await;
         *vendor_epoch = vendor_epoch.wrapping_add(1);
         self.vendor_autoload_cache.lock().await.clear();
-        let evicted = self.vendor_file_lru.lock().await.clear();
-        for uri in evicted {
-            self.index.remove_file(&uri);
-        }
+        self.vendor_file_lru.lock().await.clear();
 
         let state = self.runtime_state_snapshot().await;
         let mut affected_configs: Vec<WorkspaceRootConfig> = state
@@ -4046,8 +4062,9 @@ impl PhpLspBackend {
         let mut removed_vendor_files = 0;
         for config in &affected_configs {
             config.vendor_file_lru.lock().await.clear();
-            removed_vendor_files +=
-                remove_indexed_vendor_symbols(&config.index, std::slice::from_ref(&config.root));
+            removed_vendor_files += self.indexing_run.commit_unleased_index_mutation(|| {
+                remove_indexed_vendor_symbols(&config.index, std::slice::from_ref(&config.root))
+            });
         }
         {
             let _aggregate_rebuild = self.aggregate_rebuild.lock().await;

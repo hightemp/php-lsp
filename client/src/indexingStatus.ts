@@ -22,11 +22,50 @@ export interface IndexingStatus {
   truncationLimit?: number;
   visitedEntries?: number;
   runtimeGeneration?: number;
+  indexingRunId?: number;
+  workspaceFolder?: string;
   lastUpdatedAt?: number;
 }
 
 export interface IndexingStatusUpdate extends IndexingStatus {
   resetTraversal?: boolean;
+}
+
+export interface LatestIndexingRun {
+  runtimeGeneration?: number;
+  indexingRunId: number;
+}
+
+export function indexingStatusUpdateIsCurrent(
+  latestRuns: Map<string, LatestIndexingRun>,
+  incoming: IndexingStatusUpdate,
+): boolean {
+  if (incoming.phase === "starting" || incoming.resetTraversal === true) {
+    latestRuns.clear();
+  }
+  const workspace = incoming.workspaceFolder ?? incoming.root;
+  if (!workspace || incoming.indexingRunId === undefined) {
+    return true;
+  }
+  const current = latestRuns.get(workspace);
+  if (current) {
+    const incomingGeneration = incoming.runtimeGeneration ?? 0;
+    const currentGeneration = current.runtimeGeneration ?? 0;
+    if (incomingGeneration < currentGeneration) {
+      return false;
+    }
+    if (
+      incomingGeneration === currentGeneration
+      && incoming.indexingRunId < current.indexingRunId
+    ) {
+      return false;
+    }
+  }
+  latestRuns.set(workspace, {
+    runtimeGeneration: incoming.runtimeGeneration,
+    indexingRunId: incoming.indexingRunId,
+  });
+  return true;
 }
 
 export function mergeIndexingStatus(

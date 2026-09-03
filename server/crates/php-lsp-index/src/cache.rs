@@ -228,6 +228,35 @@ pub fn load_cache(path: &Path) -> Result<IndexCache, CacheError> {
 }
 
 pub fn save_cache_atomic(path: &Path, cache: &IndexCache) -> Result<(), CacheError> {
+    prepare_cache_write(path, cache)?.commit()
+}
+
+pub struct PreparedCacheWrite {
+    tmp_path: PathBuf,
+    destination: PathBuf,
+    committed: bool,
+}
+
+impl PreparedCacheWrite {
+    pub fn commit(mut self) -> Result<(), CacheError> {
+        replace_cache_file(&self.tmp_path, &self.destination)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedCacheWrite {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+pub fn prepare_cache_write(
+    path: &Path,
+    cache: &IndexCache,
+) -> Result<PreparedCacheWrite, CacheError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -243,8 +272,11 @@ pub fn save_cache_atomic(path: &Path, cache: &IndexCache) -> Result<(), CacheErr
     ));
     let bytes = bincode::serialize(cache)?;
     write_cache_temp_file(&tmp_path, &bytes)?;
-    replace_cache_file(&tmp_path, path)?;
-    Ok(())
+    Ok(PreparedCacheWrite {
+        tmp_path,
+        destination: path.to_path_buf(),
+        committed: false,
+    })
 }
 
 fn write_cache_temp_file(path: &Path, bytes: &[u8]) -> io::Result<()> {

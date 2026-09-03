@@ -154,6 +154,14 @@ pub async fn wait_for_indexing_phase(
     phase: &str,
     timeout: Duration,
 ) {
+    let _ = next_indexing_status_for_phase(notifications, phase, timeout).await;
+}
+
+pub async fn next_indexing_status_for_phase(
+    notifications: &mut UnboundedReceiver<Request>,
+    phase: &str,
+    timeout: Duration,
+) -> serde_json::Value {
     let started = std::time::Instant::now();
     loop {
         let remaining = timeout
@@ -172,7 +180,7 @@ pub async fn wait_for_indexing_phase(
             .cloned()
             .expect("indexingStatus params");
         if params.get("phase").and_then(|value| value.as_str()) == Some(phase) {
-            return;
+            return params;
         }
     }
 }
@@ -241,6 +249,26 @@ pub fn did_change_watched_files_notification(changes: Vec<(&str, i32)>) -> Reque
 pub fn did_change_configuration_notification(settings: serde_json::Value) -> Request {
     Request::build("workspace/didChangeConfiguration")
         .params(json!({ "settings": settings }))
+        .finish()
+}
+
+pub fn did_change_workspace_folders_notification(
+    added: Vec<(&str, &str)>,
+    removed: Vec<(&str, &str)>,
+) -> Request {
+    let folders = |folders: Vec<(&str, &str)>| {
+        folders
+            .into_iter()
+            .map(|(name, uri)| json!({ "name": name, "uri": uri }))
+            .collect::<Vec<_>>()
+    };
+    Request::build("workspace/didChangeWorkspaceFolders")
+        .params(json!({
+            "event": {
+                "added": folders(added),
+                "removed": folders(removed)
+            }
+        }))
         .finish()
 }
 
