@@ -456,6 +456,19 @@ workspace executable не проходит через `allowProjectCommands`. Cl
 > всех записей одного reindex-run, поэтому проблема сохранялась для индекса,
 > Composer/vendor state, caches и части post-processing.
 
+> **Повторная проверка 2026-09-03 (Codex):** при полном перечитывании файлов
+> обнаружены и исправлены три оставшихся окна. Configuration-driven reindex
+> публиковал новый runtime и перезагружал root stubs до регистрации нового run;
+> Composer invalidation запускал replacement-run только после очистки
+> vendor/LRU и aggregate rebuild; post-index diagnostics могли начать новую
+> computation со старой runtime-конфигурацией и вытеснить актуальную. Теперь
+> configuration и Composer пути заранее резервируют guard, root stub-cache
+> использует prepared write и публикуется одной транзакцией с live stub index,
+> global Composer epoch/cache/LRU меняются под общей all-runs lease barrier,
+> stale зарезервированный caller не создаёт новый run поверх более нового, а
+> diagnostics повторно получают и проверяют актуальные config/index/generation
+> после каждого длительного этапа.
+
 В `reindex_workspaces` старый run отменяется только после discovery, смены
 workspace-конфигурации и удаления индексированных файлов:
 
@@ -496,6 +509,9 @@ generation-barrier тестов.
   завершения Twig refresh, повторного commit открытых документов, постановки
   diagnostics и финального `ready`; новый run немедленно отменяет и лишает
   права commit только старый run того же folder;
+- configuration replacement резервирует новый run до публикации runtime state,
+  а Composer reindex — до epoch/cache/vendor/LRU/aggregate cleanup; одна и та же
+  lease затем используется для stubs и workspace runner;
 - workspace/stub/vendor данные и cache-файлы сначала строятся во временном
   staging state. Публикация в live index и atomic rename выполняются коротким
   guarded commit; stale staging автоматически отбрасывается;
@@ -505,7 +521,8 @@ generation-barrier тестов.
 - symlink aliases, Twig documents/cache, semantic-token invalidation,
   open-document recommit, diagnostics и status защищены той же run identity;
   `DiagnosticPublishRequest` отличает повторные Composer reindex даже при
-  одинаковом runtime generation;
+  одинаковом runtime generation, а post-index computation перезапускается с
+  текущей runtime-конфигурацией при её смене;
 - status и diagnostics publishers корректно останавливаются при shutdown:
   queued state очищается, workers abort/await-ятся, а coordinator invalidates
   все latest identities;

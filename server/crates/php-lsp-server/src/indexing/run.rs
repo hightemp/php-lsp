@@ -167,6 +167,18 @@ impl IndexingRunCoordinator {
         .then(commit)
     }
 
+    pub(in crate::server) fn commit_if_all_current<T>(
+        &self,
+        runs: &[IndexingRunLease],
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _aggregate_commit = self
+            .aggregate_commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runs.iter().all(IndexingRunLease::is_current).then(commit)
+    }
+
     pub(in crate::server) fn aggregate_source_revision(&self) -> u64 {
         let _aggregate_commit = self
             .aggregate_commit_gate

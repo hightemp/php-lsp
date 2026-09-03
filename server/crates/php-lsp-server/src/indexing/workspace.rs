@@ -5,13 +5,122 @@ use crate::util::uri::path_to_uri;
 
 use super::super::*;
 
-fn commit_staged_stubs(
+fn commit_prepared_stub_load(
     run: &IndexingRunLease,
     staged: &WorkspaceIndex,
     destination: &WorkspaceIndex,
+    prepared: PreparedStubLoad,
+) -> usize {
+    run.commit_if_current(|| {
+        replace_stub_symbols_from(staged, destination);
+        prepared.commit_cache()
+    })
+    .unwrap_or_default()
+}
+
+fn start_post_index_diagnostic_computation_if_current(
+    diagnostics_publisher: &DiagnosticsPublisher,
+    open_files: &DashMap<String, FileParser>,
+    template_documents: &DashMap<String, TemplateDocument>,
+    document_versions: &DashMap<String, OpenDocumentState>,
+    uri_str: &str,
+    snapshot: &OpenDocumentSnapshot,
+) -> Option<u64> {
+    let dashmap::mapref::entry::Entry::Occupied(_open_entry) =
+        open_files.entry(uri_str.to_string())
+    else {
+        return None;
+    };
+    if document_versions.get(uri_str).map(|state| *state) != snapshot.document_state {
+        return None;
+    }
+    let current_template = template_documents
+        .get(uri_str)
+        .map(|template| template.value().clone());
+    let template_matches = match (&snapshot.template_document, &current_template) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => current.has_same_source_and_twig_context(expected),
+        _ => false,
+    };
+    template_matches.then(|| diagnostics_publisher.start_computation(uri_str))
+}
+
+fn post_index_diagnostic_runtime_is_current(
+    state: &WorkspaceRuntimeState,
+    uri_str: &str,
+    expected_generation: u64,
+    expected_index: &Arc<WorkspaceIndex>,
+    expected_runtime: &ResolvedRuntimeConfiguration,
 ) -> bool {
-    run.commit_index_if_current(|| replace_stub_symbols_from(staged, destination))
-        .is_some()
+    state.generation == expected_generation
+        && workspace_config_for_uri_from_configs(&state.configs, uri_str).is_some_and(|current| {
+            Arc::ptr_eq(&current.index, expected_index)
+                && current.runtime_config == *expected_runtime
+        })
+}
+
+pub(in crate::server) async fn load_stubs_for_indexing_runs(
+    indexing_status_publisher: &IndexingStatusPublisher,
+    configs: &[WorkspaceRootConfig],
+    runs: &[IndexingRunLease],
+    runtime_generation: u64,
+) -> Vec<usize> {
+    debug_assert_eq!(configs.len(), runs.len());
+    for (config, run) in configs.iter().zip(runs) {
+        indexing_status_publisher.publish_for_run(
+            run,
+            runtime_generation,
+            serde_json::json!({
+                "phase": "loadingStubs",
+                "root": config.root.display().to_string(),
+                "message": "Loading PHP stubs"
+            }),
+        );
+    }
+
+    let stub_jobs = configs
+        .iter()
+        .cloned()
+        .zip(runs.iter().cloned())
+        .collect::<Vec<_>>();
+    let loaded_stubs = tokio::task::spawn_blocking(move || {
+        stub_jobs
+            .into_iter()
+            .map(|(config, run)| {
+                if !run.is_current() {
+                    return 0;
+                }
+                let staged = WorkspaceIndex::new();
+                let Some(prepared) = prepare_configured_stubs_for_run(
+                    &staged,
+                    &config.root,
+                    config.runtime_config.stubs_path.clone(),
+                    config.runtime_config.stub_extensions.clone(),
+                    config.runtime_config.php_version,
+                    &run,
+                ) else {
+                    return 0;
+                };
+                commit_prepared_stub_load(&run, &staged, &config.index, prepared)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_else(|_| vec![0; configs.len()]);
+
+    for ((config, run), loaded) in configs.iter().zip(runs).zip(loaded_stubs.iter().copied()) {
+        indexing_status_publisher.publish_for_run(
+            run,
+            runtime_generation,
+            serde_json::json!({
+                "phase": "stubsLoaded",
+                "root": config.root.display().to_string(),
+                "message": format!("Loaded {} stub files", loaded),
+                "stubFiles": loaded
+            }),
+        );
+    }
+    loaded_stubs
 }
 
 struct RenamedOpenDocument {
@@ -218,14 +327,7 @@ impl PhpLspBackend {
             std::mem::take(&mut *pending)
         };
         for config in &configs {
-            let guard = pending_initial_runs
-                .iter()
-                .position(|pending| {
-                    pending.workspace_folder == config.workspace_folder
-                        && Arc::ptr_eq(&pending.index, &config.index)
-                        && pending.guard.lease().is_current()
-                })
-                .map(|position| pending_initial_runs.swap_remove(position).guard)
+            let guard = take_matching_indexing_run(&mut pending_initial_runs, config)
                 .unwrap_or_else(|| self.start_indexing_run(&config.workspace_folder));
             self.indexing_status_publisher.publish_for_run(
                 &guard.lease(),
@@ -243,61 +345,17 @@ impl PhpLspBackend {
             .find_map(|config| config.namespace_map.clone());
 
         // Load into per-root staging indexes, then publish only through the reserved run lease.
-        for (config, guard) in configs.iter().zip(&indexing_guards) {
-            self.indexing_status_publisher.publish_for_run(
-                &guard.lease(),
-                runtime_generation,
-                serde_json::json!({
-                    "phase": "loadingStubs",
-                    "root": config.root.display().to_string(),
-                    "message": "Loading PHP stubs"
-                }),
-            );
-        }
-        let stub_jobs = configs
+        let initial_runs = indexing_guards
             .iter()
-            .zip(&indexing_guards)
-            .map(|(config, guard)| (config.clone(), guard.lease()))
+            .map(IndexingRunGuard::lease)
             .collect::<Vec<_>>();
-        let loaded_stubs = tokio::task::spawn_blocking(move || {
-            stub_jobs
-                .into_iter()
-                .map(|(config, run)| {
-                    if !run.is_current() {
-                        return 0;
-                    }
-                    let staged = WorkspaceIndex::new();
-                    let loaded = load_configured_stubs(
-                        &staged,
-                        &config.root,
-                        config.runtime_config.stubs_path.clone(),
-                        config.runtime_config.stub_extensions.clone(),
-                        config.runtime_config.php_version,
-                        false,
-                    );
-                    if commit_staged_stubs(&run, &staged, &config.index) {
-                        loaded
-                    } else {
-                        0
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_else(|_| vec![0; configs.len()]);
-
-        for ((config, guard), loaded) in configs.iter().zip(&indexing_guards).zip(loaded_stubs) {
-            self.indexing_status_publisher.publish_for_run(
-                &guard.lease(),
-                runtime_generation,
-                serde_json::json!({
-                    "phase": "stubsLoaded",
-                    "root": config.root.display().to_string(),
-                    "message": format!("Loaded {} stub files", loaded),
-                    "stubFiles": loaded
-                }),
-            );
-        }
+        load_stubs_for_indexing_runs(
+            &self.indexing_status_publisher,
+            &configs,
+            &initial_runs,
+            runtime_generation,
+        )
+        .await;
 
         let client = self.client.clone();
         let open_files = self.open_files.clone();
@@ -2035,7 +2093,6 @@ pub(in crate::server) async fn postprocess_workspace_indexing_runs(
     if completed.is_empty() {
         return;
     }
-    let runtime_generation = state.generation;
     let workspace_roots = state
         .configs
         .iter()
@@ -2090,13 +2147,15 @@ pub(in crate::server) async fn postprocess_workspace_indexing_runs(
         ) else {
             continue;
         };
-        let Some(config) = workspace_config_for_uri_from_configs(&configs, &uri_str) else {
+        let commit_state = runtime_state.lock().await.clone();
+        let Some(config) = workspace_config_for_uri_from_configs(&commit_state.configs, &uri_str)
+        else {
             continue;
         };
-        let Some(completed_run) = completed
-            .iter()
-            .find(|completed| completed.run.workspace_folder() == config.workspace_folder)
-        else {
+        let Some(completed_run) = completed.iter().find(|completed| {
+            completed.run.workspace_folder() == config.workspace_folder
+                && Arc::ptr_eq(&completed.expected_config.index, &config.index)
+        }) else {
             continue;
         };
         let run = &completed_run.run;
@@ -2124,98 +2183,152 @@ pub(in crate::server) async fn postprocess_workspace_indexing_runs(
         let Ok(uri) = uri_str.parse::<Uri>() else {
             continue;
         };
-        let Some(computation_sequence) =
-            run.commit_if_current(|| diagnostics_publisher.start_computation(&uri_str))
-        else {
-            continue;
-        };
-        let runtime = &config.runtime_config;
-        let diagnostics_config = DiagnosticsRuntimeConfig {
-            mode: runtime.diagnostics_mode,
-            severity: runtime.diagnostic_severity,
-            budget: runtime.diagnostic_budget,
-            php_version: runtime.php_version,
-        };
-        let vendor_lazy_context = VendorLazyIndexContext {
-            index: config.index.clone(),
-            workspace_configs: vec![config.clone()],
-            exclude_paths: runtime.exclude_paths.clone(),
-            traversal_limits: runtime.traversal_limits,
-            php_version: runtime.php_version,
-            index_vendor: runtime.index_vendor,
-            vendor_autoload_cache: vendor_autoload_cache.clone(),
-            vendor_file_lru: config.vendor_file_lru.clone(),
-            lazy_loads: vendor_lazy_loads.clone(),
-            load_epoch: vendor_load_epoch.clone(),
-            external_symlinks: Some(external_symlinks.clone()),
-            runtime_generation,
-            indexing_run: Some(run.clone()),
-            indexing_runs: Some(run.coordinator()),
-        };
-        let document_state = snapshot.document_state;
-        let version = document_state.map(|state| state.version);
-        let template_document = snapshot.template_document.clone();
-        if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
-            && template_document.is_none()
-            && runtime.index_vendor
-        {
-            preresolve_open_file_diagnostic_dependencies(
-                &snapshot.tree,
-                &snapshot.source,
-                &snapshot.file_symbols,
-                &vendor_lazy_context,
+        for _ in 0..MAX_POST_INDEX_DIAGNOSTIC_CONFIG_RETRIES {
+            let diagnostic_state = runtime_state.lock().await.clone();
+            let Some(config) =
+                workspace_config_for_uri_from_configs(&diagnostic_state.configs, &uri_str)
+            else {
+                break;
+            };
+            if config.workspace_folder != *run.workspace_folder()
+                || !Arc::ptr_eq(&config.index, &completed_run.expected_config.index)
+                || !run.is_current()
+            {
+                break;
+            }
+            let runtime_generation = diagnostic_state.generation;
+            let runtime = config.runtime_config.clone();
+            let Some(computation_sequence) = run
+                .commit_if_current(|| {
+                    start_post_index_diagnostic_computation_if_current(
+                        &diagnostics_publisher,
+                        &open_files,
+                        &template_documents,
+                        &document_versions,
+                        &uri_str,
+                        &snapshot,
+                    )
+                })
+                .flatten()
+            else {
+                break;
+            };
+            let diagnostics_config = DiagnosticsRuntimeConfig {
+                mode: runtime.diagnostics_mode,
+                severity: runtime.diagnostic_severity,
+                budget: runtime.diagnostic_budget,
+                php_version: runtime.php_version,
+            };
+            let vendor_lazy_context = VendorLazyIndexContext {
+                index: config.index.clone(),
+                workspace_configs: vec![config.clone()],
+                exclude_paths: runtime.exclude_paths.clone(),
+                traversal_limits: runtime.traversal_limits,
+                php_version: runtime.php_version,
+                index_vendor: runtime.index_vendor,
+                vendor_autoload_cache: vendor_autoload_cache.clone(),
+                vendor_file_lru: config.vendor_file_lru.clone(),
+                lazy_loads: vendor_lazy_loads.clone(),
+                load_epoch: vendor_load_epoch.clone(),
+                external_symlinks: Some(external_symlinks.clone()),
+                runtime_generation,
+                indexing_run: Some(run.clone()),
+                indexing_runs: Some(run.coordinator()),
+            };
+            let document_state = snapshot.document_state;
+            let version = document_state.map(|state| state.version);
+            let template_document = snapshot.template_document.clone();
+            if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+                && template_document.is_none()
+                && runtime.index_vendor
+            {
+                preresolve_open_file_diagnostic_dependencies(
+                    &snapshot.tree,
+                    &snapshot.source,
+                    &snapshot.file_symbols,
+                    &vendor_lazy_context,
+                )
+                .await;
+                if !run.is_current() {
+                    break;
+                }
+                let current = runtime_state.lock().await.clone();
+                if !post_index_diagnostic_runtime_is_current(
+                    &current,
+                    &uri_str,
+                    runtime_generation,
+                    &config.index,
+                    &runtime,
+                ) {
+                    continue;
+                }
+            }
+            let mut diagnostics = compute_source_diagnostics_blocking(
+                uri_str.clone(),
+                snapshot.source.clone(),
+                config.index.clone(),
+                diagnostics_config,
+                version,
             )
             .await;
             if !run.is_current() {
-                continue;
+                break;
             }
-        }
-        let mut diagnostics = compute_source_diagnostics_blocking(
-            uri_str.clone(),
-            snapshot.source.clone(),
-            config.index.clone(),
-            diagnostics_config,
-            version,
-        )
-        .await;
-        if !run.is_current() {
-            continue;
-        }
-        if let Some(template) = &template_document {
-            diagnostics = template.map_diagnostics_to_original(
-                diagnostics,
-                diagnostics_config.mode == DiagnosticsMode::Off,
-            );
-        } else if diagnostics_config.mode == DiagnosticsMode::BasicSemantic && runtime.index_vendor
-        {
-            diagnostics = filter_lazy_resolved_symbol_diagnostics_with_context(
+            if let Some(template) = &template_document {
+                diagnostics = template.map_diagnostics_to_original(
+                    diagnostics,
+                    diagnostics_config.mode == DiagnosticsMode::Off,
+                );
+            } else if diagnostics_config.mode == DiagnosticsMode::BasicSemantic
+                && runtime.index_vendor
+            {
+                diagnostics = filter_lazy_resolved_symbol_diagnostics_with_context(
+                    &config.index,
+                    &vendor_lazy_context,
+                    diagnostics,
+                )
+                .await;
+                if !run.is_current() {
+                    break;
+                }
+            }
+            let current = runtime_state.lock().await.clone();
+            if !post_index_diagnostic_runtime_is_current(
+                &current,
+                &uri_str,
+                runtime_generation,
                 &config.index,
-                &vendor_lazy_context,
-                diagnostics,
-            )
-            .await;
-            if !run.is_current() {
+                &runtime,
+            ) {
                 continue;
             }
+            let publish = DiagnosticPublishRequest {
+                uri: uri.clone(),
+                diagnostics,
+                version,
+                expected_state: document_state,
+                expected_template: template_document,
+                require_idle_index: false,
+                expected_runtime_generation: runtime_generation,
+                indexing_workspace_folder: Some(config.workspace_folder.clone()),
+                expected_indexing_run: Some(run.identity()),
+                expected_runtime_config: runtime,
+                expected_index: config.index.clone(),
+                computation_sequence,
+            };
+            run.commit_if_current(|| diagnostics_publisher.publish(publish));
+            break;
         }
-        let publish = DiagnosticPublishRequest {
-            uri,
-            diagnostics,
-            version,
-            expected_state: document_state,
-            expected_template: template_document,
-            require_idle_index: false,
-            expected_runtime_generation: runtime_generation,
-            indexing_workspace_folder: Some(config.workspace_folder.clone()),
-            expected_indexing_run: Some(run.identity()),
-            expected_runtime_config: runtime.clone(),
-            expected_index: config.index.clone(),
-            computation_sequence,
-        };
-        run.commit_if_current(|| diagnostics_publisher.publish(publish));
     }
 
     for completed in completed {
+        let ready_state = runtime_state.lock().await.clone();
+        if !ready_state.configs.iter().any(|config| {
+            config.workspace_folder == *completed.run.workspace_folder()
+                && Arc::ptr_eq(&config.index, &completed.expected_config.index)
+        }) {
+            continue;
+        }
         let mut ready_status = completed.report.ready_status;
         if let Some(status) = ready_status.as_object_mut() {
             status.insert(
@@ -2223,7 +2336,11 @@ pub(in crate::server) async fn postprocess_workspace_indexing_runs(
                 serde_json::Value::from(elapsed_ms(completed.report.started_at)),
             );
         }
-        indexing_status_publisher.publish_for_run(&completed.run, runtime_generation, ready_status);
+        indexing_status_publisher.publish_for_run(
+            &completed.run,
+            ready_state.generation,
+            ready_status,
+        );
     }
 }
 

@@ -456,7 +456,7 @@ fn superseded_workspace_run_cannot_restore_removed_symbols() {
 }
 
 #[test]
-fn superseded_initial_run_cannot_publish_staged_stubs() {
+fn superseded_initial_run_cannot_publish_staged_stubs_or_cache() {
     let root = PathBuf::from("/workspace/a");
     let live = WorkspaceIndex::new();
     let staged = WorkspaceIndex::new();
@@ -468,9 +468,43 @@ fn superseded_initial_run_cannot_publish_staged_stubs() {
     let old = coordinator.start(root.clone());
     let old_run = old.lease();
     let _new = coordinator.start(root);
+    let cache_root = std::env::temp_dir().join(format!(
+        "php-lsp-stale-stub-cache-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&cache_root).unwrap();
+    let cache_path = cache_root.join("index.bin");
+    std::fs::write(&cache_path, b"newer-stub-cache").unwrap();
+    let stale_cache = php_lsp_index::cache::IndexCache {
+        schema_version: php_lsp_index::cache::CACHE_SCHEMA_VERSION,
+        namespace: "stubs".to_string(),
+        php_lsp_version: "test".to_string(),
+        workspace_root: "/workspace/a".to_string(),
+        config_hash: 1,
+        stubs_hash: 2,
+        created_at_unix_ms: 3,
+        files: Vec::new(),
+        top_level: php_lsp_index::cache::CachedTopLevelSymbols::default(),
+    };
+    let cache_write = php_lsp_index::cache::prepare_cache_write(&cache_path, &stale_cache).unwrap();
+    let prepared = PreparedStubLoad {
+        loaded: 1,
+        cache_path: Some(cache_path.clone()),
+        cache_write: Some(cache_write),
+    };
 
-    assert!(!commit_staged_stubs(&old_run, &staged, &live));
+    assert_eq!(
+        commit_prepared_stub_load(&old_run, &staged, &live, prepared),
+        0
+    );
     assert!(live.resolve_fqn("stale_builtin").is_none());
+    assert_eq!(std::fs::read(&cache_path).unwrap(), b"newer-stub-cache");
+    assert_eq!(std::fs::read_dir(&cache_root).unwrap().count(), 1);
+    std::fs::remove_dir_all(cache_root).unwrap();
 }
 
 #[test]
@@ -771,4 +805,49 @@ fn client_only_runtime_fallback_preserves_resource_scoped_settings() {
     );
     assert!(!config_b.runtime_config.index_vendor);
     assert_eq!(loaded.messages, vec!["configuration load timed out"]);
+}
+
+#[test]
+fn post_index_diagnostics_require_the_latest_runtime_config_and_index() {
+    let root = PathBuf::from("/workspace/root");
+    let uri = "file:///workspace/root/Subject.php";
+    let index = Arc::new(WorkspaceIndex::new());
+    let runtime = ResolvedRuntimeConfiguration {
+        diagnostics_mode: DiagnosticsMode::Off,
+        ..ResolvedRuntimeConfiguration::default()
+    };
+    let state = WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root,
+            namespace_map: None,
+            runtime_config: runtime.clone(),
+            index: index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 2,
+    };
+
+    assert!(post_index_diagnostic_runtime_is_current(
+        &state, uri, 2, &index, &runtime,
+    ));
+    assert!(!post_index_diagnostic_runtime_is_current(
+        &state, uri, 1, &index, &runtime,
+    ));
+    assert!(!post_index_diagnostic_runtime_is_current(
+        &state,
+        uri,
+        2,
+        &index,
+        &ResolvedRuntimeConfiguration::default(),
+    ));
+    assert!(!post_index_diagnostic_runtime_is_current(
+        &state,
+        uri,
+        2,
+        &Arc::new(WorkspaceIndex::new()),
+        &runtime,
+    ));
 }

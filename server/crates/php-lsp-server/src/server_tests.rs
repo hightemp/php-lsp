@@ -5,6 +5,7 @@ use super::lsp::diagnostics::{
 };
 use super::lsp::document_symbols::{workspace_symbol_candidates, workspace_symbol_lsp_range};
 use super::*;
+use futures::StreamExt;
 use php_lsp_types::*;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -2484,6 +2485,124 @@ async fn composer_epoch_prevents_stale_vendor_preload_recommit() {
     if let Some(cache_dir) = cache_path.parent().and_then(Path::parent) {
         let _ = std::fs::remove_dir_all(cache_dir);
     }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_composer_reindex_cannot_mutate_global_state_after_epoch_wait() {
+    let root = unique_server_temp_dir("composer-run-reservation");
+    let composer_path = root.join("composer.json");
+    std::fs::write(&composer_path, r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#).unwrap();
+    let root_index = Arc::new(WorkspaceIndex::new());
+    let (service, socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration {
+                stub_extensions: Some(Vec::new()),
+                ..ResolvedRuntimeConfiguration::default()
+            },
+            index: root_index,
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 7,
+    });
+    let vendor_dir = root.join("vendor");
+    backend
+        .vendor_autoload_cache
+        .lock()
+        .await
+        .by_vendor_dir
+        .insert(
+            vendor_dir.clone(),
+            VendorAutoloadCacheEntry {
+                map: VendorAutoloadMap::default(),
+            },
+        );
+    backend
+        .vendor_file_lru
+        .lock()
+        .await
+        .touch("file:///fallback-vendor.php".to_string());
+    let previous = backend.start_indexing_run(&root);
+    let previous_run = previous.lease();
+    let epoch_reader = backend.vendor_load_epoch.read().await;
+    assert_eq!(*epoch_reader, 0);
+    let mut invalidation = Box::pin(backend.invalidate_composer_metadata(&composer_path, true));
+
+    tokio::select! {
+        _ = &mut invalidation => panic!("Composer invalidation unexpectedly passed the held epoch"),
+        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+    assert!(previous_run.token().is_cancelled());
+    assert!(!previous_run.is_latest());
+    assert!(previous_run.commit_if_current(|| ()).is_none());
+    assert!(backend.indexing_run.is_active(&root));
+
+    let superseding = backend.start_indexing_run(&root);
+    let superseding_identity = superseding.lease().identity();
+    drop(superseding);
+    drop(epoch_reader);
+    invalidation.await;
+    assert_eq!(*backend.vendor_load_epoch.read().await, 0);
+    assert!(backend
+        .vendor_autoload_cache
+        .lock()
+        .await
+        .by_vendor_dir
+        .contains_key(&vendor_dir));
+    assert_eq!(backend.vendor_file_lru.lock().await.len(), 1);
+    assert!(backend.indexing_run.is_latest(&superseding_identity));
+    assert!(!backend.indexing_run.is_active(&root));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn stale_reserved_reindex_cannot_supersede_a_newer_run() {
+    let root = unique_server_temp_dir("stale-reserved-reindex");
+    let root_index = Arc::new(WorkspaceIndex::new());
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration {
+                stub_extensions: Some(Vec::new()),
+                ..ResolvedRuntimeConfiguration::default()
+            },
+            index: root_index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 9,
+    });
+    let stale_guard = backend.start_indexing_run(&root);
+    let stale = ReservedIndexingRun {
+        workspace_folder: root.clone(),
+        index: root_index,
+        guard: stale_guard,
+    };
+    let newer = backend.start_indexing_run(&root);
+    let newer_run = newer.lease();
+
+    backend
+        .reindex_workspace_folders(std::slice::from_ref(&root), vec![stale])
+        .await;
+
+    assert!(newer_run.is_current());
+    assert!(backend.indexing_run.is_latest(&newer_run.identity()));
+    drop(newer);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -7307,6 +7426,57 @@ async fn test_configuration_change_is_atomic_and_replaces_only_the_affected_root
     ));
 
     std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test]
+async fn configuration_application_reserves_reindex_before_publishing_replacement_state() {
+    let root = unique_server_temp_dir("configuration-run-reservation");
+    let root_uri = php_lsp_types::uri::path_to_uri(&root).unwrap();
+    let settings = |include_paths: Vec<&str>| {
+        serde_json::json!({
+            "configurationVersion": 2,
+            "global": { "composerEnabled": false, "stubExtensions": [] },
+            "workspaceFolders": [{
+                "uri": root_uri,
+                "settings": { "includePaths": include_paths }
+            }]
+        })
+    };
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+
+    let initial_application = backend
+        .apply_effective_configuration_settings(&settings(Vec::new()), std::slice::from_ref(&root))
+        .await;
+    assert_eq!(initial_application.reserved_indexing_runs.len(), 1);
+    drop(initial_application);
+
+    let previous = backend.start_indexing_run(&root);
+    let previous_run = previous.lease();
+    let application = backend
+        .apply_effective_configuration_settings(
+            &settings(vec!["packages"]),
+            std::slice::from_ref(&root),
+        )
+        .await;
+    let state = backend.runtime_state_snapshot().await;
+    let current = state.configs.first().expect("replacement root config");
+    let reserved = application
+        .reserved_indexing_runs
+        .first()
+        .expect("replacement indexing run must be reserved");
+
+    assert!(previous_run.token().is_cancelled());
+    assert!(!previous_run.is_current());
+    assert!(previous_run.commit_if_current(|| ()).is_none());
+    assert_eq!(reserved.workspace_folder, root);
+    assert!(Arc::ptr_eq(&reserved.index, &current.index));
+    assert!(reserved.guard.lease().is_current());
+    assert!(backend.indexing_run.is_active(&root));
+
+    drop(application);
+    assert!(!backend.indexing_run.is_active(&root));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

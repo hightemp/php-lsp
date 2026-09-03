@@ -256,6 +256,7 @@ const FILE_IO_WALK_DEADLINE_MARGIN_MS: u64 = 250;
 const DIAGNOSTIC_PHASE_SLOW_WARNING_MS: u64 = 500;
 const DIAGNOSTIC_PUBLISHER_MAX_SHARDS: usize = 16;
 const INDEXING_STATUS_PENDING_LIMIT: usize = 256;
+const MAX_POST_INDEX_DIAGNOSTIC_CONFIG_RETRIES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OpenDocumentState {
@@ -1021,10 +1022,24 @@ struct OperationCancellationToken {
     notify: Arc<Notify>,
 }
 
-struct PendingInitialIndexingRun {
+struct ReservedIndexingRun {
     workspace_folder: PathBuf,
     index: Arc<WorkspaceIndex>,
     guard: IndexingRunGuard,
+}
+
+fn take_matching_indexing_run(
+    reserved: &mut Vec<ReservedIndexingRun>,
+    config: &WorkspaceRootConfig,
+) -> Option<IndexingRunGuard> {
+    reserved
+        .iter()
+        .position(|pending| {
+            pending.workspace_folder == config.workspace_folder
+                && Arc::ptr_eq(&pending.index, &config.index)
+                && pending.guard.lease().is_current()
+        })
+        .map(|position| reserved.swap_remove(position).guard)
 }
 
 impl OperationCancellationToken {
@@ -1808,6 +1823,7 @@ struct WorkspaceConfigurationApplication {
     reload_fallback_stubs: bool,
     previous_indexes: Vec<Arc<WorkspaceIndex>>,
     removed_workspace_folders: Vec<PathBuf>,
+    reserved_indexing_runs: Vec<ReservedIndexingRun>,
 }
 
 impl WorkspaceConfigurationApplication {
@@ -2601,7 +2617,7 @@ pub struct PhpLspBackend {
     /// Current background workspace indexing run.
     indexing_run: Arc<IndexingRunCoordinator>,
     /// Runs reserved during initialize so early document diagnostics stay syntax-only.
-    pending_initial_indexing_runs: Mutex<Vec<PendingInitialIndexingRun>>,
+    pending_initial_indexing_runs: Mutex<Vec<ReservedIndexingRun>>,
     /// Global workspace symbol index.
     index: Arc<WorkspaceIndex>,
     aggregate_rebuild: Arc<Mutex<()>>,
@@ -3505,12 +3521,24 @@ impl PhpLspBackend {
             application.republish_all_diagnostics = true;
             application.rebuild_aggregate = true;
         }
-        let mut superseded_indexing_runs = application.indexing_workspace_folders.clone();
         for workspace_folder in &application.removed_workspace_folders {
-            push_unique_path(&mut superseded_indexing_runs, workspace_folder.clone());
+            self.indexing_run.cancel_and_remove(workspace_folder);
         }
-        self.cancel_indexing_runs_for_workspace_folders(&superseded_indexing_runs)
-            .await;
+        for workspace_folder in &application.indexing_workspace_folders {
+            let Some(config) = configs
+                .iter()
+                .find(|config| config.workspace_folder == *workspace_folder)
+            else {
+                continue;
+            };
+            application
+                .reserved_indexing_runs
+                .push(ReservedIndexingRun {
+                    workspace_folder: config.workspace_folder.clone(),
+                    index: config.index.clone(),
+                    guard: self.start_indexing_run(&config.workspace_folder),
+                });
+        }
         let generation = self.next_runtime_generation.fetch_add(1, Ordering::Relaxed);
         let runtime_state = Arc::new(WorkspaceRuntimeState {
             fallback: loaded.fallback,
@@ -3538,8 +3566,9 @@ impl PhpLspBackend {
 
     async fn apply_configuration_side_effects(
         &self,
-        application: WorkspaceConfigurationApplication,
+        mut application: WorkspaceConfigurationApplication,
     ) {
+        let reserved_indexing_runs = std::mem::take(&mut application.reserved_indexing_runs);
         let runtime_state = self.runtime_state_snapshot().await;
         let active_workspace_folders = runtime_state
             .configs
@@ -3552,6 +3581,19 @@ impl PhpLspBackend {
                 &application.indexing_workspace_folders,
             )
             .await;
+        for pending in &reserved_indexing_runs {
+            let Some(config) = runtime_state.configs.iter().find(|config| {
+                config.workspace_folder == pending.workspace_folder
+                    && Arc::ptr_eq(&config.index, &pending.index)
+            }) else {
+                continue;
+            };
+            self.indexing_status_publisher.publish_for_run(
+                &pending.guard.lease(),
+                runtime_state.generation,
+                workspace_discovery_indexing_status(&config.root),
+            );
+        }
         let mut runtime_sensitive_folders = application.diagnostics_workspace_folders.clone();
         for folder in &application.stubs_workspace_folders {
             push_unique_path(&mut runtime_sensitive_folders, folder.clone());
@@ -3564,33 +3606,41 @@ impl PhpLspBackend {
         self.resynchronize_open_documents_after_runtime_change(&application.previous_indexes)
             .await;
         if application.rebuild_aggregate {
-            let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
-            let configs = self.runtime_state_snapshot().await.configs.clone();
-            let index = self.index.clone();
-            let open_files = self.open_files.clone();
-            let template_documents = self.template_documents.clone();
-            let document_versions = self.document_versions.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                rebuild_aggregate_index(
-                    &index,
-                    &configs,
-                    &open_files,
-                    &template_documents,
-                    &document_versions,
-                );
-            })
-            .await;
+            let aggregate_runs = reserved_indexing_runs
+                .iter()
+                .map(|pending| pending.guard.lease())
+                .collect::<Vec<_>>();
+            if !rebuild_aggregate_for_indexing_runs(
+                &self.indexing_run,
+                &self.aggregate_rebuild,
+                &self.index,
+                self.runtime_state_snapshot().await.configs.clone(),
+                self.open_files.clone(),
+                self.template_documents.clone(),
+                self.document_versions.clone(),
+                &aggregate_runs,
+            )
+            .await
+            {
+                return;
+            }
         }
         if application.reload_fallback_stubs {
             self.reload_fallback_stubs().await;
         }
         if !application.stubs_workspace_folders.is_empty() {
-            self.reload_configured_stubs(&application.stubs_workspace_folders)
-                .await;
+            self.reload_configured_stubs(
+                &application.stubs_workspace_folders,
+                &reserved_indexing_runs,
+            )
+            .await;
         }
         if !application.indexing_workspace_folders.is_empty() {
-            self.reindex_workspace_folders(&application.indexing_workspace_folders)
-                .await;
+            self.reindex_workspace_folders(
+                &application.indexing_workspace_folders,
+                reserved_indexing_runs,
+            )
+            .await;
         }
         if application.republish_all_diagnostics {
             self.republish_open_diagnostics().await;
@@ -3603,12 +3653,6 @@ impl PhpLspBackend {
             }
             self.republish_open_diagnostics_for_workspace_folders(&folders)
                 .await;
-        }
-    }
-
-    async fn cancel_indexing_runs_for_workspace_folders(&self, workspace_folders: &[PathBuf]) {
-        for workspace_folder in workspace_folders {
-            self.indexing_run.cancel_and_remove(workspace_folder);
         }
     }
 
@@ -3703,59 +3747,38 @@ impl PhpLspBackend {
         .unwrap_or(0);
     }
 
-    async fn reload_configured_stubs(&self, workspace_folders: &[PathBuf]) {
-        let configs: Vec<WorkspaceRootConfig> = self
-            .runtime_state_snapshot()
-            .await
+    async fn reload_configured_stubs(
+        &self,
+        workspace_folders: &[PathBuf],
+        reserved_indexing_runs: &[ReservedIndexingRun],
+    ) {
+        let state = self.runtime_state_snapshot().await;
+        let pairs = state
             .configs
             .iter()
             .filter(|config| workspace_folders.contains(&config.workspace_folder))
-            .cloned()
-            .collect();
-        let Some(first) = configs.first() else {
+            .filter_map(|config| {
+                let pending = reserved_indexing_runs.iter().find(|pending| {
+                    pending.workspace_folder == config.workspace_folder
+                        && Arc::ptr_eq(&pending.index, &config.index)
+                        && pending.guard.lease().is_current()
+                })?;
+                Some((config.clone(), pending.guard.lease()))
+            })
+            .collect::<Vec<_>>();
+        if pairs.is_empty() {
             return;
-        };
-        let root_label = first.root.display().to_string();
-
-        send_indexing_status(
-            &self.client,
-            serde_json::json!({
-                "phase": "loadingStubs",
-                "root": root_label,
-                "message": "Reloading PHP stubs"
-            }),
+        }
+        let (configs, runs): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        let loaded = load_stubs_for_indexing_runs(
+            &self.indexing_status_publisher,
+            &configs,
+            &runs,
+            state.generation,
         )
-        .await;
-
-        let loaded = tokio::task::spawn_blocking(move || {
-            configs
-                .iter()
-                .map(|config| {
-                    remove_stub_symbols(&config.index);
-                    load_configured_stubs(
-                        &config.index,
-                        &config.root,
-                        config.runtime_config.stubs_path.clone(),
-                        config.runtime_config.stub_extensions.clone(),
-                        config.runtime_config.php_version,
-                        false,
-                    )
-                })
-                .sum::<usize>()
-        })
         .await
-        .unwrap_or(0);
-
-        send_indexing_status(
-            &self.client,
-            serde_json::json!({
-                "phase": "stubsLoaded",
-                "root": root_label,
-                "message": format!("Reloaded {} stub files", loaded),
-                "stubFiles": loaded
-            }),
-        )
-        .await;
+        .into_iter()
+        .sum::<usize>();
 
         self.client
             .log_message(
@@ -3765,27 +3788,46 @@ impl PhpLspBackend {
             .await;
     }
 
-    async fn reindex_workspace_folders(&self, workspace_folders: &[PathBuf]) {
+    async fn reindex_workspace_folders(
+        &self,
+        workspace_folders: &[PathBuf],
+        mut reserved_indexing_runs: Vec<ReservedIndexingRun>,
+    ) {
         let state = self.runtime_state_snapshot().await;
         let all_configs = state.configs.clone();
         let runtime_generation = state.generation;
-        let configs: Vec<WorkspaceRootConfig> = all_configs
+        let requested_configs: Vec<WorkspaceRootConfig> = all_configs
             .iter()
             .filter(|config| workspace_folders.contains(&config.workspace_folder))
             .cloned()
             .collect();
-        if configs.is_empty() {
+        if requested_configs.is_empty() {
             return;
         }
-        let mut indexing_guards = Vec::with_capacity(configs.len());
-        for config in &configs {
-            let guard = self.start_indexing_run(&config.workspace_folder);
-            self.indexing_status_publisher.publish_for_run(
-                &guard.lease(),
-                runtime_generation,
-                workspace_discovery_indexing_status(&config.root),
-            );
+        let requires_reserved_run = !reserved_indexing_runs.is_empty();
+        let mut configs = Vec::with_capacity(requested_configs.len());
+        let mut indexing_guards = Vec::with_capacity(requested_configs.len());
+        for config in requested_configs {
+            let guard = if let Some(guard) =
+                take_matching_indexing_run(&mut reserved_indexing_runs, &config)
+            {
+                guard
+            } else if requires_reserved_run {
+                continue;
+            } else {
+                let guard = self.start_indexing_run(&config.workspace_folder);
+                self.indexing_status_publisher.publish_for_run(
+                    &guard.lease(),
+                    runtime_generation,
+                    workspace_discovery_indexing_status(&config.root),
+                );
+                guard
+            };
+            configs.push(config);
             indexing_guards.push(guard);
+        }
+        if configs.is_empty() {
+            return;
         }
         let effective_roots: Vec<PathBuf> = all_configs
             .iter()
@@ -4041,12 +4083,6 @@ impl PhpLspBackend {
     }
 
     async fn invalidate_composer_metadata(&self, path: &Path, reindex_workspace: bool) {
-        self.invalidate_request_fs_caches().await;
-        let mut vendor_epoch = self.vendor_load_epoch.write().await;
-        *vendor_epoch = vendor_epoch.wrapping_add(1);
-        self.vendor_autoload_cache.lock().await.clear();
-        self.vendor_file_lru.lock().await.clear();
-
         let state = self.runtime_state_snapshot().await;
         let mut affected_configs: Vec<WorkspaceRootConfig> = state
             .configs
@@ -4059,14 +4095,101 @@ impl PhpLspBackend {
         if affected_configs.is_empty() {
             affected_configs = state.configs.clone();
         }
+        let mut reserved_indexing_runs = Vec::new();
+        if reindex_workspace {
+            for config in &affected_configs {
+                let guard = self.start_indexing_run(&config.workspace_folder);
+                self.indexing_status_publisher.publish_for_run(
+                    &guard.lease(),
+                    state.generation,
+                    workspace_discovery_indexing_status(&config.root),
+                );
+                reserved_indexing_runs.push(ReservedIndexingRun {
+                    workspace_folder: config.workspace_folder.clone(),
+                    index: config.index.clone(),
+                    guard,
+                });
+            }
+        }
+        let reserved_run_leases = reserved_indexing_runs
+            .iter()
+            .map(|pending| pending.guard.lease())
+            .collect::<Vec<_>>();
+
+        self.invalidate_request_fs_caches().await;
+        if reindex_workspace && reserved_run_leases.iter().any(|run| !run.is_current()) {
+            return;
+        }
+        let mut vendor_epoch = self.vendor_load_epoch.write().await;
+        if reindex_workspace && reserved_run_leases.iter().any(|run| !run.is_current()) {
+            return;
+        }
+        let mut vendor_autoload_cache = self.vendor_autoload_cache.lock().await;
+        if reindex_workspace && reserved_run_leases.iter().any(|run| !run.is_current()) {
+            return;
+        }
+        let mut fallback_vendor_lru = self.vendor_file_lru.lock().await;
+        if reindex_workspace {
+            if self
+                .indexing_run
+                .commit_if_all_current(&reserved_run_leases, || {
+                    *vendor_epoch = vendor_epoch.wrapping_add(1);
+                    vendor_autoload_cache.clear();
+                    fallback_vendor_lru.clear();
+                })
+                .is_none()
+            {
+                return;
+            }
+        } else {
+            *vendor_epoch = vendor_epoch.wrapping_add(1);
+            vendor_autoload_cache.clear();
+            fallback_vendor_lru.clear();
+        }
+        drop(fallback_vendor_lru);
+        drop(vendor_autoload_cache);
+
         let mut removed_vendor_files = 0;
         for config in &affected_configs {
-            config.vendor_file_lru.lock().await.clear();
-            removed_vendor_files += self.indexing_run.commit_unleased_index_mutation(|| {
+            let mut lru = config.vendor_file_lru.lock().await;
+            let remove_vendor = || {
+                lru.clear();
                 remove_indexed_vendor_symbols(&config.index, std::slice::from_ref(&config.root))
-            });
+            };
+            if let Some(run) = reserved_indexing_runs
+                .iter()
+                .find(|pending| {
+                    pending.workspace_folder == config.workspace_folder
+                        && Arc::ptr_eq(&pending.index, &config.index)
+                })
+                .map(|pending| pending.guard.lease())
+            {
+                removed_vendor_files += run
+                    .commit_index_if_current(remove_vendor)
+                    .unwrap_or_default();
+            } else {
+                removed_vendor_files += self
+                    .indexing_run
+                    .commit_unleased_index_mutation(remove_vendor);
+            }
         }
-        {
+        if reindex_workspace {
+            if !rebuild_aggregate_for_indexing_runs(
+                &self.indexing_run,
+                &self.aggregate_rebuild,
+                &self.index,
+                state.configs.clone(),
+                self.open_files.clone(),
+                self.template_documents.clone(),
+                self.document_versions.clone(),
+                &reserved_run_leases,
+            )
+            .await
+            {
+                drop(vendor_epoch);
+                return;
+            }
+        } else {
             let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
             let aggregate = self.index.clone();
             let rebuild_configs = state.configs.clone();
@@ -4101,7 +4224,8 @@ impl PhpLspBackend {
                 .iter()
                 .map(|config| config.workspace_folder.clone())
                 .collect::<Vec<_>>();
-            self.reindex_workspace_folders(&workspace_folders).await;
+            self.reindex_workspace_folders(&workspace_folders, reserved_indexing_runs)
+                .await;
         } else {
             self.refresh_open_twig_contexts().await;
             let workspace_folders = affected_configs

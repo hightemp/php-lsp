@@ -128,13 +128,83 @@ pub(crate) fn load_configured_stubs(
     if clear_existing {
         remove_stub_symbols(index);
     }
+    prepare_configured_stubs(
+        index,
+        root,
+        client_stubs_path,
+        stub_extensions,
+        php_version,
+        None,
+    )
+    .map(PreparedStubLoad::commit_cache)
+    .unwrap_or_default()
+}
+
+pub(crate) struct PreparedStubLoad {
+    pub(crate) loaded: usize,
+    pub(crate) cache_path: Option<PathBuf>,
+    pub(crate) cache_write: Option<cache::PreparedCacheWrite>,
+}
+
+impl PreparedStubLoad {
+    fn empty() -> Self {
+        Self {
+            loaded: 0,
+            cache_path: None,
+            cache_write: None,
+        }
+    }
+
+    pub(crate) fn commit_cache(self) -> usize {
+        if let (Some(cache_path), Some(cache_write)) = (self.cache_path, self.cache_write) {
+            if let Err(error) = cache_write.commit() {
+                tracing::warn!(
+                    "Failed to save stubs index cache at {}: {}",
+                    cache_path.display(),
+                    error
+                );
+            }
+        }
+        self.loaded
+    }
+}
+
+pub(crate) fn prepare_configured_stubs_for_run(
+    index: &WorkspaceIndex,
+    root: &Path,
+    client_stubs_path: Option<PathBuf>,
+    stub_extensions: Option<Vec<String>>,
+    php_version: PhpVersion,
+    indexing_run: &IndexingRunLease,
+) -> Option<PreparedStubLoad> {
+    prepare_configured_stubs(
+        index,
+        root,
+        client_stubs_path,
+        stub_extensions,
+        php_version,
+        Some(indexing_run),
+    )
+}
+
+fn prepare_configured_stubs(
+    index: &WorkspaceIndex,
+    root: &Path,
+    client_stubs_path: Option<PathBuf>,
+    stub_extensions: Option<Vec<String>>,
+    php_version: PhpVersion,
+    indexing_run: Option<&IndexingRunLease>,
+) -> Option<PreparedStubLoad> {
+    if indexing_run.is_some_and(|run| !run.is_current()) {
+        return None;
+    }
 
     if stub_extensions
         .as_deref()
         .is_some_and(|extensions| extensions.is_empty())
     {
         tracing::info!("phpstorm-stubs disabled by config: stub extensions list is empty");
-        return 0;
+        return Some(PreparedStubLoad::empty());
     }
 
     let mut missing_paths = Vec::new();
@@ -159,7 +229,7 @@ pub(crate) fn load_configured_stubs(
             effective_stub_extensions_for_path(&stubs_path, stub_extensions.as_deref());
         if extensions.is_empty() {
             tracing::info!("phpstorm-stubs disabled by config: stub extensions list is empty");
-            return 0;
+            return Some(PreparedStubLoad::empty());
         }
         let cache_sources = collect_stub_cache_sources(&stubs_path, &extensions);
         let cache_path = cache::cache_file_path_for_namespace(root, CacheNamespace::Stubs);
@@ -176,12 +246,18 @@ pub(crate) fn load_configured_stubs(
             &cache_sources,
             &cache_config,
         );
+        if indexing_run.is_some_and(|run| !run.is_current()) {
+            return None;
+        }
         if let Some(reason) = cache_report.miss_reason.as_deref() {
             tracing::debug!("Stubs index cache miss: {}", reason);
         }
 
         let mut parsed = 0;
         for source in &cache_report.parse_sources {
+            if indexing_run.is_some_and(|run| !run.is_current()) {
+                return None;
+            }
             let Some(ext_name) = source.relative_path.split('/').next() else {
                 continue;
             };
@@ -200,12 +276,19 @@ pub(crate) fn load_configured_stubs(
 
         let cache_to_save =
             cache::build_cache_from_sources(index, &stubs_path, &cache_sources, &cache_config);
-        if let Err(e) = cache::save_cache_atomic(&cache_path, &cache_to_save) {
-            tracing::warn!(
-                "Failed to save stubs index cache at {}: {}",
-                cache_path.display(),
-                e
-            );
+        let cache_write = match cache::prepare_cache_write(&cache_path, &cache_to_save) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to prepare stubs index cache at {}: {}",
+                    cache_path.display(),
+                    error
+                );
+                None
+            }
+        };
+        if indexing_run.is_some_and(|run| !run.is_current()) {
+            return None;
         }
 
         let loaded = cache_report.loaded_files + parsed;
@@ -215,7 +298,11 @@ pub(crate) fn load_configured_stubs(
             cache_report.loaded_files,
             parsed
         );
-        return loaded;
+        return Some(PreparedStubLoad {
+            loaded,
+            cache_path: Some(cache_path),
+            cache_write,
+        });
     }
 
     if !unusable_paths.is_empty() {
@@ -231,7 +318,7 @@ pub(crate) fn load_configured_stubs(
         );
     }
     tracing::warn!("No usable phpstorm-stubs path found; built-in completions will be limited");
-    0
+    Some(PreparedStubLoad::empty())
 }
 
 fn unusable_stubs_path_reason(stubs_path: &Path) -> Option<String> {

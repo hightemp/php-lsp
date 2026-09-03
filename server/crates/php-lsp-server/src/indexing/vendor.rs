@@ -122,6 +122,11 @@ impl VendorFileLru {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.uris.len()
+    }
+
     pub(crate) fn touch(&mut self, uri: String) -> Vec<String> {
         if let Some(position) = self.uris.iter().position(|existing| existing == &uri) {
             self.uris.remove(position);

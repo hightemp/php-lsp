@@ -1479,6 +1479,117 @@ async fn test_initial_indexing_statuses_keep_run_fifo_order() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_configuration_reindex_reserves_one_run_before_stub_reload() {
+    let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
+    let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(notification) = socket.next().await {
+            let _ = notification_tx.send(notification);
+        }
+    });
+    let tmp = std::env::temp_dir().join(format!(
+        "php-lsp-configuration-run-order-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("Subject.php"), "<?php class Subject {}\n").unwrap();
+    let root_uri = path_to_uri(&tmp).unwrap();
+    let settings = |exclude_paths: Vec<&str>| {
+        json!({
+            "configurationVersion": 2,
+            "global": { "composerEnabled": false, "stubExtensions": [] },
+            "workspaceFolders": [{
+                "uri": root_uri,
+                "settings": { "excludePaths": exclude_paths }
+            }]
+        })
+    };
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            Some(&root_uri),
+            Some(settings(Vec::new())),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    let initial_ready =
+        next_indexing_status_for_phase(&mut notifications, "ready", Duration::from_secs(5)).await;
+    let initial_run = initial_ready["indexingRunId"].as_u64().unwrap();
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_change_configuration_notification(settings(vec![
+            "generated",
+        ])))
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let mut replacement_run = None;
+    let mut phases = Vec::new();
+    while phases.last().map(String::as_str) != Some("ready") {
+        let remaining = Duration::from_secs(5)
+            .checked_sub(started.elapsed())
+            .expect("timed out waiting for configuration reindex statuses");
+        let notification = tokio::time::timeout(remaining, notifications.recv())
+            .await
+            .expect("timed out waiting for configuration reindex statuses")
+            .expect("notification channel closed");
+        if notification.method() != "phpLsp/indexingStatus" {
+            continue;
+        }
+        let params = notification.params().expect("indexing status params");
+        let Some(run_id) = params["indexingRunId"].as_u64() else {
+            panic!("root-specific stub/reindex status must carry a run id: {params}");
+        };
+        if run_id <= initial_run {
+            continue;
+        }
+        assert_eq!(
+            replacement_run.get_or_insert(run_id),
+            &run_id,
+            "configuration stub reload and reindex must share one run"
+        );
+        phases.push(params["phase"].as_str().unwrap().to_string());
+    }
+    let position = |phase: &str| {
+        phases
+            .iter()
+            .position(|candidate| candidate == phase)
+            .unwrap_or_else(|| panic!("missing phase `{phase}` in {phases:?}"))
+    };
+    assert!(position("discovering") < position("loadingStubs"));
+    assert!(position("loadingStubs") < position("stubsLoaded"));
+    assert!(position("stubsLoaded") < position("indexing"));
+    assert!(position("indexing") < position("ready"));
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(999))
+        .await
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_shutdown_cancels_active_indexing_without_late_ready() {
     let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
     let (notification_tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();

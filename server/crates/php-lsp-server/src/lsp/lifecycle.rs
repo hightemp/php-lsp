@@ -64,7 +64,8 @@ impl PhpLspBackend {
             .initialization_options
             .unwrap_or_else(|| serde_json::json!({}));
         *self.client_settings.lock().await = client_settings.clone();
-        self.apply_effective_configuration_settings(&client_settings, &workspace_roots)
+        let mut application = self
+            .apply_effective_configuration_settings(&client_settings, &workspace_roots)
             .await;
         let runtime_state = self.runtime_state_snapshot().await;
         let active_workspaces = runtime_state
@@ -75,13 +76,15 @@ impl PhpLspBackend {
         self.external_symlinks
             .set_active_workspaces(&active_workspaces, &[])
             .await;
+        let mut reserved_runs = std::mem::take(&mut application.reserved_indexing_runs);
         let pending_runs = runtime_state
             .configs
             .iter()
-            .map(|config| PendingInitialIndexingRun {
+            .map(|config| ReservedIndexingRun {
                 workspace_folder: config.workspace_folder.clone(),
                 index: config.index.clone(),
-                guard: self.start_indexing_run(&config.workspace_folder),
+                guard: take_matching_indexing_run(&mut reserved_runs, config)
+                    .unwrap_or_else(|| self.start_indexing_run(&config.workspace_folder)),
             })
             .collect();
         *self.pending_initial_indexing_runs.lock().await = pending_runs;

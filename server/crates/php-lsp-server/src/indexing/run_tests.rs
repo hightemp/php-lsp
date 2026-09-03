@@ -90,6 +90,21 @@ fn aggregate_commit_linearizes_before_replacement_run_start() {
 }
 
 #[test]
+fn multi_root_commit_rejects_when_any_reserved_run_is_stale() {
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let root_a = PathBuf::from("/workspace/a");
+    let root_b = PathBuf::from("/workspace/b");
+    let old_a = coordinator.start(root_a.clone());
+    let run_b = coordinator.start(root_b);
+    let runs = vec![old_a.lease(), run_b.lease()];
+    let _new_a = coordinator.start(root_a);
+
+    assert!(coordinator
+        .commit_if_all_current(&runs, || "must not commit")
+        .is_none());
+}
+
+#[test]
 fn dropping_old_guard_does_not_finish_newer_run() {
     let coordinator = Arc::new(IndexingRunCoordinator::default());
     let root = PathBuf::from("/workspace/a");
