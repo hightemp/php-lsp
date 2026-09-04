@@ -3451,14 +3451,9 @@ pub(crate) fn nearest_local_refactor_scope<'tree>(
 
 pub(crate) fn collect_variable_names_for_refactor(
     node: tree_sitter::Node,
-    scope_id: usize,
     source: &str,
     names: &mut HashSet<String>,
 ) {
-    if node.id() != scope_id && is_refactor_scope_boundary(node) {
-        return;
-    }
-
     if node.kind() == "variable_name" {
         let text = source.get(node.byte_range()).unwrap_or("").trim();
         if let Some(name) = text.strip_prefix('$') {
@@ -3468,7 +3463,7 @@ pub(crate) fn collect_variable_names_for_refactor(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_variable_names_for_refactor(child, scope_id, source, names);
+        collect_variable_names_for_refactor(child, source, names);
     }
 }
 
@@ -3480,7 +3475,7 @@ pub(crate) fn unique_local_variable_name(
     let root = tree.root_node();
     let scope = nearest_local_refactor_scope(selected_node).unwrap_or(root);
     let mut names = HashSet::new();
-    collect_variable_names_for_refactor(scope, scope.id(), source, &mut names);
+    collect_variable_names_for_refactor(scope, source, &mut names);
 
     let base = "extracted";
     if !names.contains(base) {
@@ -3591,6 +3586,328 @@ pub(crate) fn selected_extract_expression<'tree>(
     }
 }
 
+pub(crate) fn refactor_binary_operator<'a>(
+    node: tree_sitter::Node,
+    source: &'a str,
+) -> Option<&'a str> {
+    let operator = node.child_by_field_name("operator")?;
+    source.get(operator.byte_range()).map(str::trim)
+}
+
+pub(crate) fn refactor_binary_operator_is_pure(operator: &str) -> bool {
+    matches!(
+        operator,
+        "+" | "-" | "*" | "==" | "!=" | "===" | "!==" | "<>" | "<" | "<=" | ">" | ">=" | "<=>"
+    )
+}
+
+pub(crate) fn first_non_extra_named_child(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut cursor = node.walk();
+    let child = node
+        .named_children(&mut cursor)
+        .find(|child| !child.is_extra());
+    child
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuaranteedScalarKind {
+    Numeric,
+    Other,
+}
+
+pub(crate) fn guaranteed_native_scalar_kind(type_text: &str) -> Option<GuaranteedScalarKind> {
+    let normalized = type_text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let is_nullable = normalized.starts_with('?');
+    let normalized = normalized.strip_prefix('?').unwrap_or(&normalized);
+    let parts = normalized.split('|').collect::<Vec<_>>();
+    if parts.is_empty()
+        || !parts.iter().all(|part| {
+            matches!(
+                *part,
+                "bool" | "false" | "float" | "int" | "null" | "string" | "true"
+            )
+        })
+    {
+        return None;
+    }
+    if !is_nullable && parts.iter().all(|part| matches!(*part, "float" | "int")) {
+        Some(GuaranteedScalarKind::Numeric)
+    } else {
+        Some(GuaranteedScalarKind::Other)
+    }
+}
+
+pub(crate) fn stable_variable_scalar_kind(
+    tree: &tree_sitter::Tree,
+    variable: tree_sitter::Node,
+    source: &str,
+) -> Option<GuaranteedScalarKind> {
+    let variable_name = variable_text_for_node(source, variable)?;
+    let scope = nearest_local_refactor_scope(variable)?;
+    let parameters = scope.child_by_field_name("parameters")?;
+
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if !matches!(
+            parameter.kind(),
+            "simple_parameter" | "property_promotion_parameter" | "variadic_parameter"
+        ) {
+            continue;
+        }
+        let Some(name) = parameter.child_by_field_name("name") else {
+            continue;
+        };
+        if variable_text_for_node(source, name).as_deref() != Some(variable_name.as_str()) {
+            continue;
+        }
+        if parameter.kind() == "variadic_parameter" {
+            return None;
+        }
+        let scalar_kind = parameter
+            .child_by_field_name("type")
+            .and_then(|type_node| source.get(type_node.byte_range()))
+            .and_then(guaranteed_native_scalar_kind);
+        if scalar_kind.is_none() || binding_reference_has_alias_hazard(name) {
+            return None;
+        }
+
+        let binding_references = find_variable_references_at_position(
+            tree,
+            source,
+            variable.start_position().row as u32,
+            variable.start_position().column as u32,
+            true,
+        )
+        .into_iter()
+        .filter_map(|reference| byte_offsets_for_range(source, reference.range))
+        .collect::<Vec<_>>();
+        return (binding_references.as_slice()
+            == [
+                (name.start_byte(), name.end_byte()),
+                (variable.start_byte(), variable.end_byte()),
+            ])
+        .then_some(scalar_kind)
+        .flatten();
+    }
+    None
+}
+
+pub(crate) fn refactor_expression_is_numeric(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+) -> bool {
+    match node.kind() {
+        "float" | "integer" => true,
+        "variable_name" => {
+            stable_variable_scalar_kind(tree, node, source) == Some(GuaranteedScalarKind::Numeric)
+        }
+        "parenthesized_expression" => first_non_extra_named_child(node)
+            .is_some_and(|child| refactor_expression_is_numeric(tree, child, source)),
+        "unary_op_expression" => {
+            let numeric_operator = node
+                .child_by_field_name("operator")
+                .and_then(|operator| source.get(operator.byte_range()))
+                .is_some_and(|operator| matches!(operator.trim(), "+" | "-"));
+            let argument = node
+                .child_by_field_name("argument")
+                .or_else(|| first_non_extra_named_child(node));
+            numeric_operator
+                && argument
+                    .is_some_and(|argument| refactor_expression_is_numeric(tree, argument, source))
+        }
+        "binary_expression" => {
+            let Some(left) = node.child_by_field_name("left") else {
+                return false;
+            };
+            let Some(right) = node.child_by_field_name("right") else {
+                return false;
+            };
+            refactor_binary_operator(node, source)
+                .is_some_and(|operator| matches!(operator, "+" | "-" | "*"))
+                && refactor_expression_is_numeric(tree, left, source)
+                && refactor_expression_is_numeric(tree, right, source)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn refactor_expression_is_pure(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+) -> bool {
+    if node.has_error() || node.is_missing() {
+        return false;
+    }
+
+    match node.kind() {
+        "boolean" | "false" | "float" | "integer" | "null" | "true" => true,
+        "variable_name" => stable_variable_scalar_kind(tree, node, source).is_some(),
+        "string" | "encapsed_string" => is_static_string_literal_node(node),
+        "parenthesized_expression" => first_non_extra_named_child(node)
+            .is_some_and(|child| refactor_expression_is_pure(tree, child, source)),
+        "unary_op_expression" => {
+            let operator = node
+                .child_by_field_name("operator")
+                .and_then(|operator| source.get(operator.byte_range()))
+                .map(str::trim);
+            let argument = node
+                .child_by_field_name("argument")
+                .or_else(|| first_non_extra_named_child(node));
+            match operator {
+                Some("!") => argument
+                    .is_some_and(|argument| refactor_expression_is_pure(tree, argument, source)),
+                Some("+") | Some("-") => argument
+                    .is_some_and(|argument| refactor_expression_is_numeric(tree, argument, source)),
+                _ => false,
+            }
+        }
+        "binary_expression" => {
+            let Some(left) = node.child_by_field_name("left") else {
+                return false;
+            };
+            let Some(right) = node.child_by_field_name("right") else {
+                return false;
+            };
+            match refactor_binary_operator(node, source) {
+                Some("+") | Some("-") | Some("*") => {
+                    refactor_expression_is_numeric(tree, left, source)
+                        && refactor_expression_is_numeric(tree, right, source)
+                }
+                Some(operator) if refactor_binary_operator_is_pure(operator) => {
+                    refactor_expression_is_pure(tree, left, source)
+                        && refactor_expression_is_pure(tree, right, source)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn simple_plain_variable_assignment_has_rhs(
+    assignment: tree_sitter::Node,
+    rhs: tree_sitter::Node,
+    source: &str,
+) -> bool {
+    if assignment.kind() != "assignment_expression" {
+        return false;
+    }
+    let Some(left) = assignment.child_by_field_name("left") else {
+        return false;
+    };
+    let Some(actual_rhs) = assignment.child_by_field_name("right") else {
+        return false;
+    };
+    left.kind() == "variable_name"
+        && actual_rhs.id() == rhs.id()
+        && source
+            .get(left.end_byte()..actual_rhs.start_byte())
+            .is_some_and(|operator| operator.trim() == "=")
+}
+
+pub(crate) fn refactor_expression_has_safe_statement_context(
+    tree: &tree_sitter::Tree,
+    expression: tree_sitter::Node,
+    statement: tree_sitter::Node,
+    source: &str,
+) -> bool {
+    let mut current = expression;
+    loop {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        if parent.id() == statement.id() {
+            return match statement.kind() {
+                "expression_statement" | "return_statement" => {
+                    first_non_extra_named_child(statement)
+                        .is_some_and(|child| child.id() == current.id())
+                }
+                "if_statement" | "switch_statement" => statement
+                    .child_by_field_name("condition")
+                    .is_some_and(|condition| condition.id() == current.id()),
+                _ => false,
+            };
+        }
+
+        let safe_parent = match parent.kind() {
+            "parenthesized_expression" | "unary_op_expression" => {
+                refactor_expression_is_pure(tree, parent, source)
+            }
+            "binary_expression" => {
+                refactor_expression_is_pure(tree, parent, source)
+                    && parent
+                        .child_by_field_name("left")
+                        .is_some_and(|left| left.id() == current.id())
+            }
+            "assignment_expression" => {
+                simple_plain_variable_assignment_has_rhs(parent, current, source)
+            }
+            _ => false,
+        };
+        if !safe_parent {
+            return false;
+        }
+        current = parent;
+    }
+}
+
+pub(crate) fn statement_starts_on_own_line(source: &str, statement: tree_sitter::Node) -> bool {
+    source
+        .get(line_start_offset(source, statement.start_byte())..statement.start_byte())
+        .is_some_and(|prefix| prefix.trim().is_empty())
+}
+
+pub(crate) fn tree_has_ticks_directive(tree: &tree_sitter::Tree) -> bool {
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "declare_directive" {
+            let mut directive_cursor = node.walk();
+            let is_ticks = node
+                .children(&mut directive_cursor)
+                .any(|child| !child.is_extra() && child.kind() == "ticks");
+            if is_ticks {
+                return true;
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+pub(crate) fn callable_returns_by_reference(callable: tree_sitter::Node) -> bool {
+    if !matches!(
+        callable.kind(),
+        "method_declaration"
+            | "function_definition"
+            | "arrow_function"
+            | "anonymous_function"
+            | "anonymous_function_creation_expression"
+    ) {
+        return false;
+    }
+    if callable.child_by_field_name("reference_modifier").is_some() {
+        return true;
+    }
+
+    let mut cursor = callable.walk();
+    let returns_by_reference = callable
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "reference_modifier");
+    returns_by_reference
+}
+
+pub(crate) fn statement_changes_reference_return_semantics(statement: tree_sitter::Node) -> bool {
+    statement.kind() == "return_statement"
+        && nearest_local_refactor_scope(statement).is_some_and(callable_returns_by_reference)
+}
+
 pub(crate) struct ExtractVariablePlan {
     variable_name: String,
     assignment_insert: usize,
@@ -3602,12 +3919,27 @@ pub(crate) struct ExtractVariablePlan {
 pub(crate) fn extract_variable_plan(
     tree: &tree_sitter::Tree,
     source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
     range: (u32, u32, u32, u32),
     variable_name: Option<&str>,
 ) -> Option<ExtractVariablePlan> {
+    if tree_has_ticks_directive(tree) {
+        return None;
+    }
     let expression = selected_extract_expression(tree, source, range)?;
     let statement = enclosing_statement_for_refactor(expression)?;
     statement_container_id(statement)?;
+    let scope = nearest_local_refactor_scope(expression)?;
+    let dangerous_aliases =
+        dynamic_symbol_table_function_aliases(file_symbols, scope.start_position());
+    if statement_changes_reference_return_semantics(statement)
+        || has_dynamic_local_symbol_table_hazard(scope, source, &dangerous_aliases)
+        || !statement_starts_on_own_line(source, statement)
+        || !refactor_expression_is_pure(tree, expression, source)
+        || !refactor_expression_has_safe_statement_context(tree, expression, statement, source)
+    {
+        return None;
+    }
 
     let expression_text = source
         .get(expression.start_byte()..expression.end_byte())?
@@ -3616,13 +3948,16 @@ pub(crate) fn extract_variable_plan(
         return None;
     }
 
+    let expected_variable_name = unique_local_variable_name(tree, source, expression);
     let variable_name = match variable_name {
-        Some(name) => requested_variable_name(name)?,
-        None => unique_local_variable_name(tree, source, expression),
+        Some(name) => {
+            let requested = requested_variable_name(name)?;
+            (requested == expected_variable_name).then_some(requested)?
+        }
+        None => expected_variable_name,
     };
-    let assignment_insert = line_start_offset(source, statement.start_byte());
-    let indent = line_indent_at_offset(source, statement.start_byte());
-    let assignment_text = format!("{}${} = {};\n", indent, variable_name, expression_text);
+    let assignment_insert = statement.start_byte();
+    let assignment_text = format!("${} = {}; ", variable_name, expression_text);
 
     Some(ExtractVariablePlan {
         variable_name,
@@ -3637,11 +3972,12 @@ pub(crate) fn build_extract_variable_action(
     uri: Uri,
     tree: &tree_sitter::Tree,
     source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
     request_range: Range,
     document_version: Option<i32>,
 ) -> Option<CodeActionOrCommand> {
     let range = lsp_range_to_byte_range(source, request_range);
-    let plan = extract_variable_plan(tree, source, range, None)?;
+    let plan = extract_variable_plan(tree, source, file_symbols, range, None)?;
     let data = serde_json::to_value(CodeActionData {
         action_kind: CodeActionDataKind::ExtractVariable,
         uri: uri.as_str().to_string(),
@@ -3684,10 +4020,24 @@ pub(crate) fn extract_variable_edit(
     uri: Uri,
     tree: &tree_sitter::Tree,
     source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
     range: (u32, u32, u32, u32),
     variable_name: &str,
 ) -> Option<WorkspaceEdit> {
-    let plan = extract_variable_plan(tree, source, range, Some(variable_name))?;
+    let plan = extract_variable_plan(tree, source, file_symbols, range, Some(variable_name))?;
+    if plan.assignment_insert == plan.expression_start {
+        return Some(workspace_edit_from_text_edits(
+            uri,
+            vec![TextEdit {
+                range: lsp_range_for_byte_offsets(
+                    source,
+                    plan.expression_start,
+                    plan.expression_end,
+                ),
+                new_text: format!("{}${}", plan.assignment_text, plan.variable_name),
+            }],
+        ));
+    }
     Some(workspace_edit_from_text_edits(
         uri,
         vec![
@@ -3990,6 +4340,8 @@ pub(crate) struct InlineAssignment {
     statement_start: usize,
     statement_end: usize,
     statement_container_id: usize,
+    variable_start: usize,
+    variable_end: usize,
     rhs_start: usize,
     rhs_end: usize,
 }
@@ -3998,6 +4350,7 @@ pub(crate) struct InlineRead {
     start: usize,
     end: usize,
     statement_start: usize,
+    statement_end: usize,
     statement_container_id: usize,
 }
 
@@ -4027,6 +4380,8 @@ pub(crate) fn simple_inline_assignment_from_statement(
         statement_start: statement.start_byte(),
         statement_end: statement.end_byte(),
         statement_container_id: statement_container_id(statement)?,
+        variable_start: left.start_byte(),
+        variable_end: left.end_byte(),
         rhs_start: right.start_byte(),
         rhs_end: right.end_byte(),
     })
@@ -4073,6 +4428,7 @@ pub(crate) fn collect_inline_reads(
                     start: node.start_byte(),
                     end: node.end_byte(),
                     statement_start: statement.start_byte(),
+                    statement_end: statement.end_byte(),
                     statement_container_id: container_id,
                 });
             }
@@ -4083,6 +4439,248 @@ pub(crate) fn collect_inline_reads(
     for child in node.named_children(&mut cursor) {
         collect_inline_reads(child, scope_id, source, variable_name, reads);
     }
+}
+
+pub(crate) fn node_for_exact_byte_span<'tree>(
+    root: tree_sitter::Node<'tree>,
+    start: usize,
+    end: usize,
+    kind: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut current = root.descendant_for_byte_range(start, end)?;
+    loop {
+        if current.kind() == kind && current.start_byte() == start && current.end_byte() == end {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+}
+
+pub(crate) fn inline_statements_are_adjacent(
+    root: tree_sitter::Node,
+    assignment: &InlineAssignment,
+    read: &InlineRead,
+) -> bool {
+    let Some(assignment_statement) = node_for_exact_byte_span(
+        root,
+        assignment.statement_start,
+        assignment.statement_end,
+        "expression_statement",
+    ) else {
+        return false;
+    };
+    let Some(read_statement) =
+        root.descendant_for_byte_range(read.statement_start, read.statement_end)
+    else {
+        return false;
+    };
+    let Some(container) = assignment_statement.parent() else {
+        return false;
+    };
+    if read_statement.parent().map(|parent| parent.id()) != Some(container.id()) {
+        return false;
+    }
+
+    let mut saw_assignment = false;
+    let mut cursor = container.walk();
+    for child in container.named_children(&mut cursor) {
+        if child.id() == assignment_statement.id() {
+            saw_assignment = true;
+            continue;
+        }
+        if !saw_assignment || child.is_extra() || child.kind() == "comment" {
+            continue;
+        }
+        return child.id() == read_statement.id();
+    }
+    false
+}
+
+pub(crate) fn inline_assignment_occupies_own_line(
+    source: &str,
+    assignment: &InlineAssignment,
+) -> bool {
+    let start_line = line_start_offset(source, assignment.statement_start);
+    let end_line = line_end_offset(source, assignment.statement_end);
+    source
+        .get(start_line..assignment.statement_start)
+        .is_some_and(|prefix| prefix.trim().is_empty())
+        && source
+            .get(assignment.statement_end..end_line)
+            .is_some_and(|suffix| suffix.trim().is_empty())
+        && !source
+            .get(assignment.statement_start..assignment.statement_end)
+            .is_some_and(|statement| statement.contains(['\n', '\r']))
+}
+
+pub(crate) fn line_content_span_preserving_ending(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
+    let line_start = line_start_offset(source, start);
+    let line_end = line_end_offset(source, end);
+    let content_end =
+        if line_end > line_start && source.as_bytes().get(line_end - 1) == Some(&b'\r') {
+            line_end - 1
+        } else {
+            line_end
+        };
+    (line_start, content_end)
+}
+
+pub(crate) fn binding_reference_has_alias_hazard(node: tree_sitter::Node) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "global_declaration"
+            | "static_variable_declaration"
+            | "by_ref"
+            | "by_ref_assignment_expression"
+            | "reference_assignment_expression" => return true,
+            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
+                return parent.child_by_field_name("reference_modifier").is_some();
+            }
+            kind if is_refactor_scope_boundary(parent) || kind == "program" => return false,
+            _ => current = parent,
+        }
+    }
+    false
+}
+
+pub(crate) fn function_may_access_caller_symbol_table(function_name: &str) -> bool {
+    matches!(
+        function_name,
+        "assert"
+            | "call_user_func"
+            | "call_user_func_array"
+            | "compact"
+            | "eval"
+            | "extract"
+            | "get_defined_vars"
+            | "parse_str"
+    )
+}
+
+pub(crate) fn dynamic_symbol_table_function_aliases(
+    file_symbols: &php_lsp_types::FileSymbols,
+    position: tree_sitter::Point,
+) -> HashSet<String> {
+    file_symbols
+        .scoped_at_byte_position(position.row as u32, position.column as u32)
+        .use_statements
+        .iter()
+        .filter(|use_statement| use_statement.kind == php_lsp_types::UseKind::Function)
+        .filter_map(|use_statement| {
+            let target = use_statement
+                .fqn
+                .trim_start_matches('\\')
+                .rsplit('\\')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            function_may_access_caller_symbol_table(&target).then(|| {
+                use_statement
+                    .alias
+                    .as_deref()
+                    .unwrap_or(target.as_str())
+                    .to_ascii_lowercase()
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn has_dynamic_local_symbol_table_hazard(
+    node: tree_sitter::Node,
+    source: &str,
+    dangerous_aliases: &HashSet<String>,
+) -> bool {
+    if matches!(
+        node.kind(),
+        "dynamic_variable_name"
+            | "include_expression"
+            | "include_once_expression"
+            | "require_expression"
+            | "require_once_expression"
+    ) {
+        return true;
+    }
+    if node.kind() == "function_call_expression" {
+        let dangerous = match node.child_by_field_name("function") {
+            Some(function) if matches!(function.kind(), "name" | "qualified_name") => source
+                .get(function.byte_range())
+                .map(str::trim)
+                .is_none_or(|function| {
+                    let normalized = function.trim_start_matches('\\').to_ascii_lowercase();
+                    let short_name = normalized.rsplit('\\').next().unwrap_or("");
+                    function_may_access_caller_symbol_table(short_name)
+                        || (!normalized.contains('\\') && dangerous_aliases.contains(&normalized))
+                }),
+            Some(_) | None => true,
+        };
+        if dangerous {
+            return true;
+        }
+    }
+
+    let mut cursor = node.walk();
+    let has_hazard = node
+        .named_children(&mut cursor)
+        .any(|child| has_dynamic_local_symbol_table_hazard(child, source, dangerous_aliases));
+    has_hazard
+}
+
+pub(crate) fn inline_binding_is_safe(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    selected_variable: tree_sitter::Node,
+    assignment: &InlineAssignment,
+    read: &InlineRead,
+) -> bool {
+    let selected_position = selected_variable.start_position();
+    let reference_spans = |include_declaration| {
+        find_variable_references_at_position(
+            tree,
+            source,
+            selected_position.row as u32,
+            selected_position.column as u32,
+            include_declaration,
+        )
+        .into_iter()
+        .filter_map(|reference| byte_offsets_for_range(source, reference.range))
+        .collect::<Vec<_>>()
+    };
+
+    let reads = reference_spans(false);
+    if reads.as_slice() != [(read.start, read.end)] {
+        return false;
+    }
+
+    let all_references = reference_spans(true);
+    if all_references.as_slice()
+        != [
+            (assignment.variable_start, assignment.variable_end),
+            (read.start, read.end),
+        ]
+    {
+        return false;
+    }
+
+    let root = tree.root_node();
+    if all_references.into_iter().any(|(start, end)| {
+        node_for_exact_byte_span(root, start, end, "variable_name")
+            .is_none_or(binding_reference_has_alias_hazard)
+    }) {
+        return false;
+    }
+
+    let Some(scope) = nearest_local_refactor_scope(selected_variable) else {
+        return false;
+    };
+    let dangerous_aliases =
+        dynamic_symbol_table_function_aliases(file_symbols, scope.start_position());
+    !has_dynamic_local_symbol_table_hazard(scope, source, &dangerous_aliases)
 }
 
 pub(crate) fn inline_replacement_is_atomic(node: tree_sitter::Node, source: &str) -> bool {
@@ -4204,9 +4802,13 @@ pub(crate) struct InlineVariablePlan {
 pub(crate) fn inline_variable_plan(
     tree: &tree_sitter::Tree,
     source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
     range: (u32, u32, u32, u32),
     variable_name: Option<&str>,
 ) -> Option<InlineVariablePlan> {
+    if tree_has_ticks_directive(tree) {
+        return None;
+    }
     let selected_variable = variable_name_node_at_range(tree, source, range)?;
     let selected_name = variable_text_for_node(source, selected_variable)?;
     if !is_renameable_variable(&selected_name) {
@@ -4220,7 +4822,7 @@ pub(crate) fn inline_variable_plan(
     }
 
     let root = tree.root_node();
-    let scope = nearest_local_refactor_scope(selected_variable).unwrap_or(root);
+    let scope = nearest_local_refactor_scope(selected_variable)?;
     let mut assignments = Vec::new();
     collect_inline_assignments(scope, scope.id(), source, &selected_name, &mut assignments);
     if assignments.len() != 1 {
@@ -4229,31 +4831,45 @@ pub(crate) fn inline_variable_plan(
 
     let mut reads = Vec::new();
     collect_inline_reads(scope, scope.id(), source, &selected_name, &mut reads);
-    if reads.is_empty() {
+    if reads.len() != 1 {
         return None;
     }
 
     let assignment = assignments.into_iter().next()?;
-    if !reads.iter().all(|read| {
-        assignment.statement_container_id == read.statement_container_id
-            && assignment.statement_end <= read.statement_start
-    }) {
+    let read = reads.into_iter().next()?;
+    if assignment.statement_container_id != read.statement_container_id
+        || assignment.statement_end > read.statement_start
+        || !inline_statements_are_adjacent(root, &assignment, &read)
+        || !inline_assignment_occupies_own_line(source, &assignment)
+    {
         return None;
     }
 
-    let rhs_node = tree
-        .root_node()
-        .descendant_for_byte_range(assignment.rhs_start, assignment.rhs_end)?;
-    if node_references_variable(rhs_node, source, &selected_name) {
+    let rhs_node = root.descendant_for_byte_range(assignment.rhs_start, assignment.rhs_end)?;
+    let read_node = node_for_exact_byte_span(root, read.start, read.end, "variable_name")?;
+    let read_statement = enclosing_statement_for_refactor(read_node)?;
+    if statement_changes_reference_return_semantics(read_statement)
+        || !refactor_expression_is_pure(tree, rhs_node, source)
+        || !refactor_expression_has_safe_statement_context(tree, read_node, read_statement, source)
+        || node_references_variable(rhs_node, source, &selected_name)
+        || !inline_binding_is_safe(
+            tree,
+            source,
+            file_symbols,
+            selected_variable,
+            &assignment,
+            &read,
+        )
+    {
         return None;
     }
     let replacement = inline_replacement_text_for_node(source, rhs_node)?;
-    let assignment_delete =
-        line_full_span(source, assignment.statement_start, assignment.statement_end);
-    let usage_replacements = reads
-        .into_iter()
-        .map(|read| (read.start, read.end, replacement.clone()))
-        .collect();
+    let assignment_delete = line_content_span_preserving_ending(
+        source,
+        assignment.statement_start,
+        assignment.statement_end,
+    );
+    let usage_replacements = vec![(read.start, read.end, replacement)];
 
     Some(InlineVariablePlan {
         variable_name: selected_name,
@@ -4266,11 +4882,12 @@ pub(crate) fn build_inline_variable_action(
     uri: Uri,
     tree: &tree_sitter::Tree,
     source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
     request_range: Range,
     document_version: Option<i32>,
 ) -> Option<CodeActionOrCommand> {
     let range = lsp_range_to_byte_range(source, request_range);
-    let plan = inline_variable_plan(tree, source, range, None)?;
+    let plan = inline_variable_plan(tree, source, file_symbols, range, None)?;
     let data = serde_json::to_value(CodeActionData {
         action_kind: CodeActionDataKind::InlineVariable,
         uri: uri.as_str().to_string(),
@@ -4298,10 +4915,11 @@ pub(crate) fn inline_variable_edit(
     uri: Uri,
     tree: &tree_sitter::Tree,
     source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
     range: (u32, u32, u32, u32),
     variable_name: &str,
 ) -> Option<WorkspaceEdit> {
-    let plan = inline_variable_plan(tree, source, range, Some(variable_name))?;
+    let plan = inline_variable_plan(tree, source, file_symbols, range, Some(variable_name))?;
     let mut edits = plan
         .usage_replacements
         .into_iter()
@@ -6044,6 +6662,7 @@ impl PhpLspBackend {
                     uri.clone(),
                     tree,
                     &source,
+                    &file_symbols,
                     params.range,
                     document_version,
                 ) {
@@ -6068,6 +6687,7 @@ impl PhpLspBackend {
                     uri.clone(),
                     tree,
                     &source,
+                    &file_symbols,
                     params.range,
                     document_version,
                 )
@@ -6629,16 +7249,26 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let Some(OpenDocumentSnapshot { tree, source, .. }) =
-                    open_document_snapshot_for_code_action(self, &uri, document_version)
+                let Some(OpenDocumentSnapshot {
+                    tree,
+                    source,
+                    file_symbols,
+                    ..
+                }) = open_document_snapshot_for_code_action(self, &uri, document_version)
                 else {
                     params.edit = Some(empty_workspace_edit());
                     return Ok(params);
                 };
                 let range = lsp_range_to_byte_range(&source, requested_range);
-                params.edit =
-                    extract_variable_edit(uri_value, &tree, &source, range, &variable_name)
-                        .or_else(|| Some(empty_workspace_edit()));
+                params.edit = extract_variable_edit(
+                    uri_value,
+                    &tree,
+                    &source,
+                    &file_symbols,
+                    range,
+                    &variable_name,
+                )
+                .or_else(|| Some(empty_workspace_edit()));
             }
             (
                 CodeActionDataKind::ExtractConstant,
@@ -6689,16 +7319,26 @@ impl PhpLspBackend {
                     return Ok(params);
                 };
 
-                let Some(OpenDocumentSnapshot { tree, source, .. }) =
-                    open_document_snapshot_for_code_action(self, &uri, document_version)
+                let Some(OpenDocumentSnapshot {
+                    tree,
+                    source,
+                    file_symbols,
+                    ..
+                }) = open_document_snapshot_for_code_action(self, &uri, document_version)
                 else {
                     params.edit = Some(empty_workspace_edit());
                     return Ok(params);
                 };
                 let range = lsp_range_to_byte_range(&source, requested_range);
-                params.edit =
-                    inline_variable_edit(uri_value, &tree, &source, range, &variable_name)
-                        .or_else(|| Some(empty_workspace_edit()));
+                params.edit = inline_variable_edit(
+                    uri_value,
+                    &tree,
+                    &source,
+                    &file_symbols,
+                    range,
+                    &variable_name,
+                )
+                .or_else(|| Some(empty_workspace_edit()));
             }
             _ => {
                 params.edit = Some(empty_workspace_edit());
@@ -6708,3 +7348,7 @@ impl PhpLspBackend {
         Ok(params)
     }
 }
+
+#[cfg(test)]
+#[path = "code_action_tests.rs"]
+mod tests;

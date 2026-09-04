@@ -2229,7 +2229,7 @@ function outside(): string
     assert!(
         extract_variable_edits
             .iter()
-            .any(|edit| { edit["newText"].as_str() == Some("        $extracted = $a + $b;\n") })
+            .any(|edit| { edit["newText"].as_str() == Some("$extracted = $a + $b; ") })
             && extract_variable_edits
                 .iter()
                 .any(|edit| edit["newText"].as_str() == Some("$extracted")),
@@ -2386,7 +2386,7 @@ function outside(): string
     assert!(
         collision_extract_edits
             .iter()
-            .any(|edit| { edit["newText"].as_str() == Some("        $extracted2 = $a * $b;\n") })
+            .any(|edit| { edit["newText"].as_str() == Some("$extracted2 = $a * $b; ") })
             && collision_extract_edits
                 .iter()
                 .any(|edit| edit["newText"].as_str() == Some("$extracted2")),
@@ -2408,47 +2408,17 @@ function outside(): string
         .await
         .unwrap();
     let inline_many_result = extract_result(inline_many_resp);
-    let inline_many_action = inline_many_result
-        .as_array()
-        .expect("code actions array")
-        .iter()
-        .find(|action| {
-            action.get("title").and_then(|value| value.as_str()) == Some("Inline variable `$total`")
-        })
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "expected multi-read inline variable action, got: {}",
-                inline_many_result
-            )
-        });
-    let inline_many_resolve = service
-        .ready()
-        .await
-        .unwrap()
-        .call(code_action_resolve_request(11, inline_many_action))
-        .await
-        .unwrap();
-    let inline_many_resolved = extract_result(inline_many_resolve);
-    let inline_many_edits = inline_many_resolved["edit"]["changes"][uri]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!(
-                "expected multi-read inline edits, got: {}",
-                inline_many_resolved
-            )
-        });
     assert!(
-        inline_many_edits
+        !inline_many_result
+            .as_array()
+            .expect("code actions array")
             .iter()
-            .filter(|edit| edit["newText"].as_str() == Some("($a + $b)"))
-            .count()
-            == 2
-            && inline_many_edits
-                .iter()
-                .any(|edit| edit["newText"].as_str() == Some("")),
-        "expected all same-block reads to be inlined and assignment deleted, got: {}",
-        inline_many_resolved
+            .any(|action| {
+                action.get("title").and_then(|value| value.as_str())
+                    == Some("Inline variable `$total`")
+            }),
+        "multi-read inline must be suppressed to preserve evaluation count, got: {}",
+        inline_many_result
     );
 
     let reassigned_inline_resp = service
@@ -2649,6 +2619,698 @@ function outside(): string
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_extract_and_inline_variable_suppress_semantic_changes() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "8.2" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+use function get_defined_vars as symbolVars;
+
+class SemanticSafety
+{
+    public function shortAnd(bool $ready, int $andLeft, int $andRight): bool
+    {
+        return $ready && ($andLeft + $andRight);
+    }
+
+    public function shortOr(bool $ready, int $orLeft, int $orRight): bool
+    {
+        return $ready || ($orLeft + $orRight);
+    }
+
+    public function ternary(bool $ready, int $ternaryLeft, int $ternaryRight): int
+    {
+        return $ready ? ($ternaryLeft + $ternaryRight) : 0;
+    }
+
+    public function matchBranch(bool $ready, int $matchLeft, int $matchRight): int
+    {
+        return match ($ready) { true => $matchLeft + $matchRight, default => 0 };
+    }
+
+    public function whileCondition(int $whileLeft, int $whileRight): void
+    {
+        while ($whileLeft + $whileRight) {}
+    }
+
+    public function forCondition(int $forLeft, int $forRight): void
+    {
+        for (; $forLeft + $forRight; ) {}
+    }
+
+    public function doCondition(int $doLeft, int $doRight): void
+    {
+        do {} while ($doLeft + $doRight);
+    }
+
+    public function effectfulExtract(): int
+    {
+        return nextId(); // extract-call target
+    }
+
+    public function propertyExtract(object $object): mixed
+    {
+        return $object->value; // extract-property target
+    }
+
+    public function inlineCall(): int
+    {
+        $callValue = nextId();
+        return $callValue; // inline-call target
+    }
+
+    public function inlineProperty(object $object): mixed
+    {
+        $propertyValue = $object->value;
+        return $propertyValue; // inline-property target
+    }
+
+    public function inlineMany(int $a): int
+    {
+        $manyValue = $a + 1;
+        return $manyValue + $manyValue; // inline-many target
+    }
+
+    public function interveningCall(int $a): int
+    {
+        $callGapValue = $a + 1;
+        observe();
+        return $callGapValue; // inline-call-gap target
+    }
+
+    public function interveningWrite(int $a): int
+    {
+        $writeGapValue = $a + 1;
+        $a++;
+        return $writeGapValue; // inline-write-gap target
+    }
+
+    public function inlineLoop(int $a): void
+    {
+        $loopValue = $a + 1;
+        while ($loopValue) {} // inline-loop target
+    }
+
+    public function inlineConditional(bool $flag, int $a): int
+    {
+        $conditionalValue = $a + 1;
+        return $flag ? $conditionalValue : 0; // inline-conditional target
+    }
+
+    public function inlineReference(int &$referenceValue, int $a): int
+    {
+        $referenceValue = $a + 1;
+        return $referenceValue; // inline-reference target
+    }
+
+    public function inlineStatic(int $a): int
+    {
+        static $staticValue;
+        $staticValue = $a + 1;
+        return $staticValue; // inline-static target
+    }
+
+    public function inlineGlobal(int $a): int
+    {
+        global $globalValue;
+        $globalValue = $a + 1;
+        return $globalValue; // inline-global target
+    }
+
+    public function inlineCapture(int $a): int
+    {
+        $captureValue = $a + 1;
+        $captureResult = $captureValue; // inline-capture target
+        $closure = function () use ($captureValue) { return $captureValue; };
+        return $captureResult;
+    }
+
+    public function inlineCompact(int $a): int
+    {
+        $compactValue = $a + 1;
+        $compactResult = $compactValue; // inline-compact target
+        compact('compactValue');
+        return $compactResult;
+    }
+
+    public function sameLine(int $a): int
+    {
+        $sameLineValue = $a + 1; return $sameLineValue; // inline-same-line target
+    }
+
+    public function dynamicExtract(int $dynamicValue): int
+    {
+        symbolVars();
+        return $dynamicValue + 1;
+    }
+
+    public function inlineIndirect(int $a): int
+    {
+        $indirectValue = $a + 1;
+        return $indirectValue; // inline-indirect target
+        call_user_func('get_defined_vars');
+    }
+
+    public function &referenceExtract(int &$referenceSource): int
+    {
+        return $referenceSource;
+    }
+
+    public function &referenceInline(int &$referenceSource): int
+    {
+        $referenceReturnValue = $referenceSource;
+        return $referenceReturnValue; // inline-reference-return target
+    }
+
+    public function refcountedExtract(object $refcountedObject): void
+    {
+        if ($refcountedObject) {}
+        unset($refcountedObject);
+        echo 'A';
+    }
+
+    public function refcountedInline(object $refcountedObject): void
+    {
+        $refcountedValue = $refcountedObject;
+        $refcountedResult = $refcountedValue; // inline-refcounted target
+        unset($refcountedObject, $refcountedResult);
+        echo 'A';
+    }
+
+    public function collisionExtract(int $collisionLeft, int $collisionRight): int
+    {
+        $extracted = 0;
+        return $collisionLeft + $collisionRight;
+    }
+
+    public function wholeExpression(int $wholeLeft, int $wholeRight): void
+    {
+        $wholeLeft + $wholeRight;
+    }
+
+    public function safeExtract(int $safeLeft, int $safeRight): int
+    {
+        return ($safeLeft + $safeRight) * 2;
+    }
+
+    public function safeInline(int $a): int
+    {
+        $safeInlineValue = $a + 1;
+        return $safeInlineValue; // safe-inline target
+    }
+}
+"#;
+    let uri = "file:///test/VariableRefactorSemanticSafety.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    let negative_cases = [
+        (
+            "$andLeft + $andRight",
+            "$andLeft + $andRight",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$orLeft + $orRight",
+            "$orLeft + $orRight",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$ternaryLeft + $ternaryRight",
+            "$ternaryLeft + $ternaryRight",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$matchLeft + $matchRight",
+            "$matchLeft + $matchRight",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$whileLeft + $whileRight",
+            "$whileLeft + $whileRight",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$forLeft + $forRight",
+            "$forLeft + $forRight",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$doLeft + $doRight",
+            "$doLeft + $doRight",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "nextId(); // extract-call target",
+            "nextId()",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$object->value; // extract-property target",
+            "$object->value",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$callValue; // inline-call target",
+            "$callValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$propertyValue; // inline-property target",
+            "$propertyValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$manyValue + $manyValue; // inline-many target",
+            "$manyValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$callGapValue; // inline-call-gap target",
+            "$callGapValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$writeGapValue; // inline-write-gap target",
+            "$writeGapValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$loopValue) {} // inline-loop target",
+            "$loopValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$conditionalValue : 0; // inline-conditional target",
+            "$conditionalValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$referenceValue; // inline-reference target",
+            "$referenceValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$staticValue; // inline-static target",
+            "$staticValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$globalValue; // inline-global target",
+            "$globalValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$captureValue; // inline-capture target",
+            "$captureValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$compactValue; // inline-compact target",
+            "$compactValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$sameLineValue; // inline-same-line target",
+            "$sameLineValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$dynamicValue + 1",
+            "$dynamicValue + 1",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$indirectValue; // inline-indirect target",
+            "$indirectValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "$referenceSource;\n    }\n\n    public function &referenceInline",
+            "$referenceSource",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$referenceReturnValue; // inline-reference-return target",
+            "$referenceReturnValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            "($refcountedObject) {}",
+            "($refcountedObject)",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            "$refcountedValue; // inline-refcounted target",
+            "$refcountedValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+    ];
+
+    for (index, (needle, selected, only, forbidden_title)) in negative_cases.into_iter().enumerate()
+    {
+        let start = utf16_position_at(code, needle);
+        let end = (start.0, start.1 + selected.encode_utf16().count() as u32);
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(code_action_request_with_only(
+                10 + index as i64,
+                uri,
+                (start, end),
+                json!([]),
+                vec![only],
+            ))
+            .await
+            .unwrap();
+        let result = extract_result(response);
+        assert!(
+            !result
+                .as_array()
+                .expect("code actions array")
+                .iter()
+                .any(|action| action
+                    .get("title")
+                    .and_then(|title| title.as_str())
+                    .is_some_and(|title| title.starts_with(forbidden_title))),
+            "unsafe {only} action should be suppressed for `{needle}`, got: {result}"
+        );
+    }
+
+    let safe_extract_start = utf16_position_at(code, "$safeLeft + $safeRight");
+    let safe_extract_end = (
+        safe_extract_start.0,
+        safe_extract_start.1 + "$safeLeft + $safeRight".len() as u32,
+    );
+    let safe_extract_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            40,
+            uri,
+            (safe_extract_start, safe_extract_end),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let safe_extract_result = extract_result(safe_extract_response);
+    let safe_extract_action = safe_extract_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| action["title"].as_str() == Some("Extract variable `$extracted`"))
+        .cloned()
+        .unwrap_or_else(|| panic!("expected safe extract action, got: {safe_extract_result}"));
+    let mut forged_extract = safe_extract_action.clone();
+    let unsafe_extract_start = utf16_position_at(code, "nextId(); // extract-call target");
+    forged_extract["data"]["range"] = json!({
+        "start": { "line": unsafe_extract_start.0, "character": unsafe_extract_start.1 },
+        "end": { "line": unsafe_extract_start.0, "character": unsafe_extract_start.1 + "nextId()".len() as u32 }
+    });
+    let forged_extract_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(41, forged_extract))
+        .await
+        .unwrap();
+    let forged_extract_result = extract_result(forged_extract_response);
+    assert_eq!(
+        forged_extract_result["edit"]["changes"]
+            .as_object()
+            .map(|changes| changes.len()),
+        Some(0),
+        "forged unsafe extract resolve must fail closed: {forged_extract_result}"
+    );
+
+    let mut forged_extract_name = safe_extract_action.clone();
+    forged_extract_name["data"]["extra"]["variable_name"] = json!("$safeLeft");
+    let forged_extract_name_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(42, forged_extract_name))
+        .await
+        .unwrap();
+    let forged_extract_name_result = extract_result(forged_extract_name_response);
+    assert_eq!(
+        forged_extract_name_result["edit"]["changes"]
+            .as_object()
+            .map(|changes| changes.len()),
+        Some(0),
+        "forged colliding extract name must fail closed: {forged_extract_name_result}"
+    );
+
+    let mut forged_extract_scope = safe_extract_action;
+    let collision_extract_start = utf16_position_at(code, "$collisionLeft + $collisionRight");
+    forged_extract_scope["data"]["range"] = json!({
+        "start": { "line": collision_extract_start.0, "character": collision_extract_start.1 },
+        "end": { "line": collision_extract_start.0, "character": collision_extract_start.1 + "$collisionLeft + $collisionRight".len() as u32 }
+    });
+    let forged_extract_scope_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(43, forged_extract_scope))
+        .await
+        .unwrap();
+    let forged_extract_scope_result = extract_result(forged_extract_scope_response);
+    assert_eq!(
+        forged_extract_scope_result["edit"]["changes"]
+            .as_object()
+            .map(|changes| changes.len()),
+        Some(0),
+        "cross-scope extract collision must fail closed: {forged_extract_scope_result}"
+    );
+
+    let whole_expression_start = utf16_position_at(code, "$wholeLeft + $wholeRight");
+    let whole_expression_end = (
+        whole_expression_start.0,
+        whole_expression_start.1 + "$wholeLeft + $wholeRight".len() as u32,
+    );
+    let whole_expression_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            44,
+            uri,
+            (whole_expression_start, whole_expression_end),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let whole_expression_result = extract_result(whole_expression_response);
+    let whole_expression_action = whole_expression_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| action["title"].as_str() == Some("Extract variable `$extracted`"))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("expected whole-expression extract action, got: {whole_expression_result}")
+        });
+    let whole_expression_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(45, whole_expression_action))
+        .await
+        .unwrap();
+    let whole_expression_resolved = extract_result(whole_expression_resolve);
+    let whole_expression_edits = whole_expression_resolved["edit"]["changes"][uri]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("expected combined whole-expression edit: {whole_expression_resolved}")
+        });
+    assert_eq!(whole_expression_edits.len(), 1);
+    assert_eq!(
+        whole_expression_edits[0]["newText"].as_str(),
+        Some("$extracted = $wholeLeft + $wholeRight; $extracted")
+    );
+
+    let safe_inline_start = utf16_position_at(code, "$safeInlineValue; // safe-inline target");
+    let safe_inline_end = (
+        safe_inline_start.0,
+        safe_inline_start.1 + "$safeInlineValue".len() as u32,
+    );
+    let safe_inline_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            46,
+            uri,
+            (safe_inline_start, safe_inline_end),
+            json!([]),
+            vec!["refactor.inline"],
+        ))
+        .await
+        .unwrap();
+    let safe_inline_result = extract_result(safe_inline_response);
+    let mut forged_inline = safe_inline_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| action["title"].as_str() == Some("Inline variable `$safeInlineValue`"))
+        .cloned()
+        .unwrap_or_else(|| panic!("expected safe inline action, got: {safe_inline_result}"));
+    let unsafe_inline_start = utf16_position_at(code, "$callValue; // inline-call target");
+    forged_inline["data"]["range"] = json!({
+        "start": { "line": unsafe_inline_start.0, "character": unsafe_inline_start.1 },
+        "end": { "line": unsafe_inline_start.0, "character": unsafe_inline_start.1 + "$callValue".len() as u32 }
+    });
+    forged_inline["data"]["extra"]["variable_name"] = json!("$callValue");
+    let forged_inline_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(47, forged_inline))
+        .await
+        .unwrap();
+    let forged_inline_result = extract_result(forged_inline_response);
+    assert_eq!(
+        forged_inline_result["edit"]["changes"]
+            .as_object()
+            .map(|changes| changes.len()),
+        Some(0),
+        "forged unsafe inline resolve must fail closed: {forged_inline_result}"
+    );
+
+    let ticks_code = r#"<?php
+declare(ticks /* keep */ = 1);
+
+function ticksExtract(int $ticksLeft, int $ticksRight): int
+{
+    return $ticksLeft + $ticksRight;
+}
+
+function ticksInline(int $source): int
+{
+    $ticksValue = $source + 1;
+    return $ticksValue;
+}
+"#;
+    let ticks_uri = "file:///test/VariableRefactorTicks.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(ticks_uri, ticks_code))
+        .await
+        .unwrap();
+    for (id, needle, selected, only, forbidden_title) in [
+        (
+            48,
+            "$ticksLeft + $ticksRight",
+            "$ticksLeft + $ticksRight",
+            "refactor.extract",
+            "Extract variable",
+        ),
+        (
+            49,
+            "$ticksValue;",
+            "$ticksValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+    ] {
+        let start = utf16_position_at(ticks_code, needle);
+        let end = (start.0, start.1 + selected.len() as u32);
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(code_action_request_with_only(
+                id,
+                ticks_uri,
+                (start, end),
+                json!([]),
+                vec![only],
+            ))
+            .await
+            .unwrap();
+        let result = extract_result(response);
+        assert!(
+            !result
+                .as_array()
+                .expect("code actions array")
+                .iter()
+                .any(|action| action["title"]
+                    .as_str()
+                    .is_some_and(|title| title.starts_with(forbidden_title))),
+            "{only} must be suppressed under declare(ticks): {result}"
+        );
+    }
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_inline_variable_allows_prefix_variable_in_rhs() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
@@ -2828,7 +3490,7 @@ class UnicodeRefactorDemo
     assert!(
         edits
             .iter()
-            .any(|edit| edit["newText"].as_str() == Some("        $extracted = $a + $b;\n"))
+            .any(|edit| edit["newText"].as_str() == Some("$extracted = $a + $b; "))
             && edits
                 .iter()
                 .any(|edit| edit["newText"].as_str() == Some("$extracted")),

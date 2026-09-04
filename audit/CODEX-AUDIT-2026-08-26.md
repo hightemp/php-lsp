@@ -533,6 +533,10 @@ generation-barrier тестов.
 
 ### CODEX-P1-09. Extract/inline variable могут менять семантику программы
 
+> **Статус 2026-09-04:** исправлено. Оба refactoring action теперь доступны
+> только для консервативного CST-доказанного scalar subset и повторно проходят
+> те же проверки при lazy resolve.
+
 [`extract_variable_plan`](server/crates/php-lsp-server/src/lsp/code_action.rs#L3602)
 для любой однострочной выбранной expression вставляет assignment перед
 enclosing statement. Проверок short-circuit, ternary, loop condition и числа
@@ -555,6 +559,25 @@ use($x)` начинает читать уже новое состояние.
 - учитывать writes/calls/aliasing между assignment и usage;
 - добавить negative E2E на `&&`, `||`, `?:`, loop condition, function calls,
   property reads и несколько usages.
+
+#### Реализовано
+
+- Extract/inline ограничены локальным callable scope, стабильными native scalar
+  parameters/literals и non-throwing arithmetic/comparison expressions;
+  effectful, refcounted, reassigned, aliased и повторно используемые bindings
+  fail closed;
+- hoist допускается только по однократному unconditional left evaluation path;
+  short-circuit, ternary/match, loop headers, calls, properties, interpolation,
+  reference returns, top-level globals и `declare(ticks)` блокируются;
+- Inline требует одну fresh assignment и одно непосредственно следующее safe
+  read в parser binding component; captures, foreach/reference bindings,
+  dynamic variables, include/eval и прямые/aliased/indirect symbol-table
+  observers блокируются;
+- edits сохраняют число строк и не пересекаются; forged extract name/range
+  повторно сверяются с актуальным уникальным именем и безопасным планом;
+- unit/E2E regressions покрывают control flow, evaluation count, object lifetime,
+  backward loops, aliases/captures, dynamic symbol tables, ticks, UTF-16,
+  CRLF/LF и lazy resolve fail-closed.
 
 ### CODEX-P1-10. Generate constructor может сломать наследование
 

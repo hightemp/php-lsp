@@ -8183,7 +8183,7 @@ fn test_parse_psalm_json_diagnostics_clamps_inverted_ranges() {
 }
 
 #[test]
-fn test_inline_variable_plan_uses_exact_rhs_variable_tokens() {
+fn test_inline_variable_plan_uses_exact_rhs_variable_tokens_and_purity() {
     fn plan_is_available(rhs: &str) -> bool {
         let source = format!(
             "<?php\nfunction test(int $ab): mixed\n{{\n    $a = {rhs};\n    return $a;\n}}\n"
@@ -8193,10 +8193,12 @@ fn test_inline_variable_plan_uses_exact_rhs_variable_tokens() {
         let mut parser = FileParser::new();
         parser.parse_full(&source);
         let tree = parser.tree().expect("inline test source should parse");
+        let file_symbols = extract_file_symbols(tree, &source, "file:///inline-token-test.php");
 
         inline_variable_plan(
             tree,
             &source,
+            &file_symbols,
             (line, column, line, column + "$a".len() as u32),
             None,
         )
@@ -8208,12 +8210,10 @@ fn test_inline_variable_plan_uses_exact_rhs_variable_tokens() {
         "'$a literal'",
         r#""literal \$a""#,
         "1 /* $a */ + 2",
-        r#""${ab}""#,
-        r#""${obj->a}""#,
     ] {
         assert!(
             plan_is_available(rhs),
-            "non-reference text must not suppress inline variable for RHS {rhs:?}"
+            "pure non-reference text must not suppress inline variable for RHS {rhs:?}"
         );
     }
     for rhs in [
@@ -8222,10 +8222,12 @@ fn test_inline_variable_plan_uses_exact_rhs_variable_tokens() {
         r#""${a}""#,
         r#""${a[0]}""#,
         r#""${a->p}""#,
+        r#""${ab}""#,
+        r#""${obj->a}""#,
     ] {
         assert!(
             !plan_is_available(rhs),
-            "a true selected-variable read must suppress inline for RHS {rhs:?}"
+            "selected-variable reads and interpolated strings must suppress inline for RHS {rhs:?}"
         );
     }
 }
