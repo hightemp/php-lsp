@@ -1,5 +1,6 @@
 model_context_window = 1000000
 model_auto_compact_token_limit = 1000000
+project_doc_max_bytes = 65536
 
 [mcp_servers.codegraph]
 command = "codegraph"
