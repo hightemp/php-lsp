@@ -3311,6 +3311,248 @@ function ticksInline(int $source): int
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_variable_refactors_handle_php74_mb_parse_str_and_integer_bitwise() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request_with_options(
+            1,
+            None,
+            Some(json!({ "phpVersion": "7.4" })),
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+
+    let code = r#"<?php
+use function mb_parse_str as importVariables;
+
+function directInline(int $a): int
+{
+    mb_parse_str('a=not_numeric');
+    $unsafeValue = $a + 1;
+    return $unsafeValue; // direct inline
+}
+
+function aliasedInline(int $a): int
+{
+    importVariables('a=not_numeric');
+    $aliasedValue = $a + 1;
+    return $aliasedValue; // aliased inline
+}
+
+function qualifiedExtract(int $extractA): int
+{
+    \mb_parse_str('extractA=not_numeric');
+    return $extractA + 1; // qualified extract
+}
+
+function safeBitwise(int $left, int $right): int
+{
+    return ~$left & ($right | 1); // bitwise extract
+}
+
+function safeInlineBitwise(int $left, int $right): int
+{
+    $safeValue = $left ^ $right;
+    return $safeValue; // bitwise inline
+}
+"#;
+    let uri = "file:///test/VariableRefactorMbParseStr.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(uri, code))
+        .await
+        .unwrap();
+
+    for (id, needle, selected, only, forbidden_title) in [
+        (
+            10,
+            "$unsafeValue; // direct inline",
+            "$unsafeValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            11,
+            "$aliasedValue; // aliased inline",
+            "$aliasedValue",
+            "refactor.inline",
+            "Inline variable",
+        ),
+        (
+            12,
+            "$extractA + 1; // qualified extract",
+            "$extractA + 1",
+            "refactor.extract",
+            "Extract variable",
+        ),
+    ] {
+        let start = utf16_position_at(code, needle);
+        let end = (start.0, start.1 + selected.encode_utf16().count() as u32);
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(code_action_request_with_only(
+                id,
+                uri,
+                (start, end),
+                json!([]),
+                vec![only],
+            ))
+            .await
+            .unwrap();
+        let result = extract_result(response);
+        assert!(
+            !result
+                .as_array()
+                .expect("code actions array")
+                .iter()
+                .any(|action| action["title"]
+                    .as_str()
+                    .is_some_and(|title| title.starts_with(forbidden_title))),
+            "{only} must be suppressed for PHP 7.4 mb_parse_str hazard: {result}"
+        );
+    }
+
+    let bitwise_expression = "~$left & ($right | 1)";
+    let bitwise_start = utf16_position_at(code, bitwise_expression);
+    let bitwise_end = (
+        bitwise_start.0,
+        bitwise_start.1 + bitwise_expression.encode_utf16().count() as u32,
+    );
+    let bitwise_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            20,
+            uri,
+            (bitwise_start, bitwise_end),
+            json!([]),
+            vec!["refactor.extract"],
+        ))
+        .await
+        .unwrap();
+    let bitwise_result = extract_result(bitwise_response);
+    let bitwise_action = bitwise_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| action["title"].as_str() == Some("Extract variable `$extracted`"))
+        .cloned()
+        .unwrap_or_else(|| panic!("expected integer bitwise extract action: {bitwise_result}"));
+
+    let bitwise_resolve = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(21, bitwise_action.clone()))
+        .await
+        .unwrap();
+    let bitwise_resolved = extract_result(bitwise_resolve);
+    assert!(
+        bitwise_resolved["edit"]["changes"][uri]
+            .as_array()
+            .is_some_and(|edits| !edits.is_empty()),
+        "integer bitwise extract should resolve to edits: {bitwise_resolved}"
+    );
+
+    let mut forged_extract = bitwise_action;
+    let unsafe_extract_start = utf16_position_at(code, "$extractA + 1; // qualified extract");
+    forged_extract["data"]["range"] = json!({
+        "start": { "line": unsafe_extract_start.0, "character": unsafe_extract_start.1 },
+        "end": { "line": unsafe_extract_start.0, "character": unsafe_extract_start.1 + "$extractA + 1".len() as u32 }
+    });
+    let forged_extract_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(22, forged_extract))
+        .await
+        .unwrap();
+    let forged_extract_result = extract_result(forged_extract_response);
+    assert_eq!(
+        forged_extract_result["edit"]["changes"]
+            .as_object()
+            .map(|changes| changes.len()),
+        Some(0),
+        "forged mb_parse_str extract resolve must fail closed: {forged_extract_result}"
+    );
+
+    let safe_inline_start = utf16_position_at(code, "$safeValue; // bitwise inline");
+    let safe_inline_end = (
+        safe_inline_start.0,
+        safe_inline_start.1 + "$safeValue".len() as u32,
+    );
+    let safe_inline_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_request_with_only(
+            23,
+            uri,
+            (safe_inline_start, safe_inline_end),
+            json!([]),
+            vec!["refactor.inline"],
+        ))
+        .await
+        .unwrap();
+    let safe_inline_result = extract_result(safe_inline_response);
+    let mut forged_inline = safe_inline_result
+        .as_array()
+        .expect("code actions array")
+        .iter()
+        .find(|action| action["title"].as_str() == Some("Inline variable `$safeValue`"))
+        .cloned()
+        .unwrap_or_else(|| panic!("expected integer bitwise inline action: {safe_inline_result}"));
+    let unsafe_inline_start = utf16_position_at(code, "$unsafeValue; // direct inline");
+    forged_inline["data"]["range"] = json!({
+        "start": { "line": unsafe_inline_start.0, "character": unsafe_inline_start.1 },
+        "end": { "line": unsafe_inline_start.0, "character": unsafe_inline_start.1 + "$unsafeValue".len() as u32 }
+    });
+    forged_inline["data"]["extra"]["variable_name"] = json!("$unsafeValue");
+    let forged_inline_response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(code_action_resolve_request(24, forged_inline))
+        .await
+        .unwrap();
+    let forged_inline_result = extract_result(forged_inline_response);
+    assert_eq!(
+        forged_inline_result["edit"]["changes"]
+            .as_object()
+            .map(|changes| changes.len()),
+        Some(0),
+        "forged mb_parse_str inline resolve must fail closed: {forged_inline_result}"
+    );
+
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_inline_variable_allows_prefix_variable_in_rhs() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {

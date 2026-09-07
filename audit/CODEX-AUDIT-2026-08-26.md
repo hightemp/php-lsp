@@ -563,21 +563,24 @@ use($x)` начинает читать уже новое состояние.
 #### Реализовано
 
 - Extract/inline ограничены локальным callable scope, стабильными native scalar
-  parameters/literals и non-throwing arithmetic/comparison expressions;
-  effectful, refcounted, reassigned, aliased и повторно используемые bindings
-  fail closed;
+  parameters/literals и non-throwing arithmetic/comparison expressions; unary
+  `~` и binary `& | ^` разрешены только для доказанно integer operands, а
+  literals дополнительно ограничены переносимым 32-bit диапазоном; effectful,
+  refcounted, reassigned, aliased и повторно используемые bindings fail closed;
 - hoist допускается только по однократному unconditional left evaluation path;
   short-circuit, ternary/match, loop headers, calls, properties, interpolation,
   reference returns, top-level globals и `declare(ticks)` блокируются;
 - Inline требует одну fresh assignment и одно непосредственно следующее safe
   read в parser binding component; captures, foreach/reference bindings,
   dynamic variables, include/eval и прямые/aliased/indirect symbol-table
-  observers блокируются;
+  observers блокируются, включая однопараметрический PHP 7.4 `mb_parse_str`,
+  который может изменить caller symbol table без явного variable reference;
 - edits сохраняют число строк и не пересекаются; forged extract name/range
   повторно сверяются с актуальным уникальным именем и безопасным планом;
 - unit/E2E regressions покрывают control flow, evaluation count, object lifetime,
-  backward loops, aliases/captures, dynamic symbol tables, ticks, UTF-16,
-  CRLF/LF и lazy resolve fail-closed.
+  backward loops, aliases/captures, dynamic symbol tables, direct/qualified/
+  aliased `mb_parse_str`, integer bitwise whitelist, ticks, UTF-16, CRLF/LF и
+  lazy resolve fail-closed.
 
 ### CODEX-P1-10. Generate constructor может сломать наследование
 

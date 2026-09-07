@@ -3594,10 +3594,10 @@ pub(crate) fn refactor_binary_operator<'a>(
     source.get(operator.byte_range()).map(str::trim)
 }
 
-pub(crate) fn refactor_binary_operator_is_pure(operator: &str) -> bool {
+pub(crate) fn refactor_binary_operator_is_comparison(operator: &str) -> bool {
     matches!(
         operator,
-        "+" | "-" | "*" | "==" | "!=" | "===" | "!==" | "<>" | "<" | "<=" | ">" | ">=" | "<=>"
+        "==" | "!=" | "===" | "!==" | "<>" | "<" | "<=" | ">" | ">=" | "<=>"
     )
 }
 
@@ -3611,6 +3611,7 @@ pub(crate) fn first_non_extra_named_child(node: tree_sitter::Node) -> Option<tre
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GuaranteedScalarKind {
+    Integer,
     Numeric,
     Other,
 }
@@ -3634,7 +3635,9 @@ pub(crate) fn guaranteed_native_scalar_kind(type_text: &str) -> Option<Guarantee
     {
         return None;
     }
-    if !is_nullable && parts.iter().all(|part| matches!(*part, "float" | "int")) {
+    if !is_nullable && parts.iter().all(|part| *part == "int") {
+        Some(GuaranteedScalarKind::Integer)
+    } else if !is_nullable && parts.iter().all(|part| matches!(*part, "float" | "int")) {
         Some(GuaranteedScalarKind::Numeric)
     } else {
         Some(GuaranteedScalarKind::Other)
@@ -3696,13 +3699,81 @@ pub(crate) fn stable_variable_scalar_kind(
     None
 }
 
-pub(crate) fn refactor_expression_is_numeric(
+pub(crate) fn integer_literal_is_portably_integer(node: tree_sitter::Node, source: &str) -> bool {
+    if node.kind() != "integer" {
+        return false;
+    }
+    let Some(raw) = source.get(node.byte_range()) else {
+        return false;
+    };
+    let normalized = raw.replace('_', "");
+    let lower = normalized.to_ascii_lowercase();
+    let (digits, radix) = if let Some(digits) = lower.strip_prefix("0x") {
+        (digits, 16)
+    } else if let Some(digits) = lower.strip_prefix("0b") {
+        (digits, 2)
+    } else if let Some(digits) = lower.strip_prefix("0o") {
+        (digits, 8)
+    } else if lower.len() > 1 && lower.starts_with('0') {
+        (&lower[1..], 8)
+    } else {
+        (lower.as_str(), 10)
+    };
+    !digits.is_empty()
+        && u64::from_str_radix(digits, radix).is_ok_and(|value| value <= i32::MAX as u64)
+}
+
+pub(crate) fn refactor_expression_is_integer(
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node,
     source: &str,
 ) -> bool {
     match node.kind() {
-        "float" | "integer" => true,
+        "integer" => integer_literal_is_portably_integer(node, source),
+        "variable_name" => {
+            stable_variable_scalar_kind(tree, node, source) == Some(GuaranteedScalarKind::Integer)
+        }
+        "parenthesized_expression" => first_non_extra_named_child(node)
+            .is_some_and(|child| refactor_expression_is_integer(tree, child, source)),
+        "unary_op_expression" => {
+            let is_bitwise_not = node
+                .child_by_field_name("operator")
+                .and_then(|operator| source.get(operator.byte_range()))
+                .is_some_and(|operator| operator.trim() == "~");
+            let argument = node
+                .child_by_field_name("argument")
+                .or_else(|| first_non_extra_named_child(node));
+            is_bitwise_not
+                && argument
+                    .is_some_and(|argument| refactor_expression_is_integer(tree, argument, source))
+        }
+        "binary_expression" => {
+            let Some(left) = node.child_by_field_name("left") else {
+                return false;
+            };
+            let Some(right) = node.child_by_field_name("right") else {
+                return false;
+            };
+            refactor_binary_operator(node, source)
+                .is_some_and(|operator| matches!(operator, "&" | "|" | "^"))
+                && refactor_expression_is_integer(tree, left, source)
+                && refactor_expression_is_integer(tree, right, source)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn refactor_expression_is_numeric(
+    tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+    source: &str,
+) -> bool {
+    if refactor_expression_is_integer(tree, node, source) {
+        return true;
+    }
+
+    match node.kind() {
+        "float" => true,
         "variable_name" => {
             stable_variable_scalar_kind(tree, node, source) == Some(GuaranteedScalarKind::Numeric)
         }
@@ -3764,6 +3835,8 @@ pub(crate) fn refactor_expression_is_pure(
                     .is_some_and(|argument| refactor_expression_is_pure(tree, argument, source)),
                 Some("+") | Some("-") => argument
                     .is_some_and(|argument| refactor_expression_is_numeric(tree, argument, source)),
+                Some("~") => argument
+                    .is_some_and(|argument| refactor_expression_is_integer(tree, argument, source)),
                 _ => false,
             }
         }
@@ -3779,7 +3852,11 @@ pub(crate) fn refactor_expression_is_pure(
                     refactor_expression_is_numeric(tree, left, source)
                         && refactor_expression_is_numeric(tree, right, source)
                 }
-                Some(operator) if refactor_binary_operator_is_pure(operator) => {
+                Some("&") | Some("|") | Some("^") => {
+                    refactor_expression_is_integer(tree, left, source)
+                        && refactor_expression_is_integer(tree, right, source)
+                }
+                Some(operator) if refactor_binary_operator_is_comparison(operator) => {
                     refactor_expression_is_pure(tree, left, source)
                         && refactor_expression_is_pure(tree, right, source)
                 }
@@ -4558,6 +4635,7 @@ pub(crate) fn function_may_access_caller_symbol_table(function_name: &str) -> bo
             | "eval"
             | "extract"
             | "get_defined_vars"
+            | "mb_parse_str"
             | "parse_str"
     )
 }

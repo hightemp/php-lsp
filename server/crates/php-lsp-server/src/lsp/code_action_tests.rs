@@ -118,6 +118,14 @@ fn refactor_purity_whitelist_excludes_magic_and_conditional_operations() {
             "<?php\nfunction f(int $value): int\n{\n    return -$value;\n}\n",
             "-$value",
         ),
+        (
+            "<?php\nfunction f(int $value): int\n{\n    return ~$value;\n}\n",
+            "~$value",
+        ),
+        (
+            "<?php\nfunction f(int $left, int $right): int\n{\n    return $left & ($right | 1);\n}\n",
+            "$left & ($right | 1)",
+        ),
     ];
     for (source, needle) in safe_cases {
         assert!(
@@ -142,6 +150,18 @@ fn refactor_purity_whitelist_excludes_magic_and_conditional_operations() {
         (
             "<?php\nfunction f($value): mixed\n{\n    return $value ?? 0;\n}\n",
             "$value ?? 0",
+        ),
+        (
+            "<?php\nfunction f(float $value): int\n{\n    return ~$value;\n}\n",
+            "~$value",
+        ),
+        (
+            "<?php\nfunction f(int $left, int $right): int\n{\n    return $left << $right;\n}\n",
+            "$left << $right",
+        ),
+        (
+            "<?php\nfunction f(int $value): int\n{\n    return 4294967296 & $value;\n}\n",
+            "4294967296 & $value",
         ),
         (
             "<?php\nfunction f(string $value): string\n{\n    return \"prefix $value\";\n}\n",
@@ -253,6 +273,8 @@ fn dynamic_symbol_table_aliases_and_indirect_calls_block_refactors() {
         "<?php\nfunction f(int $a): int\n{\n    $value = $a + 1;\n    return $value;\n    call_user_func('get_defined_vars');\n}\n",
         "<?php\nfunction f(int $a, callable $observer): int\n{\n    $value = $a + 1;\n    return $value;\n    $observer();\n}\n",
         "<?php\nfunction f(int $a): int\n{\n    $value = $a + 1;\n    return $value;\n    assert('$value = 0;');\n}\n",
+        "<?php\nfunction f(int $a): int\n{\n    mb_parse_str('a=not_numeric');\n    $value = $a + 1;\n    return $value;\n}\n",
+        "<?php\nuse function mb_parse_str as importVariables;\nfunction f(int $a): int\n{\n    importVariables('a=not_numeric');\n    $value = $a + 1;\n    return $value;\n}\n",
     ];
     for source in inline_cases {
         assert!(
@@ -263,6 +285,8 @@ fn dynamic_symbol_table_aliases_and_indirect_calls_block_refactors() {
 
     let aliased_extract = "<?php\nuse function get_defined_vars as vars;\nfunction f(int $a): int\n{\n    vars();\n    return $a + 1;\n}\n";
     assert!(!extract_available(aliased_extract, "$a + 1"));
+    let mb_parse_extract = "<?php\nfunction f(int $a): int\n{\n    \\mb_parse_str('a=not_numeric');\n    return $a + 1;\n}\n";
+    assert!(!extract_available(mb_parse_extract, "$a + 1"));
 }
 
 #[test]
@@ -377,6 +401,7 @@ fn inline_variable_requires_one_adjacent_unaliased_safe_read() {
         "<?php\nfunction f(int $a): int {\n    $value = $a + 1;\n    return $value;\n    get_defined_vars();\n}\n",
         "<?php\nfunction f(int $a): int {\n    $value = $a + 1;\n    return $value;\n    extract([]);\n}\n",
         "<?php\nfunction f(int $a): int {\n    $value = $a + 1;\n    return $value;\n    parse_str('value=1');\n}\n",
+        "<?php\nfunction f(int $a): int {\n    mb_parse_str('a=not_numeric');\n    $value = $a + 1;\n    return $value;\n}\n",
         "<?php\nfunction f(int $a): int {\n    $value = $a + 1;\n    return $value;\n    eval('$value = 0;');\n}\n",
         "<?php\nfunction f(int $a): int {\n    $value = $a + 1;\n    return $value;\n    include 'dynamic.php';\n}\n",
         "<?php\nfunction f(int $a): int {\n    $value = $a + 1;\n    return $value;\n    $name = 'value';\n    $$name;\n}\n",
