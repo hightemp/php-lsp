@@ -696,6 +696,10 @@ dependency `dev-bootstrap.php`.
 
 ### CODEX-P1-12. Twig context scan имеет комбинаторный worst case
 
+> **Статус 2026-09-22:** исправлено. Инкрементальный workspace index устраняет
+> повторные PHP-сканирования для каждого caller; один отменяемый worker сохраняет
+> ограниченное ожидание, лимиты обхода и поддержку внешних symlink.
+
 Для определения include-контекста сервер сначала сканирует до 2048 Twig-файлов,
 а затем для каждого найденного caller вызывает
 [`direct_twig_variable_types_for_template_state`](server/crates/php-lsp-server/src/lsp/templates.rs#L3602),
@@ -716,6 +720,36 @@ Worst case — около 4,2 млн чтений/парсов на один ref
 - ограничить concurrent scans semaphore и проверять cancellation внутри walk;
 - добавить performance regression с тысячами PHP/Twig файлов и верхней границей
   числа фактических reads/parses.
+
+#### Реализовано
+
+- Новый workspace-scoped индекс в `indexing/twig_context.rs` хранит связи
+  PHP source → render targets и Twig source → include targets, а также reverse
+  caller maps. Все вызовы одного источника извлекаются одним проходом.
+- Кеш исходников использует physical identity/content hash, сохраняет logical
+  URI и отдельные open-buffer overlays. Удаление последнего render/include в
+  unsaved buffer не возвращает старый дисковый контекст. FormType и другие
+  дополнительные источники используют тот же кеш.
+- Синтаксические факты отделены от результатов вывода типов. Scoped index-read
+  tracking учитывает declaration files, запросы отсутствующих символов и
+  консервативные зависимости от перечисления типов; include results зависят от
+  собственного содержимого и переменных caller. Обычные file events обновляют
+  адресованные источники; full/directory/partial invalidation выполняет
+  необходимую повторную инвентаризацию.
+- Один coalesced worker на backend использует общий 15-секундный бюджет.
+  Semaphore permit принадлежит blocking closure; отменённые и устаревшие задачи
+  не публикуют результаты. Commit проверяет runtime generation, source epoch,
+  index revision под mutation barrier, indexing lease и document state.
+- Регрессия на 2000 PHP + 2000 Twig: холодный сбор выполняет 4000 чтений и
+  2000 PHP-разборов, повторные запросы — 0 новых чтений/разборов, изменение одного
+  controller — +1 чтение/+1 разбор без пересчёта независимых contributions.
+  Покрыты full/partial invalidation, errors, atomic replacement, symlink aliases
+  и physical budgets, overlays/close, FormType dependencies, coalescing,
+  cancellation/timeout permit lifetime, root/runtime/run supersession и LSP flow.
+- Проверки: 20 coordinator regressions, 25 существующих template E2E и новый
+  controller → caller → partial lifecycle E2E прошли. Финальный полный Rust-набор:
+  996/996, без ignored (`CARGO_BUILD_JOBS=1`, `--test-threads=1`); Clippy
+  `--all-targets -D warnings`, Rustfmt, diff checks и повторный Verifier review — GO.
 
 ## P2 — корректность и устойчивость
 

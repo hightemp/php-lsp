@@ -1,5 +1,75 @@
 use super::*;
 
+#[tokio::test(flavor = "current_thread")]
+async fn twig_context_reads_and_parses_each_source_once_across_include_callers() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-twig-linear-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("templates")).unwrap();
+    for number in 0..4 {
+        std::fs::write(root.join(format!("src/Controller{number}.php")), format!("<?php function render{number}() {{ $this->render('caller{number}.twig', ['item' => new Item{number}()]); }}")).unwrap();
+        std::fs::write(
+            root.join(format!("templates/caller{number}.twig")),
+            "{% include 'partial.twig' with { value: item } %}",
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join("templates/partial.twig"), "{{ value }}").unwrap();
+    let uri = path_to_uri(&root.join("templates/partial.twig")).unwrap();
+    let open_files = Arc::new(DashMap::new());
+    let templates = Arc::new(DashMap::new());
+    let index = Arc::new(WorkspaceIndex::new());
+    let cache = Arc::new(Mutex::new(TwigContextDiskCache::default()));
+    let result = twig_variable_types_for_template_state(
+        &uri,
+        &open_files,
+        &templates,
+        &index,
+        std::slice::from_ref(&root),
+        &cache,
+        TraversalLimits::default(),
+        &[],
+        None,
+        None,
+    )
+    .await;
+    assert!(result
+        .unwrap()
+        .variables
+        .iter()
+        .any(|variable| variable.name == "value"));
+    let cold = crate::server::indexing::twig_context::source_work(&root);
+    assert!(
+        cold.0 <= 9 && cold.1 <= 4,
+        "cold source work must be linear, got {cold:?}"
+    );
+    twig_variable_types_for_template_state(
+        &uri,
+        &open_files,
+        &templates,
+        &index,
+        std::slice::from_ref(&root),
+        &cache,
+        TraversalLimits::default(),
+        &[],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        crate::server::indexing::twig_context::source_work(&root),
+        cold,
+        "warm context must not read or parse sources again"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn parse_test_file_symbols(source: &str, uri: &str) -> php_lsp_types::FileSymbols {
     let mut parser = FileParser::new();
     parser.parse_full(source);

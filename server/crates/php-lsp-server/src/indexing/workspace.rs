@@ -547,7 +547,11 @@ impl PhpLspBackend {
         tracing::debug!("didChangeWatchedFiles: {} change(s)", changes.len());
 
         if !changes.is_empty() {
-            self.invalidate_request_fs_caches().await;
+            self.framework_string_key_cache.lock().await.clear();
+            let mut cache = self.twig_context_disk_cache.lock().await;
+            for event in &changes {
+                cache.evict_entries_for_source_uri(event.uri.as_str());
+            }
         }
 
         let roots = self.current_workspace_roots().await;
@@ -619,7 +623,7 @@ impl PhpLspBackend {
         tracing::debug!("didCreateFiles: {} file(s)", params.files.len());
 
         if !params.files.is_empty() {
-            self.invalidate_request_fs_caches().await;
+            self.framework_string_key_cache.lock().await.clear();
         }
 
         for file in params.files {
@@ -627,6 +631,8 @@ impl PhpLspBackend {
                 self.reindex_php_file(&uri).await;
             }
         }
+        self.refresh_open_twig_contexts_and_republish_diagnostics()
+            .await;
     }
 
     pub(crate) async fn lsp_will_rename_files(
@@ -640,7 +646,7 @@ impl PhpLspBackend {
         tracing::debug!("didRenameFiles: {} file(s)", params.files.len());
 
         if !params.files.is_empty() {
-            self.invalidate_request_fs_caches().await;
+            self.framework_string_key_cache.lock().await.clear();
         }
 
         for file in params.files {
@@ -650,6 +656,8 @@ impl PhpLspBackend {
                 self.rename_php_file(&old_uri, &new_uri).await;
             }
         }
+        self.refresh_open_twig_contexts_and_republish_diagnostics()
+            .await;
     }
 
     pub(crate) async fn lsp_will_delete_files(
@@ -663,7 +671,7 @@ impl PhpLspBackend {
         tracing::debug!("didDeleteFiles: {} file(s)", params.files.len());
 
         if !params.files.is_empty() {
-            self.invalidate_request_fs_caches().await;
+            self.framework_string_key_cache.lock().await.clear();
         }
 
         for file in params.files {
@@ -671,6 +679,8 @@ impl PhpLspBackend {
                 self.remove_php_file(&uri).await;
             }
         }
+        self.refresh_open_twig_contexts_and_republish_diagnostics()
+            .await;
     }
 
     // --- Language Features ---
@@ -2129,6 +2139,7 @@ pub(in crate::server) async fn postprocess_workspace_indexing_runs(
         workspace_configs: &state.configs,
         workspace_folders_filter: Some(&workspace_folders),
         indexing_runs: &runs,
+        runtime_generation: state.generation,
         twig_context_disk_cache: &twig_context_disk_cache,
         semantic_tokens_cache: &semantic_tokens_cache,
     })
@@ -2883,6 +2894,8 @@ impl PhpLspBackend {
     /// Reindex one changed PHP file from the open buffer when available,
     /// otherwise from disk.
     pub(in crate::server) async fn reindex_php_file(&self, uri: &Uri) {
+        self.invalidate_twig_context_disk_cache_for_source_uri(uri.as_str())
+            .await;
         let uri_str = uri.as_str().to_string();
         if !uri_is_php_file(uri) {
             return;
@@ -2996,6 +3009,8 @@ impl PhpLspBackend {
 
     /// Remove one PHP file from all server-side caches/indexes.
     pub(in crate::server) async fn remove_php_file(&self, uri: &Uri) {
+        self.invalidate_twig_context_disk_cache_for_source_uri(uri.as_str())
+            .await;
         if !uri_is_php_file(uri) {
             return;
         }
@@ -3028,6 +3043,10 @@ impl PhpLspBackend {
     }
 
     pub(in crate::server) async fn rename_php_file(&self, old_uri: &Uri, new_uri: &Uri) {
+        self.invalidate_twig_context_disk_cache_for_source_uri(old_uri.as_str())
+            .await;
+        self.invalidate_twig_context_disk_cache_for_source_uri(new_uri.as_str())
+            .await;
         let old_is_php = uri_is_php_file(old_uri);
         let new_is_php = uri_is_php_file(new_uri);
 

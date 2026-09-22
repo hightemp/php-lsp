@@ -17,6 +17,25 @@ type TemplateSubstitutions = HashMap<String, TypeInfo>;
 const MAX_TYPE_ALIAS_EXPANSION_DEPTH: usize = 32;
 const MAX_COMMITTED_SNAPSHOT_RETRIES: usize = 8;
 
+/// Dependencies of one synchronous derived-data computation, including misses.
+#[derive(Default, Clone)]
+pub struct IndexReadDependencies {
+    pub files: HashSet<String>,
+    pub symbols: HashSet<String>,
+    pub whole_index: bool,
+}
+
+std::thread_local! {
+    static READ_DEPENDENCIES: std::cell::RefCell<Option<(usize, IndexReadDependencies)>> = const { std::cell::RefCell::new(None) };
+}
+
+struct RestoreReadDependencies(Option<(usize, IndexReadDependencies)>);
+impl Drop for RestoreReadDependencies {
+    fn drop(&mut self) {
+        READ_DEPENDENCIES.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
 #[derive(Clone)]
 struct DirectMemberSource {
     uri: Arc<str>,
@@ -166,6 +185,47 @@ pub struct WorkspaceIndexRevision {
 }
 
 impl WorkspaceIndex {
+    /// Trace synchronous lookups without changing the behavior of other readers.
+    pub fn trace_read_dependencies<T>(
+        &self,
+        read: impl FnOnce() -> T,
+    ) -> (T, IndexReadDependencies) {
+        let previous = READ_DEPENDENCIES.with(|slot| {
+            slot.replace(Some((
+                self as *const Self as usize,
+                IndexReadDependencies::default(),
+            )))
+        });
+        let _restore = RestoreReadDependencies(previous);
+        let value = read();
+        let dependencies = READ_DEPENDENCIES.with(|slot| slot.borrow_mut().take().unwrap().1);
+        (value, dependencies)
+    }
+
+    fn record_read(&self, symbol: Option<&str>, file: Option<&str>, whole_index: bool) {
+        READ_DEPENDENCIES.with(|slot| {
+            if let Some((identity, dependencies)) = slot.borrow_mut().as_mut() {
+                if *identity != self as *const Self as usize {
+                    return;
+                }
+                if let Some(symbol) = symbol {
+                    dependencies
+                        .symbols
+                        .insert(symbol.trim_start_matches('\\').to_ascii_lowercase());
+                }
+                if let Some(file) = file {
+                    dependencies.files.insert(file.to_string());
+                }
+                dependencies.whole_index |= whole_index;
+            }
+        });
+    }
+
+    /// Mark a direct enumeration whose dependency cannot be narrowed to a name.
+    pub fn observe_type_inventory(&self) {
+        self.record_read(None, None, true);
+    }
+
     /// Create a new empty index.
     pub fn new() -> Self {
         WorkspaceIndex {
@@ -357,6 +417,20 @@ impl WorkspaceIndex {
             identity: self as *const Self as usize,
             revision: self.mutation_revision.load(Ordering::SeqCst),
         }
+    }
+
+    /// Publish derived data only while the source revision is unchanged.
+    /// The callback must not mutate this index (writers take the same barrier).
+    pub fn with_revision<T>(
+        &self,
+        expected: WorkspaceIndexRevision,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _barrier = self
+            .mutation_barrier
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (self.revision_snapshot() == expected).then(publish)
     }
 
     pub fn replace_from_staged_if_sources_current(
@@ -567,6 +641,7 @@ impl WorkspaceIndex {
     /// Handles both top-level symbols (`App\Foo`) and member symbols
     /// (`App\Foo::method`, `App\Foo::CONST`, `App\Foo::$prop`).
     pub fn resolve_fqn(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
+        self.record_read(Some(fqn), None, false);
         let normalized = fqn.trim_start_matches('\\');
         let case_insensitive_key = case_insensitive_fqn_key(normalized);
 
@@ -605,6 +680,7 @@ impl WorkspaceIndex {
         fqn: &str,
         expected_kinds: &[PhpSymbolKind],
     ) -> Option<Arc<SymbolInfo>> {
+        self.record_read(Some(fqn), None, false);
         let normalized = fqn.trim_start_matches('\\');
         if normalized.contains("::") {
             return self.resolve_member_matching_kinds(normalized, expected_kinds);
@@ -641,11 +717,13 @@ impl WorkspaceIndex {
 
     /// Return whether a class-like symbol exists using PHP's casing rules.
     pub fn contains_type(&self, fqn: &str) -> bool {
+        self.record_read(Some(fqn), None, false);
         self.types.contains_key(&case_insensitive_fqn_key(fqn))
     }
 
     /// Get a class-like symbol using PHP's casing rules.
     pub fn get_type(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
+        self.record_read(Some(fqn), None, false);
         self.types
             .get(&case_insensitive_fqn_key(fqn))
             .map(|entry| entry.value().clone())
@@ -671,6 +749,7 @@ impl WorkspaceIndex {
     }
 
     fn committed_type_resolution_snapshot(&self, fqn: &str) -> Option<TypeResolutionSnapshot> {
+        self.record_read(Some(fqn), None, false);
         self.committed_type_snapshot_with(fqn, || self.get_direct_members(fqn))
             .map(|(type_snapshot, direct_members)| TypeResolutionSnapshot {
                 type_snapshot,
@@ -1028,6 +1107,7 @@ impl WorkspaceIndex {
         symbol: Arc<SymbolInfo>,
         substitutions: &TemplateSubstitutions,
     ) -> Arc<SymbolInfo> {
+        self.record_read(None, Some(&symbol.uri), false);
         if symbol.signature.is_none() && substitutions.is_empty() {
             return symbol;
         }
@@ -1752,3 +1832,7 @@ impl Default for WorkspaceIndex {
 #[cfg(test)]
 #[path = "workspace_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "workspace_dependency_tests.rs"]
+mod dependency_tests;

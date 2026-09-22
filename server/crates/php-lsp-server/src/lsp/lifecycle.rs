@@ -207,6 +207,7 @@ impl PhpLspBackend {
     pub(crate) async fn lsp_shutdown(&self) -> Result<()> {
         tracing::info!("php-lsp: shutdown");
         self.pending_initial_indexing_runs.lock().await.clear();
+        self.twig_context_disk_cache.lock().await.shutdown();
         self.indexing_run.cancel_all();
         self.indexing_status_publisher.shutdown().await;
         self.diagnostics_publisher.shutdown().await;

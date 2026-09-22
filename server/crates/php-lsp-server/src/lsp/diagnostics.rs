@@ -479,7 +479,9 @@ impl PhpLspBackend {
             }
 
             if template_kind == TemplateKind::Twig {
-                let twig_variable_types = self
+                self.invalidate_twig_context_disk_cache_for_source_uri(&uri_str)
+                    .await;
+                let twig_context_result = self
                     .twig_variable_types_for_template(&request, &uri_str)
                     .await;
                 let dashmap::mapref::entry::Entry::Occupied(mut open_entry) =
@@ -500,13 +502,17 @@ impl PhpLspBackend {
                     return;
                 }
                 drop(current_template);
-                let parser = self.open_template_document(
-                    &uri_str,
-                    text,
-                    template_kind,
-                    &twig_variable_types,
-                );
-                open_entry.insert(parser);
+                if let Some(result) = twig_context_result {
+                    result.context.commit_if_current(|| {
+                        let parser = self.open_template_document(
+                            &uri_str,
+                            text,
+                            template_kind,
+                            &result.variables,
+                        );
+                        open_entry.insert(parser);
+                    });
+                }
             }
 
             if self.current_document_state(&uri_str) != Some(document_state) {
@@ -519,6 +525,10 @@ impl PhpLspBackend {
                 return;
             }
             self.publish_diagnostics(&uri).await;
+            if template_kind == TemplateKind::Twig {
+                self.refresh_open_twig_contexts_and_republish_diagnostics()
+                    .await;
+            }
             return;
         }
 
@@ -839,6 +849,8 @@ impl PhpLspBackend {
             if refresh_twig_contexts
                 && self.current_document_state(&uri_str) == Some(document_state)
             {
+                self.invalidate_twig_context_disk_cache_for_source_uri(&uri_str)
+                    .await;
                 self.refresh_open_twig_contexts_and_republish_diagnostics()
                     .await;
             }
@@ -887,6 +899,7 @@ impl PhpLspBackend {
         let request_index = request.index(&self.index);
         tracing::debug!("didClose: {}", uri_str);
         let is_php_uri = uri_is_php_file(&uri);
+        let closed_twig = is_twig_template_uri(&uri_str);
         let (restore_token, refresh_twig_contexts) = match self.open_files.entry(uri_str.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 // Serialize removal with didOpen/didChange and Twig refresh,
@@ -908,7 +921,7 @@ impl PhpLspBackend {
                     token
                 });
                 entry.remove();
-                (restore_token, restore_php_index)
+                (restore_token, restore_php_index || closed_twig)
             }
             dashmap::mapref::entry::Entry::Vacant(_) => {
                 self.document_versions.remove(&uri_str);
@@ -929,6 +942,8 @@ impl PhpLspBackend {
         }
         self.publish_empty_diagnostics_if_closed(uri).await;
         if refresh_twig_contexts && self.current_document_state(&uri_str).is_none() {
+            self.invalidate_twig_context_disk_cache_for_source_uri(&uri_str)
+                .await;
             self.refresh_open_twig_contexts_and_republish_diagnostics()
                 .await;
         }
@@ -1021,6 +1036,10 @@ impl PhpLspBackend {
             .await;
         self.publish_diagnostics(&params.text_document.uri).await;
         if refresh_twig_contexts {
+            self.invalidate_twig_context_disk_cache_for_source_uri(
+                params.text_document.uri.as_str(),
+            )
+            .await;
             self.refresh_open_twig_contexts_and_republish_diagnostics()
                 .await;
         }

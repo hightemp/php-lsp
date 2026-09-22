@@ -513,7 +513,7 @@ pub(crate) fn symlink_aliases_on_path(path: &Path) -> Vec<SymlinkAlias> {
     aliases
 }
 
-fn physical_identity(path: &Path) -> std::io::Result<PhysicalIdentity> {
+pub(crate) fn physical_identity(path: &Path) -> std::io::Result<PhysicalIdentity> {
     match file_id::get_file_id(path) {
         Ok(identity) => Ok(PhysicalIdentity::FileId(identity)),
         Err(identity_error) => std::fs::canonicalize(path)

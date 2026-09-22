@@ -1,13 +1,13 @@
 //! Template-aware LSP helpers extracted from `server.rs`.
 
 use crate::template::{TemplateShapeDefinitionTarget, TemplateShapeKeyDefinition};
-use crate::util::fs_walk::{walk_files, TraversalLimits, TraversalStopReason};
+#[cfg(test)]
+use crate::util::fs_walk::{walk_files, TraversalStopReason};
 use crate::util::uri::path_to_uri;
 
 use super::super::*;
+use crate::server::indexing::twig_context::*;
 
-const TWIG_CONTEXT_PHP_FILE_SCAN_LIMIT: usize = 2048;
-const TWIG_CONTEXT_TEMPLATE_FILE_SCAN_LIMIT: usize = 2048;
 const OPEN_TWIG_CONTEXT_REFRESH_LIMIT: usize = 64;
 const SYMFONY_ABSTRACT_FORM_TYPE_FQN: &str = "Symfony\\Component\\Form\\AbstractType";
 const SYMFONY_FORM_ERROR_FQN: &str = "Symfony\\Component\\Form\\FormError";
@@ -15,23 +15,17 @@ const SYMFONY_AUTHENTICATION_EXCEPTION_FQN: &str =
     "Symfony\\Component\\Security\\Core\\Exception\\AuthenticationException";
 const SYMFONY_USER_INTERFACE_FQN: &str = "Symfony\\Component\\Security\\Core\\User\\UserInterface";
 
+pub(in crate::server) struct TwigContextPhpSourceResolver<'a> {
+    pub(in crate::server) lookup:
+        &'a dyn Fn(&php_lsp_types::SymbolInfo) -> Option<TwigContextResolvedPhpSource>,
+    pub(in crate::server) cancelled: &'a dyn Fn() -> bool,
+}
+
 #[derive(Debug, Clone)]
-struct TwigContextPhpSource {
-    uri: String,
-    source: String,
-    file_symbols: php_lsp_types::FileSymbols,
-}
-
-struct TwigContextPhpSourceResolver<'a> {
-    sources: &'a HashMap<String, TwigContextPhpSource>,
-    allow_disk_read: bool,
-}
-
-#[derive(Debug)]
-struct TwigContextResolvedPhpSource {
-    uri: String,
-    source: String,
-    file_symbols: Option<php_lsp_types::FileSymbols>,
+pub(in crate::server) struct TwigContextResolvedPhpSource {
+    pub(in crate::server) uri: String,
+    pub(in crate::server) source: Arc<str>,
+    pub(in crate::server) file_symbols: Option<Arc<php_lsp_types::FileSymbols>>,
 }
 
 impl TwigContextPhpSourceResolver<'_> {
@@ -39,25 +33,10 @@ impl TwigContextPhpSourceResolver<'_> {
         &self,
         symbol: &php_lsp_types::SymbolInfo,
     ) -> Option<TwigContextResolvedPhpSource> {
-        if let Some(open_source) = self.sources.get(&symbol.uri) {
-            return Some(TwigContextResolvedPhpSource {
-                uri: open_source.uri.clone(),
-                source: open_source.source.clone(),
-                file_symbols: Some(open_source.file_symbols.clone()),
-            });
-        }
-
-        if !self.allow_disk_read {
+        if (self.cancelled)() {
             return None;
         }
-
-        let path = uri_to_path(&symbol.uri)?;
-        let source = std::fs::read_to_string(path).ok()?;
-        Some(TwigContextResolvedPhpSource {
-            uri: symbol.uri.clone(),
-            source,
-            file_symbols: None,
-        })
+        (self.lookup)(symbol)
     }
 }
 
@@ -143,6 +122,7 @@ pub(in crate::server) fn normalize_twig_template_name(path: &Path) -> Option<Str
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+#[cfg(test)]
 fn collect_twig_context_php_files_with_limits(
     root: &Path,
     limit: usize,
@@ -181,76 +161,94 @@ fn collect_twig_context_php_files_with_limits(
     outcome.files
 }
 
-fn collect_twig_context_template_files(
-    root: &Path,
-    limit: usize,
-    traversal_limits: TraversalLimits,
-    exclude_paths: &[PathBuf],
-) -> Vec<PathBuf> {
-    let deadline = file_io_walk_deadline();
-    let outcome = walk_files(
-        &[
-            root.join("templates"),
-            root.join("resources/views"),
-            root.join("app/templates"),
-        ],
-        traversal_limits.capped_files(limit),
-        |path| crate::server::path_is_excluded(path, root, exclude_paths),
-        |_, _| true,
-        |path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("twig"))
-        },
-        || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
-    );
-    if outcome.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
-        tracing::warn!(
-            "Twig template traversal stopped at the file-I/O deadline after {} entries",
-            outcome.stats.visited_entries
-        );
-    }
-    outcome.files
+#[derive(Debug, Clone)]
+pub(in crate::server) struct TwigRenderCall {
+    pub(in crate::server) target: String,
+    pub(in crate::server) context: (usize, usize),
 }
 
-fn collect_twig_render_context_types(
-    template_name: &str,
-    ctx: &TwigShapeDefinitionContext<'_>,
-    variables: &mut HashMap<String, String>,
-    shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
-) {
+pub(in crate::server) fn twig_render_calls(
+    source: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Vec<TwigRenderCall> {
+    let mut calls = Vec::new();
     let mut offset = 0usize;
-    while let Some((name_start, name_end, open_paren)) = next_twig_context_call(ctx.source, offset)
-    {
-        let call_name = ctx.source.get(name_start..name_end).unwrap_or("");
-        let Some(close_paren) = find_matching_delimiter(ctx.source, open_paren, '(', ')') else {
+    while !cancelled() {
+        let Some((name_start, name_end, open_paren)) = next_twig_context_call(source, offset)
+        else {
+            break;
+        };
+        let call_name = source.get(name_start..name_end).unwrap_or("");
+        let Some(close_paren) = find_matching_delimiter(source, open_paren, '(', ')') else {
             offset = name_end;
             continue;
         };
         let args = split_top_level_spans(
-            ctx.source.get(open_paren + 1..close_paren).unwrap_or(""),
+            source.get(open_paren + 1..close_paren).unwrap_or(""),
             open_paren + 1,
         );
         for (arg_index, pair) in args.windows(2).enumerate() {
+            if cancelled() {
+                break;
+            }
             if !twig_context_call_accepts_template_argument(call_name, arg_index) {
                 continue;
             }
-            let template_arg = trim_source_range(ctx.source, pair[0].0, pair[0].1);
-            let context_arg = trim_source_range(ctx.source, pair[1].0, pair[1].1);
-            if php_string_literal_value_at_range(ctx.source, template_arg.0, template_arg.1)
-                .is_some_and(|name| normalize_twig_key(&name) == normalize_twig_key(template_name))
-                && !collect_twig_context_compact_types(
-                    ctx,
-                    context_arg,
-                    variables,
-                    shape_definitions,
-                )
+            let template_arg = trim_source_range(source, pair[0].0, pair[0].1);
+            if let Some(name) =
+                php_string_literal_value_at_range(source, template_arg.0, template_arg.1)
             {
-                collect_twig_context_array_types(ctx, context_arg, variables, shape_definitions);
+                calls.push(TwigRenderCall {
+                    target: normalize_twig_key(&name),
+                    context: trim_source_range(source, pair[1].0, pair[1].1),
+                });
             }
         }
         offset = close_paren + 1;
     }
+    calls
+}
+
+pub(in crate::server) fn evaluate_twig_render_calls(
+    source_uri: &str,
+    source: &str,
+    file_symbols: &php_lsp_types::FileSymbols,
+    calls: &[TwigRenderCall],
+    index: &WorkspaceIndex,
+    resolver: &TwigContextPhpSourceResolver<'_>,
+) -> HashMap<String, Vec<TemplateVariableType>> {
+    let ctx = TwigShapeDefinitionContext {
+        source,
+        source_uri,
+        file_symbols,
+        index: Some(index),
+        php_sources: Some(resolver),
+    };
+    let mut results = HashMap::<
+        String,
+        (
+            HashMap<String, String>,
+            HashMap<String, Vec<TemplateShapeKeyDefinition>>,
+        ),
+    >::new();
+    for call in calls {
+        if (resolver.cancelled)() {
+            break;
+        }
+        let (variables, definitions) = results.entry(call.target.clone()).or_default();
+        if !collect_twig_context_compact_types(&ctx, call.context, variables, definitions) {
+            collect_twig_context_array_types(&ctx, call.context, variables, definitions);
+        }
+    }
+    results
+        .into_iter()
+        .map(|(target, (variables, definitions))| {
+            (
+                target,
+                twig_context_variable_types_from_maps(variables, definitions),
+            )
+        })
+        .collect()
 }
 
 fn twig_context_call_accepts_template_argument(call_name: &str, arg_index: usize) -> bool {
@@ -286,6 +284,12 @@ fn collect_twig_context_compact_types(
 
     let mut found = false;
     for arg in split_top_level_spans(ctx.source.get(open + 1..close).unwrap_or(""), open + 1) {
+        if ctx
+            .php_sources
+            .is_some_and(|resolver| (resolver.cancelled)())
+        {
+            break;
+        }
         let arg = trim_source_range(ctx.source, arg.0, arg.1);
         let Some(name) = php_string_literal_value_at_range(ctx.source, arg.0, arg.1) else {
             continue;
@@ -358,6 +362,12 @@ fn collect_twig_context_array_types(
         inner_start,
     );
     for span in spans {
+        if ctx
+            .php_sources
+            .is_some_and(|resolver| (resolver.cancelled)())
+        {
+            break;
+        }
         let Some(arrow) = find_top_level_double_arrow(ctx.source, span.0, span.1) else {
             continue;
         };
@@ -2475,10 +2485,10 @@ fn resolve_twig_context_symbol_source(
     }
 
     let path = uri_to_path(&symbol.uri)?;
-    let source = std::fs::read_to_string(path).ok()?;
+    let source = read_twig_context_source(&path).ok()?;
     Some(TwigContextResolvedPhpSource {
         uri: symbol.uri.clone(),
-        source,
+        source: source.into(),
         file_symbols: None,
     })
 }
@@ -2938,6 +2948,7 @@ fn doctrine_repository_entity_from_repository_class_binding(
     repository_fqn: &str,
 ) -> Option<String> {
     let repository_fqn = repository_fqn.trim_start_matches('\\');
+    index.observe_type_inventory();
     index.types.iter().find_map(|entry| {
         let symbol = entry.value();
         if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class) {
@@ -2971,6 +2982,7 @@ fn conventional_entity_fqn_for_repository(
         }
     }
 
+    index.observe_type_inventory();
     let mut candidates = index.types.iter().filter_map(|entry| {
         let symbol = entry.value();
         (matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class)
@@ -3485,255 +3497,33 @@ pub(in crate::server) fn map_location_for_template(
     location
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn cached_twig_context_file_variables_for_state(
-    root: &Path,
-    template_name: &str,
-    index: Arc<WorkspaceIndex>,
-    twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
-    open_php_sources: HashMap<String, TwigContextPhpSource>,
-    traversal_limits: TraversalLimits,
-    exclude_paths: Vec<PathBuf>,
-    indexing_run: Option<&IndexingRunLease>,
-) -> Vec<TwigContextFileVariables> {
-    let key = TwigContextDiskCacheKey {
-        root: root.to_path_buf(),
-        index_identity: Arc::as_ptr(&index) as usize,
-        template_name: template_name.to_string(),
-    };
-    let use_disk_cache = open_php_sources.is_empty();
-    if use_disk_cache {
-        if let Some(files) = twig_context_disk_cache.lock().await.get(&key) {
-            return files;
-        }
-    }
-
-    let root = root.to_path_buf();
-    let template_name = template_name.to_string();
-    let path_label = format!("{} ({})", root.display(), template_name);
-    let files = match run_file_io_blocking("twig context scan", path_label, move || {
-        collect_cached_twig_context_file_variables(
-            &root,
-            &template_name,
-            index.as_ref(),
-            &open_php_sources,
-            traversal_limits,
-            &exclude_paths,
-        )
-    })
-    .await
-    {
-        Ok(files) => files,
-        Err(message) => {
-            tracing::warn!("{}", message);
-            Vec::new()
-        }
-    };
-
-    if use_disk_cache {
-        let mut cache = twig_context_disk_cache.lock().await;
-        let commit = || cache.insert(key, files.clone());
-        match indexing_run {
-            Some(run) => {
-                run.commit_if_current(commit);
-            }
-            None => commit(),
-        }
-    }
-    files
-}
-
-fn collect_cached_twig_context_file_variables(
-    root: &Path,
-    template_name: &str,
-    index: &WorkspaceIndex,
-    open_php_sources: &HashMap<String, TwigContextPhpSource>,
-    traversal_limits: TraversalLimits,
-    exclude_paths: &[PathBuf],
-) -> Vec<TwigContextFileVariables> {
-    let mut result = Vec::new();
-    let php_sources = TwigContextPhpSourceResolver {
-        sources: open_php_sources,
-        allow_disk_read: true,
-    };
-    for path in collect_twig_context_php_files_with_limits(
-        root,
-        TWIG_CONTEXT_PHP_FILE_SCAN_LIMIT,
-        traversal_limits,
-        exclude_paths,
-    ) {
-        let Ok(source_uri) = path_to_uri(&path) else {
-            continue;
-        };
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let mut parser = FileParser::new();
-        parser.parse_full(&source);
-        let file_symbols = parser
-            .tree()
-            .map(|tree| extract_file_symbols(tree, &source, &source_uri))
-            .unwrap_or_default();
-        let mut variables = HashMap::new();
-        let mut shape_definitions = HashMap::new();
-        let ctx = TwigShapeDefinitionContext {
-            source: &source,
-            source_uri: &source_uri,
-            file_symbols: &file_symbols,
-            index: Some(index),
-            php_sources: Some(&php_sources),
-        };
-        collect_twig_render_context_types(
-            template_name,
-            &ctx,
-            &mut variables,
-            &mut shape_definitions,
-        );
-        if variables.is_empty() {
-            continue;
-        }
-        let variables = twig_context_variable_types_from_maps(variables, shape_definitions);
-        result.push(TwigContextFileVariables {
-            uri: source_uri,
-            variables,
-        });
-    }
-    result
-}
-
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::server) async fn direct_twig_variable_types_for_template_state(
     root: &Path,
     template_name: &str,
-    target_uri: Option<&str>,
+    _target_uri: Option<&str>,
     open_files: &Arc<DashMap<String, FileParser>>,
     index: &Arc<WorkspaceIndex>,
-    twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
-    traversal_limits: TraversalLimits,
-    exclude_paths: &[PathBuf],
-    indexing_run: Option<&IndexingRunLease>,
+    cache: &Arc<Mutex<TwigContextDiskCache>>,
+    limits: TraversalLimits,
+    excludes: &[PathBuf],
+    run: Option<&IndexingRunLease>,
 ) -> Vec<TemplateVariableType> {
-    let mut variables = HashMap::<String, String>::new();
-    let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
-    let mut open_php_uris = HashSet::<String>::new();
-    let mut open_php_sources = HashMap::<String, TwigContextPhpSource>::new();
-
-    for entry in open_files.iter() {
-        let source_uri = entry.key();
-        if target_uri.is_some_and(|target_uri| source_uri == target_uri)
-            || !source_uri.ends_with(".php")
-            || is_blade_template_uri(source_uri.as_str())
-            || !index.file_symbols.contains_key(source_uri.as_str())
-        {
-            continue;
-        }
-        open_php_uris.insert(source_uri.to_string());
-        let source = entry.value().source();
-        let Some(file_symbols) = index
-            .file_symbols
-            .get(source_uri.as_str())
-            .map(|symbols| symbols.value().as_ref().clone())
-        else {
-            continue;
-        };
-        open_php_sources.insert(
-            source_uri.to_string(),
-            TwigContextPhpSource {
-                uri: source_uri.to_string(),
-                source,
-                file_symbols,
-            },
-        );
-    }
-
-    let open_php_sources_for_disk_scan = open_php_sources.clone();
-    if !open_php_sources.is_empty() {
-        let template_name_for_open = template_name.to_string();
-        let index_for_open = index.clone();
-        let path_label = format!("{} ({})", root.display(), template_name);
-        match run_file_io_blocking("open twig context scan", path_label, move || {
-            let mut variables = HashMap::<String, String>::new();
-            let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
-            let php_sources = TwigContextPhpSourceResolver {
-                sources: &open_php_sources,
-                allow_disk_read: true,
-            };
-            for source_file in open_php_sources.values() {
-                let ctx = TwigShapeDefinitionContext {
-                    source: &source_file.source,
-                    source_uri: &source_file.uri,
-                    file_symbols: &source_file.file_symbols,
-                    index: Some(index_for_open.as_ref()),
-                    php_sources: Some(&php_sources),
-                };
-                collect_twig_render_context_types(
-                    &template_name_for_open,
-                    &ctx,
-                    &mut variables,
-                    &mut shape_definitions,
-                );
-            }
-            (variables, shape_definitions)
-        })
-        .await
-        {
-            Ok((open_variables, open_shape_definitions)) => {
-                for (name, type_text) in open_variables {
-                    merge_twig_context_variable_type(&mut variables, name, type_text);
-                }
-                for (name, definitions) in open_shape_definitions {
-                    merge_twig_context_variable_shape_definitions(
-                        &mut shape_definitions,
-                        name,
-                        definitions,
-                    );
-                }
-            }
-            Err(message) => {
-                tracing::warn!("{}", message);
-            }
-        }
-    }
-
-    for file in cached_twig_context_file_variables_for_state(
-        root,
-        template_name,
-        index.clone(),
-        twig_context_disk_cache,
-        open_php_sources_for_disk_scan,
-        traversal_limits,
-        exclude_paths.to_vec(),
-        indexing_run,
+    let templates = Arc::new(DashMap::new());
+    let context = twig_context_for_state(
+        root, open_files, &templates, index, cache, limits, excludes, run, None,
     )
-    .await
-    {
-        if open_php_uris.contains(&file.uri) {
-            continue;
-        }
-        for variable in file.variables {
-            merge_twig_context_template_variable_type(
-                &mut variables,
-                &mut shape_definitions,
-                variable,
-            );
-        }
-    }
-
-    twig_context_variable_types_from_maps(variables, shape_definitions)
-}
-
-#[derive(Debug)]
-struct TwigContextTemplateSource {
-    uri: String,
-    template_name: String,
-    source: String,
-    include_with_ranges: Vec<(usize, usize)>,
+    .await;
+    context
+        .map(|context| context.direct(template_name))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
 struct SymfonyFormTypeFields {
     source_uri: String,
-    source: String,
+    source: Arc<str>,
     fields: Vec<SymfonyFormField>,
 }
 
@@ -3743,155 +3533,22 @@ struct SymfonyFormField {
     key_range: (usize, usize),
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn twig_include_variable_types_for_template_state(
-    root: &Path,
-    target_template_name: &str,
-    target_uri: &str,
-    open_files: &Arc<DashMap<String, FileParser>>,
-    template_documents: &Arc<DashMap<String, TemplateDocument>>,
-    index: &Arc<WorkspaceIndex>,
-    twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
-    traversal_limits: TraversalLimits,
-    exclude_paths: &[PathBuf],
-    indexing_run: Option<&IndexingRunLease>,
-) -> Vec<TemplateVariableType> {
-    let mut variables = HashMap::<String, String>::new();
-    let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
-    let mut open_template_uris = HashSet::<String>::new();
-    let mut open_sources = Vec::new();
-
-    for entry in template_documents.iter() {
-        let source_uri = entry.key();
-        let template = entry.value();
-        if source_uri == target_uri || template.kind() != TemplateKind::Twig {
-            continue;
-        }
-        let Some(source_template_name) = twig_template_name_for_uri(source_uri, root) else {
-            continue;
-        };
-        let source = template.original_source().to_string();
-        let include_with_ranges =
-            twig_include_with_ranges_for_target(target_template_name, &source);
-        if include_with_ranges.is_empty() {
-            continue;
-        }
-        open_template_uris.insert(source_uri.to_string());
-        open_sources.push(TwigContextTemplateSource {
-            uri: source_uri.to_string(),
-            template_name: source_template_name,
-            source,
-            include_with_ranges,
-        });
-    }
-
-    for source in open_sources {
-        let caller_variables = direct_twig_variable_types_for_template_state(
-            root,
-            &source.template_name,
-            Some(&source.uri),
-            open_files,
-            index,
-            twig_context_disk_cache,
-            traversal_limits,
-            exclude_paths,
-            indexing_run,
-        )
-        .await;
-        collect_twig_include_context_types_from_ranges(
-            &source.source,
-            &source.include_with_ranges,
-            &caller_variables,
-            &mut variables,
-            &mut shape_definitions,
-        );
-    }
-
-    let root_for_scan = root.to_path_buf();
-    let root_for_names = root.to_path_buf();
-    let target_template_name_for_scan = target_template_name.to_string();
-    let target_uri_for_scan = target_uri.to_string();
-    let exclude_paths_for_scan = exclude_paths.to_vec();
-    let path_label = format!("{} ({})", root.display(), target_template_name);
-    let disk_sources =
-        match run_file_io_blocking("twig include context scan", path_label, move || {
-            let mut sources = Vec::new();
-            for path in collect_twig_context_template_files(
-                &root_for_scan,
-                TWIG_CONTEXT_TEMPLATE_FILE_SCAN_LIMIT,
-                traversal_limits,
-                &exclude_paths_for_scan,
-            ) {
-                let Ok(source_uri) = path_to_uri(&path) else {
-                    continue;
-                };
-                if open_template_uris.contains(&source_uri) || source_uri == target_uri_for_scan {
-                    continue;
-                }
-                let Some(template_name) = twig_template_name_for_uri(&source_uri, &root_for_names)
-                else {
-                    continue;
-                };
-                let Ok(source) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let include_with_ranges =
-                    twig_include_with_ranges_for_target(&target_template_name_for_scan, &source);
-                if include_with_ranges.is_empty() {
-                    continue;
-                }
-                sources.push(TwigContextTemplateSource {
-                    uri: source_uri,
-                    template_name,
-                    source,
-                    include_with_ranges,
-                });
-            }
-            sources
-        })
-        .await
-        {
-            Ok(sources) => sources,
-            Err(message) => {
-                tracing::warn!("{}", message);
-                Vec::new()
-            }
-        };
-
-    for source in disk_sources {
-        let caller_variables = direct_twig_variable_types_for_template_state(
-            root,
-            &source.template_name,
-            Some(&source.uri),
-            open_files,
-            index,
-            twig_context_disk_cache,
-            traversal_limits,
-            exclude_paths,
-            indexing_run,
-        )
-        .await;
-        collect_twig_include_context_types_from_ranges(
-            &source.source,
-            &source.include_with_ranges,
-            &caller_variables,
-            &mut variables,
-            &mut shape_definitions,
-        );
-    }
-
-    twig_context_variable_types_from_maps(variables, shape_definitions)
+#[derive(Debug, Clone)]
+pub(in crate::server) struct TwigIncludeCall {
+    pub(in crate::server) target: String,
+    pub(in crate::server) with_range: (usize, usize),
 }
 
-fn twig_include_with_ranges_for_target(
-    target_template_name: &str,
+pub(in crate::server) fn twig_include_calls(
     source: &str,
-) -> Vec<(usize, usize)> {
-    let target_key = normalize_twig_key(target_template_name);
+    cancelled: &dyn Fn() -> bool,
+) -> Vec<TwigIncludeCall> {
     let mut offset = 0usize;
-    let mut ranges = Vec::new();
-
-    while let Some(relative) = source.get(offset..).and_then(|rest| rest.find("{%")) {
+    let mut calls = Vec::new();
+    while !cancelled() {
+        let Some(relative) = source.get(offset..).and_then(|rest| rest.find("{%")) else {
+            break;
+        };
         let open_start = offset + relative;
         let Some((content_start, content_end, close_end)) =
             twig_context_tag_content_range(source, open_start)
@@ -3901,14 +3558,65 @@ fn twig_include_with_ranges_for_target(
         if let Some((included_name, with_range)) =
             twig_context_include_tag_target_and_with_range(source, content_start, content_end)
         {
-            if normalize_twig_key(&included_name) == target_key {
-                ranges.push(with_range);
-            }
+            calls.push(TwigIncludeCall {
+                target: normalize_twig_key(&included_name),
+                with_range,
+            });
         }
         offset = close_end;
     }
+    calls
+}
 
+pub(in crate::server) fn evaluate_twig_include_calls(
+    source: &str,
+    calls: &[TwigIncludeCall],
+    caller_variables: &[TemplateVariableType],
+    cancelled: &dyn Fn() -> bool,
+) -> HashMap<String, Vec<TemplateVariableType>> {
+    let mut ranges = HashMap::<String, Vec<(usize, usize)>>::new();
+    for call in calls {
+        if cancelled() {
+            break;
+        }
+        ranges
+            .entry(call.target.clone())
+            .or_default()
+            .push(call.with_range);
+    }
     ranges
+        .into_iter()
+        .take_while(|_| !cancelled())
+        .map(|(target, ranges)| {
+            let mut variables = HashMap::new();
+            let mut definitions = HashMap::new();
+            collect_twig_include_context_types_from_ranges(
+                source,
+                &ranges,
+                caller_variables,
+                &mut variables,
+                &mut definitions,
+                cancelled,
+            );
+            (
+                target,
+                twig_context_variable_types_from_maps(variables, definitions),
+            )
+        })
+        .collect()
+}
+
+pub(in crate::server) fn merge_twig_context_variables(
+    groups: impl IntoIterator<Item = Vec<TemplateVariableType>>,
+) -> Vec<TemplateVariableType> {
+    let mut variables = HashMap::new();
+    let mut definitions = HashMap::new();
+    for group in groups {
+        for variable in group {
+            merge_twig_context_template_variable_type(&mut variables, &mut definitions, variable);
+        }
+    }
+    twig_context_variable_types_from_maps(variables, definitions)
 }
 
 fn collect_twig_include_context_types_from_ranges(
@@ -3917,18 +3625,23 @@ fn collect_twig_include_context_types_from_ranges(
     caller_variables: &[TemplateVariableType],
     variables: &mut HashMap<String, String>,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
+    cancelled: &dyn Fn() -> bool,
 ) {
     let caller_by_name: HashMap<_, _> = caller_variables
         .iter()
         .map(|variable| (variable.name.as_str(), variable))
         .collect();
     for with_range in include_with_ranges {
+        if cancelled() {
+            break;
+        }
         collect_twig_include_with_variable_types(
             source,
             *with_range,
             &caller_by_name,
             variables,
             shape_definitions,
+            cancelled,
         );
     }
 }
@@ -3976,6 +3689,7 @@ fn collect_twig_include_with_variable_types(
     caller_by_name: &HashMap<&str, &TemplateVariableType>,
     variables: &mut HashMap<String, String>,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
+    cancelled: &dyn Fn() -> bool,
 ) {
     let (start, end) = trim_source_range(source, with_range.0, with_range.1);
     if source.as_bytes().get(start) != Some(&b'{') {
@@ -3990,6 +3704,9 @@ fn collect_twig_include_with_variable_types(
 
     let spans = split_top_level_spans(source.get(start + 1..close).unwrap_or(""), start + 1);
     for span in spans {
+        if cancelled() {
+            break;
+        }
         let span = trim_source_range(source, span.0, span.1);
         if span.0 >= span.1 {
             continue;
@@ -4333,61 +4050,41 @@ async fn twig_variable_types_for_template_state(
     template_documents: &Arc<DashMap<String, TemplateDocument>>,
     index: &Arc<WorkspaceIndex>,
     workspace_roots: &[PathBuf],
-    twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
+    cache: &Arc<Mutex<TwigContextDiskCache>>,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
     indexing_run: Option<&IndexingRunLease>,
-) -> Vec<TemplateVariableType> {
-    let Some(root) = workspace_root_for_template_context_uri(uri_str, workspace_roots) else {
-        return Vec::new();
-    };
-    let Some(template_name) = twig_template_name_for_uri(uri_str, &root) else {
-        return Vec::new();
-    };
-
-    let mut variables = HashMap::<String, String>::new();
-    let mut shape_definitions = HashMap::<String, Vec<TemplateShapeKeyDefinition>>::new();
-
-    for variable in direct_twig_variable_types_for_template_state(
+    runtime_generation: Option<u64>,
+) -> Option<TwigContextResult> {
+    let root = workspace_root_for_template_context_uri(uri_str, workspace_roots)?;
+    let name = twig_template_name_for_uri(uri_str, &root)?;
+    let context = twig_context_for_state(
         &root,
-        &template_name,
-        Some(uri_str),
-        open_files,
-        index,
-        twig_context_disk_cache,
-        traversal_limits,
-        exclude_paths,
-        indexing_run,
-    )
-    .await
-    {
-        merge_twig_context_template_variable_type(&mut variables, &mut shape_definitions, variable);
-    }
-
-    for variable in twig_include_variable_types_for_template_state(
-        &root,
-        &template_name,
-        uri_str,
         open_files,
         template_documents,
         index,
-        twig_context_disk_cache,
+        cache,
         traversal_limits,
         exclude_paths,
         indexing_run,
+        runtime_generation,
     )
-    .await
-    {
-        merge_twig_context_template_variable_type(&mut variables, &mut shape_definitions, variable);
+    .await?;
+    let mut variables = HashMap::new();
+    let mut definitions = HashMap::new();
+    for variable in context.variables(&name) {
+        merge_twig_context_template_variable_type(&mut variables, &mut definitions, variable);
     }
+    merge_symfony_twig_builtin_variable_types(index, &mut variables, &mut definitions);
+    Some(TwigContextResult {
+        context,
+        variables: twig_context_variable_types_from_maps(variables, definitions),
+    })
+}
 
-    merge_symfony_twig_builtin_variable_types(
-        index.as_ref(),
-        &mut variables,
-        &mut shape_definitions,
-    );
-
-    twig_context_variable_types_from_maps(variables, shape_definitions)
+pub(in crate::server) struct TwigContextResult {
+    pub(in crate::server) context: TwigContextView,
+    pub(in crate::server) variables: Vec<TemplateVariableType>,
 }
 
 fn merge_symfony_twig_builtin_variable_types(
@@ -4468,6 +4165,7 @@ struct OpenTemplateRefreshSnapshot<'a> {
     document: &'a TemplateDocument,
 }
 
+#[cfg(test)]
 fn replace_open_template_if_current(
     snapshot: OpenTemplateRefreshSnapshot<'_>,
     parser: FileParser,
@@ -4476,27 +4174,53 @@ fn replace_open_template_if_current(
     template_documents: &DashMap<String, TemplateDocument>,
     document_versions: &DashMap<String, OpenDocumentState>,
 ) -> bool {
+    replace_open_template_with_context(
+        snapshot,
+        parser,
+        template,
+        open_files,
+        template_documents,
+        document_versions,
+        None,
+    )
+}
+
+fn replace_open_template_with_context(
+    snapshot: OpenTemplateRefreshSnapshot<'_>,
+    parser: FileParser,
+    template: TemplateDocument,
+    open_files: &DashMap<String, FileParser>,
+    template_documents: &DashMap<String, TemplateDocument>,
+    document_versions: &DashMap<String, OpenDocumentState>,
+    context: Option<&TwigContextView>,
+) -> bool {
     let dashmap::mapref::entry::Entry::Occupied(mut open_entry) =
         open_files.entry(snapshot.uri.to_string())
     else {
         return false;
     };
-    if document_versions.get(snapshot.uri).map(|current| *current) != Some(snapshot.state) {
-        return false;
-    }
-    let Some(current_template) = template_documents.get(snapshot.uri) else {
-        return false;
-    };
-    if !current_template.has_same_source_and_twig_context(snapshot.document) {
-        return false;
-    }
-    drop(current_template);
+    let replace = || {
+        if document_versions.get(snapshot.uri).map(|current| *current) != Some(snapshot.state) {
+            return false;
+        }
+        let Some(current_template) = template_documents.get(snapshot.uri) else {
+            return false;
+        };
+        if !current_template.has_same_source_and_twig_context(snapshot.document) {
+            return false;
+        }
+        drop(current_template);
 
-    // Keep the parser entry locked until the refreshed virtual document and
-    // parser are committed. Concurrent document writers use the same entry.
-    template_documents.insert(snapshot.uri.to_string(), template);
-    open_entry.insert(parser);
-    true
+        // Keep the parser entry locked until the refreshed virtual document and
+        // parser are committed. Concurrent document writers use the same entry.
+        template_documents.insert(snapshot.uri.to_string(), template);
+        open_entry.insert(parser);
+        true
+    };
+    match context {
+        Some(context) => context.commit_if_current(replace).unwrap_or(false),
+        None => replace(),
+    }
 }
 
 pub(in crate::server) struct OpenTwigContextRefreshState<'a> {
@@ -4508,6 +4232,7 @@ pub(in crate::server) struct OpenTwigContextRefreshState<'a> {
     pub(in crate::server) workspace_roots: &'a [PathBuf],
     pub(in crate::server) workspace_configs: &'a [WorkspaceRootConfig],
     pub(in crate::server) workspace_folders_filter: Option<&'a [PathBuf]>,
+    pub(in crate::server) runtime_generation: u64,
     pub(in crate::server) indexing_runs: &'a [IndexingRunLease],
     pub(in crate::server) twig_context_disk_cache: &'a Arc<Mutex<TwigContextDiskCache>>,
     pub(in crate::server) semantic_tokens_cache: &'a Arc<Mutex<SemanticTokensCache>>,
@@ -4526,6 +4251,7 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         workspace_configs,
         workspace_folders_filter,
         indexing_runs,
+        runtime_generation,
         twig_context_disk_cache,
         semantic_tokens_cache,
     } = state;
@@ -4597,7 +4323,7 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
             .as_ref()
             .map(|config| config.runtime_config.exclude_paths.clone())
             .unwrap_or_default();
-        let variable_types = twig_variable_types_for_template_state(
+        let Some(context_result) = twig_variable_types_for_template_state(
             &uri_str,
             open_files,
             template_documents,
@@ -4607,9 +4333,16 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
             traversal_limits,
             &exclude_paths,
             indexing_run,
+            Some(runtime_generation),
         )
-        .await;
-        let refreshed_template = template.with_twig_variable_types(&variable_types);
+        .await
+        else {
+            continue;
+        };
+        let refreshed_template = template.with_twig_variable_types(&context_result.variables);
+        if refreshed_template.has_same_source_and_twig_context(&template) {
+            continue;
+        }
         let mut parser = FileParser::new();
         parser.parse_full(refreshed_template.virtual_source());
         if indexing_run.is_some_and(|run| !run.is_current()) {
@@ -4617,7 +4350,7 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         }
         let mut semantic_tokens = semantic_tokens_cache.lock().await;
         let commit_refresh = || {
-            let replaced = replace_open_template_if_current(
+            let replaced = replace_open_template_with_context(
                 OpenTemplateRefreshSnapshot {
                     uri: &uri_str,
                     state,
@@ -4628,9 +4361,14 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
                 open_files,
                 template_documents,
                 document_versions,
+                Some(&context_result.context),
             );
             if replaced {
-                remove_from_aggregate_and_root_index(index, workspace_index, &uri_str);
+                if index.file_symbols.contains_key(&uri_str)
+                    || workspace_index.file_symbols.contains_key(&uri_str)
+                {
+                    remove_from_aggregate_and_root_index(index, workspace_index, &uri_str);
+                }
                 semantic_tokens.remove(&uri_str);
             }
             replaced
@@ -4677,7 +4415,7 @@ impl PhpLspBackend {
         &self,
         request: &WorkspaceRequestContext,
         uri_str: &str,
-    ) -> Vec<TemplateVariableType> {
+    ) -> Option<TwigContextResult> {
         let index = request.index(&self.index);
         let roots = request
             .root()
@@ -4699,6 +4437,7 @@ impl PhpLspBackend {
             runtime_config.traversal_limits,
             &runtime_config.exclude_paths,
             None,
+            Some(request.state.generation),
         )
         .await
     }
@@ -4716,6 +4455,7 @@ impl PhpLspBackend {
             workspace_configs: &runtime_state.configs,
             workspace_folders_filter: None,
             indexing_runs: &[],
+            runtime_generation: runtime_state.generation,
             twig_context_disk_cache: &self.twig_context_disk_cache,
             semantic_tokens_cache: &self.semantic_tokens_cache,
         })

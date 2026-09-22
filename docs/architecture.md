@@ -64,6 +64,7 @@ server/crates/php-lsp-server/src/
     stubs.rs                 # stub path discovery/validation and reload orchestration
     vendor.rs                # vendor autoload cache and lazy vendor LRU helpers
     symlinks.rs              # physical/logical aliases and external watcher lifecycle
+    twig_context.rs          # incremental render/include graph, source cache and worker ownership
   util/
     fs_walk.rs               # deterministic identity-aware shared filesystem visitor
     fs_walk_tests.rs         # focused visitor budgets/symlink/linearity regressions
@@ -572,7 +573,7 @@ item types, so `{% for item in pagination %}` can inherit the entity type
 without booting Symfony. Custom Doctrine repositories are resolved from indexed
 `@extends ServiceEntityRepository<Entity>` PHPDoc and indexed ORM
 `repositoryClass` attributes; request handlers avoid synchronous source reads
-for this lookup. A bounded Twig include scan also handles one-level
+for this lookup. The Twig context index also handles one-level
 `{% include 'partial.html.twig' with {'items': items} %}` calls by evaluating
 the caller template's static render context and copying simple `with` object
 values and member chains such as `form_field: form.subscriber` into the
@@ -591,19 +592,36 @@ metadata points back to the `add('field')` string literal.
 Render keys whose value type cannot be inferred still
 seed `mixed` variables in the virtual prelude so valid templates do not publish
 false undefined-variable diagnostics just because the server cannot infer a
-richer type. The context scanner combines open PHP/Twig files from memory with a
-bounded, disk-backed cache for closed PHP files. Cache misses run through
-Tokio's blocking pool and file watcher/save events clear the cache. Open PHP
-buffers are authoritative over cached disk scan results; opening or editing a
-PHP source evicts disk-cache
-entries that were derived from that source URI, so a later close falls back to a
-refreshed disk snapshot instead of stale render context. Open Twig documents are
-bounded-refresh candidates after PHP controller/render edits, open Twig caller
-edits, and workspace reindex completion: their context
-prelude, virtual PHP parser, diagnostics, and request-time hover/completion/inlay
-state are rebuilt from current open buffers plus the disk cache. The scanner
-does not boot Symfony, evaluate Twig extensions, run user code, or read the
-service container.
+richer type. `indexing/twig_context.rs` maintains a workspace-scoped reverse
+index of PHP render calls and Twig include callers. Each file contributes all
+of its calls in one pass. Closed sources are cached by physical identity and
+content hash, with logical URI bindings retained separately; disk contributions
+are deduplicated in logical-path order before applying the physical file limit.
+Open buffers have separate URI-based overlays and replace their disk version
+even when their final render/include call has been removed. Full ASTs are not
+retained for closed files. Additional sources such as FormType bodies use the
+same cache.
+
+File notifications invalidate addressed sources and their dependent context
+contributions. Index lookup dependencies include declaration files and unresolved
+names; changes to their symbols invalidate type results without reparsing
+unchanged source content. Include results are reused while their source and
+caller variables remain unchanged. Directory changes, full invalidation and
+partial-coverage changes can require bounded rediscovery through the shared
+symlink-aware walker. The existing PHP/Twig file caps, traversal limits and open
+template refresh limit remain in effect; partial coverage is cached explicitly.
+
+Requests for the same input revision share one job. A single backend semaphore
+limits Twig blocking workers, and its permit stays inside the blocking closure
+until that worker really exits. The existing 15-second budget covers queueing
+and computation; cancellation/deadline checks run during discovery, source
+processing and render/include evaluation. Timeout, supersession, root removal
+and shutdown cannot publish a successful empty result. Publication validates
+runtime generation, source epoch, index revision and any indexing-run lease;
+virtual-document replacement additionally checks the document lifetime/version
+and previous context. Unchanged open contexts are not reparsed or republished.
+The index does not boot Symfony, evaluate Twig extensions, run user code, or read
+the service container.
 
 Open template virtual-PHP snapshots are deliberately excluded from workspace
 symbol and reference scans. A rename that changes an open URI's PHP/Blade

@@ -81,6 +81,7 @@ use indexing::run::*;
 pub(crate) use indexing::stubs::load_configured_stubs;
 use indexing::stubs::*;
 use indexing::symlinks::*;
+use indexing::twig_context::*;
 use indexing::vendor::*;
 pub(crate) use indexing::vendor::{
     parse_vendor_autoload_map, resolve_vendor_paths_from_map, vendor_autoload_file_paths_from_map,
@@ -1121,7 +1122,7 @@ async fn clear_request_fs_caches(
     twig_context_disk_cache: &Arc<Mutex<TwigContextDiskCache>>,
 ) {
     framework_string_key_cache.lock().await.clear();
-    twig_context_disk_cache.lock().await.clear();
+    twig_context_disk_cache.lock().await.invalidate_results();
 }
 
 fn elapsed_ms(started_at: Instant) -> u64 {
@@ -1957,106 +1958,6 @@ impl FrameworkStringKeyCache {
     }
 
     fn touch(&mut self, key: FrameworkStringKeyCacheKey) {
-        if let Some(position) = self.order.iter().position(|existing| existing == &key) {
-            self.order.remove(position);
-        }
-        self.order.push_back(key);
-    }
-
-    fn evict_over_capacity(&mut self) {
-        while self.order.len() > self.capacity {
-            if let Some(key) = self.order.pop_front() {
-                self.entries.remove(&key);
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TwigContextDiskCacheKey {
-    root: PathBuf,
-    index_identity: usize,
-    template_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TwigContextFileVariables {
-    uri: String,
-    variables: Vec<TemplateVariableType>,
-}
-
-#[derive(Debug)]
-struct TwigContextDiskCache {
-    capacity: usize,
-    entries: HashMap<TwigContextDiskCacheKey, Vec<TwigContextFileVariables>>,
-    order: VecDeque<TwigContextDiskCacheKey>,
-}
-
-impl Default for TwigContextDiskCache {
-    fn default() -> Self {
-        Self {
-            capacity: TWIG_CONTEXT_DISK_CACHE_CAPACITY,
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-}
-
-impl TwigContextDiskCache {
-    fn get(&mut self, key: &TwigContextDiskCacheKey) -> Option<Vec<TwigContextFileVariables>> {
-        let value = self.entries.get(key).cloned()?;
-        self.touch(key.clone());
-        Some(value)
-    }
-
-    fn insert(&mut self, key: TwigContextDiskCacheKey, value: Vec<TwigContextFileVariables>) {
-        self.entries.insert(key.clone(), value);
-        self.touch(key);
-        self.evict_over_capacity();
-    }
-
-    fn evict_entries_for_source_uri(&mut self, source_uri: &str) -> usize {
-        let stale_keys: HashSet<_> = self
-            .entries
-            .iter()
-            .filter(|(_, files)| files.iter().any(|file| file.uri == source_uri))
-            .map(|(key, _)| key.clone())
-            .collect();
-        let evicted = stale_keys.len();
-        if evicted == 0 {
-            return 0;
-        }
-
-        self.entries.retain(|key, _| !stale_keys.contains(key));
-        self.order.retain(|key| !stale_keys.contains(key));
-        evicted
-    }
-
-    fn evict_index(&mut self, index: &Arc<WorkspaceIndex>) -> usize {
-        let index_identity = Arc::as_ptr(index) as usize;
-        let stale_keys: HashSet<_> = self
-            .entries
-            .keys()
-            .filter(|key| key.index_identity == index_identity)
-            .cloned()
-            .collect();
-        let evicted = stale_keys.len();
-        self.entries.retain(|key, _| !stale_keys.contains(key));
-        self.order.retain(|key| !stale_keys.contains(key));
-        evicted
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.order.clear();
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn touch(&mut self, key: TwigContextDiskCacheKey) {
         if let Some(position) = self.order.iter().position(|existing| existing == &key) {
             self.order.remove(position);
         }
@@ -3553,7 +3454,17 @@ impl PhpLspBackend {
             runtime_state.generation,
             runtime_state.configs.len()
         );
-        *self.runtime_state.lock().await = runtime_state.clone();
+        let twig_context = self
+            .twig_context_disk_cache
+            .lock()
+            .await
+            .coordinator
+            .clone();
+        {
+            let mut current = self.runtime_state.lock().await;
+            twig_context.configure(&runtime_state);
+            *current = runtime_state.clone();
+        }
         if let Some(first) = runtime_state.configs.first() {
             *self.workspace_root.lock().await = Some(first.root.clone());
         } else {
