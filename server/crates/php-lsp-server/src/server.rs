@@ -2334,14 +2334,16 @@ const TWIG_CONTEXT_DISK_CACHE_CAPACITY: usize = 64;
 const MAX_INDEXING_PARSE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
-pub(crate) struct VendorPsr4Mapping {
+pub(crate) struct VendorNamespaceMapping {
     prefix: String,
     directories: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VendorAutoloadMap {
-    psr4: Vec<VendorPsr4Mapping>,
+    path_policy: VendorPathPolicy,
+    psr4: Vec<VendorNamespaceMapping>,
+    psr0: Vec<VendorNamespaceMapping>,
     pub(crate) files: Vec<PathBuf>,
     pub(crate) classmap: Vec<PathBuf>,
 }

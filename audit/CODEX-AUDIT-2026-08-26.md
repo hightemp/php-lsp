@@ -633,6 +633,14 @@ use($x)` начинает читать уже новое состояние.
 
 ### CODEX-P1-11. Vendor autoload metadata не ограничена каталогом `vendor`
 
+> **Статус 2026-09-22:** исправлено. Пути metadata и vendor include-цепочек
+> ограничены логическим vendor root; внешние symlink сохраняются.
+
+> **Уточнение политики 2026-09-22:** симлинки из `vendor` на разрабатываемые
+> внешние библиотеки поддерживаются намеренно. Граница для metadata является
+> логической; canonical paths используются для идентичности и дедупликации.
+> Защита общего обхода от циклов и превышения лимитов уже реализована в P1-01.
+
 [`parse_vendor_autoload_map`](server/crates/php-lsp-server/src/indexing/vendor.rs#L147)
 доверяет `install-path` и затем присоединяет к нему PSR-4/files/classmap paths.
 Нет canonical containment относительно `vendor/`; абсолютный путь или лишние
@@ -650,14 +658,41 @@ dependency `dev-bootstrap.php`.
 
 #### Что исправить
 
-- canonicalize package/autoload paths и требовать containment в canonical
-  vendor root;
-- не следовать symlink в classmap traversal и ввести file/depth budget;
+- нормализовать package/autoload paths и проверять логическую границу vendor
+  перед filesystem access, сохраняя явно созданные внешние symlink;
+- использовать общий ограниченный symlink-aware walker с physical identity
+  вместо повторной рекурсии или запрета внешних целей;
 - не читать `autoload-dev` из installed dependencies;
 - либо поддержать PSR-0, либо сначала читать сгенерированные Composer maps
   `autoload_psr4.php`, `autoload_namespaces.php`, `autoload_classmap.php` и
   `autoload_files.php` как authoritative данные;
 - добавить hostile installed.json и symlink-cycle tests.
+
+#### Реализовано
+
+- Общий `VendorPathPolicy` блокирует абсолютные/drive/UNC metadata paths,
+  неоднозначные компоненты и выход через `..`; нормализует смешанные разделители
+  и проверяет конечные PSR/classmap/files/include candidates. Canonical containment
+  не применяется: package, directory и file symlinks на внешние библиотеки
+  продолжают работать с логическими URI, exclusions и существующими watchers.
+- `install-path` разрешается относительно `vendor/composer`; legacy metadata
+  без поля использует проверенное package name, а null/пустые/неверные значения
+  и metapackages не превращаются в fallback на весь vendor.
+- Dependency `autoload-dev` исключён; root `autoload-dev` и runtime autoload
+  установленных dev dependencies сохраняются. Добавлен vendor PSR-0; общий
+  resolver сохраняет namespace prefix, поддерживает PEAR/empty/partial prefixes,
+  несколько директорий и начальные `_`, не создавая абсолютный candidate.
+- PSR-4 проверяется перед PSR-0 с сохранением порядка директорий; неполный
+  PSR-обход сохраняет watcher aliases, но не выбирает менее приоритетное
+  определение вместо непроверенного кандидата.
+- Обновлён маркер vendor-cache. Регрессии проверяют hostile metadata,
+  include escape, кеш с запрещёнными источниками, external symlinks, циклы,
+  дедупликацию и лимиты. Сквозной LSP-тест проверяет definition, physical change,
+  создание файла и повторный lifecycle с сохранённым vendor cache.
+- Проверки: 11 metadata regressions, 14 Composer tests и сквозной LSP-сценарий
+  прошли в полном наборе 975/975 (`CARGO_BUILD_JOBS=1`, `--test-threads=1`).
+  Clippy `--all-targets -D warnings`, Rustfmt, diff checks и повторный Verifier
+  review завершились успешно.
 
 ### CODEX-P1-12. Twig context scan имеет комбинаторный worst case
 

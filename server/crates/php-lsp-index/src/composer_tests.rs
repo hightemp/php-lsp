@@ -93,7 +93,7 @@ fn test_resolve_class_psr0_keeps_namespace_underscores() {
     let map = parse_composer_json_str(json, Path::new("/project")).unwrap();
     let paths = map.resolve_class_to_paths("App\\Foo_Bar\\Baz");
     assert_eq!(paths.len(), 1);
-    assert_eq!(paths[0], PathBuf::from("/project/src/Foo_Bar/Baz.php"));
+    assert_eq!(paths[0], PathBuf::from("/project/src/App/Foo_Bar/Baz.php"));
 }
 
 #[test]
@@ -108,7 +108,10 @@ fn test_resolve_class_psr0_maps_only_class_name_underscores() {
     let map = parse_composer_json_str(json, Path::new("/project")).unwrap();
     let paths = map.resolve_class_to_paths("App\\Foo\\Legacy_Class");
     assert_eq!(paths.len(), 1);
-    assert_eq!(paths[0], PathBuf::from("/project/src/Foo/Legacy/Class.php"));
+    assert_eq!(
+        paths[0],
+        PathBuf::from("/project/src/App/Foo/Legacy/Class.php")
+    );
 }
 
 #[test]
@@ -127,6 +130,42 @@ fn test_resolve_class_psr0_global_pear_style_class() {
         paths[0],
         PathBuf::from("/project/legacy/Legacy/Class/Name.php")
     );
+}
+
+#[test]
+fn test_resolve_class_psr0_named_prefix_multiple_dirs_and_leading_separator() {
+    let map = parse_composer_json_str(
+        r#"{"autoload":{"psr-0":{"Legacy_":["src/","lib/"]}}}"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+    assert_eq!(
+        map.resolve_class_to_paths("\\Legacy_Class_Name"),
+        vec![
+            PathBuf::from("/project/src/Legacy/Class/Name.php"),
+            PathBuf::from("/project/lib/Legacy/Class/Name.php"),
+        ]
+    );
+}
+
+#[test]
+fn test_resolve_class_psr0_leading_underscores_remain_relative() {
+    let map = parse_composer_json_str(
+        r#"{"autoload":{"psr-0":{"":"src/"}}}"#,
+        Path::new("/project"),
+    )
+    .unwrap();
+    for (fqn, expected) in [
+        ("_Foo", "/project/src/Foo.php"),
+        ("__Foo", "/project/src/Foo.php"),
+        ("Acme\\_Foo", "/project/src/Acme/Foo.php"),
+    ] {
+        assert_eq!(
+            map.resolve_class_to_paths(fqn),
+            vec![PathBuf::from(expected)],
+            "{fqn}"
+        );
+    }
 }
 
 #[test]

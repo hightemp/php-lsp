@@ -28,7 +28,8 @@ fn psr4_aliases_choose_one_physical_file_and_lexical_logical_uri() {
     symlink(&external, root.join("vendor/z-package/src")).expect("create z alias");
 
     let map = VendorAutoloadMap {
-        psr4: vec![VendorPsr4Mapping {
+        path_policy: VendorPathPolicy::new(&root.join("vendor")).unwrap(),
+        psr4: vec![VendorNamespaceMapping {
             prefix: "Vendor\\Package\\".to_string(),
             directories: vec![
                 root.join("vendor/z-package/src"),
@@ -86,7 +87,8 @@ fn missing_psr4_class_keeps_external_directory_alias_for_future_create_events() 
     symlink(&external, root.join("vendor/package/src")).expect("create source alias");
 
     let map = VendorAutoloadMap {
-        psr4: vec![VendorPsr4Mapping {
+        path_policy: VendorPathPolicy::new(&root.join("vendor")).unwrap(),
+        psr4: vec![VendorNamespaceMapping {
             prefix: "Vendor\\Package\\".to_string(),
             directories: vec![root.join("vendor/package/src")],
         }],

@@ -184,7 +184,7 @@ pub(crate) fn stubs_cache_hash_for_path_with_extensions(
 
 pub(crate) fn vendor_cache_hash(root: &Path) -> u64 {
     let mut parts = vec![
-        "vendor-cache-v1".to_string(),
+        "vendor-cache-v2-logical-boundary".to_string(),
         format!("root={}", cache_path_label(root)),
     ];
     for relative in [

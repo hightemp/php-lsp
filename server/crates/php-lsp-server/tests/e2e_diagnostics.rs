@@ -311,7 +311,7 @@ async fn test_post_index_diagnostics_preresolve_vendor_imports_for_open_files() 
     fs::create_dir_all(installed_json.parent().unwrap()).unwrap();
     fs::write(
         &installed_json,
-        r#"{"packages":[{"name":"acme/pkg","install-path":"acme/pkg","autoload":{"psr-4":{"Vendor\\Pkg\\":"src/"}}}]}"#,
+        r#"{"packages":[{"name":"acme/pkg","install-path":"../acme/pkg","autoload":{"psr-4":{"Vendor\\Pkg\\":"src/"}}}]}"#,
     )
     .unwrap();
 
@@ -549,7 +549,7 @@ final class Handler
     let installed_json = composer_dir.join("installed.json");
     fs::write(
         &installed_json,
-        r#"{"packages":[{"name":"acme/pkg","install-path":"acme/pkg","autoload":{"psr-4":{"Vendor\\Pkg\\":"src/"}}}]}"#,
+        r#"{"packages":[{"name":"acme/pkg","install-path":"../acme/pkg","autoload":{"psr-4":{"Vendor\\Pkg\\":"src/"}}}]}"#,
     )
     .unwrap();
     let installed_uri = format!("file://{}", installed_json.to_string_lossy());

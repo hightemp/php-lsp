@@ -5,6 +5,11 @@ use crate::util::uri::path_to_uri;
 
 use super::super::*;
 
+#[path = "vendor_paths.rs"]
+mod vendor_paths;
+pub(crate) use vendor_paths::VendorPathPolicy;
+use vendor_paths::{valid_package_name, valid_vendor_class_name, valid_vendor_prefix};
+
 #[derive(Debug, Clone)]
 pub(crate) struct VendorAutoloadCacheEntry {
     pub(crate) map: VendorAutoloadMap,
@@ -306,7 +311,8 @@ async fn wait_for_hierarchy_load(
 }
 
 pub(crate) fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutoloadMap> {
-    let installed_json = vendor_dir.join("composer/installed.json");
+    let path_policy = VendorPathPolicy::new(vendor_dir)?;
+    let installed_json = path_policy.root().join("composer/installed.json");
     if !installed_json.exists() {
         return None;
     }
@@ -320,19 +326,17 @@ pub(crate) fn parse_vendor_autoload_map(vendor_dir: &Path) -> Option<VendorAutol
         .and_then(|p| p.as_array())
         .or_else(|| data.as_array())?;
 
-    let mut map = VendorAutoloadMap::default();
+    let mut map = VendorAutoloadMap {
+        path_policy,
+        ..Default::default()
+    };
 
     for pkg in packages {
-        let install_path = pkg
-            .get("install-path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let pkg_dir = vendor_package_dir(vendor_dir, install_path);
+        let Some(pkg_dir) = vendor_package_dir(&map.path_policy, pkg) else {
+            continue;
+        };
 
         if let Some(autoload) = pkg.get("autoload") {
-            append_vendor_autoload(&mut map, &pkg_dir, autoload);
-        }
-        if let Some(autoload) = pkg.get("autoload-dev") {
             append_vendor_autoload(&mut map, &pkg_dir, autoload);
         }
     }
@@ -881,27 +885,36 @@ pub(in crate::server) fn append_vendor_autoload(
     pkg_dir: &Path,
     autoload: &serde_json::Value,
 ) {
-    if let Some(psr4) = autoload.get("psr-4").and_then(|v| v.as_object()) {
-        for (prefix, dirs) in psr4 {
-            let mut directories = Vec::new();
-            match dirs {
-                serde_json::Value::String(dir) => {
-                    directories.push(pkg_dir.join(dir));
+    for (key, mappings) in [("psr-4", &mut map.psr4), ("psr-0", &mut map.psr0)] {
+        if let Some(entries) = autoload.get(key).and_then(|v| v.as_object()) {
+            for (prefix, dirs) in entries {
+                if !valid_vendor_prefix(prefix, key == "psr-4") {
+                    continue;
                 }
-                serde_json::Value::Array(dir_list) => {
-                    for dir in dir_list {
-                        if let Some(dir_str) = dir.as_str() {
-                            directories.push(pkg_dir.join(dir_str));
+                let mut directories = Vec::new();
+                match dirs {
+                    serde_json::Value::String(dir) => {
+                        if let Some(path) = map.path_policy.join(pkg_dir, dir) {
+                            push_unique_path(&mut directories, path);
                         }
                     }
+                    serde_json::Value::Array(dir_list) => {
+                        for dir in dir_list {
+                            if let Some(dir_str) = dir.as_str() {
+                                if let Some(path) = map.path_policy.join(pkg_dir, dir_str) {
+                                    push_unique_path(&mut directories, path);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            if !directories.is_empty() {
-                map.psr4.push(VendorPsr4Mapping {
-                    prefix: prefix.clone(),
-                    directories,
-                });
+                if !directories.is_empty() {
+                    mappings.push(VendorNamespaceMapping {
+                        prefix: prefix.clone(),
+                        directories,
+                    });
+                }
             }
         }
     }
@@ -909,7 +922,9 @@ pub(in crate::server) fn append_vendor_autoload(
     if let Some(files) = autoload.get("files").and_then(|value| value.as_array()) {
         for file in files {
             if let Some(file_path) = file.as_str() {
-                push_unique_path(&mut map.files, pkg_dir.join(file_path));
+                if let Some(path) = map.path_policy.join(pkg_dir, file_path) {
+                    push_unique_path(&mut map.files, path);
+                }
             }
         }
     }
@@ -917,19 +932,30 @@ pub(in crate::server) fn append_vendor_autoload(
     if let Some(classmap) = autoload.get("classmap").and_then(|value| value.as_array()) {
         for path in classmap {
             if let Some(path) = path.as_str() {
-                push_unique_path(&mut map.classmap, pkg_dir.join(path));
+                if let Some(path) = map.path_policy.join(pkg_dir, path) {
+                    push_unique_path(&mut map.classmap, path);
+                }
             }
         }
     }
 }
 
-pub(in crate::server) fn vendor_package_dir(vendor_dir: &Path, install_path: &str) -> PathBuf {
-    if install_path.is_empty() {
-        vendor_dir.to_path_buf()
-    } else if install_path.starts_with("../") {
-        vendor_dir.join("composer").join(install_path)
-    } else {
-        vendor_dir.join(install_path)
+fn vendor_package_dir(policy: &VendorPathPolicy, package: &serde_json::Value) -> Option<PathBuf> {
+    if package.get("type").and_then(|value| value.as_str()) == Some("metapackage") {
+        return None;
+    }
+    match package.get("install-path") {
+        Some(value) => {
+            let relative = value.as_str().filter(|path| !path.is_empty())?;
+            policy.join(&policy.root().join("composer"), relative)
+        }
+        None => {
+            let name = package
+                .get("name")?
+                .as_str()
+                .filter(|name| valid_package_name(name))?;
+            policy.join(policy.root(), name)
+        }
     }
 }
 
@@ -937,7 +963,7 @@ pub(crate) fn resolve_vendor_paths_from_map(
     fqn: &str,
     map: &VendorAutoloadMap,
 ) -> Option<Vec<PathBuf>> {
-    let psr4_candidates = vendor_psr4_candidate_paths(fqn, map, None, &[]);
+    let psr4_candidates = vendor_namespace_candidate_paths(fqn, map, None, &[]);
     let mut paths = psr4_candidates
         .iter()
         .filter(|candidate| !candidate.is_file())
@@ -975,22 +1001,36 @@ fn resolve_vendor_paths_from_map_with_limits(
     exclude_paths: &[PathBuf],
 ) -> Option<VendorPathResolution> {
     let normalized_fqn = fqn.trim_start_matches('\\');
-    let psr4_candidates = vendor_psr4_candidate_paths(fqn, map, project_root, exclude_paths);
+    if !valid_vendor_class_name(normalized_fqn) {
+        return None;
+    }
+    let psr4_candidates = vendor_namespace_candidate_paths(fqn, map, project_root, exclude_paths);
 
     let deadline = file_io_walk_deadline();
     let psr4 = walk_files(
         &psr4_candidates,
         traversal_limits,
-        |path| project_root.is_some_and(|root| path_is_excluded(path, root, exclude_paths)),
+        |path| {
+            map.path_policy.check(path).as_deref() != Some(path)
+                || project_root.is_some_and(|root| path_is_excluded(path, root, exclude_paths))
+        },
         |_, _| false,
         is_php_file_path,
         || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
     );
     if psr4.truncated() || psr4.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
         tracing::warn!(
-            "Vendor PSR-4 candidate traversal was truncated after {} entries",
+            "Vendor PSR candidate traversal was truncated after {} entries",
             psr4.stats.visited_entries
         );
+        // The lexically first visited file need not be the highest-priority
+        // Composer candidate. Keep watcher aliases, but never select a lower
+        // priority definition when the candidate traversal is incomplete.
+        return (!psr4.symlink_aliases.is_empty()).then_some(VendorPathResolution {
+            paths: Vec::new(),
+            symlink_aliases: psr4.symlink_aliases,
+            physical_files: psr4.physical_files,
+        });
     }
 
     let classmap = classmap_candidate_paths_for_fqn(
@@ -1000,7 +1040,8 @@ fn resolve_vendor_paths_from_map_with_limits(
         project_root,
         exclude_paths,
     );
-    let mut priority_identities = ordered_physical_identities(&psr4.files, &psr4.physical_files);
+    let mut priority_identities =
+        ordered_physical_identities(&psr4_candidates, &psr4.physical_files);
     priority_identities.extend(ordered_physical_identities(
         &classmap.paths,
         &classmap.physical_files,
@@ -1035,7 +1076,7 @@ fn resolve_vendor_paths_from_map_with_limits(
     }
 }
 
-fn vendor_psr4_candidate_paths(
+fn vendor_namespace_candidate_paths(
     fqn: &str,
     map: &VendorAutoloadMap,
     project_root: Option<&Path>,
@@ -1043,13 +1084,33 @@ fn vendor_psr4_candidate_paths(
 ) -> Vec<PathBuf> {
     let normalized_fqn = fqn.trim_start_matches('\\');
     let mut candidates = Vec::new();
-    for mapping in &map.psr4 {
+    if !valid_vendor_class_name(normalized_fqn) {
+        return candidates;
+    }
+    for (mapping, psr4) in map
+        .psr4
+        .iter()
+        .map(|mapping| (mapping, true))
+        .chain(map.psr0.iter().map(|mapping| (mapping, false)))
+    {
+        if !valid_vendor_prefix(&mapping.prefix, psr4) {
+            continue;
+        }
         let Some(relative) = normalized_fqn.strip_prefix(mapping.prefix.as_str()) else {
             continue;
         };
-        let relative_path = relative.replace('\\', "/") + ".php";
+        let relative_path = if psr4 {
+            if relative.is_empty() {
+                continue;
+            }
+            relative.replace('\\', "/") + ".php"
+        } else {
+            php_lsp_index::composer::psr0_relative_path(normalized_fqn)
+        };
         for directory in &mapping.directories {
-            let candidate = directory.join(&relative_path);
+            let Some(candidate) = map.path_policy.join(directory, &relative_path) else {
+                continue;
+            };
             if project_root.is_some_and(|root| path_is_excluded(&candidate, root, exclude_paths)) {
                 continue;
             }
@@ -1119,6 +1180,7 @@ pub(crate) fn vendor_autoload_file_paths_from_map(
     for file_path in &map.files {
         push_vendor_autoload_file_and_static_includes(
             file_path,
+            &map.path_policy,
             project_root,
             exclude_paths,
             &mut paths,
@@ -1155,6 +1217,7 @@ pub(in crate::server) async fn vendor_autoload_file_paths_from_map_blocking(
 
 fn push_vendor_autoload_file_and_static_includes(
     file_path: &Path,
+    policy: &VendorPathPolicy,
     project_root: &Path,
     exclude_paths: &[PathBuf],
     paths: &mut Vec<PathBuf>,
@@ -1162,6 +1225,10 @@ fn push_vendor_autoload_file_and_static_includes(
 ) {
     const MAX_STATIC_INCLUDE_DEPTH: usize = 8;
 
+    let Some(file_path) = policy.check(file_path) else {
+        return;
+    };
+    let file_path = file_path.as_path();
     if depth > MAX_STATIC_INCLUDE_DEPTH
         || !is_php_file_path(file_path)
         || path_is_excluded(file_path, project_root, exclude_paths)
@@ -1178,6 +1245,7 @@ fn push_vendor_autoload_file_and_static_includes(
     for include_path in static_php_include_target_paths_for_file(file_path) {
         push_vendor_autoload_file_and_static_includes(
             &include_path,
+            policy,
             project_root,
             exclude_paths,
             paths,
@@ -1202,17 +1270,29 @@ fn static_php_include_target_paths_for_file(file_path: &Path) -> Vec<PathBuf> {
 
 pub(crate) fn vendor_namespace_exists_from_map(fqn: &str, map: &VendorAutoloadMap) -> bool {
     let normalized_fqn = fqn.trim_matches('\\');
-    if normalized_fqn.is_empty() {
+    if !valid_vendor_class_name(normalized_fqn) {
         return false;
     }
 
-    for mapping in &map.psr4 {
-        let prefix = mapping.prefix.trim_matches('\\');
-        if prefix.is_empty() {
+    for (mapping, psr4) in map
+        .psr4
+        .iter()
+        .map(|mapping| (mapping, true))
+        .chain(map.psr0.iter().map(|mapping| (mapping, false)))
+    {
+        if !valid_vendor_prefix(&mapping.prefix, psr4) {
             continue;
         }
+        let prefix = mapping.prefix.trim_matches('\\');
 
-        let relative = if normalized_fqn == prefix {
+        let relative = if !psr4 {
+            if !normalized_fqn.starts_with(&mapping.prefix) && normalized_fqn != prefix {
+                continue;
+            }
+            normalized_fqn
+        } else if prefix.is_empty() {
+            normalized_fqn
+        } else if normalized_fqn == prefix {
             ""
         } else if let Some(relative) = normalized_fqn.strip_prefix(prefix) {
             let Some(relative) = relative.strip_prefix('\\') else {
@@ -1223,12 +1303,10 @@ pub(crate) fn vendor_namespace_exists_from_map(fqn: &str, map: &VendorAutoloadMa
             continue;
         };
 
-        let relative_path = relative.replace('\\', "/");
+        let relative_path = if psr4 { relative } else { normalized_fqn }.replace('\\', "/");
         for directory in &mapping.directories {
-            let namespace_dir = if relative_path.is_empty() {
-                directory.clone()
-            } else {
-                directory.join(&relative_path)
+            let Some(namespace_dir) = map.path_policy.join(directory, &relative_path) else {
+                continue;
             };
             if namespace_dir.is_dir() {
                 return true;
@@ -1251,10 +1329,18 @@ fn classmap_candidate_paths_for_fqn(
     let mut fallback = Vec::new();
 
     let deadline = file_io_walk_deadline();
+    let roots = map
+        .classmap
+        .iter()
+        .filter_map(|path| map.path_policy.check(path))
+        .collect::<Vec<_>>();
     let outcome = walk_files(
-        &map.classmap,
+        &roots,
         traversal_limits,
-        |path| project_root.is_some_and(|root| path_is_excluded(path, root, exclude_paths)),
+        |path| {
+            map.path_policy.check(path).as_deref() != Some(path)
+                || project_root.is_some_and(|root| path_is_excluded(path, root, exclude_paths))
+        },
         |_, _| true,
         is_php_file_path,
         || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
@@ -1612,3 +1698,7 @@ impl PhpLspBackend {
 #[cfg(all(test, unix))]
 #[path = "vendor_symlink_tests.rs"]
 mod symlink_resolution_tests;
+
+#[cfg(test)]
+#[path = "vendor_metadata_tests.rs"]
+mod metadata_tests;

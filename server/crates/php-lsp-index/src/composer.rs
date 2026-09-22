@@ -26,6 +26,7 @@ impl NamespaceMap {
     /// E.g., with mapping `App\\` → `src/`, resolving `App\\Service\\Foo`
     /// returns `[src/Service/Foo.php]`.
     pub fn resolve_class_to_paths(&self, fqn: &str) -> Vec<PathBuf> {
+        let fqn = fqn.trim_start_matches('\\');
         let mut results = Vec::new();
 
         for (prefix, dirs) in &self.psr4 {
@@ -38,8 +39,8 @@ impl NamespaceMap {
         }
 
         for (prefix, dirs) in &self.psr0 {
-            if let Some(relative) = fqn.strip_prefix(prefix.as_str()) {
-                let relative_path = psr0_relative_path(relative);
+            if fqn.starts_with(prefix.as_str()) {
+                let relative_path = psr0_relative_path(fqn);
                 for dir in dirs {
                     results.push(dir.join(&relative_path));
                 }
@@ -69,7 +70,9 @@ impl NamespaceMap {
     }
 }
 
-fn psr0_relative_path(relative: &str) -> String {
+/// PSR-0 retains the complete class name, including the matching prefix.
+pub fn psr0_relative_path(fqn: &str) -> String {
+    let relative = fqn.trim_start_matches('\\');
     // PSR-0 gives underscores special meaning only in the unqualified class name.
     let (namespace, class_name) = relative
         .rsplit_once('\\')
@@ -79,7 +82,9 @@ fn psr0_relative_path(relative: &str) -> String {
     let class_path = class_name.replace('_', "/");
 
     if namespace.is_empty() {
-        format!("{class_path}.php")
+        // Composer concatenates dir + '/' + logical path, so a leading `_`
+        // produces an extra separator inside dir, never an absolute path.
+        format!("{}.php", class_path.trim_start_matches('/'))
     } else {
         format!("{}/{}.php", namespace.replace('\\', "/"), class_path)
     }

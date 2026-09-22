@@ -363,11 +363,17 @@ to an effective root:
 
 - If Composer support is enabled, `composer.json` discovery can narrow indexing
   to the Composer project root.
-- Composer `autoload` and `autoload-dev` entries are parsed for PSR-4, PSR-0,
-  classmap, and files entries.
-- PSR-0 candidate paths map namespace separators to directories and treat
+- Root Composer `autoload` and `autoload-dev` entries are parsed for PSR-4,
+  PSR-0, classmap, and files entries. Installed dependencies contribute only
+  `autoload`, including dependencies installed through `require-dev`.
+- Workspace and vendor PSR-0 candidate paths retain the full matching prefix,
+  map namespace separators to directories, and treat
   underscores as path separators only in the unqualified class-name segment;
-  underscores inside namespace segments are preserved.
+  underscores inside namespace segments are preserved. Leading class-name
+  underscores never turn a candidate into an absolute filesystem path.
+- Vendor PSR-4 candidates precede PSR-0 candidates and retain each mapping's
+  directory order. Incomplete PSR traversal retains watcher aliases but does
+  not choose a lower-priority definition from a partial set of candidates.
 - `phpLsp.includePaths` adds explicit directories or files.
 - `phpLsp.excludePaths` removes relative or absolute paths from indexing and
   lazy vendor work.
@@ -382,6 +388,17 @@ children are complete so an entry-budget stop remains deterministic. One
 bounded, unqueued EOF lookahead distinguishes an exact budget fit. Clients with LSP relative-pattern
 support receive dynamic watchers for external physical roots; incoming events
 are translated back to the deterministic logical URI before normal indexing.
+
+Vendor metadata paths are constrained to the logical `vendor` directory.
+`install-path` is relative to `vendor/composer`; older metadata without that
+field falls back to a validated package name under `vendor`. Absolute metadata
+paths, drive/UNC paths and traversal above the logical vendor root are rejected.
+PSR paths, classmap roots, files entrypoints and their static includes are
+normalized and checked before reading; invalid entries do not discard valid
+neighboring packages. A library symlinked into `vendor` may still live outside
+the project: canonical paths establish physical identity, not an access boundary.
+The logical URI and exclusions remain stable across lazy loading and watcher
+updates. Newly created, unopened vendor files continue to be indexed lazily.
 
 Each mapping keeps the original workspace-folder path, its Composer effective
 root, namespace map, immutable `ResolvedRuntimeConfiguration`, and a root-owned

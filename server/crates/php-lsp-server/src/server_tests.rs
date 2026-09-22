@@ -1960,10 +1960,10 @@ fn test_vendor_autoload_map_parses_psr4_and_files() {
         map.files
     );
     assert!(
-        vendor_autoload_file_paths_from_map(&map, &tmp, &[])
+        !vendor_autoload_file_paths_from_map(&map, &tmp, &[])
             .iter()
             .any(|path| path.to_string_lossy().ends_with("dev-bootstrap.php")),
-        "Expected autoload-dev file path, got: {:?}",
+        "Dependency autoload-dev must not be loaded, got: {:?}",
         map.files
     );
     assert!(
@@ -2013,6 +2013,7 @@ fn test_vendor_classmap_uses_safe_external_symlink_walker() {
     symlink(&external, root.join("linked-classmap")).expect("link external classmap");
     symlink(&external, external.join("cycle")).expect("create classmap cycle");
     let map = VendorAutoloadMap {
+        path_policy: VendorPathPolicy::new(&root).unwrap(),
         classmap: vec![root.join("linked-classmap")],
         ..Default::default()
     };
