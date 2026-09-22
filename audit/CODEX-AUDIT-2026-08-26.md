@@ -584,6 +584,10 @@ use($x)` начинает читать уже новое состояние.
 
 ### CODEX-P1-10. Generate constructor может сломать наследование
 
+> **Статус 2026-09-22:** исправлено. Генерация сохраняет вызов effective parent
+> constructor в поддерживаемом безопасном подмножестве; одинаковые проверки
+> выполняются при proposal и lazy resolve.
+
 [`generate_constructor_edit`](server/crates/php-lsp-server/src/lsp/code_action.rs#L2681)
 проверяет только наличие **direct** `__construct`, собирает свойства и генерирует
 новый child constructor. Наличие унаследованного конструктора не проверяется,
@@ -600,6 +604,32 @@ use($x)` начинает читать уже новое состояние.
 - иначе переносить совместимые параметры и генерировать явный
   `parent::__construct(...)`;
 - тестировать required/optional/variadic parent parameters и multi-level chain.
+
+#### Реализовано
+
+- Общий planner для proposal и lazy resolve проходит всю индексированную цепочку
+  родителей, находит effective constructor и запрещает неполную/циклическую
+  иерархию, final/private constructors и abstract constructor contracts, включая
+  дальнего предка с concrete override в промежуточном классе.
+- Нативная сигнатура читается из AST исходника родителя: required/optional,
+  by-reference и variadic параметры переносятся без property promotion и
+  PHPDoc narrowing; class aliases, `self` и `parent` квалифицируются в исходном
+  namespace. Генерируется явный `parent::__construct(...)` с unpacking variadic.
+- Коллизии имён параметров, общее readonly storage, traits/interfaces,
+  parameter attributes и контекстно-зависимые defaults fail closed. Родители,
+  наблюдающие свои arguments через `func_num_args`/`func_get_args`/`func_get_arg`,
+  aliases, indirect calls или include/eval, также блокируются: явная передача
+  optional defaults может менять их инициализацию.
+- Resolve пересчитывает план по актуальному родителю, проверяет revision индекса
+  и версию child document после awaits; stale/forged unsafe actions дают пустой
+  edit. Незагруженный родитель не считается классом без конструктора.
+- В `e2e_constructor.rs` добавлены протокольные регрессии для многоуровневого
+  наследования, defaults, variadic/references, namespace/imports, readonly,
+  argument observers, обновлённого parent и stale child. При доступном PHP CLI
+  сгенерированный код также выполняется с проверкой состояния родителя и ссылок.
+- Проверки: 8/8 новых E2E, полный `CARGO_BUILD_JOBS=1 cargo test --all --
+  --test-threads=1`, Clippy `--all-targets -D warnings`, Rustfmt и diff check
+  затронутых файлов прошли; повторный Verifier review дал GO.
 
 ### CODEX-P1-11. Vendor autoload metadata не ограничена каталогом `vendor`
 

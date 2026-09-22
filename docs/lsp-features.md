@@ -94,6 +94,19 @@ comparison rule.
 | `textDocument/rangeFormatting` | Partial | Uses the same external formatter resolution, but formats only selected PHP fragments via temporary files and never formats the whole document for a range request. |
 | `textDocument/onTypeFormatting` | Supported | Local indentation edits for newline, semicolon, and closing brace. |
 
+Constructor generation forwards the effective parent constructor's native
+parameters, including references and variadics, and inserts an explicit
+`parent::__construct(...)` call. Required parameters precede optional parameters;
+variadics remain last. Parent class types are qualified in their declaring
+namespace, and parameter promotion is not copied into the child. Proposal and
+resolve both refuse unresolved/cyclic inheritance, final/private/abstract parent
+constructors, parameter-name collisions, and unsupported contracts (including
+traits/interfaces, parameter attributes, and defaults that depend on the parent
+scope). Unindexed parents must be indexed before the action becomes available.
+It also refuses shared readonly property initialization and parent constructors
+that inspect their arguments (including indirect calls whose argument-observation
+behavior cannot be established).
+
 ## Intelligence
 
 | LSP feature | Status | Notes |

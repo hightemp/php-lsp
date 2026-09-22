@@ -38,3 +38,5 @@ Thumbs.db
 .cache/
 .semantic-search/
 .codegraph/daemon.pid
+
+NOTES.md

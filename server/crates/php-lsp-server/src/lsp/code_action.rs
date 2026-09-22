@@ -3,6 +3,10 @@
 use super::super::*;
 use super::document_links::is_static_string_literal_node;
 
+#[path = "constructor_generation.rs"]
+mod constructor_generation;
+use constructor_generation::{ConstructorGenerationPlan, ParentConstructorPlan};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ImportKind {
     Class,
@@ -1078,18 +1082,10 @@ pub(crate) fn build_implement_missing_methods_action(
 
 pub(crate) fn build_generate_constructor_action(
     uri: Uri,
-    source: &str,
-    file_symbols: &php_lsp_types::FileSymbols,
     class_sym: &php_lsp_types::SymbolInfo,
     request_range: Range,
     document_version: Option<i32>,
 ) -> Option<CodeActionOrCommand> {
-    if direct_method_name_exists(file_symbols, &class_sym.fqn, "__construct")
-        || constructor_generation_properties(source, file_symbols, &class_sym.fqn).is_empty()
-    {
-        return None;
-    }
-
     let data = serde_json::to_value(CodeActionData {
         action_kind: CodeActionDataKind::GenerateConstructor,
         uri: uri.as_str().to_string(),
@@ -2516,13 +2512,35 @@ pub(crate) fn render_phpdoc_type_line(
 
 pub(crate) fn render_constructor_method(
     properties: &[ConstructorProperty<'_>],
+    parent: Option<&ParentConstructorPlan>,
     method_indent: &str,
     body_indent: &str,
     php_version: PhpVersion,
 ) -> String {
-    let params = properties
-        .iter()
-        .map(|property| render_constructor_param(property, php_version))
+    let mut params = parent
+        .into_iter()
+        .flat_map(|parent| &parent.params)
+        .map(|param| {
+            (
+                if param.variadic {
+                    2
+                } else {
+                    u8::from(param.optional)
+                },
+                param.declaration.clone(),
+            )
+        })
+        .chain(properties.iter().map(|property| {
+            (
+                u8::from(property.param_default.is_some()),
+                render_constructor_param(property, php_version),
+            )
+        }))
+        .collect::<Vec<_>>();
+    params.sort_by_key(|(order, _)| *order);
+    let params = params
+        .into_iter()
+        .map(|(_, declaration)| declaration)
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -2548,11 +2566,26 @@ pub(crate) fn render_constructor_method(
         text.push('\n');
     }
     text.push_str(method_indent);
-    text.push_str("public function __construct(");
+    text.push_str(visibility_text(
+        parent.map_or(php_lsp_types::Visibility::Public, |parent| {
+            parent.visibility
+        }),
+    ));
+    text.push_str(" function __construct(");
     text.push_str(&params);
     text.push_str(")\n");
     text.push_str(method_indent);
     text.push_str("{\n");
+    if let Some(parent) = parent {
+        let arguments = parent
+            .params
+            .iter()
+            .map(|param| format!("{}${}", if param.variadic { "..." } else { "" }, param.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(body_indent);
+        text.push_str(&format!("parent::__construct({arguments});\n"));
+    }
     for property in properties {
         text.push_str(body_indent);
         text.push_str("$this->");
@@ -2683,6 +2716,7 @@ pub(crate) fn generate_constructor_edit(
     source: &str,
     file_symbols: &php_lsp_types::FileSymbols,
     class_sym: &php_lsp_types::SymbolInfo,
+    plan: &ConstructorGenerationPlan,
     php_version: PhpVersion,
 ) -> Option<WorkspaceEdit> {
     if direct_method_name_exists(file_symbols, &class_sym.fqn, "__construct") {
@@ -2696,6 +2730,7 @@ pub(crate) fn generate_constructor_edit(
     let insertion = class_method_insertion(source, class_sym)?;
     let constructor = render_constructor_method(
         &properties,
+        plan.parent.as_ref(),
         &insertion.method_indent,
         &insertion.body_indent,
         php_version,
@@ -6625,6 +6660,30 @@ impl PhpLspBackend {
         };
         let document_version = document_state.map(|state| state.version);
 
+        let constructor_action = if wants_generate_members {
+            let range = lsp_range_to_byte_range(&source, params.range);
+            if let Some(class_sym) = concrete_class_symbol_at_range(&file_symbols, range) {
+                self.constructor_generation_plan(&request, &source, &file_symbols, class_sym)
+                    .await
+                    .and_then(|_| {
+                        (self.current_document_version(&uri_str) == document_version)
+                            .then(|| {
+                                build_generate_constructor_action(
+                                    uri.clone(),
+                                    class_sym,
+                                    params.range,
+                                    document_version,
+                                )
+                            })
+                            .flatten()
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let (
             source,
             file_symbols,
@@ -6673,17 +6732,8 @@ impl PhpLspBackend {
                         document_version,
                     ));
                 }
-                if let Some(class_sym) = concrete_class_symbol_at_range(&file_symbols, range) {
-                    if let Some(action) = build_generate_constructor_action(
-                        uri.clone(),
-                        &source,
-                        &file_symbols,
-                        class_sym,
-                        params.range,
-                        document_version,
-                    ) {
-                        actions.push(action);
-                    }
+                if let Some(action) = constructor_action {
+                    actions.push(action);
                 }
                 if let Some(property) = property_symbol_at_range(&file_symbols, range) {
                     let parent_is_class =
@@ -7137,11 +7187,23 @@ impl PhpLspBackend {
                 };
 
                 let php_version = request.runtime_config().php_version;
+                let Some(plan) = self
+                    .constructor_generation_plan(&request, &source, &file_symbols, class_sym)
+                    .await
+                else {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                };
+                if self.current_document_version(&uri) != document_version {
+                    params.edit = Some(empty_workspace_edit());
+                    return Ok(params);
+                }
                 params.edit = generate_constructor_edit(
                     uri_value,
                     &source,
                     &file_symbols,
                     class_sym,
+                    &plan,
                     php_version,
                 )
                 .or_else(|| Some(empty_workspace_edit()));
