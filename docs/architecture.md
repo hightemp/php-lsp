@@ -870,7 +870,9 @@ template identity before sending the result to the client.
 
 External analyzer runs are per document. A newer document event cancels the
 previous analyzer run for that URI. Analyzer commands are timeout-bound and
-expected to print JSON.
+expected to print JSON. PHPStan file keys are resolved against the cwd used by
+its command; only diagnostics for the requested file are published. Malformed
+PHPStan range ends are clamped to the range start.
 
 ## Request Paths
 

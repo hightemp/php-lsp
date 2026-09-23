@@ -909,6 +909,9 @@ generic, пропуск vendor-зависимости и сохранение с
 
 ### CODEX-P2-04. PHPStan diagnostics могут иметь неверный range или файл
 
+> **Статус 2026-09-23:** исправлено через RED → GREEN. Исходное описание
+> дефекта ниже сохранено как обоснование изменений.
+
 [`phpstan_message_to_diagnostic`](server/crates/php-lsp-server/src/lsp/diagnostics.rs#L147)
 не гарантирует LSP-инвариант `end >= start`, хотя Psalm range уже
 нормализуется.
@@ -931,6 +934,25 @@ generic, пропуск vendor-зависимости и сохранение с
 - разрешать relative paths относительно этого cwd;
 - убрать безусловный single-file fallback;
 - добавить malformed/single-relative/multi-relative regression matrix.
+
+#### Реализовано
+
+Конец PHPStan range зажимается лексикографически до начала. Ключи `files`
+сопоставляются с запрошенным файлом; относительные пути разрешаются от cwd,
+переданного процессу анализатора (или унаследованного cwd, если workspace root
+не задан). Единственный чужой файл больше не считается совпадением. Проверка
+physical identity через canonical path сохраняет symlink-алиасы. Разбор JSON и
+проверка файловых путей остаются в blocking-задаче; поведение Psalm не менялось.
+
+Постоянные RED-регрессии воспроизвели перевёрнутые координаты, публикацию
+диагностики чужого single-file результата и потерю нужного relative key при
+multi-file output. Тесты покрывают malformed/valid ranges, single и multi
+relative keys, отсутствие workspace root, foreign keys, missing target и
+canonical symlink alias.
+
+Финальный `CARGO_BUILD_JOBS=1 cargo test --all -- --test-threads=1` прошёл
+1073/1073 без ignored. Clippy `--all-targets -D warnings`, Rustfmt и diff check
+прошли; повторный Verifier review дал GO.
 
 ### CODEX-P2-05. Timeout не ограничивает все потребляемые ресурсы
 

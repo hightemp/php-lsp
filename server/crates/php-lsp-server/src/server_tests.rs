@@ -7686,7 +7686,7 @@ fn test_parse_phpstan_json_diagnostics_maps_messages() {
     })
     .to_string();
 
-    let diagnostics = parse_phpstan_json_diagnostics(&output, &file_path).unwrap();
+    let diagnostics = parse_phpstan_json_diagnostics(&output, &file_path, None).unwrap();
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].range.start.line, 6);
     assert_eq!(diagnostics[0].source.as_deref(), Some("phpstan"));
@@ -7706,6 +7706,46 @@ fn test_parse_phpstan_json_diagnostics_maps_messages() {
         diagnostics[0].message.contains("Check the object type."),
         "tip should be appended to diagnostic message"
     );
+}
+
+#[test]
+fn test_phpstan_malformed_ranges_never_end_before_start() {
+    let target = PathBuf::from("/definitely/missing/php-lsp/Range.php");
+    let cases = [
+        (
+            serde_json::json!({"message":"earlier line", "line":9, "column":8, "endLine":8, "endColumn":20}),
+            (8, 7),
+            (8, 7),
+        ),
+        (
+            serde_json::json!({"message":"earlier column", "line":9, "column":8, "endLine":9, "endColumn":3}),
+            (8, 7),
+            (8, 7),
+        ),
+        (
+            serde_json::json!({"message":"valid span", "line":9, "column":8, "endLine":9, "endColumn":11}),
+            (8, 7),
+            (8, 10),
+        ),
+        (
+            serde_json::json!({"message":"next line", "line":9, "column":8, "endLine":10, "endColumn":1}),
+            (8, 7),
+            (9, 0),
+        ),
+        (
+            serde_json::json!({"message":"zero fields", "line":0, "column":0, "endLine":0, "endColumn":0}),
+            (0, 0),
+            (0, 0),
+        ),
+    ];
+    for (message, start, end) in cases {
+        let output = serde_json::json!({"files": {(target.to_string_lossy().to_string()): {"messages": [message]}}}).to_string();
+        let diagnostics = parse_phpstan_json_diagnostics(&output, &target, None).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        let range = diagnostics[0].range;
+        assert_eq!((range.start.line, range.start.character), start);
+        assert_eq!((range.end.line, range.end.character), end);
+    }
 }
 
 #[tokio::test]
@@ -7770,6 +7810,126 @@ async fn test_run_phpstan_for_file_accepts_nonzero_json_output() {
     assert_eq!(diagnostics[0].message, "PHPStan reported a test error.");
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_phpstan_resolves_relative_json_keys_against_command_cwd() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-phpstan-relative-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let target = root.join("src/Subject.php");
+    let other = root.join("src/Other.php");
+    std::fs::write(&target, "<?php class Subject {}\n").unwrap();
+    std::fs::write(&other, "<?php class Other {}\n").unwrap();
+    let script = root.join("phpstan-fake.sh");
+    let config = PhpStanConfig {
+        enabled: true,
+        command: format!("sh {} {{file}}", shell_escape(&script.to_string_lossy())),
+        timeout_ms: 5_000,
+        memory_limit: None,
+    };
+
+    let multiple = serde_json::json!({
+        "files": {
+            "src/Subject.php": {"messages": [{"message": "relative target", "line": 2}]},
+            "src/Other.php": {"messages": [{"message": "relative other", "line": 3}]}
+        }
+    });
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ncat <<'JSON'\n{multiple}\nJSON\nexit 1\n"),
+    )
+    .unwrap();
+    let diagnostics =
+        run_phpstan_for_file(config.clone(), target.clone(), Some(root.clone()), None)
+            .await
+            .unwrap();
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "multi-file relative output: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics[0].message, "relative target");
+
+    let single_target = serde_json::json!({
+        "files": {"src/Subject.php": {"messages": [{"message": "relative single target", "line": 2}]}}
+    });
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ncat <<'JSON'\n{single_target}\nJSON\nexit 1\n"),
+    )
+    .unwrap();
+    let diagnostics =
+        run_phpstan_for_file(config.clone(), target.clone(), Some(root.clone()), None)
+            .await
+            .unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].message, "relative single target");
+
+    let single = serde_json::json!({
+        "files": {"src/Other.php": {"messages": [{"message": "foreign single", "line": 3}]}}
+    });
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ncat <<'JSON'\n{single}\nJSON\nexit 1\n"),
+    )
+    .unwrap();
+    let diagnostics = run_phpstan_for_file(config, target, Some(root.clone()), None)
+        .await
+        .unwrap();
+    assert!(
+        diagnostics.is_empty(),
+        "foreign single-file output: {diagnostics:?}"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_phpstan_relative_json_keys_use_inherited_cwd_without_workspace_root() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("php-lsp-inherited-cwd-{nanos}.php");
+    let cwd = std::env::current_dir().unwrap();
+    let target = cwd.join(&name);
+    let script = std::env::temp_dir().join(format!("php-lsp-inherited-cwd-{nanos}.sh"));
+    let output = serde_json::json!({
+        "files": {
+            (name.clone()): {"messages": [{"message": "inherited cwd target", "line": 2}]},
+            "other.php": {"messages": [{"message": "other file", "line": 3}]}
+        }
+    });
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ncat <<'JSON'\n{output}\nJSON\nexit 1\n"),
+    )
+    .unwrap();
+    let config = PhpStanConfig {
+        enabled: true,
+        command: format!("sh {} {{file}}", shell_escape(&script.to_string_lossy())),
+        timeout_ms: 5_000,
+        memory_limit: None,
+    };
+    let diagnostics = run_phpstan_for_file(config, target, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "inherited cwd output: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics[0].message, "inherited cwd target");
+    std::fs::remove_file(script).unwrap();
 }
 
 #[tokio::test]
@@ -8156,7 +8316,7 @@ fn test_analyzer_json_parsers_match_canonical_target_and_filter_other_files() {
         }
     })
     .to_string();
-    let phpstan = parse_phpstan_json_diagnostics(&phpstan_output, &target).unwrap();
+    let phpstan = parse_phpstan_json_diagnostics(&phpstan_output, &target, None).unwrap();
     assert_eq!(phpstan.len(), 1);
     assert_eq!(phpstan[0].message, "canonical target");
 
@@ -8181,7 +8341,7 @@ fn test_analyzer_json_parsers_match_canonical_target_and_filter_other_files() {
 }
 
 #[test]
-fn test_analyzer_json_parsers_keep_exact_missing_target_and_phpstan_single_file_fallback() {
+fn test_analyzer_json_parsers_keep_exact_missing_target_and_reject_foreign_single_file() {
     let target = PathBuf::from("/definitely/missing/php-lsp/Target.php");
     let other = PathBuf::from("/definitely/missing/php-lsp/Other.php");
     let phpstan_multi = serde_json::json!({
@@ -8195,7 +8355,7 @@ fn test_analyzer_json_parsers_keep_exact_missing_target_and_phpstan_single_file_
         }
     })
     .to_string();
-    let diagnostics = parse_phpstan_json_diagnostics(&phpstan_multi, &target).unwrap();
+    let diagnostics = parse_phpstan_json_diagnostics(&phpstan_multi, &target, None).unwrap();
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].message, "exact missing target");
 
@@ -8207,9 +8367,11 @@ fn test_analyzer_json_parsers_keep_exact_missing_target_and_phpstan_single_file_
         }
     })
     .to_string();
-    let diagnostics = parse_phpstan_json_diagnostics(&phpstan_single, &target).unwrap();
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].message, "single file fallback");
+    let diagnostics = parse_phpstan_json_diagnostics(&phpstan_single, &target, None).unwrap();
+    assert!(
+        diagnostics.is_empty(),
+        "foreign PHPStan result must not be published"
+    );
 
     let psalm_output = serde_json::json!([
         {

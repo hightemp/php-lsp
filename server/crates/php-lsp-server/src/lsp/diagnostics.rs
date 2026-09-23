@@ -58,21 +58,34 @@ fn phpstan_json_message_u32(message: &serde_json::Value, key: &str) -> Option<u3
 struct AnalyzerTargetPathMatcher {
     target: PathBuf,
     canonical_target: Option<PathBuf>,
+    analyzer_cwd: Option<PathBuf>,
     candidate_matches: HashMap<PathBuf, bool>,
 }
 
 impl AnalyzerTargetPathMatcher {
     fn new(target: &Path) -> Self {
+        Self::with_analyzer_cwd(target, None)
+    }
+
+    fn with_analyzer_cwd(target: &Path, analyzer_cwd: Option<&Path>) -> Self {
         Self {
             target: target.to_path_buf(),
             canonical_target: target.canonicalize().ok(),
+            analyzer_cwd: analyzer_cwd.map(Path::to_path_buf),
             candidate_matches: HashMap::new(),
         }
     }
 
     fn matches(&mut self, key: &str) -> bool {
         let key_path = PathBuf::from(key);
-        if key_path == self.target {
+        let candidate = if key_path.is_absolute() {
+            key_path.clone()
+        } else if let Some(cwd) = &self.analyzer_cwd {
+            cwd.join(&key_path)
+        } else {
+            key_path.clone()
+        };
+        if candidate == self.target {
             return true;
         }
         if let Some(matches) = self.candidate_matches.get(&key_path) {
@@ -80,7 +93,7 @@ impl AnalyzerTargetPathMatcher {
         }
 
         let matches = self.canonical_target.as_ref().is_some_and(|target| {
-            key_path
+            candidate
                 .canonicalize()
                 .is_ok_and(|candidate| candidate == *target)
         });
@@ -94,13 +107,16 @@ pub(in crate::server) struct ProcessedAnalyzerOutput {
     pub(in crate::server) stderr_details: String,
 }
 
-pub(in crate::server) async fn parse_analyzer_output_off_runtime(
+pub(in crate::server) async fn parse_analyzer_output_off_runtime<F>(
     analyzer: &'static str,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     file_path: PathBuf,
-    parser: fn(&str, &Path) -> std::result::Result<Vec<Diagnostic>, String>,
-) -> std::result::Result<ProcessedAnalyzerOutput, String> {
+    parser: F,
+) -> std::result::Result<ProcessedAnalyzerOutput, String>
+where
+    F: FnOnce(&str, &Path) -> std::result::Result<Vec<Diagnostic>, String> + Send + 'static,
+{
     tokio::task::spawn_blocking(move || {
         let stdout = String::from_utf8_lossy(&stdout);
         let stderr = String::from_utf8_lossy(&stderr);
@@ -158,6 +174,8 @@ fn phpstan_message_to_diagnostic(message: &serde_json::Value) -> Option<Diagnost
     let end_character = phpstan_json_message_u32(message, "endColumn")
         .map(|column| column.saturating_sub(1))
         .unwrap_or(start_character + 1);
+    let (end_line, end_character) =
+        std::cmp::max((end_line, end_character), (start_line, start_character));
 
     let tip = message
         .get("tip")
@@ -191,6 +209,7 @@ fn phpstan_message_to_diagnostic(message: &serde_json::Value) -> Option<Diagnost
 pub(in crate::server) fn parse_phpstan_json_diagnostics(
     stdout: &str,
     file_path: &Path,
+    analyzer_cwd: Option<&Path>,
 ) -> std::result::Result<Vec<Diagnostic>, String> {
     let value: serde_json::Value =
         serde_json::from_str(stdout).map_err(|err| format!("invalid PHPStan JSON: {}", err))?;
@@ -199,9 +218,9 @@ pub(in crate::server) fn parse_phpstan_json_diagnostics(
     };
 
     let mut diagnostics = Vec::new();
-    let mut matcher = AnalyzerTargetPathMatcher::new(file_path);
+    let mut matcher = AnalyzerTargetPathMatcher::with_analyzer_cwd(file_path, analyzer_cwd);
     for (file_key, file_value) in files {
-        if files.len() != 1 && !matcher.matches(file_key) {
+        if !matcher.matches(file_key) {
             continue;
         }
 
@@ -224,6 +243,14 @@ pub(in crate::server) async fn run_phpstan_for_file(
     cancellation: Option<OperationCancellationToken>,
 ) -> std::result::Result<Vec<Diagnostic>, String> {
     let command = build_phpstan_shell_command(&config, &file_path);
+    let analyzer_cwd = match workspace_root.as_deref() {
+        Some(root) if root.is_absolute() => root.to_path_buf(),
+        Some(root) => std::env::current_dir()
+            .map_err(|err| format!("failed to resolve PHPStan command cwd: {err}"))?
+            .join(root),
+        None => std::env::current_dir()
+            .map_err(|err| format!("failed to resolve PHPStan command cwd: {err}"))?,
+    };
     let output = run_shell_command_with_timeout(
         "PHPStan",
         &command,
@@ -243,7 +270,9 @@ pub(in crate::server) async fn run_phpstan_for_file(
         stdout,
         stderr,
         file_path,
-        parse_phpstan_json_diagnostics,
+        move |stdout: &str, target: &Path| {
+            parse_phpstan_json_diagnostics(stdout, target, Some(&analyzer_cwd))
+        },
     )
     .await?;
     match processed.diagnostics {
