@@ -43,6 +43,7 @@ server/crates/php-lsp-server/src/
     diagnostics.rs           # didOpen/didChange/didSave/didClose
     completion.rs            # completion, completion resolve, signature help
     completion_helpers.rs    # virtual members, shapes, local variables, auto-import edits
+    composite_receivers.rs   # typed union/intersection member selection and receiver loading
     hover.rs                 # hover response assembly
     definition.rs            # definition/declaration/typeDefinition/implementation
     references.rs            # documentHighlight/references/codeLens
@@ -280,6 +281,29 @@ request cannot combine a new symbol index with an older editor buffer.
 | Stubs/vendor/cache | `src/indexing/*` runtime orchestration and lazy index paths | symbol extraction | `php-lsp-index::{stubs,composer,cache}` storage/loading primitives | index unit tests + `tests/e2e_indexing.rs` |
 
 ## Completion Context
+
+Composite instance receivers retain their `TypeInfo` tree through member lookup.
+`lsp/composite_receivers.rs` selects the union of guaranteed members for an
+intersection and the common members for a union, without expanding DNF into
+products. Unknown or non-object union alternatives are not discarded. Required
+object-shape properties and PHPDoc virtual properties participate in the same
+selection, including the existing visibility and read/write policies.
+
+Member results preserve every return alternative and declaration location.
+Qualification occurs in the declaring scope, before results cross namespaces;
+generic substitutions, `self` versus late-bound `static`, nested shapes and
+nullsafe results retain their meaning in subsequent or assigned chains. Legacy
+text callbacks serialize composite grouping explicitly. Single-FQN projections
+do not invent an exact target for a composite receiver, including consumers such
+as rename/references. Completion resolve retains the merged detail; navigation
+deduplicates real declaration locations. Lazy receiver loading uses the existing
+vendor loader and its workspace/generation guards for each constituent.
+Strict scalar equality guards whose matching branch immediately returns can
+remove that alternative before a direct later expression or return in the same
+callable body. Narrowing rejects loops/nested uses, backward jumps, dynamic
+symbol-table access and bindings that may escape, be referenced, or be
+overwritten; existing object-or-false APIs such as SimpleXML retain inference
+after their explicit error guard.
 
 The LSP completion path calls `provide_completions_at_range(...)` with the
 cursor byte-column range. The completion provider uses that range to find the

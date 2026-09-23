@@ -261,6 +261,28 @@ impl PhpLspBackend {
                 .await;
         }
 
+        if let php_lsp_completion::context::CompletionContext::MemberAccess {
+            object_expr, ..
+        } = &context
+        {
+            if let Some(node) = super::composite_receivers::completion_node(
+                &tree,
+                &source,
+                pos.line,
+                byte_col,
+                object_expr,
+            ) {
+                super::composite_receivers::preload(
+                    &tree,
+                    &source,
+                    &file_symbols,
+                    &self.vendor_lazy_index_context_from_request(&request),
+                    vec![node],
+                )
+                .await;
+            }
+        }
+
         let inference_ctx = CompletionInferenceContext {
             index: &request_index,
             tree: &tree,
@@ -369,6 +391,38 @@ impl PhpLspBackend {
                 if seen_labels.insert(label) {
                     lsp_items.push(framework_virtual_completion_item(&member, member_prefix));
                 }
+            }
+        }
+
+        if let php_lsp_completion::context::CompletionContext::MemberAccess {
+            object_expr,
+            member_prefix,
+            access_mode,
+            ..
+        } = &context
+        {
+            if let Some(receiver) = super::composite_receivers::completion_type(
+                &tree,
+                &source,
+                &file_symbols,
+                &request_index,
+                pos.line,
+                byte_col,
+                object_expr,
+            ) {
+                let scoped = file_symbols.scoped_at_byte_position(pos.line, byte_col);
+                lsp_items = super::composite_receivers::members_for_access(
+                    &request_index,
+                    &scoped,
+                    &receiver,
+                    Some((pos.line, byte_col, pos.line, byte_col)),
+                    *access_mode,
+                )
+                .into_values()
+                .filter_map(|member| {
+                    super::composite_receivers::completion_item(member, member_prefix)
+                })
+                .collect();
             }
         }
 

@@ -160,6 +160,50 @@ impl PhpLspBackend {
                 response
             }
         };
+        if let Some(node) = super::composite_receivers::expression_at(
+            &tree,
+            pos.line,
+            utf16_col_to_byte(&source, pos.line, pos.character),
+        ) {
+            super::composite_receivers::preload(
+                &tree,
+                &source,
+                &file_symbols,
+                &self.vendor_lazy_index_context_from_request(&request),
+                vec![node],
+            )
+            .await;
+            if let Some(ty) = super::composite_receivers::expression_type(
+                &tree,
+                &source,
+                &file_symbols,
+                &request_index,
+                node,
+            )
+            .filter(super::composite_receivers::composite)
+            {
+                let mut locations = Vec::new();
+                for name in super::composite_receivers::type_targets(&ty) {
+                    if let Some(symbol) = request_index.get_type(&name) {
+                        if let Some(location) = self
+                            .location_for_symbol_selection_in_request(
+                                &request,
+                                &symbol,
+                                "composite type definition",
+                            )
+                            .await
+                        {
+                            if !locations.contains(&location) {
+                                locations.push(location);
+                            }
+                        }
+                    }
+                }
+                return Ok(Some(map_template_response(GotoDefinitionResponse::Array(
+                    locations,
+                ))));
+            }
+        }
         tracing::debug!(
             "gotoTypeDefinition: {}:{}:{}",
             uri_str,
@@ -573,6 +617,20 @@ impl PhpLspBackend {
             original_pos
         };
         tracing::debug!("gotoDefinition: {}:{}:{}", uri_str, pos.line, pos.character);
+        if let Some(node) = super::composite_receivers::access_at(
+            &tree,
+            pos.line,
+            utf16_col_to_byte(&source, pos.line, pos.character),
+        ) {
+            super::composite_receivers::preload(
+                &tree,
+                &source,
+                &file_symbols,
+                &self.vendor_lazy_index_context_from_request(&request),
+                vec![node],
+            )
+            .await;
+        }
 
         // Extract symbol-at-position inside a block so DashMap guard is dropped
         let (
@@ -677,6 +735,55 @@ impl PhpLspBackend {
                 }
             }
             return Ok(None);
+        }
+
+        if let Some((node, receiver)) = super::composite_receivers::receiver_at(
+            &tree,
+            &source,
+            &file_symbols,
+            &request_index,
+            pos.line,
+            utf16_col_to_byte(&source, pos.line, pos.character),
+        ) {
+            let Some(member) = super::composite_receivers::selected(
+                &request_index,
+                &file_symbols,
+                &source,
+                node,
+                &receiver,
+            ) else {
+                return Ok(None);
+            };
+            let has_declarations =
+                !member.declarations.is_empty() || !member.virtual_properties.is_empty();
+            let mut locations = Vec::new();
+            for symbol in member.declarations {
+                if let Some(location) = self
+                    .location_for_symbol_selection_in_request(
+                        &request,
+                        &symbol,
+                        "composite member definition",
+                    )
+                    .await
+                {
+                    if !locations.contains(&location) {
+                        locations.push(location);
+                    }
+                }
+            }
+            for property in member.virtual_properties {
+                if let Some(location) = self
+                    .phpdoc_virtual_member_location(&request, &property)
+                    .await
+                {
+                    if !locations.contains(&location) {
+                        locations.push(location);
+                    }
+                }
+            }
+            if has_declarations {
+                return Ok(Some(GotoDefinitionResponse::Array(locations)));
+            }
         }
 
         if let Some(def) = shape_def {
@@ -1111,7 +1218,9 @@ impl PhpLspBackend {
             )
             .await?;
         let doc_comment = member.owner.doc_comment.as_ref()?;
-        let doc_start = source.find(doc_comment)?;
+        let owner_start =
+            byte_offset_for_line_col(&source, member.owner.range.0, member.owner.range.1)?;
+        let doc_start = source.get(..owner_start)?.rfind(doc_comment)?;
         let range = phpdoc_virtual_member_range(&source, doc_comment, doc_start, member)?;
         let utf16_range = range_byte_to_utf16(&source, range);
         Some(Location {

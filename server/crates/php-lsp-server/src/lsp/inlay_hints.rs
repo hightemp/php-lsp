@@ -1487,7 +1487,17 @@ pub(in crate::server) fn server_variable_type_info(
         });
     }
 
-    if let Some(type_info) = server_variable_assignment_type_info(ctx, variable_node) {
+    if let Some(mut type_info) = server_variable_assignment_type_info(ctx, variable_node) {
+        if let Some(narrowed) = php_lsp_parser::resolve::narrow_type_after_exit_guards(
+            &type_info.type_info,
+            local_variable_scope_node(variable_node),
+            node_text(ctx.source, variable_node),
+            variable_node.start_byte(),
+            ctx.source,
+            ctx.file_symbols,
+        ) {
+            type_info.type_info = narrowed;
+        }
         return Some(type_info);
     }
 

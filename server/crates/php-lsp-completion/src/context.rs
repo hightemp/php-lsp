@@ -242,7 +242,7 @@ fn receiver_text_before_member_arrow(text: &str) -> &str {
         .trim_end()
 }
 
-fn member_access_mode_after_cursor(text_after: &str) -> MemberAccessMode {
+pub fn member_access_mode_after_cursor(text_after: &str) -> MemberAccessMode {
     let mut rest = text_after;
     loop {
         let Some(ch) = rest.chars().next() else {

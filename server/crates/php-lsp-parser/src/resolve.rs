@@ -17,6 +17,10 @@ use tree_sitter::{Node, Point, Tree};
 
 const MAX_OBJECT_TYPE_RESOLVE_DEPTH: usize = 64;
 
+#[cfg(test)]
+#[path = "resolve_composite_tests.rs"]
+mod composite_tests;
+
 thread_local! {
     static OBJECT_TYPE_RESOLVE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
@@ -43,6 +47,12 @@ impl Drop for ObjectTypeResolveDepthGuard {
     fn drop(&mut self) {
         OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| depth.set(self.previous));
     }
+}
+
+/// Share the existing synchronous type-resolution depth budget across consumers.
+pub fn within_type_resolution_budget<T>(resolve: impl FnOnce() -> Option<T>) -> Option<T> {
+    let _depth = ObjectTypeResolveDepthGuard::enter()?;
+    resolve()
 }
 
 /// Callback for resolving a member's type from an external source (e.g., workspace index).
@@ -1703,19 +1713,7 @@ fn object_fqn_from_resolved_member_type_info(
         TypeInfo::Nullable(inner) => {
             object_fqn_from_resolved_member_type_info(inner, context_node, source, file_symbols)
         }
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
-            for ty in types {
-                if let Some(resolved) = object_fqn_from_resolved_member_type_info(
-                    ty,
-                    context_node,
-                    source,
-                    file_symbols,
-                ) {
-                    return Some(resolved);
-                }
-            }
-            None
-        }
+        TypeInfo::Union(_) | TypeInfo::Intersection(_) => None,
         TypeInfo::Self_ | TypeInfo::Static_ => {
             find_parent_class_fqn(context_node, source, file_symbols)
         }
@@ -1878,10 +1876,7 @@ fn resolved_fqn_type_info(resolved: &str) -> TypeInfo {
         return TypeInfo::Simple(String::new());
     }
 
-    if !resolved.starts_with('\\')
-        && resolved.contains('\\')
-        && !is_builtin_non_object_type(resolved)
-    {
+    if !resolved.starts_with('\\') && !is_builtin_non_object_type(resolved) {
         TypeInfo::Simple(format!("\\{resolved}"))
     } else {
         TypeInfo::Simple(resolved.to_string())
@@ -2682,7 +2677,14 @@ fn infer_variable_in_scope(
                             if let Some(type_node) = param.child_by_field_name("type") {
                                 inferred.type_display =
                                     Some(source[type_node.byte_range()].trim().to_string());
-                                if let Some(class_name) = extract_type_name(type_node, source) {
+                                let native =
+                                    type_info_from_type_text(&source[type_node.byte_range()]);
+                                if matches!(native, TypeInfo::Union(_) | TypeInfo::Intersection(_))
+                                {
+                                    inferred.type_info = Some(native);
+                                } else if let Some(class_name) =
+                                    extract_type_name(type_node, source)
+                                {
                                     let resolved = resolve_type_name_in_context(
                                         &class_name,
                                         param,
@@ -2729,7 +2731,245 @@ fn infer_variable_in_scope(
         inferred = stmt_info;
     }
 
+    if let Some(ty) = &inferred.type_info {
+        if let Some(narrowed) = narrow_type_after_exit_guards(
+            ty,
+            scope_node,
+            var_name,
+            usage_start,
+            source,
+            file_symbols,
+        ) {
+            inferred.type_display = Some(narrowed.to_string());
+            inferred.resolved_type_fqn =
+                resolve_phpdoc_var_type(&narrowed, scope_node, source, file_symbols);
+            inferred.type_info = Some(narrowed);
+        }
+    }
+
     inferred
+}
+
+/// Narrow strict scalar guards only when the matching branch really returns and
+/// the local binding cannot have been replaced or escaped on the remaining path.
+pub fn narrow_type_after_exit_guards(
+    ty: &TypeInfo,
+    scope: Node,
+    variable: &str,
+    usage: usize,
+    source: &str,
+    symbols: &FileSymbols,
+) -> Option<TypeInfo> {
+    if !matches!(ty, TypeInfo::Union(_) | TypeInfo::Nullable(_))
+        || !matches!(
+            scope.kind(),
+            "function_definition"
+                | "method_declaration"
+                | "anonymous_function"
+                | "anonymous_function_creation_expression"
+        )
+    {
+        return None;
+    }
+    if let Some(parameters) = scope.child_by_field_name("parameters") {
+        let mut pending = vec![parameters];
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "reference_modifier" | "by_ref") {
+                return None;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+    }
+    let body = scope.child_by_field_name("body")?;
+    // Only direct uses in this body are dominated by the guard. In particular,
+    // a write later in a loop may reach the next iteration's earlier use.
+    let mut cursor = body.walk();
+    if !body.named_children(&mut cursor).any(|statement| {
+        matches!(
+            statement.kind(),
+            "expression_statement" | "return_statement"
+        ) && statement.start_byte() <= usage
+            && usage <= statement.end_byte()
+    }) {
+        return None;
+    }
+    let mentions = |node: Node| {
+        let mut names = Vec::new();
+        collect_variable_name_descendants(node, scope.end_byte(), source, &mut names);
+        names.iter().any(|(_, name)| name == variable)
+    };
+    let mut scope_cursor = scope.walk();
+    if scope.named_children(&mut scope_cursor).any(|child| {
+        child.kind() == "reference_modifier"
+            || (child.kind() == "anonymous_function_use_clause"
+                && source[child.byte_range()].contains('&')
+                && mentions(child))
+    }) {
+        return None;
+    }
+    let mut narrowed = ty.clone();
+    let mut cursor = body.walk();
+    for statement in body.named_children(&mut cursor) {
+        if statement.kind() != "if_statement" || statement.end_byte() > usage {
+            continue;
+        }
+        let mut children = statement.walk();
+        if statement
+            .named_children(&mut children)
+            .any(|child| matches!(child.kind(), "else_clause" | "else_if_clause"))
+        {
+            continue;
+        }
+        let mut condition = if_condition_node(statement)?;
+        while condition.kind() == "parenthesized_expression" {
+            condition = condition.named_child(0)?;
+        }
+        if condition.kind() != "binary_expression"
+            || condition
+                .child_by_field_name("operator")
+                .is_none_or(|operator| &source[operator.byte_range()] != "===")
+        {
+            continue;
+        }
+        let (Some(left), Some(right)) = (
+            condition.child_by_field_name("left"),
+            condition.child_by_field_name("right"),
+        ) else {
+            continue;
+        };
+        let literal = if left.kind() == "variable_name" && &source[left.byte_range()] == variable {
+            &source[right.byte_range()]
+        } else if right.kind() == "variable_name" && &source[right.byte_range()] == variable {
+            &source[left.byte_range()]
+        } else {
+            continue;
+        };
+        let literal = literal.to_ascii_lowercase();
+        if !matches!(literal.as_str(), "false" | "true" | "null") {
+            continue;
+        }
+        let Some(then) = statement.child_by_field_name("body") else {
+            continue;
+        };
+        let returns = if then.kind() == "return_statement" {
+            true
+        } else if then.kind() == "compound_statement" {
+            let mut cursor = then.walk();
+            let children: Vec<_> = then
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() != "comment")
+                .collect();
+            children.len() == 1 && children[0].kind() == "return_statement"
+        } else {
+            false
+        };
+        if !returns {
+            continue;
+        }
+        let mut pending = vec![body];
+        let mut unsafe_binding = false;
+        while let Some(node) = pending.pop() {
+            if matches!(
+                node.kind(),
+                "reference_assignment_expression"
+                    | "by_ref_assignment_expression"
+                    | "by_ref"
+                    | "global_declaration"
+                    | "global_statement"
+                    | "function_static_declaration"
+                    | "static_variable_declaration"
+                    | "goto_statement"
+                    | "yield_expression"
+                    | "dynamic_variable_name"
+                    | "include_expression"
+                    | "include_once_expression"
+                    | "require_expression"
+                    | "require_once_expression"
+            ) || (node.kind() == "anonymous_function_use_clause"
+                && source[node.byte_range()].contains('&')
+                && mentions(node))
+            {
+                unsafe_binding = true;
+                break;
+            }
+            if node.start_byte() < usage
+                && (node.child_by_field_name("arguments").is_some_and(mentions)
+                    || (node.kind() == "catch_clause"
+                        && node.child_by_field_name("name").is_some_and(mentions)))
+            {
+                unsafe_binding = true;
+                break;
+            }
+            if node.kind() == "function_call_expression" {
+                let Some(function) = node.child_by_field_name("function") else {
+                    unsafe_binding = true;
+                    break;
+                };
+                let scoped = symbols.scoped_at_byte_position(
+                    node.start_position().row as u32,
+                    node.start_position().column as u32,
+                );
+                let name = resolve_function_name(&source[function.byte_range()], &scoped)
+                    .to_ascii_lowercase();
+                if !matches!(function.kind(), "name" | "qualified_name")
+                    || matches!(
+                        name.rsplit('\\').next().unwrap_or(&name),
+                        "assert"
+                            | "call_user_func"
+                            | "call_user_func_array"
+                            | "compact"
+                            | "eval"
+                            | "extract"
+                            | "get_defined_vars"
+                            | "parse_str"
+                            | "mb_parse_str"
+                    )
+                {
+                    unsafe_binding = true;
+                    break;
+                }
+            }
+            let writes_binding = matches!(
+                node.kind(),
+                "assignment_expression" | "augmented_assignment_expression"
+            ) && node.child_by_field_name("left").is_some_and(mentions)
+                || matches!(
+                    node.kind(),
+                    "update_expression" | "unset_statement" | "foreach_statement"
+                ) && mentions(node);
+            if node.start_byte() >= statement.end_byte()
+                && node.start_byte() < usage
+                && writes_binding
+            {
+                unsafe_binding = true;
+                break;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        if unsafe_binding {
+            continue;
+        }
+        fn remove(ty: &TypeInfo, literal: &str) -> Option<TypeInfo> {
+            match ty {
+                TypeInfo::Union(parts) => {
+                    let parts: Vec<_> = parts
+                        .iter()
+                        .filter_map(|part| remove(part, literal))
+                        .collect();
+                    (!parts.is_empty()).then(|| merge_type_infos(parts))
+                }
+                TypeInfo::Nullable(inner) if literal == "null" => Some(inner.as_ref().clone()),
+                TypeInfo::LiteralNull if literal == "null" => None,
+                TypeInfo::LiteralBool(value) if value.to_string() == literal => None,
+                TypeInfo::Simple(name) if name.eq_ignore_ascii_case(literal) => None,
+                _ => Some(ty.clone()),
+            }
+        }
+        narrowed = remove(&narrowed, &literal).unwrap_or(TypeInfo::Never);
+    }
+    (narrowed != *ty).then_some(narrowed)
 }
 
 struct CallableArgumentSite {
@@ -3000,11 +3240,7 @@ fn object_fqn_from_type_info(
         TypeInfo::Nullable(inner) => {
             object_fqn_from_type_info(inner, context_node, source, file_symbols)
         }
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
-            types.iter().find_map(|type_info| {
-                object_fqn_from_type_info(type_info, context_node, source, file_symbols)
-            })
-        }
+        TypeInfo::Union(_) | TypeInfo::Intersection(_) => None,
         TypeInfo::Self_ | TypeInfo::Static_ => {
             find_parent_class_fqn(context_node, source, file_symbols)
         }
@@ -3393,16 +3629,7 @@ fn resolve_phpdoc_var_type(
         TypeInfo::Nullable(inner) => {
             resolve_phpdoc_var_type(inner, context_node, source, file_symbols)
         }
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
-            for ty in types {
-                if let Some(resolved) =
-                    resolve_phpdoc_var_type(ty, context_node, source, file_symbols)
-                {
-                    return Some(resolved);
-                }
-            }
-            None
-        }
+        TypeInfo::Union(_) | TypeInfo::Intersection(_) => None,
         TypeInfo::Self_ | TypeInfo::Static_ => {
             find_parent_class_fqn(context_node, source, file_symbols)
         }
@@ -3433,7 +3660,7 @@ fn resolve_phpdoc_var_type(
     }
 }
 
-fn is_builtin_non_object_type(name: &str) -> bool {
+pub fn is_builtin_non_object_type(name: &str) -> bool {
     matches!(
         name.trim_start_matches('\\').to_ascii_lowercase().as_str(),
         "int"
@@ -3442,6 +3669,9 @@ fn is_builtin_non_object_type(name: &str) -> bool {
             | "bool"
             | "boolean"
             | "array"
+            | "list"
+            | "non-empty-list"
+            | "non-empty-array"
             | "object"
             | "null"
             | "void"
@@ -3478,15 +3708,7 @@ fn resolve_symbol_type_info_to_object_fqn(
             source,
             file_symbols,
         ),
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types.iter().find_map(|ty| {
-            resolve_symbol_type_info_to_object_fqn(
-                ty,
-                owner_fqn,
-                context_node,
-                source,
-                file_symbols,
-            )
-        }),
+        TypeInfo::Union(_) | TypeInfo::Intersection(_) => None,
         _ => resolve_phpdoc_var_type(type_info, context_node, source, file_symbols),
     }
 }
@@ -3530,42 +3752,50 @@ fn symbol_effective_type_info(symbol: &SymbolInfo, file_symbols: &FileSymbols) -
     }
 }
 
-fn resolve_type_info_relative_to_symbol(
+/// Resolve every class leaf, including shapes, in the declaration's scope.
+pub fn resolve_type_info_relative_to_symbol(
     type_info: &TypeInfo,
     symbol: &SymbolInfo,
     file_symbols: &FileSymbols,
 ) -> TypeInfo {
+    map_receiver_type_names(type_info, &|name| {
+        (!matches!(name, "self" | "static" | "parent"))
+            .then(|| resolve_type_name_relative_to_symbol(name, symbol, file_symbols))
+    })
+}
+
+/// Traverse all type containers while preserving their structure and non-type metadata.
+pub fn map_receiver_type_names(
+    type_info: &TypeInfo,
+    mapper: &impl Fn(&str) -> Option<String>,
+) -> TypeInfo {
     match type_info {
-        TypeInfo::Simple(name) => TypeInfo::Simple(resolve_type_name_relative_to_symbol(
-            name,
-            symbol,
-            file_symbols,
-        )),
+        TypeInfo::Simple(name) => TypeInfo::Simple(mapper(name).unwrap_or_else(|| name.clone())),
         TypeInfo::Generic { base, args } => TypeInfo::Generic {
-            base: resolve_type_name_relative_to_symbol(base, symbol, file_symbols),
+            base: mapper(base).unwrap_or_else(|| base.clone()),
             args: args
                 .iter()
-                .map(|arg| resolve_type_info_relative_to_symbol(arg, symbol, file_symbols))
+                .map(|arg| map_receiver_type_names(arg, mapper))
                 .collect(),
         },
-        TypeInfo::Nullable(inner) => TypeInfo::Nullable(Box::new(
-            resolve_type_info_relative_to_symbol(inner, symbol, file_symbols),
-        )),
+        TypeInfo::Nullable(inner) => {
+            TypeInfo::Nullable(Box::new(map_receiver_type_names(inner, mapper)))
+        }
         TypeInfo::Union(types) => TypeInfo::Union(
             types
                 .iter()
-                .map(|ty| resolve_type_info_relative_to_symbol(ty, symbol, file_symbols))
+                .map(|ty| map_receiver_type_names(ty, mapper))
                 .collect(),
         ),
         TypeInfo::Intersection(types) => TypeInfo::Intersection(
             types
                 .iter()
-                .map(|ty| resolve_type_info_relative_to_symbol(ty, symbol, file_symbols))
+                .map(|ty| map_receiver_type_names(ty, mapper))
                 .collect(),
         ),
-        TypeInfo::ClassString(Some(inner)) => TypeInfo::ClassString(Some(Box::new(
-            resolve_type_info_relative_to_symbol(inner, symbol, file_symbols),
-        ))),
+        TypeInfo::ClassString(Some(inner)) => {
+            TypeInfo::ClassString(Some(Box::new(map_receiver_type_names(inner, mapper))))
+        }
         TypeInfo::Conditional {
             subject,
             target,
@@ -3573,21 +3803,9 @@ fn resolve_type_info_relative_to_symbol(
             else_type,
         } => TypeInfo::Conditional {
             subject: subject.clone(),
-            target: Box::new(resolve_type_info_relative_to_symbol(
-                target,
-                symbol,
-                file_symbols,
-            )),
-            if_type: Box::new(resolve_type_info_relative_to_symbol(
-                if_type,
-                symbol,
-                file_symbols,
-            )),
-            else_type: Box::new(resolve_type_info_relative_to_symbol(
-                else_type,
-                symbol,
-                file_symbols,
-            )),
+            target: Box::new(map_receiver_type_names(target, mapper)),
+            if_type: Box::new(map_receiver_type_names(if_type, mapper)),
+            else_type: Box::new(map_receiver_type_names(else_type, mapper)),
         },
         TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
             items
@@ -3595,7 +3813,7 @@ fn resolve_type_info_relative_to_symbol(
                 .map(|item| php_lsp_types::ArrayShapeItem {
                     key: item.key.clone(),
                     optional: item.optional,
-                    value: resolve_type_info_relative_to_symbol(&item.value, symbol, file_symbols),
+                    value: map_receiver_type_names(&item.value, mapper),
                 })
                 .collect(),
         ),
@@ -3605,7 +3823,7 @@ fn resolve_type_info_relative_to_symbol(
                 .map(|item| php_lsp_types::ArrayShapeItem {
                     key: item.key.clone(),
                     optional: item.optional,
-                    value: resolve_type_info_relative_to_symbol(&item.value, symbol, file_symbols),
+                    value: map_receiver_type_names(&item.value, mapper),
                 })
                 .collect(),
         ),
@@ -3615,17 +3833,15 @@ fn resolve_type_info_relative_to_symbol(
         } => TypeInfo::Callable {
             params: params
                 .iter()
-                .map(|param| resolve_type_info_relative_to_symbol(param, symbol, file_symbols))
+                .map(|param| map_receiver_type_names(param, mapper))
                 .collect(),
-            return_type: return_type.as_ref().map(|return_type| {
-                Box::new(resolve_type_info_relative_to_symbol(
-                    return_type,
-                    symbol,
-                    file_symbols,
-                ))
-            }),
+            return_type: return_type
+                .as_ref()
+                .map(|return_type| Box::new(map_receiver_type_names(return_type, mapper))),
         },
-        TypeInfo::Self_ | TypeInfo::Static_ | TypeInfo::Parent_ => type_info.clone(),
+        TypeInfo::Self_ | TypeInfo::Static_ | TypeInfo::Parent_ => mapper(&type_info.to_string())
+            .map(TypeInfo::Simple)
+            .unwrap_or_else(|| type_info.clone()),
         TypeInfo::ClassString(None)
         | TypeInfo::LiteralString(_)
         | TypeInfo::LiteralInt(_)
@@ -4462,9 +4678,7 @@ fn resolver_type_info_to_object_fqn(
         TypeInfo::Nullable(inner) => {
             resolver_type_info_to_object_fqn(inner, context_node, source, file_symbols)
         }
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types.iter().find_map(|ty| {
-            resolver_type_info_to_object_fqn(ty, context_node, source, file_symbols)
-        }),
+        TypeInfo::Union(_) | TypeInfo::Intersection(_) => None,
         TypeInfo::Self_ | TypeInfo::Static_ => {
             find_parent_class_fqn(context_node, source, file_symbols)
         }
@@ -4708,9 +4922,10 @@ fn type_info_from_type_text(type_text: &str) -> TypeInfo {
     }
 }
 
-fn type_info_without_null(type_info: &TypeInfo) -> Option<TypeInfo> {
+pub fn type_info_without_null(type_info: &TypeInfo) -> Option<TypeInfo> {
     match type_info {
         TypeInfo::LiteralNull => None,
+        TypeInfo::Simple(name) if name.eq_ignore_ascii_case("null") => None,
         TypeInfo::Nullable(inner) => type_info_without_null(inner),
         TypeInfo::Union(types) => {
             let kept: Vec<TypeInfo> = types.iter().filter_map(type_info_without_null).collect();
@@ -4774,7 +4989,8 @@ fn infer_expression_type_info(
     )
 }
 
-fn infer_expression_type_info_with_function_resolver(
+/// Infer an expression without projecting composite receivers to one class.
+pub fn infer_expression_type_info_with_function_resolver(
     node: Node,
     source: &str,
     file_symbols: &FileSymbols,
@@ -4782,8 +4998,51 @@ fn infer_expression_type_info_with_function_resolver(
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
     function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
+    let _depth = ObjectTypeResolveDepthGuard::enter()?;
     if let Some(class_string) = class_string_type_info_from_expression(node, source, file_symbols) {
         return Some(class_string);
+    }
+
+    if matches!(
+        node.kind(),
+        "member_access_expression"
+            | "nullsafe_member_access_expression"
+            | "member_call_expression"
+            | "nullsafe_member_call_expression"
+    ) {
+        let object = node.child_by_field_name("object")?;
+        if let Some(receiver) = infer_expression_type_info_with_function_resolver(
+            object,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+            function_resolver,
+        ) {
+            if matches!(receiver, TypeInfo::Union(_) | TypeInfo::Intersection(_)) {
+                let nullable = node.kind().starts_with("nullsafe_")
+                    && type_info_without_null(&receiver).as_ref() != Some(&receiver);
+                let receiver = if node.kind().starts_with("nullsafe_") {
+                    type_info_without_null(&receiver)?
+                } else {
+                    receiver
+                };
+                let receiver = qualify_receiver_type(&receiver, object, source, file_symbols);
+                let name = node.child_by_field_name("name")?;
+                let name = if node.kind().ends_with("access_expression") {
+                    format!("${}", &source[name.byte_range()])
+                } else {
+                    source[name.byte_range()].to_string()
+                };
+                let text = resolver?(&receiver_type_text(&receiver), &name)?;
+                let result = type_info_from_type_text(&text);
+                return Some(if nullable {
+                    TypeInfo::Nullable(Box::new(result))
+                } else {
+                    result
+                });
+            }
+        }
     }
 
     match node.kind() {
@@ -4810,7 +5069,7 @@ fn infer_expression_type_info_with_function_resolver(
             infer_variable_in_scope(
                 scope,
                 &var_name,
-                node.start_byte(),
+                node.end_byte(),
                 source,
                 file_symbols,
                 resolver,
@@ -4822,7 +5081,7 @@ fn infer_expression_type_info_with_function_resolver(
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
                     if matches!(child.kind(), "name" | "qualified_name") {
-                        return Some(TypeInfo::Simple(resolve_class_name(
+                        return Some(resolved_fqn_type_info(&resolve_class_name(
                             &source[child.byte_range()],
                             file_symbols,
                         )));
@@ -4952,6 +5211,107 @@ fn infer_expression_type_info_with_function_resolver(
             iterable_value_type_info(&base_type, key_text.as_deref())
         }
         _ => None,
+    }
+}
+
+/// Resolve class leaves in the declaring scope before passing a receiver across files.
+pub fn qualify_receiver_type(
+    ty: &TypeInfo,
+    node: Node,
+    source: &str,
+    symbols: &FileSymbols,
+) -> TypeInfo {
+    map_receiver_type_names(ty, &|name| match name {
+        "self" | "static" => {
+            find_parent_class_fqn(node, source, symbols).map(|name| format!("\\{name}"))
+        }
+        "parent" => {
+            find_extended_parent_class_fqn(node, source, symbols).map(|name| format!("\\{name}"))
+        }
+        _ if is_builtin_non_object_type(name) => None,
+        _ => Some(format!(
+            "\\{}",
+            resolve_class_name(name, symbols).trim_start_matches('\\')
+        )),
+    })
+}
+
+/// Lossless composite grouping at the legacy text callback boundary.
+pub fn receiver_type_text(ty: &TypeInfo) -> String {
+    match ty {
+        TypeInfo::Union(parts) | TypeInfo::Intersection(parts) => format!(
+            "({})",
+            parts
+                .iter()
+                .map(receiver_type_text)
+                .collect::<Vec<_>>()
+                .join(if matches!(ty, TypeInfo::Union(_)) {
+                    "|"
+                } else {
+                    "&"
+                })
+        ),
+        TypeInfo::Generic { base, args } => format!(
+            "{}<{}>",
+            base,
+            args.iter()
+                .map(receiver_type_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypeInfo::Nullable(inner) => format!("?{}", receiver_type_text(inner)),
+        TypeInfo::ArrayShape(items) | TypeInfo::ObjectShape(items) => {
+            let items = items
+                .iter()
+                .map(|item| {
+                    php_lsp_types::ArrayShapeItem {
+                        key: item.key.clone(),
+                        optional: item.optional,
+                        value: TypeInfo::Simple(receiver_type_text(&item.value)),
+                    }
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{}{{{items}}}",
+                if matches!(ty, TypeInfo::ArrayShape(_)) {
+                    "array"
+                } else {
+                    "object"
+                }
+            )
+        }
+        TypeInfo::ClassString(Some(inner)) => {
+            format!("class-string<{}>", receiver_type_text(inner))
+        }
+        TypeInfo::Callable {
+            params,
+            return_type,
+        } => {
+            let args = params
+                .iter()
+                .map(receiver_type_text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let result = return_type
+                .as_ref()
+                .map(|ty| format!(": {}", receiver_type_text(ty)))
+                .unwrap_or_default();
+            format!("callable({args}){result}")
+        }
+        TypeInfo::Conditional {
+            subject,
+            target,
+            if_type,
+            else_type,
+        } => format!(
+            "({subject} is {} ? {} : {})",
+            receiver_type_text(target),
+            receiver_type_text(if_type),
+            receiver_type_text(else_type)
+        ),
+        _ => ty.to_string(),
     }
 }
 
@@ -5258,7 +5618,7 @@ fn infer_literal_value_type_text(
         .and_then(|rest| rest.split(['(', ' ', '\n', '\t']).next())
         .filter(|name| !name.is_empty())
     {
-        return TypeInfo::Simple(resolve_class_name(class_name, file_symbols));
+        return resolved_fqn_type_info(&resolve_class_name(class_name, file_symbols));
     }
     if matches!(text, "true" | "false") {
         return TypeInfo::LiteralBool(text == "true");
@@ -5599,9 +5959,22 @@ fn find_matching_textual_bracket(text: &str, open: usize) -> Option<usize> {
 pub fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) -> Option<TypeInfo> {
     match type_info {
         TypeInfo::Nullable(inner) => iterable_value_type_info(inner, key_text),
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
+        TypeInfo::Union(types) => types
             .iter()
-            .find_map(|ty| iterable_value_type_info(ty, key_text)),
+            .map(|ty| iterable_value_type_info(ty, key_text))
+            .collect::<Option<Vec<_>>>()
+            .map(merge_type_infos),
+        TypeInfo::Intersection(types) => {
+            let values: Vec<_> = types
+                .iter()
+                .filter_map(|ty| iterable_value_type_info(ty, key_text))
+                .collect();
+            match values.len() {
+                0 => None,
+                1 => values.into_iter().next(),
+                _ => Some(TypeInfo::Intersection(values)),
+            }
+        }
         TypeInfo::Simple(name) if is_plain_iterable_type_name(name) => Some(TypeInfo::Mixed),
         TypeInfo::Generic { base, args } => generic_value_type_arg(base, args).cloned(),
         TypeInfo::ArrayShape(items) => array_shape_value_type(items, key_text).cloned(),
@@ -5623,8 +5996,18 @@ fn is_plain_iterable_type_name(name: &str) -> bool {
 fn iterable_key_type_info(type_info: &TypeInfo) -> Option<TypeInfo> {
     match type_info {
         TypeInfo::Nullable(inner) => iterable_key_type_info(inner),
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
-            types.iter().find_map(iterable_key_type_info)
+        TypeInfo::Union(types) => types
+            .iter()
+            .map(iterable_key_type_info)
+            .collect::<Option<Vec<_>>>()
+            .map(merge_type_infos),
+        TypeInfo::Intersection(types) => {
+            let keys: Vec<_> = types.iter().filter_map(iterable_key_type_info).collect();
+            match keys.len() {
+                0 => None,
+                1 => keys.into_iter().next(),
+                _ => Some(TypeInfo::Intersection(keys)),
+            }
         }
         TypeInfo::Generic { base, args } => generic_key_type_arg(base, args),
         TypeInfo::ArrayShape(items) => array_shape_key_type(items),

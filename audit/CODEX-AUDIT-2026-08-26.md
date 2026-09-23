@@ -800,6 +800,9 @@ RustSec не нашёл известных уязвимостей в lockfile, �
 
 ### CODEX-P2-02. Union/intersection сворачиваются к первому object type
 
+> **Статус 2026-09-23:** исправлено через RED → GREEN. Исходное описание ниже
+> сохранено как обоснование изменения.
+
 [`resolve_phpdoc_var_type`](server/crates/php-lsp-parser/src/resolve.rs#L3396)
 обрабатывает `Union` и `Intersection` одинаково и возвращает первый разрешимый
 тип.
@@ -818,6 +821,47 @@ completion вернул только методы `ArrayAccess` и не пред
 - для union возвращать общие безопасные members либо явно помеченные uncertain
   candidates;
 - использовать одну семантику в completion, hover, definition и diagnostics.
+
+#### Реализовано
+
+- Сохранён полный `TypeInfo` для PHPDoc/native union/intersection, DNF,
+  generic receiver и результатов member calls. Однообъектные FQN projections
+  больше не выбирают первый вариант; неоднозначные receiver не превращаются
+  в точные цели для rename/references.
+- Общий typed selector объединяет доступные members для intersection и
+  пересекает их для union; неизвестные/scalar alternatives не отбрасываются.
+  Сохранены visibility, read/write policy, PHPDoc virtual properties и object
+  shapes. Возвращаемые типы и реальные declaration locations объединяются
+  отдельно, с дедупликацией definitions и сохранением detail после resolve.
+- Квалификация всех вложенных class leaves выполняется в declaring scope;
+  generic substitutions, `self`/`static`, глобальные классы, shapes и namespace
+  aliases не теряются при переходе в caller. Строковая callback-граница сохраняет
+  скобки во всех контейнерах. Прямые/присвоенные цепочки, nullsafe results,
+  foreach/subscripts используют полные типы.
+- Lazy vendor loading охватывает все receiver/result leaves, сохраняя
+  существующие leases и политику symlink. Добавлены parser/unit и сквозные LSP
+  регрессии с RED evidence до исправлений.
+- Сохранено поведение guarded object-or-false APIs: строгий scalar guard с
+  немедленным `return` сужает тип для прямого последующего выражения/return в том
+  же теле функции при отсутствии возможной перезаписи или изменения через ссылку.
+  Вложенные/циклические uses, обратные переходы, динамические переменные,
+  include/eval и caller-symbol-table mutations не дают ложного сужения;
+  существующая SimpleXML-регрессия проверяет generic result и hover.
+
+#### Проверка исправления
+
+Добавлены 40 постоянных тестов: 4 parser, 1 server unit и 35 сквозных LSP.
+Проверяются порядок составляющих, PHPDoc/native types, DNF, generics,
+цепочки/присваивания, scalar/null alternatives, visibility, virtual/shape members,
+definition/hover/diagnostics, cold vendor loading и безопасное сужение после guard.
+Негативные сценарии с динамическими переменными, ссылками, generator suspension,
+promoted parameters, catch до/после guard и обратными переходами воспроизведены
+до исправления. Сохранены существующие SimpleXML и Twig shape-navigation тесты.
+
+Финальный `CARGO_BUILD_JOBS=1 cargo test --all -- --test-threads=1` прошёл
+1060/1060 без ignored, включая существующие lifecycle/race suites. Clippy
+`--all-targets -D warnings`, Rustfmt и diff check прошли. Повторный Verifier
+review дал GO после устранения всех выявленных замечаний.
 
 ### CODEX-P2-03. Не выводится тип `clone` expression
 

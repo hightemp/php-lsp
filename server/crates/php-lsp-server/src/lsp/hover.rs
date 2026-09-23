@@ -29,6 +29,71 @@ impl PhpLspBackend {
             original_pos
         };
         tracing::debug!("hover: {}:{}:{}", uri_str, pos.line, pos.character);
+        if let Some(node) = super::composite_receivers::access_at(
+            &tree,
+            pos.line,
+            utf16_col_to_byte(&source, pos.line, pos.character),
+        ) {
+            super::composite_receivers::preload(
+                &tree,
+                &source,
+                &file_symbols,
+                &self.vendor_lazy_index_context_from_request(&request),
+                vec![node],
+            )
+            .await;
+        }
+
+        if let Some((node, receiver)) = super::composite_receivers::receiver_at(
+            &tree,
+            &source,
+            &file_symbols,
+            &request_index,
+            pos.line,
+            utf16_col_to_byte(&source, pos.line, pos.character),
+        ) {
+            let Some(member) = super::composite_receivers::selected(
+                &request_index,
+                &file_symbols,
+                &source,
+                node,
+                &receiver,
+            ) else {
+                return Ok(None);
+            };
+            let declarations = member
+                .declarations
+                .iter()
+                .map(|symbol| symbol.fqn.clone())
+                .chain(
+                    member
+                        .virtual_properties
+                        .iter()
+                        .map(|property| format!("{}::${}", property.owner.fqn, property.name)),
+                )
+                .chain(member.shape.as_ref().and_then(|item| item.key.clone()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let result = member
+                .result
+                .map(|ty| php_lsp_parser::resolve::receiver_type_text(&ty))
+                .unwrap_or_else(|| "mixed".into());
+            let range = range_from_byte_range(
+                &source,
+                node_range_node(node.child_by_field_name("name").unwrap()),
+            );
+            let range = template_document
+                .as_ref()
+                .map(|template| template.map_virtual_range_to_original(range))
+                .unwrap_or(Some(range));
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("```php\n{declarations}\n```\n\n**Type:** `{result}`"),
+                }),
+                range,
+            }));
+        }
 
         // Extract symbol-at-position and local variable hover info inside a block so DashMap guard is dropped.
         let (sym_at_pos, local_var_hover, shape_member_hover, call_site_return_type, file_symbols) = {

@@ -1069,6 +1069,17 @@ pub(in crate::server) async fn preresolve_open_file_diagnostic_dependencies(
 
         lazy_index_class_with_context(vendor_context, &fqn).await;
     }
+    let mut pending = vec![tree.root_node()];
+    let mut receivers = Vec::new();
+    while let Some(node) = pending.pop() {
+        if let Some(object) = node.child_by_field_name("object") {
+            receivers.push(object);
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    super::composite_receivers::preload(tree, source, file_symbols, vendor_context, receivers)
+        .await;
 }
 
 fn lazy_diagnostic_class_fqn(fqn: &str) -> &str {
@@ -1848,6 +1859,31 @@ pub(in crate::server) fn check_member_access_node(
         return;
     }
     let pos = name_node.start_position();
+    if let Some((access, receiver)) = super::composite_receivers::receiver_at(
+        tree,
+        source,
+        file_symbols,
+        index,
+        pos.row as u32,
+        pos.column as u32,
+    ) {
+        if super::composite_receivers::known(index, &receiver)
+            && super::composite_receivers::selected(index, file_symbols, source, access, &receiver)
+                .is_none()
+        {
+            let name = &source[name_node.byte_range()];
+            diagnostics.push(Diagnostic {
+                range: range_from_byte_range(source, node_range_node(name_node)),
+                severity: Some(DiagnosticSeverity::WARNING),
+                source: Some("php-lsp".into()),
+                message: format!(
+                    "Member {name} is not available on every alternative of {receiver}"
+                ),
+                ..Default::default()
+            });
+        }
+        return;
+    }
     let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
         type_cache.cached_string(
             (0, 0, 0, 0),

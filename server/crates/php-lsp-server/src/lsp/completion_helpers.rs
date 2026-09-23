@@ -2302,6 +2302,22 @@ pub(in crate::server) fn resolve_member_type_from_index(
         return resolve_function_return_type_from_index(index, member_name);
     }
 
+    if let Some(receiver) = parse_phpdoc(&format!("/** @var {class_fqn} */"))
+        .var_type
+        .filter(super::composite_receivers::composite)
+    {
+        return super::composite_receivers::member(
+            index,
+            &php_lsp_types::FileSymbols::default(),
+            &receiver,
+            member_name,
+            member_name.starts_with('$'),
+            None,
+        )
+        .and_then(|member| member.result)
+        .map(|ty| php_lsp_parser::resolve::receiver_type_text(&ty));
+    }
+
     let member_fqn = format!("{}::{}", class_fqn, member_name);
     tracing::debug!("resolve_member_type: looking up {}", member_fqn);
 
@@ -2436,11 +2452,7 @@ pub(in crate::server) fn type_info_fqn_from_index(
         php_lsp_types::TypeInfo::Generic { base, .. } if !is_builtin_type_name(base) => {
             simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, base)
         }
-        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
-            types
-                .iter()
-                .find_map(|type_info| type_info_fqn_from_index(index, owner_fqn, uri, type_info))
-        }
+        php_lsp_types::TypeInfo::Union(_) | php_lsp_types::TypeInfo::Intersection(_) => None,
         php_lsp_types::TypeInfo::ClassString(Some(inner)) => {
             type_info_fqn_from_index(index, owner_fqn, uri, inner)
         }

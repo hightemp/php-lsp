@@ -379,7 +379,7 @@ fn add_phpdoc_static_virtual_method_completions(
     }
 }
 
-fn phpdoc_property_matches_access(
+pub fn phpdoc_property_matches_access(
     property_access: PhpDocPropertyAccess,
     completion_access: MemberAccessMode,
 ) -> bool {
@@ -389,7 +389,7 @@ fn phpdoc_property_matches_access(
     }
 }
 
-fn phpdoc_property_completion_item(
+pub fn phpdoc_property_completion_item(
     owner_fqn: &str,
     property: &PhpDocProperty,
     member_prefix: &str,
@@ -745,7 +745,7 @@ fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Complet
 }
 
 /// Convert a SymbolInfo to a CompletionItem.
-fn symbol_to_completion_item(
+pub fn symbol_to_completion_item(
     sym: &SymbolInfo,
     is_static_access: bool,
     member_prefix: Option<&str>,
@@ -845,7 +845,7 @@ fn property_symbol_completion_detail(sym: &SymbolInfo) -> Option<String> {
         .map(|return_type| return_type.to_string())
 }
 
-fn phpdoc_property_access_for_symbol(sym: &SymbolInfo) -> Option<PhpDocPropertyAccess> {
+pub fn phpdoc_property_access_for_symbol(sym: &SymbolInfo) -> Option<PhpDocPropertyAccess> {
     if sym.kind != PhpSymbolKind::Property {
         return None;
     }

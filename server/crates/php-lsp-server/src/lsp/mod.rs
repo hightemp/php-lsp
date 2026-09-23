@@ -3,6 +3,7 @@
 pub(super) mod code_action;
 pub(super) mod completion;
 pub(super) mod completion_helpers;
+pub(super) mod composite_receivers;
 pub(super) mod conversions;
 pub(super) mod definition;
 pub(super) mod diagnostics;
