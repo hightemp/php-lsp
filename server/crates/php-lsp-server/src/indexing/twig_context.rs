@@ -167,14 +167,25 @@ struct Job {
     cancel: watch::Sender<bool>,
     result: watch::Sender<JobResult>,
     waiters: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    last_waiter_pause: StdMutex<Option<WorkerPause>>,
 }
 
 impl Job {
+    fn try_join(&self) -> bool {
+        self.waiters
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count > 0).then(|| count + 1)
+            })
+            .is_ok()
+    }
+
     fn cancel(&self) {
         self.cancel.send_replace(true);
     }
     fn stopped(&self) -> bool {
         *self.cancel.borrow()
+            || self.waiters.load(Ordering::SeqCst) == 0
             || Instant::now() >= self.deadline
             || self
                 .lease
@@ -187,6 +198,11 @@ struct Waiter(Arc<Job>);
 impl Drop for Waiter {
     fn drop(&mut self) {
         if self.0.waiters.fetch_sub(1, Ordering::SeqCst) == 1 {
+            #[cfg(test)]
+            if let Some((reached, release)) = self.0.last_waiter_pause.lock().unwrap().take() {
+                let _ = reached.send(());
+                let _ = release.recv_timeout(Duration::from_secs(5));
+            }
             self.0.cancel();
         }
     }
@@ -318,6 +334,14 @@ impl TwigContextDiskCache {
 }
 
 impl Coordinator {
+    pub(in crate::server) fn deadline(&self) -> Instant {
+        let budget = Duration::from_millis(FILE_IO_TIMEOUT_MS);
+        #[cfg(test)]
+        let budget =
+            Duration::from_millis(self.hooks.budget_ms.load(Ordering::SeqCst).max(1)).min(budget);
+        Instant::now() + budget
+    }
+
     pub(in crate::server) fn configure(&self, runtime: &WorkspaceRuntimeState) {
         let active = runtime
             .configs
@@ -355,9 +379,14 @@ pub(in crate::server) struct TwigContextView {
     generation: Option<u64>,
     index: Arc<WorkspaceIndex>,
     snapshot: Arc<Snapshot>,
+    deadline: Instant,
 }
 
 impl TwigContextView {
+    pub(in crate::server) fn limit_deadline(&mut self, deadline: Instant) {
+        self.deadline = self.deadline.min(deadline);
+    }
+
     pub(in crate::server) fn variables(&self, template: &str) -> Vec<TemplateVariableType> {
         self.snapshot
             .variables
@@ -389,7 +418,17 @@ impl TwigContextView {
         {
             return None;
         }
-        self.index.with_revision(self.snapshot.revision?, commit)
+        self.index
+            .with_revision(self.snapshot.revision?, || {
+                if self.coordinator.stopped.load(Ordering::SeqCst)
+                    || Instant::now() >= self.deadline
+                {
+                    None
+                } else {
+                    Some(commit())
+                }
+            })
+            .flatten()
     }
 }
 
@@ -456,6 +495,7 @@ pub(in crate::server) async fn twig_context_for_state(
                     generation,
                     index: index.clone(),
                     snapshot: snapshot.clone(),
+                    deadline: coordinator.deadline(),
                 });
             }
         }
@@ -468,28 +508,25 @@ pub(in crate::server) async fn twig_context_for_state(
                         .as_ref()
                         .is_some_and(|owner| owner.run_id() == run.run_id())
                 })
+                && job.try_join()
         }) {
-            job.waiters.fetch_add(1, Ordering::SeqCst);
             (job.clone(), None)
         } else {
             if let Some(old) = slot.job.take() {
                 old.cancel();
             }
-            let budget = Duration::from_millis(FILE_IO_TIMEOUT_MS);
-            #[cfg(test)]
-            let budget =
-                Duration::from_millis(coordinator.hooks.budget_ms.load(Ordering::SeqCst).max(1))
-                    .min(budget);
             let job = Arc::new(Job {
                 id,
                 epoch: slot.epoch,
                 revision,
                 generation,
                 lease: run.cloned(),
-                deadline: Instant::now() + budget,
+                deadline: coordinator.deadline(),
                 cancel: watch::channel(false).0,
                 result: watch::channel(JobResult::Pending).0,
                 waiters: std::sync::atomic::AtomicUsize::new(1),
+                #[cfg(test)]
+                last_waiter_pause: StdMutex::new(None),
             });
             let work = (slot.snapshot.clone(), slot.dirty.clone(), slot.reinventory);
             slot.job = Some(job.clone());
@@ -507,10 +544,14 @@ pub(in crate::server) async fn twig_context_for_state(
         let run = run.cloned();
         tokio::spawn(async move {
             let mut cancellation = job.cancel.subscribe();
-            let permit = tokio::select! {
-                permit = coordinator.permits.clone().acquire_owned() => permit.ok(),
-                _ = cancellation.changed() => None,
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(job.deadline)) => None,
+            let permit = if job.stopped() {
+                None
+            } else {
+                tokio::select! {
+                    permit = coordinator.permits.clone().acquire_owned() => permit.ok(),
+                    _ = cancellation.changed() => None,
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(job.deadline)) => None,
+                }
             };
             let result = if let Some(permit) = permit.filter(|_| !job.stopped()) {
                 let worker_job = job.clone();
@@ -564,13 +605,18 @@ pub(in crate::server) async fn twig_context_for_state(
                     return None;
                 }
                 let snapshot = Arc::new(result?);
-                index.with_revision(job.revision, || {
-                    slot.snapshot = Some(snapshot.clone());
-                    slot.ready_epoch = Some(job.epoch);
-                    slot.dirty.clear();
-                    slot.reinventory = false;
-                    snapshot
-                })
+                index
+                    .with_revision(job.revision, || {
+                        if job.stopped() || coordinator.stopped.load(Ordering::SeqCst) {
+                            return None;
+                        }
+                        slot.snapshot = Some(snapshot.clone());
+                        slot.ready_epoch = Some(job.epoch);
+                        slot.dirty.clear();
+                        slot.reinventory = false;
+                        Some(snapshot)
+                    })
+                    .flatten()
             };
             let result = match &run {
                 Some(run) => run.commit_if_current(publish).flatten(),
@@ -615,6 +661,7 @@ pub(in crate::server) async fn twig_context_for_state(
         generation: job.generation,
         index: index.clone(),
         snapshot: snapshot?,
+        deadline: job.deadline,
     })
 }
 
@@ -634,6 +681,12 @@ fn ordered_source_uris(uris: BTreeSet<String>) -> Vec<String> {
 
 fn source_hash(source: &str) -> u64 {
     cache::stable_hash_strings([source])
+}
+
+fn is_php_source(uri: &str) -> bool {
+    uri_to_path(uri)
+        .and_then(|path| path.extension().map(|ext| ext.eq_ignore_ascii_case("php")))
+        .unwrap_or(false)
 }
 
 fn eligible_disk_source(path: &Path, key: &RootKey, php: bool) -> bool {
@@ -722,6 +775,7 @@ struct SourceLoader<'a> {
     physical_paths: HashMap<PathBuf, PhysicalIdentity>,
     overlays: HashMap<String, Arc<SourceFacts>>,
     open: HashMap<String, OpenSource>,
+    open_aliases: HashMap<(PhysicalIdentity, bool), String>,
     dirty: &'a HashSet<String>,
     dirty_ids: HashSet<PhysicalIdentity>,
     validated: HashSet<PhysicalIdentity>,
@@ -732,6 +786,16 @@ struct SourceLoader<'a> {
 }
 
 impl SourceLoader<'_> {
+    fn open_source_uri(&mut self, uri: &str) -> Option<String> {
+        if self.open.contains_key(uri) {
+            return Some(uri.to_string());
+        }
+        let identity = self.identity(uri)?;
+        self.open_aliases
+            .get(&(identity, is_php_source(uri)))
+            .cloned()
+    }
+
     fn identity(&mut self, uri: &str) -> Option<PhysicalIdentity> {
         if let Some(identity) = self.bindings.get(uri) {
             if !self.dirty.contains(uri) && !self.dirty_ids.contains(identity) {
@@ -773,6 +837,15 @@ impl SourceLoader<'_> {
         let Some(identity) = self.identity(uri) else {
             return false;
         };
+        // Open URIs own separate overlays; disk aliases must not contribute
+        // older bytes of the same physical file alongside those overlays.
+        if self
+            .open_aliases
+            .contains_key(&(identity.clone(), is_php_source(uri)))
+        {
+            self.accessed.insert(uri.to_string());
+            return false;
+        }
         if seen.contains(&identity) {
             self.accessed.insert(uri.to_string());
             return false;
@@ -794,9 +867,7 @@ impl SourceLoader<'_> {
         if (self.stopped)() {
             return None;
         }
-        let php = uri_to_path(uri)
-            .and_then(|path| path.extension().map(|ext| ext.eq_ignore_ascii_case("php")))
-            .unwrap_or(false);
+        let php = is_php_source(uri);
         let symbols = if php {
             if let Some(symbols) = symbols {
                 symbols
@@ -1096,12 +1167,13 @@ fn build_snapshot(
             .map(|(uri, _)| uri.clone()),
     );
     let dirty = &effective_dirty;
-    let loader = RefCell::new(SourceLoader {
+    let mut loader = SourceLoader {
         disk: snapshot.disk.clone(),
         bindings: snapshot.bindings.clone(),
         physical_paths: snapshot.physical_paths.clone(),
         overlays: snapshot.overlays.clone(),
         open,
+        open_aliases: HashMap::new(),
         dirty,
         failed: snapshot
             .failed_disk
@@ -1113,7 +1185,19 @@ fn build_snapshot(
         missing: snapshot.missing_uris.difference(dirty).cloned().collect(),
         accessed: HashSet::new(),
         stopped,
-    });
+    };
+    for uri in ordered_source_uris(loader.open.keys().cloned().collect()) {
+        if stopped() {
+            return None;
+        }
+        if let Some(identity) = loader.identity(&uri) {
+            loader
+                .open_aliases
+                .entry((identity, is_php_source(&uri)))
+                .or_insert(uri);
+        }
+    }
+    let loader = RefCell::new(loader);
     let mut php_uris = snapshot.inventory_php.clone();
     let mut twig_uris = snapshot.inventory_twig.clone();
     for uri in loader.borrow().open.keys() {
@@ -1161,11 +1245,16 @@ fn build_snapshot(
             let dependencies = RefCell::new(HashSet::new());
             let lookup = |symbol: &php_lsp_types::SymbolInfo| {
                 dependencies.borrow_mut().insert(symbol.uri.clone());
-                let facts = loader.borrow_mut().get(&symbol.uri)?;
+                let uri = loader
+                    .borrow_mut()
+                    .open_source_uri(&symbol.uri)
+                    .unwrap_or_else(|| symbol.uri.clone());
+                dependencies.borrow_mut().insert(uri.clone());
+                let facts = loader.borrow_mut().get(&uri)?;
                 Some(TwigContextResolvedPhpSource {
-                    uri: symbol.uri.clone(),
+                    file_symbols: Some(facts.symbols_for(&uri)),
+                    uri,
                     source: facts.source.clone(),
-                    file_symbols: Some(facts.symbols_for(&symbol.uri)),
                 })
             };
             let resolver = TwigContextPhpSourceResolver {
@@ -1244,7 +1333,21 @@ fn build_snapshot(
         .collect::<HashMap<_, _>>();
     let mut twig_contributions = BTreeMap::new();
     let mut twig_seen = HashSet::new();
-    for uri in ordered_source_uris(twig_uris) {
+    let twig_uris = ordered_source_uris(twig_uris);
+    let mut caller_names = HashMap::<String, BTreeSet<String>>::new();
+    for uri in &twig_uris {
+        if stopped() {
+            return None;
+        }
+        if let Some(name) = twig_template_name_for_uri(uri, &key.root) {
+            let source_uri = loader
+                .borrow_mut()
+                .open_source_uri(uri)
+                .unwrap_or_else(|| uri.clone());
+            caller_names.entry(source_uri).or_default().insert(name);
+        }
+    }
+    for uri in twig_uris {
         if stopped() {
             return None;
         }
@@ -1262,10 +1365,16 @@ fn build_snapshot(
         let Some(facts) = loader.borrow_mut().get(&uri) else {
             continue;
         };
-        let Some(name) = twig_template_name_for_uri(&uri, &key.root) else {
+        let Some(names) = caller_names.get(&uri) else {
             continue;
         };
-        let caller_variables = snapshot.direct.get(&name).cloned().unwrap_or_default();
+        // A buffer may supply bytes for another logical template name. Keep
+        // render bindings separate from the URI owning those unsaved bytes.
+        let caller_variables = merge_twig_context_variables(
+            names
+                .iter()
+                .filter_map(|name| snapshot.direct.get(name).cloned()),
+        );
         let contribution = snapshot
             .twig
             .get(&uri)

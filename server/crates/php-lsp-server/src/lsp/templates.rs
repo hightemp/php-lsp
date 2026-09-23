@@ -4255,6 +4255,7 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         twig_context_disk_cache,
         semantic_tokens_cache,
     } = state;
+    let deadline = twig_context_disk_cache.lock().await.coordinator.deadline();
     let mut candidates: Vec<_> = template_documents
         .iter()
         .filter_map(|entry| {
@@ -4273,7 +4274,11 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
     }
 
     let mut refreshed = Vec::new();
+    let mut failed_roots = HashSet::new();
     for uri_str in candidates {
+        if Instant::now() >= deadline {
+            break;
+        }
         let workspace = workspace_config_for_uri_from_configs(workspace_configs, &uri_str);
         if workspace_folders_filter.is_some_and(|workspace_folders| {
             workspace
@@ -4323,22 +4328,34 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
             .as_ref()
             .map(|config| config.runtime_config.exclude_paths.clone())
             .unwrap_or_default();
-        let Some(context_result) = twig_variable_types_for_template_state(
-            &uri_str,
-            open_files,
-            template_documents,
-            workspace_index,
-            roots,
-            twig_context_disk_cache,
-            traversal_limits,
-            &exclude_paths,
-            indexing_run,
-            Some(runtime_generation),
+        let root_key = (Arc::as_ptr(workspace_index) as usize, root.clone());
+        if failed_roots.contains(&root_key) {
+            continue;
+        }
+        let context_result = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            twig_variable_types_for_template_state(
+                &uri_str,
+                open_files,
+                template_documents,
+                workspace_index,
+                roots,
+                twig_context_disk_cache,
+                traversal_limits,
+                &exclude_paths,
+                indexing_run,
+                Some(runtime_generation),
+            ),
         )
-        .await
-        else {
+        .await;
+        let Ok(Some(mut context_result)) = context_result else {
+            failed_roots.insert(root_key);
             continue;
         };
+        context_result.context.limit_deadline(deadline);
+        if Instant::now() >= deadline {
+            break;
+        }
         let refreshed_template = template.with_twig_variable_types(&context_result.variables);
         if refreshed_template.has_same_source_and_twig_context(&template) {
             continue;
@@ -4348,7 +4365,14 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
         if indexing_run.is_some_and(|run| !run.is_current()) {
             continue;
         }
-        let mut semantic_tokens = semantic_tokens_cache.lock().await;
+        let Ok(mut semantic_tokens) = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            semantic_tokens_cache.lock(),
+        )
+        .await
+        else {
+            break;
+        };
         let commit_refresh = || {
             let replaced = replace_open_template_with_context(
                 OpenTemplateRefreshSnapshot {

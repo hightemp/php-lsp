@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "twig_context_regression_tests.rs"]
+mod regressions;
+
 struct Fixture {
     root: PathBuf,
     index: Arc<WorkspaceIndex>,

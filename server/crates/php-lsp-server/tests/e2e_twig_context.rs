@@ -54,6 +54,30 @@ async fn assert_context(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn twig_file_operations_are_negotiated_with_the_client() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+    let result = send(&mut service, initialize_request(1)).await;
+    let operations = &result["capabilities"]["workspace"]["fileOperations"];
+    for operation in ["didCreate", "didRename", "didDelete"] {
+        let filters = operations[operation]["filters"].as_array().unwrap();
+        for extension in ["php", "twig"] {
+            assert!(
+                filters.iter().any(|filter| {
+                    filter["scheme"] == "file"
+                        && filter["pattern"]["glob"] == format!("**/*.{extension}")
+                        && filter["pattern"]["matches"] == "file"
+                }),
+                "{operation} must register {extension} files: {operations}"
+            );
+        }
+    }
+    send(&mut service, shutdown_request(99)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn twig_context_controller_caller_partial_updates_remove_restore_and_rename() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -187,6 +211,76 @@ async fn twig_context_controller_caller_partial_updates_remove_restore_and_renam
     )
     .await;
     assert_context(&mut service, &uri, Some(("Other", "otherOnly", &other_uri))).await;
+    // Keep an unsaved caller through rename, then edit/close/delete the new URI.
+    send(
+        &mut service,
+        did_open_notification_with_language(&renamed_uri, "twig", "removed include"),
+    )
+    .await;
+    assert_context(&mut service, &uri, None).await;
+    let moved_uri = path_to_uri(&root.join("templates/moved.twig")).unwrap();
+    fs::rename(
+        root.join("templates/renamed.twig"),
+        root.join("templates/moved.twig"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/Created.php"),
+        changed.replace("caller.twig", "moved.twig"),
+    )
+    .unwrap();
+    send(
+        &mut service,
+        did_rename_files_notification(vec![(&renamed_uri, &moved_uri)]),
+    )
+    .await;
+    send(
+        &mut service,
+        did_change_watched_files_notification(vec![(&created_uri, 2)]),
+    )
+    .await;
+    assert_context(&mut service, &uri, None).await;
+    send(
+        &mut service,
+        did_change_full_notification(&moved_uri, 2, caller),
+    )
+    .await;
+    assert_context(&mut service, &uri, Some(("Other", "otherOnly", &other_uri))).await;
+    send(&mut service, did_close_notification(&renamed_uri)).await;
+    assert_context(&mut service, &uri, Some(("Other", "otherOnly", &other_uri))).await;
+    send(&mut service, did_close_notification(&moved_uri)).await;
+    assert_context(&mut service, &uri, Some(("Other", "otherOnly", &other_uri))).await;
+    send(
+        &mut service,
+        did_open_notification_with_language(&moved_uri, "twig", caller),
+    )
+    .await;
+    fs::remove_file(root.join("templates/moved.twig")).unwrap();
+    send(
+        &mut service,
+        did_delete_files_notification(vec![&moved_uri]),
+    )
+    .await;
+    assert_context(&mut service, &uri, None).await;
+    fs::write(root.join("templates/moved.twig"), caller).unwrap();
+    send(
+        &mut service,
+        did_create_files_notification(vec![&moved_uri]),
+    )
+    .await;
+    assert_context(&mut service, &uri, Some(("Other", "otherOnly", &other_uri))).await;
+    send(
+        &mut service,
+        did_open_notification_with_language(&moved_uri, "twig", caller),
+    )
+    .await;
+    fs::remove_file(root.join("templates/moved.twig")).unwrap();
+    send(
+        &mut service,
+        did_change_watched_files_notification(vec![(&moved_uri, 3)]),
+    )
+    .await;
+    assert_context(&mut service, &uri, None).await;
     send(&mut service, shutdown_request(99)).await;
     let cache = php_lsp_index::cache::cache_file_path(&root);
     if let Some(dir) = cache.parent().and_then(std::path::Path::parent) {

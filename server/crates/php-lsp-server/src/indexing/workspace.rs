@@ -578,6 +578,9 @@ impl PhpLspBackend {
 
             if is_twig_template_uri(event.uri.as_str()) {
                 template_context_changed = true;
+                if event.typ == FileChangeType::DELETED {
+                    self.remove_php_file(&event.uri).await;
+                }
                 continue;
             }
 
@@ -3011,7 +3014,7 @@ impl PhpLspBackend {
     pub(in crate::server) async fn remove_php_file(&self, uri: &Uri) {
         self.invalidate_twig_context_disk_cache_for_source_uri(uri.as_str())
             .await;
-        if !uri_is_php_file(uri) {
+        if !uri_is_php_file(uri) && !is_twig_template_uri(uri.as_str()) {
             return;
         }
 
@@ -3049,8 +3052,10 @@ impl PhpLspBackend {
             .await;
         let old_is_php = uri_is_php_file(old_uri);
         let new_is_php = uri_is_php_file(new_uri);
+        let old_is_source = old_is_php || is_twig_template_uri(old_uri.as_str());
+        let new_is_source = new_is_php || is_twig_template_uri(new_uri.as_str());
 
-        if !old_is_php && !new_is_php {
+        if !old_is_source && !new_is_source {
             return;
         }
 
@@ -3098,7 +3103,7 @@ impl PhpLspBackend {
         self.cancel_analyzer_run(new_uri.as_str()).await;
         self.cancel_formatter_run(&old_uri_str).await;
         self.cancel_formatter_run(new_uri.as_str()).await;
-        if old_is_php {
+        if old_is_source {
             self.remove_uri_from_current_runtime_indexes(&old_uri_str)
                 .await;
             self.remove_uri_from_current_vendor_lrus(&old_uri_str).await;
@@ -3107,8 +3112,8 @@ impl PhpLspBackend {
                 .await;
         }
 
-        if !new_is_php {
-            if old_is_php && !is_blade_template_uri(&old_uri_str) {
+        if !new_is_source {
+            if old_is_source && !is_blade_template_uri(&old_uri_str) {
                 self.refresh_open_twig_contexts_and_republish_diagnostics()
                     .await;
             }
@@ -3137,13 +3142,17 @@ impl PhpLspBackend {
         });
         let requires_full_sync = moved_full_sync_generation == Some(state.generation);
 
-        let destination_is_template = is_blade_template_uri(&new_uri_str);
-        let template = if destination_is_template {
+        let destination_kind = template_kind_for_document(&new_uri_str, "");
+        let destination_is_template = destination_kind.is_some();
+        let template = if let Some(kind) = destination_kind {
             let source = moved_template
                 .as_ref()
                 .map(|template| template.original_source().to_string())
                 .unwrap_or_else(|| parser.source());
-            let template = preprocess_blade_template(&source);
+            let template = match kind {
+                TemplateKind::Blade => preprocess_blade_template(&source),
+                TemplateKind::Twig => preprocess_twig_template(&source, &[]),
+            };
             let mut virtual_parser = FileParser::new();
             virtual_parser.parse_full(template.virtual_source());
             parser = virtual_parser;

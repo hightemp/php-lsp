@@ -598,7 +598,12 @@ of its calls in one pass. Closed sources are cached by physical identity and
 content hash, with logical URI bindings retained separately; disk contributions
 are deduplicated in logical-path order before applying the physical file limit.
 Open buffers have separate URI-based overlays and replace their disk version
-even when their final render/include call has been removed. Full ASTs are not
+even when their final render/include call has been removed. An open physical
+alias also shadows closed aliases of the same source; distinct open buffers
+retain their own contributions in logical-path order. Include evaluation keeps
+logical render names separate from the buffer supplying the source. Dependency
+reads prefer the exact open URI, then the first open physical alias, retaining
+that buffer's URI and ranges for definitions. Full ASTs are not
 retained for closed files. Additional sources such as FormType bodies use the
 same cache.
 
@@ -613,13 +618,21 @@ template refresh limit remain in effect; partial coverage is cached explicitly.
 
 Requests for the same input revision share one job. A single backend semaphore
 limits Twig blocking workers, and its permit stays inside the blocking closure
-until that worker really exits. The existing 15-second budget covers queueing
-and computation; cancellation/deadline checks run during discovery, source
-processing and render/include evaluation. Timeout, supersession, root removal
+until that worker really exits. Last-waiter release is terminal: a concurrent
+request starts new work instead of reviving the abandoned job. The existing
+15-second budget covers queueing and computation across the entire open-template
+refresh pass, including multiple roots and the semantic-cache lock wait; a failed
+root is not retried for every template in that pass. Cancellation/deadline checks
+run during discovery, source processing and render/include evaluation. Timeout,
+supersession, root removal
 and shutdown cannot publish a successful empty result. Publication validates
 runtime generation, source epoch, index revision and any indexing-run lease;
 virtual-document replacement additionally checks the document lifetime/version
-and previous context. Unchanged open contexts are not reparsed or republished.
+and previous context. Cancellation, shutdown and deadlines are checked again
+after acquiring publication barriers. Unchanged open contexts are not reparsed
+or republished. Save invalidation targets the affected source. Existing LSP file
+operation registrations cover PHP and Twig files; renaming an open template
+preserves its unsaved original text, and deletion removes its overlay.
 The index does not boot Symfony, evaluate Twig extensions, run user code, or read
 the service container.
 

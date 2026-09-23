@@ -2,16 +2,19 @@
 
 use super::super::*;
 
-fn php_file_operation_registration_options() -> FileOperationRegistrationOptions {
+fn source_file_operation_registration_options() -> FileOperationRegistrationOptions {
     FileOperationRegistrationOptions {
-        filters: vec![FileOperationFilter {
-            scheme: Some("file".to_string()),
-            pattern: FileOperationPattern {
-                glob: "**/*.php".to_string(),
-                matches: Some(FileOperationPatternKind::File),
-                options: None,
-            },
-        }],
+        filters: ["**/*.php", "**/*.twig"]
+            .into_iter()
+            .map(|glob| FileOperationFilter {
+                scheme: Some("file".to_string()),
+                pattern: FileOperationPattern {
+                    glob: glob.to_string(),
+                    matches: Some(FileOperationPatternKind::File),
+                    options: None,
+                },
+            })
+            .collect(),
     }
 }
 
@@ -130,14 +133,14 @@ impl PhpLspBackend {
                         change_notifications: Some(OneOf::Left(true)),
                     }),
                     file_operations: Some({
-                        let php_files = php_file_operation_registration_options();
+                        let source_files = source_file_operation_registration_options();
                         WorkspaceFileOperationsServerCapabilities {
-                            did_create: Some(php_files.clone()),
-                            will_create: Some(php_files.clone()),
-                            did_rename: Some(php_files.clone()),
+                            did_create: Some(source_files.clone()),
+                            will_create: Some(source_files.clone()),
+                            did_rename: Some(source_files.clone()),
                             will_rename: None,
-                            did_delete: Some(php_files),
-                            will_delete: Some(php_file_operation_registration_options()),
+                            did_delete: Some(source_files.clone()),
+                            will_delete: Some(source_files),
                         }
                     }),
                 }),

@@ -700,6 +700,10 @@ dependency `dev-bootstrap.php`.
 > повторные PHP-сканирования для каждого caller; один отменяемый worker сохраняет
 > ограниченное ожидание, лимиты обхода и поддержку внешних symlink.
 
+> **Повторная проверка 2026-09-22:** первоначальный GO не покрывал save,
+> ожидание блокировок, last-waiter race и сочетания open buffers с alias/rename.
+> Постоянные RED-регрессии воспроизвели эти пробелы; исправления описаны ниже.
+
 Для определения include-контекста сервер сначала сканирует до 2048 Twig-файлов,
 а затем для каждого найденного caller вызывает
 [`direct_twig_variable_types_for_template_state`](server/crates/php-lsp-server/src/lsp/templates.rs#L3602),
@@ -746,10 +750,27 @@ Worst case — около 4,2 млн чтений/парсов на один ref
   Покрыты full/partial invalidation, errors, atomic replacement, symlink aliases
   и physical budgets, overlays/close, FormType dependencies, coalescing,
   cancellation/timeout permit lifetime, root/runtime/run supersession и LSP flow.
-- Проверки: 20 coordinator regressions, 25 существующих template E2E и новый
-  controller → caller → partial lifecycle E2E прошли. Финальный полный Rust-набор:
+- Проверки первоначальной реализации: 20 coordinator regressions, 25 существующих
+  template E2E и controller → caller → partial lifecycle E2E прошли. Полный Rust-набор:
   996/996, без ignored (`CARGO_BUILD_JOBS=1`, `--test-threads=1`); Clippy
   `--all-targets -D warnings`, Rustfmt, diff checks и повторный Verifier review — GO.
+- TDD postcheck: save обновляет адресованный источник, общий deadline действует
+  на весь refresh с несколькими roots, failed root не повторяется для каждого
+  шаблона. Последний waiter необратимо завершает владение job; новые запросы
+  не присоединяются к отменённой работе. Job повторно проверяет отмену, а job и
+  готовый view — shutdown/deadline после получения publication barrier.
+- Open aliases подавляют дисковые версии того же источника. Дополнительные
+  FormType reads используют реальный URI/range выбранного буфера; include
+  evaluation сохраняет logical render bindings даже при чтении другого alias.
+  Rename/delete переносят или удаляют открытый Twig; существующие LSP File
+  registrations теперь включают `*.twig`. PHP/Twig/Blade transitions сохраняют
+  исходный несохранённый текст и защищают более новый destination document.
+- Финальные проверки postcheck: 23 новых regression tests (43 coordinator tests
+  суммарно), 33 адресных LSP-теста и полный Rust-набор **1020/1020**, без ignored.
+  Контролируемыми барьерами покрыты last-waiter/join, отмена/deadline/shutdown
+  перед публикацией, queued cancellation, общий бюджет разных roots и короткий
+  waiter общего job. Clippy, Rustfmt, diff checks и повторный Verifier review — GO;
+  сборки выполнялись последовательно с `CARGO_BUILD_JOBS=1`, тесты — `--test-threads=1`.
 
 ## P2 — корректность и устойчивость
 

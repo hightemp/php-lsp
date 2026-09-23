@@ -1027,19 +1027,18 @@ impl PhpLspBackend {
 
     pub(crate) async fn lsp_did_save(&self, params: DidSaveTextDocumentParams) {
         tracing::debug!("didSave: {}", params.text_document.uri.as_str());
-        let refresh_twig_contexts = uri_is_php_file(&params.text_document.uri)
-            && !self
-                .template_documents
-                .contains_key(params.text_document.uri.as_str());
-        self.invalidate_request_fs_caches().await;
+        let refresh_twig_contexts = is_twig_template_uri(params.text_document.uri.as_str())
+            || (uri_is_php_file(&params.text_document.uri)
+                && !self
+                    .template_documents
+                    .contains_key(params.text_document.uri.as_str()));
+        self.framework_string_key_cache.lock().await.clear();
+        self.invalidate_twig_context_disk_cache_for_source_uri(params.text_document.uri.as_str())
+            .await;
         self.cancel_debounced_diagnostics(params.text_document.uri.as_str())
             .await;
         self.publish_diagnostics(&params.text_document.uri).await;
         if refresh_twig_contexts {
-            self.invalidate_twig_context_disk_cache_for_source_uri(
-                params.text_document.uri.as_str(),
-            )
-            .await;
             self.refresh_open_twig_contexts_and_republish_diagnostics()
                 .await;
         }
