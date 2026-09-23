@@ -619,6 +619,8 @@ pub(super) async fn preload<'a>(
             stack.push((node, true));
             if let Some(object) = node.child_by_field_name("object") {
                 stack.push((object, false));
+            } else if let Some(operand) = php_lsp_parser::resolve::first_expression_child(node) {
+                stack.push((operand, false));
             } else if node.kind() == "variable_name" {
                 if let Some((_, rhs)) = latest_assignment_rhs_before_usage(
                     local_variable_scope_node(node),
@@ -628,10 +630,7 @@ pub(super) async fn preload<'a>(
                 ) {
                     stack.push((rhs, false));
                 }
-            } else if matches!(
-                node.kind(),
-                "subscript_expression" | "parenthesized_expression"
-            ) {
+            } else if matches!(node.kind(), "subscript_expression") {
                 if let Some(child) = node.named_child(0) {
                     stack.push((child, false));
                 }

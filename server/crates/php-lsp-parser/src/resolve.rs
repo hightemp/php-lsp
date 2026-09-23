@@ -1393,6 +1393,14 @@ fn try_resolve_object_type_inner<'a>(
 ) -> Option<String> {
     let kind = object_node.kind();
     match kind {
+        "clone_expression" => try_resolve_object_type(
+            first_expression_child(object_node)?,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+            function_resolver,
+        ),
         "function_call_expression" => try_resolve_function_call_object_fqn(
             object_node,
             source,
@@ -1883,6 +1891,37 @@ fn resolved_fqn_type_info(resolved: &str) -> TypeInfo {
     }
 }
 
+fn infer_clone_assignment(
+    expression: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<VariableInference> {
+    let mut inner = expression;
+    while inner.kind() == "parenthesized_expression" {
+        inner = first_expression_child(inner)?;
+    }
+    if inner.kind() != "clone_expression" {
+        return None;
+    }
+    let type_info = infer_expression_type_info(
+        expression,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    );
+    Some(VariableInference {
+        type_display: type_info.as_ref().map(ToString::to_string),
+        resolved_type_fqn: type_info.as_ref().and_then(|type_info| {
+            resolve_phpdoc_var_type(type_info, expression, source, file_symbols)
+        }),
+        phpdoc_comment: None,
+        type_info,
+    })
+}
+
 /// Scan a compound_statement for `$var = new ClassName()` before the usage point.
 fn find_variable_inference_before_usage(
     body: Node,
@@ -1974,6 +2013,10 @@ fn find_variable_inference_before_usage(
                         type_info: Some(type_info),
                     },
                 ));
+            } else if let Some(clone_info) =
+                infer_clone_assignment(right, source, file_symbols, resolver, callable_resolver)
+            {
+                inferred = Some((stmt.start_byte(), clone_info));
             } else if let Some(resolved) = try_resolve_object_type(
                 right,
                 source,
@@ -2112,6 +2155,10 @@ fn find_nested_variable_inference_before_usage(
                         type_info: Some(type_info),
                     },
                 ));
+            } else if let Some(clone_info) =
+                infer_clone_assignment(right, source, file_symbols, resolver, callable_resolver)
+            {
+                inferred = Some((child.start_byte(), clone_info));
             } else if let Some(resolved) = try_resolve_object_type(
                 right,
                 source,
@@ -4989,6 +5036,18 @@ fn infer_expression_type_info(
     )
 }
 
+/// Find the inner expression, skipping comments that are named CST extras.
+pub fn first_expression_child(node: Node<'_>) -> Option<Node<'_>> {
+    if !matches!(node.kind(), "clone_expression" | "parenthesized_expression") {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let operand = node
+        .named_children(&mut cursor)
+        .find(|child| !child.is_extra());
+    operand
+}
+
 /// Infer an expression without projecting composite receivers to one class.
 pub fn infer_expression_type_info_with_function_resolver(
     node: Node,
@@ -5046,6 +5105,28 @@ pub fn infer_expression_type_info_with_function_resolver(
     }
 
     match node.kind() {
+        "clone_expression" => {
+            let operand = first_expression_child(node)?;
+            infer_expression_type_info_with_function_resolver(
+                operand,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+                function_resolver,
+            )
+            .or_else(|| {
+                try_resolve_object_type(
+                    operand,
+                    source,
+                    file_symbols,
+                    resolver,
+                    callable_resolver,
+                    function_resolver,
+                )
+                .map(|fqn| resolved_fqn_type_info(&fqn))
+            })
+        }
         "parenthesized_expression" => {
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {

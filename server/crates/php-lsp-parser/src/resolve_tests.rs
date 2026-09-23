@@ -2,6 +2,151 @@ use super::*;
 use crate::parser::FileParser;
 use crate::symbols::extract_file_symbols;
 
+#[test]
+fn test_clone_this_preserves_owner_for_assignment_and_property_access() {
+    let source = r#"<?php
+namespace App;
+class Example {
+    public string $mapping;
+    public function copy(): void {
+        $copy = clone $this;
+        $copy->mapping;
+    }
+}
+"#;
+    let (line, col) = find_line_col(source, "$copy->mapping");
+    assert_eq!(
+        parse_and_infer_var_type_at(source, line, col, "$copy"),
+        Some("App\\Example".to_string())
+    );
+    assert_eq!(
+        parse_and_resolve(source, line, col + "$copy->".len() as u32).map(|sym| sym.fqn),
+        Some("App\\Example::$mapping".to_string())
+    );
+}
+
+#[test]
+fn test_clone_preserves_named_operand_through_parentheses_and_nesting() {
+    for expression in [
+        "clone $item",
+        "clone /* note */ $item",
+        "clone($item)",
+        "clone (clone $item)",
+    ] {
+        let source = format!("<?php\nfunction copy(\\Domain\\Model $item) {{\n    $copy = {expression};\n    $copy->value;\n}}");
+        let (line, col) = find_line_col(&source, "$copy->value");
+        assert_eq!(
+            parse_and_infer_var_type_at(&source, line, col, "$copy"),
+            Some("Domain\\Model".to_string()),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn test_clone_unknown_operand_does_not_invent_object_type() {
+    let source = "<?php function copy($item) { $copy = clone $item; $copy->value; }";
+    let (line, col) = find_line_col(source, "$copy->value");
+    assert_eq!(
+        parse_and_infer_var_type_at(source, line, col, "$copy"),
+        None
+    );
+
+    let reassigned = "<?php class Known { public function knownOnly() {} } function copy($item) { $copy = new Known(); $copy = clone $item; $copy->knownOnly(); }";
+    let (line, col) = find_line_col(reassigned, "$copy->knownOnly");
+    assert_eq!(
+        parse_and_infer_var_type_at(reassigned, line, col, "$copy"),
+        None,
+        "an unknown clone must replace the prior Known assignment"
+    );
+}
+
+#[test]
+fn test_clone_self_and_static_operands_resolve_in_their_class() {
+    let source = r#"<?php
+namespace App;
+class Example {
+    public string $mapping;
+    public function fromSelf(self $item): void {
+        $copy = clone $item;
+        (clone $item)->mapping;
+        $copy->mapping;
+    }
+    public function fromStatic(): void {
+        /** @var static $item */
+        $copy = clone $item;
+        $copy->mapping;
+    }
+}
+"#;
+    let (line, col) = find_line_col(source, "(clone $item)->mapping");
+    assert_eq!(
+        parse_and_resolve(source, line, col + "(clone $item)->".len() as u32).map(|sym| sym.fqn),
+        Some("App\\Example::$mapping".to_string())
+    );
+    for (line, row) in source.lines().enumerate() {
+        if let Some(col) = row.find("$copy->mapping") {
+            assert_eq!(
+                parse_and_infer_var_type_at(source, line as u32, col as u32, "$copy"),
+                Some("App\\Example".to_string()),
+                "clone result in {row}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_clone_keeps_union_operand_without_selecting_first_class() {
+    let source = "<?php function copy(A|B $item) { $copy = clone $item; $copy->common(); }";
+    let (line, col) = find_line_col(source, "$copy->common");
+    assert!(matches!(
+        parse_and_infer_var_type_info_at(source, line, col, "$copy"),
+        Some(TypeInfo::Union(parts)) if parts.len() == 2
+    ));
+    assert_eq!(
+        parse_and_infer_var_type_at(source, line, col, "$copy"),
+        None
+    );
+}
+
+#[test]
+fn test_clone_assignment_keeps_generic_arguments() {
+    for expression in [
+        "clone $item",
+        "clone (clone $item)",
+        "(clone $item)",
+        "((clone /* note */ $item))",
+    ] {
+        for in_branch in [false, true] {
+            let assignment = if in_branch {
+                format!("if (true) {{ $copy = {expression}; }}")
+            } else {
+                format!("$copy = {expression};")
+            };
+            let source = format!(
+                r#"<?php
+namespace App;
+class Item {{}}
+/** @template T */ class Box {{ /** @return T */ public function get() {{}} }}
+function copy() {{
+    /** @var Box<Item> $item */
+    $item = getBox();
+    {assignment}
+    $copy->get();
+}}
+"#
+            );
+            let (line, col) = find_line_col(&source, "$copy->get");
+            let inferred = parse_and_infer_var_type_info_at(&source, line, col, "$copy");
+            assert!(
+            matches!(&inferred, Some(TypeInfo::Generic { base, args })
+            if base.contains("Box") && args.iter().any(|arg| arg.to_string().contains("Item"))),
+            "cloning should preserve Box<Item> for {expression} branch={in_branch}: {inferred:?}"
+        );
+        }
+    }
+}
+
 fn parse_and_resolve(code: &str, line: u32, col: u32) -> Option<SymbolAtPosition> {
     let mut parser = FileParser::new();
     parser.parse_full(code);

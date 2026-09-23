@@ -211,6 +211,27 @@ impl PhpLspBackend {
 
         // Detect completion context
         let context = detect_context_at_byte_col(&tree, &source, pos.line, byte_col, &file_symbols);
+        if let php_lsp_completion::context::CompletionContext::MemberAccess {
+            object_expr, ..
+        } = &context
+        {
+            if let Some(node) = super::composite_receivers::completion_node(
+                &tree,
+                &source,
+                pos.line,
+                byte_col,
+                object_expr,
+            ) {
+                super::composite_receivers::preload(
+                    &tree,
+                    &source,
+                    &file_symbols,
+                    &self.vendor_lazy_index_context_from_request(&request),
+                    vec![node],
+                )
+                .await;
+            }
+        }
         let context = match context {
             php_lsp_completion::context::CompletionContext::MemberAccess {
                 object_expr,
@@ -259,28 +280,6 @@ impl PhpLspBackend {
         if let Some(class_fqn) = completion_class_fqn {
             self.lazy_index_class_dependencies_in_request(&request, &class_fqn)
                 .await;
-        }
-
-        if let php_lsp_completion::context::CompletionContext::MemberAccess {
-            object_expr, ..
-        } = &context
-        {
-            if let Some(node) = super::composite_receivers::completion_node(
-                &tree,
-                &source,
-                pos.line,
-                byte_col,
-                object_expr,
-            ) {
-                super::composite_receivers::preload(
-                    &tree,
-                    &source,
-                    &file_symbols,
-                    &self.vendor_lazy_index_context_from_request(&request),
-                    vec![node],
-                )
-                .await;
-            }
         }
 
         let inference_ctx = CompletionInferenceContext {
@@ -872,6 +871,34 @@ impl PhpLspBackend {
                     },
                 ) {
                     return Some(class_fqn);
+                }
+
+                if let Some(node) = super::composite_receivers::completion_node(
+                    tree,
+                    source,
+                    line,
+                    byte_col,
+                    object_expr,
+                ) {
+                    let mut expression = node;
+                    while expression.kind() == "parenthesized_expression" {
+                        let Some(inner) =
+                            php_lsp_parser::resolve::first_expression_child(expression)
+                        else {
+                            break;
+                        };
+                        expression = inner;
+                    }
+                    if expression.kind() == "clone_expression" {
+                        let type_info = super::composite_receivers::expression_type(
+                            tree,
+                            source,
+                            file_symbols,
+                            index,
+                            node,
+                        )?;
+                        return type_info_fqn_from_index(index, "", source_uri, &type_info);
+                    }
                 }
 
                 if object_expr.contains("->") || object_expr.contains("?->") {

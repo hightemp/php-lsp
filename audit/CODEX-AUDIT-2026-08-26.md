@@ -865,6 +865,10 @@ review дал GO после устранения всех выявленных �
 
 ### CODEX-P2-03. Не выводится тип `clone` expression
 
+> **Статус 2026-09-23:** основной дефект исправлен для обычного `clone`.
+> Синтаксис PHP 8.5 `clone($object, $properties)` вынесен по решению пользователя
+> в отдельную открытую задачу `FOLLOWUP-CODEX-P2-03-PHP85-CLONE-WITH`.
+
 В
 [`PromotedSelfDefaults.php:15`](test-fixtures/lsp-cases/src/Diagnostics/PromotedSelfDefaults.php#L15)
 переменная `$clone = clone $this` не получает тип текущего класса. Поэтому
@@ -880,6 +884,28 @@ completion для `$clone->objectManager` и `$clone->mapping` пуст.
 - сохранять `self`/`static` substitution текущего owner;
 - поддержать PHP 8.5 clone-with;
 - добавить parser unit и completion E2E tests.
+
+#### Реализовано и проверено
+
+Вывод типа `clone` использует полный тип operand, включая union, и разрешает
+`$this`, `self` и `static` в текущем классе. Прямой доступ к члену клона и
+переменная после присваивания проходят через тот же resolver; неизвестный
+operand не получает выдуманный тип. Вывод сохраняет generic-параметры через
+скобки и комментарии; lazy vendor loading обходит operand до расчёта receiver.
+RED-тесты подтвердили отсутствие типа у `clone $this` и `clone($item)`, потерю
+generic, пропуск vendor-зависимости и сохранение старого типа после клонирования
+неизвестного operand до исправления. Добавлены шесть parser unit и четыре
+сквозных LSP-теста для completion, hover, definition, прямого receiver,
+закрытого vendor, очистки stale-типа и обновления документа.
+
+Финальный `CARGO_BUILD_JOBS=1 cargo test --all -- --test-threads=1` прошёл
+1070/1070 без ignored. Clippy `--all-targets -D warnings`, Rustfmt и diff check
+прошли; повторный Verifier review дал GO для кода обычного `clone`.
+
+Текущая версия Tree-sitter PHP и доступная upstream-грамматика не разбирают
+валидный [PHP 8.5 `clone($object, $properties)`](https://wiki.php.net/rfc/clone_with_v2).
+Отдельные RED parser/LSP-пробы подтвердили синтаксическую ошибку; поддержка
+этой формы потребует изменения грамматики и остаётся открытой в follow-up.
 
 ### CODEX-P2-04. PHPStan diagnostics могут иметь неверный range или файл
 

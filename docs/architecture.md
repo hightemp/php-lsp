@@ -298,6 +298,10 @@ do not invent an exact target for a composite receiver, including consumers such
 as rename/references. Completion resolve retains the merged detail; navigation
 deduplicates real declaration locations. Lazy receiver loading uses the existing
 vendor loader and its workspace/generation guards for each constituent.
+For ordinary `clone` expressions, parser inference carries the full operand
+type, including generic arguments and unions, through assignments and nested
+expressions. Cloning `$this` resolves against the enclosing class; unknown
+operands remain unresolved. Lazy vendor loading follows the clone operand.
 Strict scalar equality guards whose matching branch immediately returns can
 remove that alternative before a direct later expression or return in the same
 callable body. Narrowing rejects loops/nested uses, backward jumps, dynamic
