@@ -64,6 +64,106 @@ fn test_incremental_edit() {
 }
 
 #[test]
+fn incremental_oversized_columns_stop_before_lf_and_crlf() {
+    for ending in ["\n", "\r\n"] {
+        let source = format!("<?php{ending}class First {{}}{ending}class Second {{}}{ending}");
+        let mut parser = FileParser::new();
+        parser.parse_full(&source);
+        parser.apply_edit(1, 999, 1, 999, " class Tail {}").unwrap();
+        let expected = format!(
+            "<?php{ending}class First {{}} class Tail {{}}{ending}class Second {{}}{ending}"
+        );
+        assert_eq!(parser.source(), expected, "line ending {ending:?}");
+        assert!(!parser.tree().unwrap().root_node().has_error());
+
+        parser.apply_edit(2, 6, 2, 12, "Third").unwrap();
+        let after_second = format!(
+            "<?php{ending}class First {{}} class Tail {{}}{ending}class Third {{}}{ending}"
+        );
+        assert_eq!(parser.source(), after_second);
+        let mut fresh = FileParser::new();
+        fresh.parse_full(&after_second);
+        assert_eq!(
+            parser.tree().unwrap().root_node().to_sexp(),
+            fresh.tree().unwrap().root_node().to_sexp(),
+            "incremental tree diverged for {ending:?}"
+        );
+    }
+}
+
+#[test]
+fn incremental_mid_surrogate_position_uses_start_of_scalar() {
+    let source = "<?php\n$path = \"😀.php\";\n$next = 1;\n";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let (line, emoji_start) = utf16_position_at(source, "😀");
+    parser
+        .apply_edit(line, emoji_start + 1, line, emoji_start + 1, "X")
+        .unwrap();
+    let expected = "<?php\n$path = \"X😀.php\";\n$next = 1;\n";
+    assert_eq!(parser.source(), expected);
+    let next = utf16_position_at(expected, "$next");
+    parser
+        .apply_edit(next.0, next.1, next.0, next.1 + 5, "$other")
+        .unwrap();
+    assert_eq!(
+        parser.source(),
+        "<?php\n$path = \"X😀.php\";\n$other = 1;\n"
+    );
+    assert!(!parser.tree().unwrap().root_node().has_error());
+}
+
+#[test]
+fn incremental_oversized_columns_handle_blank_crlf_and_final_empty_line() {
+    let mut parser = FileParser::new();
+    parser.parse_full("<?php\r\n\r\nclass First {}\r\n");
+    parser.apply_edit(1, 999, 1, 999, "// blank").unwrap();
+    assert_eq!(parser.source(), "<?php\r\n// blank\r\nclass First {}\r\n");
+    parser
+        .apply_edit(3, 999, 3, 999, "class Second {}")
+        .unwrap();
+    assert_eq!(
+        parser.source(),
+        "<?php\r\n// blank\r\nclass First {}\r\nclass Second {}"
+    );
+    assert!(!parser.tree().unwrap().root_node().has_error());
+}
+
+#[test]
+fn incremental_out_of_range_lines_use_actual_eof_point() {
+    fn assert_same_tree(actual: tree_sitter::Node, fresh: tree_sitter::Node) {
+        assert_eq!(actual.kind(), fresh.kind());
+        assert_eq!(actual.byte_range(), fresh.byte_range());
+        assert_eq!(actual.start_position(), fresh.start_position());
+        assert_eq!(actual.end_position(), fresh.end_position());
+        assert_eq!(actual.child_count(), fresh.child_count());
+        for index in 0..actual.child_count() {
+            assert_same_tree(actual.child(index).unwrap(), fresh.child(index).unwrap());
+        }
+    }
+
+    let mut parser = FileParser::new();
+    parser.parse_full("<?php\nclass First {}");
+    parser
+        .apply_edit(99, 999, 100, 999, " class Second {}")
+        .unwrap();
+    assert_eq!(parser.source(), "<?php\nclass First {} class Second {}");
+    let mut fresh = FileParser::new();
+    fresh.parse_full(&parser.source());
+    assert_same_tree(
+        parser.tree().unwrap().root_node(),
+        fresh.tree().unwrap().root_node(),
+    );
+
+    parser.apply_edit(1, 6, 1, 11, "Third").unwrap();
+    fresh.parse_full(&parser.source());
+    assert_same_tree(
+        parser.tree().unwrap().root_node(),
+        fresh.tree().unwrap().root_node(),
+    );
+}
+
+#[test]
 fn test_incremental_edit_after_emoji_uses_utf16_positions() {
     let mut parser = FileParser::new();
     parser.parse_full("<?php\n$emoji = \"😀\"; $name = 1;\n");

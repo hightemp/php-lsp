@@ -61,7 +61,7 @@ fn assert_line_conversions(source: &str, line: u32) {
     for utf16_col in 0..=max_utf16 {
         assert_eq!(
             utf16_col_to_byte(source, line, utf16_col),
-            reference_utf16_to_byte(text, utf16_col),
+            reference_utf16_to_byte(text.trim_end_matches('\r'), utf16_col),
             "utf16->byte mismatch for line {line}, utf16_col {utf16_col}, text {text:?}"
         );
     }
@@ -155,6 +155,36 @@ fn test_crlf_empty_lines_and_eof_conversions() {
     assert_line_conversions(source, 2);
     assert_eq!(byte_col_to_utf16(source, 99, 7), 7);
     assert_eq!(utf16_col_to_byte(source, 99, 7), 7);
+}
+
+#[test]
+fn oversized_utf16_columns_exclude_crlf_line_ending() {
+    let source = "<?php\r\n$one = '😀';\r\n$two = 1;\r\n";
+    let content = "$one = '😀';";
+    assert_eq!(utf16_col_to_byte(source, 1, u32::MAX), content.len() as u32);
+    assert_eq!(
+        utf16_col_to_byte(source, 1, content.encode_utf16().count() as u32 + 1),
+        content.len() as u32
+    );
+}
+
+#[test]
+fn iterator_conversion_stops_near_small_columns_on_long_lines() {
+    let line = format!("{}😀\r\n", "a".repeat(10_000));
+    let mut consumed = 0usize;
+    let at_start = utf16_col_to_byte_chars(line.chars().inspect(|_| consumed += 1), 0);
+    assert_eq!(at_start, 0);
+    assert_eq!(consumed, 0, "zero column should not scan the line");
+
+    consumed = 0;
+    let small = utf16_col_to_byte_chars(line.chars().inspect(|_| consumed += 1), 3);
+    assert_eq!(small, 3);
+    assert!(consumed <= 4, "small column scanned {consumed} characters");
+
+    assert_eq!(
+        utf16_col_to_byte_chars(line.chars(), u32::MAX),
+        10_000 + "😀".len() as u32
+    );
 }
 
 #[test]

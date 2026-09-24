@@ -1006,6 +1006,9 @@ CST-обхода, vendor/framework traversal, EINTR и сохранение clea
 
 ### CODEX-P2-06. Incremental edit не зажимается на конце строки
 
+> **Статус 2026-09-24:** исправлено через RED → GREEN. Исходное описание
+> ниже сохранено как обоснование изменения.
+
 [`FileParser::utf16_position_to_byte`](server/crates/php-lsp-parser/src/parser.rs#L146)
 проходит по `rope.line(line)`, содержащей line ending. Позиция с character
 больше длины строки может пересечь `\n` и превратиться в начало следующей
@@ -1015,6 +1018,23 @@ CST-обхода, vendor/framework traversal, EINTR и сохранение clea
 
 Что исправить: исключать `\n` и `\r\n` из line slice при edit conversion,
 централизовать UTF-16 → byte policy и добавить oversized/mid-surrogate E2E.
+
+#### Реализовано
+
+`FileParser::apply_edit` и общие LSP-конверсии используют одну политику
+UTF-16 → byte: колонка сверх содержимого строки зажимается до LF/CRLF,
+позиция внутри surrogate pair — к началу Unicode scalar. Для RopeSlice
+используется итератор без копирования всей строки. RED-регрессии подтвердили
+переход вставки на следующую строку и неверную сторону emoji; parser-тесты
+проверяют LF, CRLF, пустую CRLF-строку, конечную пустую строку, последующие
+правки и соответствие инкрементального дерева полному разбору. Сквозной LSP
+тест проверяет didChange через document links и относительные позиции после
+нескольких правок.
+
+Добавлено семь постоянных тестов. Финальный
+`CARGO_BUILD_JOBS=1 cargo test --all -- --test-threads=1` прошёл 1096/1096
+без ignored; Clippy `--all-targets -D warnings`, Rustfmt и diff check прошли.
+Повторный Verifier review дал GO.
 
 ### CODEX-P2-07. Arrow function не является отдельным diagnostic scope
 

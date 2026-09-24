@@ -137,15 +137,34 @@ pub fn utf16_col_to_byte(source: &str, line: u32, utf16_col: u32) -> u32 {
         None => return utf16_col,
     };
 
+    utf16_col_to_byte_in_line(line_text, utf16_col)
+}
+
+/// Convert within one line, clamping to content before LF or CRLF. A position
+/// inside a surrogate pair resolves to the start of that Unicode scalar.
+pub fn utf16_col_to_byte_in_line(line_text: &str, utf16_col: u32) -> u32 {
+    let line_text = line_text.split(['\r', '\n']).next().unwrap_or(line_text);
+
     if line_text.is_ascii() {
         return utf16_col.min(line_text.len() as u32);
     }
 
+    utf16_col_to_byte_chars(line_text.chars(), utf16_col)
+}
+
+/// Shared iterator form for RopeSlice lines, avoiding a full line allocation.
+pub(crate) fn utf16_col_to_byte_chars(chars: impl Iterator<Item = char>, utf16_col: u32) -> u32 {
+    if utf16_col == 0 {
+        return 0;
+    }
     let utf16_col = utf16_col as usize;
     let mut byte_off = 0usize;
     let mut utf16_off = 0usize;
 
-    for ch in line_text.chars() {
+    for ch in chars {
+        if matches!(ch, '\r' | '\n') {
+            break;
+        }
         if utf16_col <= utf16_off {
             break;
         }

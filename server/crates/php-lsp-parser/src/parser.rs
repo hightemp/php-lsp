@@ -1,5 +1,6 @@
 //! FileParser: tree-sitter + ropey::Rope for incremental PHP parsing.
 
+use crate::utf16::utf16_col_to_byte_chars;
 use ropey::Rope;
 use std::fmt;
 use tree_sitter::{InputEdit, Parser, Point, Tree};
@@ -148,20 +149,8 @@ impl FileParser {
             return self.rope.len_bytes();
         }
         let line_start = self.rope.line_to_byte(line);
-        let line_slice = self.rope.line(line);
-
-        let mut utf16_offset = 0;
-        let mut byte_offset = 0;
-
-        for ch in line_slice.chars() {
-            if utf16_offset >= utf16_char {
-                break;
-            }
-            byte_offset += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-
-        line_start + byte_offset
+        line_start
+            + utf16_col_to_byte_chars(self.rope.line(line).chars(), utf16_char as u32) as usize
     }
 
     /// Get the byte offset of the start of a line.

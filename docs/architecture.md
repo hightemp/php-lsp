@@ -180,6 +180,9 @@ Outbound LSP handlers must convert byte-backed ranges with
 Completion context detection receives byte columns after the server converts
 LSP UTF-16 positions and clamps them to valid UTF-8 boundaries before slicing,
 so non-ASCII text and CRLF line endings do not change the internal unit model.
+Incremental edits use the same UTF-16-to-byte boundary policy directly over
+RopeSlice characters: positions beyond line content stop before LF/CRLF, and
+positions inside a surrogate pair resolve to the scalar's start.
 
 ### URI Model
 
