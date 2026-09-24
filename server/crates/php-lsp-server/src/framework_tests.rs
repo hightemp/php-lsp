@@ -1456,6 +1456,7 @@ fn framework_string_scan_follows_external_template_symlink_without_cycles() {
             max_entries: Some(256),
         },
         &[],
+        None,
     );
     assert!(keys.iter().any(|key| key.key == "nested/page.html.twig"));
     let excluded = framework_string_keys_for_workspace_with_limits(
@@ -1466,10 +1467,60 @@ fn framework_string_scan_follows_external_template_symlink_without_cycles() {
             max_entries: Some(256),
         },
         &[PathBuf::from("templates")],
+        None,
     );
     assert!(excluded.is_empty());
 
     fs::remove_file(external.join("nested/back")).expect("remove cycle link");
     fs::remove_dir_all(root).expect("remove workspace");
     fs::remove_dir_all(external).expect("remove external templates");
+}
+
+#[test]
+fn framework_static_walk_stops_on_file_io_cancellation() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("php-lsp-framework-cancel-{nanos}"));
+    fs::create_dir_all(root.join("templates")).unwrap();
+    fs::write(root.join("templates/page.html.twig"), "{{ value }}").unwrap();
+    let limits = TraversalLimits {
+        max_files: Some(10),
+        max_entries: Some(10),
+    };
+    assert_eq!(
+        collect_static_files(
+            &root.join("templates"),
+            &root,
+            &[],
+            &["twig"],
+            10,
+            limits,
+            None
+        )
+        .len(),
+        1
+    );
+    let token = crate::server::OperationCancellationToken::new();
+    token.cancel();
+    assert!(collect_static_files(
+        &root.join("templates"),
+        &root,
+        &[],
+        &["twig"],
+        10,
+        limits,
+        Some(&token)
+    )
+    .is_empty());
+    assert!(framework_string_keys_for_workspace_with_limits(
+        &root,
+        "twig",
+        limits,
+        &[],
+        Some(&token)
+    )
+    .is_empty());
+    fs::remove_dir_all(root).unwrap();
 }

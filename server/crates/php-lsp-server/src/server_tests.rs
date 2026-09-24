@@ -857,6 +857,197 @@ async fn test_file_io_blocking_yields_current_thread_runtime() {
     assert_eq!(handle.await.unwrap().unwrap(), 7);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn test_file_io_blocking_keeps_capacity_until_cancelled_worker_finishes() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let spawn_worker = |started: Arc<AtomicUsize>, release: Arc<AtomicBool>| {
+        tokio::spawn(run_file_io_blocking(
+            "bounded IO",
+            "test".to_string(),
+            move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            },
+        ))
+    };
+
+    let first = spawn_worker(started.clone(), release.clone());
+    let second = spawn_worker(started.clone(), release.clone());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    first.abort();
+    let third = spawn_worker(started.clone(), release.clone());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let leaked_capacity = started.load(Ordering::SeqCst) > 2;
+    release.store(true, Ordering::SeqCst);
+    second.await.unwrap().unwrap();
+    third.await.unwrap().unwrap();
+    assert!(
+        !leaked_capacity,
+        "a cancelled waiter released capacity while its blocking worker was still running"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_file_io_blocking_signals_cooperative_worker_on_timeout_and_abort() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for abort_waiter in [false, true] {
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped_by_cancellation = Arc::new(AtomicBool::new(false));
+        let worker_started = started.clone();
+        let worker_stopped = stopped_by_cancellation.clone();
+        let run = tokio::spawn(run_file_io_blocking_with_budget(
+            "cancellable IO",
+            "test".to_string(),
+            if abort_waiter {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(30)
+            },
+            move |token| {
+                worker_started.store(true, Ordering::SeqCst);
+                let safety_deadline = Instant::now() + Duration::from_secs(1);
+                while !token.is_cancelled() && Instant::now() < safety_deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                worker_stopped.store(token.is_cancelled(), Ordering::SeqCst);
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if abort_waiter {
+            run.abort();
+        } else {
+            assert!(run.await.unwrap().unwrap_err().contains("timed out"));
+        }
+        tokio::time::timeout(Duration::from_millis(300), async {
+            while !stopped_by_cancellation.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking worker did not observe cancellation promptly");
+    }
+}
+
+#[test]
+fn cancellable_file_reader_retries_interrupted_reads() {
+    struct InterruptThenBytes {
+        bytes: std::io::Cursor<Vec<u8>>,
+        interrupted: bool,
+    }
+    impl std::io::Read for InterruptThenBytes {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                Err(std::io::ErrorKind::Interrupted.into())
+            } else {
+                std::io::Read::read(&mut self.bytes, buffer)
+            }
+        }
+    }
+    let token = OperationCancellationToken::new();
+    let mut reader = InterruptThenBytes {
+        bytes: std::io::Cursor::new(b"<?php echo 1;".to_vec()),
+        interrupted: false,
+    };
+    assert_eq!(
+        read_to_string_with_cancellation(&mut reader, &token).unwrap(),
+        "<?php echo 1;"
+    );
+}
+
+#[test]
+fn test_queued_blocking_operation_does_not_start_after_caller_abort() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let release = Arc::new(AtomicBool::new(false));
+    let release_on_drop = release.clone();
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let _release_on_drop = ReleaseOnDrop(release_on_drop);
+    runtime.block_on(async {
+        let blocker_started = Arc::new(AtomicBool::new(false));
+        let blocker_release = release.clone();
+        let started = blocker_started.clone();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.store(true, Ordering::SeqCst);
+            while !blocker_release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !blocker_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let worker_ran = ran.clone();
+        let permit_count = FILE_IO_BLOCKING_SEMAPHORE.available_permits();
+        let queued = tokio::spawn(run_file_io_blocking_with_budget(
+            "queued IO",
+            "test".to_string(),
+            Duration::from_secs(5),
+            move |_| worker_ran.store(true, Ordering::SeqCst),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while FILE_IO_BLOCKING_SEMAPHORE.available_permits() == permit_count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        queued.abort();
+        let _ = queued.await;
+        let permit_returned = tokio::time::timeout(Duration::from_millis(300), async {
+            while FILE_IO_BLOCKING_SEMAPHORE.available_permits() != permit_count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        release.store(true, Ordering::SeqCst);
+        blocker.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            permit_returned,
+            "queued worker retained its permit after abort"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "queued IO ran after its caller was cancelled"
+        );
+    });
+}
+
 #[test]
 fn test_file_io_walk_deadline_precedes_outer_blocking_timeout() {
     let before = Instant::now();
@@ -7158,6 +7349,50 @@ async fn test_framework_string_key_scan_uses_request_scoped_shared_root_config()
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn test_failed_framework_scan_is_retried_after_capacity_returns() {
+    let root = unique_server_temp_dir("framework-scan-timeout-retry");
+    std::fs::create_dir_all(root.join("templates")).unwrap();
+    std::fs::write(root.join("templates/page.html.twig"), "{{ value }}").unwrap();
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let config = WorkspaceRootConfig {
+        workspace_folder: root.clone(),
+        root: root.clone(),
+        namespace_map: None,
+        runtime_config: ResolvedRuntimeConfiguration::default(),
+        index: Arc::new(WorkspaceIndex::new()),
+        vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+    };
+    let request = WorkspaceRequestContext {
+        state: Arc::new(WorkspaceRuntimeState {
+            fallback: ResolvedRuntimeConfiguration::default(),
+            fallback_index: Arc::new(WorkspaceIndex::new()),
+            configs: vec![config.clone()],
+            generation: 1,
+        }),
+        workspace: Some(config),
+    };
+    let held = FILE_IO_BLOCKING_SEMAPHORE
+        .clone()
+        .acquire_many_owned(MAX_CONCURRENT_FILE_IO_TASKS as u32)
+        .await
+        .unwrap();
+    let first = backend.cached_framework_string_keys(&request, "twig").await;
+    assert!(
+        first.is_empty(),
+        "capacity timeout should not fabricate keys"
+    );
+    drop(held);
+
+    let second = backend.cached_framework_string_keys(&request, "twig").await;
+    assert!(
+        second.iter().any(|key| key.key == "page.html.twig"),
+        "failed scan must be retried when capacity returns: {second:?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn test_root_indices_isolate_duplicate_fqns_stub_versions_and_stub_sources() {
     let tmp = unique_server_temp_dir("root-index-isolation");
@@ -7948,6 +8183,160 @@ async fn test_run_shell_command_with_timeout_respects_cancellation() {
 
     let error = run.await.unwrap().unwrap_err();
     assert_eq!(error, "Test command cancelled");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_external_command_bounds_combined_stdout_and_stderr() {
+    for command in [
+        "head -c 5242880 /dev/zero",
+        "head -c 5242880 /dev/zero >&2",
+        "head -c 3145728 /dev/zero; head -c 3145728 /dev/zero >&2",
+    ] {
+        let result = run_shell_command_with_timeout("Bounded", command, None, 5_000, None).await;
+        assert!(
+            result.is_err(),
+            "command output must fail the byte budget: {command}"
+        );
+        assert!(
+            result.unwrap_err().contains("output exceeded"),
+            "output budget should explain the failure for {command}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_external_command_stops_never_ending_output_at_byte_limit() {
+    let command = "while :; do head -c 4096 /dev/zero; sleep 0.002; done";
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_shell_command_with_output_limit("Streaming", command, None, 5_000, None, 128 * 1024),
+    )
+    .await
+    .expect("continuous output did not stop promptly")
+    .unwrap_err();
+    assert!(result.contains("output exceeded"), "{result}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_external_command_timeout_and_cancel_stop_descendants() {
+    for cancelled in [false, true] {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!(
+            "php-lsp-external-descendant-{}-{nanos}",
+            std::process::id()
+        ));
+        let command = format!(
+            "(sleep 1; touch {}) & wait",
+            shell_escape(&marker.to_string_lossy())
+        );
+        let token = OperationCancellationToken::new();
+        let canceller = token.clone();
+        let run = tokio::spawn(async move {
+            run_shell_command_with_timeout("Descendant", &command, None, 100, Some(token)).await
+        });
+        if cancelled {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            canceller.cancel();
+        }
+        let result = run.await.unwrap();
+        assert!(result.is_err());
+        tokio::time::sleep(Duration::from_millis(1_150)).await;
+        let descendant_survived = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !descendant_survived,
+            "{} left a descendant running after the shell returned",
+            if cancelled { "cancellation" } else { "timeout" }
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_successful_shell_does_not_leave_background_descendants() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let marker = std::env::temp_dir().join(format!("php-lsp-success-child-{nanos}"));
+    let command = format!(
+        "(sleep 1; touch {}) >/dev/null 2>&1 & exit 0",
+        shell_escape(&marker.to_string_lossy())
+    );
+    let output = run_shell_command_with_timeout("Background", &command, None, 5_000, None)
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    tokio::time::sleep(Duration::from_millis(1_150)).await;
+    let survived = marker.exists();
+    let _ = std::fs::remove_file(&marker);
+    assert!(
+        !survived,
+        "successful shell left a background descendant alive"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_pre_cancelled_external_command_does_not_spawn() {
+    let token = OperationCancellationToken::new();
+    token.cancel();
+    let missing_cwd = std::env::temp_dir().join(format!(
+        "php-lsp-pre-cancelled-missing-{}",
+        std::process::id()
+    ));
+    let result = run_shell_command_with_timeout(
+        "Precancelled",
+        "touch should-not-run",
+        Some(&missing_cwd),
+        5_000,
+        Some(token),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), "Precancelled command cancelled");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_aborted_external_command_future_stops_descendants() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("php-lsp-abort-child-{nanos}"));
+    std::fs::create_dir_all(&root).unwrap();
+    let started = root.join("started");
+    let marker = root.join("child-survived");
+    let command = format!(
+        "touch {}; (sleep 1; touch {}) & wait",
+        shell_escape(&started.to_string_lossy()),
+        shell_escape(&marker.to_string_lossy())
+    );
+    let run = tokio::spawn(async move {
+        run_shell_command_with_timeout("Aborted", &command, None, 5_000, None).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("external shell did not start");
+    run.abort();
+    let _ = run.await;
+    tokio::time::sleep(Duration::from_millis(1_150)).await;
+    let survived = marker.exists();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        !survived,
+        "dropped command future left its descendant running"
+    );
 }
 
 #[tokio::test]

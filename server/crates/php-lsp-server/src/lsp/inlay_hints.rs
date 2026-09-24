@@ -36,8 +36,10 @@ impl PhpLspBackend {
             original_requested_range
         };
         let compute_uri = uri_str.clone();
-        let mut hints =
-            match run_file_io_blocking("inlayHint compute", uri_str.clone(), move || {
+        let mut hints = match run_file_io_blocking_cancellable(
+            "inlayHint compute",
+            uri_str.clone(),
+            move |token| {
                 inlay_hints(
                     &compute_uri,
                     document_version,
@@ -47,16 +49,18 @@ impl PhpLspBackend {
                     &index,
                     requested_range,
                     php_version,
+                    Some(&token),
                 )
-            })
-            .await
-            {
-                Ok(hints) => hints,
-                Err(message) => {
-                    tracing::warn!("{}", message);
-                    Vec::new()
-                }
-            };
+            },
+        )
+        .await
+        {
+            Ok(hints) => hints,
+            Err(message) => {
+                tracing::warn!("{}", message);
+                Vec::new()
+            }
+        };
 
         if let Some(template) = &template_document {
             hints = map_inlay_hints_to_template_original(template, original_requested_range, hints);
@@ -155,7 +159,11 @@ pub(in crate::server) fn inlay_hints(
     index: &WorkspaceIndex,
     requested_range: Range,
     php_version: PhpVersion,
+    cancellation: Option<&OperationCancellationToken>,
 ) -> Vec<InlayHint> {
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return Vec::new();
+    }
     let utf16_index = Utf16LineIndex::new(source);
     let byte_range = lsp_range_to_byte_range(source, requested_range);
     let mut hints = Vec::new();
@@ -171,18 +179,32 @@ pub(in crate::server) fn inlay_hints(
         requested_range: byte_range,
         allow_twig_property_accessors,
         allow_blocking_file_io: true,
+        cancellation,
     };
 
     collect_call_argument_inlay_hints(&ctx, tree.root_node(), &mut hints);
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return Vec::new();
+    }
     collect_local_variable_type_inlay_hints(&ctx, tree.root_node(), &mut hints);
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return Vec::new();
+    }
     collect_scope_end_inlay_hints(&ctx, tree.root_node(), &mut hints);
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return Vec::new();
+    }
     collect_phpdoc_parameter_type_inlay_hints(
         tree.root_node(),
         source,
         &utf16_index,
         byte_range,
         &mut hints,
+        cancellation,
     );
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return Vec::new();
+    }
     collect_phpdoc_return_type_inlay_hints(
         tree,
         source,
@@ -190,7 +212,11 @@ pub(in crate::server) fn inlay_hints(
         byte_range,
         php_version,
         &mut hints,
+        cancellation,
     );
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return Vec::new();
+    }
 
     hints.sort_by(|left, right| {
         (
@@ -217,6 +243,7 @@ pub(in crate::server) struct InlayHintContext<'a> {
     pub(in crate::server) requested_range: (u32, u32, u32, u32),
     pub(in crate::server) allow_twig_property_accessors: bool,
     pub(in crate::server) allow_blocking_file_io: bool,
+    pub(in crate::server) cancellation: Option<&'a OperationCancellationToken>,
 }
 
 fn inlay_context_with_file_symbols<'a>(
@@ -233,6 +260,7 @@ fn inlay_context_with_file_symbols<'a>(
         requested_range: ctx.requested_range,
         allow_twig_property_accessors: ctx.allow_twig_property_accessors,
         allow_blocking_file_io: ctx.allow_blocking_file_io,
+        cancellation: ctx.cancellation,
     }
 }
 
@@ -241,6 +269,12 @@ pub(in crate::server) fn collect_scope_end_inlay_hints(
     node: tree_sitter::Node,
     hints: &mut Vec<InlayHint>,
 ) {
+    if ctx
+        .cancellation
+        .is_some_and(OperationCancellationToken::is_cancelled)
+    {
+        return;
+    }
     if let Some(hint) = scope_end_inlay_hint(ctx, node) {
         hints.push(hint);
     }
@@ -423,6 +457,12 @@ pub(in crate::server) fn collect_call_argument_inlay_hints(
     node: tree_sitter::Node,
     hints: &mut Vec<InlayHint>,
 ) {
+    if ctx
+        .cancellation
+        .is_some_and(OperationCancellationToken::is_cancelled)
+    {
+        return;
+    }
     if matches!(
         node.kind(),
         "function_call_expression"
@@ -542,6 +582,12 @@ pub(in crate::server) fn collect_local_variable_type_inlay_hints_inner(
     hints: &mut Vec<InlayHint>,
     seen: &mut HashSet<(u32, u32, String)>,
 ) {
+    if ctx
+        .cancellation
+        .is_some_and(OperationCancellationToken::is_cancelled)
+    {
+        return;
+    }
     match node.kind() {
         "expression_statement" => {
             add_assignment_variable_type_inlay_hint(ctx, node, hints, seen);
@@ -4251,7 +4297,11 @@ pub(in crate::server) fn collect_phpdoc_parameter_type_inlay_hints(
     utf16_index: &Utf16LineIndex,
     requested_range: (u32, u32, u32, u32),
     hints: &mut Vec<InlayHint>,
+    cancellation: Option<&OperationCancellationToken>,
 ) {
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return;
+    }
     if matches!(node.kind(), "function_definition" | "method_declaration") {
         add_phpdoc_parameter_type_inlay_hints(node, source, utf16_index, requested_range, hints);
     }
@@ -4264,6 +4314,7 @@ pub(in crate::server) fn collect_phpdoc_parameter_type_inlay_hints(
             utf16_index,
             requested_range,
             hints,
+            cancellation,
         );
     }
 }
@@ -4333,8 +4384,19 @@ pub(in crate::server) fn collect_phpdoc_return_type_inlay_hints(
     requested_range: (u32, u32, u32, u32),
     php_version: PhpVersion,
     hints: &mut Vec<InlayHint>,
+    cancellation: Option<&OperationCancellationToken>,
 ) {
-    for candidate in find_missing_return_type_candidates(tree, source, requested_range) {
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return;
+    }
+    for candidate in
+        find_missing_return_type_candidates_with_control(tree, source, requested_range, || {
+            cancellation.is_some_and(OperationCancellationToken::is_cancelled)
+        })
+    {
+        if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+            break;
+        }
         let label = return_type_hint(&candidate.return_type, php_version)
             .unwrap_or_else(|| candidate.return_type.to_string());
         hints.push(InlayHint {

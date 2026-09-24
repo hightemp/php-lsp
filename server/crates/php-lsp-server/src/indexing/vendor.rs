@@ -1000,6 +1000,27 @@ fn resolve_vendor_paths_from_map_with_limits(
     project_root: Option<&Path>,
     exclude_paths: &[PathBuf],
 ) -> Option<VendorPathResolution> {
+    resolve_vendor_paths_from_map_with_limits_cancellable(
+        fqn,
+        map,
+        traversal_limits,
+        project_root,
+        exclude_paths,
+        None,
+    )
+}
+
+fn resolve_vendor_paths_from_map_with_limits_cancellable(
+    fqn: &str,
+    map: &VendorAutoloadMap,
+    traversal_limits: TraversalLimits,
+    project_root: Option<&Path>,
+    exclude_paths: &[PathBuf],
+    cancellation: Option<&OperationCancellationToken>,
+) -> Option<VendorPathResolution> {
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return None;
+    }
     let normalized_fqn = fqn.trim_start_matches('\\');
     if !valid_vendor_class_name(normalized_fqn) {
         return None;
@@ -1016,8 +1037,19 @@ fn resolve_vendor_paths_from_map_with_limits(
         },
         |_, _| false,
         is_php_file_path,
-        || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
+        || {
+            if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+                Some(TraversalStopReason::Cancelled)
+            } else if Instant::now() >= deadline {
+                Some(TraversalStopReason::DeadlineExceeded)
+            } else {
+                None
+            }
+        },
     );
+    if psr4.stop_reason == Some(TraversalStopReason::Cancelled) {
+        return None;
+    }
     if psr4.truncated() || psr4.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
         tracing::warn!(
             "Vendor PSR candidate traversal was truncated after {} entries",
@@ -1039,7 +1071,11 @@ fn resolve_vendor_paths_from_map_with_limits(
         traversal_limits,
         project_root,
         exclude_paths,
+        cancellation,
     );
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return None;
+    }
     let mut priority_identities =
         ordered_physical_identities(&psr4_candidates, &psr4.physical_files);
     priority_identities.extend(ordered_physical_identities(
@@ -1148,15 +1184,20 @@ async fn resolve_vendor_paths_from_map_with_limits_blocking(
 ) -> Option<VendorPathResolution> {
     let fqn = fqn.to_string();
     let path_label = project_root.display().to_string();
-    match run_file_io_blocking("vendor path discovery", path_label.clone(), move || {
-        resolve_vendor_paths_from_map_with_limits(
-            &fqn,
-            &map,
-            traversal_limits,
-            Some(&project_root),
-            &exclude_paths,
-        )
-    })
+    match run_file_io_blocking_cancellable(
+        "vendor path discovery",
+        path_label.clone(),
+        move |token| {
+            resolve_vendor_paths_from_map_with_limits_cancellable(
+                &fqn,
+                &map,
+                traversal_limits,
+                Some(&project_root),
+                &exclude_paths,
+                Some(&token),
+            )
+        },
+    )
     .await
     {
         Ok(resolution) => resolution,
@@ -1176,8 +1217,20 @@ pub(crate) fn vendor_autoload_file_paths_from_map(
     project_root: &Path,
     exclude_paths: &[PathBuf],
 ) -> Vec<PathBuf> {
+    vendor_autoload_file_paths_from_map_with_cancellation(map, project_root, exclude_paths, None)
+}
+
+fn vendor_autoload_file_paths_from_map_with_cancellation(
+    map: &VendorAutoloadMap,
+    project_root: &Path,
+    exclude_paths: &[PathBuf],
+    cancellation: Option<&OperationCancellationToken>,
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for file_path in &map.files {
+        if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+            break;
+        }
         push_vendor_autoload_file_and_static_includes(
             file_path,
             &map.path_policy,
@@ -1185,6 +1238,7 @@ pub(crate) fn vendor_autoload_file_paths_from_map(
             exclude_paths,
             &mut paths,
             0,
+            cancellation,
         );
     }
     paths
@@ -1196,10 +1250,17 @@ pub(in crate::server) async fn vendor_autoload_file_paths_from_map_blocking(
     exclude_paths: Vec<PathBuf>,
 ) -> Vec<PathBuf> {
     let path_label = project_root.display().to_string();
-    match run_file_io_blocking(
+    match run_file_io_blocking_cancellable(
         "vendor autoload file discovery",
         path_label.clone(),
-        move || vendor_autoload_file_paths_from_map(&map, &project_root, &exclude_paths),
+        move |token| {
+            vendor_autoload_file_paths_from_map_with_cancellation(
+                &map,
+                &project_root,
+                &exclude_paths,
+                Some(&token),
+            )
+        },
     )
     .await
     {
@@ -1222,9 +1283,13 @@ fn push_vendor_autoload_file_and_static_includes(
     exclude_paths: &[PathBuf],
     paths: &mut Vec<PathBuf>,
     depth: usize,
+    cancellation: Option<&OperationCancellationToken>,
 ) {
     const MAX_STATIC_INCLUDE_DEPTH: usize = 8;
 
+    if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+        return;
+    }
     let Some(file_path) = policy.check(file_path) else {
         return;
     };
@@ -1243,6 +1308,9 @@ fn push_vendor_autoload_file_and_static_includes(
     }
 
     for include_path in static_php_include_target_paths_for_file(file_path) {
+        if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+            break;
+        }
         push_vendor_autoload_file_and_static_includes(
             &include_path,
             policy,
@@ -1250,6 +1318,7 @@ fn push_vendor_autoload_file_and_static_includes(
             exclude_paths,
             paths,
             depth + 1,
+            cancellation,
         );
     }
 }
@@ -1323,6 +1392,7 @@ fn classmap_candidate_paths_for_fqn(
     traversal_limits: TraversalLimits,
     project_root: Option<&Path>,
     exclude_paths: &[PathBuf],
+    cancellation: Option<&OperationCancellationToken>,
 ) -> VendorPathResolution {
     let class_basename = fqn.rsplit('\\').next().unwrap_or(fqn);
     let mut matching = Vec::new();
@@ -1343,7 +1413,15 @@ fn classmap_candidate_paths_for_fqn(
         },
         |_, _| true,
         is_php_file_path,
-        || (Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
+        || {
+            if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+                Some(TraversalStopReason::Cancelled)
+            } else if Instant::now() >= deadline {
+                Some(TraversalStopReason::DeadlineExceeded)
+            } else {
+                None
+            }
+        },
     );
     if outcome.truncated() || outcome.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
         tracing::warn!(
@@ -1352,6 +1430,9 @@ fn classmap_candidate_paths_for_fqn(
         );
     }
     for path in &outcome.files {
+        if cancellation.is_some_and(OperationCancellationToken::is_cancelled) {
+            break;
+        }
         push_classmap_candidate(path, class_basename, &mut matching, &mut fallback);
     }
 

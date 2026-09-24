@@ -16,17 +16,30 @@ pub fn find_missing_return_type_candidates(
     source: &str,
     range: (u32, u32, u32, u32),
 ) -> Vec<MissingReturnTypeCandidate> {
+    find_missing_return_type_candidates_with_control(tree, source, range, || false)
+}
+
+pub fn find_missing_return_type_candidates_with_control(
+    tree: &Tree,
+    source: &str,
+    range: (u32, u32, u32, u32),
+    mut stop: impl FnMut() -> bool,
+) -> Vec<MissingReturnTypeCandidate> {
     let mut candidates = Vec::new();
-    walk_for_missing_return_types(tree.root_node(), source, range, &mut candidates);
+    walk_for_missing_return_types(tree.root_node(), source, range, &mut candidates, &mut stop);
     candidates
 }
 
-fn walk_for_missing_return_types(
+fn walk_for_missing_return_types<Stop: FnMut() -> bool>(
     node: Node,
     source: &str,
     range: (u32, u32, u32, u32),
     candidates: &mut Vec<MissingReturnTypeCandidate>,
-) {
+    stop: &mut Stop,
+) -> bool {
+    if stop() {
+        return true;
+    }
     if matches!(node.kind(), "function_definition" | "method_declaration") {
         if let Some(candidate) = missing_return_type_candidate(node, source, range) {
             candidates.push(candidate);
@@ -35,8 +48,11 @@ fn walk_for_missing_return_types(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_for_missing_return_types(child, source, range, candidates);
+        if walk_for_missing_return_types(child, source, range, candidates, stop) {
+            return true;
+        }
     }
+    false
 }
 
 fn missing_return_type_candidate(

@@ -129,6 +129,7 @@ impl PhpLspBackend {
                     .as_ref()
                     .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig),
                 allow_blocking_file_io: false,
+                cancellation: None,
             };
             let variable_node_at_position = variable_name_node_at_range(
                 tree,

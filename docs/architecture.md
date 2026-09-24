@@ -874,6 +874,15 @@ expected to print JSON. PHPStan file keys are resolved against the cwd used by
 its command; only diagnostics for the requested file are published. Malformed
 PHPStan range ends are clamped to the range start.
 
+External command stdout and stderr are read with one combined 4 MiB limit.
+The command owns its process tree: Unix commands run in a dedicated process
+group; Windows commands enter a kill-on-close Job Object before their suspended
+primary thread resumes. Timeout, cancellation and request drop terminate the
+tree. File-I/O workers share two semaphore permits held until the blocking task
+actually exits, including after request timeout. Workspace, vendor and framework
+walkers and inlay-hint traversal check cooperative cancellation; formatter temp
+cleanup uses the same bounded worker capacity.
+
 ## Request Paths
 
 Low-latency requests such as hover, completion, signature help, definition, and

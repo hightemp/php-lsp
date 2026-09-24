@@ -1024,6 +1024,7 @@ impl PhpLspBackend {
             requested_range: (0, 0, u32::MAX, u32::MAX),
             allow_twig_property_accessors: true,
             allow_blocking_file_io: false,
+            cancellation: None,
         };
         let type_info = server_variable_type_info(&ctx, variable_node)?;
         type_info_fqn_from_index(

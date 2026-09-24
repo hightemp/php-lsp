@@ -849,24 +849,28 @@ pub(in crate::server) async fn collect_php_files_blocking(
 ) -> std::result::Result<FileWalkOutcome, String> {
     let path_label = root.display().to_string();
     let deadline = file_io_walk_deadline();
-    run_file_io_blocking("workspace PHP file discovery", path_label, move || {
-        collect_php_files_with_explicit_control(
-            &directories,
-            &explicit_files,
-            &root,
-            &exclude_paths,
-            limits,
-            || {
-                if cancellation.is_cancelled() {
-                    Some(TraversalStopReason::Cancelled)
-                } else if Instant::now() >= deadline {
-                    Some(TraversalStopReason::DeadlineExceeded)
-                } else {
-                    None
-                }
-            },
-        )
-    })
+    run_file_io_blocking_cancellable(
+        "workspace PHP file discovery",
+        path_label,
+        move |worker_token| {
+            collect_php_files_with_explicit_control(
+                &directories,
+                &explicit_files,
+                &root,
+                &exclude_paths,
+                limits,
+                || {
+                    if cancellation.is_cancelled() || worker_token.is_cancelled() {
+                        Some(TraversalStopReason::Cancelled)
+                    } else if Instant::now() >= deadline {
+                        Some(TraversalStopReason::DeadlineExceeded)
+                    } else {
+                        None
+                    }
+                },
+            )
+        },
+    )
     .await
 }
 
@@ -893,37 +897,41 @@ async fn collect_feature_symlink_aliases_blocking(
     ];
     let path_label = root.display().to_string();
     let deadline = file_io_walk_deadline();
-    run_file_io_blocking("feature symlink discovery", path_label, move || {
-        walk_files(
-            &roots,
-            TraversalLimits {
-                max_files: None,
-                max_entries: limits.max_entries,
-            },
-            |path| path_is_excluded(path, &root, &exclude_paths),
-            |path, is_root| {
-                if is_root {
-                    return true;
-                }
-                let name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy())
-                    .unwrap_or_default();
-                !name.starts_with('.')
-                    && !matches!(name.as_ref(), "vendor" | "node_modules" | "target")
-            },
-            |_| false,
-            || {
-                if cancellation.is_cancelled() {
-                    Some(TraversalStopReason::Cancelled)
-                } else if Instant::now() >= deadline {
-                    Some(TraversalStopReason::DeadlineExceeded)
-                } else {
-                    None
-                }
-            },
-        )
-    })
+    run_file_io_blocking_cancellable(
+        "feature symlink discovery",
+        path_label,
+        move |worker_token| {
+            walk_files(
+                &roots,
+                TraversalLimits {
+                    max_files: None,
+                    max_entries: limits.max_entries,
+                },
+                |path| path_is_excluded(path, &root, &exclude_paths),
+                |path, is_root| {
+                    if is_root {
+                        return true;
+                    }
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_default();
+                    !name.starts_with('.')
+                        && !matches!(name.as_ref(), "vendor" | "node_modules" | "target")
+                },
+                |_| false,
+                || {
+                    if cancellation.is_cancelled() || worker_token.is_cancelled() {
+                        Some(TraversalStopReason::Cancelled)
+                    } else if Instant::now() >= deadline {
+                        Some(TraversalStopReason::DeadlineExceeded)
+                    } else {
+                        None
+                    }
+                },
+            )
+        },
+    )
     .await
 }
 

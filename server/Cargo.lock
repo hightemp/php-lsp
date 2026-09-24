@@ -551,6 +551,7 @@ dependencies = [
  "dashmap",
  "file-id",
  "futures",
+ "libc",
  "lsp-types",
  "php-lsp-completion",
  "php-lsp-index",
@@ -565,6 +566,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tree-sitter",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

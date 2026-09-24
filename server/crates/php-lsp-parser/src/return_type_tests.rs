@@ -47,3 +47,29 @@ class Demo {
     let candidates = parse_candidates(source, (0, 0, 8, 0));
     assert!(candidates.is_empty());
 }
+
+#[test]
+fn cancellation_stops_missing_return_type_walk_mid_tree() {
+    let mut source = String::from("<?php\n");
+    for index in 0..100 {
+        source.push_str(&format!(
+            "/** @return int */ function f{index}() {{ return 1; }}\n"
+        ));
+    }
+    let mut parser = FileParser::new();
+    parser.parse_full(&source);
+    let tree = parser.tree().unwrap();
+    let range = (0, 0, u32::MAX, u32::MAX);
+    assert_eq!(
+        find_missing_return_type_candidates(tree, &source, range).len(),
+        100
+    );
+
+    let mut visited = 0usize;
+    let partial = find_missing_return_type_candidates_with_control(tree, &source, range, || {
+        visited += 1;
+        visited > 30
+    });
+    assert_eq!(visited, 31, "walk continued after cancellation");
+    assert!(partial.len() < 100, "cancelled walk parsed the whole file");
+}

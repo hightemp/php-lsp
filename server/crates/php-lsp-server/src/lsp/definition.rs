@@ -675,6 +675,7 @@ impl PhpLspBackend {
                     .as_ref()
                     .is_some_and(|template| template.kind() == crate::template::TemplateKind::Twig),
                 allow_blocking_file_io: false,
+                cancellation: None,
             };
             let shape_member_info = shape_member_access_info_at_position(&ctx, pos.line, byte_col);
             let inferred_member_symbol = server_member_symbol_at_position(&ctx, pos.line, byte_col);
@@ -1280,20 +1281,25 @@ impl PhpLspBackend {
         let root = workspace_root.to_path_buf();
         let domain = domain.to_string();
         let path_label = format!("{} ({})", root.display(), domain);
-        let keys = match run_file_io_blocking("framework string-key scan", path_label, move || {
-            crate::framework::framework_string_keys_for_workspace_with_limits(
-                &root,
-                &domain,
-                traversal_limits,
-                &exclude_paths,
-            )
-        })
+        let keys = match run_file_io_blocking_cancellable(
+            "framework string-key scan",
+            path_label,
+            move |token| {
+                crate::framework::framework_string_keys_for_workspace_with_limits(
+                    &root,
+                    &domain,
+                    traversal_limits,
+                    &exclude_paths,
+                    Some(&token),
+                )
+            },
+        )
         .await
         {
             Ok(keys) => keys,
             Err(message) => {
                 tracing::warn!("{}", message);
-                Vec::new()
+                return Vec::new();
             }
         };
 

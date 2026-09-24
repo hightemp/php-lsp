@@ -47,7 +47,8 @@ use php_lsp_parser::resolve::{
     CallableParameterContext, MemberTypeResolver, RefKind, SymbolAtPosition,
 };
 use php_lsp_parser::return_type::{
-    find_missing_return_type_candidates, MissingReturnTypeCandidate,
+    find_missing_return_type_candidates, find_missing_return_type_candidates_with_control,
+    MissingReturnTypeCandidate,
 };
 use php_lsp_parser::semantic::{
     collect_aliased_class_fqns, extract_semantic_diagnostics, SemanticDiagnostic,
@@ -62,9 +63,9 @@ use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
@@ -933,6 +934,30 @@ struct CompletionInferenceContext<'a> {
 
 const DEFAULT_MEMBER_TYPE_DIAGNOSTIC_NODE_BUDGET: usize = 512;
 const DEFAULT_PARTIAL_ANALYSIS_DIAGNOSTIC: bool = true;
+const MAX_CONCURRENT_FILE_IO_TASKS: usize = 2;
+static FILE_IO_BLOCKING_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_IO_TASKS)));
+
+struct CancelFileIoOnDrop {
+    token: OperationCancellationToken,
+    task: Option<tokio::task::AbortHandle>,
+    queued_permit: Option<Arc<StdMutex<Option<tokio::sync::OwnedSemaphorePermit>>>>,
+}
+
+impl Drop for CancelFileIoOnDrop {
+    fn drop(&mut self) {
+        self.token.cancel();
+        if let Some(permit) = &self.queued_permit {
+            permit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
 
 fn document_version_is_newer(current: Option<i32>, incoming: i32) -> bool {
     current.is_none_or(|current| incoming > current)
@@ -966,20 +991,107 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    run_file_io_blocking_with_budget(
+        label,
+        path_label,
+        Duration::from_millis(FILE_IO_TIMEOUT_MS),
+        move |_| op(),
+    )
+    .await
+}
+
+async fn run_file_io_blocking_cancellable<T, F>(
+    label: &'static str,
+    path_label: String,
+    op: F,
+) -> std::result::Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(OperationCancellationToken) -> T + Send + 'static,
+{
+    run_file_io_blocking_with_budget(
+        label,
+        path_label,
+        Duration::from_millis(FILE_IO_TIMEOUT_MS),
+        op,
+    )
+    .await
+}
+
+async fn run_file_io_blocking_with_budget<T, F>(
+    label: &'static str,
+    path_label: String,
+    budget: Duration,
+    op: F,
+) -> std::result::Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(OperationCancellationToken) -> T + Send + 'static,
+{
     let started = Instant::now();
-    let task = tokio::task::spawn_blocking(op);
-    let result = match tokio::time::timeout(Duration::from_millis(FILE_IO_TIMEOUT_MS), task).await {
-        Ok(Ok(result)) => result,
+    let cancellation = OperationCancellationToken::new();
+    let mut cancel_on_drop = CancelFileIoOnDrop {
+        token: cancellation.clone(),
+        task: None,
+        queued_permit: None,
+    };
+    let timeout_message = || {
+        format!(
+            "{} timed out after {} ms for {}",
+            label,
+            budget.as_millis(),
+            path_label
+        )
+    };
+    let permit = match tokio::time::timeout(
+        budget,
+        FILE_IO_BLOCKING_SEMAPHORE.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(err)) => {
+            return Err(format!(
+                "{} capacity unavailable for {}: {}",
+                label, path_label, err
+            ))
+        }
+        Err(_) => {
+            let message = timeout_message();
+            tracing::warn!("{}", message);
+            return Err(message);
+        }
+    };
+    if started.elapsed() >= budget {
+        return Err(timeout_message());
+    }
+    let queued_permit = Arc::new(StdMutex::new(Some(permit)));
+    cancel_on_drop.queued_permit = Some(queued_permit.clone());
+    let worker_token = cancellation.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let permit = queued_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?;
+        let _permit = permit;
+        if worker_token.is_cancelled() || started.elapsed() >= budget {
+            None
+        } else {
+            Some(op(worker_token))
+        }
+    });
+    cancel_on_drop.task = Some(task.abort_handle());
+    let remaining = budget.saturating_sub(started.elapsed());
+    let result = match tokio::time::timeout(remaining, task).await {
+        Ok(Ok(Some(result))) => result,
+        Ok(Ok(None)) => return Err(timeout_message()),
         Ok(Err(err)) => {
             let message = format!("{} task failed for {}: {}", label, path_label, err);
             tracing::warn!("{}", message);
             return Err(message);
         }
         Err(_) => {
-            let message = format!(
-                "{} timed out after {} ms for {}",
-                label, FILE_IO_TIMEOUT_MS, path_label
-            );
+            let message = timeout_message();
             tracing::warn!("{}", message);
             return Err(message);
         }
@@ -1003,8 +1115,8 @@ async fn read_file_to_string_blocking(
     label: &'static str,
 ) -> std::io::Result<String> {
     let path_label = path.display().to_string();
-    match run_file_io_blocking(label, path_label.clone(), move || {
-        std::fs::read_to_string(&path)
+    match run_file_io_blocking_cancellable(label, path_label.clone(), move |token| {
+        read_file_to_string_cancellable(&path, &token)
     })
     .await
     {
@@ -1017,8 +1129,43 @@ async fn read_file_to_string_blocking(
     }
 }
 
+fn read_file_to_string_cancellable(
+    path: &Path,
+    token: &OperationCancellationToken,
+) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    read_to_string_with_cancellation(&mut file, token)
+}
+
+fn read_to_string_with_cancellation(
+    reader: &mut impl std::io::Read,
+    token: &OperationCancellationToken,
+) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        if token.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "file read cancelled",
+            ));
+        }
+        let count = match reader.read(&mut chunk) {
+            Ok(count) => count,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
 #[derive(Clone, Debug)]
-struct OperationCancellationToken {
+pub(crate) struct OperationCancellationToken {
     cancelled: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
@@ -1044,19 +1191,19 @@ fn take_matching_indexing_run(
 }
 
 impl OperationCancellationToken {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
         }
     }
 
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
         self.notify.notify_waiters();
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
 
@@ -1065,8 +1212,14 @@ impl OperationCancellationToken {
     }
 
     async fn cancelled(&self) {
-        while !self.is_cancelled() {
-            self.notify.notified().await;
+        loop {
+            // Capture the notification generation before checking the atomic
+            // flag, so cancel() between the check and await cannot be lost.
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
         }
     }
 }

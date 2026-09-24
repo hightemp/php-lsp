@@ -219,6 +219,7 @@ pub(crate) struct FrameworkProviderContext<'a> {
     pub(crate) relevant_files: &'a [PathBuf],
     pub(crate) traversal_limits: TraversalLimits,
     pub(crate) exclude_paths: &'a [PathBuf],
+    pub(crate) cancellation: Option<&'a crate::server::OperationCancellationToken>,
 }
 
 impl<'a> FrameworkProviderContext<'a> {
@@ -236,6 +237,7 @@ impl<'a> FrameworkProviderContext<'a> {
                 max_entries: Some(crate::config::DEFAULT_INDEXING_MAX_ENTRIES),
             },
             exclude_paths: &[],
+            cancellation: None,
         }
     }
 
@@ -276,6 +278,14 @@ impl<'a> FrameworkProviderContext<'a> {
 
     pub(crate) fn with_exclude_paths(mut self, exclude_paths: &'a [PathBuf]) -> Self {
         self.exclude_paths = exclude_paths;
+        self
+    }
+
+    pub(crate) fn with_cancellation(
+        mut self,
+        cancellation: Option<&'a crate::server::OperationCancellationToken>,
+    ) -> Self {
+        self.cancellation = cancellation;
         self
     }
 
@@ -434,6 +444,9 @@ impl<'a> FrameworkProviderRegistry<'a> {
         let mut seen = HashMap::<String, usize>::new();
 
         for provider in &self.providers {
+            if ctx.cancellation.is_some_and(|token| token.is_cancelled()) {
+                break;
+            }
             for key in provider.string_keys(ctx, query) {
                 let identity = key.identity();
                 if let Some(index) = seen.get(&identity).copied() {
@@ -540,12 +553,14 @@ pub(crate) fn framework_string_keys_for_workspace_with_limits(
     domain: &str,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    cancellation: Option<&crate::server::OperationCancellationToken>,
 ) -> Vec<FrameworkStringKey> {
     let index = WorkspaceIndex::new();
     let ctx = FrameworkProviderContext::new(&index)
         .with_workspace(Some(root), None)
         .with_traversal_limits(traversal_limits)
         .with_exclude_paths(exclude_paths)
+        .with_cancellation(cancellation)
         .with_relevant_files(&[]);
     let registry = default_framework_provider_registry();
     let query = FrameworkStringKeyQuery {
@@ -665,6 +680,7 @@ impl VirtualMemberProvider for SymfonyStringKeyProvider {
                 &query.prefix,
                 ctx.traversal_limits,
                 ctx.exclude_paths,
+                ctx.cancellation,
             ),
             "route" => collect_symfony_route_keys(
                 self.id(),
@@ -672,6 +688,7 @@ impl VirtualMemberProvider for SymfonyStringKeyProvider {
                 &query.prefix,
                 ctx.traversal_limits,
                 ctx.exclude_paths,
+                ctx.cancellation,
             ),
             _ => Vec::new(),
         };
@@ -954,6 +971,7 @@ impl VirtualMemberProvider for LaravelStringKeyProvider {
                 &query.prefix,
                 ctx.traversal_limits,
                 ctx.exclude_paths,
+                ctx.cancellation,
             ),
             "route" => collect_laravel_route_keys(
                 self.id(),
@@ -961,6 +979,7 @@ impl VirtualMemberProvider for LaravelStringKeyProvider {
                 &query.prefix,
                 ctx.traversal_limits,
                 ctx.exclude_paths,
+                ctx.cancellation,
             ),
             "translation" => collect_laravel_translation_keys(
                 self.id(),
@@ -968,6 +987,7 @@ impl VirtualMemberProvider for LaravelStringKeyProvider {
                 &query.prefix,
                 ctx.traversal_limits,
                 ctx.exclude_paths,
+                ctx.cancellation,
             ),
             "view" => collect_laravel_view_keys(
                 self.id(),
@@ -975,6 +995,7 @@ impl VirtualMemberProvider for LaravelStringKeyProvider {
                 &query.prefix,
                 ctx.traversal_limits,
                 ctx.exclude_paths,
+                ctx.cancellation,
             ),
             _ => Vec::new(),
         };
@@ -3424,6 +3445,7 @@ fn collect_laravel_config_keys(
     prefix: &str,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    cancellation: Option<&crate::server::OperationCancellationToken>,
 ) -> Vec<FrameworkStringKey> {
     let config_dir = root.join("config");
     let mut keys = Vec::new();
@@ -3434,7 +3456,11 @@ fn collect_laravel_config_keys(
         &["php"],
         512,
         traversal_limits,
+        cancellation,
     ) {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            break;
+        }
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
@@ -3466,6 +3492,7 @@ fn collect_laravel_route_keys(
     prefix: &str,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    cancellation: Option<&crate::server::OperationCancellationToken>,
 ) -> Vec<FrameworkStringKey> {
     let routes_dir = root.join("routes");
     let mut keys = Vec::new();
@@ -3476,7 +3503,11 @@ fn collect_laravel_route_keys(
         &["php"],
         512,
         traversal_limits,
+        cancellation,
     ) {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            break;
+        }
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -3504,9 +3535,13 @@ fn collect_laravel_translation_keys(
     prefix: &str,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    cancellation: Option<&crate::server::OperationCancellationToken>,
 ) -> Vec<FrameworkStringKey> {
     let mut keys = Vec::new();
     for lang_root in [root.join("resources/lang"), root.join("lang")] {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            break;
+        }
         if !lang_root.is_dir() {
             continue;
         }
@@ -3517,7 +3552,11 @@ fn collect_laravel_translation_keys(
             &["php"],
             2048,
             traversal_limits,
+            cancellation,
         ) {
+            if cancellation.is_some_and(|token| token.is_cancelled()) {
+                break;
+            }
             let Ok(relative) = path.strip_prefix(&lang_root) else {
                 continue;
             };
@@ -3558,6 +3597,7 @@ fn collect_laravel_view_keys(
     prefix: &str,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    cancellation: Option<&crate::server::OperationCancellationToken>,
 ) -> Vec<FrameworkStringKey> {
     let view_dir = root.join("resources/views");
     let mut keys = Vec::new();
@@ -3568,7 +3608,11 @@ fn collect_laravel_view_keys(
         &["php"],
         4096,
         traversal_limits,
+        cancellation,
     ) {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            break;
+        }
         let Ok(relative) = path.strip_prefix(&view_dir) else {
             continue;
         };
@@ -3597,6 +3641,7 @@ fn collect_symfony_twig_template_keys(
     prefix: &str,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    cancellation: Option<&crate::server::OperationCancellationToken>,
 ) -> Vec<FrameworkStringKey> {
     let template_dir = root.join("templates");
     let mut keys = Vec::new();
@@ -3607,7 +3652,11 @@ fn collect_symfony_twig_template_keys(
         &["twig"],
         4096,
         traversal_limits,
+        cancellation,
     ) {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            break;
+        }
         let Ok(relative) = path.strip_prefix(&template_dir) else {
             continue;
         };
@@ -3636,6 +3685,7 @@ fn collect_symfony_route_keys(
     prefix: &str,
     traversal_limits: TraversalLimits,
     exclude_paths: &[PathBuf],
+    cancellation: Option<&crate::server::OperationCancellationToken>,
 ) -> Vec<FrameworkStringKey> {
     let src_dir = root.join("src");
     let mut keys = Vec::new();
@@ -3646,7 +3696,11 @@ fn collect_symfony_route_keys(
         &["php"],
         4096,
         traversal_limits,
+        cancellation,
     ) {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            break;
+        }
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -3690,6 +3744,7 @@ fn collect_static_files(
     extensions: &[&str],
     limit: usize,
     traversal_limits: TraversalLimits,
+    cancellation: Option<&crate::server::OperationCancellationToken>,
 ) -> Vec<PathBuf> {
     let deadline = crate::server::file_io_walk_deadline();
     let outcome = walk_files(
@@ -3706,7 +3761,15 @@ fn collect_static_files(
                         .any(|expected| extension.eq_ignore_ascii_case(expected))
                 })
         },
-        || (std::time::Instant::now() >= deadline).then_some(TraversalStopReason::DeadlineExceeded),
+        || {
+            if cancellation.is_some_and(|token| token.is_cancelled()) {
+                Some(TraversalStopReason::Cancelled)
+            } else if std::time::Instant::now() >= deadline {
+                Some(TraversalStopReason::DeadlineExceeded)
+            } else {
+                None
+            }
+        },
     );
     if outcome.stop_reason == Some(TraversalStopReason::DeadlineExceeded) {
         tracing::warn!(

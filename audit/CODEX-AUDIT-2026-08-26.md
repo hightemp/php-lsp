@@ -956,6 +956,10 @@ canonical symlink alias.
 
 ### CODEX-P2-05. Timeout не ограничивает все потребляемые ресурсы
 
+> **Статус 2026-09-23:** исправлено через RED → GREEN на Unix; Windows Job
+> Object реализован, но runtime-проверка Windows на этой машине недоступна.
+> Исходное описание дефекта ниже сохранено как обоснование.
+
 [`run_file_io_blocking`](server/crates/php-lsp-server/src/server.rs#L664)
 оборачивает `spawn_blocking` в timeout. После timeout уже выполняющаяся
 blocking task не отменяется и продолжает работать в фоне.
@@ -973,6 +977,32 @@ blocking task не отменяется и продолжает работать
 - запускать Unix process group и завершать всю группу;
 - использовать Windows Job Object для эквивалентного поведения;
 - добавить тест на subprocess, создающий потомка и неограниченный output.
+
+#### Реализовано
+
+Файловые blocking-задачи ограничены двумя общими permit; permit остаётся у
+worker до завершения. Отменённая задача в очереди не запускает тяжёлую работу
+и освобождает permit сразу. Общий бюджет включает ожидание permit и выполнение.
+Отмена распространяется на workspace/vendor/framework-обходы, инлайны и
+рекурсивный поиск return type. Неуспешный framework scan не публикуется как
+успешный пустой кеш; временный каталог formatter имеет владельца, а его очистка
+использует тот же предел одновременно выполняющихся blocking workers.
+
+Вывод команды читается потоково с суммарным лимитом 4 MiB для stdout/stderr.
+Unix process group завершается при timeout, cancellation, dropped waiter и при
+завершении shell с оставленным фоновым потомком. Windows процесс создаётся
+приостановленным, добавляется в kill-on-close Job Object и лишь затем
+запускается. Windows ветка проверена по коду и API; локальных Windows runtime
+тестов нет.
+
+RED-регрессии воспроизвели потерю permit после отмены, продолжение отложенной
+blocking-задачи, неограниченный вывод, выживших потомков после timeout и
+успешного shell, пустой кеш после timeout и потерю formatter temp-dir. Всего
+добавлено 16 постоянных тестов, включая непрерывный output, отмену в середине
+CST-обхода, vendor/framework traversal, EINTR и сохранение cleanup capacity.
+Финальный `CARGO_BUILD_JOBS=1 cargo test --all -- --test-threads=1` прошёл
+1089/1089 без ignored; Clippy `--all-targets -D warnings`, Rustfmt и diff check
+прошли. Повторный Verifier review дал GO по коду.
 
 ### CODEX-P2-06. Incremental edit не зажимается на конце строки
 

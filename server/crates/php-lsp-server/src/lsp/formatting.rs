@@ -106,19 +106,60 @@ fn temp_format_dir() -> PathBuf {
     std::env::temp_dir().join(format!("php-lsp-format-{}-{}", std::process::id(), nanos))
 }
 
+struct FormatterTempDir(Option<PathBuf>);
+
+impl FormatterTempDir {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for FormatterTempDir {
+    fn drop(&mut self) {
+        let Some(path) = self.0.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let Ok(permit) = FILE_IO_BLOCKING_SEMAPHORE.clone().acquire_owned().await else {
+                    return;
+                };
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let _ = std::fs::remove_dir_all(path);
+                })
+                .await;
+            });
+        } else {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
 async fn write_formatter_temp_file_blocking(
     temp_dir: PathBuf,
     file_path: PathBuf,
     source: String,
 ) -> std::result::Result<(), String> {
     let path_label = file_path.display().to_string();
-    match run_file_io_blocking("formatter temp write", path_label, move || {
+    match run_file_io_blocking_cancellable("formatter temp write", path_label, move |token| {
+        if token.is_cancelled() {
+            return Err("formatter temp write cancelled".to_string());
+        }
         if let Err(err) = std::fs::create_dir_all(&temp_dir) {
             return Err(format!("failed to create formatter temp dir: {}", err));
+        }
+        if token.is_cancelled() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err("formatter temp write cancelled".to_string());
         }
         if let Err(err) = std::fs::write(&file_path, &source) {
             let _ = std::fs::remove_dir_all(&temp_dir);
             return Err(format!("failed to write formatter temp file: {}", err));
+        }
+        if token.is_cancelled() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err("formatter temp write cancelled".to_string());
         }
         Ok(())
     })
@@ -134,9 +175,13 @@ async fn read_and_cleanup_formatter_temp_file_blocking(
     file_path: PathBuf,
 ) -> std::result::Result<String, String> {
     let path_label = file_path.display().to_string();
-    match run_file_io_blocking("formatter temp read", path_label, move || {
-        let formatted = std::fs::read_to_string(&file_path)
-            .map_err(|err| format!("failed to read formatter temp file: {}", err));
+    match run_file_io_blocking_cancellable("formatter temp read", path_label, move |token| {
+        let formatted = if token.is_cancelled() {
+            Err("formatter temp read cancelled".to_string())
+        } else {
+            read_file_to_string_cancellable(&file_path, &token)
+                .map_err(|err| format!("failed to read formatter temp file: {}", err))
+        };
         let _ = std::fs::remove_dir_all(&temp_dir);
         formatted
     })
@@ -158,6 +203,7 @@ async fn run_external_formatter(
     };
 
     let temp_dir = temp_format_dir();
+    let mut temp_guard = FormatterTempDir(Some(temp_dir.clone()));
     let file_path = temp_dir.join("input.php");
     write_formatter_temp_file_blocking(temp_dir.clone(), file_path.clone(), source.clone()).await?;
 
@@ -172,6 +218,9 @@ async fn run_external_formatter(
     .await
     .map_err(|err| format!("failed to run formatter command: {}", err));
     let formatted = read_and_cleanup_formatter_temp_file_blocking(temp_dir, file_path).await;
+    if formatted.is_ok() {
+        temp_guard.disarm();
+    }
 
     let output = output?;
     let formatted = formatted?;

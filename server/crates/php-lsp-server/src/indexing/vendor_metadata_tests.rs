@@ -40,6 +40,52 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn vendor_path_and_static_include_walks_stop_on_worker_cancellation() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "vendor/acme/pkg/src/Foo.php",
+        "<?php namespace Acme; class Foo {}",
+    );
+    fixture.write(
+        "vendor/acme/pkg/bootstrap.php",
+        "<?php require __DIR__ . '/second.php';",
+    );
+    fixture.write("vendor/acme/pkg/second.php", "<?php class Second {}");
+    let map = fixture.map(json!({"packages":[{
+        "name":"acme/pkg", "install-path":"../acme/pkg",
+        "autoload":{"psr-4":{"Acme\\":"src/"},"classmap":["src/"],"files":["bootstrap.php"]}
+    }]}));
+    assert!(resolve_vendor_paths_from_map_with_limits(
+        "Acme\\Foo",
+        &map,
+        TraversalLimits::default(),
+        Some(&fixture.0),
+        &[]
+    )
+    .is_some());
+    assert!(!vendor_autoload_file_paths_from_map(&map, &fixture.0, &[]).is_empty());
+
+    let token = OperationCancellationToken::new();
+    token.cancel();
+    assert!(resolve_vendor_paths_from_map_with_limits_cancellable(
+        "Acme\\Foo",
+        &map,
+        TraversalLimits::default(),
+        Some(&fixture.0),
+        &[],
+        Some(&token)
+    )
+    .is_none());
+    assert!(vendor_autoload_file_paths_from_map_with_cancellation(
+        &map,
+        &fixture.0,
+        &[],
+        Some(&token)
+    )
+    .is_empty());
+}
+
+#[test]
 fn vendor_metadata_rejects_hostile_install_paths_without_dropping_good_packages() {
     let fixture = Fixture::new();
     let mut packages = vec![
