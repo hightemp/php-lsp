@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 24;
-const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3315;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x2d43_0f87_6194_40a4;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 25;
+const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3373;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x4910_5a5f_1be5_eecd;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -174,11 +174,19 @@ fn cache_schema_fixture() -> IndexCache {
                         }]),
                         TypeInfo::LiteralNull,
                     ]),
+                    scope: Some(NamespaceScope {
+                        namespace: Some("App".to_string()),
+                        range: (0, 0, 12, 1),
+                    }),
                 }],
                 type_alias_imports: vec![PhpDocTypeAliasImport {
                     name: "ExternalPayload".to_string(),
                     source_alias: "Payload".to_string(),
                     source_type: "Vendor\\Package\\Thing".to_string(),
+                    scope: Some(NamespaceScope {
+                        namespace: Some("App".to_string()),
+                        range: (0, 0, 12, 1),
+                    }),
                 }],
             },
             references: vec![

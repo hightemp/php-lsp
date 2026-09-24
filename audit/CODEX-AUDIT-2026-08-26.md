@@ -1125,13 +1125,27 @@ check и повторный Verifier review прошли.
 
 ### CODEX-P2-10. File-level PHPDoc aliases протекают между namespace sections
 
-`FileSymbols.type_aliases` и `type_alias_imports` не содержат namespace/range.
+**Исправлено 2026-09-24.** Исходно `FileSymbols.type_aliases` и
+`type_alias_imports` не содержали namespace/range.
 [`scoped_at_byte_position`](server/crates/php-lsp-types/src/lib.rs#L490)
 фильтрует imports, но оставляет все aliases файла. Alias из первого bracketed
 namespace может разрешиться во втором namespace с тем же именем.
 
-Что исправить: хранить scope range/namespace у alias declarations/imports и
-фильтровать их вместе с `use_statements`; добавить multi-namespace alias tests.
+File-level alias declarations/imports теперь несут `NamespaceScope` с конкретным
+range, включая повторные секции одного namespace. Prepass собирает scopes до
+разбора PHPDoc, а scoped lookup фильтрует aliases вместе с `use_statements`.
+Index передаёт исходную позицию symbol через раскрытие вложенных aliases;
+class-level PHPDoc aliases остаются локальными для класса. Комментарий
+непосредственно перед `namespace` относится к следующей секции; вне всех
+секций чужие aliases не видны. Schema version кеша повышена до 25.
+
+RED-регрессии подтвердили утечку между секциями, потерю file-level aliases
+в bracketed namespace и неверные index/LSP типы. Parser, index, types и LSP
+тесты проверяют повторный namespace, unbracketed sections, одноимённые
+declarations/imports, разные source classes, позиционный и node-based вывод
+типов, hover двух sections и organize imports. Добавлено 6 unit и 3 LSP e2e
+теста; полный Rust-набор прошёл 1165/1165 без ignored. Clippy, Rustfmt,
+diff check и повторный Verifier review — GO.
 
 ### CODEX-P2-11. WorkspaceIndex публикует обновление неатомарно
 

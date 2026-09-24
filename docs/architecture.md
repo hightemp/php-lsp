@@ -219,6 +219,11 @@ constant identifier remains case-sensitive.
 unbracketed namespace section. Each `UseStatement` carries its namespace and
 per-clause class/function/constant kind, so repeated aliases and mixed group
 imports are resolved against the section containing the cursor.
+File-level PHPDoc `@phpstan-type` / `@psalm-type` and imported type aliases
+carry the same section identity. Repeated namespace names remain separate;
+alias expansion uses the source position of the referring symbol, including
+when an alias refers to another alias. Class PHPDoc aliases stay local to their
+own class.
 
 A leading-backslash name remains fully qualified. An ordinary qualified name
 resolves from the active namespace and its first segment can expand an

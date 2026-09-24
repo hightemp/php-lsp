@@ -395,6 +395,7 @@ pub(crate) struct OrganizableImport {
     fqn: String,
     alias: Option<String>,
     kind: ImportKind,
+    scope: Option<php_lsp_types::NamespaceScope>,
 }
 
 pub(crate) fn import_kind_sort_key(kind: ImportKind) -> u8 {
@@ -465,18 +466,40 @@ pub(crate) fn import_is_used(
     import: &OrganizableImport,
     file_symbols: &php_lsp_types::FileSymbols,
     references: &[php_lsp_types::SymbolReference],
+    source: &str,
 ) -> bool {
-    import_is_used_by_references(import, references)
+    import_is_used_by_references(import, references, source)
         || import_is_used_by_phpdoc_types(import, file_symbols)
 }
 
 fn import_is_used_by_references(
     import: &OrganizableImport,
     references: &[php_lsp_types::SymbolReference],
+    source: &str,
 ) -> bool {
-    references
-        .iter()
-        .any(|reference| reference_matches_import(reference, import))
+    references.iter().any(|reference| {
+        let line = reference.range.0;
+        let byte_column = php_lsp_parser::utf16::utf16_col_to_byte(source, line, reference.range.1);
+        import_scope_contains(import, line, byte_column)
+            && reference_matches_import(reference, import)
+    })
+}
+
+fn import_scope_contains(import: &OrganizableImport, line: u32, column: u32) -> bool {
+    import.scope.as_ref().is_none_or(|scope| {
+        (line, column) >= (scope.range.0, scope.range.1)
+            && (line, column) < (scope.range.2, scope.range.3)
+    })
+}
+
+fn import_scope_matches_alias(
+    import: &OrganizableImport,
+    alias_scope: Option<&php_lsp_types::NamespaceScope>,
+) -> bool {
+    import
+        .scope
+        .as_ref()
+        .is_none_or(|scope| alias_scope.is_some_and(|alias_scope| alias_scope.range == scope.range))
 }
 
 fn reference_matches_import(
@@ -528,17 +551,18 @@ fn import_is_used_by_phpdoc_types(
     file_symbols
         .symbols
         .iter()
+        .filter(|symbol| import_scope_contains(import, symbol.range.0, symbol.range.1))
         .filter_map(|symbol| symbol.doc_comment.as_deref())
         .map(parse_phpdoc)
         .any(|phpdoc| phpdoc_uses_import(&phpdoc, import))
-        || file_symbols
-            .type_aliases
-            .iter()
-            .any(|alias| type_info_uses_import(&alias.type_info, import))
-        || file_symbols
-            .type_alias_imports
-            .iter()
-            .any(|alias_import| phpdoc_name_uses_import(&alias_import.source_type, import))
+        || file_symbols.type_aliases.iter().any(|alias| {
+            import_scope_matches_alias(import, alias.scope.as_ref())
+                && type_info_uses_import(&alias.type_info, import)
+        })
+        || file_symbols.type_alias_imports.iter().any(|alias_import| {
+            import_scope_matches_alias(import, alias_import.scope.as_ref())
+                && phpdoc_name_uses_import(&alias_import.source_type, import)
+        })
 }
 
 fn phpdoc_uses_import(phpdoc: &php_lsp_types::PhpDoc, import: &OrganizableImport) -> bool {
@@ -697,8 +721,11 @@ pub(crate) fn build_organize_imports_edit(
             fqn: use_stmt.fqn.trim_start_matches('\\').to_string(),
             alias: use_stmt.alias.clone(),
             kind: import_kind_from_use_kind(use_stmt.kind),
+            scope: file_symbols
+                .namespace_scope_at_byte_position(use_stmt.range.0, use_stmt.range.1)
+                .cloned(),
         })
-        .filter(|import| import_is_used(import, file_symbols, &references))
+        .filter(|import| import_is_used(import, file_symbols, &references, source))
         .collect();
 
     imports.sort_by(|a, b| {

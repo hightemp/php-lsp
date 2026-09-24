@@ -334,6 +334,7 @@ fn parse_type_alias_tag(rest: &str, doc: &mut PhpDoc) {
     doc.type_aliases.push(PhpDocTypeAlias {
         name: name.to_string(),
         type_info: parse_type_string(type_str),
+        scope: None,
     });
 }
 
@@ -373,6 +374,7 @@ fn parse_type_alias_import_tag(rest: &str, doc: &mut PhpDoc) {
         name: local_name.to_string(),
         source_alias: source_alias.to_string(),
         source_type: source_type.to_string(),
+        scope: None,
     });
 }
 

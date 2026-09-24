@@ -283,6 +283,9 @@ pub struct TemplateBinding {
 pub struct PhpDocTypeAlias {
     pub name: String,
     pub type_info: TypeInfo,
+    /// Owning file-level namespace section; absent for class-local PHPDoc.
+    #[serde(default)]
+    pub scope: Option<NamespaceScope>,
 }
 
 /// A PHPStan/Psalm imported type alias declared by `@phpstan-import-type` or
@@ -295,6 +298,9 @@ pub struct PhpDocTypeAliasImport {
     pub source_alias: String,
     /// Source class/interface/trait/enum name as written in PHPDoc.
     pub source_type: String,
+    /// Owning file-level namespace section; absent for class-local PHPDoc.
+    #[serde(default)]
+    pub scope: Option<NamespaceScope>,
 }
 
 /// Parsed PHPDoc information.
@@ -457,7 +463,7 @@ pub struct UseStatement {
 ///
 /// The range uses tree-sitter byte columns. `namespace` is `None` for the
 /// global namespace, including an explicit `namespace { ... }` section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NamespaceScope {
     pub namespace: Option<String>,
     pub range: (u32, u32, u32, u32),
@@ -492,13 +498,31 @@ impl FileSymbols {
     /// section containing the provided tree-sitter byte position.
     pub fn scoped_at_byte_position(&self, line: u32, column: u32) -> std::borrow::Cow<'_, Self> {
         let Some(scope) = self.namespace_scope_at_byte_position(line, column) else {
-            return std::borrow::Cow::Borrowed(self);
+            if self.namespace_scopes.is_empty() {
+                return std::borrow::Cow::Borrowed(self);
+            }
+            let mut scoped = self.clone();
+            scoped.type_aliases.clear();
+            scoped.type_alias_imports.clear();
+            return std::borrow::Cow::Owned(scoped);
         };
 
         if self.namespace_scopes.len() == 1
             && self.namespace == scope.namespace
             && self.use_statements.iter().all(|statement| {
                 byte_position_in_range(statement.range.0, statement.range.1, scope.range)
+            })
+            && self.type_aliases.iter().all(|alias| {
+                alias
+                    .scope
+                    .as_ref()
+                    .is_none_or(|owner| owner.range == scope.range)
+            })
+            && self.type_alias_imports.iter().all(|alias| {
+                alias
+                    .scope
+                    .as_ref()
+                    .is_none_or(|owner| owner.range == scope.range)
             })
         {
             return std::borrow::Cow::Borrowed(self);
@@ -508,6 +532,20 @@ impl FileSymbols {
         scoped.namespace = scope.namespace.clone();
         scoped.use_statements.retain(|statement| {
             byte_position_in_range(statement.range.0, statement.range.1, scope.range)
+        });
+        scoped.type_aliases.retain(|alias| {
+            alias
+                .scope
+                .as_ref()
+                .is_some_and(|owner| owner.range == scope.range)
+                || (alias.scope.is_none() && self.namespace_scopes.len() == 1)
+        });
+        scoped.type_alias_imports.retain(|alias| {
+            alias
+                .scope
+                .as_ref()
+                .is_some_and(|owner| owner.range == scope.range)
+                || (alias.scope.is_none() && self.namespace_scopes.len() == 1)
         });
         scoped.namespace_scopes = vec![scope.clone()];
         std::borrow::Cow::Owned(scoped)

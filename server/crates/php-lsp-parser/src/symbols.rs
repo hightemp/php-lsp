@@ -36,8 +36,6 @@ fn extract_file_symbols_with_php_version(
 ) -> FileSymbols {
     let mut result = FileSymbols::default();
     let root = tree.root_node();
-    extract_file_level_phpdoc_aliases(root, source, &mut result);
-
     let mut root_cursor = root.walk();
     let children: Vec<Node<'_>> = root.children(&mut root_cursor).collect();
     let has_namespace_declarations = children.iter().any(|child| {
@@ -50,13 +48,46 @@ fn extract_file_symbols_with_php_version(
             namespace: None,
             range: node_range(root),
         });
+    } else {
+        for (index, child) in children.iter().copied().enumerate() {
+            if child.kind() != "namespace_definition"
+                || crate::resolve::namespace_relative_function_call(child, source).is_some()
+            {
+                continue;
+            }
+            let namespace = find_namespace_name(child, source);
+            let range = if child.child_by_field_name("body").is_some() {
+                node_range(child)
+            } else {
+                let end = children[index + 1..]
+                    .iter()
+                    .find(|candidate| {
+                        candidate.kind() == "namespace_definition"
+                            && crate::resolve::namespace_relative_function_call(**candidate, source)
+                                .is_none()
+                    })
+                    .map(|candidate| candidate.start_position())
+                    .unwrap_or_else(|| root.end_position());
+                let start = child.start_position();
+                (
+                    start.row as u32,
+                    start.column as u32,
+                    end.row as u32,
+                    end.column as u32,
+                )
+            };
+            result
+                .namespace_scopes
+                .push(NamespaceScope { namespace, range });
+        }
     }
+    extract_file_level_phpdoc_aliases(root, source, &mut result);
 
     // Handle both bracketed namespace bodies and unbracketed namespace
     // sections. An unbracketed section extends to the next namespace
     // declaration (or EOF), not merely to the declaration's semicolon.
     let mut current_ns: Option<String> = None;
-    for (index, child) in children.iter().copied().enumerate() {
+    for child in children.iter().copied() {
         match child.kind() {
             "namespace_definition"
                 if crate::resolve::namespace_relative_function_call(child, source).is_none() =>
@@ -65,35 +96,9 @@ fn extract_file_symbols_with_php_version(
                 result.namespace = ns_name.clone();
 
                 if let Some(body) = child.child_by_field_name("body") {
-                    result.namespace_scopes.push(NamespaceScope {
-                        namespace: ns_name.clone(),
-                        range: node_range(child),
-                    });
                     extract_children(body, source, uri, &mut result, &ns_name, php_version);
                     current_ns = None;
                 } else {
-                    let end = children[index + 1..]
-                        .iter()
-                        .find(|candidate| {
-                            candidate.kind() == "namespace_definition"
-                                && crate::resolve::namespace_relative_function_call(
-                                    **candidate,
-                                    source,
-                                )
-                                .is_none()
-                        })
-                        .map(|candidate| candidate.start_position())
-                        .unwrap_or_else(|| root.end_position());
-                    let start = child.start_position();
-                    result.namespace_scopes.push(NamespaceScope {
-                        namespace: ns_name.clone(),
-                        range: (
-                            start.row as u32,
-                            start.column as u32,
-                            end.row as u32,
-                            end.column as u32,
-                        ),
-                    });
                     current_ns = ns_name;
                 }
             }
@@ -112,7 +117,9 @@ fn extract_file_level_phpdoc_aliases(root: Node, source: &str, result: &mut File
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() == "namespace_definition" {
-            collect_file_level_phpdoc_aliases(child, source, result);
+            if let Some(body) = child.child_by_field_name("body") {
+                collect_file_level_phpdoc_aliases(body, source, result);
+            }
         }
     }
 }
@@ -129,10 +136,49 @@ fn collect_file_level_phpdoc_aliases(node: Node, source: &str, result: &mut File
             continue;
         }
 
+        let Some(scope) = file_alias_scope_for_comment(child, result) else {
+            continue;
+        };
         let phpdoc = crate::phpdoc::parse_phpdoc(text);
-        result.type_aliases.extend(phpdoc.type_aliases);
-        result.type_alias_imports.extend(phpdoc.type_alias_imports);
+        result
+            .type_aliases
+            .extend(phpdoc.type_aliases.into_iter().map(|mut alias| {
+                alias.scope = Some(scope.clone());
+                alias
+            }));
+        result
+            .type_alias_imports
+            .extend(phpdoc.type_alias_imports.into_iter().map(|mut alias| {
+                alias.scope = Some(scope.clone());
+                alias
+            }));
     }
+}
+
+fn file_alias_scope_for_comment(comment: Node, result: &FileSymbols) -> Option<NamespaceScope> {
+    if let Some(next) = comment.next_sibling() {
+        if next.kind() == "namespace_definition" {
+            let start = next.start_position();
+            if let Some(scope) = result.namespace_scopes.iter().find(|scope| {
+                (scope.range.0, scope.range.1) == (start.row as u32, start.column as u32)
+            }) {
+                return Some(scope.clone());
+            }
+        }
+    }
+    let start = comment.start_position();
+    result
+        .namespace_scope_at_byte_position(start.row as u32, start.column as u32)
+        .cloned()
+        .or_else(|| {
+            result
+                .namespace_scopes
+                .iter()
+                .find(|scope| {
+                    (scope.range.0, scope.range.1) > (start.row as u32, start.column as u32)
+                })
+                .cloned()
+        })
 }
 
 fn phpdoc_comment_belongs_to_declaration(comment: Node) -> bool {

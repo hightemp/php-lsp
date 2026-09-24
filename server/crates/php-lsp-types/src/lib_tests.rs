@@ -145,3 +145,48 @@ fn final_namespace_scope_includes_cursor_at_file_end_only() {
     assert_eq!(scoped.use_statements.len(), 1);
     assert_eq!(scoped.use_statements[0].fqn, r"Vendor\Two");
 }
+
+#[test]
+fn scoped_alias_lookup_does_not_expose_other_sections_outside_a_namespace() {
+    let first = NamespaceScope {
+        namespace: Some("App".to_string()),
+        range: (1, 0, 3, 1),
+    };
+    let second = NamespaceScope {
+        namespace: Some("App".to_string()),
+        range: (5, 0, 7, 1),
+    };
+    let file_symbols = FileSymbols {
+        namespace_scopes: vec![first.clone(), second.clone()],
+        type_aliases: vec![
+            PhpDocTypeAlias {
+                name: "Shared".to_string(),
+                type_info: TypeInfo::Simple("First".to_string()),
+                scope: Some(first),
+            },
+            PhpDocTypeAlias {
+                name: "Shared".to_string(),
+                type_info: TypeInfo::Simple("Second".to_string()),
+                scope: Some(second),
+            },
+        ],
+        ..Default::default()
+    };
+    let first_scope = file_symbols.scoped_at_byte_position(2, 0);
+    assert_eq!(first_scope.type_aliases.len(), 1);
+    assert_eq!(
+        first_scope.type_aliases[0].type_info,
+        TypeInfo::Simple("First".into())
+    );
+    let second_scope = file_symbols.scoped_at_byte_position(6, 0);
+    assert_eq!(second_scope.type_aliases.len(), 1);
+    assert_eq!(
+        second_scope.type_aliases[0].type_info,
+        TypeInfo::Simple("Second".into())
+    );
+    let between = file_symbols.scoped_at_byte_position(4, 0);
+    assert!(
+        between.type_aliases.is_empty(),
+        "aliases leaked outside sections: {between:?}"
+    );
+}

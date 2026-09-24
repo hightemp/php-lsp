@@ -1711,6 +1711,7 @@ fn test_file_level_type_alias_expands_function_return() {
                     optional: false,
                     value: TypeInfo::Simple("int".to_string()),
                 }]),
+                scope: None,
             }],
             ..Default::default()
         },
@@ -1726,6 +1727,83 @@ fn test_file_level_type_alias_expands_function_return() {
             .and_then(|signature| signature.return_type.as_ref()),
         Some(TypeInfo::ArrayShape(_))
     ));
+}
+
+#[test]
+fn file_alias_resolution_uses_the_callers_namespace_section() {
+    let source = r#"<?php
+namespace App {
+    /** @phpstan-type Shared array{first: int} */
+    use Vendor\One;
+    /** @return Shared */ function first() {}
+}
+
+namespace App {
+    /** @phpstan-type Shared array{second: string} */
+    use Vendor\Two;
+    /** @return Shared */ function second() {}
+}
+"#;
+    let uri = "file:///aliases.php";
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let symbols =
+        php_lsp_parser::symbols::extract_file_symbols(parser.tree().unwrap(), source, uri);
+    let index = WorkspaceIndex::new();
+    index.update_file(uri, symbols);
+
+    for (fqn, key) in [("App\\first", "first"), ("App\\second", "second")] {
+        let function = index.resolve_fqn(fqn).expect("function should resolve");
+        let shape = function
+            .signature
+            .as_ref()
+            .and_then(|signature| signature.return_type.as_ref());
+        let Some(TypeInfo::ArrayShape(items)) = shape else {
+            panic!("{fqn} should use its own Shared alias: {shape:?}");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key.as_deref(), Some(key), "{fqn}: {items:?}");
+    }
+}
+
+#[test]
+fn file_alias_import_resolution_uses_its_own_section_and_source_class() {
+    let source = r#"<?php
+namespace Vendor {
+    /** @phpstan-type External array{first: int} */ class First {}
+    /** @phpstan-type External array{second: string} */ class Second {}
+}
+namespace App {
+    /** @phpstan-import-type External from \Vendor\First as Local */
+    use Vendor\First;
+    /** @return Local */ function first() {}
+}
+namespace App {
+    /** @phpstan-import-type External from \Vendor\Second as Local */
+    use Vendor\Second;
+    /** @return Local */ function second() {}
+}
+"#;
+    let uri = "file:///alias-imports.php";
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let symbols =
+        php_lsp_parser::symbols::extract_file_symbols(parser.tree().unwrap(), source, uri);
+    let index = WorkspaceIndex::new();
+    index.update_file(uri, symbols);
+
+    for (fqn, key) in [("App\\first", "first"), ("App\\second", "second")] {
+        let function = index.resolve_fqn(fqn).expect("function should resolve");
+        let shape = function
+            .signature
+            .as_ref()
+            .and_then(|signature| signature.return_type.as_ref());
+        let Some(TypeInfo::ArrayShape(items)) = shape else {
+            panic!("{fqn} should import its own Local alias: {shape:?}");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key.as_deref(), Some(key), "{fqn}: {items:?}");
+    }
 }
 
 #[test]

@@ -435,6 +435,102 @@ function getShape() {}
 }
 
 #[test]
+fn file_level_aliases_and_imports_stay_in_their_bracketed_namespace_sections() {
+    let symbols = parse_and_extract(
+        r#"<?php
+namespace App {
+    /**
+     * @phpstan-type Shared array{first: int}
+     * @phpstan-import-type External from Vendor\First as Imported
+     */
+    use Vendor\First;
+    function first(): void {}
+}
+namespace App {
+    /**
+     * @phpstan-type Shared array{second: string}
+     * @phpstan-import-type External from Vendor\Second as Imported
+     */
+    use Vendor\Second;
+    function second(): void {}
+}
+"#,
+    );
+    assert_eq!(symbols.type_aliases.len(), 2);
+    assert_eq!(symbols.type_alias_imports.len(), 2);
+    let first = symbols
+        .symbols
+        .iter()
+        .find(|item| item.fqn == "App\\first")
+        .unwrap();
+    let second = symbols
+        .symbols
+        .iter()
+        .find(|item| item.fqn == "App\\second")
+        .unwrap();
+    let first_scope = symbols.scoped_at_byte_position(first.range.0, first.range.1);
+    let second_scope = symbols.scoped_at_byte_position(second.range.0, second.range.1);
+    assert_eq!(first_scope.type_aliases.len(), 1, "{first_scope:?}");
+    assert_eq!(second_scope.type_aliases.len(), 1, "{second_scope:?}");
+    assert_ne!(
+        first_scope.type_aliases[0].type_info,
+        second_scope.type_aliases[0].type_info
+    );
+    assert_eq!(first_scope.type_alias_imports.len(), 1, "{first_scope:?}");
+    assert_eq!(second_scope.type_alias_imports.len(), 1, "{second_scope:?}");
+    assert_eq!(
+        first_scope.type_alias_imports[0].source_type,
+        "Vendor\\First"
+    );
+    assert_eq!(
+        second_scope.type_alias_imports[0].source_type,
+        "Vendor\\Second"
+    );
+}
+
+#[test]
+fn file_level_alias_before_namespace_header_belongs_to_the_following_section() {
+    let symbols = parse_and_extract(
+        r#"<?php
+/** @phpstan-type Header array{first: int} */
+namespace First;
+function one(): void {}
+/** @phpstan-type Local array{second: string} */
+namespace Second;
+function two(): void {}
+"#,
+    );
+    let one = symbols
+        .symbols
+        .iter()
+        .find(|item| item.fqn == "First\\one")
+        .unwrap();
+    let two = symbols
+        .symbols
+        .iter()
+        .find(|item| item.fqn == "Second\\two")
+        .unwrap();
+    let first = symbols.scoped_at_byte_position(one.range.0, one.range.1);
+    let second = symbols.scoped_at_byte_position(two.range.0, two.range.1);
+    assert_eq!(
+        first
+            .type_aliases
+            .iter()
+            .map(|alias| alias.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Header"]
+    );
+    assert_eq!(
+        second
+            .type_aliases
+            .iter()
+            .map(|alias| alias.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Local"]
+    );
+}
+
+#[test]
 fn test_class_type_alias_docblock_is_not_file_level_alias() {
     let syms = parse_and_extract(
         "<?php\n/**\n * @phpstan-type UserShape array{id: int}\n */\nclass Foo {}\n",

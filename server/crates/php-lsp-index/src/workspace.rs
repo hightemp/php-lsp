@@ -136,7 +136,7 @@ fn top_level_generation_keys(file_symbols: &FileSymbols) -> HashSet<(TopLevelSym
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TypeAliasScope {
     Class(String),
-    File(String),
+    File(String, (u32, u32)),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1307,7 +1307,9 @@ impl WorkspaceIndex {
             TypeAliasScope::Class(class_fqn) => {
                 self.class_type_alias_for_name(class_fqn, name, visited)
             }
-            TypeAliasScope::File(uri) => self.file_type_alias_for_name(uri, name, visited),
+            TypeAliasScope::File(uri, position) => {
+                self.file_type_alias_for_name(uri, *position, name, visited)
+            }
         };
 
         visited.pop();
@@ -1373,19 +1375,27 @@ impl WorkspaceIndex {
             );
         }
 
-        self.file_type_alias_for_name(&class_symbol.uri, name, visited)
+        self.file_type_alias_for_name(
+            &class_symbol.uri,
+            (class_symbol.range.0, class_symbol.range.1),
+            name,
+            visited,
+        )
     }
 
     fn file_type_alias_for_name(
         &self,
         uri: &str,
+        position: (u32, u32),
         name: &str,
         visited: &mut Vec<TypeAliasVisit>,
     ) -> Option<TypeInfo> {
-        let file_symbols = self
-            .file_symbols
-            .get(uri)
-            .map(|entry| entry.value().clone())?;
+        let file_symbols = self.file_symbols.get(uri).map(|entry| {
+            entry
+                .value()
+                .scoped_at_byte_position(position.0, position.1)
+                .into_owned()
+        })?;
 
         if let Some(alias) = file_symbols
             .type_aliases
@@ -1402,7 +1412,7 @@ impl WorkspaceIndex {
             );
             return Some(self.expand_type_aliases(
                 &type_info,
-                &TypeAliasScope::File(uri.to_string()),
+                &TypeAliasScope::File(uri.to_string(), position),
                 visited,
             ));
         }
@@ -1470,7 +1480,7 @@ fn alias_scope_for_symbol(symbol: &SymbolInfo) -> TypeAliasScope {
     ) {
         TypeAliasScope::Class(symbol.fqn.clone())
     } else {
-        TypeAliasScope::File(symbol.uri.clone())
+        TypeAliasScope::File(symbol.uri.clone(), (symbol.range.0, symbol.range.1))
     }
 }
 

@@ -608,6 +608,9 @@ pub fn infer_variable_hover_info_at_node_with_resolvers(
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableHoverInfo> {
     let normalized = normalize_var_name(var_name);
+    let start = context_node.start_position();
+    let scoped_file_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
     let scope =
         find_enclosing_function(context_node).unwrap_or_else(|| find_root_node(context_node));
     let inference = infer_variable_in_scope(
@@ -615,7 +618,7 @@ pub fn infer_variable_hover_info_at_node_with_resolvers(
         &normalized,
         usage_start,
         source,
-        file_symbols,
+        scoped_file_symbols.as_ref(),
         resolver,
         callable_resolver,
     );

@@ -2929,3 +2929,62 @@ class Foo {
     );
     assert_eq!(result3.ref_kind, RefKind::MethodCall);
 }
+
+#[test]
+fn node_based_variable_inference_uses_the_current_namespace_alias_section() {
+    let source = r#"<?php
+namespace App {
+    /** @phpstan-type Shared array{first: int} */
+    use Vendor\One;
+    function first(): void {
+        /** @var Shared $row */
+        $row = [];
+        echo $row;
+    }
+}
+namespace App {
+    /** @phpstan-type Shared array{second: string} */
+    use Vendor\Two;
+    function second(): void {
+        /** @var Shared $row */
+        $row = [];
+        echo $row;
+    }
+}
+"#;
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let symbols = extract_file_symbols(tree, source, "file:///node-aliases.php");
+    for (occurrence, expected, rejected) in [
+        (0, "first: int", "second: string"),
+        (1, "second: string", "first: int"),
+    ] {
+        let offset = source.match_indices("echo $row").nth(occurrence).unwrap().0 + "echo $".len();
+        let prefix = &source[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+        let column = prefix
+            .rfind('\n')
+            .map_or(prefix.len(), |start| prefix.len() - start - 1);
+        let node = find_node_at_point(tree.root_node(), Point::new(line, column)).unwrap();
+        let info = infer_variable_hover_info_at_node_with_resolvers(
+            node,
+            source,
+            &symbols,
+            node.start_byte(),
+            "$row",
+            None,
+            None,
+        )
+        .expect("node-based hover should infer PHPDoc type");
+        let display = info.type_display.unwrap_or_default();
+        assert!(
+            display.contains(expected),
+            "section {occurrence}: {display}"
+        );
+        assert!(
+            !display.contains(rejected),
+            "section {occurrence}: {display}"
+        );
+    }
+}
