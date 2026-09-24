@@ -856,6 +856,7 @@ enum VariableDeclarationKind {
     Variable,
     ClosureUse,
     PromotedProperty,
+    ReferenceCapture,
 }
 
 #[derive(Debug, Clone)]
@@ -865,6 +866,41 @@ struct VariableOccurrence {
     start_byte: usize,
     declaration_kind: Option<VariableDeclarationKind>,
     null_coalesce_probe: bool,
+    capture_eligible: bool,
+    implicit_capture: bool,
+    explicit_by_ref_capture: bool,
+}
+
+struct ScopeBindings {
+    start_byte: usize,
+    is_arrow: bool,
+    available_at: HashMap<String, usize>,
+}
+
+impl ScopeBindings {
+    fn new(scope: tree_sitter::Node, occurrences: &[VariableOccurrence]) -> Self {
+        let mut available_at: HashMap<String, usize> = HashMap::new();
+        for occurrence in occurrences
+            .iter()
+            .filter(|item| item.declaration_kind.is_some())
+        {
+            let mut ready_at = occurrence.start_byte.saturating_add(1);
+            if occurrence.declaration_kind == Some(VariableDeclarationKind::Variable) {
+                if let Some(end) = assignment_binding_end(scope, occurrence.start_byte) {
+                    ready_at = ready_at.max(end);
+                }
+            }
+            available_at
+                .entry(occurrence.name.clone())
+                .and_modify(|earliest| *earliest = (*earliest).min(ready_at))
+                .or_insert(ready_at);
+        }
+        Self {
+            start_byte: scope.start_byte(),
+            is_arrow: scope.kind() == "arrow_function",
+            available_at,
+        }
+    }
 }
 
 type ByteRange = (u32, u32, u32, u32);
@@ -890,7 +926,14 @@ fn check_variable_diagnostics<F>(
 ) where
     F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
-    check_variables_in_scope(root, source, file_symbols, resolver, diagnostics);
+    check_variables_in_scope(
+        root,
+        source,
+        file_symbols,
+        resolver,
+        diagnostics,
+        &mut Vec::new(),
+    );
 }
 
 fn check_variables_in_scope<F>(
@@ -899,6 +942,7 @@ fn check_variables_in_scope<F>(
     file_symbols: &FileSymbols,
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
+    ancestors: &mut Vec<ScopeBindings>,
 ) where
     F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
@@ -917,14 +961,23 @@ fn check_variables_in_scope<F>(
         source,
         file_symbols,
         resolver,
-        should_report_unused_declarations(scope),
+        ancestors,
         diagnostics,
     );
 
+    ancestors.push(ScopeBindings::new(scope, &occurrences));
     let mut cursor = scope.walk();
     for child in scope.named_children(&mut cursor) {
-        walk_nested_scopes(child, source, file_symbols, resolver, diagnostics);
+        walk_nested_scopes(
+            child,
+            source,
+            file_symbols,
+            resolver,
+            diagnostics,
+            ancestors,
+        );
     }
+    ancestors.pop();
 }
 
 fn walk_nested_scopes<F>(
@@ -933,17 +986,25 @@ fn walk_nested_scopes<F>(
     file_symbols: &FileSymbols,
     resolver: &F,
     diagnostics: &mut Vec<SemanticDiagnostic>,
+    ancestors: &mut Vec<ScopeBindings>,
 ) where
     F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
 {
     if is_variable_scope(node) {
-        check_variables_in_scope(node, source, file_symbols, resolver, diagnostics);
+        check_variables_in_scope(node, source, file_symbols, resolver, diagnostics, ancestors);
         return;
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_nested_scopes(child, source, file_symbols, resolver, diagnostics);
+        walk_nested_scopes(
+            child,
+            source,
+            file_symbols,
+            resolver,
+            diagnostics,
+            ancestors,
+        );
     }
 }
 
@@ -956,7 +1017,7 @@ fn collect_variable_occurrences(
     occurrences: &mut Vec<VariableOccurrence>,
 ) {
     if node.id() != scope_id && is_variable_scope(node) {
-        collect_closure_use_reads(node, source, occurrences);
+        collect_nested_scope_capture_reads(node, source, file_symbols, resolver, occurrences);
         return;
     }
 
@@ -973,6 +1034,9 @@ fn collect_variable_occurrences(
                 start_byte: node.start_byte(),
                 declaration_kind: variable_declaration_kind(node, source, &name),
                 null_coalesce_probe: is_null_coalesce_probe(node),
+                capture_eligible: true,
+                implicit_capture: false,
+                explicit_by_ref_capture: false,
             });
         }
     }
@@ -983,11 +1047,17 @@ fn collect_variable_occurrences(
     }
 }
 
-fn collect_closure_use_reads(
+fn collect_nested_scope_capture_reads(
     scope: tree_sitter::Node,
     source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &impl Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
     occurrences: &mut Vec<VariableOccurrence>,
 ) {
+    if scope.kind() == "arrow_function" {
+        collect_arrow_capture_reads(scope, source, file_symbols, resolver, occurrences);
+        return;
+    }
     if !matches!(
         scope.kind(),
         "anonymous_function" | "anonymous_function_creation_expression"
@@ -1003,6 +1073,136 @@ fn collect_closure_use_reads(
     }
 }
 
+fn collect_arrow_capture_reads(
+    scope: tree_sitter::Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: &impl Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
+    occurrences: &mut Vec<VariableOccurrence>,
+) {
+    let mut parameter_names = HashSet::new();
+    if let Some(parameters) = scope.child_by_field_name("parameters") {
+        collect_parameter_variable_names(parameters, source, &mut parameter_names);
+    }
+    let mut local_occurrences = Vec::new();
+    collect_variable_occurrences(
+        scope,
+        scope.id(),
+        source,
+        file_symbols,
+        resolver,
+        &mut local_occurrences,
+    );
+    local_occurrences.sort_by_key(|occurrence| occurrence.start_byte);
+    let mut bound_locals = HashSet::new();
+    let mut pending_bindings: Vec<(String, usize)> = Vec::new();
+    for occurrence in local_occurrences {
+        pending_bindings.retain(|(name, end)| {
+            if *end <= occurrence.start_byte {
+                bound_locals.insert(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if parameter_names.contains(&occurrence.name)
+            || bound_locals.contains(&occurrence.name)
+            || !occurrence.capture_eligible
+        {
+            continue;
+        }
+        let is_read = occurrence.declaration_kind.is_none();
+        if occurrence.declaration_kind == Some(VariableDeclarationKind::Variable) {
+            if let Some(end) = assignment_binding_end(scope, occurrence.start_byte) {
+                pending_bindings.push((occurrence.name.clone(), end));
+            } else {
+                bound_locals.insert(occurrence.name.clone());
+            }
+        } else if occurrence.explicit_by_ref_capture && !occurrence.implicit_capture {
+            // A direct `use (&$name)` creates a binding in this arrow even
+            // when there is no outer variable to capture.
+            bound_locals.insert(occurrence.name.clone());
+        }
+        occurrences.push(VariableOccurrence {
+            declaration_kind: None,
+            null_coalesce_probe: occurrence.null_coalesce_probe || !is_read,
+            capture_eligible: true,
+            implicit_capture: true,
+            ..occurrence
+        });
+    }
+}
+
+fn assignment_binding_end(scope: tree_sitter::Node, start_byte: usize) -> Option<usize> {
+    let mut current = scope.descendant_for_byte_range(start_byte, start_byte)?;
+    while let Some(parent) = current.parent() {
+        if parent.id() == scope.id() {
+            return None;
+        }
+        if matches!(
+            parent.kind(),
+            "assignment_expression" | "by_ref_assignment_expression"
+        ) && parent
+            .child_by_field_name("left")
+            .is_some_and(|left| left.start_byte() <= start_byte && start_byte < left.end_byte())
+        {
+            return Some(parent.end_byte());
+        }
+        current = parent;
+    }
+    None
+}
+
+fn declaration_available_before(
+    scope: tree_sitter::Node,
+    declaration: &VariableOccurrence,
+    use_byte: usize,
+    allow_incomplete_assignment: bool,
+) -> bool {
+    declaration.start_byte < use_byte
+        && (allow_incomplete_assignment
+            || declaration.declaration_kind != Some(VariableDeclarationKind::Variable)
+            || assignment_binding_end(scope, declaration.start_byte)
+                .is_none_or(|end| end <= use_byte))
+}
+
+fn arrow_has_enclosing_binding(
+    arrow: tree_sitter::Node,
+    name: &str,
+    ancestors: &[ScopeBindings],
+) -> bool {
+    let mut created_at = arrow.start_byte();
+    for ancestor in ancestors.iter().rev() {
+        if ancestor
+            .available_at
+            .get(name)
+            .is_some_and(|ready_at| *ready_at <= created_at)
+        {
+            return true;
+        }
+        if !ancestor.is_arrow {
+            break;
+        }
+        created_at = ancestor.start_byte;
+    }
+    false
+}
+
+fn collect_parameter_variable_names(
+    node: tree_sitter::Node,
+    source: &str,
+    names: &mut HashSet<String>,
+) {
+    if node.kind() == "variable_name" {
+        names.insert(normalize_var_name(&source[node.byte_range()]));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_parameter_variable_names(child, source, names);
+    }
+}
+
 fn collect_variable_reads_in_node(
     node: tree_sitter::Node,
     source: &str,
@@ -1011,13 +1211,28 @@ fn collect_variable_reads_in_node(
     if node.kind() == "variable_name" {
         let name = normalize_var_name(&source[node.byte_range()]);
         if !is_ignorable_variable(&name) {
-            occurrences.push(VariableOccurrence {
+            let by_ref = node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "by_ref");
+            let read = VariableOccurrence {
                 name,
                 range: node_range(&node),
                 start_byte: node.start_byte(),
                 declaration_kind: None,
                 null_coalesce_probe: false,
-            });
+                capture_eligible: true,
+                implicit_capture: false,
+                explicit_by_ref_capture: by_ref,
+            };
+            occurrences.push(read.clone());
+            if by_ref {
+                occurrences.push(VariableOccurrence {
+                    declaration_kind: Some(VariableDeclarationKind::ReferenceCapture),
+                    capture_eligible: false,
+                    explicit_by_ref_capture: false,
+                    ..read
+                });
+            }
         }
     }
 
@@ -1097,7 +1312,14 @@ fn collect_compact_variable_reads(
             .child_by_field_name("value")
             .or_else(|| argument.named_child(0))
             .unwrap_or(argument);
-        collect_compact_variable_reads_from_argument(value, source, occurrences);
+        // All arguments have evaluated when compact reads names, but the
+        // enclosing assignment has not received compact's return value yet.
+        collect_compact_variable_reads_from_argument(
+            value,
+            source,
+            call.end_byte().saturating_sub(1),
+            occurrences,
+        );
     }
 }
 
@@ -1116,6 +1338,7 @@ fn call_arguments_node(call: tree_sitter::Node) -> Option<tree_sitter::Node> {
 fn collect_compact_variable_reads_from_argument(
     node: tree_sitter::Node,
     source: &str,
+    read_at: usize,
     occurrences: &mut Vec<VariableOccurrence>,
 ) {
     if let Some(name) = compact_variable_name_from_string_node(node, source) {
@@ -1123,9 +1346,12 @@ fn collect_compact_variable_reads_from_argument(
             occurrences.push(VariableOccurrence {
                 name,
                 range: node_range(&node),
-                start_byte: node.start_byte(),
+                start_byte: read_at,
                 declaration_kind: None,
                 null_coalesce_probe: false,
+                capture_eligible: false,
+                implicit_capture: false,
+                explicit_by_ref_capture: false,
             });
         }
         return;
@@ -1136,7 +1362,7 @@ fn collect_compact_variable_reads_from_argument(
             .child_by_field_name("value")
             .or_else(|| node.named_child(0))
         {
-            collect_compact_variable_reads_from_argument(value, source, occurrences);
+            collect_compact_variable_reads_from_argument(value, source, read_at, occurrences);
         }
         return;
     }
@@ -1147,7 +1373,7 @@ fn collect_compact_variable_reads_from_argument(
     ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            collect_compact_variable_reads_from_argument(child, source, occurrences);
+            collect_compact_variable_reads_from_argument(child, source, read_at, occurrences);
         }
     }
 }
@@ -1308,7 +1534,7 @@ fn report_variable_diagnostics<F>(
     source: &str,
     file_symbols: &FileSymbols,
     resolver: &F,
-    report_unused_declarations: bool,
+    ancestors: &[ScopeBindings],
     diagnostics: &mut Vec<SemanticDiagnostic>,
 ) where
     F: Fn(&str, &[PhpSymbolKind]) -> Option<Arc<SymbolInfo>>,
@@ -1331,10 +1557,28 @@ fn report_variable_diagnostics<F>(
     }
 
     let mut reported_undefined = HashSet::new();
+    let lexical_capture_names = if scope.kind() == "arrow_function" {
+        occurrences
+            .iter()
+            .filter(|occurrence| occurrence.capture_eligible)
+            .map(|occurrence| occurrence.name.as_str())
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     for occurrence in occurrences
         .iter()
         .filter(|occurrence| occurrence.declaration_kind.is_none())
     {
+        if scope.kind() == "arrow_function"
+            && (occurrence.capture_eligible
+                || (lexical_capture_names.contains(occurrence.name.as_str())
+                    && arrow_has_enclosing_binding(scope, &occurrence.name, ancestors)))
+        {
+            // Implicit captures are resolved at the arrow's creation site in
+            // its parent scope, not as independent undefined locals here.
+            continue;
+        }
         if occurrence.name == "$this" {
             continue;
         }
@@ -1344,14 +1588,21 @@ fn report_variable_diagnostics<F>(
 
         let declared_before = declared_by_name
             .get(occurrence.name.as_str())
-            .map(|decls| {
-                decls
-                    .iter()
-                    .any(|decl| decl.start_byte < occurrence.start_byte)
-            })
-            .unwrap_or(false);
+            .is_some_and(|decls| {
+                decls.iter().any(|decl| {
+                    declaration_available_before(
+                        scope,
+                        decl,
+                        occurrence.start_byte,
+                        occurrence.explicit_by_ref_capture,
+                    )
+                })
+            });
 
-        if !declared_before && reported_undefined.insert(occurrence.name.clone()) {
+        if !declared_before
+            && !occurrence.explicit_by_ref_capture
+            && reported_undefined.insert(occurrence.name.clone())
+        {
             diagnostics.push(SemanticDiagnostic {
                 range: occurrence.range,
                 message: format!("Undefined variable: {}", occurrence.name),
@@ -1360,7 +1611,7 @@ fn report_variable_diagnostics<F>(
         }
     }
 
-    if !report_unused_declarations {
+    if !should_report_unused_declarations(scope) {
         return;
     }
 
@@ -1368,14 +1619,23 @@ fn report_variable_diagnostics<F>(
         if name == "$this" {
             continue;
         }
-        let has_read = used_by_name.get(name).is_some_and(|uses| !uses.is_empty());
-        if has_read {
-            continue;
-        }
-
         let Some(first_declaration) = declarations.first() else {
             continue;
         };
+        let has_read = used_by_name.get(name).is_some_and(|uses| {
+            uses.iter().any(|use_site| {
+                (!use_site.implicit_capture && !use_site.explicit_by_ref_capture)
+                    || declaration_available_before(
+                        scope,
+                        first_declaration,
+                        use_site.start_byte,
+                        use_site.explicit_by_ref_capture && !use_site.implicit_capture,
+                    )
+            })
+        });
+        if has_read {
+            continue;
+        }
         match first_declaration.declaration_kind {
             Some(VariableDeclarationKind::Parameter) => {
                 if should_suppress_unused_parameter(scope, source, file_symbols, resolver) {
@@ -1393,7 +1653,9 @@ fn report_variable_diagnostics<F>(
                 kind: SemanticDiagnosticKind::UnusedVariable,
             }),
             Some(
-                VariableDeclarationKind::ClosureUse | VariableDeclarationKind::PromotedProperty,
+                VariableDeclarationKind::ClosureUse
+                | VariableDeclarationKind::PromotedProperty
+                | VariableDeclarationKind::ReferenceCapture,
             )
             | None => {}
         }
@@ -1407,6 +1669,7 @@ fn is_variable_scope(node: tree_sitter::Node) -> bool {
             | "function_definition"
             | "anonymous_function"
             | "anonymous_function_creation_expression"
+            | "arrow_function"
     )
 }
 
@@ -1572,7 +1835,7 @@ fn variable_declaration_kind(
     let parent = node.parent()?;
 
     match parent.kind() {
-        "simple_parameter" => parent
+        "simple_parameter" | "variadic_parameter" => parent
             .child_by_field_name("name")
             .is_some_and(|name| name.id() == node.id())
             .then_some(VariableDeclarationKind::Parameter),
@@ -1611,6 +1874,7 @@ fn is_assignment_left_hand_declared_variable(node: tree_sitter::Node) -> bool {
             }
             "method_declaration"
             | "function_definition"
+            | "arrow_function"
             | "anonymous_function"
             | "anonymous_function_creation_expression"
             | "program" => return false,

@@ -1038,8 +1038,9 @@ UTF-16 → byte: колонка сверх содержимого строки �
 
 ### CODEX-P2-07. Arrow function не является отдельным diagnostic scope
 
-[`is_variable_scope`](server/crates/php-lsp-parser/src/semantic.rs#L1403)
-не включает `arrow_function`. Его параметры и тело попадают во внешний scope.
+**Исправлено 2026-09-24.** Исходно
+[`is_variable_scope`](server/crates/php-lsp-parser/src/semantic.rs)
+не включал `arrow_function`: его параметры и тело попадали во внешний scope.
 
 Подтверждённый пример:
 
@@ -1048,11 +1049,19 @@ $shadowed = 1;
 return fn($shadowed) => $shadowed + 1;
 ```
 
-CLI вернул 0 diagnostics, хотя внешняя `$shadowed` не используется. Чтение
-одноимённого параметра arrow function ошибочно засчитывается внешней переменной.
+CLI возвращал 0 diagnostics, хотя внешняя `$shadowed` не используется. Чтение
+одноимённого параметра arrow function ошибочно засчитывалось внешней переменной.
 
-Что исправить: отдельный arrow scope плюс явный учёт автоматических captures
-при анализе внешнего scope.
+Arrow function теперь имеет отдельный diagnostic scope. Неявные захваты
+лексических чтений учитываются при анализе внешнего scope, включая вложенные
+arrow functions; параметры и локальные присваивания остаются внутри стрелки.
+Захват проверяется в момент создания функции: последующие объявления и
+незавершённые присваивания не делают переменную доступной. Статические имена
+`compact()` не создают захват сами по себе. Постоянные parser- и LSP-регрессии
+сначала воспроизвели дефекты, затем прошли после исправления.
+Всего добавлено 22 parser-теста и один LSP e2e-тест; полный Rust-набор прошёл
+1119/1119 без пропусков, Clippy, Rustfmt и diff check прошли. Повторный
+Verifier review дал GO.
 
 ### CODEX-P2-08. Argument-count diagnostics неверны для части допустимых вызовов
 
@@ -1385,8 +1394,8 @@ Assignment в одной ветви может подавить undefined read �
 declaration, поэтому последующий `$value` может остаться “undefined”, хотя
 `$value ??= default()` гарантированно инициализирует переменную.
 
-Отдельный arrow-scope defect уже описан в P2-07. Для исправления нужен хотя бы
-must/may-defined dataflow по basic blocks и явная семантика `isset`, `empty`,
+Отдельный arrow-scope defect из P2-07 уже исправлен. Для P2-31 по-прежнему
+нужен must/may-defined dataflow по basic blocks и явная семантика `isset`, `empty`,
 `??`, `??=`, destructuring и loop/catch variables.
 
 ### CODEX-P2-32. Framework/type helpers возвращают уверенные, но неверные типы

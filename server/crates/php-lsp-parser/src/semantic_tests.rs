@@ -1087,6 +1087,185 @@ function run(): void {
 }
 
 #[test]
+fn arrow_parameter_read_does_not_hide_unused_outer_variable() {
+    let source = r#"<?php
+function run(): mixed {
+    $shadowed = 1;
+    return fn($shadowed) => $shadowed + 1;
+}
+"#;
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    let unused: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::UnusedVariable)
+        .collect();
+    assert_eq!(unused.len(), 1, "{diagnostics:?}");
+    assert_eq!(unused[0].message, "Unused variable: $shadowed");
+    assert_eq!(
+        unused[0].range.0, 2,
+        "the outer declaration must be reported"
+    );
+    assert!(!diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == SemanticDiagnosticKind::UnusedParameter
+            && diagnostic.message.contains("$shadowed")
+    }));
+}
+
+#[test]
+fn arrow_capture_and_nested_capture_credit_the_correct_outer_binding() {
+    for source in [
+        "<?php function run(): void { $captured = 1; $f = fn() => $captured; echo $f(); }",
+        "<?php function run(): void { $outer = 1; $f = fn($param) => fn() => $param + $outer; echo $f(2)(); }",
+        "<?php function run(): void { $outer = 1; $f = fn() => function() use ($outer) { return $outer; }; echo $f()(); }",
+    ] {
+        let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+        assert!(
+            diagnostics.iter().all(|diagnostic| !matches!(
+                diagnostic.kind,
+                SemanticDiagnosticKind::UndefinedVariable
+                    | SemanticDiagnosticKind::UnusedVariable
+                    | SemanticDiagnosticKind::UnusedParameter
+            )),
+            "valid capture was lost: {source}\n{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn nested_arrow_shadowing_does_not_credit_the_outer_name() {
+    let source = r#"<?php
+function run(): void {
+    $shadowed = 'outer';
+    $f = fn($x) => fn($shadowed) => $shadowed . $x;
+    echo $f('a')('b');
+}
+"#;
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    let unused_outer: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UnusedVariable
+                && diagnostic.message == "Unused variable: $shadowed"
+        })
+        .collect();
+    assert_eq!(unused_outer.len(), 1, "{diagnostics:?}");
+    assert_eq!(unused_outer[0].range.0, 2);
+    assert!(!diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == SemanticDiagnosticKind::UnusedParameter
+            && (diagnostic.message.contains("$x") || diagnostic.message.contains("$shadowed"))
+    }));
+}
+
+#[test]
+fn arrow_parameter_shadowing_remains_local_through_explicit_closure_use() {
+    let source = r#"<?php
+function run(): void {
+    $shadowed = 'outer';
+    $f = fn($shadowed) => function() use ($shadowed) { return $shadowed; };
+    echo $f('inner')();
+}
+"#;
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    let unused_outer: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UnusedVariable
+                && diagnostic.message == "Unused variable: $shadowed"
+        })
+        .collect();
+    assert_eq!(unused_outer.len(), 1, "{diagnostics:?}");
+    assert_eq!(unused_outer[0].range.0, 2);
+    assert!(!diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == SemanticDiagnosticKind::UnusedParameter
+            && diagnostic.message.contains("$shadowed")
+    }));
+}
+
+#[test]
+fn arrow_scope_reports_its_own_unused_parameter() {
+    let source = "<?php function run(): void { $f = fn($unused) => 42; echo $f(1); }";
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UnusedParameter
+                    && diagnostic.message == "Unused parameter: $unused"
+            })
+            .count(),
+        1,
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn arrow_assignment_captures_outer_value_without_changing_it() {
+    let source = "<?php function run(): void { $outer = 1; $f = fn() => ($outer = 2); echo $f(); }";
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    let outer_declaration = source.find("$outer").unwrap() as u32;
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UnusedVariable
+                && diagnostic.message.contains("$outer")
+                && diagnostic.range.1 == outer_declaration
+        }),
+        "arrow assignment should still capture the outer value by copy: {diagnostics:?}"
+    );
+
+    let no_outer = "<?php function run(): void { $f = fn() => ($local = 2); echo $f(); }";
+    let diagnostics = parse_and_check(no_outer, |_fqn| Some(dummy_symbol()));
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message.contains("$local")
+        }),
+        "assignment-only capture must not invent an undefined read: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn arrow_free_variable_reports_one_undefined_diagnostic() {
+    let source = "<?php function run(): void { $f = fn() => $missing; echo $f(); }";
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    let undefined: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message.contains("$missing")
+        })
+        .collect();
+    assert_eq!(undefined.len(), 1, "{diagnostics:?}");
+}
+
+#[test]
+fn arrow_cannot_capture_a_variable_declared_after_creation() {
+    let source = "<?php function run(): mixed { $f = fn() => $later; $later = 1; return $f(); }";
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && diagnostic.message == "Undefined variable: $later"
+            })
+            .count(),
+        1,
+        "arrow read before declaration must be undefined: {diagnostics:?}"
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UnusedVariable
+                    && diagnostic.message == "Unused variable: $later"
+            })
+            .count(),
+        1,
+        "later assignment must remain unused: {diagnostics:?}"
+    );
+}
+
+#[test]
 fn test_foreach_value_variable_is_declared() {
     let code = r#"<?php
 function run(array $requests): void {
@@ -1283,6 +1462,26 @@ function run(): void {
         }),
         "Closure use variables should count as reads in the outer scope, got: {:?}",
         diags
+    );
+}
+
+#[test]
+fn recursive_closure_can_capture_its_assignment_target_by_reference() {
+    let source = r#"<?php
+function run(): int {
+    $recurse = function (int $n) use (&$recurse): int {
+        return $n ? $recurse($n - 1) : 7;
+    };
+    return $recurse(2);
+}
+"#;
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message.contains("$recurse")
+        }),
+        "recursive by-reference capture must see its assignment target: {diagnostics:?}"
     );
 }
 
@@ -1580,4 +1779,344 @@ namespace vendor\package { const FLAG = 2; const flag = 3; }
     assert!(duplicates
         .iter()
         .all(|diagnostic| diagnostic.message.ends_with(r"\FLAG")));
+}
+
+#[test]
+fn arrow_local_assignment_then_read_stays_in_arrow_scope() {
+    for expression in ["[$local = 2, $local]", "[$local = 2, (fn() => $local)()]"] {
+        let source =
+            format!("<?php function run(): void {{ $f = fn() => {expression}; echo $f()[0]; }}");
+        let diagnostics = parse_and_check(&source, |_fqn| Some(dummy_symbol()));
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && diagnostic.message.contains("$local")
+            }),
+            "local assignment was exported as an outer capture: {expression}\n{diagnostics:?}"
+        );
+    }
+
+    for expression in ["[$missing, $missing = 2]", "($missing = $missing + 1)"] {
+        let source =
+            format!("<?php function run(): void {{ $f = fn() => {expression}; echo $f(); }}");
+        let diagnostics = parse_and_check(&source, |_fqn| Some(dummy_symbol()));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                        && diagnostic.message.contains("$missing")
+                })
+                .count(),
+            1,
+            "read-before-binding was suppressed: {expression}\n{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn compact_string_name_does_not_trigger_implicit_arrow_capture() {
+    let source =
+        "<?php function run(): void { $outer = 7; $f = fn() => compact('outer'); echo $f(); }";
+    let diagnostics = parse_and_check(source, compact_function_resolver);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UnusedVariable
+                && diagnostic.message == "Unused variable: $outer"
+        }),
+        "string-key compact must not consume parent $outer: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message == "Undefined variable: $outer"
+        }),
+        "compact must see undefined $outer inside the arrow: {diagnostics:?}"
+    );
+
+    let captured = "<?php function run(): void { $outer = 7; $f = fn() => [$outer, compact('outer')]; echo $f()[0]; }";
+    let diagnostics = parse_and_check(captured, compact_function_resolver);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !matches!(
+                diagnostic.kind,
+                SemanticDiagnosticKind::UnusedVariable | SemanticDiagnosticKind::UndefinedVariable
+            ) || !diagnostic.message.contains("$outer")
+        }),
+        "real lexical capture must remain visible to compact: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn arrow_variadic_and_by_reference_parameters_stay_in_arrow_scope() {
+    let source = r#"<?php
+function run(): array {
+    $byRef = fn(&$unusedRef) => 42;
+    $variadic = fn(...$unusedRest) => 42;
+    return [$byRef, $variadic];
+}
+"#;
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    for name in ["$unusedRef", "$unusedRest"] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UnusedParameter
+                    && diagnostic.message == format!("Unused parameter: {name}")
+            }),
+            "arrow parameter was not classified locally: {name}\n{diagnostics:?}"
+        );
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && diagnostic.message.contains(name)
+            }),
+            "arrow parameter was mistaken for an outer capture: {name}\n{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn compact_inside_arrow_requires_a_real_binding_at_creation() {
+    for (name, expression) in [
+        ("$x", "[compact('x'), $x = 2]"),
+        ("$y", "[compact('y'), $y ?? 0]"),
+        ("$z", "[$z = compact('z')]"),
+    ] {
+        let source =
+            format!("<?php function run(): void {{ $f = fn() => {expression}; var_dump($f()); }}");
+        let diagnostics = parse_and_check(&source, compact_function_resolver);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && diagnostic.message == format!("Undefined variable: {name}")
+            }),
+            "compact used a nonexistent captured binding: {expression}\n{diagnostics:?}"
+        );
+
+        let source = format!("<?php function run(): void {{ {name} = 7; $f = fn() => {expression}; var_dump($f()); }}");
+        let diagnostics = parse_and_check(&source, compact_function_resolver);
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && diagnostic.message.contains(name)
+            }),
+            "existing outer binding was not captured: {expression}\n{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn arrow_created_on_assignment_rhs_cannot_capture_incomplete_target() {
+    for (source, names) in [
+        (
+            "<?php function run(): mixed { $f = fn() => $f; return $f(); }",
+            vec!["$f"],
+        ),
+        (
+            "<?php function run(): mixed { $a = $b = fn() => [$a, $b]; return $a(); }",
+            vec!["$a", "$b"],
+        ),
+    ] {
+        let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+        for name in names {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                        && diagnostic.message == format!("Undefined variable: {name}")
+                }),
+                "incomplete assignment became a capture: {name}\n{diagnostics:?}"
+            );
+        }
+    }
+
+    let valid = "<?php function run(): mixed { $f = 1; $f = fn() => $f; return $f(); }";
+    let diagnostics = parse_and_check(valid, |_fqn| Some(dummy_symbol()));
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message.contains("$f")
+        }),
+        "prior binding must remain capturable: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn compact_reads_variables_after_all_arguments_have_evaluated() {
+    for expression in [
+        "compact('x', ($x = 'value'))",
+        "compact(($x = 'value'), 'x')",
+    ] {
+        for arrow in [false, true] {
+            let source = if arrow {
+                format!("<?php function run(): array {{ $f = fn() => {expression}; return $f(); }}")
+            } else {
+                format!("<?php function run(): array {{ return {expression}; }}")
+            };
+            let diagnostics = parse_and_check(&source, compact_function_resolver);
+            assert!(
+                !diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                        && diagnostic.message.contains("$x")
+                }),
+                "compact ran before its arguments: arrow={arrow}, {expression}\n{diagnostics:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn recursive_closure_by_value_still_requires_a_prior_binding() {
+    let source =
+        "<?php function run(): mixed { $f = function () use ($f) { return $f; }; return $f(); }";
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message == "Undefined variable: $f"
+        }),
+        "by-value capture cannot read the pending assignment: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn sibling_arrow_compact_diagnostics_do_not_rescan_all_siblings() {
+    fn resolver_calls_for(arrows: usize) -> usize {
+        let mut source =
+            String::from("<?php namespace App; function run(): array { $outer = 1; $fns = [];");
+        for _ in 0..arrows {
+            source.push_str(" $fns[] = fn() => [$outer, compact('outer')];");
+        }
+        source.push_str(" return $fns; }");
+        let calls = std::cell::Cell::new(0);
+        let diagnostics = parse_and_check(&source, |fqn| {
+            if fqn == r"App\compact" {
+                calls.set(calls.get() + 1);
+            }
+            compact_function_resolver(fqn)
+        });
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.kind,
+                    SemanticDiagnosticKind::UndefinedVariable
+                        | SemanticDiagnosticKind::UnusedVariable
+                ) && diagnostic.message.contains("$outer")
+            }),
+            "valid sibling captures were lost: {diagnostics:?}"
+        );
+        calls.get()
+    }
+
+    let small = resolver_calls_for(12);
+    let large = resolver_calls_for(24);
+    assert!(
+        large <= small * 3,
+        "doubling sibling arrows caused repeated parent scans: {small} -> {large} resolver calls"
+    );
+}
+
+#[test]
+fn arrow_local_recursive_closure_reference_does_not_require_outer_binding() {
+    let source = r#"<?php
+function run(): int {
+    $outer = fn() => ($inner = function (int $n) use (&$inner): int {
+        return $n ? $inner($n - 1) : 7;
+    });
+    $recurse = $outer();
+    return $recurse(2);
+}
+"#;
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message.contains("$inner")
+        }),
+        "by-reference closure use must bind the arrow-local target: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn closure_reference_use_creates_an_arrow_local_before_following_read() {
+    let source = r#"<?php
+function run(): array {
+    $outer = fn() => [function () use (&$fresh) { return $fresh; }, $fresh];
+    return $outer();
+}
+"#;
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message.contains("$fresh")
+        }),
+        "reference use must create the arrow-local binding: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn arrow_parameter_inside_assignment_array_key_is_not_a_variable_assignment() {
+    let source = r#"<?php
+function run(): array {
+    $values = [];
+    $values[(fn($key) => $key)(1)] = 2;
+    return $values;
+}
+"#;
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.kind,
+                SemanticDiagnosticKind::UnusedVariable
+                    | SemanticDiagnosticKind::UnusedParameter
+                    | SemanticDiagnosticKind::UndefinedVariable
+            ) && diagnostic.message.contains("$key")
+        }),
+        "outer assignment reclassified the arrow parameter: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn reference_use_binding_is_visible_to_compact_and_nested_arrow() {
+    for expression in [
+        "[function () use (&$fresh) { return $fresh; }, compact('fresh')]",
+        "[function () use (&$fresh) { return $fresh; }, (fn() => [$fresh, compact('fresh')])()]",
+    ] {
+        let source = format!(
+            "<?php function run(): array {{ $outer = fn() => {expression}; return $outer(); }}"
+        );
+        let diagnostics = parse_and_check(&source, compact_function_resolver);
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                    && diagnostic.message.contains("$fresh")
+            }),
+            "reference binding was lost for {expression}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn optional_reference_capture_through_arrow_does_not_use_pending_outer_assignment() {
+    let source = r#"<?php
+function run(): void {
+    $self = fn() => function () use (&$self) {};
+}
+"#;
+    let diagnostics = parse_and_check(source, |_fqn| Some(dummy_symbol()));
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UnusedVariable
+                && diagnostic.message == "Unused variable: $self"
+        }),
+        "inner reference creation falsely credited the pending assignment: {diagnostics:?}"
+    );
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::UndefinedVariable
+                && diagnostic.message.contains("$self")
+        }),
+        "reference capture should remain optional: {diagnostics:?}"
+    );
 }

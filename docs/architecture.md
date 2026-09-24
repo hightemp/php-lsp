@@ -821,6 +821,13 @@ override signatures, and PHP-version checks. Duplicate-name comparisons follow
 the casing rules of each symbol kind. Per-category severity is controlled by
 `phpLsp.diagnostics.severity`.
 
+Variable diagnostics treat each arrow function as a lexical scope. Its
+parameters and assignments belong to that scope; reads of outer variables are
+credited as implicit captures at the arrow's creation site, including through
+nested arrows. A same-named arrow parameter does not count as a read of the
+outer variable. Static names passed to `compact()` are checked in the scope
+where the call executes, but do not create implicit captures on their own.
+
 Member access and type-compatibility diagnostics share a latency budget because
 they can resolve many call sites and inferred types in large files. The default
 `phpLsp.diagnostics.memberTypeNodeBudget` is `512` relevant syntax nodes. When a
