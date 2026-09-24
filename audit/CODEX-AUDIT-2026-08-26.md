@@ -1065,20 +1065,34 @@ Verifier review дал GO.
 
 ### CODEX-P2-08. Argument-count diagnostics неверны для части допустимых вызовов
 
-В function и constructor checks required count определяется позицией первого
-параметра с default/variadic. Это неверно для legacy-signature с обязательным
-параметром после optional: PHP трактует предшествующий optional как required.
+**Исправлено 2026-09-24.** Исходно в function и constructor checks required count
+определялся позицией первого параметра с default/variadic. Это неверно для
+legacy-signature с обязательным параметром после optional: [PHP трактует
+предшествующий optional как required](https://www.php.net/manual/en/functions.arguments.php).
 
 Кроме того, один unpacked argument `...$args` считается ровно одним аргументом,
 из-за чего возможны ложные `too few` и `too many` diagnostics.
 
-Код находится в
-[`semantic.rs:208`](server/crates/php-lsp-parser/src/semantic.rs#L208) и
-[`semantic.rs:387`](server/crates/php-lsp-parser/src/semantic.rs#L387).
+Исходные проверки находились в `check_class_in_new` и `check_function_call`
+файла [`semantic.rs`](server/crates/php-lsp-parser/src/semantic.rs).
 
-Что исправить: required boundary считать по последнему required parameter;
-при unpack suppress/relax обе границы, пока cardinality неизвестна; отдельно
-валидировать named arguments.
+Оба вида вызова теперь используют общий расчёт: required boundary определяется
+последним обязательным параметром, named arguments сопоставляются по имени,
+повторные и неизвестные имена диагностируются. Простые packed literal unpacks
+имеют известное количество элементов; динамические и keyed unpacks не
+приравниваются к одному аргументу, когда их cardinality или сопоставление с
+параметрами неизвестно. Для keyed literals это намеренно консервативная
+проверка. Лишние positional arguments у пользовательских функций и
+конструкторов [PHP допускает](https://www.php.net/manual/en/function.func-get-args.php);
+верхняя граница проверяется только для известных
+встроенных символов. Это также исправляет прежнее ошибочное ожидание теста
+`too many` для пользовательской функции.
+First-class callable `f(...)` не считается вызовом. Существующий тест
+`preg_replace_callback` скорректирован по реальной сигнатуре stub: у
+необязательного `&$count` есть default `null`.
+Добавлено 18 parser-тестов и один LSP e2e-тест; полный Rust-набор прошёл
+1138/1138 без пропусков, Clippy, Rustfmt и diff check прошли. Повторный
+Verifier review дал GO.
 
 ### CODEX-P2-09. `SymbolModifiers.is_deprecated` никогда не устанавливается
 

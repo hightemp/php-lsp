@@ -452,26 +452,27 @@ helper();
 }
 
 #[test]
-fn test_function_argument_count_mismatch_too_many() {
+fn test_builtin_function_argument_count_mismatch_too_many() {
     let code = r#"<?php
-namespace App;
-
-function helper(string $a): void {}
-helper("x", "y");
+strlen("x", "y");
 "#;
     let diags = parse_and_check(code, |fqn| {
-        if fqn == "App\\helper" {
-            Some(function_symbol(
+        if fqn == "strlen" {
+            let mut symbol = function_symbol(
                 fqn,
                 vec![ParamInfo {
-                    name: "a".to_string(),
+                    name: "string".to_string(),
                     type_info: None,
                     default_value: None,
                     is_variadic: false,
                     is_by_ref: false,
                     is_promoted: false,
                 }],
-            ))
+            )
+            .as_ref()
+            .clone();
+            symbol.modifiers.is_builtin = true;
+            Some(Arc::new(symbol))
         } else {
             None
         }
@@ -485,10 +486,225 @@ helper("x", "y");
     assert!(
         arg_diags
             .iter()
-            .any(|d| d.message.contains("Too many arguments to App\\helper()")),
+            .any(|d| d.message.contains("Too many arguments to strlen()")),
         "Expected too-many-arguments diagnostic, got: {:?}",
         arg_diags
     );
+}
+
+fn argument_mismatches(code: &str) -> Vec<SemanticDiagnostic> {
+    parse_and_check_with_file_resolver(code)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::ArgumentCountMismatch)
+        .collect()
+}
+
+#[test]
+fn required_parameter_after_default_sets_function_arity_boundary() {
+    let code = "<?php\nfunction legacy($first = 1, $second): void {}\nlegacy(1);\nlegacy(1, 2);\n";
+    let mismatches = argument_mismatches(code);
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert_eq!(mismatches[0].range.0, 2);
+    assert!(mismatches[0].message.contains("expected at least 2"));
+}
+
+#[test]
+fn required_parameter_after_default_sets_constructor_arity_boundary() {
+    let code = "<?php\nclass Legacy { public function __construct($first = 1, $second) {} }\nnew Legacy(1);\nnew Legacy(1, 2);\n";
+    let mismatches = argument_mismatches(code);
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert_eq!(mismatches[0].range.0, 2);
+    assert!(mismatches[0].message.contains("expected at least 2"));
+}
+
+#[test]
+fn unknown_unpack_cardinality_does_not_invent_too_few_or_too_many() {
+    let code = "<?php\nfunction pair($a, $b): void {}\nfunction one($a): void {}\n$values = [1, 2];\npair(...$values);\none(1, ...$values);\n";
+    let mismatches = argument_mismatches(code);
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[test]
+fn unpacked_literal_arguments_use_their_known_cardinality() {
+    let code = "<?php\nfunction pair($a, $b): void {}\npair(...[1, 2]);\npair(...[]);\npair(...[1, 2, 3]);\n";
+    let mismatches = argument_mismatches(code);
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert!(mismatches
+        .iter()
+        .any(|diagnostic| diagnostic.range.0 == 3 && diagnostic.message.starts_with("Too few")));
+}
+
+#[test]
+fn builtin_literal_unpack_retains_strict_upper_bound() {
+    let code = "<?php\nstrlen(...['x']);\nstrlen(...['x', 'y']);\n";
+    let diagnostics = parse_and_check(code, |fqn| {
+        (fqn == "strlen").then(|| {
+            let mut symbol = function_symbol(
+                fqn,
+                vec![ParamInfo {
+                    name: "string".to_string(),
+                    type_info: None,
+                    default_value: None,
+                    is_variadic: false,
+                    is_by_ref: false,
+                    is_promoted: false,
+                }],
+            )
+            .as_ref()
+            .clone();
+            symbol.modifiers.is_builtin = true;
+            Arc::new(symbol)
+        })
+    });
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::ArgumentCountMismatch)
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert_eq!(mismatches[0].range.0, 2);
+    assert!(mismatches[0].message.starts_with("Too many"));
+}
+
+#[test]
+fn builtin_constructor_retains_strict_upper_bound() {
+    let code = "<?php\nnew InternalBox(1);\nnew InternalBox(1, 2);\n";
+    let diagnostics = parse_and_check(code, |fqn| match fqn {
+        "InternalBox" => Some(dummy_symbol()),
+        "InternalBox::__construct" => {
+            let mut symbol = function_symbol(
+                fqn,
+                vec![ParamInfo {
+                    name: "value".to_string(),
+                    type_info: None,
+                    default_value: None,
+                    is_variadic: false,
+                    is_by_ref: false,
+                    is_promoted: false,
+                }],
+            )
+            .as_ref()
+            .clone();
+            symbol.modifiers.is_builtin = true;
+            Some(Arc::new(symbol))
+        }
+        _ => None,
+    });
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::ArgumentCountMismatch)
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert_eq!(mismatches[0].range.0, 2);
+    assert!(mismatches[0].message.starts_with("Too many"));
+}
+
+#[test]
+fn named_arguments_bind_required_parameters_by_name() {
+    let code = "<?php\nfunction named($left, $right, $tail = 0): void {}\nnamed(right: 2, left: 1);\nnamed(1, right: 2);\nnamed(left: 1, tail: 3);\n";
+    let mismatches = argument_mismatches(code);
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert_eq!(mismatches[0].range.0, 4);
+    assert!(mismatches[0].message.contains("$right"), "{mismatches:?}");
+}
+
+#[test]
+fn duplicate_and_unknown_named_arguments_are_reported() {
+    let code = "<?php\nfunction named($left, $right, $tail = 0): void {}\nnamed(left: 1, left: 2);\nnamed(left: 1, right: 2, unknown: 3);\n";
+    let mismatches = argument_mismatches(code);
+    assert!(
+        mismatches
+            .iter()
+            .any(|diagnostic| diagnostic.range.0 == 2 && diagnostic.message.contains("left")),
+        "{mismatches:?}"
+    );
+    assert!(
+        mismatches
+            .iter()
+            .any(|diagnostic| diagnostic.range.0 == 3 && diagnostic.message.contains("unknown")),
+        "{mismatches:?}"
+    );
+}
+
+#[test]
+fn variadic_parameter_accepts_extra_named_arguments() {
+    let code = "<?php\nfunction gather($first, ...$rest): void {}\ngather(first: 1, extra: 2);\n";
+    let mismatches = argument_mismatches(code);
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[test]
+fn named_argument_cannot_overwrite_a_positional_argument() {
+    let code = "<?php\nfunction pair($left, $right): void {}\npair(1, left: 2);\n";
+    let mismatches = argument_mismatches(code);
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert!(mismatches[0].message.contains("left"), "{mismatches:?}");
+}
+
+#[test]
+fn named_argument_matching_is_case_sensitive() {
+    let code = "<?php\nfunction pair($left, $right): void {}\npair(Left: 1, right: 2);\n";
+    let mismatches = argument_mismatches(code);
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert!(mismatches[0].message.contains("Left"), "{mismatches:?}");
+}
+
+#[test]
+fn constructor_named_arguments_share_the_function_binding_rules() {
+    let code = "<?php\nclass Pair { public function __construct($left, $right) {} }\nnew Pair(right: 2, left: 1);\nnew Pair(left: 1, left: 2);\n";
+    let mismatches = argument_mismatches(code);
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert_eq!(mismatches[0].range.0, 3);
+    assert!(mismatches[0].message.contains("left"), "{mismatches:?}");
+}
+
+#[test]
+fn keyed_unpack_and_first_class_callable_do_not_have_fixed_positional_arity() {
+    let code = "<?php\nfunction pair($left, $right): void {}\npair(...['left' => 1, 'right' => 2]);\n$callable = pair(...);\n";
+    let mismatches = argument_mismatches(code);
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[test]
+fn variadic_named_parameter_can_follow_positional_variadic_values() {
+    let code = "<?php\nfunction gather($first, ...$rest): void {}\ngather(1, 2, rest: 3);\ngather(...[1, 2], rest: 3);\nclass Gatherer { public function __construct($first, ...$rest) {} }\nnew Gatherer(1, 2, rest: 3);\n";
+    let mismatches = argument_mismatches(code);
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[test]
+fn named_argument_cannot_overwrite_positional_prefix_before_unknown_unpack() {
+    let code = "<?php\nfunction pair($left, $right = 0): void {}\n$values = [];\npair(1, ...$values, left: 2);\n";
+    let mismatches = argument_mismatches(code);
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert!(mismatches[0].message.contains("left"), "{mismatches:?}");
+}
+
+#[test]
+fn positional_argument_after_named_argument_is_reported() {
+    let code = "<?php\nfunction pair($left, $right): void {}\npair(right: 2, 1);\n";
+    let mismatches = argument_mismatches(code);
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert!(
+        mismatches[0]
+            .message
+            .contains("Positional argument after named"),
+        "{mismatches:?}"
+    );
+}
+
+#[test]
+fn first_class_callable_with_comment_does_not_check_call_arity() {
+    let code =
+        "<?php\nfunction pair($left, $right): void {}\n$callable = pair(/* deferred */ ...);\n";
+    let mismatches = argument_mismatches(code);
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[test]
+fn user_defined_functions_and_constructors_accept_extra_positional_arguments() {
+    let code = "<?php\nfunction one($value): void {}\nclass One { public function __construct($value) {} }\none(1, 2);\nnew One(1, 2);\none(...[1, 2]);\nnew One(...[1, 2]);\n";
+    let mismatches = argument_mismatches(code);
+    assert!(mismatches.is_empty(), "{mismatches:?}");
 }
 
 #[test]
@@ -565,12 +781,11 @@ class Child extends Base {
     );
 }
 
-/// Params after the first default-value param are implicitly optional even
-/// without their own default value (common in phpstorm-stubs, e.g.
-/// `preg_replace_callback`, `file_get_contents`).
+/// The optional by-reference output parameter in phpstorm-stubs has its own
+/// null default; a parameter without a default after an optional one is required.
 #[test]
-fn test_no_false_positive_for_optional_params_after_default() {
-    // Simulates preg_replace_callback($pattern, $callback, $subject, int $limit = -1, &$count, int $flags = 0)
+fn test_no_false_positive_for_optional_by_reference_output_parameter() {
+    // Matches preg_replace_callback($pattern, $callback, $subject, int $limit = -1, &$count = null, int $flags = 0).
     // Only the first 3 params (before $limit which has a default) are truly required.
     let code = r#"<?php
 preg_replace_callback('/x/', function(){}, 'input');
@@ -615,7 +830,7 @@ preg_replace_callback('/x/', function(){}, 'input');
                     ParamInfo {
                         name: "count".to_string(),
                         type_info: None,
-                        default_value: None, // no default but after a defaulted param
+                        default_value: Some("null".to_string()),
                         is_variadic: false,
                         is_by_ref: true,
                         is_promoted: false,
@@ -642,7 +857,7 @@ preg_replace_callback('/x/', function(){}, 'input');
 
     assert!(
             arg_diags.is_empty(),
-            "Expected NO argument-count diagnostic for 3 args to preg_replace_callback (required prefix = 3), got: {:?}",
+            "Expected NO argument-count diagnostic for 3 args to preg_replace_callback (required boundary = 3), got: {:?}",
             arg_diags
         );
 }

@@ -4,11 +4,12 @@
 //! against a resolver function (typically backed by the workspace index).
 
 use crate::cst::{
-    ancestor_field_contains, has_ancestor_before_scope, is_by_ref_output_argument_variable,
-    is_foreach_header_declared_variable, node_contains,
+    ancestor_field_contains, argument_name, has_ancestor_before_scope,
+    is_by_ref_output_argument_variable, is_foreach_header_declared_variable, node_contains,
 };
 use php_lsp_types::{
-    global_constant_fqn_key, FileSymbols, PhpDoc, PhpSymbolKind, SymbolInfo, TypeInfo, UseKind,
+    global_constant_fqn_key, FileSymbols, PhpDoc, PhpSymbolKind, Signature, SymbolInfo, TypeInfo,
+    UseKind,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -250,44 +251,14 @@ fn check_class_in_new<F>(
             resolve_symbol_matching_kinds(resolver, &ctor_fqn, METHOD_SYMBOL_KINDS)
         {
             if let Some(ref sig) = ctor_sym.signature {
-                // Required = contiguous leading params without defaults.
-                // Once a param has a default or is variadic, all subsequent are optional.
-                let required = sig
-                    .params
-                    .iter()
-                    .position(|p| p.default_value.is_some() || p.is_variadic)
-                    .unwrap_or(sig.params.len());
-                let max = if sig.params.iter().any(|p| p.is_variadic) {
-                    usize::MAX
-                } else {
-                    sig.params.len()
-                };
-
-                // Count actual arguments
-                let actual = count_arguments(node);
-
-                if actual < required {
-                    // Find the arguments node for better range
-                    let args_node = node.child_by_field_name("arguments").unwrap_or(node);
-                    diagnostics.push(SemanticDiagnostic {
-                        range: node_range(&args_node),
-                        message: format!(
-                            "Too few arguments to {}::__construct(): expected at least {}, got {}",
-                            fqn, required, actual
-                        ),
-                        kind: SemanticDiagnosticKind::ArgumentCountMismatch,
-                    });
-                } else if actual > max {
-                    let args_node = node.child_by_field_name("arguments").unwrap_or(node);
-                    diagnostics.push(SemanticDiagnostic {
-                        range: node_range(&args_node),
-                        message: format!(
-                            "Too many arguments to {}::__construct(): expected at most {}, got {}",
-                            fqn, max, actual
-                        ),
-                        kind: SemanticDiagnosticKind::ArgumentCountMismatch,
-                    });
-                }
+                check_call_argument_count(
+                    node,
+                    source,
+                    sig,
+                    ctor_sym.modifiers.is_builtin,
+                    &ctor_fqn,
+                    diagnostics,
+                );
             }
         }
     }
@@ -412,41 +383,14 @@ fn check_function_call<F>(
 
             if let Some((resolved_fqn, func_sym)) = resolved {
                 if let Some(ref sig) = func_sym.signature {
-                    // Required = contiguous leading params without defaults.
-                    // Once a param has a default or is variadic, all subsequent are optional.
-                    let required = sig
-                        .params
-                        .iter()
-                        .position(|p| p.default_value.is_some() || p.is_variadic)
-                        .unwrap_or(sig.params.len());
-                    let max = if sig.params.iter().any(|p| p.is_variadic) {
-                        usize::MAX
-                    } else {
-                        sig.params.len()
-                    };
-                    let actual = count_arguments(node);
-
-                    if actual < required {
-                        let args_node = node.child_by_field_name("arguments").unwrap_or(node);
-                        diagnostics.push(SemanticDiagnostic {
-                            range: node_range(&args_node),
-                            message: format!(
-                                "Too few arguments to {}(): expected at least {}, got {}",
-                                resolved_fqn, required, actual
-                            ),
-                            kind: SemanticDiagnosticKind::ArgumentCountMismatch,
-                        });
-                    } else if actual > max {
-                        let args_node = node.child_by_field_name("arguments").unwrap_or(node);
-                        diagnostics.push(SemanticDiagnostic {
-                            range: node_range(&args_node),
-                            message: format!(
-                                "Too many arguments to {}(): expected at most {}, got {}",
-                                resolved_fqn, max, actual
-                            ),
-                            kind: SemanticDiagnosticKind::ArgumentCountMismatch,
-                        });
-                    }
+                    check_call_argument_count(
+                        node,
+                        source,
+                        sig,
+                        func_sym.modifiers.is_builtin,
+                        &resolved_fqn,
+                        diagnostics,
+                    );
                 }
             }
 
@@ -591,25 +535,204 @@ fn resolve_function_name(name: &str, file_symbols: &FileSymbols) -> String {
     crate::resolve::resolve_function_name_pub(name, file_symbols)
 }
 
-/// Count the number of actual arguments in an `object_creation_expression` or similar call node.
-fn count_arguments(node: tree_sitter::Node) -> usize {
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            if child.kind() == "arguments" {
-                // Count direct named children that are "argument"
-                let mut count = 0;
-                for j in 0..child.named_child_count() {
-                    if let Some(arg) = child.named_child(j) {
-                        if arg.kind() == "argument" {
-                            count += 1;
-                        }
-                    }
+#[derive(Default)]
+struct CallArguments {
+    positional: usize,
+    definite_positional_prefix: usize,
+    named: Vec<String>,
+    unknown_unpack: bool,
+    positional_after_named: bool,
+    first_class_callable: bool,
+}
+
+fn summarize_call_arguments(node: tree_sitter::Node, source: &str) -> CallArguments {
+    let mut summary = CallArguments::default();
+    let Some(arguments) = call_arguments_node(node) else {
+        return summary;
+    };
+
+    let mut cursor = arguments.walk();
+    let mut saw_unknown_unpack = false;
+    let mut saw_named = false;
+    for argument in arguments.named_children(&mut cursor) {
+        if argument.kind() == "variadic_placeholder" {
+            summary.first_class_callable = true;
+            continue;
+        }
+        if argument.kind() != "argument" {
+            continue;
+        }
+        if let Some(name) = argument_name(argument, source) {
+            summary.named.push(name);
+            saw_named = true;
+            continue;
+        }
+        let mut argument_cursor = argument.walk();
+        let unpack = argument
+            .named_children(&mut argument_cursor)
+            .find(|child| child.kind() == "variadic_unpacking");
+        if let Some(unpack) = unpack {
+            if let Some(count) = literal_unpacked_argument_count(unpack) {
+                if saw_named && count > 0 {
+                    summary.positional_after_named = true;
                 }
-                return count;
+                summary.positional += count;
+                if !saw_unknown_unpack {
+                    summary.definite_positional_prefix += count;
+                }
+            } else {
+                summary.unknown_unpack = true;
+                saw_unknown_unpack = true;
+            }
+        } else {
+            if saw_named {
+                summary.positional_after_named = true;
+            }
+            summary.positional += 1;
+            if !saw_unknown_unpack {
+                summary.definite_positional_prefix += 1;
             }
         }
     }
-    0
+    summary
+}
+
+/// A packed literal has a known positional cardinality. Keys and nested
+/// unpacks can carry named arguments or dynamic cardinality, so stay unknown.
+fn literal_unpacked_argument_count(unpack: tree_sitter::Node) -> Option<usize> {
+    let array = unpack.named_child(0)?;
+    if array.kind() != "array_creation_expression" {
+        return None;
+    }
+    let mut count = 0;
+    let mut cursor = array.walk();
+    for element in array.named_children(&mut cursor) {
+        if element.kind() != "array_element_initializer" || element.named_child_count() != 1 {
+            return None;
+        }
+        if element
+            .named_child(0)
+            .is_some_and(|child| child.kind() == "variadic_unpacking")
+        {
+            return None;
+        }
+        count += 1;
+    }
+    Some(count)
+}
+
+fn check_call_argument_count(
+    node: tree_sitter::Node,
+    source: &str,
+    signature: &Signature,
+    strict_upper_bound: bool,
+    callable_name: &str,
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+) {
+    let arguments = summarize_call_arguments(node, source);
+    if arguments.first_class_callable {
+        return;
+    }
+    let required = signature
+        .params
+        .iter()
+        .enumerate()
+        .filter(|(_, parameter)| parameter.default_value.is_none() && !parameter.is_variadic)
+        .map(|(index, _)| index + 1)
+        .max()
+        .unwrap_or(0);
+    let variadic = signature
+        .params
+        .iter()
+        .any(|parameter| parameter.is_variadic);
+    let max = signature.params.len();
+    let range = node_range(&call_arguments_node(node).unwrap_or(node));
+    if arguments.positional_after_named {
+        diagnostics.push(SemanticDiagnostic {
+            range,
+            message: format!("Positional argument after named argument to {callable_name}()"),
+            kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+        });
+        return;
+    }
+    let mut provided = vec![false; max];
+    for slot in provided
+        .iter_mut()
+        .take(arguments.definite_positional_prefix)
+    {
+        *slot = true;
+    }
+    let mut explicit_names = HashSet::new();
+    for name in &arguments.named {
+        if !explicit_names.insert(name.as_str()) {
+            diagnostics.push(SemanticDiagnostic {
+                range,
+                message: format!("Duplicate named argument ${name} to {callable_name}()"),
+                kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+            });
+            return;
+        }
+        if let Some(index) = signature
+            .params
+            .iter()
+            .position(|parameter| parameter.name.trim_start_matches('$') == name)
+        {
+            if provided[index] && !signature.params[index].is_variadic {
+                diagnostics.push(SemanticDiagnostic {
+                    range,
+                    message: format!("Duplicate named argument ${name} to {callable_name}()"),
+                    kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+                });
+                return;
+            }
+            provided[index] = true;
+        } else if !variadic {
+            diagnostics.push(SemanticDiagnostic {
+                range,
+                message: format!("Unknown named argument ${name} to {callable_name}()"),
+                kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+            });
+            return;
+        }
+    }
+
+    if !arguments.unknown_unpack {
+        if let Some((_, missing)) = signature
+            .params
+            .iter()
+            .take(required)
+            .enumerate()
+            .find(|(index, _)| !provided[*index])
+        {
+            let message = if arguments.named.is_empty() {
+                format!(
+                    "Too few arguments to {callable_name}(): expected at least {required}, got {}",
+                    arguments.positional
+                )
+            } else {
+                format!(
+                    "Missing required argument ${} to {callable_name}()",
+                    missing.name.trim_start_matches('$')
+                )
+            };
+            diagnostics.push(SemanticDiagnostic {
+                range,
+                message,
+                kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+            });
+            return;
+        }
+    }
+    if strict_upper_bound && !variadic && arguments.positional > max {
+        diagnostics.push(SemanticDiagnostic {
+            range,
+            message: format!(
+                "Too many arguments to {callable_name}(): expected at most {max}, got {}",
+                arguments.positional
+            ),
+            kind: SemanticDiagnosticKind::ArgumentCountMismatch,
+        });
+    }
 }
 
 fn check_unused_imports(

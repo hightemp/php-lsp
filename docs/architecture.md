@@ -821,6 +821,14 @@ override signatures, and PHP-version checks. Duplicate-name comparisons follow
 the casing rules of each symbol kind. Per-category severity is controlled by
 `phpLsp.diagnostics.severity`.
 
+Function and constructor argument diagnostics match named arguments to
+parameter names and treat parameters before the last required parameter as
+required. Packed literal unpacks have a known count; when unpack cardinality or
+keys are dynamic, count diagnostics avoid assuming that `...$args` supplies
+exactly one value. First-class callable syntax (`fn_name(...)`) is not a call.
+Extra positional arguments remain valid for user-defined PHP callables; a
+strict upper bound is checked only for known built-in symbols.
+
 Variable diagnostics treat each arrow function as a lexical scope. Its
 parameters and assignments belong to that scope; reads of outer variables are
 credited as implicit captures at the arrow's creation site, including through
