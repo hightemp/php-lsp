@@ -493,6 +493,7 @@ async fn index_class_uncached_with_context(
                 staged_index.clone(),
                 abs.clone(),
                 "lazy PHP file index",
+                context.php_version,
             )
             .await
             {

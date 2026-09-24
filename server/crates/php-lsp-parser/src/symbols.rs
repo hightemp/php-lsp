@@ -524,12 +524,20 @@ fn extract_class_like(
         .scoped_at_byte_position(start.row as u32, start.column as u32)
         .into_owned();
 
-    let modifiers = extract_modifiers(node, source);
+    let mut modifiers = extract_modifiers(node, source);
     let attributes = attribute_groups_for_node(node, source);
     let doc_comment_node = find_doc_comment_node(node, source);
     let doc_comment = doc_comment_node
         .as_ref()
         .map(|doc_node| node_text(*doc_node, source).to_string());
+    modifiers.is_deprecated = declaration_is_deprecated(
+        node,
+        source,
+        doc_comment.as_deref(),
+        kind,
+        php_version,
+        &resolution_symbols,
+    );
     let templates = phpdoc_templates(doc_comment.as_deref());
     let mut template_bindings =
         phpdoc_template_bindings(doc_comment.as_deref(), &resolution_symbols);
@@ -926,9 +934,17 @@ fn extract_method(
     let fqn = format!("{}::{}", parent_fqn, name);
 
     let visibility = extract_visibility(node, source);
-    let modifiers = extract_modifiers(node, source);
+    let mut modifiers = extract_modifiers(node, source);
     let attributes = attribute_groups_for_node(node, source);
     let doc_comment = find_doc_comment(node, source);
+    modifiers.is_deprecated = declaration_is_deprecated(
+        node,
+        source,
+        doc_comment.as_deref(),
+        PhpSymbolKind::Method,
+        php_version,
+        result,
+    );
     let templates = phpdoc_templates(doc_comment.as_deref());
     let mut signature = extract_signature(node, source, php_version);
 
@@ -969,7 +985,16 @@ fn extract_method(
                     continue;
                 }
                 let prop_vis = extract_visibility(child, source);
-                let prop_mods = extract_modifiers(child, source);
+                let mut prop_mods = extract_modifiers(child, source);
+                let prop_doc = find_doc_comment(child, source);
+                prop_mods.is_deprecated = declaration_is_deprecated(
+                    child,
+                    source,
+                    prop_doc.as_deref(),
+                    PhpSymbolKind::Property,
+                    php_version,
+                    result,
+                );
                 let prop_attributes = attribute_groups_for_node(child, source);
                 let prop_type = child
                     .child_by_field_name("type")
@@ -989,7 +1014,7 @@ fn extract_method(
                         visibility: prop_vis,
                         modifiers: prop_mods,
                         attributes: prop_attributes,
-                        doc_comment: None,
+                        doc_comment: prop_doc.clone(),
                         signature: prop_type.map(|t| Signature {
                             params: vec![],
                             return_type: Some(t),
@@ -1027,6 +1052,17 @@ fn extract_function(
     let fqn = make_fqn(current_ns, &name);
     let attributes = attribute_groups_for_node(node, source);
     let doc_comment = find_doc_comment(node, source);
+    let modifiers = SymbolModifiers {
+        is_deprecated: declaration_is_deprecated(
+            node,
+            source,
+            doc_comment.as_deref(),
+            PhpSymbolKind::Function,
+            php_version,
+            result,
+        ),
+        ..Default::default()
+    };
     let templates = phpdoc_templates(doc_comment.as_deref());
     let mut signature = extract_signature(node, source, php_version);
 
@@ -1043,7 +1079,7 @@ fn extract_function(
         range: node_range(node),
         selection_range: node_range(name_node),
         visibility: Visibility::Public,
-        modifiers: SymbolModifiers::default(),
+        modifiers,
         attributes,
         doc_comment,
         signature: Some(signature),
@@ -1069,8 +1105,16 @@ fn extract_properties(
     }
 
     let visibility = extract_visibility(node, source);
-    let modifiers = extract_modifiers(node, source);
+    let mut modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
+    modifiers.is_deprecated = declaration_is_deprecated(
+        node,
+        source,
+        doc_comment.as_deref(),
+        PhpSymbolKind::Property,
+        php_version,
+        result,
+    );
     let attribute_text = attribute_prefix_for_node(node, source);
     let attributes = attribute_groups_for_node(node, source);
 
@@ -1314,8 +1358,16 @@ fn extract_class_constants(
     }
 
     let visibility = extract_visibility(node, source);
-    let modifiers = extract_modifiers(node, source);
+    let mut modifiers = extract_modifiers(node, source);
     let doc_comment = find_doc_comment(node, source);
+    modifiers.is_deprecated = declaration_is_deprecated(
+        node,
+        source,
+        doc_comment.as_deref(),
+        PhpSymbolKind::ClassConstant,
+        php_version,
+        result,
+    );
     let attributes = attribute_groups_for_node(node, source);
 
     let mut cursor = node.walk();
@@ -1369,6 +1421,17 @@ fn extract_global_constants(
     }
 
     let doc_comment = find_doc_comment(node, source);
+    let modifiers = SymbolModifiers {
+        is_deprecated: declaration_is_deprecated(
+            node,
+            source,
+            doc_comment.as_deref(),
+            PhpSymbolKind::GlobalConstant,
+            php_version,
+            result,
+        ),
+        ..Default::default()
+    };
     let attributes = attribute_groups_for_node(node, source);
 
     let mut cursor = node.walk();
@@ -1391,7 +1454,7 @@ fn extract_global_constants(
                     range: node_range(node),
                     selection_range: node_range(name_node),
                     visibility: Visibility::Public,
-                    modifiers: SymbolModifiers::default(),
+                    modifiers,
                     attributes: attributes.clone(),
                     doc_comment: doc_comment.clone(),
                     signature: None,
@@ -1426,6 +1489,17 @@ fn extract_enum_case(
     let name = node_text(name_node, source).to_string();
     let fqn = format!("{}::{}", parent_fqn, name);
     let doc_comment = find_doc_comment(node, source);
+    let modifiers = SymbolModifiers {
+        is_deprecated: declaration_is_deprecated(
+            node,
+            source,
+            doc_comment.as_deref(),
+            PhpSymbolKind::EnumCase,
+            php_version,
+            result,
+        ),
+        ..Default::default()
+    };
     let attributes = attribute_groups_for_node(node, source);
 
     result.symbols.push(SymbolInfo {
@@ -1436,7 +1510,7 @@ fn extract_enum_case(
         range: node_range(node),
         selection_range: node_range(name_node),
         visibility: Visibility::Public,
-        modifiers: SymbolModifiers::default(),
+        modifiers,
         attributes,
         doc_comment,
         signature: None,
@@ -2129,6 +2203,86 @@ fn extract_modifiers(node: Node, _source: &str) -> SymbolModifiers {
     mods
 }
 
+fn declaration_is_deprecated(
+    node: Node,
+    source: &str,
+    doc_comment: Option<&str>,
+    kind: PhpSymbolKind,
+    php_version: Option<PhpSymbolExtractionVersion>,
+    file_symbols: &FileSymbols,
+) -> bool {
+    if doc_comment.is_some_and(|doc| crate::phpdoc::parse_phpdoc(doc).deprecated.is_some()) {
+        return true;
+    }
+
+    // Without a configured version, extraction describes source metadata using
+    // the latest supported attribute targets. Versioned callers use the PHP
+    // runtime selected for their workspace or stub set.
+    let php_version = php_version.unwrap_or(PhpSymbolExtractionVersion { major: 8, minor: 5 });
+    let minimum_version = match kind {
+        PhpSymbolKind::Function
+        | PhpSymbolKind::Method
+        | PhpSymbolKind::ClassConstant
+        | PhpSymbolKind::EnumCase => PhpSymbolExtractionVersion { major: 8, minor: 4 },
+        PhpSymbolKind::Trait | PhpSymbolKind::GlobalConstant => {
+            PhpSymbolExtractionVersion { major: 8, minor: 5 }
+        }
+        _ => return false,
+    };
+    if php_version < minimum_version {
+        return false;
+    }
+
+    let start = node.start_position();
+    let scoped_symbols =
+        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+    let mut lists = Vec::new();
+    let mut node_cursor = node.walk();
+    lists.extend(
+        node.named_children(&mut node_cursor)
+            .filter(|child| child.kind() == "attribute_list"),
+    );
+    // PHP 8.5 global-constant attributes are currently separate CST siblings
+    // rather than children of the const declaration.
+    let mut previous = node.prev_sibling();
+    let mut boundary = node.start_byte();
+    while let Some(sibling) = previous {
+        if sibling.kind() != "attribute_list"
+            || !source[sibling.end_byte()..boundary].trim().is_empty()
+        {
+            break;
+        }
+        lists.push(sibling);
+        boundary = sibling.start_byte();
+        previous = sibling.prev_sibling();
+    }
+    for list in lists {
+        let mut list_cursor = list.walk();
+        for group in list.named_children(&mut list_cursor) {
+            let mut group_cursor = group.walk();
+            for attribute in group.named_children(&mut group_cursor) {
+                if attribute.kind() != "attribute" {
+                    continue;
+                }
+                let Some(name) = attribute.named_child(0) else {
+                    continue;
+                };
+                if !matches!(name.kind(), "name" | "qualified_name") {
+                    continue;
+                }
+                let fqn = resolve_class_name_in_file(node_text(name, source), &scoped_symbols);
+                if fqn
+                    .trim_start_matches('\\')
+                    .eq_ignore_ascii_case("Deprecated")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn has_child_kind(node: Node, kind: &str) -> bool {
     let mut cursor = node.walk();
     let result = node.children(&mut cursor).any(|c| c.kind() == kind);
@@ -2141,9 +2295,28 @@ fn find_doc_comment(node: Node, source: &str) -> Option<String> {
 }
 
 fn find_doc_comment_node<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
+    let mut leading_doc = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "attribute_list" => {}
+            "comment" => {
+                leading_doc = node_text(child, source).starts_with("/**").then_some(child);
+            }
+            _ => break,
+        }
+    }
+    if leading_doc.is_some() {
+        return leading_doc;
+    }
+
     // Look for a comment node as a previous sibling
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {
+        if p.kind() == "attribute_list" {
+            prev = p.prev_sibling();
+            continue;
+        }
         if p.kind() == "comment" {
             let text = node_text(p, source);
             if text.starts_with("/**") {

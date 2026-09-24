@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// bytes. The cache schema fixture test below guards the representative binary
 /// shape so CI fails until this version and its fingerprint are updated
 /// together.
-pub const CACHE_SCHEMA_VERSION: u32 = 23;
+pub const CACHE_SCHEMA_VERSION: u32 = 24;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;

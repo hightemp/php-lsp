@@ -246,15 +246,18 @@ fn commit_workspace_disk_file_preserving_open(
     ctx: DiskPhpIndexCommitContext<'_>,
     file_symbols: php_lsp_types::FileSymbols,
     references: Vec<php_lsp_types::SymbolReference>,
+    php_version: PhpVersion,
 ) {
     if commit_disk_php_index_if_closed(ctx, Some(file_symbols), references) {
         return;
     }
-    if let Some(snapshot) = open_document_snapshot_from_state(
+    if let Some(snapshot) = open_document_snapshot_from_state_with_lock_hook_for_version(
         ctx.open_files,
         ctx.template_documents,
         ctx.document_versions,
         ctx.uri_str,
+        Some(symbol_extraction_version(php_version)),
+        || {},
     ) {
         commit_open_document_index_snapshot_if_current(
             OpenDocumentIndexCommitContext {
@@ -385,6 +388,7 @@ impl PhpLspBackend {
                 }
                 let runtime = &config.runtime_config;
                 let indexing_options = WorkspaceIndexingOptions {
+                    php_version: runtime.php_version,
                     include_paths: runtime.include_paths.clone(),
                     exclude_paths: runtime.exclude_paths.clone(),
                     traversal_limits: runtime.traversal_limits,
@@ -1542,9 +1546,18 @@ pub(in crate::server) fn read_php_source_lossy(file_path: &Path) -> std::io::Res
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+#[cfg(test)]
 pub(in crate::server) fn parse_and_index_php_file(
     index: &WorkspaceIndex,
     file_path: &Path,
+) -> bool {
+    parse_and_index_php_file_for_version(index, file_path, None)
+}
+
+fn parse_and_index_php_file_for_version(
+    index: &WorkspaceIndex,
+    file_path: &Path,
+    php_version: Option<PhpVersion>,
 ) -> bool {
     let uri = match path_to_uri(file_path) {
         Ok(uri) => uri,
@@ -1562,14 +1575,22 @@ pub(in crate::server) fn parse_and_index_php_file(
         return false;
     };
 
-    let file_symbols = extract_file_symbols(tree, &source, &uri);
+    let file_symbols = extract_index_file_symbols(tree, &source, &uri, php_version);
     let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
     index.update_file_with_references(&uri, file_symbols, references);
     true
 }
 
+#[cfg(test)]
 pub(in crate::server) fn parse_workspace_file_for_index(
     file_path: PathBuf,
+) -> WorkspaceParseResult {
+    parse_workspace_file_for_index_with_version(file_path, None)
+}
+
+fn parse_workspace_file_for_index_with_version(
+    file_path: PathBuf,
+    php_version: Option<PhpVersion>,
 ) -> WorkspaceParseResult {
     let uri = match path_to_uri(&file_path) {
         Ok(uri) => uri,
@@ -1611,7 +1632,7 @@ pub(in crate::server) fn parse_workspace_file_for_index(
         };
     };
 
-    let file_symbols = extract_file_symbols(tree, &source, &uri);
+    let file_symbols = extract_index_file_symbols(tree, &source, &uri, php_version);
     let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
     let symbol_count = file_symbols.symbols.len();
     WorkspaceParseResult {
@@ -1624,13 +1645,56 @@ pub(in crate::server) fn parse_workspace_file_for_index(
     }
 }
 
-pub(in crate::server) async fn parse_workspace_file_for_index_blocking(
+fn extract_index_file_symbols(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    uri: &str,
+    php_version: Option<PhpVersion>,
+) -> php_lsp_types::FileSymbols {
+    if let Some(version) = php_version {
+        extract_file_symbols_for_php_version(tree, source, uri, symbol_extraction_version(version))
+    } else {
+        extract_file_symbols(tree, source, uri)
+    }
+}
+
+pub(in crate::server) async fn parse_workspace_file_for_versions_blocking(
     file_path: PathBuf,
+    versions: Vec<PhpVersion>,
     label: &'static str,
-) -> std::result::Result<WorkspaceParseResult, String> {
+) -> std::result::Result<Vec<VersionedPhpFileSymbols>, String> {
     let path_label = file_path.display().to_string();
     run_file_io_blocking(label, path_label, move || {
-        parse_workspace_file_for_index(file_path)
+        let source = read_php_source_lossy(&file_path).ok();
+        let uri = path_to_uri(&file_path).ok();
+        let mut parser = FileParser::new();
+        if let Some(source) = source.as_deref() {
+            parser.parse_full(source);
+        }
+        versions
+            .into_iter()
+            .map(|php_version| {
+                let parsed = source
+                    .as_deref()
+                    .zip(uri.as_deref())
+                    .zip(parser.tree())
+                    .map(|((source, uri), tree)| {
+                        let symbols = extract_file_symbols_for_php_version(
+                            tree,
+                            source,
+                            uri,
+                            symbol_extraction_version(php_version),
+                        );
+                        let references = collect_symbol_references_in_file(tree, source, &symbols);
+                        (symbols, references)
+                    });
+                VersionedPhpFileSymbols {
+                    php_version,
+                    file_symbols: parsed.as_ref().map(|(symbols, _)| symbols.clone()),
+                    references: parsed.map(|(_, references)| references).unwrap_or_default(),
+                }
+            })
+            .collect()
     })
     .await
 }
@@ -1639,10 +1703,11 @@ pub(in crate::server) async fn parse_and_index_php_file_blocking(
     index: Arc<WorkspaceIndex>,
     file_path: PathBuf,
     label: &'static str,
+    php_version: PhpVersion,
 ) -> bool {
     let path_label = file_path.display().to_string();
     match run_file_io_blocking(label, path_label.clone(), move || {
-        parse_and_index_php_file(&index, &file_path)
+        parse_and_index_php_file_for_version(&index, &file_path, Some(php_version))
     })
     .await
     {
@@ -1909,6 +1974,7 @@ pub(in crate::server) async fn preload_vendor_entrypoints(
                 staged_index.clone(),
                 file_path.clone(),
                 "vendor preload PHP file index",
+                php_version,
             )
             .await
         {
@@ -2008,6 +2074,7 @@ pub(in crate::server) async fn rebuild_aggregate_for_indexing_runs(
     aggregate_rebuild: &Arc<Mutex<()>>,
     aggregate_index: &Arc<WorkspaceIndex>,
     configs: Vec<WorkspaceRootConfig>,
+    fallback_php_version: PhpVersion,
     open_files: Arc<DashMap<String, FileParser>>,
     template_documents: Arc<DashMap<String, TemplateDocument>>,
     document_versions: Arc<DashMap<String, OpenDocumentState>>,
@@ -2034,6 +2101,7 @@ pub(in crate::server) async fn rebuild_aggregate_for_indexing_runs(
         rebuild_aggregate_index(
             &staged_for_build,
             &configs,
+            fallback_php_version,
             &open_files,
             &template_documents,
             &document_versions,
@@ -2099,6 +2167,7 @@ pub(in crate::server) async fn postprocess_workspace_indexing_runs(
         &aggregate_rebuild,
         &aggregate_index,
         current_state.configs.clone(),
+        current_state.fallback.php_version,
         open_files.clone(),
         template_documents.clone(),
         document_versions.clone(),
@@ -2161,17 +2230,19 @@ pub(in crate::server) async fn postprocess_workspace_indexing_runs(
         .map(|entry| entry.key().clone())
         .collect::<Vec<_>>();
     for uri_str in open_file_uris {
-        let Some(snapshot) = open_document_snapshot_from_state(
+        let commit_state = runtime_state.lock().await.clone();
+        let Some(config) = workspace_config_for_uri_from_configs(&commit_state.configs, &uri_str)
+        else {
+            continue;
+        };
+        let Some(snapshot) = open_document_snapshot_from_state_with_lock_hook_for_version(
             &open_files,
             &template_documents,
             &document_versions,
             &uri_str,
+            Some(symbol_extraction_version(config.runtime_config.php_version)),
+            || {},
         ) else {
-            continue;
-        };
-        let commit_state = runtime_state.lock().await.clone();
-        let Some(config) = workspace_config_for_uri_from_configs(&commit_state.configs, &uri_str)
-        else {
             continue;
         };
         let Some(completed_run) = completed.iter().find(|completed| {
@@ -2545,6 +2616,7 @@ pub(in crate::server) async fn index_workspace(
                     },
                     file_symbols,
                     references,
+                    options.php_version,
                 );
             })
             .is_none()
@@ -2617,13 +2689,16 @@ pub(in crate::server) async fn index_workspace(
     }
 
     let parse_concurrency = indexing_parse_concurrency();
+    let php_version = options.php_version;
     let mut pending_files = files_to_parse.into_iter();
     let mut parse_tasks = JoinSet::new();
     while parse_tasks.len() < parse_concurrency {
         let Some(file_path) = pending_files.next() else {
             break;
         };
-        parse_tasks.spawn_blocking(move || parse_workspace_file_for_index(file_path));
+        parse_tasks.spawn_blocking(move || {
+            parse_workspace_file_for_index_with_version(file_path, Some(php_version))
+        });
     }
 
     let mut done = loaded_from_cache;
@@ -2680,6 +2755,7 @@ pub(in crate::server) async fn index_workspace(
                         },
                         file_symbols,
                         parsed.references,
+                        options.php_version,
                     );
                 })
                 .is_none()
@@ -2715,7 +2791,9 @@ pub(in crate::server) async fn index_workspace(
             let Some(file_path) = pending_files.next() else {
                 break;
             };
-            parse_tasks.spawn_blocking(move || parse_workspace_file_for_index(file_path));
+            parse_tasks.spawn_blocking(move || {
+                parse_workspace_file_for_index_with_version(file_path, Some(php_version))
+            });
         }
 
         if let Some(ref p) = ongoing {
@@ -2847,52 +2925,64 @@ impl PhpLspBackend {
     pub(in crate::server) async fn commit_closed_php_snapshot_to_current_runtime(
         &self,
         uri_str: &str,
-        file_symbols: Option<php_lsp_types::FileSymbols>,
-        references: Vec<php_lsp_types::SymbolReference>,
+        snapshots: Option<Vec<VersionedPhpFileSymbols>>,
     ) -> bool {
-        for _ in 0..4 {
-            let state = self.runtime_state_snapshot().await;
-            let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
-            let dashmap::mapref::entry::Entry::Vacant(_open_entry) =
-                self.open_files.entry(uri_str.to_string())
-            else {
-                return false;
-            };
-            if self.template_documents.contains_key(uri_str)
-                || self.document_versions.contains_key(uri_str)
-            {
-                return false;
+        let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
+        let state = self.runtime_state.lock().await;
+        let dashmap::mapref::entry::Entry::Vacant(_open_entry) =
+            self.open_files.entry(uri_str.to_string())
+        else {
+            return false;
+        };
+        if self.template_documents.contains_key(uri_str)
+            || self.document_versions.contains_key(uri_str)
+        {
+            return false;
+        }
+        if let Some(snapshots) = snapshots.as_ref() {
+            let indexes = workspace_indexes_for_uri(&state, uri_str, true);
+            let mut target_snapshots = Vec::new();
+            for index in &indexes {
+                let version = php_version_for_workspace_index(&state, index);
+                let Some(snapshot) = snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.php_version == version)
+                else {
+                    return false;
+                };
+                target_snapshots.push((index, snapshot));
             }
-            if let Some(file_symbols) = file_symbols.as_ref() {
-                let indexes = workspace_indexes_for_uri(&state, uri_str, true);
-                if indexes.is_empty() {
-                    self.index.remove_file(uri_str);
-                } else {
+            if indexes.is_empty() {
+                self.index.remove_file(uri_str);
+            } else {
+                if let Some(symbols) = target_snapshots[0].1.file_symbols.as_ref() {
                     self.index.update_file_with_references(
                         uri_str,
-                        file_symbols.clone(),
-                        references.clone(),
+                        symbols.clone(),
+                        target_snapshots[0].1.references.clone(),
                     );
-                    for index in indexes {
+                } else {
+                    self.index.remove_file(uri_str);
+                }
+                for (index, snapshot) in target_snapshots {
+                    if let Some(symbols) = snapshot.file_symbols.as_ref() {
                         index.update_file_with_references(
                             uri_str,
-                            file_symbols.clone(),
-                            references.clone(),
+                            symbols.clone(),
+                            snapshot.references.clone(),
                         );
+                    } else {
+                        index.remove_file(uri_str);
                     }
                 }
-            } else {
-                self.index.remove_file(uri_str);
-                for index in workspace_indexes_for_uri(&state, uri_str, false) {
-                    index.remove_file(uri_str);
-                }
             }
-            drop(_open_entry);
-            if Arc::ptr_eq(&state, &self.runtime_state_snapshot().await) {
-                return true;
+        } else {
+            self.index.remove_file(uri_str);
+            for index in workspace_indexes_for_uri(&state, uri_str, false) {
+                index.remove_file(uri_str);
             }
         }
-        false
+        true
     }
 
     pub(in crate::server) async fn path_is_excluded_by_config(&self, path: &Path) -> bool {
@@ -2923,7 +3013,7 @@ impl PhpLspBackend {
                     false
                 }
             } else {
-                self.commit_closed_php_snapshot_to_current_runtime(&uri_str, None, Vec::new())
+                self.commit_closed_php_snapshot_to_current_runtime(&uri_str, None)
                     .await
             };
             self.semantic_tokens_cache.lock().await.remove(&uri_str);
@@ -2948,7 +3038,7 @@ impl PhpLspBackend {
             }
             let state = self.runtime_state_snapshot().await;
             if workspace_indexes_for_uri(&state, &uri_str, true).is_empty() {
-                self.commit_closed_php_snapshot_to_current_runtime(&uri_str, None, Vec::new())
+                self.commit_closed_php_snapshot_to_current_runtime(&uri_str, None)
                     .await;
                 self.semantic_tokens_cache.lock().await.remove(&uri_str);
                 return;
@@ -2972,34 +3062,50 @@ impl PhpLspBackend {
         let Some(path) = uri_to_path(&uri_str) else {
             return;
         };
-
-        let (file_symbols, references) =
-            match parse_workspace_file_for_index_blocking(path.clone(), "watched PHP file reindex")
-                .await
+        let mut committed_disk = false;
+        for _ in 0..4 {
+            let state = self.runtime_state_snapshot().await;
+            let mut versions = workspace_indexes_for_uri(&state, &uri_str, true)
+                .iter()
+                .map(|index| php_version_for_workspace_index(&state, index))
+                .collect::<Vec<_>>();
+            versions.sort_unstable();
+            versions.dedup();
+            let snapshots = match parse_workspace_file_for_versions_blocking(
+                path.clone(),
+                versions.clone(),
+                "watched PHP file reindex",
+            )
+            .await
             {
-                Ok(parsed) => {
-                    if let Some(error) = parsed.error.as_ref() {
-                        tracing::debug!(
-                            "Failed to reindex watched PHP file {}, removing from index: {}",
-                            path.display(),
-                            error
-                        );
-                    }
-                    (parsed.file_symbols, parsed.references)
-                }
+                Ok(snapshots) => snapshots,
                 Err(message) => {
                     tracing::warn!(
-                    "Failed to schedule watched PHP file reindex for {}, removing from index: {}",
-                    path.display(),
-                    message
-                );
-                    (None, Vec::new())
+                        "Failed to schedule watched PHP file reindex for {}, removing from index: {}",
+                        path.display(),
+                        message
+                    );
+                    versions
+                        .into_iter()
+                        .map(|php_version| VersionedPhpFileSymbols {
+                            php_version,
+                            file_symbols: None,
+                            references: Vec::new(),
+                        })
+                        .collect()
                 }
             };
-
-        let committed_disk = self
-            .commit_closed_php_snapshot_to_current_runtime(&uri_str, file_symbols, references)
-            .await;
+            if self
+                .commit_closed_php_snapshot_to_current_runtime(&uri_str, Some(snapshots))
+                .await
+            {
+                committed_disk = true;
+                break;
+            }
+            if self.current_document_state(&uri_str).is_some() {
+                break;
+            }
+        }
         if !committed_disk {
             if let Some(snapshot) = self.open_document_snapshot(&uri_str) {
                 if let Some(expected) = snapshot.document_state {

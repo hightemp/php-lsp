@@ -1,4 +1,5 @@
 use super::*;
+use lsp_types::CompletionItemTag;
 use php_lsp_types::*;
 
 fn make_symbol(
@@ -1782,4 +1783,72 @@ fn current_file_members_replace_stale_index_generation() {
         .collect();
     assert!(static_labels.contains(&"newStatic"));
     assert!(!static_labels.contains(&"oldStatic"));
+}
+
+#[test]
+fn deprecated_symbols_have_tags_in_initial_free_and_namespace_completions() {
+    let index = WorkspaceIndex::new();
+    let mut old_class = make_symbol(
+        "OldClass",
+        "App\\OldClass",
+        PhpSymbolKind::Class,
+        None,
+        Visibility::Public,
+        false,
+    );
+    old_class.modifiers.is_deprecated = true;
+    let mut old_function = make_symbol(
+        "OldFunction",
+        "App\\OldFunction",
+        PhpSymbolKind::Function,
+        None,
+        Visibility::Public,
+        false,
+    );
+    old_function.modifiers.is_deprecated = true;
+    let current_class = make_symbol(
+        "OldLookingCurrent",
+        "App\\OldLookingCurrent",
+        PhpSymbolKind::Class,
+        None,
+        Visibility::Public,
+        false,
+    );
+    let file_symbols = FileSymbols {
+        symbols: vec![old_class, old_function, current_class],
+        ..Default::default()
+    };
+    index.update_file("file:///test.php", file_symbols.clone());
+
+    for context in [
+        CompletionContext::Free {
+            prefix: "Old".to_string(),
+        },
+        CompletionContext::Namespace {
+            prefix: "App\\Old".to_string(),
+        },
+        CompletionContext::UseStatement {
+            prefix: "App\\Old".to_string(),
+        },
+    ] {
+        let items = provide_completions_outside_class_for_test(&context, &index, &file_symbols);
+        let old_class = items.iter().find(|item| item.label == "OldClass").unwrap();
+        assert_eq!(
+            old_class.tags,
+            Some(vec![CompletionItemTag::DEPRECATED]),
+            "{context:?}: {old_class:?}"
+        );
+        let current = items
+            .iter()
+            .find(|item| item.label == "OldLookingCurrent")
+            .unwrap();
+        assert!(current.tags.is_none(), "{context:?}: {current:?}");
+        if matches!(context, CompletionContext::Free { .. }) {
+            let old_function = items
+                .iter()
+                .find(|item| item.label == "OldFunction")
+                .unwrap();
+            assert_eq!(old_function.tags, Some(vec![CompletionItemTag::DEPRECATED]));
+        }
+    }
 }

@@ -71,7 +71,8 @@ impl PhpLspBackend {
             template_document,
             file_symbols,
             ..
-        }) = self.open_document_snapshot(&uri_str)
+        }) = self
+            .open_document_snapshot_for_php_version(&uri_str, request.runtime_config().php_version)
         else {
             return Ok(None);
         };
@@ -161,7 +162,8 @@ impl PhpLspBackend {
             template_document,
             document_state,
             file_symbols,
-        }) = self.open_document_snapshot(&uri_str)
+        }) = self
+            .open_document_snapshot_for_php_version(&uri_str, request.runtime_config().php_version)
         else {
             return Ok(None);
         };

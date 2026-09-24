@@ -651,6 +651,7 @@ fn provide_namespace_completions_with_options(
                 )),
                 filter_text: Some(format!("{} {}", sym.name, sym.fqn)),
                 data: Some(serde_json::Value::String(sym.fqn.clone())),
+                tags: deprecated_completion_tags(sym),
                 ..Default::default()
             };
             if insert_fqn {
@@ -717,6 +718,7 @@ fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Complet
             )),
             filter_text: Some(format!("{} {}", sym.name, sym.fqn)),
             data: Some(serde_json::Value::String(sym.fqn.clone())),
+            tags: deprecated_completion_tags(&sym),
             ..Default::default()
         });
     }
@@ -733,6 +735,7 @@ fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Complet
                 filter_text: Some(format!("{} {}", sym.name, sym.fqn)),
                 commit_characters: Some(vec!["(".to_string()]),
                 data: Some(serde_json::Value::String(sym.fqn.clone())),
+                tags: deprecated_completion_tags(sym),
                 ..Default::default()
             });
         }
@@ -742,6 +745,12 @@ fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Complet
     sort_completion_items(&mut items);
     items.truncate(100);
     items
+}
+
+fn deprecated_completion_tags(sym: &SymbolInfo) -> Option<Vec<lsp_types::CompletionItemTag>> {
+    sym.modifiers
+        .is_deprecated
+        .then(|| vec![lsp_types::CompletionItemTag::DEPRECATED])
 }
 
 /// Convert a SymbolInfo to a CompletionItem.
@@ -761,16 +770,11 @@ pub fn symbol_to_completion_item(
             sym.name.clone()
         };
 
-    let mut tags = Vec::new();
-    if sym.modifiers.is_deprecated {
-        tags.push(lsp_types::CompletionItemTag::DEPRECATED);
-    }
-
     let mut item = CompletionItem {
         label,
         kind: Some(kind),
         detail,
-        tags: if tags.is_empty() { None } else { Some(tags) },
+        tags: deprecated_completion_tags(sym),
         // Store FQN in data for resolve
         data: Some(serde_json::Value::String(sym.fqn.clone())),
         ..Default::default()

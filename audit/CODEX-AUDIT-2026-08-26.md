@@ -1096,8 +1096,8 @@ Verifier review дал GO.
 
 ### CODEX-P2-09. `SymbolModifiers.is_deprecated` никогда не устанавливается
 
-Поле объявлено и используется completion/document/workspace symbols, но в
-production Rust нет ни одного присваивания `is_deprecated: true` или
+**Исправлено 2026-09-24.** Исходно поле объявлено и используется
+completion/document/workspace symbols, но в production Rust не было присваивания `is_deprecated: true` или
 `mods.is_deprecated = ...`. [`extract_modifiers`](server/crates/php-lsp-parser/src/symbols.rs#L2117)
 обрабатывает только static/abstract/final/readonly.
 
@@ -1105,8 +1105,23 @@ production Rust нет ни одного присваивания `is_deprecated
 `#[Deprecated]`; completion resolve частично компенсирует это только после
 дополнительного запроса.
 
-Что исправить: вычислять deprecated из PHPDoc и version-aware Deprecated
-attribute при извлечении всех поддерживаемых symbol kinds.
+Извлечение теперь помечает собственный `@deprecated` PHPDoc у class-like,
+functions, methods, properties (включая promoted), class/global constants и
+enum cases без переноса флага на соседние или виртуальные члены. Встроенный
+`#[\Deprecated]` распознаётся по CST имени и namespace imports, с учётом
+[допустимых targets и версии PHP](https://www.php.net/manual/en/class.deprecated.php):
+functions/methods/class constants/enum cases с 8.4, traits с 8.5. Начальные
+completion items и document/workspace symbol responses получают Deprecated tag;
+смена PHP version и обновления open/closed файлов перестраивают данные по
+версиям всех участвующих roots. Кешу повышена schema version, чтобы старые
+записи с ложным `false` не оставались свежими.
+
+Атрибут перед global `const` в PHP 8.5 текущая Tree-sitter grammar разбирает как
+`ERROR` + `const_declaration`; поддержка этой синтаксической формы относится к
+отдельной задаче PHP 8.5 grammar (P1-04). PHPDoc global constants работает.
+Добавлено 18 постоянных parser/completion/server/index и LSP e2e-регрессий;
+финальный Rust-набор прошёл 1156/1156 без пропусков. Clippy, Rustfmt, diff
+check и повторный Verifier review прошли.
 
 ### CODEX-P2-10. File-level PHPDoc aliases протекают между namespace sections
 

@@ -55,7 +55,9 @@ use php_lsp_parser::semantic::{
     SemanticDiagnosticKind,
 };
 use php_lsp_parser::signature_help::signature_help_context_at_position;
-use php_lsp_parser::symbols::extract_file_symbols;
+use php_lsp_parser::symbols::{
+    extract_file_symbols, extract_file_symbols_for_php_version, PhpSymbolExtractionVersion,
+};
 use php_lsp_parser::utf16::{range_byte_to_utf16, utf16_col_to_byte, Utf16LineIndex};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -266,6 +268,7 @@ struct OpenDocumentState {
     generation: u64,
 }
 
+#[derive(Clone)]
 struct OpenDocumentSnapshot {
     tree: tree_sitter::Tree,
     source: String,
@@ -284,6 +287,27 @@ fn open_document_snapshot_from_state_with_lock_hook<F>(
 where
     F: FnOnce(),
 {
+    open_document_snapshot_from_state_with_lock_hook_for_version(
+        open_files,
+        template_documents,
+        document_versions,
+        uri_str,
+        None,
+        after_open_lock,
+    )
+}
+
+fn open_document_snapshot_from_state_with_lock_hook_for_version<F>(
+    open_files: &DashMap<String, FileParser>,
+    template_documents: &DashMap<String, TemplateDocument>,
+    document_versions: &DashMap<String, OpenDocumentState>,
+    uri_str: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
+    after_open_lock: F,
+) -> Option<OpenDocumentSnapshot>
+where
+    F: FnOnce(),
+{
     // The parser entry is the primary per-document lock. Writers publish the
     // parser, template, and version while holding its write guard, so clone
     // every request-facing component before releasing this read guard.
@@ -296,7 +320,11 @@ where
         .map(|document| document.value().clone());
     let document_state = document_versions.get(uri_str).map(|state| *state);
     drop(parser);
-    let file_symbols = extract_file_symbols(&tree, &source, uri_str);
+    let file_symbols = if let Some(version) = php_version {
+        extract_file_symbols_for_php_version(&tree, &source, uri_str, version)
+    } else {
+        extract_file_symbols(&tree, &source, uri_str)
+    };
 
     Some(OpenDocumentSnapshot {
         tree,
@@ -400,10 +428,17 @@ struct ClosedPhpIndexCommitContext<'a> {
     token: u64,
 }
 
+struct ClosedPhpSecondaryIndexUpdate<'a> {
+    index: &'a WorkspaceIndex,
+    file_symbols: Option<php_lsp_types::FileSymbols>,
+    references: Vec<php_lsp_types::SymbolReference>,
+}
+
 fn commit_closed_php_index_if_current_with_hook<F>(
     ctx: ClosedPhpIndexCommitContext<'_>,
     file_symbols: Option<php_lsp_types::FileSymbols>,
     references: Vec<php_lsp_types::SymbolReference>,
+    secondary_updates: Vec<ClosedPhpSecondaryIndexUpdate<'_>>,
     before_open_lock: F,
 ) -> bool
 where
@@ -437,16 +472,17 @@ where
         let root_index = ctx.root_index.unwrap_or(ctx.index);
         remove_from_aggregate_and_root_index(ctx.index, root_index, ctx.uri_str);
     }
+    for update in secondary_updates {
+        if let Some(symbols) = update.file_symbols {
+            update
+                .index
+                .update_file_with_references(ctx.uri_str, symbols, update.references);
+        } else {
+            update.index.remove_file(ctx.uri_str);
+        }
+    }
     ctx.reload_tokens.remove(ctx.uri_str);
     true
-}
-
-fn commit_closed_php_index_if_current(
-    ctx: ClosedPhpIndexCommitContext<'_>,
-    file_symbols: Option<php_lsp_types::FileSymbols>,
-    references: Vec<php_lsp_types::SymbolReference>,
-) -> bool {
-    commit_closed_php_index_if_current_with_hook(ctx, file_symbols, references, || {})
 }
 
 struct DiagnosticPublishRequest {
@@ -1321,6 +1357,13 @@ impl PhpVersion {
     }
 }
 
+pub(crate) fn symbol_extraction_version(version: PhpVersion) -> PhpSymbolExtractionVersion {
+    PhpSymbolExtractionVersion {
+        major: version.major,
+        minor: version.minor,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FormattingConfig {
     provider: String,
@@ -2027,6 +2070,7 @@ fn runtime_configuration_changes(
 
 #[derive(Debug, Clone)]
 struct WorkspaceIndexingOptions {
+    php_version: PhpVersion,
     include_paths: Vec<PathBuf>,
     exclude_paths: Vec<PathBuf>,
     traversal_limits: TraversalLimits,
@@ -2284,6 +2328,18 @@ fn workspace_indexes_for_uri(
     unique
 }
 
+fn php_version_for_workspace_index(
+    state: &WorkspaceRuntimeState,
+    index: &Arc<WorkspaceIndex>,
+) -> PhpVersion {
+    state
+        .configs
+        .iter()
+        .find(|config| Arc::ptr_eq(&config.index, index))
+        .map(|config| config.runtime_config.php_version)
+        .unwrap_or(state.fallback.php_version)
+}
+
 fn update_aggregate_and_root_index(
     aggregate: &WorkspaceIndex,
     root_index: &WorkspaceIndex,
@@ -2344,6 +2400,7 @@ fn copy_non_stub_symbols(source: &WorkspaceIndex, destination: &WorkspaceIndex) 
 fn rebuild_aggregate_index(
     aggregate: &WorkspaceIndex,
     configs: &[WorkspaceRootConfig],
+    fallback_php_version: PhpVersion,
     open_files: &DashMap<String, FileParser>,
     template_documents: &DashMap<String, TemplateDocument>,
     document_versions: &DashMap<String, OpenDocumentState>,
@@ -2361,11 +2418,16 @@ fn rebuild_aggregate_index(
     }
     let open_uris: Vec<String> = open_files.iter().map(|entry| entry.key().clone()).collect();
     for uri in open_uris {
-        let Some(snapshot) = open_document_snapshot_from_state(
+        let php_version = workspace_config_for_uri_from_configs(configs, &uri)
+            .map(|config| config.runtime_config.php_version)
+            .unwrap_or(fallback_php_version);
+        let Some(snapshot) = open_document_snapshot_from_state_with_lock_hook_for_version(
             open_files,
             template_documents,
             document_versions,
             &uri,
+            Some(symbol_extraction_version(php_version)),
+            || {},
         ) else {
             continue;
         };
@@ -2410,6 +2472,13 @@ struct WorkspaceParseResult {
     references: Vec<php_lsp_types::SymbolReference>,
     symbol_count: usize,
     error: Option<String>,
+}
+
+#[derive(Clone)]
+struct VersionedPhpFileSymbols {
+    php_version: PhpVersion,
+    file_symbols: Option<php_lsp_types::FileSymbols>,
+    references: Vec<php_lsp_types::SymbolReference>,
 }
 
 impl SemanticTokensCache {
@@ -2877,6 +2946,21 @@ impl PhpLspBackend {
         )
     }
 
+    fn open_document_snapshot_for_php_version(
+        &self,
+        uri_str: &str,
+        php_version: PhpVersion,
+    ) -> Option<OpenDocumentSnapshot> {
+        open_document_snapshot_from_state_with_lock_hook_for_version(
+            &self.open_files,
+            &self.template_documents,
+            &self.document_versions,
+            uri_str,
+            Some(symbol_extraction_version(php_version)),
+            || {},
+        )
+    }
+
     async fn synchronize_open_document_index_to_current_runtime(
         &self,
         uri_str: &str,
@@ -2889,18 +2973,47 @@ impl PhpLspBackend {
             let indexes = workspace_indexes_for_uri(&state, uri_str, should_index);
             let committed = if should_index {
                 let Some(primary_index) = indexes.first() else {
-                    self.index.remove_file(uri_str);
-                    let current = self.runtime_state_snapshot().await;
-                    if Arc::ptr_eq(&state, &current) {
-                        return true;
+                    let current = self.runtime_state.lock().await;
+                    if !Arc::ptr_eq(&state, &current) {
+                        continue;
                     }
-                    continue;
+                    self.index.remove_file(uri_str);
+                    return true;
                 };
-                let Some(snapshot) = self.open_document_snapshot(uri_str) else {
+                let version_for_index = |index: &Arc<WorkspaceIndex>| {
+                    state
+                        .configs
+                        .iter()
+                        .find(|config| Arc::ptr_eq(&config.index, index))
+                        .map(|config| config.runtime_config.php_version)
+                        .unwrap_or(state.fallback.php_version)
+                };
+                let Some(snapshot) = self.open_document_snapshot_for_php_version(
+                    uri_str,
+                    version_for_index(primary_index),
+                ) else {
                     return false;
                 };
                 if snapshot.document_state != Some(expected) {
                     return false;
+                }
+                let secondary_snapshots = indexes
+                    .iter()
+                    .skip(1)
+                    .map(|index| {
+                        let mut secondary = snapshot.clone();
+                        secondary.file_symbols = extract_file_symbols_for_php_version(
+                            &snapshot.tree,
+                            &snapshot.source,
+                            uri_str,
+                            symbol_extraction_version(version_for_index(index)),
+                        );
+                        (index, secondary)
+                    })
+                    .collect::<Vec<_>>();
+                let current = self.runtime_state.lock().await;
+                if !Arc::ptr_eq(&state, &current) {
+                    continue;
                 }
                 let committed = commit_open_document_index_snapshot_if_current(
                     OpenDocumentIndexCommitContext {
@@ -2914,25 +3027,28 @@ impl PhpLspBackend {
                     &snapshot,
                 );
                 if committed {
-                    let references = snapshot.template_document.is_none().then(|| {
-                        collect_symbol_references_in_file(
-                            &snapshot.tree,
-                            &snapshot.source,
-                            &snapshot.file_symbols,
-                        )
-                    });
-                    if let Some(references) = references {
-                        for index in indexes.iter().skip(1) {
-                            index.update_file_with_references(
+                    for (index, secondary) in secondary_snapshots {
+                        if !commit_open_document_index_snapshot_if_current(
+                            OpenDocumentIndexCommitContext {
+                                open_files: &self.open_files,
+                                template_documents: &self.template_documents,
+                                document_versions: &self.document_versions,
+                                index,
+                                root_index: Some(index),
                                 uri_str,
-                                snapshot.file_symbols.clone(),
-                                references.clone(),
-                            );
+                            },
+                            &secondary,
+                        ) {
+                            return false;
                         }
                     }
                 }
                 committed
             } else {
+                let current = self.runtime_state.lock().await;
+                if !Arc::ptr_eq(&state, &current) {
+                    continue;
+                }
                 let dashmap::mapref::entry::Entry::Occupied(_entry) =
                     self.open_files.entry(uri_str.to_string())
                 else {
@@ -3672,6 +3788,7 @@ impl PhpLspBackend {
         self.resynchronize_open_documents_after_runtime_change(&application.previous_indexes)
             .await;
         if application.rebuild_aggregate {
+            let aggregate_state = self.runtime_state_snapshot().await;
             let aggregate_runs = reserved_indexing_runs
                 .iter()
                 .map(|pending| pending.guard.lease())
@@ -3680,7 +3797,8 @@ impl PhpLspBackend {
                 &self.indexing_run,
                 &self.aggregate_rebuild,
                 &self.index,
-                self.runtime_state_snapshot().await.configs.clone(),
+                aggregate_state.configs.clone(),
+                aggregate_state.fallback.php_version,
                 self.open_files.clone(),
                 self.template_documents.clone(),
                 self.document_versions.clone(),
@@ -3925,12 +4043,13 @@ impl PhpLspBackend {
             .iter()
             .map(IndexingRunGuard::lease)
             .collect::<Vec<_>>();
-        let current_configs = self.runtime_state_snapshot().await.configs.clone();
+        let current_state = self.runtime_state_snapshot().await;
         if !rebuild_aggregate_for_indexing_runs(
             &self.indexing_run,
             &self.aggregate_rebuild,
             &self.index,
-            current_configs,
+            current_state.configs.clone(),
+            current_state.fallback.php_version,
             self.open_files.clone(),
             self.template_documents.clone(),
             self.document_versions.clone(),
@@ -3978,6 +4097,7 @@ impl PhpLspBackend {
                 }
                 let runtime = &config.runtime_config;
                 let indexing_options = WorkspaceIndexingOptions {
+                    php_version: runtime.php_version,
                     include_paths: runtime.include_paths.clone(),
                     exclude_paths: runtime.exclude_paths.clone(),
                     traversal_limits: runtime.traversal_limits,
@@ -4245,6 +4365,7 @@ impl PhpLspBackend {
                 &self.aggregate_rebuild,
                 &self.index,
                 state.configs.clone(),
+                state.fallback.php_version,
                 self.open_files.clone(),
                 self.template_documents.clone(),
                 self.document_versions.clone(),
@@ -4266,6 +4387,7 @@ impl PhpLspBackend {
                 rebuild_aggregate_index(
                     &aggregate,
                     &rebuild_configs,
+                    state.fallback.php_version,
                     &open_files,
                     &template_documents,
                     &document_versions,

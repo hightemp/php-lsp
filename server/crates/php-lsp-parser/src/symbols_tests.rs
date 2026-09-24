@@ -1115,3 +1115,236 @@ interface Loggable {}
         .iter()
         .any(|s| s.kind == PhpSymbolKind::Property && s.fqn == "App\\Loggable::$secret"));
 }
+
+#[test]
+fn phpdoc_deprecated_marks_owning_symbols_without_bleeding() {
+    let symbols = parse_and_extract(
+        r#"<?php
+/** @deprecated */
+class OldClass {
+    /** @deprecated Use currentMethod. */
+    public function oldMethod(): void {}
+    public function currentMethod(): void {}
+    /** @deprecated */
+    public string $oldProperty;
+    public string $currentProperty;
+    /** @deprecated */
+    public const OLD = 1;
+    public const CURRENT = 2;
+}
+/** @deprecated */ interface OldInterface {}
+/** @deprecated */ trait OldTrait {}
+/** @deprecated */ enum OldEnum {
+    /** @deprecated */ case Legacy;
+    case Current;
+}
+/** @deprecated */ function oldFunction(): void {}
+function currentFunction(): void {}
+/** @deprecated */ const OLD_GLOBAL = 1;
+const CURRENT_GLOBAL = 2;
+"#,
+    );
+    for fqn in [
+        "OldClass",
+        "OldClass::oldMethod",
+        "OldClass::$oldProperty",
+        "OldClass::OLD",
+        "OldInterface",
+        "OldTrait",
+        "OldEnum",
+        "OldEnum::Legacy",
+        "oldFunction",
+        "OLD_GLOBAL",
+    ] {
+        let symbol = symbols.symbols.iter().find(|item| item.fqn == fqn).unwrap();
+        assert!(symbol.modifiers.is_deprecated, "{fqn}: {symbol:?}");
+    }
+    for fqn in [
+        "OldClass::currentMethod",
+        "OldClass::$currentProperty",
+        "OldClass::CURRENT",
+        "OldEnum::Current",
+        "currentFunction",
+        "CURRENT_GLOBAL",
+    ] {
+        let symbol = symbols.symbols.iter().find(|item| item.fqn == fqn).unwrap();
+        assert!(!symbol.modifiers.is_deprecated, "{fqn}: {symbol:?}");
+    }
+}
+
+#[test]
+fn unrelated_phpdoc_text_and_virtual_members_do_not_inherit_deprecation() {
+    let symbols = parse_and_extract(
+        r#"<?php
+/** @deprecatedSoon */ function similarTag(): void {}
+// @deprecated is only a comment here
+function regular(): void {}
+/**
+ * @deprecated
+ * @method int virtual()
+ * @property int $virtualProperty
+ */
+class OldOwner {}
+"#,
+    );
+    assert!(
+        symbols
+            .symbols
+            .iter()
+            .find(|item| item.fqn == "OldOwner")
+            .unwrap()
+            .modifiers
+            .is_deprecated
+    );
+    for fqn in [
+        "similarTag",
+        "regular",
+        "OldOwner::virtual",
+        "OldOwner::$virtualProperty",
+    ] {
+        let symbol = symbols.symbols.iter().find(|item| item.fqn == fqn).unwrap();
+        assert!(!symbol.modifiers.is_deprecated, "{fqn}: {symbol:?}");
+    }
+}
+
+#[test]
+fn builtin_deprecated_attribute_obeys_php_84_target_and_version() {
+    let code = r#"<?php
+#[\Deprecated] function oldFunction(): void {}
+#[\Deprecated] class NotAnAttributeTarget {
+    #[\Deprecated] public function oldMethod(): void {}
+    #[\Deprecated] public const OLD = 1;
+    #[\Deprecated] public string $notSupported;
+}
+enum Cases { #[\Deprecated] case Old; }
+"#;
+    let php83 = parse_and_extract_for_version(code, 8, 3);
+    assert!(php83
+        .symbols
+        .iter()
+        .all(|item| !item.modifiers.is_deprecated));
+
+    let php84 = parse_and_extract_for_version(code, 8, 4);
+    for fqn in [
+        "oldFunction",
+        "NotAnAttributeTarget::oldMethod",
+        "NotAnAttributeTarget::OLD",
+        "Cases::Old",
+    ] {
+        let symbol = php84.symbols.iter().find(|item| item.fqn == fqn).unwrap();
+        assert!(symbol.modifiers.is_deprecated, "{fqn}: {symbol:?}");
+    }
+    for fqn in [
+        "NotAnAttributeTarget",
+        "NotAnAttributeTarget::$notSupported",
+        "Cases",
+    ] {
+        let symbol = php84.symbols.iter().find(|item| item.fqn == fqn).unwrap();
+        assert!(!symbol.modifiers.is_deprecated, "{fqn}: {symbol:?}");
+    }
+}
+
+#[test]
+fn deprecated_attribute_resolves_only_the_builtin_name_and_imports() {
+    let symbols = parse_and_extract_for_version(
+        r#"<?php
+namespace App;
+use Deprecated as Sunset;
+#[Sunset(message: "Use replacement")] function imported(): void {}
+#[\Deprecated] function qualified(): void {}
+#[Deprecated] function localName(): void {}
+#[Vendor\Deprecated] function otherNamespace(): void {}
+#[Other(message: "Deprecated")] function stringOnly(): void {}
+"#,
+        8,
+        4,
+    );
+    for fqn in ["App\\imported", "App\\qualified"] {
+        let symbol = symbols.symbols.iter().find(|item| item.fqn == fqn).unwrap();
+        assert!(symbol.modifiers.is_deprecated, "{fqn}: {symbol:?}");
+    }
+    for fqn in ["App\\localName", "App\\otherNamespace", "App\\stringOnly"] {
+        let symbol = symbols.symbols.iter().find(|item| item.fqn == fqn).unwrap();
+        assert!(!symbol.modifiers.is_deprecated, "{fqn}: {symbol:?}");
+    }
+}
+
+#[test]
+fn deprecated_attribute_gains_trait_target_in_php_85() {
+    let code = r#"<?php
+#[\Deprecated] trait OldTrait {}
+"#;
+    let php84 = parse_and_extract_for_version(code, 8, 4);
+    let old_trait = php84
+        .symbols
+        .iter()
+        .find(|item| item.fqn == "OldTrait")
+        .unwrap();
+    assert!(!old_trait.modifiers.is_deprecated, "{old_trait:?}");
+    let php85 = parse_and_extract_for_version(code, 8, 5);
+    let old_trait = php85
+        .symbols
+        .iter()
+        .find(|item| item.fqn == "OldTrait")
+        .unwrap();
+    assert!(old_trait.modifiers.is_deprecated, "{old_trait:?}");
+}
+
+#[test]
+fn promoted_property_uses_its_own_phpdoc_deprecation() {
+    let symbols = parse_and_extract(
+        r#"<?php
+class Holder {
+    /** @deprecated Constructor only. */
+    public function __construct(
+        /** @deprecated Use $current. */ public string $old,
+        public string $current,
+    ) {}
+}
+"#,
+    );
+    let constructor = symbols
+        .symbols
+        .iter()
+        .find(|item| item.fqn == "Holder::__construct")
+        .unwrap();
+    assert!(constructor.modifiers.is_deprecated);
+    let old = symbols
+        .symbols
+        .iter()
+        .find(|item| item.fqn == "Holder::$old")
+        .unwrap();
+    assert!(old.modifiers.is_deprecated, "{old:?}");
+    let current = symbols
+        .symbols
+        .iter()
+        .find(|item| item.fqn == "Holder::$current")
+        .unwrap();
+    assert!(!current.modifiers.is_deprecated, "{current:?}");
+}
+
+#[test]
+fn phpdoc_after_attributes_belongs_to_the_following_declaration() {
+    let symbols = parse_and_extract(
+        r#"<?php
+#[Whatever]
+/** @deprecated */
+function oldFunction(): void {}
+function currentFunction(): void {}
+class Holder {
+    #[Whatever]
+    /** @deprecated */
+    public function oldMethod(): void {}
+    public function currentMethod(): void {}
+}
+"#,
+    );
+    for fqn in ["oldFunction", "Holder::oldMethod"] {
+        let symbol = symbols.symbols.iter().find(|item| item.fqn == fqn).unwrap();
+        assert!(symbol.modifiers.is_deprecated, "{fqn}: {symbol:?}");
+    }
+    for fqn in ["currentFunction", "Holder::currentMethod"] {
+        let symbol = symbols.symbols.iter().find(|item| item.fqn == fqn).unwrap();
+        assert!(!symbol.modifiers.is_deprecated, "{fqn}: {symbol:?}");
+    }
+}

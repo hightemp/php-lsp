@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 23;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 24;
 const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3315;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x0518_12bd_a359_78dd;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x2d43_0f87_6194_40a4;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(

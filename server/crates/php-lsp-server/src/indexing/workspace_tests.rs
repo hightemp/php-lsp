@@ -18,6 +18,42 @@ fn parsed_document(
     (parser, file_symbols, references)
 }
 
+#[test]
+fn disk_index_open_overlay_uses_own_php_version_for_deprecation() {
+    let uri = "file:///workspace/Old.php";
+    let source = "<?php\n#[\\Deprecated] function oldFunction(): void {}\n";
+    let (parser, disk_symbols, disk_references) = parsed_document(uri, source);
+    let open_files = DashMap::new();
+    open_files.insert(uri.to_string(), parser);
+    let document_versions = DashMap::new();
+    document_versions.insert(
+        uri.to_string(),
+        OpenDocumentState {
+            version: 1,
+            generation: 1,
+        },
+    );
+    let template_documents = DashMap::new();
+    let index = WorkspaceIndex::new();
+    commit_workspace_disk_file_preserving_open(
+        DiskPhpIndexCommitContext {
+            open_files: &open_files,
+            template_documents: &template_documents,
+            document_versions: &document_versions,
+            index: &index,
+            root_index: None,
+            uri_str: uri,
+        },
+        disk_symbols,
+        disk_references,
+        PhpVersion { major: 8, minor: 3 },
+    );
+    let symbol = index
+        .resolve_fqn("oldFunction")
+        .expect("open overlay symbol");
+    assert!(!symbol.modifiers.is_deprecated, "{symbol:?}");
+}
+
 fn indexed_symbol_names(index: &WorkspaceIndex, uri: &str) -> Vec<String> {
     index
         .file_symbols
@@ -394,6 +430,7 @@ fn delayed_workspace_disk_index_never_overwrites_an_unsaved_open_document() {
             },
             disk_symbols,
             disk_references,
+            PhpVersion::DEFAULT,
         );
     });
 
@@ -448,6 +485,7 @@ fn superseded_workspace_run_cannot_restore_removed_symbols() {
                 },
                 stale_symbols,
                 stale_references,
+                PhpVersion::DEFAULT,
             );
         })
         .is_none());

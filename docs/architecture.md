@@ -200,6 +200,14 @@ indexed in dedicated `WorkspaceIndex` maps. Members remain part of
 `SymbolInfo.name` is stored without `$`, while property FQNs include `$` as in
 `Class::$prop`.
 
+`SymbolModifiers.is_deprecated` comes from the declaration's own PHPDoc
+`@deprecated` or a resolved built-in `#[\Deprecated]` attribute. Attribute
+targets follow the configured PHP version: functions, methods, class constants,
+and enum cases from 8.4; traits from 8.5. Completion and document/workspace
+symbol responses use the indexed flag for their Deprecated tag. The cache
+schema changes when this extraction rule changes so older symbol snapshots are
+rebuilt.
+
 Lookup keys follow PHP's symbol-kind rules rather than one blanket string
 comparison. Class-like symbols and functions are ASCII case-insensitive.
 Member owners and method names are ASCII case-insensitive, while properties,

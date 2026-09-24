@@ -582,6 +582,7 @@ fn closed_index_restore_cannot_overwrite_a_reopened_document() {
             },
             Some(disk_symbols),
             Vec::new(),
+            Vec::new(),
             || {
                 ready_tx.send(()).expect("announce parsed disk snapshot");
                 release_rx.recv().expect("release close restore");
@@ -7249,7 +7250,14 @@ async fn test_shared_effective_root_lifecycle_respects_each_root_excludes() {
     };
     assert!(
         backend
-            .commit_closed_php_snapshot_to_current_runtime(uri, Some(symbols), Vec::new())
+            .commit_closed_php_snapshot_to_current_runtime(
+                uri,
+                Some(vec![VersionedPhpFileSymbols {
+                    php_version: PhpVersion::DEFAULT,
+                    file_symbols: Some(symbols),
+                    references: Vec::new(),
+                }]),
+            )
             .await
     );
     assert!(index_a.resolve_fqn("SharedSubject").is_none());
@@ -7257,6 +7265,380 @@ async fn test_shared_effective_root_lifecycle_respects_each_root_excludes() {
     backend.remove_uri_from_current_runtime_indexes(uri).await;
     assert!(index_a.resolve_fqn("SharedSubject").is_none());
     assert!(index_b.resolve_fqn("SharedSubject").is_none());
+}
+
+#[tokio::test]
+async fn test_watched_deprecated_snapshot_cannot_commit_to_new_php_version() {
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let uri = "file:///workspace/Versioned.php";
+    let old_version = PhpVersion { major: 8, minor: 3 };
+    let current_version = PhpVersion { major: 8, minor: 4 };
+    let root_index = Arc::new(WorkspaceIndex::new());
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: PathBuf::from("/workspace"),
+            root: PathBuf::from("/workspace"),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration {
+                php_version: current_version,
+                ..Default::default()
+            },
+            index: root_index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 2,
+    });
+    let mut symbol = make_symbol_for_uri(
+        uri,
+        "versioned",
+        "versioned",
+        PhpSymbolKind::Function,
+        (0, 0, 0, 9),
+        None,
+    );
+    symbol.modifiers.is_deprecated = false;
+    let parsed_under_old_version = FileSymbols {
+        symbols: vec![symbol],
+        ..Default::default()
+    };
+
+    let committed = backend
+        .commit_closed_php_snapshot_to_current_runtime(
+            uri,
+            Some(vec![VersionedPhpFileSymbols {
+                php_version: old_version,
+                file_symbols: Some(parsed_under_old_version),
+                references: Vec::new(),
+            }]),
+        )
+        .await;
+    assert!(!committed, "stale PHP 8.3 metadata reached PHP 8.4 index");
+    assert!(root_index.resolve_fqn("versioned").is_none());
+}
+
+#[tokio::test]
+async fn test_open_deprecated_overlay_keeps_each_shared_root_php_version() {
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let uri = "file:///workspace/shared/Shared.php";
+    let source = "<?php\n#[\\Deprecated] function sharedDeprecated(): void {}\n";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let document_state = backend.next_document_state(1);
+    backend.open_files.insert(uri.to_string(), parser);
+    backend
+        .document_versions
+        .insert(uri.to_string(), document_state);
+    let root_a = Arc::new(WorkspaceIndex::new());
+    let root_b = Arc::new(WorkspaceIndex::new());
+    let config =
+        |folder: &str, version: PhpVersion, index: Arc<WorkspaceIndex>| WorkspaceRootConfig {
+            workspace_folder: PathBuf::from(folder),
+            root: PathBuf::from("/workspace/shared"),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration {
+                php_version: version,
+                ..Default::default()
+            },
+            index,
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        };
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![
+            config(
+                "/workspace/a",
+                PhpVersion { major: 8, minor: 3 },
+                root_a.clone(),
+            ),
+            config(
+                "/workspace/b",
+                PhpVersion { major: 8, minor: 4 },
+                root_b.clone(),
+            ),
+        ],
+        generation: 1,
+    });
+
+    assert!(
+        backend
+            .synchronize_open_document_index_to_current_runtime(uri, document_state, true)
+            .await
+    );
+    let a = root_a
+        .resolve_fqn("sharedDeprecated")
+        .expect("root A symbol");
+    let b = root_b
+        .resolve_fqn("sharedDeprecated")
+        .expect("root B symbol");
+    assert!(!a.modifiers.is_deprecated, "PHP 8.3 root: {a:?}");
+    assert!(b.modifiers.is_deprecated, "PHP 8.4 root: {b:?}");
+}
+
+#[tokio::test]
+async fn test_watched_deprecated_snapshot_keeps_each_shared_root_php_version() {
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let uri = "file:///workspace/shared/Watched.php";
+    let source = "<?php\n#[\\Deprecated] function watchedDeprecated(): void {}\n";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let parsed_83 = extract_file_symbols_for_php_version(
+        tree,
+        source,
+        uri,
+        symbol_extraction_version(PhpVersion { major: 8, minor: 3 }),
+    );
+    let parsed_84 = extract_file_symbols_for_php_version(
+        tree,
+        source,
+        uri,
+        symbol_extraction_version(PhpVersion { major: 8, minor: 4 }),
+    );
+    let root_a = Arc::new(WorkspaceIndex::new());
+    let root_b = Arc::new(WorkspaceIndex::new());
+    let config =
+        |folder: &str, version: PhpVersion, index: Arc<WorkspaceIndex>| WorkspaceRootConfig {
+            workspace_folder: PathBuf::from(folder),
+            root: PathBuf::from("/workspace/shared"),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration {
+                php_version: version,
+                ..Default::default()
+            },
+            index,
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        };
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![
+            config(
+                "/workspace/a",
+                PhpVersion { major: 8, minor: 3 },
+                root_a.clone(),
+            ),
+            config(
+                "/workspace/b",
+                PhpVersion { major: 8, minor: 4 },
+                root_b.clone(),
+            ),
+        ],
+        generation: 1,
+    });
+
+    assert!(
+        backend
+            .commit_closed_php_snapshot_to_current_runtime(
+                uri,
+                Some(vec![
+                    VersionedPhpFileSymbols {
+                        php_version: PhpVersion { major: 8, minor: 3 },
+                        file_symbols: Some(parsed_83),
+                        references: Vec::new(),
+                    },
+                    VersionedPhpFileSymbols {
+                        php_version: PhpVersion { major: 8, minor: 4 },
+                        file_symbols: Some(parsed_84),
+                        references: Vec::new(),
+                    },
+                ]),
+            )
+            .await
+    );
+    let a = root_a
+        .resolve_fqn("watchedDeprecated")
+        .expect("root A symbol");
+    let b = root_b
+        .resolve_fqn("watchedDeprecated")
+        .expect("root B symbol");
+    assert!(!a.modifiers.is_deprecated, "PHP 8.3 root: {a:?}");
+    assert!(b.modifiers.is_deprecated, "PHP 8.4 root: {b:?}");
+}
+
+#[tokio::test]
+async fn test_shared_root_watched_and_close_restore_keep_versioned_deprecation() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-shared-deprecated-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("Shared.php");
+    std::fs::write(
+        &file,
+        "<?php\n#[\\Deprecated] function sharedDeprecated(): void {}\n",
+    )
+    .unwrap();
+    let uri = php_lsp_types::uri::path_to_uri(&file).unwrap();
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let root_83 = Arc::new(WorkspaceIndex::new());
+    let root_84 = Arc::new(WorkspaceIndex::new());
+    let config =
+        |folder: &str, version: PhpVersion, index: Arc<WorkspaceIndex>| WorkspaceRootConfig {
+            workspace_folder: PathBuf::from(folder),
+            root: root.clone(),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration {
+                php_version: version,
+                ..Default::default()
+            },
+            index,
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        };
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![
+            config(
+                "/workspace/shared-a",
+                PhpVersion { major: 8, minor: 3 },
+                root_83.clone(),
+            ),
+            config(
+                "/workspace/shared-b",
+                PhpVersion { major: 8, minor: 4 },
+                root_84.clone(),
+            ),
+        ],
+        generation: 1,
+    });
+
+    backend.reindex_php_file(&uri.parse().unwrap()).await;
+    let assert_versions = || {
+        let old = root_83
+            .resolve_fqn("sharedDeprecated")
+            .expect("PHP 8.3 symbol");
+        let new = root_84
+            .resolve_fqn("sharedDeprecated")
+            .expect("PHP 8.4 symbol");
+        assert!(!old.modifiers.is_deprecated, "{old:?}");
+        assert!(new.modifiers.is_deprecated, "{new:?}");
+    };
+    assert_versions();
+
+    backend.index.remove_file(&uri);
+    root_83.remove_file(&uri);
+    root_84.remove_file(&uri);
+    let token = 17;
+    backend
+        .closed_document_reload_tokens
+        .insert(uri.clone(), token);
+    backend
+        .restore_closed_php_index_with_hook(&uri, token, || {})
+        .await;
+    assert_versions();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_aggregate_rebuild_keeps_open_deprecation_at_selected_php_version() {
+    let uri = "file:///workspace/Old.php";
+    let source = "<?php\n#[\\Deprecated] function oldFunction(): void {}\n";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let open_files = DashMap::new();
+    open_files.insert(uri.to_string(), parser);
+    let aggregate = WorkspaceIndex::new();
+    let config = WorkspaceRootConfig {
+        workspace_folder: PathBuf::from("/workspace"),
+        root: PathBuf::from("/workspace"),
+        namespace_map: None,
+        runtime_config: ResolvedRuntimeConfiguration {
+            php_version: PhpVersion { major: 8, minor: 3 },
+            ..Default::default()
+        },
+        index: Arc::new(WorkspaceIndex::new()),
+        vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+    };
+    rebuild_aggregate_index(
+        &aggregate,
+        &[config],
+        PhpVersion::DEFAULT,
+        &open_files,
+        &DashMap::new(),
+        &DashMap::new(),
+    );
+    let symbol = aggregate
+        .resolve_fqn("oldFunction")
+        .expect("open aggregate symbol");
+    assert!(!symbol.modifiers.is_deprecated, "{symbol:?}");
+}
+
+#[tokio::test]
+async fn test_closed_restore_reparses_after_php_version_switch_before_commit() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-close-deprecated-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("Closed.php");
+    std::fs::write(
+        &file,
+        "<?php\n#[\\Deprecated] function closedDeprecated(): void {}\n",
+    )
+    .unwrap();
+    let uri = php_lsp_types::uri::path_to_uri(&file).unwrap();
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    let old_index = Arc::new(WorkspaceIndex::new());
+    let new_index = Arc::new(WorkspaceIndex::new());
+    let runtime_state = |version: PhpVersion, index: Arc<WorkspaceIndex>, generation| {
+        Arc::new(WorkspaceRuntimeState {
+            fallback: ResolvedRuntimeConfiguration::default(),
+            fallback_index: Arc::new(WorkspaceIndex::new()),
+            configs: vec![WorkspaceRootConfig {
+                workspace_folder: root.clone(),
+                root: root.clone(),
+                namespace_map: None,
+                runtime_config: ResolvedRuntimeConfiguration {
+                    php_version: version,
+                    ..Default::default()
+                },
+                index,
+                vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+            }],
+            generation,
+        })
+    };
+    *backend.runtime_state.lock().await =
+        runtime_state(PhpVersion { major: 8, minor: 3 }, old_index.clone(), 1);
+    let replacement = runtime_state(PhpVersion { major: 8, minor: 4 }, new_index.clone(), 2);
+    let token = 7;
+    backend
+        .closed_document_reload_tokens
+        .insert(uri.clone(), token);
+    let attempts = Cell::new(0usize);
+    backend
+        .restore_closed_php_index_with_hook(&uri, token, || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                *backend.runtime_state.try_lock().unwrap() = replacement.clone();
+            }
+        })
+        .await;
+
+    assert_eq!(attempts.get(), 2, "stale parse was not retried");
+    assert!(old_index.resolve_fqn("closedDeprecated").is_none());
+    let current = new_index
+        .resolve_fqn("closedDeprecated")
+        .expect("new PHP 8.4 symbol");
+    assert!(current.modifiers.is_deprecated, "{current:?}");
+    assert!(!backend.closed_document_reload_tokens.contains_key(&uri));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

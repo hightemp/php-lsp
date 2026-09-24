@@ -434,6 +434,7 @@ impl PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         let request = self.request_context_for_uri(&uri_str).await;
         let request_index = request.index(&self.index);
+        let extraction_version = symbol_extraction_version(request.runtime_config().php_version);
         let text = &params.text_document.text;
         let version = params.text_document.version;
         let document_state = self.next_document_state(version);
@@ -578,7 +579,12 @@ impl PhpLspBackend {
                 let mut parser = FileParser::new();
                 parser.parse_full(text);
                 let indexed_file = parser.tree().map(|tree| {
-                    let file_symbols = extract_file_symbols(tree, text, &uri_str);
+                    let file_symbols = extract_file_symbols_for_php_version(
+                        tree,
+                        text,
+                        &uri_str,
+                        extraction_version,
+                    );
                     let references = collect_symbol_references_in_file(tree, text, &file_symbols);
                     let sym_count = file_symbols.symbols.len();
                     (file_symbols, references, sym_count)
@@ -617,7 +623,12 @@ impl PhpLspBackend {
                 let mut parser = FileParser::new();
                 parser.parse_full(text);
                 let indexed_file = parser.tree().map(|tree| {
-                    let file_symbols = extract_file_symbols(tree, text, &uri_str);
+                    let file_symbols = extract_file_symbols_for_php_version(
+                        tree,
+                        text,
+                        &uri_str,
+                        extraction_version,
+                    );
                     let references = collect_symbol_references_in_file(tree, text, &file_symbols);
                     let sym_count = file_symbols.symbols.len();
                     (file_symbols, references, sym_count)
@@ -717,6 +728,7 @@ impl PhpLspBackend {
         let uri_str = uri.as_str().to_string();
         let request = self.request_context_for_uri(&uri_str).await;
         let request_index = request.index(&self.index);
+        let extraction_version = symbol_extraction_version(request.runtime_config().php_version);
         let version = params.text_document.version;
 
         tracing::debug!("didChange: {} version {}", uri_str, version);
@@ -818,7 +830,12 @@ impl PhpLspBackend {
                     }
                     parser.tree().map(|tree| {
                         let source = parser.source();
-                        let file_symbols = extract_file_symbols(tree, &source, &uri_str);
+                        let file_symbols = extract_file_symbols_for_php_version(
+                            tree,
+                            &source,
+                            &uri_str,
+                            extraction_version,
+                        );
                         let references =
                             collect_symbol_references_in_file(tree, &source, &file_symbols);
                         (file_symbols, references)
@@ -979,79 +996,99 @@ impl PhpLspBackend {
     }
 
     async fn restore_closed_php_index(&self, uri_str: &str, token: u64) {
-        let parsed = if let Some(path) = uri_to_path(uri_str) {
-            let state = self.runtime_state_snapshot().await;
-            if workspace_indexes_for_uri(&state, uri_str, true).is_empty() {
-                None
-            } else {
-                match parse_workspace_file_for_index_blocking(path, "closed PHP document reindex")
-                    .await
-                {
-                    Ok(parsed) => Some(parsed),
-                    Err(message) => {
-                        tracing::debug!("Failed to restore closed PHP index: {}", message);
-                        None
-                    }
-                }
-            }
-        } else {
-            None
-        };
+        self.restore_closed_php_index_with_hook(uri_str, token, || {})
+            .await;
+    }
 
-        let (file_symbols, references) = parsed
-            .map(|parsed| (parsed.file_symbols, parsed.references))
-            .unwrap_or_else(|| (None, Vec::new()));
-        let state = self.runtime_state_snapshot().await;
-        let indexes = workspace_indexes_for_uri(&state, uri_str, file_symbols.is_some());
-        let file_symbols_for_resync = file_symbols.clone();
-        let references_for_resync = references.clone();
-        let root_index = indexes.first().map(Arc::as_ref).unwrap_or(&self.index);
-        let committed = commit_closed_php_index_if_current(
-            ClosedPhpIndexCommitContext {
-                open_files: &self.open_files,
-                document_versions: &self.document_versions,
-                reload_tokens: &self.closed_document_reload_tokens,
-                index: &self.index,
-                root_index: Some(root_index),
-                uri_str,
-                token,
-            },
-            file_symbols,
-            references,
-        );
-        if committed {
-            if let Some(symbols) = self
-                .index
-                .file_symbols
-                .get(uri_str)
-                .map(|entry| entry.value().as_ref().clone())
-            {
-                let references = self
-                    .index
-                    .file_references
-                    .get(uri_str)
-                    .map(|entry| entry.value().clone())
-                    .unwrap_or_default();
-                for index in indexes.iter().skip(1) {
-                    index.update_file_with_references(uri_str, symbols.clone(), references.clone());
-                }
+    pub(in crate::server) async fn restore_closed_php_index_with_hook<F>(
+        &self,
+        uri_str: &str,
+        token: u64,
+        mut before_commit: F,
+    ) where
+        F: FnMut(),
+    {
+        for _ in 0..4 {
+            let state = self.runtime_state_snapshot().await;
+            let mut versions = workspace_indexes_for_uri(&state, uri_str, true)
+                .iter()
+                .map(|index| php_version_for_workspace_index(&state, index))
+                .collect::<Vec<_>>();
+            versions.sort_unstable();
+            versions.dedup();
+            let snapshots =
+                if let Some(path) = uri_to_path(uri_str).filter(|_| !versions.is_empty()) {
+                    match parse_workspace_file_for_versions_blocking(
+                        path,
+                        versions,
+                        "closed PHP document reindex",
+                    )
+                    .await
+                    {
+                        Ok(snapshots) => snapshots,
+                        Err(message) => {
+                            tracing::debug!("Failed to restore closed PHP index: {}", message);
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
+            before_commit();
+            let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
+            let current_state = self.runtime_state.lock().await;
+            if !Arc::ptr_eq(&state, &current_state) {
+                continue;
+            }
+            let has_symbols = snapshots
+                .iter()
+                .any(|snapshot| snapshot.file_symbols.is_some());
+            let indexes = workspace_indexes_for_uri(&state, uri_str, has_symbols);
+            let root_index = indexes.first().map(Arc::as_ref).unwrap_or(&self.index);
+            let mut updates = indexes
+                .iter()
+                .map(|index| {
+                    let version = php_version_for_workspace_index(&state, index);
+                    let snapshot = snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.php_version == version);
+                    ClosedPhpSecondaryIndexUpdate {
+                        index,
+                        file_symbols: snapshot.and_then(|item| item.file_symbols.clone()),
+                        references: snapshot
+                            .map(|item| item.references.clone())
+                            .unwrap_or_default(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let primary = if updates.is_empty() {
+                (None, Vec::new())
             } else {
-                for index in indexes.iter().skip(1) {
-                    index.remove_file(uri_str);
-                }
-            }
-            if !Arc::ptr_eq(&state, &self.runtime_state_snapshot().await)
-                && !self.closed_document_reload_tokens.contains_key(uri_str)
-                && self.current_document_state(uri_str).is_none()
-            {
-                self.commit_closed_php_snapshot_to_current_runtime(
+                let first = updates.remove(0);
+                (first.file_symbols, first.references)
+            };
+            let committed = commit_closed_php_index_if_current_with_hook(
+                ClosedPhpIndexCommitContext {
+                    open_files: &self.open_files,
+                    document_versions: &self.document_versions,
+                    reload_tokens: &self.closed_document_reload_tokens,
+                    index: &self.index,
+                    root_index: Some(root_index),
                     uri_str,
-                    file_symbols_for_resync,
-                    references_for_resync,
-                )
-                .await;
+                    token,
+                },
+                primary.0,
+                primary.1,
+                updates,
+                || {},
+            );
+            if !committed {
+                return;
             }
+            return;
         }
+        tracing::debug!("Runtime kept changing while restoring closed PHP index: {uri_str}");
     }
 
     pub(crate) async fn lsp_did_save(&self, params: DidSaveTextDocumentParams) {

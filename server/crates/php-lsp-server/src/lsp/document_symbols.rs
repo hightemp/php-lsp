@@ -413,12 +413,22 @@ impl PhpLspBackend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri_str = params.text_document.uri.as_str().to_string();
+        let request = self.request_context_for_uri(&uri_str).await;
+        let php_version = request.runtime_config().php_version;
 
         // Try open files first, then fall back to index
         let (file_symbols, source) = if let Some(parser) = self.open_files.get(&uri_str) {
             if let Some(tree) = parser.tree() {
                 let source = parser.source();
-                (extract_file_symbols(tree, &source, &uri_str), source)
+                (
+                    extract_file_symbols_for_php_version(
+                        tree,
+                        &source,
+                        &uri_str,
+                        symbol_extraction_version(php_version),
+                    ),
+                    source,
+                )
             } else {
                 return Ok(None);
             }
