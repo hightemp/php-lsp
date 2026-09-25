@@ -1,5 +1,6 @@
 use super::*;
 use lsp_types::CompletionItemTag;
+use php_lsp_parser::parser::FileParser;
 use php_lsp_types::*;
 
 fn make_symbol(
@@ -160,6 +161,8 @@ fn test_use_statement_completion_inserts_full_fqn() {
 
     let ctx = CompletionContext::UseStatement {
         prefix: "Ven".to_string(),
+        kind: UseKind::Class,
+        group_prefix: None,
     };
     let items = provide_completions_outside_class_for_test(&ctx, &index, &FileSymbols::default());
     let item = items
@@ -172,6 +175,288 @@ fn test_use_statement_completion_inserts_full_fqn() {
         Some("Vendor\\Package\\ClassName")
     );
     assert_eq!(item.detail.as_deref(), Some("Vendor\\Package\\ClassName"));
+}
+
+#[test]
+fn free_completion_does_not_repeat_functions_or_merge_distinct_symbol_kinds() {
+    let index = WorkspaceIndex::new();
+    let symbols = FileSymbols {
+        symbols: vec![
+            make_symbol(
+                "Shared",
+                "App\\Shared",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Shared",
+                "App\\Shared",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Shared",
+                "App\\Shared",
+                PhpSymbolKind::GlobalConstant,
+                None,
+                Visibility::Public,
+                false,
+            ),
+        ],
+        ..Default::default()
+    };
+    index.update_file("file:///shared.php", symbols.clone());
+    let items = provide_completions_outside_class_for_test(
+        &CompletionContext::Free {
+            prefix: "Sha".to_string(),
+        },
+        &index,
+        &symbols,
+    );
+    let shared = items
+        .iter()
+        .filter(|item| item.label == "Shared")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shared.len(),
+        3,
+        "one candidate per PHP symbol kind: {shared:?}"
+    );
+    for kind in [
+        CompletionItemKind::CLASS,
+        CompletionItemKind::FUNCTION,
+        CompletionItemKind::CONSTANT,
+    ] {
+        assert_eq!(
+            shared.iter().filter(|item| item.kind == Some(kind)).count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn use_statement_completion_selects_its_declared_symbol_kind() {
+    let index = WorkspaceIndex::new();
+    let symbols = FileSymbols {
+        symbols: vec![
+            make_symbol(
+                "Helper",
+                "Vendor\\Helper",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Helper",
+                "Vendor\\Helper",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Helper",
+                "Vendor\\Helper",
+                PhpSymbolKind::GlobalConstant,
+                None,
+                Visibility::Public,
+                false,
+            ),
+        ],
+        ..Default::default()
+    };
+    index.update_file("file:///vendor.php", symbols);
+
+    for (source, expected_kind) in [
+        ("<?php\nuse Vendor\\Hel;", CompletionItemKind::CLASS),
+        (
+            "<?php\nuse function Vendor\\Hel;",
+            CompletionItemKind::FUNCTION,
+        ),
+        (
+            "<?php\nuse const Vendor\\Hel;",
+            CompletionItemKind::CONSTANT,
+        ),
+    ] {
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        let line = source.lines().nth(1).unwrap();
+        let col = line.find(';').unwrap() as u32;
+        let context = crate::context::detect_context_at_byte_col(
+            parser.tree().unwrap(),
+            source,
+            1,
+            col,
+            &FileSymbols::default(),
+        );
+        let items =
+            provide_completions_outside_class_for_test(&context, &index, &FileSymbols::default());
+        let matching = items
+            .iter()
+            .filter(|item| item.label == "Helper")
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{source}: {matching:?}");
+        assert_eq!(matching[0].kind, Some(expected_kind), "{source}");
+        assert_eq!(matching[0].insert_text.as_deref(), Some("Vendor\\Helper"));
+    }
+}
+
+#[test]
+fn grouped_use_completion_inserts_relative_name_and_stays_in_group_namespace() {
+    let index = WorkspaceIndex::new();
+    let symbols = FileSymbols {
+        symbols: vec![
+            make_symbol(
+                "Widget",
+                "Vendor\\Sub\\Widget",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Widget",
+                "Other\\Vendor\\Sub\\Widget",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Helper",
+                "Vendor\\Helper",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Helper",
+                "Vendor\\Sub\\Helper",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Helper",
+                "Other\\Vendor\\Helper",
+                PhpSymbolKind::Function,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "FLAG",
+                "Vendor\\FLAG",
+                PhpSymbolKind::GlobalConstant,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "FLAG",
+                "Vendor\\Sub\\FLAG",
+                PhpSymbolKind::GlobalConstant,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "FLAG",
+                "Other\\Vendor\\FLAG",
+                PhpSymbolKind::GlobalConstant,
+                None,
+                Visibility::Public,
+                false,
+            ),
+        ],
+        ..Default::default()
+    };
+    index.update_file("file:///grouped-vendor.php", symbols);
+    for (source, label, expected_insert, expected_line) in [
+        (
+            "<?php\nuse Vendor\\{function Hel};",
+            "Helper",
+            "Helper",
+            "use Vendor\\{function Helper};",
+        ),
+        (
+            "<?php\nuse Vendor\\{const FL};",
+            "FLAG",
+            "FLAG",
+            "use Vendor\\{const FLAG};",
+        ),
+        (
+            "<?php\nuse vendor\\{function Hel};",
+            "Helper",
+            "Helper",
+            "use vendor\\{function Helper};",
+        ),
+        (
+            "<?php\nuse \\Vendor\\Sub\\{Wid};",
+            "Widget",
+            "Widget",
+            "use \\Vendor\\Sub\\{Widget};",
+        ),
+        (
+            "<?php\nuse Vendor\\{function Sub\\Hel};",
+            "Helper",
+            "Helper",
+            "use Vendor\\{function Sub\\Helper};",
+        ),
+        (
+            "<?php\nuse Vendor\\{const Sub\\FL};",
+            "FLAG",
+            "FLAG",
+            "use Vendor\\{const Sub\\FLAG};",
+        ),
+    ] {
+        let mut parser = FileParser::new();
+        parser.parse_full(source);
+        let col = source.lines().nth(1).unwrap().find('}').unwrap() as u32;
+        let context = crate::context::detect_context_at_byte_col(
+            parser.tree().unwrap(),
+            source,
+            1,
+            col,
+            &FileSymbols::default(),
+        );
+        let items =
+            provide_completions_outside_class_for_test(&context, &index, &FileSymbols::default());
+        let relevant = items
+            .iter()
+            .filter(|item| item.label == label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relevant.len(),
+            1,
+            "group must filter other namespaces: {items:?}"
+        );
+        assert_eq!(relevant[0].insert_text.as_deref(), Some(expected_insert));
+        let line = source.lines().nth(1).unwrap();
+        let before_cursor = &line[..col as usize];
+        let word_start = before_cursor
+            .rfind(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let applied = format!(
+            "{}{}{}",
+            &line[..word_start],
+            relevant[0].insert_text.as_deref().unwrap(),
+            &line[col as usize..]
+        );
+        assert_eq!(applied, expected_line);
+        assert!(relevant[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("Vendor\\")));
+    }
 }
 
 #[test]
@@ -947,6 +1232,61 @@ fn test_member_completion_inherits_phpdoc_virtual_members() {
 }
 
 #[test]
+fn phpdoc_virtual_member_dedup_uses_member_kind_and_php_casing() {
+    let mut class = make_symbol(
+        "Service",
+        "App\\Service",
+        PhpSymbolKind::Class,
+        None,
+        Visibility::Public,
+        false,
+    );
+    class.doc_comment =
+        Some("/**\n * @method void RUN()\n * @property string $run\n */".to_string());
+    let symbols = FileSymbols {
+        symbols: vec![
+            class,
+            make_symbol(
+                "run",
+                "App\\Service::run",
+                PhpSymbolKind::Method,
+                Some("App\\Service"),
+                Visibility::Public,
+                false,
+            ),
+        ],
+        ..Default::default()
+    };
+    let index = WorkspaceIndex::new();
+    index.update_file("file:///test.php", symbols);
+    let items = provide_completions_outside_class_for_test(
+        &CompletionContext::MemberAccess {
+            object_expr: "$service".to_string(),
+            class_fqn: Some("App\\Service".to_string()),
+            member_prefix: "run".to_string(),
+            access_mode: MemberAccessMode::Read,
+        },
+        &index,
+        &FileSymbols::default(),
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.kind == Some(CompletionItemKind::METHOD))
+            .count(),
+        1
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.kind == Some(CompletionItemKind::PROPERTY))
+            .count(),
+        1,
+        "property and method may share a label"
+    );
+}
+
+#[test]
 fn test_static_completion_filters_instance_members() {
     let file_symbols = FileSymbols {
         namespace: Some("App".to_string()),
@@ -1004,6 +1344,280 @@ fn test_static_completion_filters_instance_members() {
         !labels.contains(&"run"),
         "instance method should be hidden on `::`"
     );
+}
+
+#[test]
+fn inherited_member_completion_keeps_override_and_case_sensitive_properties() {
+    let mut child = make_symbol(
+        "Child",
+        "App\\Child",
+        PhpSymbolKind::Class,
+        None,
+        Visibility::Public,
+        false,
+    );
+    child.extends.push("App\\Base".to_string());
+    let symbols = FileSymbols {
+        symbols: vec![
+            make_symbol(
+                "Base",
+                "App\\Base",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "run",
+                "App\\Base::run",
+                PhpSymbolKind::Method,
+                Some("App\\Base"),
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "name",
+                "App\\Base::$name",
+                PhpSymbolKind::Property,
+                Some("App\\Base"),
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Name",
+                "App\\Base::$Name",
+                PhpSymbolKind::Property,
+                Some("App\\Base"),
+                Visibility::Public,
+                false,
+            ),
+            child,
+            make_symbol(
+                "RUN",
+                "App\\Child::RUN",
+                PhpSymbolKind::Method,
+                Some("App\\Child"),
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "name",
+                "App\\Child::$name",
+                PhpSymbolKind::Property,
+                Some("App\\Child"),
+                Visibility::Public,
+                false,
+            ),
+        ],
+        ..Default::default()
+    };
+    let index = WorkspaceIndex::new();
+    index.update_file("file:///test.php", symbols);
+    let items = provide_completions_outside_class_for_test(
+        &CompletionContext::MemberAccess {
+            object_expr: "$child".to_string(),
+            class_fqn: Some("App\\Child".to_string()),
+            member_prefix: String::new(),
+            access_mode: MemberAccessMode::Read,
+        },
+        &index,
+        &FileSymbols::default(),
+    );
+    let methods = items
+        .iter()
+        .filter(|item| item.kind == Some(CompletionItemKind::METHOD))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods.len(),
+        1,
+        "method names follow PHP case-insensitive lookup"
+    );
+    assert_eq!(methods[0].data, Some(json!("App\\Child::RUN")));
+    assert_eq!(items.iter().filter(|item| item.label == "name").count(), 1);
+    assert_eq!(items.iter().filter(|item| item.label == "Name").count(), 1);
+}
+
+#[test]
+fn static_completion_deduplicates_interface_diamond_by_php_lookup_identity() {
+    let mut child = make_symbol(
+        "Child",
+        "App\\Child",
+        PhpSymbolKind::Class,
+        None,
+        Visibility::Public,
+        false,
+    );
+    child.implements = vec!["App\\Left".to_string(), "App\\Right".to_string()];
+    child.extends = vec!["App\\Base".to_string()];
+    let symbols = FileSymbols {
+        symbols: vec![
+            child,
+            make_symbol(
+                "Base",
+                "App\\Base",
+                PhpSymbolKind::Class,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Left",
+                "App\\Left",
+                PhpSymbolKind::Interface,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "Right",
+                "App\\Right",
+                PhpSymbolKind::Interface,
+                None,
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "build",
+                "App\\Left::build",
+                PhpSymbolKind::Method,
+                Some("App\\Left"),
+                Visibility::Public,
+                true,
+            ),
+            make_symbol(
+                "BUILD",
+                "App\\Right::BUILD",
+                PhpSymbolKind::Method,
+                Some("App\\Right"),
+                Visibility::Public,
+                true,
+            ),
+            make_symbol(
+                "FLAG",
+                "App\\Child::FLAG",
+                PhpSymbolKind::ClassConstant,
+                Some("App\\Child"),
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "FLAG",
+                "App\\Base::FLAG",
+                PhpSymbolKind::ClassConstant,
+                Some("App\\Base"),
+                Visibility::Public,
+                false,
+            ),
+            make_symbol(
+                "flag",
+                "App\\Base::flag",
+                PhpSymbolKind::ClassConstant,
+                Some("App\\Base"),
+                Visibility::Public,
+                false,
+            ),
+        ],
+        ..Default::default()
+    };
+    let index = WorkspaceIndex::new();
+    index.update_file("file:///test.php", symbols);
+    let items = provide_completions_outside_class_for_test(
+        &CompletionContext::StaticAccess {
+            class_expr: "Child".to_string(),
+            class_fqn: "App\\Child".to_string(),
+            member_prefix: String::new(),
+        },
+        &index,
+        &FileSymbols::default(),
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.kind == Some(CompletionItemKind::METHOD))
+            .count(),
+        1,
+        "method names are case-insensitive across a diamond"
+    );
+    assert_eq!(items.iter().filter(|item| item.label == "FLAG").count(), 1);
+    assert_eq!(items.iter().filter(|item| item.label == "flag").count(), 1);
+    assert_eq!(items.iter().filter(|item| item.label == "class").count(), 1);
+}
+
+#[test]
+fn open_child_member_override_wins_over_inherited_and_stale_index_members() {
+    let mut child = make_symbol(
+        "Child",
+        "App\\Child",
+        PhpSymbolKind::Class,
+        None,
+        Visibility::Public,
+        false,
+    );
+    child.extends.push("App\\Base".to_string());
+    let index = WorkspaceIndex::new();
+    index.update_file(
+        "file:///test.php",
+        FileSymbols {
+            symbols: vec![
+                make_symbol(
+                    "Base",
+                    "App\\Base",
+                    PhpSymbolKind::Class,
+                    None,
+                    Visibility::Public,
+                    false,
+                ),
+                make_symbol(
+                    "run",
+                    "App\\Base::run",
+                    PhpSymbolKind::Method,
+                    Some("App\\Base"),
+                    Visibility::Public,
+                    false,
+                ),
+                child.clone(),
+                make_symbol(
+                    "RUN",
+                    "App\\Child::RUN",
+                    PhpSymbolKind::Method,
+                    Some("App\\Child"),
+                    Visibility::Public,
+                    false,
+                ),
+            ],
+            ..Default::default()
+        },
+    );
+    let open_file = FileSymbols {
+        symbols: vec![
+            child,
+            make_symbol(
+                "RuN",
+                "App\\Child::RuN",
+                PhpSymbolKind::Method,
+                Some("App\\Child"),
+                Visibility::Public,
+                false,
+            ),
+        ],
+        ..Default::default()
+    };
+    let items = provide_completions_outside_class_for_test(
+        &CompletionContext::MemberAccess {
+            object_expr: "$child".to_string(),
+            class_fqn: Some("App\\Child".to_string()),
+            member_prefix: String::new(),
+            access_mode: MemberAccessMode::Read,
+        },
+        &index,
+        &open_file,
+    );
+    let methods = items
+        .iter()
+        .filter(|item| item.kind == Some(CompletionItemKind::METHOD))
+        .collect::<Vec<_>>();
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0].data, Some(json!("App\\Child::RuN")));
 }
 
 #[test]
@@ -1829,6 +2443,8 @@ fn deprecated_symbols_have_tags_in_initial_free_and_namespace_completions() {
         },
         CompletionContext::UseStatement {
             prefix: "App\\Old".to_string(),
+            kind: UseKind::Class,
+            group_prefix: None,
         },
     ] {
         let items = provide_completions_outside_class_for_test(&context, &index, &file_symbols);

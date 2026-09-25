@@ -466,10 +466,69 @@ fn test_use_statement_context_uses_text_before_cursor() {
     let code = "<?php\nnamespace App;\nuse Ven;\n";
     let ctx = detect_at_byte_col(code, 2, 7);
     match ctx {
-        CompletionContext::UseStatement { prefix } => {
+        CompletionContext::UseStatement {
+            prefix,
+            kind,
+            group_prefix,
+        } => {
             assert_eq!(prefix, "Ven");
+            assert_eq!(kind, php_lsp_types::UseKind::Class);
+            assert!(group_prefix.is_none());
         }
         other => panic!("Expected UseStatement, got {:?}", other),
+    }
+}
+
+#[test]
+fn use_statement_context_keeps_function_const_and_group_clause_kinds() {
+    for (code, prefix, kind, group_prefix) in [
+        (
+            "<?php\nuse function Vendor\\Hel/*caret*/;",
+            "Vendor\\Hel",
+            php_lsp_types::UseKind::Function,
+            None,
+        ),
+        (
+            "<?php\nuse const Vendor\\FLAG/*caret*/;",
+            "Vendor\\FLAG",
+            php_lsp_types::UseKind::Constant,
+            None,
+        ),
+        (
+            "<?php\nUSE FUNCTION Vendor\\Hel/*caret*/;",
+            "Vendor\\Hel",
+            php_lsp_types::UseKind::Function,
+            None,
+        ),
+        (
+            "<?php\nuse CONST Vendor\\FLAG/*caret*/;",
+            "Vendor\\FLAG",
+            php_lsp_types::UseKind::Constant,
+            None,
+        ),
+        (
+            "<?php\nuse Vendor\\{function Hel/*caret*/, const FLAG};",
+            "Vendor\\Hel",
+            php_lsp_types::UseKind::Function,
+            Some("Vendor\\"),
+        ),
+        (
+            "<?php\nuse Vendor\\{ClassName, const FLAG/*caret*/};",
+            "Vendor\\FLAG",
+            php_lsp_types::UseKind::Constant,
+            Some("Vendor\\"),
+        ),
+    ] {
+        let context = detect_at_marker(code);
+        assert_eq!(
+            context,
+            CompletionContext::UseStatement {
+                prefix: prefix.to_string(),
+                kind,
+                group_prefix: group_prefix.map(str::to_string),
+            },
+            "{code}"
+        );
     }
 }
 

@@ -1212,6 +1212,23 @@ Rustfmt, diff check и повторный Verifier review на `gpt-6-sol` — G
 Что исправить: typed completion query, единый dedup key с kind-specific casing
 и отдельные providers для class/function/const imports.
 
+**Исправлено 2026-09-25 (FIX-CODEX-P2-13-COMPLETION-SYMBOL-KINDS).** Free
+completion перечисляет types/functions/constants по одному разу, сохраняя
+разные symbol kinds и FQNs. `UseStatement` хранит вид импорта; обычные
+`use`, `use function`, `use const` выбирают соответствующую карту. Grouped use
+ограничивает кандидатов своим namespace и вставляет только часть имени,
+которую должен заменить клиент, включая вложенные clause paths. Member
+completion убирает эквивалентные override/diamond/virtual members по PHP
+lookup identity: методы без учёта ASCII-регистра, свойства и константы с
+учётом регистра; открытый буфер имеет приоритет над индексированным файлом.
+RED-регрессии подтвердили дубли функций, неверный kind импорта, дубли
+унаследованных методов, а затем ошибки вставки в grouped и nested grouped
+imports. Unit и LSP e2e тесты покрывают эти случаи.
+
+Финальный последовательный Rust-набор прошёл 1198/1198 без ignored; Clippy,
+Rustfmt, diff check и Verifier review на `gpt-6-sol` — GO. Исходное описание
+находки сохранено без изменений.
+
 ### CODEX-P2-14. Visibility completion неполно соответствует PHP
 
 [`member_is_visible`](server/crates/php-lsp-completion/src/provider.rs#L948)

@@ -72,7 +72,9 @@ phpstorm-stubs support.
 - Completion for classes, interfaces, traits, enums, functions, constants,
   methods, properties, variables, namespaces, keywords, snippets, PHPDoc virtual
   members, shape keys/properties, framework string keys, template paths, and
-  auto-import edits; incomplete one-line `$object->` expressions remain usable
+  auto-import edits. `use` completion selects class/function/constant candidates
+  by import kind, including grouped imports; inherited member overrides do not
+  repeat equivalent labels. Incomplete one-line `$object->` expressions remain usable
   for completion while tree-sitter diagnostics still report the incomplete PHP.
 - Completion resolve enriches PHPDoc virtual member completions.
 - Signature help for functions, methods, constructors, and active parameter

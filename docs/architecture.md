@@ -298,6 +298,16 @@ request cannot combine a new symbol index with an older editor buffer.
 
 ## Completion Context
 
+`UseStatement` completion retains the PHP import kind from the declaration or
+group clause. Class-like, function, and global-constant imports enumerate their
+matching index tables. Simple imports insert the full FQN; grouped imports
+filter to the written namespace and insert only the name after any already
+typed nested clause path. Free completion enumerates each symbol table once.
+Member completion keeps an open file's direct declarations ahead of indexed
+ancestors and deduplicates overrides/diamonds by PHP lookup identity: methods
+are ASCII case-insensitive, while properties and constants remain
+case-sensitive. Distinct symbol kinds and FQNs remain separate candidates.
+
 Composite instance receivers retain their `TypeInfo` tree through member lookup.
 `lsp/composite_receivers.rs` selects the union of guaranteed members for an
 intersection and the common members for a union, without expanding DNF into

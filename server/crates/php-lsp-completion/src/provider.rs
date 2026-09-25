@@ -9,7 +9,7 @@ use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_types::{
     FileSymbols, PhpDocMethod, PhpDocProperty, PhpDocPropertyAccess, PhpSymbolKind, SymbolInfo,
-    Visibility,
+    UseKind, Visibility,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -194,9 +194,11 @@ fn provide_completions_with_current_class(
             cursor_range.and_then(|range| current_callable_symbol_at_range(file_symbols, range)),
         ),
         CompletionContext::Namespace { prefix } => provide_namespace_completions(prefix, index),
-        CompletionContext::UseStatement { prefix } => {
-            provide_use_statement_completions(prefix, index)
-        }
+        CompletionContext::UseStatement {
+            prefix,
+            kind,
+            group_prefix,
+        } => provide_use_statement_completions(prefix, *kind, group_prefix.as_deref(), index),
         CompletionContext::Free { prefix } => provide_free_completions(prefix, index),
         CompletionContext::None => vec![],
     }
@@ -231,21 +233,41 @@ fn completion_members(
                 .eq_ignore_ascii_case(type_fqn.trim_start_matches('\\'))
         })
     });
-    members.extend(
-        file_symbols
-            .symbols
-            .iter()
-            .filter(|symbol| {
-                symbol.parent_fqn.as_deref().is_some_and(|parent_fqn| {
-                    parent_fqn
-                        .trim_start_matches('\\')
-                        .eq_ignore_ascii_case(type_fqn.trim_start_matches('\\'))
-                })
+    let mut current_members = file_symbols
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.parent_fqn.as_deref().is_some_and(|parent_fqn| {
+                parent_fqn
+                    .trim_start_matches('\\')
+                    .eq_ignore_ascii_case(type_fqn.trim_start_matches('\\'))
             })
-            .cloned()
-            .map(Arc::new),
-    );
-    members
+        })
+        .cloned()
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+    current_members.extend(members);
+    current_members
+}
+
+#[derive(Hash, PartialEq, Eq)]
+enum MemberCompletionKey {
+    Method(String),
+    Property(String),
+    Constant(String),
+}
+
+fn member_completion_key(kind: PhpSymbolKind, name: &str) -> Option<MemberCompletionKey> {
+    match kind {
+        PhpSymbolKind::Method => Some(MemberCompletionKey::Method(name.to_ascii_lowercase())),
+        PhpSymbolKind::Property => Some(MemberCompletionKey::Property(
+            name.trim_start_matches('$').to_string(),
+        )),
+        PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase => {
+            Some(MemberCompletionKey::Constant(name.to_string()))
+        }
+        _ => None,
+    }
 }
 
 /// Provide member access completions (`->`).
@@ -274,6 +296,7 @@ fn provide_member_completions(
 
     if let Some(fqn) = class_fqn {
         let members = completion_members(index, file_symbols, &fqn);
+        let mut seen = HashSet::new();
         for member in members {
             // Skip static members for instance access
             if member.modifiers.is_static {
@@ -287,6 +310,11 @@ fn provide_member_completions(
                     continue;
                 }
             }
+            if let Some(key) = member_completion_key(member.kind, &member.name) {
+                if !seen.insert(key) {
+                    continue;
+                }
+            }
 
             items.push(symbol_to_completion_item(
                 &member,
@@ -294,14 +322,12 @@ fn provide_member_completions(
                 Some(member_prefix),
             ));
         }
-        let mut seen_labels: HashSet<String> =
-            items.iter().map(|item| item.label.clone()).collect();
         add_phpdoc_virtual_member_completions(
             &fqn,
             member_prefix,
             index,
             &mut items,
-            &mut seen_labels,
+            &mut seen,
             access_mode,
         );
     }
@@ -315,7 +341,7 @@ fn add_phpdoc_virtual_member_completions(
     member_prefix: &str,
     index: &WorkspaceIndex,
     items: &mut Vec<CompletionItem>,
-    seen_labels: &mut HashSet<String>,
+    seen: &mut HashSet<MemberCompletionKey>,
     access_mode: MemberAccessMode,
 ) {
     for owner in index.get_type_hierarchy_symbols(class_fqn) {
@@ -325,7 +351,11 @@ fn add_phpdoc_virtual_member_completions(
         let phpdoc = parse_phpdoc(doc_comment);
 
         for method in &phpdoc.methods {
-            if method.is_static || !seen_labels.insert(method.name.clone()) {
+            if method.is_static
+                || !seen.insert(MemberCompletionKey::Method(
+                    method.name.to_ascii_lowercase(),
+                ))
+            {
                 continue;
             }
             items.push(phpdoc_method_completion_item(
@@ -340,7 +370,7 @@ fn add_phpdoc_virtual_member_completions(
             if !phpdoc_property_matches_access(property.access, access_mode) {
                 continue;
             }
-            if !seen_labels.insert(property.name.clone()) {
+            if !seen.insert(MemberCompletionKey::Property(property.name.clone())) {
                 continue;
             }
             items.push(phpdoc_property_completion_item(
@@ -357,7 +387,7 @@ fn add_phpdoc_static_virtual_method_completions(
     member_prefix: &str,
     index: &WorkspaceIndex,
     items: &mut Vec<CompletionItem>,
-    seen_labels: &mut HashSet<String>,
+    seen: &mut HashSet<MemberCompletionKey>,
 ) {
     for owner in index.get_type_hierarchy_symbols(class_fqn) {
         let Some(ref doc_comment) = owner.doc_comment else {
@@ -366,7 +396,11 @@ fn add_phpdoc_static_virtual_method_completions(
         let phpdoc = parse_phpdoc(doc_comment);
 
         for method in &phpdoc.methods {
-            if !method.is_static || !seen_labels.insert(method.name.clone()) {
+            if !method.is_static
+                || !seen.insert(MemberCompletionKey::Method(
+                    method.name.to_ascii_lowercase(),
+                ))
+            {
                 continue;
             }
             items.push(phpdoc_method_completion_item(
@@ -510,6 +544,7 @@ fn provide_static_completions(
     let fqn = class_fqn.to_string();
 
     let members = completion_members(index, file_symbols, &fqn);
+    let mut seen = HashSet::from([MemberCompletionKey::Constant("class".to_string())]);
     for member in members {
         let is_parent_instance_method =
             class_expr == "parent" && member.kind == PhpSymbolKind::Method;
@@ -529,20 +564,18 @@ fn provide_static_completions(
         ) {
             continue;
         }
+        if let Some(key) = member_completion_key(member.kind, &member.name) {
+            if !seen.insert(key) {
+                continue;
+            }
+        }
         items.push(symbol_to_completion_item(
             &member,
             true,
             Some(member_prefix),
         ));
     }
-    let mut seen_labels: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
-    add_phpdoc_static_virtual_method_completions(
-        &fqn,
-        member_prefix,
-        index,
-        &mut items,
-        &mut seen_labels,
-    );
+    add_phpdoc_static_virtual_method_completions(&fqn, member_prefix, index, &mut items, &mut seen);
 
     sort_completion_items(&mut items);
     items
@@ -622,23 +655,43 @@ fn provide_variable_completions(
 
 /// Provide namespace/class completions.
 fn provide_namespace_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<CompletionItem> {
-    provide_namespace_completions_with_options(prefix, index, false)
+    provide_namespace_completions_with_options(prefix, index, false, UseKind::Class, None)
 }
 
-fn provide_use_statement_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<CompletionItem> {
-    provide_namespace_completions_with_options(prefix, index, true)
+fn provide_use_statement_completions(
+    prefix: &str,
+    kind: UseKind,
+    group_prefix: Option<&str>,
+    index: &WorkspaceIndex,
+) -> Vec<CompletionItem> {
+    provide_namespace_completions_with_options(prefix, index, true, kind, group_prefix)
 }
 
 fn provide_namespace_completions_with_options(
     prefix: &str,
     index: &WorkspaceIndex,
     insert_fqn: bool,
+    kind: UseKind,
+    group_prefix: Option<&str>,
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     let published = index.read();
+    let candidates = match kind {
+        UseKind::Class => published.types(),
+        UseKind::Function => published.functions(),
+        UseKind::Constant => published.constants(),
+    };
 
-    for entry in published.types().iter() {
+    for entry in candidates.iter() {
         let sym = entry.value();
+        let grouped_insert = if let Some(group_prefix) = group_prefix {
+            let Some(relative) = grouped_use_insert_text(&sym.fqn, group_prefix, prefix) else {
+                continue;
+            };
+            Some(relative)
+        } else {
+            None
+        };
         if let Some(match_rank) = namespace_completion_match_rank(&sym.name, &sym.fqn, prefix) {
             let mut item = CompletionItem {
                 label: sym.name.clone(),
@@ -656,7 +709,7 @@ fn provide_namespace_completions_with_options(
                 ..Default::default()
             };
             if insert_fqn {
-                item.insert_text = Some(sym.fqn.clone());
+                item.insert_text = Some(grouped_insert.unwrap_or(&sym.fqn).to_string());
             }
             items.push(item);
         }
@@ -666,6 +719,29 @@ fn provide_namespace_completions_with_options(
     sort_completion_items(&mut items);
     items.truncate(100);
     items
+}
+
+fn grouped_use_insert_text<'a>(
+    fqn: &'a str,
+    group_prefix: &str,
+    typed_prefix: &str,
+) -> Option<&'a str> {
+    let group_prefix = group_prefix.trim_start_matches('\\');
+    let candidate = strip_ascii_case_prefix(fqn.trim_start_matches('\\'), group_prefix)?;
+    let typed_clause =
+        strip_ascii_case_prefix(typed_prefix.trim_start_matches('\\'), group_prefix)?;
+    let candidate = if let Some(last_separator) = typed_clause.rfind('\\') {
+        strip_ascii_case_prefix(candidate, &typed_clause[..=last_separator])?
+    } else {
+        candidate
+    };
+    (!candidate.is_empty()).then_some(candidate)
+}
+
+fn strip_ascii_case_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 fn namespace_completion_match_rank(name: &str, fqn: &str, prefix: &str) -> Option<&'static str> {
@@ -706,41 +782,42 @@ fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Complet
         }
     }
 
-    // Add matching types
-    let results = index.search(prefix);
-    for sym in results {
+    let mut add_symbol = |sym: &SymbolInfo| {
+        let name_lower = sym.name.to_lowercase();
+        if !name_lower.contains(&prefix_lower) {
+            return;
+        }
+        let function_prefix_match =
+            sym.kind == PhpSymbolKind::Function && name_lower.starts_with(&prefix_lower);
+        let sort_text = if function_prefix_match {
+            format!("0200_{}", sym.name.to_ascii_lowercase())
+        } else {
+            format!(
+                "0300_{}_{}",
+                completion_prefix_rank(&sym.name, Some(prefix)),
+                sym.name.to_ascii_lowercase()
+            )
+        };
         items.push(CompletionItem {
             label: sym.name.clone(),
             kind: Some(symbol_kind_to_completion_kind(sym.kind)),
             detail: Some(sym.fqn.clone()),
-            sort_text: Some(format!(
-                "0300_{}_{}",
-                completion_prefix_rank(&sym.name, Some(prefix)),
-                sym.name.to_ascii_lowercase()
-            )),
+            sort_text: Some(sort_text),
             filter_text: Some(format!("{} {}", sym.name, sym.fqn)),
+            commit_characters: (sym.kind == PhpSymbolKind::Function).then(|| vec!["(".to_string()]),
             data: Some(serde_json::Value::String(sym.fqn.clone())),
-            tags: deprecated_completion_tags(&sym),
+            tags: deprecated_completion_tags(sym),
             ..Default::default()
         });
+    };
+    for entry in published.types().iter() {
+        add_symbol(entry.value());
     }
-
-    // Add matching functions
     for entry in published.functions().iter() {
-        let sym = entry.value();
-        if sym.name.to_lowercase().starts_with(&prefix_lower) {
-            items.push(CompletionItem {
-                label: sym.name.clone(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some(sym.fqn.clone()),
-                sort_text: Some(format!("0200_{}", sym.name.to_ascii_lowercase())),
-                filter_text: Some(format!("{} {}", sym.name, sym.fqn)),
-                commit_characters: Some(vec!["(".to_string()]),
-                data: Some(serde_json::Value::String(sym.fqn.clone())),
-                tags: deprecated_completion_tags(sym),
-                ..Default::default()
-            });
-        }
+        add_symbol(entry.value());
+    }
+    for entry in published.constants().iter() {
+        add_symbol(entry.value());
     }
 
     // Limit

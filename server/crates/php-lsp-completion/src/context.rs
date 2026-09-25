@@ -3,7 +3,7 @@
 //! Determines what kind of completion is appropriate based on
 //! the cursor position in the CST and surrounding text.
 
-use php_lsp_types::FileSymbols;
+use php_lsp_types::{FileSymbols, UseKind};
 use tree_sitter::{Node, Point, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +69,10 @@ pub enum CompletionContext {
     UseStatement {
         /// Partial FQN typed.
         prefix: String,
+        /// PHP import kind declared by `use`, including clause-local overrides.
+        kind: UseKind,
+        /// Namespace already written before a grouped `{...}` clause.
+        group_prefix: Option<String>,
     },
 
     /// No completion available.
@@ -130,7 +134,7 @@ pub fn detect_context_at_byte_col(
     }
 
     // Check for `use` statement context
-    if let Some(ctx) = check_use_context(&node, text_before, source) {
+    if let Some(ctx) = check_use_context(&node, source, cursor_offset) {
         return ctx;
     }
 
@@ -425,34 +429,76 @@ fn check_namespace_access(text_before: &str) -> Option<CompletionContext> {
 }
 
 /// Check if cursor is inside a use statement.
-fn check_use_context(node: &Node, text_before: &str, source: &str) -> Option<CompletionContext> {
+fn check_use_context(node: &Node, source: &str, cursor_offset: usize) -> Option<CompletionContext> {
     let mut current = Some(*node);
+    let mut clause_kind = None;
     while let Some(n) = current {
-        if n.kind() == "namespace_use_declaration" || n.kind() == "namespace_use_clause" {
-            let node_text = &source[n.byte_range()];
-            let prefix_source = if text_before.trim_start().starts_with("use") {
-                text_before
-            } else {
-                node_text
-            };
-            let prefix = use_statement_prefix(prefix_source);
-            return Some(CompletionContext::UseStatement { prefix });
+        if n.kind() == "namespace_use_clause" {
+            clause_kind = clause_kind.or_else(|| use_kind_from_node(&n));
+        }
+        if n.kind() == "namespace_use_declaration" {
+            let prefix_source = source.get(n.start_byte()..cursor_offset)?;
+            let (prefix, text_kind, group_prefix) = use_statement_prefix_and_kind(prefix_source);
+            let kind = clause_kind
+                .or_else(|| use_kind_from_node(&n))
+                .unwrap_or(text_kind);
+            return Some(CompletionContext::UseStatement {
+                prefix,
+                kind,
+                group_prefix,
+            });
         }
         current = n.parent();
     }
     None
 }
 
-fn use_statement_prefix(text: &str) -> String {
-    let mut prefix = text.trim_start();
-    prefix = prefix.strip_prefix("use").unwrap_or(prefix).trim_start();
-    for keyword in ["function", "const"] {
-        if let Some(rest) = prefix.strip_prefix(keyword) {
-            prefix = rest.trim_start();
-            break;
+fn use_kind_from_node(node: &Node) -> Option<UseKind> {
+    match node.child_by_field_name("type")?.kind() {
+        "function" => Some(UseKind::Function),
+        "const" => Some(UseKind::Constant),
+        _ => None,
+    }
+}
+
+fn use_statement_prefix_and_kind(text: &str) -> (String, UseKind, Option<String>) {
+    let text = text.trim_start();
+    let prefix = strip_php_keyword(text, "use").unwrap_or(text);
+    let (prefix, kind) = strip_use_kind_keyword(prefix);
+    if let Some((group_prefix, member)) = prefix.rsplit_once('{') {
+        let member = member.rsplit(',').next().unwrap_or(member).trim_start();
+        let (member, clause_kind) = strip_use_kind_keyword(member);
+        let group_prefix = group_prefix.trim().to_string();
+        return (
+            format!("{}{}", group_prefix, member.trim()),
+            if clause_kind == UseKind::Class {
+                kind
+            } else {
+                clause_kind
+            },
+            Some(group_prefix),
+        );
+    }
+    (prefix.trim_end_matches(';').trim().to_string(), kind, None)
+}
+
+fn strip_use_kind_keyword(text: &str) -> (&str, UseKind) {
+    for (keyword, kind) in [
+        ("function", UseKind::Function),
+        ("const", UseKind::Constant),
+    ] {
+        if let Some(rest) = strip_php_keyword(text, keyword) {
+            return (rest, kind);
         }
     }
-    prefix.trim_end_matches(';').trim().to_string()
+    (text, UseKind::Class)
+}
+
+fn strip_php_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let prefix = text.get(..keyword.len())?;
+    let rest = text.get(keyword.len()..)?;
+    (prefix.eq_ignore_ascii_case(keyword) && rest.chars().next().is_some_and(char::is_whitespace))
+        .then(|| rest.trim_start())
 }
 
 /// Extract the object expression from text before `->`.

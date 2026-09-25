@@ -169,6 +169,205 @@ echo $
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_completion_keeps_import_kinds_and_free_functions_distinct() {
+    let (mut service, socket) = LspService::new(PhpLspBackend::new);
+    tokio::spawn(async move {
+        socket.collect::<Vec<_>>().await;
+    });
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialize_request(1))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(initialized_notification())
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            "file:///test/CompletionKindsVendor.php",
+            "<?php\nnamespace Vendor;\nclass HelClass {}\nfunction HelFunc(): void {}\nconst HelConst = 1;\n",
+        ))
+        .await
+        .unwrap();
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(
+            "file:///test/CompletionKindsNestedVendor.php",
+            "<?php\nnamespace Vendor\\Sub;\nclass HelClass {}\nfunction HelFunc(): void {}\nconst HelConst = 2;\n",
+        ))
+        .await
+        .unwrap();
+
+    for (request_id, uri, use_line, expected, expected_insert) in [
+        (
+            2,
+            "file:///test/UseClass.php",
+            "use Vendor\\Hel;",
+            "HelClass",
+            "Vendor\\HelClass",
+        ),
+        (
+            3,
+            "file:///test/UseFunction.php",
+            "use function Vendor\\Hel;",
+            "HelFunc",
+            "Vendor\\HelFunc",
+        ),
+        (
+            4,
+            "file:///test/UseConstant.php",
+            "use const Vendor\\Hel;",
+            "HelConst",
+            "Vendor\\HelConst",
+        ),
+        (
+            5,
+            "file:///test/UseGroupedFunction.php",
+            "use Vendor\\{function Hel};",
+            "HelFunc",
+            "HelFunc",
+        ),
+        (
+            6,
+            "file:///test/UseGroupedConstant.php",
+            "use Vendor\\{const Hel};",
+            "HelConst",
+            "HelConst",
+        ),
+        (
+            7,
+            "file:///test/UseNestedGroupedClass.php",
+            "use Vendor\\{Sub\\Hel};",
+            "HelClass",
+            "HelClass",
+        ),
+        (
+            8,
+            "file:///test/UseNestedGroupedFunction.php",
+            "use Vendor\\{function Sub\\Hel};",
+            "HelFunc",
+            "HelFunc",
+        ),
+        (
+            9,
+            "file:///test/UseNestedGroupedConstant.php",
+            "use Vendor\\{const Sub\\Hel};",
+            "HelConst",
+            "HelConst",
+        ),
+    ] {
+        let source = format!("<?php\n{use_line}\n");
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open_notification(uri, &source))
+            .await
+            .unwrap();
+        let result = extract_result(
+            service
+                .ready()
+                .await
+                .unwrap()
+                .call(completion_request(
+                    request_id,
+                    uri,
+                    1,
+                    use_line
+                        .find('}')
+                        .unwrap_or_else(|| use_line.find(';').unwrap()) as u32,
+                ))
+                .await
+                .unwrap(),
+        );
+        let items = completion_items_from_result(&result);
+        let labels = items
+            .iter()
+            .filter_map(|item| item.get("label").and_then(serde_json::Value::as_str))
+            .filter(|label| label.starts_with("Hel"))
+            .collect::<Vec<_>>();
+        assert_eq!(labels, [expected], "{use_line}: {items:?}");
+        let item = items
+            .iter()
+            .find(|item| item.get("label").and_then(serde_json::Value::as_str) == Some(expected))
+            .unwrap();
+        assert_eq!(
+            item.get("insertText").and_then(serde_json::Value::as_str),
+            Some(expected_insert)
+        );
+        if use_line.contains('{') {
+            let col = use_line.find('}').unwrap();
+            let word_start = use_line[..col]
+                .rfind(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let applied = format!(
+                "{}{}{}",
+                &use_line[..word_start],
+                expected_insert,
+                &use_line[col..]
+            );
+            let expected_line = format!(
+                "{}{}{}",
+                &use_line[..word_start],
+                expected,
+                &use_line[col..]
+            );
+            assert_eq!(applied, expected_line, "grouped import edit: {use_line}");
+        }
+    }
+
+    let free_uri = "file:///test/FreeKinds.php";
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(did_open_notification(free_uri, "<?php\nHel"))
+        .await
+        .unwrap();
+    let result = extract_result(
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion_request(10, free_uri, 1, 3))
+            .await
+            .unwrap(),
+    );
+    let items = completion_items_from_result(&result);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| {
+                item.get("label").and_then(serde_json::Value::as_str) == Some("HelFunc")
+                    && item.get("detail").and_then(serde_json::Value::as_str)
+                        == Some("Vendor\\HelFunc")
+            })
+            .count(),
+        1,
+        "one function symbol must appear once, while the distinct nested FQN remains: {items:?}"
+    );
+    service
+        .ready()
+        .await
+        .unwrap()
+        .call(shutdown_request(99))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_variable_completion_is_scoped_to_the_cursor_callable() {
     let (mut service, socket) = LspService::new(PhpLspBackend::new);
     tokio::spawn(async move {
