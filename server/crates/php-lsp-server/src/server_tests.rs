@@ -785,6 +785,62 @@ fn unique_server_temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+#[tokio::test]
+async fn closed_disk_commit_rejects_changed_source_and_accepts_fresh_parse() {
+    let root = unique_server_temp_dir("changed-disk-commit");
+    let file = root.join("Subject.php");
+    std::fs::write(&file, "<?php namespace App; class Foo {}").unwrap();
+    let uri = php_lsp_types::uri::path_to_uri(&file).unwrap();
+    let root_index = Arc::new(WorkspaceIndex::new());
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: root_index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
+
+    let stale = parse_workspace_file_for_versions_blocking(
+        file.clone(),
+        vec![PhpVersion::DEFAULT],
+        "stale disk source test",
+    )
+    .await
+    .unwrap();
+    std::fs::write(&file, "<?php namespace App; class Bar {}").unwrap();
+    assert!(
+        !backend
+            .commit_closed_php_snapshot_to_current_runtime(&uri, Some(stale))
+            .await
+    );
+    assert!(backend.index.resolve_fqn("App\\Foo").is_none());
+    assert!(root_index.resolve_fqn("App\\Foo").is_none());
+
+    let fresh = parse_workspace_file_for_versions_blocking(
+        file.clone(),
+        vec![PhpVersion::DEFAULT],
+        "fresh disk source test",
+    )
+    .await
+    .unwrap();
+    assert!(
+        backend
+            .commit_closed_php_snapshot_to_current_runtime(&uri, Some(fresh))
+            .await
+    );
+    assert!(backend.index.resolve_fqn("App\\Bar").is_some());
+    assert!(root_index.resolve_fqn("App\\Bar").is_some());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn test_current_class_fqn_at_range_uses_innermost_class_like() {
     let file_symbols = FileSymbols {
@@ -7366,6 +7422,7 @@ async fn test_shared_effective_root_lifecycle_respects_each_root_excludes() {
                     php_version: PhpVersion::DEFAULT,
                     file_symbols: Some(symbols),
                     references: Vec::new(),
+                    source_fingerprint: None,
                 }]),
             )
             .await
@@ -7422,6 +7479,7 @@ async fn test_watched_deprecated_snapshot_cannot_commit_to_new_php_version() {
                 php_version: old_version,
                 file_symbols: Some(parsed_under_old_version),
                 references: Vec::new(),
+                source_fingerprint: None,
             }]),
         )
         .await;
@@ -7551,11 +7609,13 @@ async fn test_watched_deprecated_snapshot_keeps_each_shared_root_php_version() {
                         php_version: PhpVersion { major: 8, minor: 3 },
                         file_symbols: Some(parsed_83),
                         references: Vec::new(),
+                        source_fingerprint: None,
                     },
                     VersionedPhpFileSymbols {
                         php_version: PhpVersion { major: 8, minor: 4 },
                         file_symbols: Some(parsed_84),
                         references: Vec::new(),
+                        source_fingerprint: None,
                     },
                 ]),
             )

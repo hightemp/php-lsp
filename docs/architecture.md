@@ -747,6 +747,19 @@ Each cache file stores schema version, namespace, php-lsp version, workspace
 root, config hash, stubs/vendor hash, file metadata, file symbols, references,
 and top-level symbol snapshots.
 
+Disk symbols and references carry a fingerprint of the exact raw bytes parsed,
+even when parser input uses lossy UTF-8 conversion. Open-buffer and derived
+snapshots have no disk fingerprint and cannot be written to disk cache. Cache
+construction includes a file only when its current bytes match that published
+fingerprint; changed files remain eligible for reparsing. Source checks run in
+bounded blocking work before cache publication, outside the indexing run's
+commit lease. A short lease protects the final rename, with a cancellation
+check. A change in the unavoidable interval after the final check is rejected
+by the content hash on the next load. Workspace cache replay rechecks files
+before publishing symbols, and staged vendor/stub commits discard changed
+sources. Schema version 26 invalidates cache files written before provenance
+tracking.
+
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized
 `php-lsp-types` fields must bump `CACHE_SCHEMA_VERSION` in

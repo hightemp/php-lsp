@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 25;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 26;
 const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3373;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x4910_5a5f_1be5_eecd;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0xcf30_7d9f_8044_00e8;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -50,6 +50,26 @@ fn make_member_symbol(uri: &str) -> SymbolInfo {
     symbol.kind = PhpSymbolKind::Method;
     symbol.parent_fqn = Some("App\\Foo".to_string());
     symbol
+}
+
+fn update_disk_file(index: &WorkspaceIndex, file: &Path, uri: &str, symbols: FileSymbols) {
+    update_disk_file_with_references(index, file, uri, symbols, Vec::new());
+}
+
+fn update_disk_file_with_references(
+    index: &WorkspaceIndex,
+    file: &Path,
+    uri: &str,
+    symbols: FileSymbols,
+    references: Vec<SymbolReference>,
+) {
+    let bytes = fs::read(file).unwrap();
+    index.update_file_with_references_from_source(
+        uri,
+        symbols,
+        references,
+        SourceFingerprint::from_bytes(&bytes),
+    );
 }
 
 fn cache_schema_symbol(uri: &str, name: &str, kind: PhpSymbolKind) -> SymbolInfo {
@@ -312,7 +332,9 @@ fn cache_roundtrip_loads_valid_file_symbols() {
     let uri = path_to_uri(&file).unwrap();
 
     let index = WorkspaceIndex::new();
-    index.update_file(
+    update_disk_file(
+        &index,
+        &file,
         &uri,
         FileSymbols {
             namespace: Some("App".to_string()),
@@ -354,7 +376,9 @@ fn cache_invalidates_stale_schema_version() {
     let uri = path_to_uri(&file).unwrap();
 
     let index = WorkspaceIndex::new();
-    index.update_file(
+    update_disk_file(
+        &index,
+        &file,
         &uri,
         FileSymbols {
             namespace: Some("App".to_string()),
@@ -448,7 +472,9 @@ fn cache_roundtrip_loads_file_references() {
     }];
 
     let index = WorkspaceIndex::new();
-    index.update_file_with_references(
+    update_disk_file_with_references(
+        &index,
+        &file,
         &uri,
         FileSymbols {
             namespace: None,
@@ -496,7 +522,9 @@ fn cache_invalidates_changed_file_metadata() {
     let uri = path_to_uri(&file).unwrap();
 
     let index = WorkspaceIndex::new();
-    index.update_file(
+    update_disk_file(
+        &index,
+        &file,
         &uri,
         FileSymbols {
             namespace: None,
@@ -531,6 +559,253 @@ fn cache_invalidates_changed_file_metadata() {
 }
 
 #[test]
+fn cache_does_not_bind_old_symbols_to_new_same_size_source() {
+    let root = unique_temp_dir("stale-symbol-provenance");
+    let file = root.join("Foo.php");
+    fs::write(&file, "<?php class Foo {}").unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let index = WorkspaceIndex::new();
+    update_disk_file(
+        &index,
+        &file,
+        &uri,
+        FileSymbols {
+            symbols: vec![make_symbol(&uri)],
+            ..Default::default()
+        },
+    );
+
+    // The index still represents Foo when the file changes to Bar. Both
+    // versions have the same size, so mtime/size alone cannot prove freshness.
+    fs::write(&file, "<?php class Bar {}").unwrap();
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let cache_path = root.join("index.bin");
+    save_cache_atomic(&cache_path, &cache).unwrap();
+
+    let loaded = WorkspaceIndex::new();
+    let report = load_valid_cached_files(
+        &loaded,
+        &cache_path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(report.loaded_files, 0);
+    assert_eq!(report.parse_files, vec![file.clone()]);
+    assert!(loaded.resolve_fqn("App\\Foo").is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn prepared_cache_rejects_source_change_before_atomic_publish() {
+    let root = unique_temp_dir("prepared-source-change");
+    let file = root.join("Foo.php");
+    fs::write(&file, "<?php class Foo {}").unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let index = WorkspaceIndex::new();
+    update_disk_file(
+        &index,
+        &file,
+        &uri,
+        FileSymbols {
+            symbols: vec![make_symbol(&uri)],
+            ..Default::default()
+        },
+    );
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &test_config());
+    assert_eq!(cache.files.len(), 1);
+    let cache_path = root.join("index.bin");
+    fs::write(&cache_path, b"previous-cache").unwrap();
+    let prepared = prepare_cache_write(&cache_path, &cache).unwrap();
+
+    fs::write(&file, "<?php class Bar {}").unwrap();
+    assert!(prepared.commit().is_err());
+    assert_eq!(fs::read(&cache_path).unwrap(), b"previous-cache");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn validated_cache_rechecks_source_at_final_commit() {
+    let root = unique_temp_dir("validated-source-change");
+    let file = root.join("Foo.php");
+    fs::write(&file, "<?php class Foo {}").unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let index = WorkspaceIndex::new();
+    update_disk_file(
+        &index,
+        &file,
+        &uri,
+        FileSymbols {
+            symbols: vec![make_symbol(&uri)],
+            ..Default::default()
+        },
+    );
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &test_config());
+    let cache_path = root.join("index.bin");
+    fs::write(&cache_path, b"previous-cache").unwrap();
+    let validated = prepare_cache_write(&cache_path, &cache)
+        .unwrap()
+        .validate()
+        .unwrap();
+
+    fs::write(&file, "<?php class Bar {}").unwrap();
+    assert!(validated.commit().is_err());
+    assert_eq!(fs::read(&cache_path).unwrap(), b"previous-cache");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ready_cache_write_checks_cancellation_before_rename() {
+    let root = unique_temp_dir("ready-cancelled");
+    let cache_path = root.join("index.bin");
+    fs::write(&cache_path, b"previous-cache").unwrap();
+    let mut cache = cache_schema_fixture();
+    cache.files.clear();
+    cache.workspace_root = normalized_path_string(&root);
+    let ready = prepare_cache_write(&cache_path, &cache)
+        .unwrap()
+        .validate()
+        .unwrap()
+        .revalidate(|| false)
+        .unwrap();
+    assert!(ready.commit_cancellable(|| true).is_err());
+    assert_eq!(fs::read(&cache_path).unwrap(), b"previous-cache");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn source_change_after_final_check_is_a_cache_miss_on_reload() {
+    let root = unique_temp_dir("post-check-source-change");
+    let file = root.join("Foo.php");
+    fs::write(&file, "<?php class Foo {}").unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let index = WorkspaceIndex::new();
+    update_disk_file(
+        &index,
+        &file,
+        &uri,
+        FileSymbols {
+            symbols: vec![make_symbol(&uri)],
+            ..Default::default()
+        },
+    );
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let cache_path = root.join("index.bin");
+    let ready = prepare_cache_write(&cache_path, &cache)
+        .unwrap()
+        .validate()
+        .unwrap()
+        .revalidate(|| false)
+        .unwrap();
+    fs::write(&file, "<?php class Bar {}").unwrap();
+    ready.commit().unwrap();
+
+    let loaded = WorkspaceIndex::new();
+    let report = load_valid_cached_files(
+        &loaded,
+        &cache_path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(report.loaded_files, 0);
+    assert_eq!(report.parse_files, vec![file.clone()]);
+    assert!(loaded.resolve_fqn("App\\Foo").is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn untracked_or_replaced_file_does_not_poison_valid_neighbor_cache() {
+    let root = unique_temp_dir("mixed-source-provenance");
+    let untracked_file = root.join("Untracked.php");
+    let valid_file = root.join("Valid.php");
+    fs::write(&untracked_file, "<?php class Foo {}").unwrap();
+    fs::write(&valid_file, "<?php class Bar {}").unwrap();
+    let untracked_uri = path_to_uri(&untracked_file).unwrap();
+    let valid_uri = path_to_uri(&valid_file).unwrap();
+    let index = WorkspaceIndex::new();
+    index.update_file(
+        &untracked_uri,
+        FileSymbols {
+            symbols: vec![make_symbol(&untracked_uri)],
+            ..Default::default()
+        },
+    );
+    let mut valid_symbol = make_symbol(&valid_uri);
+    valid_symbol.name = "Bar".to_string();
+    valid_symbol.fqn = "App\\Bar".to_string();
+    update_disk_file(
+        &index,
+        &valid_file,
+        &valid_uri,
+        FileSymbols {
+            symbols: vec![valid_symbol],
+            ..Default::default()
+        },
+    );
+    let config = test_config();
+    let sources = [untracked_file.clone(), valid_file.clone()];
+    let cache = build_cache_from_index(&index, &root, &sources, &config);
+    assert_eq!(cache.files.len(), 1);
+    assert_eq!(cache.files[0].uri, valid_uri);
+    let cache_path = root.join("index.bin");
+    save_cache_atomic(&cache_path, &cache).unwrap();
+
+    let loaded = WorkspaceIndex::new();
+    let report = load_valid_cached_files(&loaded, &cache_path, &root, &sources, &config);
+    assert_eq!(report.loaded_files, 1);
+    assert_eq!(report.parse_files, vec![untracked_file.clone()]);
+    assert!(loaded.resolve_fqn("App\\Foo").is_none());
+    assert!(loaded.resolve_fqn("App\\Bar").is_some());
+
+    // An open/derived replacement must clear the prior disk provenance.
+    index.update_file(&valid_uri, FileSymbols::default());
+    assert!(!index.read().source_fingerprints().contains_key(&valid_uri));
+    assert!(build_cache_from_index(&index, &root, &sources, &config)
+        .files
+        .is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn external_symlink_uses_logical_uri_and_revalidates_physical_content() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_temp_dir("external-symlink-provenance");
+    let external = unique_temp_dir("external-symlink-target");
+    let target = external.join("Library.php");
+    fs::write(&target, "<?php class Foo {}").unwrap();
+    let logical = root.join("vendor/acme/Library.php");
+    fs::create_dir_all(logical.parent().unwrap()).unwrap();
+    symlink(&target, &logical).unwrap();
+    let uri = path_to_uri(&logical).unwrap();
+    let index = WorkspaceIndex::new();
+    update_disk_file(
+        &index,
+        &logical,
+        &uri,
+        FileSymbols {
+            symbols: vec![make_symbol(&uri)],
+            ..Default::default()
+        },
+    );
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&logical), &config);
+    assert_eq!(cache.files.len(), 1);
+    assert_eq!(cache.files[0].uri, uri);
+    let cache_path = root.join("index.bin");
+    let prepared = prepare_cache_write(&cache_path, &cache).unwrap();
+    fs::write(&target, "<?php class Bar {}").unwrap();
+    assert!(prepared.commit().is_err());
+    assert!(!cache_path.exists());
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(external).unwrap();
+}
+
+#[test]
 fn cache_path_uses_workspace_hash_under_php_lsp_dir() {
     let base = PathBuf::from("/tmp/php-lsp-cache-base");
     let path = cache_file_path_with_base(base.clone(), Path::new("/tmp/project"));
@@ -561,7 +836,9 @@ fn concurrent_saves_to_same_cache_path_do_not_share_temp_file() {
         let config = config.clone();
         handles.push(std::thread::spawn(move || {
             let index = WorkspaceIndex::new();
-            index.update_file(
+            update_disk_file(
+                &index,
+                &file,
                 &uri,
                 FileSymbols {
                     namespace: Some("App".to_string()),
@@ -596,7 +873,9 @@ fn cache_save_over_existing_file_replaces_previous_snapshot() {
     let config = test_config();
 
     let first_index = WorkspaceIndex::new();
-    first_index.update_file(
+    update_disk_file(
+        &first_index,
+        &file,
         &uri,
         FileSymbols {
             namespace: Some("App".to_string()),
@@ -610,10 +889,13 @@ fn cache_save_over_existing_file_replaces_previous_snapshot() {
     save_cache_atomic(&cache_path, &first_cache).unwrap();
 
     let second_index = WorkspaceIndex::new();
+    fs::write(&file, "<?php class Bar {}").unwrap();
     let mut bar_symbol = make_symbol(&uri);
     bar_symbol.name = "Bar".to_string();
     bar_symbol.fqn = "App\\Bar".to_string();
-    second_index.update_file(
+    update_disk_file(
+        &second_index,
+        &file,
         &uri,
         FileSymbols {
             namespace: Some("App".to_string()),
@@ -753,7 +1035,9 @@ fn cache_roundtrip_preserves_encoded_file_uris() {
     assert!(uri.contains("%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82%20File.php"));
 
     let index = WorkspaceIndex::new();
-    index.update_file(
+    update_disk_file(
+        &index,
+        &file,
         &uri,
         FileSymbols {
             namespace: Some("App".to_string()),

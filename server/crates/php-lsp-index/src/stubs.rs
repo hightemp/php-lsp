@@ -5,7 +5,7 @@
 //! Server-side path discovery, validation, and cache-source collection live in
 //! `php-lsp-server/src/indexing/stubs.rs`.
 
-use crate::workspace::WorkspaceIndex;
+use crate::workspace::{SourceFingerprint, WorkspaceIndex};
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::symbols::{
     extract_file_symbols, extract_file_symbols_for_php_version, PhpSymbolExtractionVersion,
@@ -254,6 +254,7 @@ pub fn load_stub_file_for_php_version(
     }
     match std::fs::read_to_string(file_path) {
         Ok(source) => {
+            let fingerprint = SourceFingerprint::from_bytes(source.as_bytes());
             let mut parser = FileParser::new();
             parser.parse_full(&source);
 
@@ -273,7 +274,15 @@ pub fn load_stub_file_for_php_version(
             }
 
             let sym_count = file_symbols.symbols.len();
-            index.update_file(&uri, file_symbols);
+            if !matches!(
+                crate::cache::file_metadata(file_path),
+                Ok(metadata)
+                    if metadata.size == fingerprint.size
+                        && metadata.content_hash == fingerprint.content_hash
+            ) {
+                return None;
+            }
+            index.update_file_from_source(&uri, file_symbols, fingerprint);
 
             if sym_count > 0 {
                 tracing::debug!(

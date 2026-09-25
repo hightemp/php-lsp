@@ -101,6 +101,61 @@ fn test_update_and_resolve() {
 }
 
 #[test]
+fn source_fingerprint_tracks_only_the_published_disk_generation() {
+    let uri = "file:///source-generation.php";
+    let first = SourceFingerprint::from_bytes(b"<?php class First {}");
+    let second = SourceFingerprint::from_bytes(b"<?php class Second {}");
+    let index = WorkspaceIndex::new();
+    index.update_file_from_source(
+        uri,
+        FileSymbols {
+            symbols: vec![make_class("First", "App\\First", uri)],
+            ..Default::default()
+        },
+        first,
+    );
+    assert_eq!(
+        index
+            .read()
+            .source_fingerprints()
+            .get(uri)
+            .map(|entry| *entry.value()),
+        Some(first)
+    );
+
+    // A derived/open-buffer replacement must not inherit stale disk identity.
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![make_class("Unsaved", "App\\Unsaved", uri)],
+            ..Default::default()
+        },
+    );
+    assert!(!index.read().source_fingerprints().contains_key(uri));
+
+    let staged = WorkspaceIndex::new();
+    staged.update_file_from_source(
+        uri,
+        FileSymbols {
+            symbols: vec![make_class("Second", "App\\Second", uri)],
+            ..Default::default()
+        },
+        second,
+    );
+    assert!(index.replace_from_staged_if_sources_current(&staged, &[], &[]));
+    assert_eq!(
+        index
+            .read()
+            .source_fingerprints()
+            .get(uri)
+            .map(|entry| *entry.value()),
+        Some(second)
+    );
+    index.remove_file(uri);
+    assert!(!index.read().source_fingerprints().contains_key(uri));
+}
+
+#[test]
 fn test_type_and_function_lookup_is_ascii_case_insensitive_but_constants_are_not() {
     let index = WorkspaceIndex::new();
     let class = make_class("MixedCaseClass", r"App\MixedCaseClass", "file:///case.php");

@@ -5,7 +5,7 @@
 //! validation. Server runtime code should build `IndexCacheConfig` inputs in
 //! `php-lsp-server/src/indexing/cache.rs` and call this module for persistence.
 
-use crate::workspace::WorkspaceIndex;
+use crate::workspace::{SourceFingerprint, WorkspaceIndex};
 use php_lsp_types::uri::{path_to_uri, FileUriError};
 use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo, SymbolReference};
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// bytes. The cache schema fixture test below guards the representative binary
 /// shape so CI fails until this version and its fingerprint are updated
 /// together.
-pub const CACHE_SCHEMA_VERSION: u32 = 25;
+pub const CACHE_SCHEMA_VERSION: u32 = 26;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -234,14 +234,77 @@ pub fn save_cache_atomic(path: &Path, cache: &IndexCache) -> Result<(), CacheErr
 pub struct PreparedCacheWrite {
     tmp_path: PathBuf,
     destination: PathBuf,
+    source_checks: Vec<(PathBuf, CachedFileMetadata)>,
     committed: bool,
 }
 
 impl PreparedCacheWrite {
-    pub fn commit(mut self) -> Result<(), CacheError> {
+    fn check_sources(&self, cancelled: impl Fn() -> bool) -> Result<(), CacheError> {
+        for (path, expected) in &self.source_checks {
+            if cancelled() {
+                return Err(CacheError::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "cache source validation cancelled",
+                )));
+            }
+            if !matches!(file_metadata(path), Ok(actual) if actual == *expected) {
+                return Err(CacheError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source changed before cache publication: {}",
+                        path.display()
+                    ),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate(self) -> Result<ValidatedCacheWrite, CacheError> {
+        self.check_sources(|| false)?;
+        Ok(ValidatedCacheWrite(self))
+    }
+
+    pub fn commit(self) -> Result<(), CacheError> {
+        self.check_sources(|| false)?;
+        self.commit_unchecked()
+    }
+
+    fn commit_unchecked(mut self) -> Result<(), CacheError> {
         replace_cache_file(&self.tmp_path, &self.destination)?;
         self.committed = true;
         Ok(())
+    }
+}
+
+pub struct ValidatedCacheWrite(PreparedCacheWrite);
+
+impl ValidatedCacheWrite {
+    pub fn commit(self) -> Result<(), CacheError> {
+        self.revalidate(|| false)?.commit()
+    }
+
+    pub fn revalidate(self, cancelled: impl Fn() -> bool) -> Result<ReadyCacheWrite, CacheError> {
+        self.0.check_sources(cancelled)?;
+        Ok(ReadyCacheWrite(self.0))
+    }
+}
+
+pub struct ReadyCacheWrite(PreparedCacheWrite);
+
+impl ReadyCacheWrite {
+    pub fn commit(self) -> Result<(), CacheError> {
+        self.commit_cancellable(|| false)
+    }
+
+    pub fn commit_cancellable(self, cancelled: impl Fn() -> bool) -> Result<(), CacheError> {
+        if cancelled() {
+            return Err(CacheError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cache publication cancelled",
+            )));
+        }
+        self.0.commit_unchecked()
     }
 }
 
@@ -272,9 +335,20 @@ pub fn prepare_cache_write(
     ));
     let bytes = bincode::serialize(cache)?;
     write_cache_temp_file(&tmp_path, &bytes)?;
+    let source_checks = cache
+        .files
+        .iter()
+        .map(|file| {
+            (
+                Path::new(&cache.workspace_root).join(&file.relative_path),
+                file.metadata,
+            )
+        })
+        .collect();
     Ok(PreparedCacheWrite {
         tmp_path,
         destination: path.to_path_buf(),
+        source_checks,
         committed: false,
     })
 }
@@ -411,10 +485,14 @@ pub fn load_valid_cached_sources(
                 if metadata == cached_file.metadata && cached_file.uri == current_source.uri =>
             {
                 report.indexed_symbols += cached_file.file_symbols.symbols.len();
-                index.update_file_with_references(
+                index.update_file_with_references_from_source(
                     &cached_file.uri,
                     cached_file.file_symbols,
                     cached_file.references,
+                    SourceFingerprint {
+                        size: cached_file.metadata.size,
+                        content_hash: cached_file.metadata.content_hash,
+                    },
                 );
                 loaded_relatives.insert(cached_file.relative_path);
                 report.loaded_files += 1;
@@ -467,20 +545,31 @@ pub fn build_cache_from_sources(
                 .file_symbols()
                 .get(&source.uri)
                 .map(|file_symbols| {
+                    let fingerprint = published
+                        .source_fingerprints()
+                        .get(&source.uri)
+                        .map(|entry| *entry.value());
                     let references = published
                         .file_references()
                         .get(&source.uri)
                         .map(|entry| entry.value().clone())
                         .unwrap_or_default();
-                    (file_symbols.value().as_ref().clone(), references)
+                    (
+                        file_symbols.value().as_ref().clone(),
+                        references,
+                        fingerprint,
+                    )
                 })
         };
-        let Some((file_symbols, references)) = indexed else {
+        let Some((file_symbols, references, Some(fingerprint))) = indexed else {
             continue;
         };
         let Ok(metadata) = file_metadata(&source.path) else {
             continue;
         };
+        if metadata.size != fingerprint.size || metadata.content_hash != fingerprint.content_hash {
+            continue;
+        }
 
         files.push(CachedFile {
             uri: source.uri.clone(),

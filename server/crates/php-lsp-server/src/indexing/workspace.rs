@@ -5,15 +5,56 @@ use crate::util::uri::path_to_uri;
 
 use super::super::*;
 
+fn commit_validated_cache_for_run(
+    run: &IndexingRunLease,
+    prepared: cache::ValidatedCacheWrite,
+    cancelled: impl Fn() -> bool,
+) -> Option<std::result::Result<(), cache::CacheError>> {
+    match prepared.revalidate(&cancelled) {
+        Ok(ready) => run.commit_if_current(|| ready.commit_cancellable(&cancelled)),
+        Err(error) => Some(Err(error)),
+    }
+}
+
 fn commit_prepared_stub_load(
     run: &IndexingRunLease,
     staged: &WorkspaceIndex,
     destination: &WorkspaceIndex,
     prepared: PreparedStubLoad,
 ) -> usize {
+    let removed = prepared.prune_changed_sources(staged);
+    let loaded = prepared.loaded.saturating_sub(removed);
+    let cache_path = prepared.cache_path;
+    let ready_cache =
+        prepared
+            .cache_write
+            .and_then(|write| match write.revalidate(|| !run.is_current()) {
+                Ok(ready) => Some(ready),
+                Err(error) => {
+                    if let Some(path) = cache_path.as_ref() {
+                        tracing::warn!(
+                            "Failed to validate stubs index cache at {}: {}",
+                            path.display(),
+                            error
+                        );
+                    }
+                    None
+                }
+            });
     run.commit_if_current(|| {
         replace_stub_symbols_from(staged, destination);
-        prepared.commit_cache()
+        if let Some(ready) = ready_cache {
+            if let Err(error) = ready.commit() {
+                if let Some(path) = cache_path.as_ref() {
+                    tracing::warn!(
+                        "Failed to save stubs index cache at {}: {}",
+                        path.display(),
+                        error
+                    );
+                }
+            }
+        }
+        loaded
     })
     .unwrap_or_default()
 }
@@ -194,6 +235,7 @@ fn commit_disk_php_index_if_closed_with_hook<F>(
     ctx: DiskPhpIndexCommitContext<'_>,
     file_symbols: Option<php_lsp_types::FileSymbols>,
     references: Vec<php_lsp_types::SymbolReference>,
+    source: Option<SourceFingerprint>,
     before_index_commit: F,
 ) -> bool
 where
@@ -214,13 +256,31 @@ where
     if let Some(file_symbols) = file_symbols {
         let root_symbols = file_symbols.clone();
         let root_references = references.clone();
-        ctx.index
-            .update_file_with_references(ctx.uri_str, file_symbols, references);
+        if let Some(source) = source {
+            ctx.index.update_file_with_references_from_source(
+                ctx.uri_str,
+                file_symbols,
+                references,
+                source,
+            );
+        } else {
+            ctx.index
+                .update_file_with_references(ctx.uri_str, file_symbols, references);
+        }
         if let Some(root_index) = ctx
             .root_index
             .filter(|root_index| !std::ptr::eq(*root_index, ctx.index))
         {
-            root_index.update_file_with_references(ctx.uri_str, root_symbols, root_references);
+            if let Some(source) = source {
+                root_index.update_file_with_references_from_source(
+                    ctx.uri_str,
+                    root_symbols,
+                    root_references,
+                    source,
+                );
+            } else {
+                root_index.update_file_with_references(ctx.uri_str, root_symbols, root_references);
+            }
         }
     } else {
         ctx.index.remove_file(ctx.uri_str);
@@ -238,8 +298,9 @@ fn commit_disk_php_index_if_closed(
     ctx: DiskPhpIndexCommitContext<'_>,
     file_symbols: Option<php_lsp_types::FileSymbols>,
     references: Vec<php_lsp_types::SymbolReference>,
+    source: Option<SourceFingerprint>,
 ) -> bool {
-    commit_disk_php_index_if_closed_with_hook(ctx, file_symbols, references, || {})
+    commit_disk_php_index_if_closed_with_hook(ctx, file_symbols, references, source, || {})
 }
 
 fn commit_workspace_disk_file_preserving_open(
@@ -247,8 +308,9 @@ fn commit_workspace_disk_file_preserving_open(
     file_symbols: php_lsp_types::FileSymbols,
     references: Vec<php_lsp_types::SymbolReference>,
     php_version: PhpVersion,
+    source: Option<SourceFingerprint>,
 ) {
-    if commit_disk_php_index_if_closed(ctx, Some(file_symbols), references) {
+    if commit_disk_php_index_if_closed(ctx, Some(file_symbols), references, source) {
         return;
     }
     if let Some(snapshot) = open_document_snapshot_from_state_with_lock_hook_for_version(
@@ -1542,10 +1604,44 @@ pub(in crate::server) fn find_composer_json(root: &Path) -> Option<PathBuf> {
     }
 }
 
-pub(in crate::server) fn read_php_source_lossy(file_path: &Path) -> std::io::Result<String> {
+fn read_php_source_with_fingerprint(
+    file_path: &Path,
+) -> std::io::Result<(String, SourceFingerprint)> {
     let bytes = std::fs::read(file_path)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let fingerprint = SourceFingerprint::from_bytes(&bytes);
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), fingerprint))
 }
+
+fn disk_source_matches(file_path: &Path, expected: SourceFingerprint) -> bool {
+    cache::file_metadata(file_path)
+        .ok()
+        .is_some_and(|metadata| {
+            metadata.size == expected.size && metadata.content_hash == expected.content_hash
+        })
+}
+
+type CachedReplayValidation = (Vec<String>, Vec<(String, PathBuf)>);
+
+fn revalidate_cached_sources(
+    candidates: Vec<(String, PathBuf, SourceFingerprint)>,
+    cancelled: impl Fn() -> bool,
+) -> Option<CachedReplayValidation> {
+    let mut current = Vec::new();
+    let mut changed = Vec::new();
+    for (uri, path, fingerprint) in candidates {
+        if cancelled() {
+            return None;
+        }
+        if disk_source_matches(&path, fingerprint) {
+            current.push(uri);
+        } else {
+            changed.push((uri, path));
+        }
+    }
+    Some((current, changed))
+}
+
+const MAX_SOURCE_STABILITY_RETRIES: usize = 3;
 
 #[cfg(test)]
 pub(in crate::server) fn parse_and_index_php_file(
@@ -1567,7 +1663,7 @@ fn parse_and_index_php_file_for_version(
             return false;
         }
     };
-    let Ok(source) = read_php_source_lossy(file_path) else {
+    let Ok((source, fingerprint)) = read_php_source_with_fingerprint(file_path) else {
         return false;
     };
     let mut parser = FileParser::new();
@@ -1578,7 +1674,10 @@ fn parse_and_index_php_file_for_version(
 
     let file_symbols = extract_index_file_symbols(tree, &source, &uri, php_version);
     let references = collect_symbol_references_in_file(tree, &source, &file_symbols);
-    index.update_file_with_references(&uri, file_symbols, references);
+    if !disk_source_matches(file_path, fingerprint) {
+        return false;
+    }
+    index.update_file_with_references_from_source(&uri, file_symbols, references, fingerprint);
     true
 }
 
@@ -1601,12 +1700,13 @@ fn parse_workspace_file_for_index_with_version(
                 uri: String::new(),
                 file_symbols: None,
                 references: Vec::new(),
+                source_fingerprint: None,
                 symbol_count: 0,
                 error: Some(err.to_string()),
             };
         }
     };
-    let source = match read_php_source_lossy(&file_path) {
+    let (source, fingerprint) = match read_php_source_with_fingerprint(&file_path) {
         Ok(source) => source,
         Err(err) => {
             return WorkspaceParseResult {
@@ -1614,6 +1714,7 @@ fn parse_workspace_file_for_index_with_version(
                 uri,
                 file_symbols: None,
                 references: Vec::new(),
+                source_fingerprint: None,
                 symbol_count: 0,
                 error: Some(format!("failed to read file: {}", err)),
             };
@@ -1628,6 +1729,7 @@ fn parse_workspace_file_for_index_with_version(
             uri,
             file_symbols: None,
             references: Vec::new(),
+            source_fingerprint: None,
             symbol_count: 0,
             error: Some("parser did not produce a syntax tree".to_string()),
         };
@@ -1641,6 +1743,7 @@ fn parse_workspace_file_for_index_with_version(
         uri,
         file_symbols: Some(file_symbols),
         references,
+        source_fingerprint: Some(fingerprint),
         symbol_count,
         error: None,
     }
@@ -1666,33 +1769,37 @@ pub(in crate::server) async fn parse_workspace_file_for_versions_blocking(
 ) -> std::result::Result<Vec<VersionedPhpFileSymbols>, String> {
     let path_label = file_path.display().to_string();
     run_file_io_blocking(label, path_label, move || {
-        let source = read_php_source_lossy(&file_path).ok();
+        let read = read_php_source_with_fingerprint(&file_path).ok();
+        let source = read.as_ref().map(|(source, _)| source.as_str());
+        let fingerprint = read.as_ref().map(|(_, fingerprint)| *fingerprint);
         let uri = path_to_uri(&file_path).ok();
         let mut parser = FileParser::new();
-        if let Some(source) = source.as_deref() {
+        if let Some(source) = source {
             parser.parse_full(source);
         }
         versions
             .into_iter()
             .map(|php_version| {
-                let parsed = source
-                    .as_deref()
-                    .zip(uri.as_deref())
-                    .zip(parser.tree())
-                    .map(|((source, uri), tree)| {
-                        let symbols = extract_file_symbols_for_php_version(
-                            tree,
-                            source,
-                            uri,
-                            symbol_extraction_version(php_version),
-                        );
-                        let references = collect_symbol_references_in_file(tree, source, &symbols);
-                        (symbols, references)
-                    });
+                let parsed =
+                    source
+                        .zip(uri.as_deref())
+                        .zip(parser.tree())
+                        .map(|((source, uri), tree)| {
+                            let symbols = extract_file_symbols_for_php_version(
+                                tree,
+                                source,
+                                uri,
+                                symbol_extraction_version(php_version),
+                            );
+                            let references =
+                                collect_symbol_references_in_file(tree, source, &symbols);
+                            (symbols, references)
+                        });
                 VersionedPhpFileSymbols {
                     php_version,
                     file_symbols: parsed.as_ref().map(|(symbols, _)| symbols.clone()),
                     references: parsed.map(|(_, references)| references).unwrap_or_default(),
+                    source_fingerprint: fingerprint,
                 }
             })
             .collect()
@@ -1828,15 +1935,37 @@ pub(in crate::server) async fn commit_staged_vendor_file(
                 .get(&uri)
                 .map(|references| references.value().clone())
                 .unwrap_or_default();
-            (symbols.value().as_ref().clone(), references)
+            let source = staged
+                .source_fingerprints()
+                .get(&uri)
+                .map(|entry| *entry.value());
+            (symbols.value().as_ref().clone(), references, source)
         })
     };
-    let Some((file_symbols, references)) = staged_snapshot else {
+    let Some((file_symbols, references, source)) = staged_snapshot else {
         return false;
     };
+    if let Some(source) = source {
+        let Some(path) = uri_to_path(&uri) else {
+            return false;
+        };
+        let label = path.display().to_string();
+        if !run_file_io_blocking("vendor source validation", label, move || {
+            disk_source_matches(&path, source)
+        })
+        .await
+        .unwrap_or(false)
+        {
+            return false;
+        }
+    }
     let mut lru = vendor_file_lru.lock().await;
     let commit = || {
-        index.update_file_with_references(&uri, file_symbols, references);
+        if let Some(source) = source {
+            index.update_file_with_references_from_source(&uri, file_symbols, references, source);
+        } else {
+            index.update_file_with_references(&uri, file_symbols, references);
+        }
         if track_in_vendor_lru {
             let evicted = lru.touch(uri);
             for uri in evicted {
@@ -1874,17 +2003,30 @@ pub(in crate::server) async fn save_vendor_index_cache_for_run_blocking(
             return Ok(None);
         }
         let cache_to_save = cache::build_cache_from_sources(&index, &root, &sources, &config);
-        cache::prepare_cache_write(&cache_path_for_prepare, &cache_to_save).map(Some)
+        cache::prepare_cache_write(&cache_path_for_prepare, &cache_to_save)
+            .and_then(cache::PreparedCacheWrite::validate)
+            .map(Some)
     })
     .await;
     match prepared {
         Ok(Ok(Some(prepared))) => {
-            if let Some(Err(error)) = indexing_run.commit_if_current(|| prepared.commit()) {
-                tracing::warn!(
+            let run = indexing_run.clone();
+            match run_file_io_blocking_cancellable(
+                "vendor cache commit",
+                cache_path.display().to_string(),
+                move |cancellation| {
+                    commit_validated_cache_for_run(&run, prepared, || cancellation.is_cancelled())
+                },
+            )
+            .await
+            {
+                Ok(Some(Err(error))) => tracing::warn!(
                     "Failed to save vendor index cache at {}: {}",
                     cache_path.display(),
                     error
-                );
+                ),
+                Err(message) => tracing::warn!("{}", message),
+                Ok(Some(Ok(())) | None) => {}
             }
         }
         Ok(Ok(None)) => {}
@@ -2622,19 +2764,68 @@ pub(in crate::server) async fn index_workspace(
     // Keep disk/cache data separate from the live index so an unsaved open
     // document is never overwritten, even transiently, during indexing.
     let disk_index = WorkspaceIndex::new();
-    let cache_report = cache::load_valid_cached_files(
+    let mut cache_report = cache::load_valid_cached_files(
         &disk_index,
         &cache_path,
         root,
         &all_files,
         &options.cache_config,
     );
-    let cached_uris: Vec<String> = disk_index
-        .read()
-        .file_symbols()
+    let cached_candidates = {
+        let published = disk_index.read();
+        published
+            .file_symbols()
+            .iter()
+            .filter_map(|entry| {
+                let uri = entry.key().clone();
+                let path = uri_to_path(&uri)?;
+                let fingerprint = published
+                    .source_fingerprints()
+                    .get(&uri)
+                    .map(|source| *source.value())?;
+                Some((uri, path, fingerprint))
+            })
+            .collect::<Vec<_>>()
+    };
+    let fallback_changed = cached_candidates
         .iter()
-        .map(|entry| entry.key().clone())
-        .collect();
+        .map(|(uri, path, _)| (uri.clone(), path.clone()))
+        .collect::<Vec<_>>();
+    let (cached_uris, changed_cached) = run_file_io_blocking_cancellable(
+        "workspace cached source validation",
+        root.display().to_string(),
+        move |cancellation| {
+            revalidate_cached_sources(cached_candidates, || cancellation.is_cancelled())
+        },
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or((Vec::new(), fallback_changed));
+    for (uri, path) in changed_cached {
+        let symbol_count = disk_index
+            .read()
+            .file_symbols()
+            .get(&uri)
+            .map(|entry| entry.symbols.len())
+            .unwrap_or_default();
+        disk_index.remove_file(&uri);
+        cache_report.loaded_files = cache_report.loaded_files.saturating_sub(1);
+        cache_report.indexed_symbols = cache_report.indexed_symbols.saturating_sub(symbol_count);
+        cache_report.stale_files += 1;
+        cache_report.parse_files.push(path.clone());
+        if let Ok(source) = CacheSourceFile::workspace(root, &path) {
+            cache_report.parse_sources.push(source);
+        }
+    }
+    cache_report.parse_files.sort();
+    cache_report.parse_files.dedup();
+    cache_report
+        .parse_sources
+        .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    cache_report
+        .parse_sources
+        .dedup_by(|left, right| left.relative_path == right.relative_path);
     for uri_str in cached_uris {
         let Some(file_symbols) = disk_index
             .read()
@@ -2650,6 +2841,11 @@ pub(in crate::server) async fn index_workspace(
             .get(&uri_str)
             .map(|references| references.value().clone())
             .unwrap_or_default();
+        let source = disk_index
+            .read()
+            .source_fingerprints()
+            .get(&uri_str)
+            .map(|entry| *entry.value());
         if indexing_run
             .commit_index_if_current(|| {
                 commit_workspace_disk_file_preserving_open(
@@ -2664,6 +2860,7 @@ pub(in crate::server) async fn index_workspace(
                     file_symbols,
                     references,
                     options.php_version,
+                    source,
                 );
             })
             .is_none()
@@ -2750,6 +2947,7 @@ pub(in crate::server) async fn index_workspace(
 
     let mut done = loaded_from_cache;
     let mut parse_errors = 0usize;
+    let mut unstable_retries: HashMap<PathBuf, usize> = HashMap::new();
     while let Some(result) = parse_tasks.join_next().await {
         if !indexing_run.is_current() {
             parse_tasks.abort_all();
@@ -2762,7 +2960,7 @@ pub(in crate::server) async fn index_workspace(
             return Ok(None);
         }
 
-        let parsed = match result {
+        let mut parsed = match result {
             Ok(parsed) => parsed,
             Err(err) => {
                 let message = format!("Workspace indexing task failed: {}", err);
@@ -2783,11 +2981,37 @@ pub(in crate::server) async fn index_workspace(
             }
         };
 
+        if let Some(fingerprint) = parsed.source_fingerprint {
+            let path = parsed.path.clone();
+            let label = path.display().to_string();
+            let current = run_file_io_blocking("workspace source validation", label, move || {
+                disk_source_matches(&path, fingerprint)
+            })
+            .await
+            .unwrap_or(false);
+            if !current {
+                let attempts = unstable_retries.entry(parsed.path.clone()).or_default();
+                if *attempts < MAX_SOURCE_STABILITY_RETRIES && indexing_run.is_current() {
+                    *attempts += 1;
+                    let path = parsed.path;
+                    parse_tasks.spawn_blocking(move || {
+                        parse_workspace_file_for_index_with_version(path, Some(php_version))
+                    });
+                    continue;
+                }
+                parsed.file_symbols = None;
+                parsed.error = Some("source changed repeatedly during indexing".to_string());
+            }
+        }
+
         if let Some(file_symbols) = parsed.file_symbols {
-            disk_index.update_file_with_references(
+            disk_index.update_file_with_references_from_source(
                 &parsed.uri,
                 file_symbols.clone(),
                 parsed.references.clone(),
+                parsed
+                    .source_fingerprint
+                    .expect("successful parse has source bytes"),
             );
             if indexing_run
                 .commit_index_if_current(|| {
@@ -2803,6 +3027,7 @@ pub(in crate::server) async fn index_workspace(
                         file_symbols,
                         parsed.references,
                         options.php_version,
+                        parsed.source_fingerprint,
                     );
                 })
                 .is_none()
@@ -2895,17 +3120,31 @@ pub(in crate::server) async fn index_workspace(
     let prepared = run_file_io_blocking(
         "workspace cache prepare",
         cache_path.display().to_string(),
-        move || cache::prepare_cache_write(&cache_path_for_prepare, &cache_to_save),
+        move || {
+            cache::prepare_cache_write(&cache_path_for_prepare, &cache_to_save)
+                .and_then(cache::PreparedCacheWrite::validate)
+        },
     )
     .await;
     match prepared {
         Ok(Ok(prepared)) => {
-            if let Some(Err(error)) = indexing_run.commit_if_current(|| prepared.commit()) {
-                tracing::warn!(
+            let run = indexing_run.clone();
+            match run_file_io_blocking_cancellable(
+                "workspace cache commit",
+                cache_path.display().to_string(),
+                move |cancellation| {
+                    commit_validated_cache_for_run(&run, prepared, || cancellation.is_cancelled())
+                },
+            )
+            .await
+            {
+                Ok(Some(Err(error))) => tracing::warn!(
                     "Failed to save workspace index cache at {}: {}",
                     cache_path.display(),
                     error
-                );
+                ),
+                Err(message) => tracing::warn!("{}", message),
+                Ok(Some(Ok(())) | None) => {}
             }
         }
         Ok(Err(error)) => tracing::warn!(
@@ -2974,6 +3213,24 @@ impl PhpLspBackend {
         uri_str: &str,
         snapshots: Option<Vec<VersionedPhpFileSymbols>>,
     ) -> bool {
+        if let Some(expected) = snapshots.as_ref().and_then(|snapshots| {
+            snapshots
+                .iter()
+                .find_map(|snapshot| snapshot.source_fingerprint)
+        }) {
+            let Some(path) = uri_to_path(uri_str) else {
+                return false;
+            };
+            let label = path.display().to_string();
+            if !run_file_io_blocking("closed PHP source validation", label, move || {
+                disk_source_matches(&path, expected)
+            })
+            .await
+            .unwrap_or(false)
+            {
+                return false;
+            }
+        }
         let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
         let state = self.runtime_state.lock().await;
         let dashmap::mapref::entry::Entry::Vacant(_open_entry) =
@@ -3003,21 +3260,40 @@ impl PhpLspBackend {
                 self.index.remove_file(uri_str);
             } else {
                 if let Some(symbols) = target_snapshots[0].1.file_symbols.as_ref() {
-                    self.index.update_file_with_references(
-                        uri_str,
-                        symbols.clone(),
-                        target_snapshots[0].1.references.clone(),
-                    );
+                    let snapshot = target_snapshots[0].1;
+                    if let Some(source) = snapshot.source_fingerprint {
+                        self.index.update_file_with_references_from_source(
+                            uri_str,
+                            symbols.clone(),
+                            snapshot.references.clone(),
+                            source,
+                        );
+                    } else {
+                        self.index.update_file_with_references(
+                            uri_str,
+                            symbols.clone(),
+                            snapshot.references.clone(),
+                        );
+                    }
                 } else {
                     self.index.remove_file(uri_str);
                 }
                 for (index, snapshot) in target_snapshots {
                     if let Some(symbols) = snapshot.file_symbols.as_ref() {
-                        index.update_file_with_references(
-                            uri_str,
-                            symbols.clone(),
-                            snapshot.references.clone(),
-                        );
+                        if let Some(source) = snapshot.source_fingerprint {
+                            index.update_file_with_references_from_source(
+                                uri_str,
+                                symbols.clone(),
+                                snapshot.references.clone(),
+                                source,
+                            );
+                        } else {
+                            index.update_file_with_references(
+                                uri_str,
+                                symbols.clone(),
+                                snapshot.references.clone(),
+                            );
+                        }
                     } else {
                         index.remove_file(uri_str);
                     }
@@ -3138,6 +3414,7 @@ impl PhpLspBackend {
                             php_version,
                             file_symbols: None,
                             references: Vec::new(),
+                            source_fingerprint: None,
                         })
                         .collect()
                 }

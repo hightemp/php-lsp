@@ -19,6 +19,296 @@ fn parsed_document(
 }
 
 #[test]
+fn parsed_source_fingerprint_uses_raw_bytes_before_lossy_utf8_conversion() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-raw-fingerprint-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("Foo.php");
+    let bytes = b"<?php namespace App; class Foo {}\xff";
+    std::fs::write(&file, bytes).unwrap();
+    let parsed = parse_workspace_file_for_index(file.clone());
+    let fingerprint = parsed.source_fingerprint.expect("raw source fingerprint");
+    assert_eq!(fingerprint, SourceFingerprint::from_bytes(bytes));
+    let index = WorkspaceIndex::new();
+    index.update_file_with_references_from_source(
+        &parsed.uri,
+        parsed.file_symbols.expect("parsed symbols"),
+        parsed.references,
+        fingerprint,
+    );
+    let config = workspace_index_cache_config(
+        Some(&root),
+        PhpVersion::DEFAULT,
+        &[],
+        &[],
+        TraversalLimits::default(),
+        None,
+        None,
+    );
+    let cache = cache::build_cache_from_index(&index, &root, &[file], &config);
+    assert_eq!(cache.files.len(), 1);
+    assert_eq!(
+        cache.files[0].metadata.content_hash,
+        fingerprint.content_hash
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cached_workspace_file_changed_after_load_is_queued_for_reparse() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-cached-replay-race-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("Subject.php");
+    std::fs::write(&file, "<?php class Foo {}").unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let parsed = parse_workspace_file_for_index(file.clone());
+    let source = parsed.source_fingerprint.unwrap();
+    let initial = WorkspaceIndex::new();
+    initial.update_file_with_references_from_source(
+        &uri,
+        parsed.file_symbols.unwrap(),
+        parsed.references,
+        source,
+    );
+    let config = workspace_index_cache_config(
+        Some(&root),
+        PhpVersion::DEFAULT,
+        &[],
+        &[],
+        TraversalLimits::default(),
+        None,
+        None,
+    );
+    let cache_path = root.join("index.bin");
+    let cache =
+        cache::build_cache_from_index(&initial, &root, std::slice::from_ref(&file), &config);
+    cache::save_cache_atomic(&cache_path, &cache).unwrap();
+    let loaded = WorkspaceIndex::new();
+    let report = cache::load_valid_cached_files(
+        &loaded,
+        &cache_path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(report.loaded_files, 1);
+
+    std::fs::write(&file, "<?php class Bar {}").unwrap();
+    let (current, changed) =
+        revalidate_cached_sources(vec![(uri.clone(), file.clone(), source)], || false)
+            .expect("completed validation");
+    assert!(current.is_empty());
+    assert_eq!(changed, vec![(uri, file)]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn superseding_run_does_not_wait_for_cache_source_revalidation() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-cache-revalidation-lease-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("Foo.php");
+    let bytes = b"<?php class Foo {}";
+    std::fs::write(&file, bytes).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let (_, symbols, references) = parsed_document(&uri, std::str::from_utf8(bytes).unwrap());
+    let index = WorkspaceIndex::new();
+    index.update_file_with_references_from_source(
+        &uri,
+        symbols,
+        references,
+        SourceFingerprint::from_bytes(bytes),
+    );
+    let config = workspace_index_cache_config(
+        Some(&root),
+        PhpVersion::DEFAULT,
+        &[],
+        &[],
+        TraversalLimits::default(),
+        None,
+        None,
+    );
+    let cache = cache::build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let cache_path = root.join("index.bin");
+    std::fs::write(&cache_path, b"previous-cache").unwrap();
+    let prepared = cache::prepare_cache_write(&cache_path, &cache)
+        .unwrap()
+        .validate()
+        .unwrap();
+
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let old_guard = coordinator.start(root.clone());
+    let old_run = old_guard.lease();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let first_check = std::sync::atomic::AtomicBool::new(true);
+        commit_validated_cache_for_run(&old_run, prepared, || {
+            if first_check.swap(false, Ordering::SeqCst) {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            false
+        })
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("source revalidation reached");
+    let newer_coordinator = coordinator.clone();
+    let newer_root = root.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let newer = std::thread::spawn(move || {
+        let guard = newer_coordinator.start(newer_root);
+        started_tx.send(()).unwrap();
+        guard
+    });
+    let started_without_waiting = started_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+    release_tx.send(()).unwrap();
+    let _new_guard = newer.join().expect("new run started");
+    assert!(
+        started_without_waiting,
+        "source hashing held the run slot lease"
+    );
+    assert!(writer.join().expect("old cache writer finished").is_none());
+    assert_eq!(std::fs::read(&cache_path).unwrap(), b"previous-cache");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn staged_vendor_commit_rejects_changed_file_without_losing_valid_neighbor() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-vendor-source-race-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let vendor = root.join("vendor/acme/pkg");
+    std::fs::create_dir_all(&vendor).unwrap();
+    let changed = vendor.join("Changed.php");
+    let stable = vendor.join("Stable.php");
+    let changed_bytes = b"<?php class Changed {}";
+    let stable_bytes = b"<?php class Stable {}";
+    std::fs::write(&changed, changed_bytes).unwrap();
+    std::fs::write(&stable, stable_bytes).unwrap();
+    let changed_uri = path_to_uri(&changed).unwrap();
+    let stable_uri = path_to_uri(&stable).unwrap();
+    let staged = WorkspaceIndex::new();
+    for (uri, bytes) in [
+        (&changed_uri, changed_bytes.as_slice()),
+        (&stable_uri, stable_bytes.as_slice()),
+    ] {
+        let source = std::str::from_utf8(bytes).unwrap();
+        let (_, symbols, references) = parsed_document(uri, source);
+        staged.update_file_with_references_from_source(
+            uri,
+            symbols,
+            references,
+            SourceFingerprint::from_bytes(bytes),
+        );
+    }
+    let live = WorkspaceIndex::new();
+    let lru = Arc::new(Mutex::new(VendorFileLru::default()));
+
+    std::fs::write(&changed, b"<?php class Replaced {}").unwrap();
+    assert!(
+        !commit_staged_vendor_file(&live, &lru, &staged, changed_uri.clone(), false, None, None,)
+            .await
+    );
+    assert!(live.resolve_fqn("Changed").is_none());
+    assert!(
+        commit_staged_vendor_file(&live, &lru, &staged, stable_uri.clone(), false, None, None,)
+            .await
+    );
+    assert!(live.resolve_fqn("Stable").is_some());
+    assert!(!live.read().source_fingerprints().contains_key(&changed_uri));
+    assert!(live.read().source_fingerprints().contains_key(&stable_uri));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn staged_stub_commit_discards_changed_file_and_keeps_valid_neighbor() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-staged-stub-race-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let core = root.join("Core");
+    std::fs::create_dir_all(&core).unwrap();
+    let changed = core.join("Changed.php");
+    let stable = core.join("Stable.php");
+    std::fs::write(&changed, "<?php function changed(): void {}").unwrap();
+    std::fs::write(&stable, "<?php function stable(): void {}").unwrap();
+    let changed_uri = stubs::stub_file_uri(&root, "Core", &changed);
+    let stable_uri = stubs::stub_file_uri(&root, "Core", &stable);
+    let staged = WorkspaceIndex::new();
+    for (uri, path) in [(&changed_uri, &changed), (&stable_uri, &stable)] {
+        let bytes = std::fs::read(path).unwrap();
+        let source = std::str::from_utf8(&bytes).unwrap();
+        let (_, symbols, references) = parsed_document(uri, source);
+        staged.update_file_with_references_from_source(
+            uri,
+            symbols,
+            references,
+            SourceFingerprint::from_bytes(&bytes),
+        );
+    }
+    let destination = WorkspaceIndex::new();
+    let coordinator = Arc::new(IndexingRunCoordinator::default());
+    let guard = coordinator.start(root.clone());
+    let run = guard.lease();
+    let prepared = PreparedStubLoad {
+        loaded: 2,
+        cache_path: None,
+        cache_write: None,
+        source_paths: vec![
+            (changed_uri.clone(), changed.clone()),
+            (stable_uri.clone(), stable.clone()),
+        ],
+    };
+    std::fs::write(&changed, "<?php function changed(): bool {}").unwrap();
+
+    assert_eq!(
+        commit_prepared_stub_load(&run, &staged, &destination, prepared),
+        1
+    );
+    assert!(destination.resolve_fqn("changed").is_none());
+    assert!(destination.resolve_fqn("stable").is_some());
+    assert!(!destination
+        .read()
+        .source_fingerprints()
+        .contains_key(&changed_uri));
+    assert!(destination
+        .read()
+        .source_fingerprints()
+        .contains_key(&stable_uri));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn disk_index_open_overlay_uses_own_php_version_for_deprecation() {
     let uri = "file:///workspace/Old.php";
     let source = "<?php\n#[\\Deprecated] function oldFunction(): void {}\n";
@@ -47,6 +337,7 @@ fn disk_index_open_overlay_uses_own_php_version_for_deprecation() {
         disk_symbols,
         disk_references,
         PhpVersion { major: 8, minor: 3 },
+        None,
     );
     let symbol = index
         .resolve_fqn("oldFunction")
@@ -432,6 +723,7 @@ fn delayed_workspace_disk_index_never_overwrites_an_unsaved_open_document() {
             disk_symbols,
             disk_references,
             PhpVersion::DEFAULT,
+            None,
         );
     });
 
@@ -487,6 +779,7 @@ fn superseded_workspace_run_cannot_restore_removed_symbols() {
                 stale_symbols,
                 stale_references,
                 PhpVersion::DEFAULT,
+                None,
             );
         })
         .is_none());
@@ -529,11 +822,15 @@ fn superseded_initial_run_cannot_publish_staged_stubs_or_cache() {
         files: Vec::new(),
         top_level: php_lsp_index::cache::CachedTopLevelSymbols::default(),
     };
-    let cache_write = php_lsp_index::cache::prepare_cache_write(&cache_path, &stale_cache).unwrap();
+    let cache_write = php_lsp_index::cache::prepare_cache_write(&cache_path, &stale_cache)
+        .unwrap()
+        .validate()
+        .unwrap();
     let prepared = PreparedStubLoad {
         loaded: 1,
         cache_path: Some(cache_path.clone()),
         cache_write: Some(cache_write),
+        source_paths: Vec::new(),
     };
 
     assert_eq!(

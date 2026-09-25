@@ -30,7 +30,7 @@ use php_lsp_completion::provider::provide_completions_at_range;
 use php_lsp_index::cache::{self, CacheNamespace, CacheSourceFile, IndexCacheConfig};
 use php_lsp_index::composer::{parse_composer_json, NamespaceMap};
 use php_lsp_index::stubs;
-use php_lsp_index::workspace::WorkspaceIndex;
+use php_lsp_index::workspace::{SourceFingerprint, WorkspaceIndex};
 use php_lsp_parser::diagnostics::extract_syntax_errors;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
@@ -2402,13 +2402,26 @@ fn copy_non_stub_symbols(source: &WorkspaceIndex, destination: &WorkspaceIndex) 
                     .get(&uri)
                     .map(|entry| entry.value().clone())
                     .unwrap_or_default();
-                (symbols.value().as_ref().clone(), references)
+                let fingerprint = published
+                    .source_fingerprints()
+                    .get(&uri)
+                    .map(|entry| *entry.value());
+                (symbols.value().as_ref().clone(), references, fingerprint)
             })
         };
-        let Some((symbols, references)) = indexed else {
+        let Some((symbols, references, fingerprint)) = indexed else {
             continue;
         };
-        destination.update_file_with_references(&uri, symbols, references);
+        if let Some(fingerprint) = fingerprint {
+            destination.update_file_with_references_from_source(
+                &uri,
+                symbols,
+                references,
+                fingerprint,
+            );
+        } else {
+            destination.update_file_with_references(&uri, symbols, references);
+        }
     }
 }
 
@@ -2486,6 +2499,7 @@ struct WorkspaceParseResult {
     uri: String,
     file_symbols: Option<php_lsp_types::FileSymbols>,
     references: Vec<php_lsp_types::SymbolReference>,
+    source_fingerprint: Option<SourceFingerprint>,
     symbol_count: usize,
     error: Option<String>,
 }
@@ -2495,6 +2509,7 @@ struct VersionedPhpFileSymbols {
     php_version: PhpVersion,
     file_symbols: Option<php_lsp_types::FileSymbols>,
     references: Vec<php_lsp_types::SymbolReference>,
+    source_fingerprint: Option<SourceFingerprint>,
 }
 
 impl SemanticTokensCache {

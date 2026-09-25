@@ -55,13 +55,26 @@ pub(crate) fn replace_stub_symbols_from(staged: &WorkspaceIndex, destination: &W
                     .get(&uri)
                     .map(|entry| entry.value().clone())
                     .unwrap_or_default();
-                (symbols.value().as_ref().clone(), references)
+                let fingerprint = published
+                    .source_fingerprints()
+                    .get(&uri)
+                    .map(|entry| *entry.value());
+                (symbols.value().as_ref().clone(), references, fingerprint)
             })
         };
-        let Some((symbols, references)) = indexed else {
+        let Some((symbols, references, fingerprint)) = indexed else {
             continue;
         };
-        destination.update_file_with_references(&uri, symbols, references);
+        if let Some(fingerprint) = fingerprint {
+            destination.update_file_with_references_from_source(
+                &uri,
+                symbols,
+                references,
+                fingerprint,
+            );
+        } else {
+            destination.update_file_with_references(&uri, symbols, references);
+        }
     }
 }
 
@@ -151,14 +164,15 @@ pub(crate) fn load_configured_stubs(
         php_version,
         None,
     )
-    .map(PreparedStubLoad::commit_cache)
+    .map(|prepared| prepared.commit_cache(index))
     .unwrap_or_default()
 }
 
 pub(crate) struct PreparedStubLoad {
     pub(crate) loaded: usize,
     pub(crate) cache_path: Option<PathBuf>,
-    pub(crate) cache_write: Option<cache::PreparedCacheWrite>,
+    pub(crate) cache_write: Option<cache::ValidatedCacheWrite>,
+    pub(crate) source_paths: Vec<(String, PathBuf)>,
 }
 
 impl PreparedStubLoad {
@@ -167,10 +181,37 @@ impl PreparedStubLoad {
             loaded: 0,
             cache_path: None,
             cache_write: None,
+            source_paths: Vec::new(),
         }
     }
 
-    pub(crate) fn commit_cache(self) -> usize {
+    pub(crate) fn prune_changed_sources(&self, index: &WorkspaceIndex) -> usize {
+        let mut removed = 0;
+        for (uri, path) in &self.source_paths {
+            let published = index.read();
+            let present = published.file_symbols().contains_key(uri);
+            let fingerprint = published
+                .source_fingerprints()
+                .get(uri)
+                .map(|entry| *entry.value());
+            drop(published);
+            if present
+                && !fingerprint.is_some_and(|fingerprint| {
+                    cache::file_metadata(path).ok().is_some_and(|metadata| {
+                        metadata.size == fingerprint.size
+                            && metadata.content_hash == fingerprint.content_hash
+                    })
+                })
+            {
+                index.remove_file(uri);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    pub(crate) fn commit_cache(self, index: &WorkspaceIndex) -> usize {
+        let removed = self.prune_changed_sources(index);
         if let (Some(cache_path), Some(cache_write)) = (self.cache_path, self.cache_write) {
             if let Err(error) = cache_write.commit() {
                 tracing::warn!(
@@ -180,7 +221,7 @@ impl PreparedStubLoad {
                 );
             }
         }
-        self.loaded
+        self.loaded.saturating_sub(removed)
     }
 }
 
@@ -291,7 +332,9 @@ fn prepare_configured_stubs(
 
         let cache_to_save =
             cache::build_cache_from_sources(index, &stubs_path, &cache_sources, &cache_config);
-        let cache_write = match cache::prepare_cache_write(&cache_path, &cache_to_save) {
+        let cache_write = match cache::prepare_cache_write(&cache_path, &cache_to_save)
+            .and_then(cache::PreparedCacheWrite::validate)
+        {
             Ok(prepared) => Some(prepared),
             Err(error) => {
                 tracing::warn!(
@@ -317,6 +360,10 @@ fn prepare_configured_stubs(
             loaded,
             cache_path: Some(cache_path),
             cache_write,
+            source_paths: cache_sources
+                .into_iter()
+                .map(|source| (source.uri, source.path))
+                .collect(),
         });
     }
 

@@ -65,6 +65,22 @@ pub struct CommittedTypeSnapshot {
     pub generation: TypeIndexGeneration,
 }
 
+/// Identity of the exact file bytes used to extract one disk symbol snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceFingerprint {
+    pub size: u64,
+    pub content_hash: u64,
+}
+
+impl SourceFingerprint {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            size: bytes.len() as u64,
+            content_hash: crate::cache::stable_hash_bytes(bytes),
+        }
+    }
+}
+
 struct TypeResolutionSnapshot {
     type_snapshot: CommittedTypeSnapshot,
     direct_members: Vec<Arc<SymbolInfo>>,
@@ -185,6 +201,9 @@ struct IndexTables {
     /// File URI → precomputed non-local symbol references for that file
     file_references: DashMap<String, Vec<SymbolReference>>,
 
+    /// File URI → bytes that produced the published disk snapshot.
+    source_fingerprints: DashMap<String, SourceFingerprint>,
+
     /// ASCII-lowercased parent FQN → compact locations of its direct members.
     direct_members_by_parent: DashMap<String, Arc<[DirectMemberSource]>>,
 }
@@ -222,6 +241,12 @@ impl WorkspaceIndexRead<'_> {
     pub fn file_references(&self) -> ReadOnlyIndexMap<'_, String, Vec<SymbolReference>> {
         ReadOnlyIndexMap {
             map: &self.index.tables.file_references,
+        }
+    }
+
+    pub fn source_fingerprints(&self) -> ReadOnlyIndexMap<'_, String, SourceFingerprint> {
+        ReadOnlyIndexMap {
+            map: &self.index.tables.source_fingerprints,
         }
     }
 }
@@ -318,6 +343,7 @@ impl WorkspaceIndex {
                 constants: DashMap::new(),
                 file_symbols: DashMap::new(),
                 file_references: DashMap::new(),
+                source_fingerprints: DashMap::new(),
                 direct_members_by_parent: DashMap::new(),
             },
             publication_barrier: PublicationLock::new(()),
@@ -350,6 +376,38 @@ impl WorkspaceIndex {
         file_references: Vec<SymbolReference>,
     ) {
         self.update_file_with_references_with_hook(uri, file_symbols, file_references, || {});
+    }
+
+    /// Publish a disk parse together with the identity of its source bytes.
+    pub fn update_file_with_references_from_source(
+        &self,
+        uri: &str,
+        file_symbols: FileSymbols,
+        file_references: Vec<SymbolReference>,
+        source: SourceFingerprint,
+    ) {
+        let _mutation = self
+            .mutation_barrier
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _publication = self.publication_barrier.write();
+        self.update_file_with_references_unguarded(
+            uri,
+            file_symbols,
+            file_references,
+            Some(source),
+            || {},
+            || {},
+        );
+    }
+
+    pub fn update_file_from_source(
+        &self,
+        uri: &str,
+        file_symbols: FileSymbols,
+        source: SourceFingerprint,
+    ) {
+        self.update_file_with_references_from_source(uri, file_symbols, Vec::new(), source);
     }
 
     fn update_file_with_references_with_hook<F>(
@@ -390,6 +448,7 @@ impl WorkspaceIndex {
             uri,
             file_symbols,
             file_references,
+            None,
             before_top_level_publish,
             before_direct_member_publish,
         );
@@ -400,6 +459,7 @@ impl WorkspaceIndex {
         uri: &str,
         file_symbols: FileSymbols,
         file_references: Vec<SymbolReference>,
+        source: Option<SourceFingerprint>,
         before_top_level_publish: F,
         before_direct_member_publish: G,
     ) where
@@ -464,6 +524,11 @@ impl WorkspaceIndex {
             .file_symbols
             .insert(uri_key.clone(), Arc::clone(&file_symbols));
         self.tables.file_references.insert(uri_key, file_references);
+        if let Some(source) = source {
+            self.tables
+                .source_fingerprints
+                .insert(uri.to_string(), source);
+        }
         let new_direct_member_parents = direct_member_indices
             .keys()
             .cloned()
@@ -568,7 +633,11 @@ impl WorkspaceIndex {
                     .get(&uri)
                     .map(|references| references.value().clone())
                     .unwrap_or_default();
-                (uri, entry.value().as_ref().clone(), references)
+                let source = staged_read
+                    .source_fingerprints()
+                    .get(&uri)
+                    .map(|source| *source.value());
+                (uri, entry.value().as_ref().clone(), references, source)
             })
             .collect::<Vec<_>>();
         drop(staged_read);
@@ -608,8 +677,15 @@ impl WorkspaceIndex {
         for uri in destination_uris {
             self.remove_file_unguarded(&uri);
         }
-        for (uri, symbols, references) in staged_files {
-            self.update_file_with_references_unguarded(&uri, symbols, references, || {}, || {});
+        for (uri, symbols, references, source) in staged_files {
+            self.update_file_with_references_unguarded(
+                &uri,
+                symbols,
+                references,
+                source,
+                || {},
+                || {},
+            );
         }
         true
     }
@@ -648,6 +724,7 @@ impl WorkspaceIndex {
 
     fn take_file_snapshot(&self, uri: &str) -> (HashSet<String>, Option<Arc<FileSymbols>>) {
         self.tables.file_references.remove(uri);
+        self.tables.source_fingerprints.remove(uri);
         let old_file_symbols = self
             .tables
             .file_symbols

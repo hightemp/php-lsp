@@ -1178,14 +1178,25 @@ Rustfmt, diff check и повторный Verifier review на `gpt-6-sol` — G
 
 ### CODEX-P2-12. Cache metadata может быть привязана к старому symbol snapshot
 
-При сохранении кэша symbols берутся из index, а
-[`file_metadata`](server/crates/php-lsp-index/src/cache.rs#L483) повторно читает
-текущий файл позже. Если файл изменился после parse, но до cache build, кэш
-получает старые symbols с hash/mtime нового содержимого. Следующий запуск
-считает такую запись свежей.
+**Исправлено 2026-09-25 (FIX-CODEX-P2-12-CACHE-SOURCE-PROVENANCE).** Индекс
+хранит fingerprint точных исходных байтов рядом с поколением symbols/references;
+замена и удаление снимка очищают его. Workspace, vendor и stubs передают
+fingerprint при разборе и загрузке кеша. Cache build не связывает старые
+символы с новой metadata: файл без provenance или с другим content hash
+пропускается, остальные корректные файлы сохраняются. Перед публикацией cache
+metadata сверяется повторно вне indexing lease, а короткий guarded rename
+проверяет отмену. Loader сверяет content hash; schema 26 отбрасывает старые
+cache-файлы. Workspace cache replay возвращает изменившиеся файлы в parse
+queue; watched PHP и staged vendor/stub commits отвергают устаревшие источники.
 
-Что исправить: переносить content hash из того же source buffer, который был
-распарсен, и отбрасывать commit/cache, если metadata изменилась до публикации.
+RED-регрессии воспроизвели same-size rewrite между parse и cache build, а
+также публикацию подготовленного cache после замены исходника. Тесты покрывают
+повторную проверку, отмену, вытеснение indexing run во время хеширования,
+external symlink, raw bytes при lossy UTF-8, соседние корректные файлы,
+workspace replay и vendor/stub staging.
+
+Финальный последовательный Rust-набор прошёл 1189/1189 без ignored; Clippy,
+Rustfmt, diff check и повторный Verifier review на `gpt-6-sol` — GO.
 
 ### CODEX-P2-13. Completion смешивает symbol kinds и создаёт дубликаты
 

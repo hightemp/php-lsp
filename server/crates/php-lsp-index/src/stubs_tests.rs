@@ -1,6 +1,56 @@
 use super::*;
 
 #[test]
+fn stub_cache_uses_the_loaded_source_fingerprint() {
+    let root = std::env::temp_dir().join(format!(
+        "php-lsp-stub-provenance-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let core = root.join("Core");
+    std::fs::create_dir_all(&core).unwrap();
+    let file = core.join("Foo.php");
+    std::fs::write(&file, "<?php function foo(): void {}").unwrap();
+    let uri = stub_file_uri(&root, "Core", &file);
+    let index = WorkspaceIndex::new();
+    assert!(load_stub_file(&index, &root, "Core", &file).is_some());
+    let source =
+        crate::cache::CacheSourceFile::new(file.clone(), uri.clone(), "Core/Foo.php".to_string());
+    let config = crate::cache::IndexCacheConfig {
+        namespace: crate::cache::CacheNamespace::Stubs,
+        php_lsp_version: "test".to_string(),
+        php_version: "8.4".to_string(),
+        include_paths: Vec::new(),
+        exclude_paths: Vec::new(),
+        traversal_max_files: None,
+        traversal_max_entries: None,
+        stub_extensions: vec!["Core".to_string()],
+        stubs_hash: 1,
+    };
+    assert_eq!(
+        crate::cache::build_cache_from_sources(
+            &index,
+            &root,
+            std::slice::from_ref(&source),
+            &config
+        )
+        .files
+        .len(),
+        1
+    );
+    std::fs::write(&file, "<?php function bar(): void {}").unwrap();
+    assert!(
+        crate::cache::build_cache_from_sources(&index, &root, &[source], &config)
+            .files
+            .is_empty()
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[allow(clippy::len_zero)]
 fn test_default_extensions_not_empty() {
     assert!(DEFAULT_EXTENSIONS.len() > 0);
