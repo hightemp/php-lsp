@@ -776,15 +776,18 @@ Cache invalidation checks:
 - Include and exclude path settings.
 - Stub extension set.
 - Stub metadata hash or vendor metadata hash.
-- Per-file size and mtime.
+- Per-file size, mtime, and content hash; cache construction also checks the
+  fingerprint of the bytes that produced the indexed symbols.
 - Missing or extra files relative to the current source set.
 
 If a filesystem cannot provide a usable modification time, the cache metadata
 records that state explicitly and relies on the content hash and file size to
 avoid accepting stale file snapshots.
 
-Writes are atomic: the server writes a unique temporary file and renames it to
-`index.bin`.
+Writes use a unique temporary file and rename it to `index.bin`. If the
+platform cannot rename over an existing file, the fallback removes the old
+cache before retrying the rename; a failure in that interval leaves a cache
+miss rather than an invalid snapshot.
 
 ## Indexing Pipeline
 

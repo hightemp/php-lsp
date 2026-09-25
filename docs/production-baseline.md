@@ -349,6 +349,9 @@ Result: the primary large workspace meets the warm-start target `< 5s`
 (`3423.19 ms` to `phase=ready`) from disk cache. Latency and heavy-request
 acceptance are tracked separately by `PV-003` and `PV-004`.
 
+These are historical measurements. Warm-start time has not been remeasured
+after the 2026-09-25 schema-26 source-provenance checks.
+
 ### Large Workspace Latency
 
 Command:

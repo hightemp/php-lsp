@@ -29,7 +29,9 @@ Latest large-workspace performance numbers are recorded in
 The latest intelligence milestone refresh is recorded there under
 "IE-045 Intelligence Milestone Acceptance Refresh". The newer 2026-07-21
 post-audit correctness and compatibility acceptance added no performance
-samples, so it does not replace these measurements.
+samples, so it does not replace these measurements. The 2026-09-25 cache
+provenance change (schema 26) added source revalidation; cold and warm
+large-workspace timings have not been rerun for that implementation.
 
 ## Latest Performance Acceptance Snapshot
 

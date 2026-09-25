@@ -197,8 +197,9 @@ phpstorm-stubs support.
   namespaces with mtime, size, and content-hash validation. Lazy vendor files
   are persisted after the requested class is verified in the index; Composer
   vendor metadata is cached in memory with an LRU for lazy vendor symbols. The
-  primary large-workspace warm cache target is met; installed-vendor first-hit
-  behavior remains a watch item.
+  2026-05-28 large-workspace baseline met the warm cache target, but that timing
+  has not been rerun after schema 26 added source-provenance checks.
+  Installed-vendor first-hit behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses merge indexed
   closed-file references with ordinary open PHP snapshots, but still iterate
   workspace reference sets and can be expensive on very large repositories.
