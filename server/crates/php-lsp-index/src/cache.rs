@@ -460,13 +460,22 @@ pub fn build_cache_from_sources(
     config: &IndexCacheConfig,
 ) -> IndexCache {
     let mut files = Vec::new();
-
     for source in current_sources {
-        let Some(file_symbols) = index
-            .file_symbols
-            .get(&source.uri)
-            .map(|entry| entry.value().as_ref().clone())
-        else {
+        let indexed = {
+            let published = index.read();
+            published
+                .file_symbols()
+                .get(&source.uri)
+                .map(|file_symbols| {
+                    let references = published
+                        .file_references()
+                        .get(&source.uri)
+                        .map(|entry| entry.value().clone())
+                        .unwrap_or_default();
+                    (file_symbols.value().as_ref().clone(), references)
+                })
+        };
+        let Some((file_symbols, references)) = indexed else {
             continue;
         };
         let Ok(metadata) = file_metadata(&source.path) else {
@@ -478,11 +487,7 @@ pub fn build_cache_from_sources(
             relative_path: source.relative_path.clone(),
             metadata,
             file_symbols,
-            references: index
-                .file_references
-                .get(&source.uri)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_default(),
+            references,
         });
     }
 

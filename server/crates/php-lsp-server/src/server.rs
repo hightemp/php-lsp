@@ -2369,7 +2369,8 @@ fn clear_non_stub_symbols(
     open_files: Option<&DashMap<String, FileParser>>,
 ) {
     let uris: Vec<String> = index
-        .file_symbols
+        .read()
+        .file_symbols()
         .iter()
         .filter(|entry| {
             !entry.key().starts_with("phpstub://")
@@ -2383,17 +2384,31 @@ fn clear_non_stub_symbols(
 }
 
 fn copy_non_stub_symbols(source: &WorkspaceIndex, destination: &WorkspaceIndex) {
-    for entry in source.file_symbols.iter() {
-        if entry.key().starts_with("phpstub://") {
+    let uris = {
+        let published = source.read();
+        published
+            .file_symbols()
+            .iter()
+            .filter(|entry| !entry.key().starts_with("phpstub://"))
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>()
+    };
+    for uri in uris {
+        let indexed = {
+            let published = source.read();
+            published.file_symbols().get(&uri).map(|symbols| {
+                let references = published
+                    .file_references()
+                    .get(&uri)
+                    .map(|entry| entry.value().clone())
+                    .unwrap_or_default();
+                (symbols.value().as_ref().clone(), references)
+            })
+        };
+        let Some((symbols, references)) = indexed else {
             continue;
-        }
-        let uri = entry.key().clone();
-        let references = source
-            .file_references
-            .get(&uri)
-            .map(|references| references.value().clone())
-            .unwrap_or_default();
-        destination.update_file_with_references(&uri, entry.value().as_ref().clone(), references);
+        };
+        destination.update_file_with_references(&uri, symbols, references);
     }
 }
 
@@ -2406,7 +2421,8 @@ fn rebuild_aggregate_index(
     document_versions: &DashMap<String, OpenDocumentState>,
 ) {
     let uris: Vec<String> = aggregate
-        .file_symbols
+        .read()
+        .file_symbols()
         .iter()
         .map(|entry| entry.key().clone())
         .collect();
@@ -4359,43 +4375,52 @@ impl PhpLspBackend {
                     .commit_unleased_index_mutation(remove_vendor);
             }
         }
-        if reindex_workspace {
-            if !rebuild_aggregate_for_indexing_runs(
-                &self.indexing_run,
-                &self.aggregate_rebuild,
-                &self.index,
-                state.configs.clone(),
-                state.fallback.php_version,
-                self.open_files.clone(),
-                self.template_documents.clone(),
-                self.document_versions.clone(),
-                &reserved_run_leases,
-            )
-            .await
-            {
-                drop(vendor_epoch);
+        let outcome = rebuild_aggregate_for_indexing_runs_with_outcome(
+            &self.indexing_run,
+            &self.aggregate_rebuild,
+            &self.index,
+            state.configs.clone(),
+            state.fallback.php_version,
+            self.open_files.clone(),
+            self.template_documents.clone(),
+            self.document_versions.clone(),
+            &reserved_run_leases,
+        )
+        .await;
+        if outcome != AggregateRebuildOutcome::Published {
+            drop(vendor_epoch);
+            if reindex_workspace || outcome == AggregateRebuildOutcome::Failed {
                 return;
             }
+            // A metadata-only rebuild has no owning indexing run. Keep one
+            // serialized rebuild pending until source commits settle or a new
+            // runtime generation takes ownership of the aggregate.
+            loop {
+                let latest = self.runtime_state_snapshot().await;
+                if latest.generation != state.generation {
+                    return;
+                }
+                match rebuild_aggregate_for_indexing_runs_with_outcome(
+                    &self.indexing_run,
+                    &self.aggregate_rebuild,
+                    &self.index,
+                    latest.configs.clone(),
+                    latest.fallback.php_version,
+                    self.open_files.clone(),
+                    self.template_documents.clone(),
+                    self.document_versions.clone(),
+                    &[],
+                )
+                .await
+                {
+                    AggregateRebuildOutcome::Published => break,
+                    AggregateRebuildOutcome::Failed => return,
+                    AggregateRebuildOutcome::Stale => tokio::task::yield_now().await,
+                }
+            }
         } else {
-            let _aggregate_rebuild = self.aggregate_rebuild.lock().await;
-            let aggregate = self.index.clone();
-            let rebuild_configs = state.configs.clone();
-            let open_files = self.open_files.clone();
-            let template_documents = self.template_documents.clone();
-            let document_versions = self.document_versions.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                rebuild_aggregate_index(
-                    &aggregate,
-                    &rebuild_configs,
-                    state.fallback.php_version,
-                    &open_files,
-                    &template_documents,
-                    &document_versions,
-                );
-            })
-            .await;
+            drop(vendor_epoch);
         }
-        drop(vendor_epoch);
         self.client
             .log_message(
                 MessageType::INFO,

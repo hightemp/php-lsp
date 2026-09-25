@@ -1120,9 +1120,15 @@ fn laravel_macro_source(
         }
     }
 
-    for entry in ctx.index.file_symbols.iter() {
-        let uri = entry.key();
-        let Some(path) = uri_to_path(uri) else {
+    let uris = ctx
+        .index
+        .read()
+        .file_symbols()
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    for uri in uris {
+        let Some(path) = uri_to_path(&uri) else {
             continue;
         };
         if path
@@ -1134,15 +1140,24 @@ fn laravel_macro_source(
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
+        let Some(file_symbols) = ctx
+            .index
+            .read()
+            .file_symbols()
+            .get(&uri)
+            .map(|entry| entry.value().clone())
+        else {
+            continue;
+        };
         let Some((start_offset, end_offset)) =
-            laravel_macro_range(&source, entry.value(), member_name, scope_matches)
+            laravel_macro_range(&source, &file_symbols, member_name, scope_matches)
         else {
             continue;
         };
         let start = line_col_for_offset(&source, start_offset);
         let end = line_col_for_offset(&source, end_offset);
         return Some(VirtualMemberSource::SourceRange {
-            uri: uri.clone(),
+            uri,
             range: (start.0, start.1, end.0, end.1),
         });
     }
@@ -2830,7 +2845,7 @@ fn laravel_model_for_builder(
         }
     }
 
-    for entry in ctx.index.types.iter() {
+    for entry in ctx.index.read().types().iter() {
         let symbol = entry.value();
         if symbol.kind != PhpSymbolKind::Class || !is_laravel_model(ctx, &symbol.fqn) {
             continue;
@@ -2990,7 +3005,7 @@ fn resolve_laravel_type_name_relative_to_owner(
     let owner_fqn = owner.parent_fqn.as_deref().unwrap_or(&owner.fqn);
     let owner_namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
     if let Some(namespace) = owner_namespace {
-        if let Some(file_symbols) = ctx.index.file_symbols.get(owner.uri.as_str()) {
+        if let Some(file_symbols) = ctx.index.read().file_symbols().get(owner.uri.as_str()) {
             let scoped_file_symbols =
                 file_symbols.scoped_at_byte_position(owner.range.0, owner.range.1);
             for use_stmt in &scoped_file_symbols.use_statements {
@@ -3031,7 +3046,7 @@ fn resolve_type_name_to_fqn(
         return Some(type_name.to_string());
     }
 
-    if let Some(file_symbols) = ctx.index.file_symbols.get(owner.uri.as_str()) {
+    if let Some(file_symbols) = ctx.index.read().file_symbols().get(owner.uri.as_str()) {
         let scoped_file_symbols =
             file_symbols.scoped_at_byte_position(owner.range.0, owner.range.1);
         return Some(resolve_class_name(type_name, scoped_file_symbols.as_ref()));

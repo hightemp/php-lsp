@@ -809,7 +809,7 @@ fn collect_symbol_type_shape_definitions(
 ) -> Vec<TemplateShapeKeyDefinition> {
     let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(fallback_owner_fqn);
     let normalized_type_info =
-        if let Some(symbol_file_symbols) = index.file_symbols.get(&symbol.uri) {
+        if let Some(symbol_file_symbols) = index.read().file_symbols().get(&symbol.uri) {
             resolve_type_info_with_context(type_info, &symbol_file_symbols, owner_fqn)
         } else {
             resolve_type_info_with_context(type_info, fallback_file_symbols, owner_fqn)
@@ -2949,7 +2949,7 @@ fn doctrine_repository_entity_from_repository_class_binding(
 ) -> Option<String> {
     let repository_fqn = repository_fqn.trim_start_matches('\\');
     index.observe_type_inventory();
-    index.types.iter().find_map(|entry| {
+    index.read().types().iter().find_map(|entry| {
         let symbol = entry.value();
         if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class) {
             return None;
@@ -2983,7 +2983,8 @@ fn conventional_entity_fqn_for_repository(
     }
 
     index.observe_type_inventory();
-    let mut candidates = index.types.iter().filter_map(|entry| {
+    let published = index.read();
+    let mut candidates = published.types().iter().filter_map(|entry| {
         let symbol = entry.value();
         (matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class)
             && symbol.name == entity_short
@@ -3039,7 +3040,7 @@ fn twig_context_type_info_text_for_symbol(
     type_info: &php_lsp_types::TypeInfo,
 ) -> Option<String> {
     let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(fallback_owner_fqn);
-    if let Some(symbol_file_symbols) = index.file_symbols.get(&symbol.uri) {
+    if let Some(symbol_file_symbols) = index.read().file_symbols().get(&symbol.uri) {
         let scoped_file_symbols =
             symbol_file_symbols.scoped_at_byte_position(symbol.range.0, symbol.range.1);
         return twig_context_type_info_text(scoped_file_symbols.as_ref(), owner_fqn, type_info);
@@ -4124,7 +4125,7 @@ fn symfony_twig_app_global_type_text(index: &WorkspaceIndex) -> String {
 
 fn symfony_user_class_fqn(index: &WorkspaceIndex) -> Option<String> {
     let mut candidates = Vec::new();
-    for entry in index.types.iter() {
+    for entry in index.read().types().iter() {
         let symbol = entry.value();
         if matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class)
             && symfony_symbol_is_descendant_of(
@@ -4388,8 +4389,8 @@ pub(in crate::server) async fn refresh_open_twig_contexts_for_state(
                 Some(&context_result.context),
             );
             if replaced {
-                if index.file_symbols.contains_key(&uri_str)
-                    || workspace_index.file_symbols.contains_key(&uri_str)
+                if index.read().file_symbols().contains_key(&uri_str)
+                    || workspace_index.read().file_symbols().contains_key(&uri_str)
                 {
                     remove_from_aggregate_and_root_index(index, workspace_index, &uri_str);
                 }

@@ -1698,7 +1698,7 @@ pub(in crate::server) fn doctrine_repository_class_from_template_binding(
     index: &WorkspaceIndex,
     entity_fqn: &str,
 ) -> Option<String> {
-    index.types.iter().find_map(|entry| {
+    index.read().types().iter().find_map(|entry| {
         let symbol = entry.value();
         if !matches!(symbol.kind, php_lsp_types::PhpSymbolKind::Class) {
             return None;
@@ -1735,10 +1735,14 @@ pub(in crate::server) fn doctrine_repository_class_from_entity_attribute(
         .join("\n");
     let repository_name = doctrine_repository_class_name_from_attribute_text(&attribute_text)?;
 
-    let entity_file_symbols = index.file_symbols.get(&entity.uri);
+    let entity_file_symbols = index
+        .read()
+        .file_symbols()
+        .get(&entity.uri)
+        .map(|entry| Arc::clone(entry.value()));
     let file_symbols = entity_file_symbols
         .as_ref()
-        .map(|symbols| symbols.value().as_ref())
+        .map(Arc::as_ref)
         .unwrap_or(current_file_symbols);
     let scoped_file_symbols = file_symbols.scoped_at_byte_position(entity.range.0, entity.range.1);
     let resolved = resolve_class_name_pub(&repository_name, scoped_file_symbols.as_ref())
@@ -1978,10 +1982,14 @@ pub(in crate::server) fn doctrine_collection_item_type_from_mutators(
         return None;
     }
 
-    let owner_file_symbols = index.file_symbols.get(uri);
+    let owner_file_symbols = index
+        .read()
+        .file_symbols()
+        .get(uri)
+        .map(|entry| Arc::clone(entry.value()));
     let file_symbols = owner_file_symbols
         .as_ref()
-        .map(|symbols| symbols.value().as_ref())
+        .map(Arc::as_ref)
         .unwrap_or(current_file_symbols);
 
     for candidate in collection_mutator_method_candidates(collection_suffix) {
@@ -3717,7 +3725,11 @@ pub(in crate::server) fn imported_type_fqn_for_owner(
     let owner_namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
     let raw = type_name.trim_start_matches('\\');
     let (first_part, rest) = raw.split_once('\\').unwrap_or((raw, ""));
-    let file_symbols = index.file_symbols.get(uri)?;
+    let file_symbols = index
+        .read()
+        .file_symbols()
+        .get(uri)
+        .map(|entry| Arc::clone(entry.value()))?;
     let scoped_file_symbols = file_symbols
         .symbols
         .iter()
@@ -3733,7 +3745,7 @@ pub(in crate::server) fn imported_type_fqn_for_owner(
                 )
         })
         .map(|symbol| file_symbols.scoped_at_byte_position(symbol.range.0, symbol.range.1))
-        .unwrap_or_else(|| std::borrow::Cow::Borrowed(file_symbols.value()));
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed(file_symbols.as_ref()));
     let use_statement = scoped_file_symbols
         .use_statements
         .iter()

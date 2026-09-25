@@ -1149,25 +1149,32 @@ diff check и повторный Verifier review — GO.
 
 ### CODEX-P2-11. WorkspaceIndex публикует обновление неатомарно
 
-[`update_file_with_references_with_hook`](server/crates/php-lsp-index/src/workspace.rs#L133)
-сначала удаляет старый file snapshot и top-level symbols, затем по отдельности
-добавляет новые maps, file snapshot, references и member sources. Читатель не
-берёт per-URI guard и может увидеть временно отсутствующий class/function или
-смешанное поколение.
+**Исправлено 2026-09-25 (FIX-CODEX-P2-11-ATOMIC-WORKSPACE-INDEX).** Исходные
+RED-тесты детерминированно показали видимость class до публикации members при
+первой загрузке и замене. Обновление и удаление файла теперь держат exclusive
+publication lease на весь commit, включая top-level maps, `file_symbols`,
+`file_references`, direct-member sources и generation. Read-only
+`WorkspaceIndex::read()` удерживает shared lease для многокарточного снимка;
+обычные lookup methods защищены тем же барьером. При конкурентном commit
+читатель ждёт и получает целиком опубликованное поколение. Aggregate
+replacement использует тот же publication lease. Existing per-URI generation
+checks остаются для проверки ранее взятых type snapshots.
 
-`file_update_generations` сериализует writers, но generation value нигде не
-читается и не обеспечивает reader consistency. Это вероятный класс причин для
-нестабильного lazy vendor lookup.
+Найдена и закрыта дополнительная ветка: metadata-only Composer invalidation
+раньше вызывала пофайловый rebuild живого aggregate. Теперь она тоже строит
+staged aggregate, отклоняет устаревший commit и повторяет построение при
+конфликте ревизий до стабильного источника или смены runtime generation.
 
-Дополнительно
-[`direct_members_from_sources`](server/crates/php-lsp-index/src/workspace.rs#L621)
-через `?`/`return None` отбрасывает **всех** direct members родителя, если хотя бы
-один locator имеет неверный индекс или parent. При смешанном/повреждённом
-snapshot локальная неконсистентность поэтому превращается в полную потерю
-member resolution для типа.
+Отдельная RED-регрессия показала, что неверный direct-member locator скрывал
+всех членов класса; теперь пропускается только повреждённая запись. Проверки
+охватывают concurrent writers/readers, first publish, replacement, removal,
+duplicate FQN fallback, reference/file symbol consistency и read-lease lifetime.
+Серверная race-регрессия дважды срывает Composer aggregate commit изменением
+root index и проверяет, что старый aggregate остаётся целым до третьего,
+актуального commit.
 
-Что исправить: immutable per-file generation snapshot + атомарная смена
-authoritative generation; readers должны либо видеть old, либо new snapshot.
+Финальный последовательный Rust-набор прошёл 1174/1174 без ignored; Clippy,
+Rustfmt, diff check и повторный Verifier review на `gpt-6-sol` — GO.
 
 ### CODEX-P2-12. Cache metadata может быть привязана к старому symbol snapshot
 

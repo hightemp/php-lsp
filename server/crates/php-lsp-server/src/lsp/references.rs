@@ -180,7 +180,8 @@ impl PhpLspBackend {
         }
 
         let indexed_references = index
-            .file_references
+            .read()
+            .file_references()
             .get(uri)
             .map(|entry| entry.value().clone());
 
@@ -283,7 +284,8 @@ impl PhpLspBackend {
         include_declaration: bool,
     ) -> Vec<(String, Vec<php_lsp_types::SymbolReference>)> {
         let mut uris: HashSet<String> = index
-            .file_references
+            .read()
+            .file_references()
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
@@ -292,7 +294,7 @@ impl PhpLspBackend {
             .iter()
             .filter(|entry| {
                 std::ptr::eq(index, self.index.as_ref())
-                    || index.file_symbols.contains_key(entry.key())
+                    || index.read().file_symbols().contains_key(entry.key())
                     || request.is_none_or(|request| {
                         if let Some(config) = request.workspace.as_ref() {
                             return uri_to_path(entry.key()).is_some_and(|path| {
@@ -624,7 +626,8 @@ impl PhpLspBackend {
             (extract_file_symbols(tree, &source, &uri_str), source)
         } else {
             let Some(file_symbols) = request_index
-                .file_symbols
+                .read()
+                .file_symbols()
                 .get(&uri_str)
                 .map(|entry| entry.value().as_ref().clone())
             else {

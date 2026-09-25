@@ -1473,7 +1473,7 @@ pub(crate) fn direct_member_symbols_from_index(
     type_fqn: &str,
 ) -> Vec<Arc<php_lsp_types::SymbolInfo>> {
     let mut members = Vec::new();
-    for entry in index.file_symbols.iter() {
+    for entry in index.read().file_symbols().iter() {
         for sym in &entry.value().symbols {
             if sym
                 .parent_fqn
@@ -6992,7 +6992,8 @@ impl PhpLspBackend {
 
             let mut candidates: Vec<std::sync::Arc<php_lsp_types::SymbolInfo>> = match import_kind {
                 ImportKind::Class => request_index
-                    .types
+                    .read()
+                    .types()
                     .iter()
                     .filter(|entry| {
                         let sym = entry.value();
@@ -7003,7 +7004,8 @@ impl PhpLspBackend {
                     .map(|entry| entry.value().clone())
                     .collect(),
                 ImportKind::Function => request_index
-                    .functions
+                    .read()
+                    .functions()
                     .iter()
                     .filter(|entry| {
                         let sym = entry.value();
@@ -7014,7 +7016,8 @@ impl PhpLspBackend {
                     .map(|entry| entry.value().clone())
                     .collect(),
                 ImportKind::Constant => request_index
-                    .constants
+                    .read()
+                    .constants()
                     .iter()
                     .filter(|entry| {
                         let sym = entry.value();

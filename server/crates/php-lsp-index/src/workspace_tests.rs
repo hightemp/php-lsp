@@ -67,6 +67,21 @@ fn make_method(name: &str, parent_fqn: &str, uri: &str) -> SymbolInfo {
     }
 }
 
+fn make_class_reference(fqn: &str) -> SymbolReference {
+    SymbolReference {
+        target_fqn: fqn.to_string(),
+        target_kind: PhpSymbolKind::Class,
+        range: (0, 0, 0, 1),
+        is_declaration: false,
+        starts_with_dollar: false,
+        allows_global_fallback: false,
+        rename_range: None,
+        preserve_spelling_on_rename: false,
+        is_import_target: false,
+        receiver: SymbolReferenceReceiver::None,
+    }
+}
+
 #[test]
 fn test_update_and_resolve() {
     let index = WorkspaceIndex::new();
@@ -377,6 +392,7 @@ fn direct_member_index_replaces_the_previous_file_generation() {
     assert!(index.resolve_fqn("App\\Owner::oldMember").is_none());
     assert!(index.resolve_fqn("App\\Owner::newMember").is_some());
     let sources = index
+        .tables
         .direct_members_by_parent
         .get(&case_insensitive_fqn_key("App\\Owner"))
         .map(|entry| Arc::clone(entry.value()))
@@ -384,7 +400,11 @@ fn direct_member_index_replaces_the_previous_file_generation() {
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].uri.as_ref(), uri);
     assert_eq!(sources[0].symbol_indices.as_ref(), &[1]);
-    let file_symbols = index.file_symbols.get(uri).expect("indexed file snapshot");
+    let file_symbols = index
+        .tables
+        .file_symbols
+        .get(uri)
+        .expect("indexed file snapshot");
     assert!(Arc::ptr_eq(file_symbols.value(), &sources[0].file_symbols));
     assert!(index
         .file_update_generations
@@ -429,8 +449,56 @@ fn removing_file_preserves_direct_members_from_duplicate_parent_in_another_file(
 
     index.remove_file(second_uri);
     assert!(!index
+        .tables
         .direct_members_by_parent
         .contains_key(&case_insensitive_fqn_key("App\\Shared")));
+}
+
+#[test]
+fn invalid_direct_member_locator_does_not_hide_other_members() {
+    let index = WorkspaceIndex::new();
+    let uri = "file:///valid-members.php";
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![
+                make_class("Owner", "App\\Owner", uri),
+                make_method("valid", "App\\Owner", uri),
+            ],
+            ..Default::default()
+        },
+    );
+
+    let key = case_insensitive_fqn_key("App\\Owner");
+    let valid_source = index
+        .tables
+        .direct_members_by_parent
+        .get(&key)
+        .expect("valid member locator")[0]
+        .clone();
+    let malformed_source = DirectMemberSource {
+        uri: Arc::from("file:///malformed-members.php"),
+        file_symbols: Arc::new(FileSymbols {
+            symbols: vec![make_method(
+                "wrongParent",
+                "App\\Other",
+                "file:///malformed-members.php",
+            )],
+            ..Default::default()
+        }),
+        symbol_indices: Arc::from([0, usize::MAX]),
+    };
+    index
+        .tables
+        .direct_members_by_parent
+        .insert(key, Arc::from(vec![valid_source, malformed_source]));
+
+    let names = index
+        .get_members("App\\Owner")
+        .into_iter()
+        .map(|member| member.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["valid"]);
 }
 
 #[test]
@@ -514,13 +582,12 @@ fn concurrent_member_writers_are_serialized_and_readers_keep_an_immutable_snapsh
         names.sort();
         reader_tx.send(names).expect("return member snapshot");
     });
-    assert_eq!(
+    assert!(
         reader_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("reader should not wait for an in-progress replacement"),
-        vec!["oldOne", "oldTwo"]
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "the reader must wait for the in-progress publication"
     );
-    reader.join().expect("member reader joined");
 
     writer_a_release_tx.send(()).expect("release writer A");
     writer_a.join().expect("writer A joined");
@@ -528,6 +595,15 @@ fn concurrent_member_writers_are_serialized_and_readers_keep_an_immutable_snapsh
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("writer B completed after writer A");
     writer_b.join().expect("writer B joined");
+
+    let observed = reader_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("reader completed after a committed generation");
+    assert!(
+        observed == ["fromWriterA"] || observed == ["fromWriterB"],
+        "reader observed an incomplete or stale generation: {observed:?}"
+    );
+    reader.join().expect("member reader joined");
 
     let names = index
         .get_direct_members("App\\Owner")
@@ -565,12 +641,6 @@ fn member_resolution_waits_for_first_file_generation_commit() {
     staged_rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("first generation reached staged publication");
-    assert!(index.contains_type("App\\Owner"));
-    assert!(
-        index.get_direct_members("App\\Owner").is_empty(),
-        "the deterministic hook must expose the pre-fix publication gap"
-    );
-
     let reader_index = Arc::clone(&index);
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -593,6 +663,463 @@ fn member_resolution_waits_for_first_file_generation_commit() {
         .expect("committed member");
     reader.join().expect("member reader joined");
     assert_eq!(resolved.fqn, "App\\Owner::loaded");
+    assert!(index.contains_type("App\\Owner"));
+}
+
+#[test]
+fn top_level_lookup_waits_for_complete_first_publication() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let uri = "file:///atomic-first.php";
+    let writer_index = Arc::clone(&index);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        writer_index.update_file_with_references_with_hook(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    make_class("Owner", "App\\Owner", uri),
+                    make_method("ready", "App\\Owner", uri),
+                ],
+                ..Default::default()
+            },
+            Vec::new(),
+            || {
+                staged_tx
+                    .send(())
+                    .expect("publication reached member staging");
+                release_rx.recv().expect("release publication");
+            },
+        );
+    });
+    staged_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("writer reached publication gap");
+
+    let reader_index = Arc::clone(&index);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        started_tx.send(()).expect("reader started");
+        let result = reader_index.get_type("App\\Owner");
+        result_tx.send(result).expect("return type lookup");
+    });
+    started_rx.recv().expect("reader started");
+    assert!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "top-level lookup must not observe a type before its members are published"
+    );
+
+    release_tx.send(()).expect("release publication");
+    writer.join().expect("writer joined");
+    assert_eq!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reader completed")
+            .expect("published type")
+            .fqn,
+        "App\\Owner"
+    );
+    reader.join().expect("reader joined");
+}
+
+#[test]
+fn function_and_constant_lookups_wait_for_complete_publication() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let uri = "file:///atomic-function-constant.php";
+    let mut constant = make_class("FLAG", "App\\FLAG", uri);
+    constant.kind = PhpSymbolKind::GlobalConstant;
+    let writer_index = Arc::clone(&index);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        writer_index.update_file_with_references_with_hook(
+            uri,
+            FileSymbols {
+                symbols: vec![make_function("build", "App\\build", uri), constant],
+                ..Default::default()
+            },
+            vec![make_class_reference("App\\FLAG")],
+            || {
+                staged_tx.send(()).expect("top-level maps reached staging");
+                release_rx.recv().expect("release top-level maps");
+            },
+        );
+    });
+    staged_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("writer reached publication gap");
+
+    let function_index = Arc::clone(&index);
+    let (function_tx, function_rx) = std::sync::mpsc::channel();
+    let function_reader = std::thread::spawn(move || {
+        function_tx
+            .send(
+                function_index.resolve_fqn_matching_kinds("App\\build", &[PhpSymbolKind::Function]),
+            )
+            .expect("return function");
+    });
+    let constant_index = Arc::clone(&index);
+    let (constant_tx, constant_rx) = std::sync::mpsc::channel();
+    let constant_reader = std::thread::spawn(move || {
+        constant_tx
+            .send(constant_index.resolve_fqn("App\\FLAG"))
+            .expect("return constant");
+    });
+    assert!(function_rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+    assert!(constant_rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+
+    release_tx.send(()).expect("release publication");
+    writer.join().expect("writer joined");
+    assert_eq!(
+        function_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("function reader completed")
+            .expect("function")
+            .kind,
+        PhpSymbolKind::Function
+    );
+    assert_eq!(
+        constant_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("constant reader completed")
+            .expect("constant")
+            .kind,
+        PhpSymbolKind::GlobalConstant
+    );
+    function_reader.join().expect("function reader joined");
+    constant_reader.join().expect("constant reader joined");
+    let published = index.read();
+    assert!(published.file_symbols().contains_key(uri));
+    assert_eq!(published.file_references().get(uri).unwrap().len(), 1);
+}
+
+#[test]
+fn replacement_lookup_waits_for_complete_file_publication() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let uri = "file:///atomic-replacement.php";
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![make_class("Old", "App\\Old", uri)],
+            ..Default::default()
+        },
+    );
+
+    let writer_index = Arc::clone(&index);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        writer_index.update_file_with_references_with_hook(
+            uri,
+            FileSymbols {
+                symbols: vec![
+                    make_class("New", "App\\New", uri),
+                    make_method("ready", "App\\New", uri),
+                ],
+                ..Default::default()
+            },
+            Vec::new(),
+            || {
+                staged_tx
+                    .send(())
+                    .expect("replacement reached member staging");
+                release_rx.recv().expect("release replacement");
+            },
+        );
+    });
+    staged_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("writer reached replacement gap");
+
+    let reader_index = Arc::clone(&index);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        result_tx
+            .send((
+                reader_index.resolve_fqn("App\\New"),
+                reader_index.search("New"),
+            ))
+            .expect("return top-level queries");
+    });
+    assert!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "readers must not observe a new type before its file generation commits"
+    );
+
+    release_tx.send(()).expect("release replacement");
+    writer.join().expect("writer joined");
+    let (resolved, search) = result_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("reader completed");
+    reader.join().expect("reader joined");
+    assert_eq!(resolved.expect("new type").fqn, "App\\New");
+    assert_eq!(search.len(), 1);
+    assert!(index.get_type("App\\Old").is_none());
+}
+
+#[test]
+fn removal_hides_partial_file_and_restores_duplicate_type_atomically() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let primary_uri = "file:///atomic-remove-primary.php";
+    let fallback_uri = "file:///atomic-remove-fallback.php";
+    index.update_file(
+        fallback_uri,
+        FileSymbols {
+            symbols: vec![make_class("Shared", "App\\Shared", fallback_uri)],
+            ..Default::default()
+        },
+    );
+    index.update_file(
+        primary_uri,
+        FileSymbols {
+            symbols: vec![
+                make_class("Shared", "App\\Shared", primary_uri),
+                make_method("primaryMethod", "App\\Shared", primary_uri),
+            ],
+            ..Default::default()
+        },
+    );
+
+    let writer_index = Arc::clone(&index);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        writer_index.remove_file_with_hook(primary_uri, || {
+            staged_tx
+                .send(())
+                .expect("removal reached file snapshot gap");
+            release_rx.recv().expect("release removal");
+        });
+    });
+    staged_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("writer reached removal gap");
+
+    let reader_index = Arc::clone(&index);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let published = reader_index.read();
+        result_tx
+            .send((
+                published.file_symbols().contains_key(primary_uri),
+                published.file_references().contains_key(primary_uri),
+                reader_index
+                    .get_type("App\\Shared")
+                    .map(|symbol| symbol.uri.clone()),
+                reader_index.resolve_member("App\\Shared::primaryMethod"),
+            ))
+            .expect("return coherent removal snapshot");
+    });
+    assert!(
+        result_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "reader must not observe a removed file snapshot with its old type still visible"
+    );
+
+    release_tx.send(()).expect("release removal");
+    writer.join().expect("writer joined");
+    let (has_symbols, has_references, type_uri, member) = result_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("reader completed");
+    reader.join().expect("reader joined");
+    assert!(!has_symbols);
+    assert!(!has_references);
+    assert_eq!(type_uri.as_deref(), Some(fallback_uri));
+    assert!(member.is_none());
+}
+
+#[test]
+fn read_lease_pins_all_tables_until_replacement_commits() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let uri = "file:///atomic-read-lease.php";
+    index.update_file(
+        uri,
+        FileSymbols {
+            symbols: vec![make_class("Old", "App\\Old", uri)],
+            ..Default::default()
+        },
+    );
+    let published = index.read();
+    let writer_index = Arc::clone(&index);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started_tx.send(()).expect("writer started");
+        writer_index.update_file(
+            uri,
+            FileSymbols {
+                symbols: vec![make_class("New", "App\\New", uri)],
+                ..Default::default()
+            },
+        );
+        done_tx.send(()).expect("writer committed");
+    });
+    started_rx.recv().expect("writer started");
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "writer must not replace maps held by a reader"
+    );
+    assert!(published.types().contains_key("app\\old"));
+    assert!(!published.types().contains_key("app\\new"));
+    assert!(published.file_symbols().contains_key(uri));
+    assert!(published.file_references().contains_key(uri));
+    drop(published);
+
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("writer committed after reader released lease");
+    writer.join().expect("writer joined");
+    let published = index.read();
+    assert!(!published.types().contains_key("app\\old"));
+    assert!(published.types().contains_key("app\\new"));
+    assert!(published.file_symbols().contains_key(uri));
+    assert!(published.file_references().contains_key(uri));
+}
+
+#[test]
+fn aggregate_replacement_waits_for_active_read_lease() {
+    let destination = Arc::new(WorkspaceIndex::new());
+    let staged = Arc::new(WorkspaceIndex::new());
+    let old_uri = "file:///aggregate-old.php";
+    let new_uri = "file:///aggregate-new.php";
+    destination.update_file(
+        old_uri,
+        FileSymbols {
+            symbols: vec![make_class("Old", "App\\Old", old_uri)],
+            ..Default::default()
+        },
+    );
+    staged.update_file(
+        new_uri,
+        FileSymbols {
+            symbols: vec![make_class("New", "App\\New", new_uri)],
+            ..Default::default()
+        },
+    );
+
+    let published = destination.read();
+    let writer_destination = Arc::clone(&destination);
+    let writer_staged = Arc::clone(&staged);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started_tx.send(()).expect("aggregate writer started");
+        done_tx
+            .send(writer_destination.replace_from_staged_if_sources_current(
+                &writer_staged,
+                &[],
+                &[],
+            ))
+            .expect("aggregate writer completed");
+    });
+    started_rx.recv().expect("aggregate writer started");
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "aggregate replacement must not mutate a leased snapshot"
+    );
+    assert!(published.types().contains_key("app\\old"));
+    assert!(!published.types().contains_key("app\\new"));
+    assert!(published.file_symbols().contains_key(old_uri));
+    drop(published);
+
+    assert!(done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("aggregate replacement committed"));
+    writer.join().expect("aggregate writer joined");
+    let published = destination.read();
+    assert!(!published.types().contains_key("app\\old"));
+    assert!(published.types().contains_key("app\\new"));
+    assert!(!published.file_symbols().contains_key(old_uri));
+    assert!(published.file_symbols().contains_key(new_uri));
+}
+
+#[test]
+fn concurrent_replacements_never_expose_mixed_file_generations() {
+    let index = Arc::new(WorkspaceIndex::new());
+    let uri = "file:///atomic-stress.php";
+    let make_generation = |which: usize| {
+        let name = if which % 2 == 0 { "Even" } else { "Odd" };
+        let fqn = format!("App\\{name}");
+        FileSymbols {
+            symbols: vec![
+                make_class(name, &fqn, uri),
+                make_method("member", &fqn, uri),
+            ],
+            ..Default::default()
+        }
+    };
+    index.update_file_with_references(
+        uri,
+        make_generation(0),
+        vec![make_class_reference("App\\Even")],
+    );
+
+    let start = Arc::new(std::sync::Barrier::new(3));
+    let writer_index = Arc::clone(&index);
+    let writer_start = Arc::clone(&start);
+    let writer = std::thread::spawn(move || {
+        writer_start.wait();
+        for generation in 1..=250 {
+            let fqn = if generation % 2 == 0 {
+                "App\\Even"
+            } else {
+                "App\\Odd"
+            };
+            writer_index.update_file_with_references(
+                uri,
+                make_generation(generation),
+                vec![make_class_reference(fqn)],
+            );
+        }
+    });
+    let reader_index = Arc::clone(&index);
+    let reader_start = Arc::clone(&start);
+    let reader = std::thread::spawn(move || {
+        reader_start.wait();
+        for _ in 0..500 {
+            let published = reader_index.read();
+            let file = published.file_symbols().get(uri).expect("indexed file");
+            let symbol = &file.symbols[0];
+            let key = case_insensitive_fqn_key(&symbol.fqn);
+            let indexed = published.types().get(&key).expect("matching indexed type");
+            assert_eq!(indexed.fqn, symbol.fqn);
+            assert_eq!(indexed.uri, uri);
+            let references = published
+                .file_references()
+                .get(uri)
+                .expect("indexed references");
+            assert_eq!(references.len(), 1);
+            assert_eq!(references[0].target_fqn, symbol.fqn);
+            let other = if symbol.name == "Even" {
+                "app\\odd"
+            } else {
+                "app\\even"
+            };
+            assert!(!published.types().contains_key(other));
+            assert!(reader_index
+                .resolve_member(&format!("{}::member", symbol.fqn))
+                .is_some());
+        }
+    });
+    start.wait();
+    writer.join().expect("writer joined");
+    reader
+        .join()
+        .expect("reader joined without mixed generations");
 }
 
 #[test]
@@ -702,14 +1229,6 @@ fn member_resolution_waits_before_replacement_top_level_publish() {
     staged_rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("replacement paused before top-level publish");
-    assert_eq!(
-        index
-            .get_type("App\\Owner")
-            .map(|symbol| symbol.uri.clone()),
-        Some(uri.to_string()),
-        "old committed type must stay published while its replacement is staged"
-    );
-
     let reader_index = Arc::clone(&index);
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {

@@ -1014,7 +1014,8 @@ fn build_snapshot(
                     })
         });
     let index_files = index
-        .file_symbols
+        .read()
+        .file_symbols()
         .iter()
         .take_while(|_| !stopped())
         .map(|entry| (entry.key().clone(), entry.value().clone()))
@@ -1090,12 +1091,13 @@ fn build_snapshot(
         let uri = entry.key();
         if !uri.ends_with(".php")
             || is_blade_template_uri(uri)
-            || !index.file_symbols.contains_key(uri)
+            || !index.read().file_symbols().contains_key(uri)
         {
             continue;
         }
         let symbols = index
-            .file_symbols
+            .read()
+            .file_symbols()
             .get(uri)
             .map(|symbols| symbols.value().clone());
         open.insert(

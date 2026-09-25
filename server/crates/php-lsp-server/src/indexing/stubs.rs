@@ -23,7 +23,8 @@ const REQUIRED_STUB_FILES: &[&str] = &[
 
 pub(crate) fn remove_stub_symbols(index: &WorkspaceIndex) {
     let stub_uris: Vec<String> = index
-        .file_symbols
+        .read()
+        .file_symbols()
         .iter()
         .filter(|entry| entry.key().starts_with("phpstub://"))
         .map(|entry| entry.key().clone())
@@ -36,17 +37,31 @@ pub(crate) fn remove_stub_symbols(index: &WorkspaceIndex) {
 
 pub(crate) fn replace_stub_symbols_from(staged: &WorkspaceIndex, destination: &WorkspaceIndex) {
     remove_stub_symbols(destination);
-    for entry in staged.file_symbols.iter() {
-        if !entry.key().starts_with("phpstub://") {
+    let uris = {
+        let published = staged.read();
+        published
+            .file_symbols()
+            .iter()
+            .filter(|entry| entry.key().starts_with("phpstub://"))
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>()
+    };
+    for uri in uris {
+        let indexed = {
+            let published = staged.read();
+            published.file_symbols().get(&uri).map(|symbols| {
+                let references = published
+                    .file_references()
+                    .get(&uri)
+                    .map(|entry| entry.value().clone())
+                    .unwrap_or_default();
+                (symbols.value().as_ref().clone(), references)
+            })
+        };
+        let Some((symbols, references)) = indexed else {
             continue;
-        }
-        let uri = entry.key().clone();
-        let references = staged
-            .file_references
-            .get(&uri)
-            .map(|references| references.value().clone())
-            .unwrap_or_default();
-        destination.update_file_with_references(&uri, entry.value().as_ref().clone(), references);
+        };
+        destination.update_file_with_references(&uri, symbols, references);
     }
 }
 

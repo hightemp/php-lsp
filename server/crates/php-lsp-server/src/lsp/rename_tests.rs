@@ -20,7 +20,7 @@ function consume(): void {
     let mut parser = FileParser::new();
     parser.parse_full(source);
     backend.open_files.insert(uri.to_string(), parser);
-    assert!(!backend.index.file_references.contains_key(uri));
+    assert!(!backend.index.read().file_references().contains_key(uri));
 
     let edit = backend
         .lsp_rename(RenameParams {

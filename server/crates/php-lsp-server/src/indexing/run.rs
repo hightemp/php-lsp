@@ -25,6 +25,8 @@ pub(in crate::server) struct IndexingRunCoordinator {
     slots: DashMap<PathBuf, IndexingRunSlot>,
     aggregate_commit_gate: StdMutex<()>,
     aggregate_source_revision: AtomicU64,
+    #[cfg(test)]
+    before_aggregate_commit: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 pub(in crate::server) struct IndexingRunGuard {
@@ -40,6 +42,29 @@ pub(in crate::server) struct IndexingRunLease {
 }
 
 impl IndexingRunCoordinator {
+    #[cfg(test)]
+    pub(in crate::server) fn set_before_aggregate_commit_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .before_aggregate_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(in crate::server) fn before_aggregate_commit_for_test(&self) {
+        let hook = self
+            .before_aggregate_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     pub(in crate::server) fn start(
         self: &Arc<Self>,
         workspace_folder: PathBuf,

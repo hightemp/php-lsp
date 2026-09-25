@@ -123,7 +123,8 @@ impl PhpLspBackend {
                         file_symbols.clone()
                     } else {
                         index
-                            .file_symbols
+                            .read()
+                            .file_symbols()
                             .get(&current.uri)?
                             .value()
                             .as_ref()

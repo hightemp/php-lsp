@@ -128,8 +128,8 @@ fn open_document_snapshot_is_atomic_and_staged_file_stays_out_of_global_index() 
         writer_committed_rx.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
     ));
-    assert!(!index.file_symbols.contains_key(uri));
-    assert!(!index.file_references.contains_key(uri));
+    assert!(!index.read().file_symbols().contains_key(uri));
+    assert!(!index.read().file_references().contains_key(uri));
 
     release_tx.send(()).expect("release snapshot reader");
     let old_snapshot = reader.join().expect("snapshot reader");
@@ -182,8 +182,8 @@ fn open_document_snapshot_is_atomic_and_staged_file_stays_out_of_global_index() 
         new_snapshot.tree.root_node().end_byte(),
         new_snapshot.source.len()
     );
-    assert!(!index.file_symbols.contains_key(uri));
-    assert!(!index.file_references.contains_key(uri));
+    assert!(!index.read().file_symbols().contains_key(uri));
+    assert!(!index.read().file_references().contains_key(uri));
 }
 
 #[test]
@@ -220,7 +220,8 @@ fn open_php_snapshot_uses_parser_symbols_instead_of_stale_global_symbols() {
         .map(|symbol| symbol.name.as_str())
         .collect();
     let indexed_names: Vec<_> = index
-        .file_symbols
+        .read()
+        .file_symbols()
         .get(uri)
         .expect("stale indexed symbols")
         .symbols
@@ -287,9 +288,13 @@ async fn staged_open_php_participates_in_reference_scans_before_global_commit() 
         },
     );
 
-    assert!(!backend.index.file_symbols.contains_key(uri));
-    assert!(!backend.index.file_references.contains_key(uri));
-    assert!(backend.index.file_references.contains_key(template_uri));
+    assert!(!backend.index.read().file_symbols().contains_key(uri));
+    assert!(!backend.index.read().file_references().contains_key(uri));
+    assert!(backend
+        .index
+        .read()
+        .file_references()
+        .contains_key(template_uri));
     let staged_matches = backend.reference_scan_matches(
         &backend.index,
         None,
@@ -358,8 +363,8 @@ async fn open_only_qualified_function_blocks_global_fallback_reference() {
         backend.open_files.insert(uri.to_string(), parser);
     }
 
-    assert!(backend.index.file_symbols.is_empty());
-    assert!(backend.index.file_references.is_empty());
+    assert!(backend.index.read().file_symbols().is_empty());
+    assert!(backend.index.read().file_references().is_empty());
 
     let global_nonempty_uris: Vec<_> = backend
         .reference_scan_matches(&backend.index, None, "f", PhpSymbolKind::Function, true)
@@ -1666,7 +1671,8 @@ fn test_document_symbol_hierarchy() {
     index.update_file("file:///test.php", file_symbols);
 
     // Retrieve and verify structure
-    let fs = index.file_symbols.get("file:///test.php").unwrap();
+    let published = index.read();
+    let fs = published.file_symbols().get("file:///test.php").unwrap();
     let symbols = &fs.symbols;
 
     // Should have 4 symbols total
@@ -2367,6 +2373,110 @@ async fn cancelling_first_lazy_waiter_does_not_cancel_shared_load() {
         .expect("shared load survived first waiter cancellation");
     assert_eq!(snapshot.generation.generation(), 1);
 
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_only_aggregate_rebuild_retries_until_current_snapshot_is_published() {
+    let root = unique_server_temp_dir("metadata-aggregate-retries");
+    let installed_path = root.join("vendor/composer/installed.json");
+    std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+    std::fs::write(&installed_path, "{}").unwrap();
+    let old_uri = php_lsp_types::uri::path_to_uri(&root.join("vendor/acme/Old.php")).unwrap();
+    let root_index = Arc::new(WorkspaceIndex::new());
+    let old_symbols = FileSymbols {
+        symbols: vec![make_symbol_for_uri(
+            &old_uri,
+            "Old",
+            "Vendor\\Old",
+            PhpSymbolKind::Class,
+            (0, 0, 0, 3),
+            None,
+        )],
+        ..Default::default()
+    };
+    root_index.update_file(&old_uri, old_symbols.clone());
+
+    let (service, _socket) = tower_lsp::LspService::new(PhpLspBackend::new);
+    let backend = service.inner();
+    backend.index.update_file(&old_uri, old_symbols);
+    *backend.runtime_state.lock().await = Arc::new(WorkspaceRuntimeState {
+        fallback: ResolvedRuntimeConfiguration::default(),
+        fallback_index: Arc::new(WorkspaceIndex::new()),
+        configs: vec![WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root: root.clone(),
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: root_index.clone(),
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        }],
+        generation: 1,
+    });
+
+    let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Arc::new(StdMutex::new(release_rx));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    backend.indexing_run.set_before_aggregate_commit_hook({
+        let attempts = attempts.clone();
+        Arc::new(move || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            reached_tx.send(attempt).expect("report aggregate stage");
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release aggregate stage");
+        })
+    });
+
+    let observe = async {
+        for attempt in 1..=3 {
+            let reached = tokio::time::timeout(Duration::from_secs(2), reached_rx.recv())
+                .await
+                .expect("aggregate stage reached")
+                .expect("aggregate stage channel open");
+            assert_eq!(reached, attempt);
+            assert!(
+                backend.index.resolve_fqn("Vendor\\Old").is_some(),
+                "live aggregate must retain its old complete state while staging"
+            );
+            if attempt < 3 {
+                let uri =
+                    php_lsp_types::uri::path_to_uri(&root.join(format!("Added{attempt}.php")))
+                        .unwrap();
+                root_index.update_file(
+                    &uri,
+                    FileSymbols {
+                        symbols: vec![make_symbol_for_uri(
+                            &uri,
+                            &format!("Added{attempt}"),
+                            &format!("App\\Added{attempt}"),
+                            PhpSymbolKind::Class,
+                            (0, 0, 0, 6),
+                            None,
+                        )],
+                        ..Default::default()
+                    },
+                );
+            }
+            release_tx.send(()).expect("release aggregate commit");
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(
+            backend.invalidate_composer_metadata(&installed_path, false),
+            observe
+        );
+    })
+    .await
+    .expect("metadata invalidation completed");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert!(backend.index.resolve_fqn("Vendor\\Old").is_none());
+    assert!(backend.index.resolve_fqn("App\\Added1").is_some());
+    assert!(backend.index.resolve_fqn("App\\Added2").is_some());
     std::fs::remove_dir_all(root).unwrap();
 }
 

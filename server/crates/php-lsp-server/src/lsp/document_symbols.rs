@@ -31,7 +31,7 @@ pub(crate) fn workspace_symbol_candidates(
     }
 
     let mut candidates = Vec::new();
-    for file_symbols in index.file_symbols.iter() {
+    for file_symbols in index.read().file_symbols().iter() {
         for symbol in &file_symbols.symbols {
             if symbol.modifiers.is_builtin {
                 continue;
@@ -432,12 +432,13 @@ impl PhpLspBackend {
             } else {
                 return Ok(None);
             }
-        } else if let Some(file_symbols) = self
-            .index
-            .file_symbols
-            .get(&uri_str)
-            .map(|entry| entry.value().as_ref().clone())
-        {
+        } else if let Some(file_symbols) = {
+            let published = self.index.read();
+            published
+                .file_symbols()
+                .get(&uri_str)
+                .map(|entry| entry.value().as_ref().clone())
+        } {
             let Some(source) = self
                 .source_for_uri(&uri_str, "documentSymbol source read")
                 .await

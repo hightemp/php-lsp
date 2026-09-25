@@ -477,7 +477,8 @@ fn cache_roundtrip_loads_file_references() {
     assert_eq!(report.loaded_files, 1);
     assert_eq!(
         loaded
-            .file_references
+            .read()
+            .file_references()
             .get(&uri)
             .map(|entry| entry.value().clone())
             .unwrap_or_default(),
@@ -779,7 +780,7 @@ fn cache_roundtrip_preserves_encoded_file_uris() {
     );
     assert_eq!(report.loaded_files, 1);
     assert!(report.parse_files.is_empty());
-    assert!(loaded.file_symbols.contains_key(&uri));
+    assert!(loaded.read().file_symbols().contains_key(&uri));
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -835,8 +836,8 @@ fn cache_invalidates_legacy_raw_file_uri_for_encoded_path() {
     assert_eq!(report.loaded_files, 0);
     assert_eq!(report.stale_files, 1);
     assert_eq!(report.parse_files, vec![file.clone()]);
-    assert!(loaded.file_symbols.get(&legacy_uri).is_none());
-    assert!(loaded.file_symbols.get(&encoded_uri).is_none());
+    assert!(loaded.read().file_symbols().get(&legacy_uri).is_none());
+    assert!(loaded.read().file_symbols().get(&encoded_uri).is_none());
 
     fs::remove_dir_all(root).unwrap();
 }

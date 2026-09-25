@@ -525,6 +525,7 @@ dependencies = [
  "bincode",
  "dashmap",
  "lsp-types",
+ "parking_lot",
  "php-lsp-parser",
  "php-lsp-types",
  "serde",

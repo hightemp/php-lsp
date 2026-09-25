@@ -1561,7 +1561,8 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
 
     // Semantic diagnostics (unknown class, function, unresolved use)
     let file_symbols = index
-        .file_symbols
+        .read()
+        .file_symbols()
         .get(uri_str)
         .map(|entry| entry.value().clone())
         .unwrap_or_default();
@@ -3144,10 +3145,14 @@ pub(in crate::server) fn check_call_argument_types(
         return;
     };
 
-    let callable_file_symbols = index.file_symbols.get(&callable.uri);
+    let callable_file_symbols = index
+        .read()
+        .file_symbols()
+        .get(&callable.uri)
+        .map(|entry| Arc::clone(entry.value()));
     let expected_file_symbols = callable_file_symbols
         .as_ref()
-        .map(|entry| entry.value().as_ref())
+        .map(Arc::as_ref)
         .unwrap_or(file_symbols);
     let scoped_expected_file_symbols =
         expected_file_symbols.scoped_at_byte_position(callable.range.0, callable.range.1);
@@ -3295,10 +3300,14 @@ pub(in crate::server) fn check_property_assignment_type_compatibility(
         return;
     };
 
-    let property_file_symbols = index.file_symbols.get(&property.uri);
+    let property_file_symbols = index
+        .read()
+        .file_symbols()
+        .get(&property.uri)
+        .map(|entry| Arc::clone(entry.value()));
     let expected_file_symbols = property_file_symbols
         .as_ref()
-        .map(|entry| entry.value().as_ref())
+        .map(Arc::as_ref)
         .unwrap_or(file_symbols);
     let scoped_expected_file_symbols =
         expected_file_symbols.scoped_at_byte_position(property.range.0, property.range.1);
@@ -4139,10 +4148,14 @@ pub(in crate::server) fn override_signature_diagnostics(
                 if parent_method.kind != php_lsp_types::PhpSymbolKind::Method {
                     continue;
                 }
-                let parent_file_symbols_guard = index.file_symbols.get(&parent_method.uri);
+                let parent_file_symbols_guard = index
+                    .read()
+                    .file_symbols()
+                    .get(&parent_method.uri)
+                    .map(|entry| Arc::clone(entry.value()));
                 let parent_file_symbols: &php_lsp_types::FileSymbols =
                     match parent_file_symbols_guard.as_ref() {
-                        Some(entry) => entry.value(),
+                        Some(entry) => entry.as_ref(),
                         None => file_symbols,
                     };
                 if !override_signatures_are_compatible(
@@ -4676,7 +4689,7 @@ pub(in crate::server) fn workspace_duplicate_symbol_diagnostics(
             continue;
         }
 
-        let has_duplicate = index.file_symbols.iter().any(|entry| {
+        let has_duplicate = index.read().file_symbols().iter().any(|entry| {
             if entry.key().as_str() == uri_str {
                 return false;
             }
@@ -4865,7 +4878,8 @@ impl PhpLspBackend {
             current_parser_symbol_references(file_uri, &parser)
         } else {
             index
-                .file_references
+                .read()
+                .file_references()
                 .get(file_uri)
                 .map(|entry| entry.value().clone())
                 .unwrap_or_default()

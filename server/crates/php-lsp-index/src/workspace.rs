@@ -1,12 +1,15 @@
 //! Global workspace symbol index.
 
-use dashmap::DashMap;
+use dashmap::{iter::Iter, mapref::one::Ref, DashMap};
+use parking_lot::{RwLock as PublicationLock, RwLockReadGuard as PublicationReadGuard};
 use php_lsp_types::{
     global_constant_fqn_key, symbol_fqn_eq, ArrayShapeItem, FileSymbols, PhpSymbolKind, Signature,
     SymbolInfo, SymbolReference, TemplateBindingKind, TypeInfo,
 };
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet},
+    hash::Hash,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
@@ -147,23 +150,11 @@ struct TypeAliasVisit {
 
 /// Global index of all symbols in the workspace.
 pub struct WorkspaceIndex {
-    /// ASCII-lowercased FQN → SymbolInfo for types.
-    pub types: DashMap<String, Arc<SymbolInfo>>,
+    tables: IndexTables,
 
-    /// ASCII-lowercased FQN → SymbolInfo for functions.
-    pub functions: DashMap<String, Arc<SymbolInfo>>,
-
-    /// FQN → SymbolInfo for constants
-    pub constants: DashMap<String, Arc<SymbolInfo>>,
-
-    /// File URI → extracted symbols for that file
-    pub file_symbols: DashMap<String, Arc<FileSymbols>>,
-
-    /// File URI → precomputed non-local symbol references for that file
-    pub file_references: DashMap<String, Vec<SymbolReference>>,
-
-    /// ASCII-lowercased parent FQN → compact locations of its direct members.
-    direct_members_by_parent: DashMap<String, Arc<[DirectMemberSource]>>,
+    /// Readers hold a shared lease across a lookup; a file commit holds the
+    /// exclusive lease across every map and generation it changes.
+    publication_barrier: PublicationLock<()>,
 
     /// File URI → generation and per-URI write barrier for snapshot replacement.
     file_update_generations: DashMap<String, u64>,
@@ -176,6 +167,98 @@ pub struct WorkspaceIndex {
 
     /// Monotonic whole-index revision for staged aggregate validation.
     mutation_revision: AtomicU64,
+}
+
+struct IndexTables {
+    /// ASCII-lowercased FQN → SymbolInfo for types.
+    types: DashMap<String, Arc<SymbolInfo>>,
+
+    /// ASCII-lowercased FQN → SymbolInfo for functions.
+    functions: DashMap<String, Arc<SymbolInfo>>,
+
+    /// FQN → SymbolInfo for constants
+    constants: DashMap<String, Arc<SymbolInfo>>,
+
+    /// File URI → extracted symbols for that file
+    file_symbols: DashMap<String, Arc<FileSymbols>>,
+
+    /// File URI → precomputed non-local symbol references for that file
+    file_references: DashMap<String, Vec<SymbolReference>>,
+
+    /// ASCII-lowercased parent FQN → compact locations of its direct members.
+    direct_members_by_parent: DashMap<String, Arc<[DirectMemberSource]>>,
+}
+
+pub struct WorkspaceIndexRead<'a> {
+    index: &'a WorkspaceIndex,
+    _guard: PublicationReadGuard<'a, ()>,
+}
+
+impl WorkspaceIndexRead<'_> {
+    pub fn types(&self) -> ReadOnlyIndexMap<'_, String, Arc<SymbolInfo>> {
+        ReadOnlyIndexMap {
+            map: &self.index.tables.types,
+        }
+    }
+
+    pub fn functions(&self) -> ReadOnlyIndexMap<'_, String, Arc<SymbolInfo>> {
+        ReadOnlyIndexMap {
+            map: &self.index.tables.functions,
+        }
+    }
+
+    pub fn constants(&self) -> ReadOnlyIndexMap<'_, String, Arc<SymbolInfo>> {
+        ReadOnlyIndexMap {
+            map: &self.index.tables.constants,
+        }
+    }
+
+    pub fn file_symbols(&self) -> ReadOnlyIndexMap<'_, String, Arc<FileSymbols>> {
+        ReadOnlyIndexMap {
+            map: &self.index.tables.file_symbols,
+        }
+    }
+
+    pub fn file_references(&self) -> ReadOnlyIndexMap<'_, String, Vec<SymbolReference>> {
+        ReadOnlyIndexMap {
+            map: &self.index.tables.file_references,
+        }
+    }
+}
+
+/// Read-only access to one map while a WorkspaceIndex publication lease is held.
+pub struct ReadOnlyIndexMap<'a, K, V> {
+    map: &'a DashMap<K, V>,
+}
+
+impl<'a, K: Eq + Hash, V> ReadOnlyIndexMap<'a, K, V> {
+    pub fn get<Q>(&self, key: &Q) -> Option<Ref<'a, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.get(key)
+    }
+
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.contains_key(key)
+    }
+
+    pub fn iter(&self) -> Iter<'a, K, V> {
+        self.map.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,16 +312,28 @@ impl WorkspaceIndex {
     /// Create a new empty index.
     pub fn new() -> Self {
         WorkspaceIndex {
-            types: DashMap::new(),
-            functions: DashMap::new(),
-            constants: DashMap::new(),
-            file_symbols: DashMap::new(),
-            file_references: DashMap::new(),
-            direct_members_by_parent: DashMap::new(),
+            tables: IndexTables {
+                types: DashMap::new(),
+                functions: DashMap::new(),
+                constants: DashMap::new(),
+                file_symbols: DashMap::new(),
+                file_references: DashMap::new(),
+                direct_members_by_parent: DashMap::new(),
+            },
+            publication_barrier: PublicationLock::new(()),
             file_update_generations: DashMap::new(),
             next_file_symbol_generation: AtomicU64::new(1),
             mutation_barrier: RwLock::new(()),
             mutation_revision: AtomicU64::new(0),
+        }
+    }
+
+    /// Pin a coherent published generation while reading several index maps.
+    /// Release the lease before mutating this index or awaiting external work.
+    pub fn read(&self) -> WorkspaceIndexRead<'_> {
+        WorkspaceIndexRead {
+            index: self,
+            _guard: self.publication_barrier.read_recursive(),
         }
     }
 
@@ -290,6 +385,7 @@ impl WorkspaceIndex {
             .mutation_barrier
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _publication = self.publication_barrier.write();
         self.update_file_with_references_unguarded(
             uri,
             file_symbols,
@@ -311,8 +407,8 @@ impl WorkspaceIndex {
         G: FnOnce(),
     {
         let uri_key = uri.to_string();
-        // The mutable generation guard is the per-URI write barrier. Readers
-        // use immutable snapshots, while other writers cannot interleave a commit.
+        // The mutable generation guard serializes writers of this URI. The
+        // publication lease keeps readers out until all maps are committed.
         let mut generation_guard = self
             .file_update_generations
             .entry(uri_key.clone())
@@ -339,15 +435,18 @@ impl WorkspaceIndex {
                 | PhpSymbolKind::Interface
                 | PhpSymbolKind::Trait
                 | PhpSymbolKind::Enum => {
-                    self.types
+                    self.tables
+                        .types
                         .insert(case_insensitive_fqn_key(&sym.fqn), Arc::new(sym.clone()));
                 }
                 PhpSymbolKind::Function => {
-                    self.functions
+                    self.tables
+                        .functions
                         .insert(case_insensitive_fqn_key(&sym.fqn), Arc::new(sym.clone()));
                 }
                 PhpSymbolKind::GlobalConstant => {
-                    self.constants
+                    self.tables
+                        .constants
                         .insert(global_constant_fqn_key(&sym.fqn), Arc::new(sym.clone()));
                 }
                 // Members are stored through compact locators below.
@@ -358,11 +457,13 @@ impl WorkspaceIndex {
             self.remove_replaced_top_level_symbols(uri, old_file_symbols, &file_symbols);
         }
 
-        // Publish the file snapshot and its generation before making locators visible.
+        // Replace the file snapshot and references before updating member
+        // locators; the publication lease hides this intermediate state.
         let member_uri: Arc<str> = Arc::from(uri);
-        self.file_symbols
+        self.tables
+            .file_symbols
             .insert(uri_key.clone(), Arc::clone(&file_symbols));
-        self.file_references.insert(uri_key, file_references);
+        self.tables.file_references.insert(uri_key, file_references);
         let new_direct_member_parents = direct_member_indices
             .keys()
             .cloned()
@@ -389,22 +490,39 @@ impl WorkspaceIndex {
 
     /// Remove all symbols from a file.
     pub fn remove_file(&self, uri: &str) {
+        self.remove_file_with_hook(uri, || {});
+    }
+
+    fn remove_file_with_hook<F>(&self, uri: &str, after_file_snapshot: F)
+    where
+        F: FnOnce(),
+    {
         let _mutation = self
             .mutation_barrier
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.remove_file_unguarded(uri);
+        let _publication = self.publication_barrier.write();
+        self.remove_file_unguarded_with_hook(uri, after_file_snapshot);
     }
 
     fn remove_file_unguarded(&self, uri: &str) {
+        self.remove_file_unguarded_with_hook(uri, || {});
+    }
+
+    fn remove_file_unguarded_with_hook<F>(&self, uri: &str, after_file_snapshot: F)
+    where
+        F: FnOnce(),
+    {
         match self.file_update_generations.entry(uri.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
-                let direct_member_parents = self.remove_file_snapshot(uri);
+                let direct_member_parents =
+                    self.remove_file_snapshot_with_hook(uri, after_file_snapshot);
                 self.remove_direct_member_sources(uri, &direct_member_parents);
                 entry.remove();
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                let direct_member_parents = self.remove_file_snapshot(uri);
+                let direct_member_parents =
+                    self.remove_file_snapshot_with_hook(uri, after_file_snapshot);
                 self.remove_direct_member_sources(uri, &direct_member_parents);
                 drop(entry);
             }
@@ -439,19 +557,21 @@ impl WorkspaceIndex {
         source_indexes: &[Arc<WorkspaceIndex>],
         expected_revisions: &[WorkspaceIndexRevision],
     ) -> bool {
-        let staged_files = staged
-            .file_symbols
+        let staged_read = staged.read();
+        let staged_files = staged_read
+            .file_symbols()
             .iter()
             .map(|entry| {
                 let uri = entry.key().clone();
-                let references = staged
-                    .file_references
+                let references = staged_read
+                    .file_references()
                     .get(&uri)
                     .map(|references| references.value().clone())
                     .unwrap_or_default();
                 (uri, entry.value().as_ref().clone(), references)
             })
             .collect::<Vec<_>>();
+        drop(staged_read);
 
         let mut indexes = source_indexes
             .iter()
@@ -470,6 +590,8 @@ impl WorkspaceIndex {
             })
             .collect::<Vec<_>>();
 
+        let _publication = self.publication_barrier.write();
+
         if source_indexes.iter().any(|index| {
             let actual = index.revision_snapshot();
             !expected_revisions.contains(&actual)
@@ -478,6 +600,7 @@ impl WorkspaceIndex {
         }
 
         let destination_uris = self
+            .tables
             .file_symbols
             .iter()
             .map(|entry| entry.key().clone())
@@ -491,8 +614,16 @@ impl WorkspaceIndex {
         true
     }
 
-    fn remove_file_snapshot(&self, uri: &str) -> HashSet<String> {
+    fn remove_file_snapshot_with_hook<F>(
+        &self,
+        uri: &str,
+        after_file_snapshot: F,
+    ) -> HashSet<String>
+    where
+        F: FnOnce(),
+    {
         let (direct_member_parents, old_file_symbols) = self.take_file_snapshot(uri);
+        after_file_snapshot();
         if let Some(old_symbols) = old_file_symbols {
             for sym in &old_symbols.symbols {
                 match sym.kind {
@@ -500,13 +631,13 @@ impl WorkspaceIndex {
                     | PhpSymbolKind::Interface
                     | PhpSymbolKind::Trait
                     | PhpSymbolKind::Enum => {
-                        self.remove_top_level_symbol(uri, sym, &self.types);
+                        self.remove_top_level_symbol(uri, sym, &self.tables.types);
                     }
                     PhpSymbolKind::Function => {
-                        self.remove_top_level_symbol(uri, sym, &self.functions);
+                        self.remove_top_level_symbol(uri, sym, &self.tables.functions);
                     }
                     PhpSymbolKind::GlobalConstant => {
-                        self.remove_top_level_symbol(uri, sym, &self.constants);
+                        self.remove_top_level_symbol(uri, sym, &self.tables.constants);
                     }
                     _ => {}
                 }
@@ -516,8 +647,12 @@ impl WorkspaceIndex {
     }
 
     fn take_file_snapshot(&self, uri: &str) -> (HashSet<String>, Option<Arc<FileSymbols>>) {
-        self.file_references.remove(uri);
-        let old_file_symbols = self.file_symbols.remove(uri).map(|(_, symbols)| symbols);
+        self.tables.file_references.remove(uri);
+        let old_file_symbols = self
+            .tables
+            .file_symbols
+            .remove(uri)
+            .map(|(_, symbols)| symbols);
         let direct_member_parents = old_file_symbols
             .iter()
             .flat_map(|symbols| symbols.symbols.iter())
@@ -546,13 +681,13 @@ impl WorkspaceIndex {
                 | PhpSymbolKind::Interface
                 | PhpSymbolKind::Trait
                 | PhpSymbolKind::Enum => {
-                    self.remove_top_level_symbol(uri, old_symbol, &self.types);
+                    self.remove_top_level_symbol(uri, old_symbol, &self.tables.types);
                 }
                 PhpSymbolKind::Function => {
-                    self.remove_top_level_symbol(uri, old_symbol, &self.functions);
+                    self.remove_top_level_symbol(uri, old_symbol, &self.tables.functions);
                 }
                 PhpSymbolKind::GlobalConstant => {
-                    self.remove_top_level_symbol(uri, old_symbol, &self.constants);
+                    self.remove_top_level_symbol(uri, old_symbol, &self.tables.constants);
                 }
                 _ => {}
             }
@@ -560,7 +695,7 @@ impl WorkspaceIndex {
     }
 
     fn insert_direct_member_source(&self, parent_key: String, source: DirectMemberSource) {
-        match self.direct_members_by_parent.entry(parent_key) {
+        match self.tables.direct_members_by_parent.entry(parent_key) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 let mut sources = entry
                     .get()
@@ -579,8 +714,10 @@ impl WorkspaceIndex {
 
     fn remove_direct_member_sources(&self, uri: &str, parent_keys: &HashSet<String>) {
         for parent_key in parent_keys {
-            let dashmap::mapref::entry::Entry::Occupied(mut entry) =
-                self.direct_members_by_parent.entry(parent_key.clone())
+            let dashmap::mapref::entry::Entry::Occupied(mut entry) = self
+                .tables
+                .direct_members_by_parent
+                .entry(parent_key.clone())
             else {
                 continue;
             };
@@ -623,7 +760,7 @@ impl WorkspaceIndex {
         &self,
         removed_symbol: &SymbolInfo,
     ) -> Option<Arc<SymbolInfo>> {
-        self.file_symbols.iter().find_map(|entry| {
+        self.tables.file_symbols.iter().find_map(|entry| {
             entry
                 .symbols
                 .iter()
@@ -641,11 +778,13 @@ impl WorkspaceIndex {
     /// Handles both top-level symbols (`App\Foo`) and member symbols
     /// (`App\Foo::method`, `App\Foo::CONST`, `App\Foo::$prop`).
     pub fn resolve_fqn(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
         self.record_read(Some(fqn), None, false);
         let normalized = fqn.trim_start_matches('\\');
         let case_insensitive_key = case_insensitive_fqn_key(normalized);
 
         if let Some(sym) = self
+            .tables
             .types
             .get(&case_insensitive_key)
             .map(|entry| entry.value().clone())
@@ -653,6 +792,7 @@ impl WorkspaceIndex {
             return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
         if let Some(sym) = self
+            .tables
             .functions
             .get(&case_insensitive_key)
             .map(|entry| entry.value().clone())
@@ -660,6 +800,7 @@ impl WorkspaceIndex {
             return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
         if let Some(sym) = self
+            .tables
             .constants
             .get(&global_constant_fqn_key(normalized))
             .map(|entry| entry.value().clone())
@@ -680,6 +821,7 @@ impl WorkspaceIndex {
         fqn: &str,
         expected_kinds: &[PhpSymbolKind],
     ) -> Option<Arc<SymbolInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
         self.record_read(Some(fqn), None, false);
         let normalized = fqn.trim_start_matches('\\');
         if normalized.contains("::") {
@@ -688,6 +830,7 @@ impl WorkspaceIndex {
 
         let case_insensitive_key = case_insensitive_fqn_key(normalized);
         if let Some(sym) = self
+            .tables
             .types
             .get(&case_insensitive_key)
             .map(|entry| entry.value().clone())
@@ -696,6 +839,7 @@ impl WorkspaceIndex {
             return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
         if let Some(sym) = self
+            .tables
             .functions
             .get(&case_insensitive_key)
             .map(|entry| entry.value().clone())
@@ -704,6 +848,7 @@ impl WorkspaceIndex {
             return Some(self.materialize_symbol(sym, &TemplateSubstitutions::new()));
         }
         if let Some(sym) = self
+            .tables
             .constants
             .get(&global_constant_fqn_key(normalized))
             .map(|entry| entry.value().clone())
@@ -717,14 +862,19 @@ impl WorkspaceIndex {
 
     /// Return whether a class-like symbol exists using PHP's casing rules.
     pub fn contains_type(&self, fqn: &str) -> bool {
+        let _publication = self.publication_barrier.read_recursive();
         self.record_read(Some(fqn), None, false);
-        self.types.contains_key(&case_insensitive_fqn_key(fqn))
+        self.tables
+            .types
+            .contains_key(&case_insensitive_fqn_key(fqn))
     }
 
     /// Get a class-like symbol using PHP's casing rules.
     pub fn get_type(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
         self.record_read(Some(fqn), None, false);
-        self.types
+        self.tables
+            .types
             .get(&case_insensitive_fqn_key(fqn))
             .map(|entry| entry.value().clone())
     }
@@ -732,12 +882,14 @@ impl WorkspaceIndex {
     /// Return a type only after the complete file generation that published it
     /// (including direct-member locators) is visible.
     pub fn get_committed_type(&self, fqn: &str) -> Option<CommittedTypeSnapshot> {
+        let _publication = self.publication_barrier.read_recursive();
         self.committed_type_snapshot_with(fqn, || ())
             .map(|(snapshot, ())| snapshot)
     }
 
     /// Check whether a previously observed committed type generation is still current.
     pub fn type_generation_is_current(&self, expected: &TypeIndexGeneration) -> bool {
+        let _publication = self.publication_barrier.read_recursive();
         let Some(generation) = self.file_update_generations.get(&expected.uri) else {
             return false;
         };
@@ -801,6 +953,7 @@ impl WorkspaceIndex {
     /// Walks the class hierarchy (extends/implements) when the member is not
     /// found directly on the given class.
     pub fn resolve_member(&self, fqn: &str) -> Option<Arc<SymbolInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
         let (class_fqn, member_name) = fqn.rsplit_once("::")?;
         self.resolve_member_in_hierarchy(
             class_fqn,
@@ -818,6 +971,7 @@ impl WorkspaceIndex {
         fqn: &str,
         expected_kinds: &[PhpSymbolKind],
     ) -> Option<Arc<SymbolInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
         let (class_fqn, member_name) = fqn.rsplit_once("::")?;
         self.resolve_member_in_hierarchy(
             class_fqn,
@@ -936,20 +1090,21 @@ impl WorkspaceIndex {
 
     /// Search symbols by name (simple substring match for now).
     pub fn search(&self, query: &str) -> Vec<Arc<SymbolInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
 
-        for entry in self.types.iter() {
+        for entry in self.tables.types.iter() {
             if entry.value().name.to_lowercase().contains(&query_lower) {
                 results.push(entry.value().clone());
             }
         }
-        for entry in self.functions.iter() {
+        for entry in self.tables.functions.iter() {
             if entry.value().name.to_lowercase().contains(&query_lower) {
                 results.push(entry.value().clone());
             }
         }
-        for entry in self.constants.iter() {
+        for entry in self.tables.constants.iter() {
             if entry.value().name.to_lowercase().contains(&query_lower) {
                 results.push(entry.value().clone());
             }
@@ -961,6 +1116,7 @@ impl WorkspaceIndex {
     /// Get members (methods, properties, constants) of a type by its FQN.
     /// Includes inherited members from parent classes and interfaces.
     pub fn get_members(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
         let mut members = Vec::new();
         self.collect_members_recursive(
             type_fqn,
@@ -973,6 +1129,7 @@ impl WorkspaceIndex {
 
     /// Get a type symbol and all type symbols in its trait/parent/interface hierarchy.
     pub fn get_type_hierarchy_symbols(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
         let mut types = Vec::new();
         self.collect_type_hierarchy_symbols(type_fqn, &mut types, &mut HashSet::new());
         types
@@ -980,8 +1137,10 @@ impl WorkspaceIndex {
 
     /// Get only the direct members of a type (no inheritance traversal).
     fn get_direct_members(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
         let parent_key = case_insensitive_fqn_key(type_fqn);
         let Some(sources) = self
+            .tables
             .direct_members_by_parent
             .get(&parent_key)
             .map(|entry| Arc::clone(entry.value()))
@@ -989,14 +1148,13 @@ impl WorkspaceIndex {
             return Vec::new();
         };
         self.direct_members_from_sources(&parent_key, &sources)
-            .unwrap_or_default()
     }
 
     fn direct_members_from_sources(
         &self,
         parent_key: &str,
         sources: &[DirectMemberSource],
-    ) -> Option<Vec<Arc<SymbolInfo>>> {
+    ) -> Vec<Arc<SymbolInfo>> {
         let capacity = sources
             .iter()
             .map(|source| source.symbol_indices.len())
@@ -1004,19 +1162,21 @@ impl WorkspaceIndex {
         let mut members = Vec::with_capacity(capacity);
         for source in sources {
             for &symbol_index in source.symbol_indices.iter() {
-                let symbol = source.file_symbols.symbols.get(symbol_index)?;
+                let Some(symbol) = source.file_symbols.symbols.get(symbol_index) else {
+                    continue;
+                };
                 let parent_matches = symbol.parent_fqn.as_deref().is_some_and(|parent_fqn| {
                     parent_fqn
                         .trim_start_matches('\\')
                         .eq_ignore_ascii_case(parent_key)
                 });
                 if !parent_matches {
-                    return None;
+                    continue;
                 }
                 members.push(Arc::new(symbol.clone()));
             }
         }
-        Some(members)
+        members
     }
 
     /// Recursively collect members including those from parent classes/interfaces.
@@ -1323,12 +1483,16 @@ impl WorkspaceIndex {
         visited: &mut Vec<TypeAliasVisit>,
     ) -> Option<TypeInfo> {
         let class_symbol = self.get_type(class_fqn)?;
-        let file_symbols = self.file_symbols.get(&class_symbol.uri).map(|entry| {
-            entry
-                .value()
-                .scoped_at_byte_position(class_symbol.range.0, class_symbol.range.1)
-                .into_owned()
-        });
+        let file_symbols = self
+            .tables
+            .file_symbols
+            .get(&class_symbol.uri)
+            .map(|entry| {
+                entry
+                    .value()
+                    .scoped_at_byte_position(class_symbol.range.0, class_symbol.range.1)
+                    .into_owned()
+            });
         let phpdoc = class_symbol
             .doc_comment
             .as_deref()
@@ -1390,7 +1554,7 @@ impl WorkspaceIndex {
         name: &str,
         visited: &mut Vec<TypeAliasVisit>,
     ) -> Option<TypeInfo> {
-        let file_symbols = self.file_symbols.get(uri).map(|entry| {
+        let file_symbols = self.tables.file_symbols.get(uri).map(|entry| {
             entry
                 .value()
                 .scoped_at_byte_position(position.0, position.1)

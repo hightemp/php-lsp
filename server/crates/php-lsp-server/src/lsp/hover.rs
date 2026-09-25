@@ -564,7 +564,8 @@ fn hover_file_symbols_for_uri(
         return fallback.clone();
     }
     index
-        .file_symbols
+        .read()
+        .file_symbols()
         .get(uri)
         .map(|entry| entry.value().as_ref().clone())
         .unwrap_or_else(|| fallback.clone())
@@ -1589,7 +1590,11 @@ fn hover_direct_method_for_type(
     method_name: &str,
 ) -> Option<php_lsp_types::SymbolInfo> {
     let type_symbol = hover_index_type_symbol(index, type_fqn)?;
-    let file_symbols = index.file_symbols.get(&type_symbol.uri)?;
+    let file_symbols = index
+        .read()
+        .file_symbols()
+        .get(&type_symbol.uri)
+        .map(|entry| Arc::clone(entry.value()))?;
     file_symbols
         .symbols
         .iter()

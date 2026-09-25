@@ -709,6 +709,18 @@ open PHP documents. Template virtual PHP is excluded. These operations avoid
 reparsing closed files in the common path, but can still iterate many indexed
 reference sets for workspace-wide operations.
 
+File updates, removals, and aggregate replacement publish all affected symbol,
+reference, member, and generation maps under one exclusive publication lease.
+Lookup methods hold a shared lease for the full lookup; code that enumerates or
+combines maps uses `WorkspaceIndex::read()` and its read-only map views. Readers
+therefore wait for an in-progress commit and cannot observe an intermediate
+file generation. Async handlers clone the data they need before releasing the
+lease and awaiting other work. The revision barrier remains separate: it
+serializes source writers with staged aggregate and derived-data commits.
+Composer metadata changes also rebuild the aggregate in staging; a
+metadata-only refresh repeats a superseded staged build until it can publish
+against the current source revisions or a newer runtime generation takes over.
+
 ## Disk Cache Model
 
 Index snapshots are serialized with `bincode` under:

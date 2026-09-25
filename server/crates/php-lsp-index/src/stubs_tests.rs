@@ -309,7 +309,8 @@ fn test_load_stubs_with_real_data() {
     // Core should define basic PHP classes like stdClass, Exception, etc.
     // Check that some known built-in class exists
     let has_builtin = index
-        .types
+        .read()
+        .types()
         .iter()
         .any(|entry| entry.value().modifiers.is_builtin);
     assert!(has_builtin, "Should have at least one built-in type");

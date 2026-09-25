@@ -56,7 +56,8 @@ fn disk_index_open_overlay_uses_own_php_version_for_deprecation() {
 
 fn indexed_symbol_names(index: &WorkspaceIndex, uri: &str) -> Vec<String> {
     index
-        .file_symbols
+        .read()
+        .file_symbols()
         .get(uri)
         .map(|symbols| {
             symbols

@@ -2623,7 +2623,7 @@ pub(in crate::server) fn simple_type_fqn_from_index(
         return Some(type_name.trim_start_matches('\\').to_string());
     }
 
-    if let Some(file_syms) = index.file_symbols.get(uri) {
+    if let Some(file_syms) = index.read().file_symbols().get(uri) {
         Some(php_lsp_parser::resolve::resolve_class_name(
             type_name, &file_syms,
         ))

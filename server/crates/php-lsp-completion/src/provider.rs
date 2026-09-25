@@ -635,8 +635,9 @@ fn provide_namespace_completions_with_options(
     insert_fqn: bool,
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
+    let published = index.read();
 
-    for entry in index.types.iter() {
+    for entry in published.types().iter() {
         let sym = entry.value();
         if let Some(match_rank) = namespace_completion_match_rank(&sym.name, &sym.fqn, prefix) {
             let mut item = CompletionItem {
@@ -696,6 +697,7 @@ fn namespace_completion_match_rank(name: &str, fqn: &str, prefix: &str) -> Optio
 fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     let prefix_lower = prefix.to_lowercase();
+    let published = index.read();
 
     // Add matching keywords
     for keyword in PHP_KEYWORDS {
@@ -724,7 +726,7 @@ fn provide_free_completions(prefix: &str, index: &WorkspaceIndex) -> Vec<Complet
     }
 
     // Add matching functions
-    for entry in index.functions.iter() {
+    for entry in published.functions().iter() {
         let sym = entry.value();
         if sym.name.to_lowercase().starts_with(&prefix_lower) {
             items.push(CompletionItem {

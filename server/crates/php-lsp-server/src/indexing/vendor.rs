@@ -1688,7 +1688,8 @@ impl PhpLspBackend {
             let source = parser.source();
 
             let file_symbols = request_index
-                .file_symbols
+                .read()
+                .file_symbols()
                 .get(uri_str)
                 .map(|entry| entry.value().clone())
                 .unwrap_or_default();

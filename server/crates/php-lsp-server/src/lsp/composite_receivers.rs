@@ -221,7 +221,8 @@ pub(super) fn members_for_access(
                     })
                     .map(|ty| {
                         let declaring = index
-                            .file_symbols
+                            .read()
+                            .file_symbols()
                             .get(&symbol.uri)
                             .map(|entry| entry.value().clone())
                             .unwrap_or_default();
@@ -264,7 +265,8 @@ pub(super) fn members_for_access(
                     );
                     let result_type = property.type_info.as_ref().map(|ty| {
                         let declaring = index
-                            .file_symbols
+                            .read()
+                            .file_symbols()
                             .get(&owner.uri)
                             .map(|entry| entry.value().clone())
                             .unwrap_or_default();

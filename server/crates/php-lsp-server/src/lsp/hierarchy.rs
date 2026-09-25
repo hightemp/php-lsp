@@ -209,18 +209,22 @@ async fn type_hierarchy_symbol_from_item(
             item.selection_range.end.character,
         ),
     );
-    index.file_symbols.get(uri).and_then(|file_symbols| {
-        file_symbols
-            .symbols
-            .iter()
-            .find(|sym| {
-                sym.name == item.name
-                    && sym.selection_range == selection
-                    && is_type_hierarchy_symbol_kind(sym.kind)
-            })
-            .cloned()
-            .map(Arc::new)
-    })
+    index
+        .read()
+        .file_symbols()
+        .get(uri)
+        .and_then(|file_symbols| {
+            file_symbols
+                .symbols
+                .iter()
+                .find(|sym| {
+                    sym.name == item.name
+                        && sym.selection_range == selection
+                        && is_type_hierarchy_symbol_kind(sym.kind)
+                })
+                .cloned()
+                .map(Arc::new)
+        })
 }
 
 fn direct_type_subtypes(
@@ -230,7 +234,7 @@ fn direct_type_subtypes(
     let mut seen = HashSet::new();
     let mut subtypes = Vec::new();
 
-    for entry in index.types.iter() {
+    for entry in index.read().types().iter() {
         let sym = entry.value().clone();
         if !is_type_hierarchy_symbol_kind(sym.kind) || sym.fqn.eq_ignore_ascii_case(target_fqn) {
             continue;
@@ -262,7 +266,7 @@ fn direct_method_by_fqn(
     index: &WorkspaceIndex,
     fqn: &str,
 ) -> Option<Arc<php_lsp_types::SymbolInfo>> {
-    index.file_symbols.iter().find_map(|entry| {
+    index.read().file_symbols().iter().find_map(|entry| {
         entry
             .value()
             .symbols
@@ -429,18 +433,22 @@ async fn call_hierarchy_symbol_from_item(
             item.selection_range.end.character,
         ),
     );
-    index.file_symbols.get(uri).and_then(|file_symbols| {
-        file_symbols
-            .symbols
-            .iter()
-            .find(|sym| {
-                sym.name == item.name
-                    && sym.selection_range == selection
-                    && is_call_hierarchy_symbol_kind(sym.kind)
-            })
-            .cloned()
-            .map(Arc::new)
-    })
+    index
+        .read()
+        .file_symbols()
+        .get(uri)
+        .and_then(|file_symbols| {
+            file_symbols
+                .symbols
+                .iter()
+                .find(|sym| {
+                    sym.name == item.name
+                        && sym.selection_range == selection
+                        && is_call_hierarchy_symbol_kind(sym.kind)
+                })
+                .cloned()
+                .map(Arc::new)
+        })
 }
 
 async fn call_hierarchy_target_from_item(
@@ -739,14 +747,20 @@ impl PhpLspBackend {
         let mut calls_by_caller: HashMap<String, (php_lsp_types::SymbolInfo, Vec<Range>)> =
             HashMap::new();
         let mut file_uris: HashSet<String> = request_index
-            .file_symbols
+            .read()
+            .file_symbols()
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
         let open_file_uris: Vec<String> = self
             .open_files
             .iter()
-            .filter(|entry| request_index.file_symbols.contains_key(entry.key()))
+            .filter(|entry| {
+                request_index
+                    .read()
+                    .file_symbols()
+                    .contains_key(entry.key())
+            })
             .map(|entry| entry.key().clone())
             .collect();
         file_uris.extend(
@@ -779,7 +793,8 @@ impl PhpLspBackend {
             }
 
             let Some(file_symbols) = request_index
-                .file_symbols
+                .read()
+                .file_symbols()
                 .get(&file_uri)
                 .map(|entry| entry.value().clone())
             else {
@@ -895,7 +910,8 @@ impl PhpLspBackend {
             outgoing_call_hierarchy_for_tree(&tree, &source, &file_symbols, &request_index, &caller)
         } else {
             let file_symbols = request_index
-                .file_symbols
+                .read()
+                .file_symbols()
                 .get(&file_uri)
                 .map(|entry| entry.value().clone())
                 .unwrap_or_default();

@@ -777,7 +777,8 @@ fn pre_resolve_analyze_file_dependencies(
     let source = parsed.parser.source();
     let file_symbols = context
         .index
-        .file_symbols
+        .read()
+        .file_symbols()
         .get(&parsed.uri)
         .map(|entry| entry.value().clone())
         .unwrap_or_default();

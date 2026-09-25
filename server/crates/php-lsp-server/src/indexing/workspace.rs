@@ -1456,7 +1456,8 @@ pub(in crate::server) fn remove_indexed_vendor_symbols(
     roots: &[PathBuf],
 ) -> usize {
     let uris: Vec<String> = index
-        .file_symbols
+        .read()
+        .file_symbols()
         .iter()
         .filter_map(|entry| {
             let path = uri_to_path(entry.key())?;
@@ -1819,18 +1820,20 @@ pub(in crate::server) async fn commit_staged_vendor_file(
     indexing_run: Option<&IndexingRunLease>,
     indexing_runs: Option<&IndexingRunCoordinator>,
 ) -> bool {
-    let Some(file_symbols) = staged_index
-        .file_symbols
-        .get(&uri)
-        .map(|symbols| symbols.value().as_ref().clone())
-    else {
+    let staged_snapshot = {
+        let staged = staged_index.read();
+        staged.file_symbols().get(&uri).map(|symbols| {
+            let references = staged
+                .file_references()
+                .get(&uri)
+                .map(|references| references.value().clone())
+                .unwrap_or_default();
+            (symbols.value().as_ref().clone(), references)
+        })
+    };
+    let Some((file_symbols, references)) = staged_snapshot else {
         return false;
     };
-    let references = staged_index
-        .file_references
-        .get(&uri)
-        .map(|references| references.value().clone())
-        .unwrap_or_default();
     let mut lru = vendor_file_lru.lock().await;
     let commit = || {
         index.update_file_with_references(&uri, file_symbols, references);
@@ -1900,7 +1903,8 @@ pub(in crate::server) fn indexed_vendor_cache_sources(
 ) -> Vec<CacheSourceFile> {
     let vendor_dir = root.join("vendor");
     let mut sources: Vec<CacheSourceFile> = index
-        .file_symbols
+        .read()
+        .file_symbols()
         .iter()
         .filter_map(|entry| {
             let path = uri_to_path(entry.key())?;
@@ -2080,9 +2084,43 @@ pub(in crate::server) async fn rebuild_aggregate_for_indexing_runs(
     document_versions: Arc<DashMap<String, OpenDocumentState>>,
     runs: &[IndexingRunLease],
 ) -> bool {
+    rebuild_aggregate_for_indexing_runs_with_outcome(
+        coordinator,
+        aggregate_rebuild,
+        aggregate_index,
+        configs,
+        fallback_php_version,
+        open_files,
+        template_documents,
+        document_versions,
+        runs,
+    )
+    .await
+        == AggregateRebuildOutcome::Published
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum AggregateRebuildOutcome {
+    Published,
+    Stale,
+    Failed,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::server) async fn rebuild_aggregate_for_indexing_runs_with_outcome(
+    coordinator: &Arc<IndexingRunCoordinator>,
+    aggregate_rebuild: &Arc<Mutex<()>>,
+    aggregate_index: &Arc<WorkspaceIndex>,
+    configs: Vec<WorkspaceRootConfig>,
+    fallback_php_version: PhpVersion,
+    open_files: Arc<DashMap<String, FileParser>>,
+    template_documents: Arc<DashMap<String, TemplateDocument>>,
+    document_versions: Arc<DashMap<String, OpenDocumentState>>,
+    runs: &[IndexingRunLease],
+) -> AggregateRebuildOutcome {
     let _aggregate_rebuild = aggregate_rebuild.lock().await;
     if runs.iter().any(|run| !run.is_current()) {
-        return false;
+        return AggregateRebuildOutcome::Stale;
     }
     let expected_source_revision = coordinator.aggregate_source_revision();
     let mut source_indexes = configs
@@ -2110,12 +2148,14 @@ pub(in crate::server) async fn rebuild_aggregate_for_indexing_runs(
     .await
     .is_ok();
     if !built {
-        return false;
+        return AggregateRebuildOutcome::Failed;
     }
     let coordinator = coordinator.clone();
     let runs = runs.to_vec();
     let aggregate_index = aggregate_index.clone();
-    tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        coordinator.before_aggregate_commit_for_test();
         coordinator
             .commit_aggregate_if_current(&runs, expected_source_revision, || {
                 aggregate_index.replace_from_staged_if_sources_current(
@@ -2127,7 +2167,11 @@ pub(in crate::server) async fn rebuild_aggregate_for_indexing_runs(
             .is_some_and(|committed| committed)
     })
     .await
-    .unwrap_or(false)
+    {
+        Ok(true) => AggregateRebuildOutcome::Published,
+        Ok(false) => AggregateRebuildOutcome::Stale,
+        Err(_) => AggregateRebuildOutcome::Failed,
+    }
 }
 
 pub(in crate::server) async fn postprocess_workspace_indexing_runs(
@@ -2586,20 +2630,23 @@ pub(in crate::server) async fn index_workspace(
         &options.cache_config,
     );
     let cached_uris: Vec<String> = disk_index
-        .file_symbols
+        .read()
+        .file_symbols()
         .iter()
         .map(|entry| entry.key().clone())
         .collect();
     for uri_str in cached_uris {
         let Some(file_symbols) = disk_index
-            .file_symbols
+            .read()
+            .file_symbols()
             .get(&uri_str)
             .map(|symbols| symbols.value().as_ref().clone())
         else {
             continue;
         };
         let references = disk_index
-            .file_references
+            .read()
+            .file_references()
             .get(&uri_str)
             .map(|references| references.value().clone())
             .unwrap_or_default();
@@ -3032,7 +3079,7 @@ impl PhpLspBackend {
                     false,
                 )
                 .iter()
-                .all(|index| !index.file_symbols.contains_key(&uri_str))
+                .all(|index| !index.read().file_symbols().contains_key(&uri_str))
             {
                 return;
             }

@@ -1061,7 +1061,7 @@ impl PhpLspBackend {
             return Some(snapshot.file_symbols);
         }
 
-        if let Some(file_symbols) = index.file_symbols.get(uri_str) {
+        if let Some(file_symbols) = index.read().file_symbols().get(uri_str) {
             return Some(file_symbols.value().as_ref().clone());
         }
         None
