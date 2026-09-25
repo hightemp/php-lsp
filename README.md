@@ -427,6 +427,8 @@ The extension contributes these VS Code commands:
   examples.
 - [LSP feature matrix](docs/lsp-features.md): supported, partial, and
   unsupported LSP behavior.
+- [Test coverage baseline](docs/test-coverage.md): feature × state × platform
+  evidence, measured Rust coverage, client check scope, and reproduction.
 - [Performance guide](docs/performance.md): baseline methodology, profiling
   commands, cache interpretation, and production acceptance metrics.
 - [Production baseline](docs/production-baseline.md): current measured

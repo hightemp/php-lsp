@@ -6266,3 +6266,27 @@ change.
   - Validation target: focused RED → GREEN parser/completion/LSP tests, sequential `CARGO_BUILD_JOBS=1` Rust checks with `--test-threads=1`, full suite, Clippy, Rustfmt, diff check, final documentation audit and Verifier on `gpt-6-sol` to GO.
   - Implemented: free completion enumerates type/function/constant tables once; use completion carries class/function/constant kind and grouped namespace path, filters candidates, and inserts the correct full or group-relative suffix. Member completion deduplicates overrides, interface diamonds and PHPDoc virtual members using method-insensitive versus property/constant-sensitive PHP identity; open-buffer direct members retain precedence. Updated README, architecture and LSP feature docs; appended status after the untouched audit description.
   - Validation: 8 unit and 1 LSP e2e regressions added. RED reproduced duplicate free functions, wrong `use function` kind, duplicate overrides, uppercase import keywords, and direct/nested grouped insertion errors; GREEN also covers `use const`, class imports, case-sensitive properties/constants, interface diamonds, virtual members, open-buffer precedence and distinct FQNs. Final sequential `CARGO_BUILD_JOBS=1 cargo test --all -q -- --test-threads=1` passed 1198/1198 without ignored tests. Clippy `--all-targets -D warnings`, Rustfmt and `git diff --check` passed; Verifier on `gpt-6-sol` returned GO. Final documentation audit confirmed all new behavior is described and the original P2-13 audit text is byte-for-byte unchanged.
+
+### Milestone: Project-wide test coverage baseline (2026-09-25 -> 2026-09-25)
+
+**Статус:** done 2026-09-25
+**Цель:** воспроизводимо измерить покрытие Rust-сервера и VS Code-клиента и сопоставить тесты с матрицей функция × состояние × платформа.
+
+#### Exit criteria
+
+- Матрица перечисляет поддерживаемые функции, применимые состояния и платформы, ссылки на тесты и явные пробелы.
+- Измерения coverage воспроизводимы в один поток и отделяют протестированную платформу от build-only и mock smoke.
+- Отчёт фиксирует измеренные числа, ограничения инструмента и приоритетный список следующих тестов.
+
+#### Задачи
+
+- [x] **COV-001** Составить матрицу пользовательских функций, состояний и платформ по существующему коду и тестам. *(done 2026-09-25)*
+  - Scope: Rust/LSP, VS Code client, packaging; учитывать поддерживаемые и частичные функции.
+  - Validation target: ссылки на тесты и CI проверены по репозиторию, матрица проходит структурную проверку.
+  - Implemented: `docs/test-coverage.md` содержит 48 сценариев с осью Linux/macOS/Windows, ссылками на тесты и явными пробелами; ссылка добавлена в README.
+  - Validation: структурная проверка 48 строк и 82 ссылок, все ссылки существуют; сопоставлено с CI и release workflows.
+- [x] **COV-002** Измерить Rust и client coverage с ограничением памяти. *(done 2026-09-25)*
+  - Scope: последовательные Rust jobs/tests, воспроизводимые команды, машинные отчёты и честные исключения.
+  - Validation target: реальные результаты или документированный блокер инструмента, проверка generated artifacts и `git diff --check`.
+  - Implemented: Rust baseline 57,105/66,948 строк (85.3%) по 59 production-файлам; client helper baseline 655/701 TypeScript-строк (93.4%) по пяти файлам, с явным исключением `extension.ts`. Команды и границы измерения сохранены в отчёте.
+  - Validation: полный инструментированный Rust workspace suite прошёл с `CARGO_BUILD_JOBS=1`, `--test-threads=1`; клиентские lint, cache-path, commands и build прошли; команды client coverage из отчёта повторно дали те же цифры; Rustfmt и `git diff --check` прошли.
