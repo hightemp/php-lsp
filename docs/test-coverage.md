@@ -1,6 +1,7 @@
 # Project-wide test coverage baseline
 
-Snapshot: 2026-09-25. This is a **test-evidence matrix**, not a claim that every
+Coverage measurement snapshot: 2026-09-25; matrix evidence updated for P2-14 on
+2026-09-28. This is a **test-evidence matrix**, not a claim that every
 possible combination works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
 is evidence for the stated scenario on Linux; it does not imply that the same
@@ -26,7 +27,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Diagnostics | rapid unsaved changes, stale versions, close/reopen | T | B | B | [diagnostics protocol tests](../server/crates/php-lsp-server/tests/e2e_diagnostics.rs). |
 | Diagnostics | syntax, semantic, PHP version, suppression budgets | T | B | B | [parser diagnostic tests](../server/crates/php-lsp-parser/src/diagnostics_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_diagnostics.rs). |
 | External analyzers | trusted/untrusted PHPStan configuration, output location | T | B | B | [initialize tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [server tests](../server/crates/php-lsp-server/src/server_tests.rs); real installed PHPStan/Psalm versions are not a compatibility matrix. |
-| Completion | classes/functions/constants, import kind, deduplication | T | B | B | [completion protocol tests](../server/crates/php-lsp-server/tests/e2e_completion.rs), [provider tests](../server/crates/php-lsp-completion/src/provider_tests.rs). |
+| Completion | symbol/import kind, deduplication, class/trait visibility | T | B | B | [completion protocol tests](../server/crates/php-lsp-server/tests/e2e_completion.rs), [visibility protocol tests](../server/crates/php-lsp-server/tests/e2e_visibility.rs), [provider tests](../server/crates/php-lsp-completion/src/provider_tests.rs). |
 | Completion resolve | enriched item detail and stale/merged type state | T | B | B | [composite receiver tests](../server/crates/php-lsp-server/tests/e2e_composite_receivers.rs), [definition tests](../server/crates/php-lsp-server/tests/e2e_definition.rs). |
 | Completion | incomplete member access and unsaved edit | T | B | B | [completion protocol tests](../server/crates/php-lsp-server/tests/e2e_completion.rs). |
 | Completion | lazy vendor first hit and warm repeated hit | T | B | B | [vendor metadata tests](../server/crates/php-lsp-server/tests/e2e_vendor_metadata.rs), [vendor symlink tests](../server/crates/php-lsp-server/src/indexing/vendor_symlink_tests.rs); latency budget is unmeasured. |
@@ -88,6 +89,8 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
+These figures predate the P2-14 visibility module and regressions; coverage has
+not been remeasured after that change.
 
 | Rust scope | Lines | Regions | Functions |
 |---|---:|---:|---:|

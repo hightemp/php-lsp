@@ -286,7 +286,7 @@ request cannot combine a new symbol index with an older editor buffer.
 |---|---|---|---|---|
 | Hover | `src/lsp/hover.rs`, shared parameter/type Markdown helpers in `src/lsp/completion_helpers.rs`, call-site return inference reused from `src/lsp/inlay_hints.rs` | `resolve.rs`, PHPDoc helpers, indexed PHP 8 attribute extraction | `workspace.rs` symbol lookup plus `SymbolInfo` source ranges, attributes, class/method relations, templates, and bindings | `tests/e2e_hover.rs` |
 | Definition/declaration/type definition/implementation | `src/lsp/definition.rs` | `resolve.rs` | `workspace.rs`, lazy vendor lookup | `tests/e2e_definition.rs`, `tests/e2e_templates.rs` |
-| Completion | `src/lsp/completion.rs` | `php-lsp-completion/src/context.rs`, `provider.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + `tests/e2e_completion.rs` |
+| Completion | `src/lsp/completion.rs` | `php-lsp-completion/src/context.rs`, `provider.rs`, `visibility.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + `tests/e2e_completion.rs`, `tests/e2e_visibility.rs` |
 | Signature help | `src/lsp/completion.rs` | call/member resolution helpers | `workspace.rs` signature lookup | `tests/e2e_completion.rs` |
 | References/code lens | `src/lsp/references.rs` | `references.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs` |
 | Rename | `src/lsp/rename.rs` | `references.rs`, local variable search | `file_references`, symbol lookup | `tests/e2e_references.rs` |
@@ -337,10 +337,28 @@ after their explicit error guard.
 
 The LSP completion path calls `provide_completions_at_range(...)` with the
 cursor byte-column range. The completion provider uses that range to find the
-class-like symbol containing the cursor before filtering member visibility for
-`$this`, `self`, `static`, and `parent`. This keeps private and protected
-members tied to the actual class, trait, enum, or anonymous class at the cursor
-instead of the first class-like symbol in file order.
+class-like symbol containing the cursor before filtering native member
+visibility. `php-lsp-completion/src/visibility.rs` shares this access model with
+composite receiver selection. Access depends on the cursor scope, receiver
+hierarchy, and declaring scope, so another instance and a named/aliased class
+expression have the same class-scope access as `$this` and `self`. Protected
+method overrides retain accessible ancestor contracts; property and constant
+redeclarations use their own declaring scope and cannot fall back to a hidden
+ancestor. Instance private binding prefers the cursor class; named static
+lookup uses the receiver, and private constants are not inherited.
+Private trait declarations use each
+direct consuming class's scope, including nested traits; inheriting the class
+does not grant its private access, and unrelated consumers do not share access.
+Declaration FQNs, URIs and ranges stay attached to the original source.
+Class and outer-trait declarations suppress imported trait methods before
+private binding is prioritized, so an overridden trait signature cannot
+displace the effective class method. Direct-member lookup is cached per
+type for the request rather than rescanning the file for each candidate.
+Type relationships from the open file override indexed metadata; collection
+and filtering hold the index read snapshot. Visited sets guard hierarchy cycles.
+This models extracted public/protected/private declarations; trait adaptations
+(`as`/`insteadof`) and asymmetric property visibility need additional extraction
+metadata and retain the existing parser/index limits.
 
 Member-access completion contexts also carry a read/write mode inferred from
 the text after the cursor. PHPDoc virtual properties use that mode to honor

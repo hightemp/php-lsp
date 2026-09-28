@@ -1213,7 +1213,7 @@ impl WorkspaceIndex {
     }
 
     /// Get only the direct members of a type (no inheritance traversal).
-    fn get_direct_members(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
+    pub fn get_direct_members(&self, type_fqn: &str) -> Vec<Arc<SymbolInfo>> {
         let _publication = self.publication_barrier.read_recursive();
         let parent_key = case_insensitive_fqn_key(type_fqn);
         let Some(sources) = self

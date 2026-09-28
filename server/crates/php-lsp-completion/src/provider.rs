@@ -9,7 +9,7 @@ use php_lsp_index::workspace::WorkspaceIndex;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_types::{
     FileSymbols, PhpDocMethod, PhpDocProperty, PhpDocPropertyAccess, PhpSymbolKind, SymbolInfo,
-    UseKind, Visibility,
+    UseKind,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -161,6 +161,7 @@ fn provide_completions_with_current_class(
     current_class_fqn: Option<&str>,
     cursor_range: Option<(u32, u32, u32, u32)>,
 ) -> Vec<CompletionItem> {
+    let _publication = index.read();
     match context {
         CompletionContext::MemberAccess {
             object_expr,
@@ -295,16 +296,12 @@ fn provide_member_completions(
     };
 
     if let Some(fqn) = class_fqn {
-        let members = completion_members(index, file_symbols, &fqn);
+        let mut members = completion_members(index, file_symbols, &fqn);
+        let mut visibility =
+            crate::visibility::MemberVisibility::new(index, file_symbols, &fqn, current_class_fqn);
         let mut seen = HashSet::new();
-        for member in members {
-            // Skip static members for instance access
-            if member.modifiers.is_static {
-                continue;
-            }
-            if !member_is_visible(&member, object_expr == "$this", current_class_fqn) {
-                continue;
-            }
+        members.retain(|member| !member.modifiers.is_static);
+        for member in visibility.filter_members(members) {
             if let Some(property_access) = phpdoc_property_access_for_symbol(&member) {
                 if !phpdoc_property_matches_access(property_access, access_mode) {
                     continue;
@@ -543,27 +540,21 @@ fn provide_static_completions(
 
     let fqn = class_fqn.to_string();
 
-    let members = completion_members(index, file_symbols, &fqn);
+    let mut members = completion_members(index, file_symbols, &fqn);
+    let mut visibility =
+        crate::visibility::MemberVisibility::new(index, file_symbols, &fqn, current_class_fqn);
     let mut seen = HashSet::from([MemberCompletionKey::Constant("class".to_string())]);
-    for member in members {
+    members.retain(|member| {
         let is_parent_instance_method =
             class_expr == "parent" && member.kind == PhpSymbolKind::Method;
-        if !member.modifiers.is_static
-            && !is_parent_instance_method
-            && !matches!(
+        member.modifiers.is_static
+            || is_parent_instance_method
+            || matches!(
                 member.kind,
                 PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase
             )
-        {
-            continue;
-        }
-        if !member_is_visible(
-            &member,
-            matches!(class_expr, "self" | "static" | "parent"),
-            current_class_fqn,
-        ) {
-            continue;
-        }
+    });
+    for member in visibility.filter_members(members) {
         if let Some(key) = member_completion_key(member.kind, &member.name) {
             if !seen.insert(key) {
                 continue;
@@ -1028,31 +1019,6 @@ fn static_class_pseudo_constant_sort_rank() -> &'static str {
     "0101"
 }
 
-fn member_is_visible(
-    member: &SymbolInfo,
-    accessing_from_self: bool,
-    current_class_fqn: Option<&str>,
-) -> bool {
-    match member.visibility {
-        Visibility::Public => true,
-        Visibility::Protected => accessing_from_self && current_class_fqn.is_some(),
-        Visibility::Private => {
-            accessing_from_self
-                && member
-                    .parent_fqn
-                    .as_deref()
-                    .zip(current_class_fqn)
-                    .is_some_and(|(declaring_class, current_class)| {
-                        php_lsp_types::symbol_fqn_eq(
-                            declaring_class,
-                            current_class,
-                            PhpSymbolKind::Class,
-                        )
-                    })
-        }
-    }
-}
-
 fn sort_completion_items(items: &mut [CompletionItem]) {
     items.sort_by(|a, b| {
         a.sort_text
@@ -1138,3 +1104,7 @@ fn byte_range_contains(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32))
 #[cfg(test)]
 #[path = "provider_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "provider_visibility_tests.rs"]
+mod visibility_tests;

@@ -106,6 +106,7 @@ pub(super) fn members_for_access(
     range: Option<(u32, u32, u32, u32)>,
     mode: php_lsp_completion::context::MemberAccessMode,
 ) -> BTreeMap<String, Member> {
+    let _publication = index.read();
     match ty {
         TypeInfo::Union(parts) | TypeInfo::Intersection(parts) => {
             let union = matches!(ty, TypeInfo::Union(_));
@@ -179,15 +180,19 @@ pub(super) fn members_for_access(
                 resolve_class_name_pub(name, symbols)
             };
             let mut result = BTreeMap::new();
-            for symbol in index.get_members(&fqn) {
-                if !matches!(symbol.kind, PhpSymbolKind::Method | PhpSymbolKind::Property)
-                    || symbol.modifiers.is_static
-                    || range.is_some_and(|range| {
-                        visibility_violation_message(index, &symbol, symbols, range).is_some()
-                    })
-                {
-                    continue;
-                }
+            let current = range.and_then(|range| current_class_fqn_at_range(symbols, range));
+            let mut visibility = php_lsp_completion::visibility::MemberVisibility::new(
+                index,
+                symbols,
+                &fqn,
+                current.as_deref(),
+            );
+            let mut candidates = index.get_members(&fqn);
+            candidates.retain(|symbol| {
+                matches!(symbol.kind, PhpSymbolKind::Method | PhpSymbolKind::Property)
+                    && !symbol.modifiers.is_static
+            });
+            for symbol in visibility.filter_members(candidates) {
                 if php_lsp_completion::provider::phpdoc_property_access_for_symbol(&symbol)
                     .is_some_and(|access| {
                         !php_lsp_completion::provider::phpdoc_property_matches_access(access, mode)

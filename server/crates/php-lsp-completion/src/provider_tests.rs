@@ -1967,7 +1967,13 @@ fn test_private_member_completion_matches_owner_fqn_using_php_class_rules() {
         "self:: should include a private member when owner FQN casing differs"
     );
     assert!(
-        !member_is_visible(&foreign_private, true, Some("\\APP\\SERVICE")),
+        !crate::visibility::MemberVisibility::new(
+            &index,
+            &file_symbols,
+            "App\\Other",
+            Some("\\APP\\SERVICE")
+        )
+        .is_visible(&foreign_private),
         "a private member declared by another class must remain hidden"
     );
 }

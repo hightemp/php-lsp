@@ -77,6 +77,10 @@ phpstorm-stubs support.
   repeat equivalent labels. Incomplete one-line `$object->` expressions remain usable
   for completion while tree-sitter diagnostics still report the incomplete PHP.
 - Completion resolve enriches PHPDoc virtual member completions.
+- Native member completion uses class-scope visibility for other instances,
+  named static access, inheritance, and nested trait consumption. Inherited
+  private trait members stay hidden from subclasses; unrelated consumers do
+  not share private access.
 - Signature help for functions, methods, constructors, and active parameter
   tracking.
 - Inlay hints for argument labels, inferred PHPDoc parameter/return types,

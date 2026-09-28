@@ -1241,6 +1241,24 @@ Private members, пришедшие из используемого trait, им�
 Что исправить: проверять relationship current/receiver/declaring type, а trait
 members материализовать с effective consuming owner или отдельной access model.
 
+Реализация (2026-09-28): общий completion access model проверяет scope класса,
+receiver hierarchy и declaring/consuming owner для instance и named static
+access. Nested traits не делят private scope между несвязанными consumers;
+обычные и composite receivers используют одну проверку. Private instance
+binding сохраняет декларацию текущего scope, protected method overrides
+учитывают контракт родителя, а property/constant redeclarations не раскрывают
+скрытый member через fallback. Исходные FQN/URI/ranges остаются у декларации.
+Class/outer-trait overrides исключают подавленную trait declaration до выбора
+private binding; исходная сигнатура trait не вытесняет метод класса.
+Trait adaptations (`as`/`insteadof`) и asymmetric property visibility требуют
+дополнительной parser/index metadata и сохраняют прежние ограничения.
+
+Статус (2026-09-28): исправлено через TDD. Добавлены 14 unit и 5 LSP регрессий
+для положительных/отрицательных scopes, nested/reused traits, source identity,
+redeclarations, циклов и unsaved changes. Последовательный полный Rust-набор
+прошёл 1217/1217 без ignored; Clippy, Rustfmt, diff check и повторный Verifier
+review на `gpt-6-sol` — GO. Исходное описание находки сохранено без изменений.
+
 ### CODEX-P2-15. Signature Help пропускает nullsafe calls и ошибается на comments
 
 [`is_call_node`](server/crates/php-lsp-parser/src/signature_help.rs#L56) не
