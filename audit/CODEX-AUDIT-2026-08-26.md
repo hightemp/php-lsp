@@ -1312,6 +1312,32 @@ parser 17/17, LSP 5/5. Полный последовательный `CARGO_BUIL
 Что исправить: группировать top-level symbols по `NamespaceScope`, сохранять
 несколько namespace DocumentSymbol и корректно обрабатывать global sections.
 
+Реализация (2026-10-07): outline группирует декларации по диапазону секции
+`NamespaceScope` в исходном тексте, а не по имени namespace.
+Bracketed/unbracketed, повторные и пустые named sections сохраняются отдельно;
+global sections дают корневые
+символы в порядке исходного текста. Namespace range покрывает section,
+selectionRange выбирает объявленное имя с учётом header comments и UTF-16.
+В проверенной версии parser уже хранит namespace sections в `FileSymbols`,
+поэтому прежний handler фактически выдавал плоский список без namespace nodes.
+Members связываются с конкретной декларацией по parent FQN и диапазону,
+включая её PHPDoc. Виртуальные `@method`/`@property` сохраняются; для корректной
+вложенности расширяется только range outline-родителя, без изменения
+parser/index ranges и выбора имени класса.
+
+Статус (2026-10-07): исправлено через TDD. Добавлены 11 постоянных LSP-регрессий:
+начальный RED воспроизвёл 8 namespace failures, дополнительные RED проверки —
+утечку членов между одинаковыми FQN и два PHPDoc member-loss cases. GREEN 11/11
+покрывает все declaration kinds, обе формы namespace, repeated/global/empty
+sections, signatures/deprecation, native/virtual ownership, header comments,
+Unicode/CRLF, unsaved changes/reopen, indexed/open parity и восстановление диска
+после close. Полный последовательный `CARGO_BUILD_JOBS=1 cargo test --all -q --
+--test-threads=1` прошёл 1255/1255 без ignored. Clippy `--all-targets -D warnings`,
+Rustfmt и diff check прошли; повторный Verifier на `gpt-6-sol` — GO после
+исправления замечания о PHPDoc. Документация и тестовая матрица обновлены;
+исторические coverage figures не выдаются за новые измерения. Исходное
+описание находки сохранено дословно.
+
 ### CODEX-P2-17. Linked Editing связывает одноимённые, но независимые names
 
 [`collect_matching_name_ranges`](server/crates/php-lsp-server/src/lsp/document_symbols.rs#L630)

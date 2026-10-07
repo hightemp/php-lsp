@@ -1,6 +1,8 @@
 //! Document Symbols LSP handlers extracted from `server.rs`.
 
 use super::super::*;
+use super::completion_helpers::{byte_offset_to_line_col, byte_offsets_to_range};
+use crate::util::lsp_text::byte_offset_for_line_col;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceSymbolCandidate {
@@ -457,7 +459,6 @@ impl PhpLspBackend {
         // and member symbols (methods, properties, class constants, enum cases)
         let mut type_symbols: Vec<&php_lsp_types::SymbolInfo> = Vec::new();
         let mut member_symbols: Vec<&php_lsp_types::SymbolInfo> = Vec::new();
-        let mut namespace_sym: Option<&php_lsp_types::SymbolInfo> = None;
 
         for sym in &file_symbols.symbols {
             match sym.kind {
@@ -475,9 +476,8 @@ impl PhpLspBackend {
                 | php_lsp_types::PhpSymbolKind::EnumCase => {
                     member_symbols.push(sym);
                 }
-                php_lsp_types::PhpSymbolKind::Namespace => {
-                    namespace_sym = Some(sym);
-                }
+                // Namespace sections come from lexical scopes, not FQN identity.
+                php_lsp_types::PhpSymbolKind::Namespace => {}
             }
         }
 
@@ -529,36 +529,86 @@ impl PhpLspBackend {
                 }
             };
 
-        // Build type symbols with their children
+        let mut namespace_children: HashMap<_, Vec<DocumentSymbol>> = HashMap::new();
+
+        // Build type symbols with their children and assign each declaration
+        // to its lexical section, including repeated declarations of a namespace.
         for type_sym in &type_symbols {
+            let member_start = type_sym
+                .doc_comment
+                .as_deref()
+                .and_then(|doc| {
+                    let start =
+                        byte_offset_for_line_col(&source, type_sym.range.0, type_sym.range.1)?;
+                    let doc_start = source.get(..start)?.rfind(doc)?;
+                    Some(byte_offset_to_line_col(&source, doc_start))
+                })
+                .unwrap_or((type_sym.range.0, type_sym.range.1));
             let children: Vec<DocumentSymbol> = member_symbols
                 .iter()
-                .filter(|m| m.parent_fqn.as_deref() == Some(&type_sym.fqn))
+                .filter(|m| {
+                    // Duplicate declarations can share an FQN in an edited file.
+                    m.parent_fqn.as_deref() == Some(&type_sym.fqn)
+                        && member_start <= (m.range.0, m.range.1)
+                        && (m.range.2, m.range.3) <= (type_sym.range.2, type_sym.range.3)
+                })
                 .map(|m| make_doc_symbol(m, vec![]))
                 .collect();
 
-            top_level.push(make_doc_symbol(type_sym, children));
+            let mut symbol = make_doc_symbol(type_sym, children);
+            if symbol.children.as_ref().is_some_and(|children| {
+                children
+                    .iter()
+                    .any(|child| child.range.start < symbol.range.start)
+            }) {
+                // Virtual members select names in the class's attached PHPDoc.
+                // Extend only this outline range; parser/index ranges stay intact.
+                symbol.range.start = to_range((
+                    member_start.0,
+                    member_start.1,
+                    type_sym.range.2,
+                    type_sym.range.3,
+                ))
+                .start;
+            }
+            match file_symbols.namespace_scope_at_byte_position(
+                type_sym.selection_range.0,
+                type_sym.selection_range.1,
+            ) {
+                Some(scope) if scope.namespace.is_some() => {
+                    namespace_children
+                        .entry(scope.range)
+                        .or_default()
+                        .push(symbol);
+                }
+                _ => top_level.push(symbol),
+            }
         }
 
-        // Wrap in namespace if present
-        if let Some(ns) = namespace_sym {
+        // Preserve empty named sections; global sections stay at the root.
+        for scope in &file_symbols.namespace_scopes {
+            let Some(name) = &scope.namespace else {
+                continue;
+            };
+            let children = namespace_children.remove(&scope.range).unwrap_or_default();
             #[allow(deprecated)]
             let ns_symbol = DocumentSymbol {
-                name: ns.name.clone(),
+                name: name.clone(),
                 detail: None,
                 kind: SymbolKind::NAMESPACE,
                 tags: None,
                 deprecated: None,
-                range: to_range(ns.range),
-                selection_range: to_range(ns.selection_range),
-                children: if top_level.is_empty() {
+                range: to_range(scope.range),
+                selection_range: namespace_selection_range(&source, scope),
+                children: if children.is_empty() {
                     None
                 } else {
-                    Some(top_level)
+                    Some(children)
                 },
             };
-            return Ok(Some(DocumentSymbolResponse::Nested(vec![ns_symbol])));
+            top_level.push(ns_symbol);
         }
+        top_level.sort_by_key(|symbol| (symbol.range.start.line, symbol.range.start.character));
 
         if top_level.is_empty() {
             Ok(None)
@@ -620,6 +670,49 @@ impl PhpLspBackend {
 
         Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
     }
+}
+
+/// Scope metadata keeps the whole section range. Locate its declared name
+/// without reparsing indexed files; comments before the name are only trivia.
+fn namespace_selection_range(source: &str, scope: &php_lsp_types::NamespaceScope) -> Range {
+    let section = range_from_byte_range(source, scope.range);
+    let fallback = Range::new(section.start, section.start);
+    let Some(name) = scope.namespace.as_deref() else {
+        return fallback;
+    };
+    let Some(start) = byte_offset_for_line_col(source, scope.range.0, scope.range.1) else {
+        return fallback;
+    };
+    let Some(end) = byte_offset_for_line_col(source, scope.range.2, scope.range.3) else {
+        return fallback;
+    };
+    let Some(mut header) = source.get(start.saturating_add("namespace".len())..end) else {
+        return fallback;
+    };
+    loop {
+        header = header.trim_start_matches(char::is_whitespace);
+        if let Some(comment) = header.strip_prefix("/*") {
+            let Some(end) = comment.find("*/") else {
+                return fallback;
+            };
+            header = &comment[end + "*/".len()..];
+        } else if header.starts_with("//") || header.starts_with('#') {
+            let Some(end) = header.find('\n') else {
+                return fallback;
+            };
+            header = &header[end + 1..];
+        } else {
+            break;
+        }
+    }
+    if !header.starts_with(name) {
+        return fallback;
+    }
+    let name_start = end - header.len();
+    range_from_byte_range(
+        source,
+        byte_offsets_to_range(source, name_start, name_start + name.len()),
+    )
 }
 
 pub(in crate::server) fn selection_range_from_byte_ranges(

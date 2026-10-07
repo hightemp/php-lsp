@@ -65,7 +65,7 @@ comparison rule.
 
 | LSP feature | Status | Notes |
 |---|---|---|
-| `textDocument/documentSymbol` | Supported | Nested namespace/type/member symbols with signatures and deprecation tags. |
+| `textDocument/documentSymbol` | Supported | Nested namespace/type/member symbols with signatures and deprecation tags. Bracketed and unbracketed namespace sections, including repeated or empty named sections, remain separate and preserve source order; global sections contribute root symbols. Namespace ranges cover their sections and select the declared name in UTF-16 coordinates. |
 | `workspace/symbol` | Supported | Ranked search over indexed workspace symbols, limited to 200 results. |
 | `textDocument/prepareCallHierarchy` | Supported | Functions, methods, constructors, and containing callable fallback. |
 | `callHierarchy/incomingCalls` | Partial | Scans indexed files and can read unopened files. Can be expensive on large workspaces. |

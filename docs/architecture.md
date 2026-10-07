@@ -138,6 +138,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_diagnostics.rs` | diagnostics debounce/staleness, PHP version gates, vendor metadata refresh. |
 | `tests/e2e_formatting.rs` | document/range/on-type formatting. |
 | `tests/e2e_symbols.rs` | semantic tokens, document/workspace symbols, selection range, folding, document links. |
+| `tests/e2e_document_symbols.rs` | namespace-section ownership, repeated/global/empty sections, native/PHPDoc member ownership, UTF-16/CRLF, unsaved updates and indexed/open-file parity. |
 | `tests/e2e_hierarchy.rs` | call hierarchy and type hierarchy. |
 | `tests/e2e_indexing.rs` | watched files, file operations, workspace folders, index-related inference. |
 | `tests/e2e_templates.rs` | Blade/Twig virtual PHP behavior. |
@@ -226,6 +227,17 @@ alias expansion uses the source position of the referring symbol, including
 when an alias refers to another alias. Class PHPDoc aliases stay local to their
 own class.
 
+Document symbols group declarations by the lexical `NamespaceScope` range,
+keeping repeated and empty named sections as separate outline nodes. Global
+sections contribute symbols at the root, in source order. A namespace node's
+range covers its entire section; selection targets its declared name, skipping
+header comment trivia without reparsing indexed source. Members must match both
+the parent FQN and its source range, including its attached PHPDoc, so duplicate
+declarations in editor text do not acquire each other's members. When virtual
+members select names before the declaration, only the outline parent's range
+extends to that PHPDoc; parser/index ranges and identifier selection stay
+unchanged. All outgoing ranges use UTF-16 columns.
+
 A leading-backslash name remains fully qualified. An ordinary qualified name
 resolves from the active namespace and its first segment can expand an
 applicable class/namespace import. An explicit `namespace\...` name always
@@ -289,6 +301,7 @@ request cannot combine a new symbol index with an older editor buffer.
 | Definition/declaration/type definition/implementation | `src/lsp/definition.rs` | `resolve.rs` | `workspace.rs`, lazy vendor lookup | `tests/e2e_definition.rs`, `tests/e2e_templates.rs` |
 | Completion | `src/lsp/completion.rs` | `php-lsp-completion/src/context.rs`, `provider.rs`, `visibility.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + `tests/e2e_completion.rs`, `tests/e2e_visibility.rs` |
 | Signature help | `src/lsp/completion.rs` | `signature_help.rs` CST call-site/argument detection and existing name/member resolution helpers | `workspace.rs` signature lookup | parser signature-help tests + `tests/e2e_signature_help.rs`, `tests/e2e_completion.rs` |
+| Document symbols | `src/lsp/document_symbols.rs` | `symbols.rs` lexical namespace scopes and declaration ranges | `FileSymbols` from open source or indexed files | `tests/e2e_document_symbols.rs`, `tests/e2e_ranges.rs`, `tests/e2e_symbols.rs` |
 | References/code lens | `src/lsp/references.rs` | `references.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs` |
 | Rename | `src/lsp/rename.rs` | `references.rs`, local variable search | `file_references`, symbol lookup | `tests/e2e_references.rs` |
 | Diagnostics | `src/lsp/diagnostics.rs` plus shared helpers in `server.rs` | `diagnostics.rs`, `semantic.rs` | `workspace.rs` symbol resolution | parser unit tests + `tests/e2e_diagnostics.rs` |
