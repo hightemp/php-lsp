@@ -1349,6 +1349,30 @@ Rustfmt и diff check прошли; повторный Verifier на `gpt-6-sol`
 Что исправить: связывать только AST-роли одной alias/import identity; для
 неоднозначных group uses возвращать `None`.
 
+Реализация (2026-10-07): recursive same-text scan удалён. Linked editing
+возвращает ровно terminal name и явный alias одной `namespace_use_clause`,
+если их написание совпадает и курсор находится на одной из этих двух CST-ролей.
+Namespace segments, group/import prefixes и body names не связываются.
+Конфликт effective aliases в sibling clauses одной group/comma declaration
+подавляет linking с учётом import kind и общих PHP casing rules: class/function
+aliases сравниваются без учёта ASCII-регистра, constant aliases — точно.
+Malformed import declaration возвращает `None`; ошибки вне неё не отключают
+корректную пару. Используется текущий open CST без повторного разбора или
+index scan. UTF-16 conversion и существующий ASCII wordPattern сохранены.
+
+Статус (2026-10-07): исправлено через TDD. Добавлены 10 unit и 7 LSP-регрессий;
+начальный RED воспроизвёл 6 unit и 5 LSP failures до исправления. GREEN 10/10
+и 7/7 покрывает role identity, group/comma ambiguity, mixed import kinds/casing,
+namespace/body names, traits/closures/comments/punctuation, malformed imports
+и независимые syntax errors, Unicode/CRLF, unsaved updates, document isolation
+и close/reopen. Сквозной протокольный тест применяет возвращённые ranges через
+incremental edits и проверяет сохранение namespace/import prefixes. Полный
+последовательный `CARGO_BUILD_JOBS=1 cargo test --all -q -- --test-threads=1`
+прошёл 1272/1272 без ignored. Clippy `--all-targets -D warnings`, Rustfmt и
+diff check прошли; существующий Verifier на `gpt-6-sol` — GO. Документация и
+тестовая матрица обновлены, исторические coverage figures не заменены новыми
+неизмеренными значениями. Исходное описание находки сохранено дословно.
+
 ### CODEX-P2-18. Incoming Call Hierarchy сопоставляет instance calls только по имени
 
 [`incoming_call_hierarchy_for_file`](server/crates/php-lsp-server/src/lsp/hierarchy.rs#L461)

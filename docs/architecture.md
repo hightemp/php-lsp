@@ -139,6 +139,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_formatting.rs` | document/range/on-type formatting. |
 | `tests/e2e_symbols.rs` | semantic tokens, document/workspace symbols, selection range, folding, document links. |
 | `tests/e2e_document_symbols.rs` | namespace-section ownership, repeated/global/empty sections, native/PHPDoc member ownership, UTF-16/CRLF, unsaved updates and indexed/open-file parity. |
+| `tests/e2e_linked_editing.rs` | import-role pairs, independent namespace/path names, group/comma ambiguity and import kinds, malformed imports, UTF-16/CRLF and document updates/isolation. |
 | `tests/e2e_hierarchy.rs` | call hierarchy and type hierarchy. |
 | `tests/e2e_indexing.rs` | watched files, file operations, workspace folders, index-related inference. |
 | `tests/e2e_templates.rs` | Blade/Twig virtual PHP behavior. |
@@ -238,6 +239,16 @@ members select names before the declaration, only the outline parent's range
 extends to that PHPDoc; parser/index ranges and identifier selection stay
 unchanged. All outgoing ranges use UTF-16 columns.
 
+Linked editing selects the target terminal and explicit alias fields from one
+`namespace_use_clause`, returning exactly two ranges when their spelling
+matches. It never groups namespace segments, import prefixes or names in a
+namespace body by text. Same-kind effective alias collisions in sibling clauses
+of a group/comma declaration suppress that pair, using the shared PHP casing
+rules; class, function and constant aliases remain separate. An erroneous import
+declaration returns no pair, while unrelated source errors leave intact imports
+usable. The lookup uses the current open CST without reparsing or an index scan;
+outgoing ranges use UTF-16 and the existing ASCII identifier word pattern.
+
 A leading-backslash name remains fully qualified. An ordinary qualified name
 resolves from the active namespace and its first segment can expand an
 applicable class/namespace import. An explicit `namespace\...` name always
@@ -302,6 +313,7 @@ request cannot combine a new symbol index with an older editor buffer.
 | Completion | `src/lsp/completion.rs` | `php-lsp-completion/src/context.rs`, `provider.rs`, `visibility.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + `tests/e2e_completion.rs`, `tests/e2e_visibility.rs` |
 | Signature help | `src/lsp/completion.rs` | `signature_help.rs` CST call-site/argument detection and existing name/member resolution helpers | `workspace.rs` signature lookup | parser signature-help tests + `tests/e2e_signature_help.rs`, `tests/e2e_completion.rs` |
 | Document symbols | `src/lsp/document_symbols.rs` | `symbols.rs` lexical namespace scopes and declaration ranges | `FileSymbols` from open source or indexed files | `tests/e2e_document_symbols.rs`, `tests/e2e_ranges.rs`, `tests/e2e_symbols.rs` |
+| Linked editing | `src/lsp/document_symbols.rs` | current CST import target/alias roles and shared kind-specific casing rules | open `FileParser`; no index lookup | `src/lsp/linked_editing_tests.rs`, `tests/e2e_linked_editing.rs`, `tests/e2e_symbols.rs` |
 | References/code lens | `src/lsp/references.rs` | `references.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs` |
 | Rename | `src/lsp/rename.rs` | `references.rs`, local variable search | `file_references`, symbol lookup | `tests/e2e_references.rs` |
 | Diagnostics | `src/lsp/diagnostics.rs` plus shared helpers in `server.rs` | `diagnostics.rs`, `semantic.rs` | `workspace.rs` symbol resolution | parser unit tests + `tests/e2e_diagnostics.rs` |

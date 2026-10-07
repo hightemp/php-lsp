@@ -750,39 +750,6 @@ pub(in crate::server) fn node_text<'a>(source: &'a str, node: tree_sitter::Node)
     source.get(node.byte_range()).unwrap_or("")
 }
 
-pub(in crate::server) fn enclosing_linked_edit_construct(
-    mut node: tree_sitter::Node,
-) -> Option<tree_sitter::Node> {
-    loop {
-        if matches!(
-            node.kind(),
-            "namespace_definition"
-                | "namespace_use_declaration"
-                | "namespace_use_clause"
-                | "namespace_use_group"
-        ) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
-
-pub(in crate::server) fn collect_matching_name_ranges(
-    node: tree_sitter::Node,
-    source: &str,
-    target: &str,
-    ranges: &mut Vec<(u32, u32, u32, u32)>,
-) {
-    if node.kind() == "name" && node_text(source, node) == target {
-        ranges.push(node_byte_range(node));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_matching_name_ranges(child, source, target, ranges);
-    }
-}
-
 pub(in crate::server) fn linked_editing_ranges_for_namespace_or_use(
     source: &str,
     node: tree_sitter::Node,
@@ -791,16 +758,99 @@ pub(in crate::server) fn linked_editing_ranges_for_namespace_or_use(
         return None;
     }
 
-    let target = node_text(source, node);
-    if target.is_empty() {
+    // Only an import clause can own a linked pair. Namespace declarations,
+    // group prefixes and names used in bodies have independent identities.
+    let mut clause = node;
+    while clause.kind() != "namespace_use_clause" {
+        if clause.is_error()
+            || matches!(
+                clause.kind(),
+                "namespace_use_declaration" | "namespace_definition"
+            )
+        {
+            return None;
+        }
+        clause = clause.parent()?;
+    }
+    let siblings = clause.parent()?;
+    let declaration = match siblings.kind() {
+        "namespace_use_declaration" => siblings,
+        "namespace_use_group" => siblings.parent()?,
+        _ => return None,
+    };
+    if declaration.kind() != "namespace_use_declaration" || declaration.has_error() {
         return None;
     }
 
-    let construct = enclosing_linked_edit_construct(node)?;
-    let mut ranges = Vec::new();
-    collect_matching_name_ranges(construct, source, target, &mut ranges);
-    ranges.sort_unstable();
-    ranges.dedup();
+    let (terminal, alias) = linked_import_names(clause)?;
+    let alias = alias?;
+    if node.id() != terminal.id() && node.id() != alias.id() {
+        return None;
+    }
+    let name = node_text(source, alias);
+    if name.is_empty() || node_text(source, terminal) != name {
+        return None;
+    }
 
-    (ranges.len() >= 2).then_some(ranges)
+    // PHP keeps class/function/constant aliases in separate tables. Only a
+    // same-kind effective alias can make the selected clause ambiguous.
+    let kind = linked_import_kind(clause, declaration);
+    let mut cursor = siblings.walk();
+    for other in siblings.named_children(&mut cursor) {
+        if other.kind() != "namespace_use_clause" || other.id() == clause.id() {
+            continue;
+        }
+        if linked_import_kind(other, declaration) != kind {
+            continue;
+        }
+        let (other_terminal, other_alias) = linked_import_names(other)?;
+        let other_name = node_text(source, other_alias.unwrap_or(other_terminal));
+        if php_lsp_types::symbol_fqn_eq(name, other_name, kind) {
+            return None;
+        }
+    }
+
+    Some(vec![node_byte_range(terminal), node_byte_range(alias)])
 }
+
+fn linked_import_names(
+    clause: tree_sitter::Node,
+) -> Option<(tree_sitter::Node, Option<tree_sitter::Node>)> {
+    let alias = clause.child_by_field_name("alias");
+    let mut cursor = clause.walk();
+    let target = clause.named_children(&mut cursor).find(|child| {
+        matches!(child.kind(), "name" | "qualified_name")
+            && Some(child.id()) != alias.map(|alias| alias.id())
+    })?;
+    let terminal = if target.kind() == "qualified_name" {
+        let mut cursor = target.walk();
+        let terminal = target
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "name")?;
+        terminal
+    } else {
+        target
+    };
+    if terminal.is_missing() || alias.is_some_and(|alias| alias.is_missing()) {
+        return None;
+    }
+    Some((terminal, alias))
+}
+
+fn linked_import_kind(
+    clause: tree_sitter::Node,
+    declaration: tree_sitter::Node,
+) -> php_lsp_types::PhpSymbolKind {
+    let type_node = clause
+        .child_by_field_name("type")
+        .or_else(|| declaration.child_by_field_name("type"));
+    match type_node.map(|node| node.kind()) {
+        Some("function") => php_lsp_types::PhpSymbolKind::Function,
+        Some("const") => php_lsp_types::PhpSymbolKind::GlobalConstant,
+        _ => php_lsp_types::PhpSymbolKind::Class,
+    }
+}
+
+#[cfg(test)]
+#[path = "linked_editing_tests.rs"]
+mod linked_editing_tests;

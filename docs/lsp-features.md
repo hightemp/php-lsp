@@ -52,7 +52,7 @@ client-visible LSP behavior and known limits.
 | `textDocument/references` | Partial | Uses indexed references for closed files, atomic snapshots for ordinary open PHP files, and same-scope references for local variables. Template virtual PHP is excluded. Workspace-wide references can still be expensive on large workspaces. |
 | `textDocument/documentHighlight` | Supported | Local variables and non-local symbols in the current document. |
 | `textDocument/selectionRange` | Supported | AST-based selection expansion. |
-| `textDocument/linkedEditingRange` | Partial | Namespace/use alias ranges only. |
+| `textDocument/linkedEditingRange` | Partial | Links an import target's terminal name and its explicit alias only when their spelling matches. Prefix/namespace segments and independent clauses are excluded. Conflicting effective aliases in a group or comma declaration and malformed imports return no ranges; import kinds and PHP casing rules remain separate. The returned word pattern supports ASCII identifiers. |
 | `textDocument/documentLink` | Supported | Static `include`, `include_once`, `require`, and `require_once` paths resolve to existing local files. |
 
 Name resolution is scoped to the namespace section at the cursor. Mixed group
