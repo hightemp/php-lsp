@@ -344,8 +344,14 @@ hierarchy, and declaring scope, so another instance and a named/aliased class
 expression have the same class-scope access as `$this` and `self`. Protected
 method overrides retain accessible ancestor contracts; property and constant
 redeclarations use their own declaring scope and cannot fall back to a hidden
-ancestor. Instance private binding prefers the cursor class; named static
-lookup uses the receiver, and private constants are not inherited.
+ancestor. Object calls (`->` / `?->`) bind private methods in the cursor scope,
+including native static methods; class calls (`::`) use the receiver's lookup.
+Private constants are not inherited. Object completion offers native methods
+and instance properties, while class constants, enum cases, and static
+properties require `::`. Static PHPDoc `@method` declarations retain their
+class-only contract. Redeclarations occupy lookup before candidates are
+filtered by static/instance callability, preventing a hidden child method from
+revealing an ancestor method through fallback.
 Private trait declarations use each
 direct consuming class's scope, including nested traits; inheriting the class
 does not grant its private access, and unrelated consumers do not share access.

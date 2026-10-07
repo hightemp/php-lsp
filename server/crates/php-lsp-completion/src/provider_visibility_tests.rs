@@ -494,3 +494,196 @@ class Child extends Base { public function choice(): string {} }
         Some(json!("Feature::choice"))
     );
 }
+
+#[test]
+fn object_calls_include_native_static_methods_with_class_scope_visibility() {
+    let fixture = Fixture::new(
+        r#"<?php
+class Subject {
+    public static function visible(): string {}
+    protected static function guarded(): string {}
+    private static function secret(): string {}
+    public static int $counter;
+    public const VALUE = 1;
+    public function inspect() { /*inside*/ }
+}
+class Stranger { public function inspect() { /*foreign*/ } }
+/*outside*/
+"#,
+    );
+    for expression in ["$this", "$other", "$factory->get()"] {
+        let labels = fixture.instance("/*inside*/", "Subject", expression);
+        for name in ["visible", "guarded", "secret"] {
+            assert!(labels.contains(name), "{expression}: {labels:?}");
+        }
+    }
+    for marker in ["/*foreign*/", "/*outside*/"] {
+        let labels = fixture.instance(marker, "Subject", "$other");
+        assert!(labels.contains("visible"), "{marker}: {labels:?}");
+        assert!(!labels.contains("guarded") && !labels.contains("secret"));
+    }
+}
+
+#[test]
+fn object_access_excludes_class_constants_enum_cases_and_static_properties() {
+    let fixture = Fixture::new(
+        r#"<?php
+class Subject {
+    public int $value;
+    public static int $counter;
+    public const VALUE = 1;
+    protected const GUARDED = 2;
+    public function inspect() { /*inside*/ }
+}
+enum Status { case READY; public const VALUE = 1; public function inspect() { /*enum*/ } }
+"#,
+    );
+    let labels = fixture.instance("/*inside*/", "Subject", "$this");
+    assert!(labels.contains("value"));
+    for forbidden in ["counter", "$counter", "VALUE", "GUARDED", "class"] {
+        assert!(!labels.contains(forbidden), "{labels:?}");
+    }
+    let labels = fixture.instance("/*enum*/", "Status", "$this");
+    assert!(labels.contains("name"));
+    assert!(
+        !labels.contains("READY") && !labels.contains("VALUE"),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn private_static_method_binding_depends_on_object_or_class_call_syntax() {
+    let fixture = Fixture::new(
+        r#"<?php
+class Base { private static function choice(): int {} public function inspect() { /*base*/ } }
+class Child extends Base { public static function choice(): string {} }
+class PrivateChild extends Base { private static function choice(): string {} }
+"#,
+    );
+    for receiver in ["Child", "PrivateChild"] {
+        let items = fixture.items(
+            "/*base*/",
+            CompletionContext::MemberAccess {
+                object_expr: "$other".into(),
+                class_fqn: Some(receiver.into()),
+                member_prefix: String::new(),
+                access_mode: MemberAccessMode::Read,
+            },
+        );
+        let item = items
+            .iter()
+            .find(|item| item.label == "choice")
+            .expect("scope-bound private static method");
+        assert_eq!(item.data, Some(json!("Base::choice")));
+        assert!(item.detail.as_deref().unwrap().contains("int"));
+    }
+    let items = fixture.items(
+        "/*base*/",
+        CompletionContext::StaticAccess {
+            class_expr: "Child".into(),
+            class_fqn: "Child".into(),
+            member_prefix: String::new(),
+        },
+    );
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.label == "choice")
+            .unwrap()
+            .data,
+        Some(json!("Child::choice"))
+    );
+    assert!(!fixture
+        .static_labels("/*base*/", "PrivateChild", "PrivateChild")
+        .contains("choice"));
+}
+
+#[test]
+fn object_call_keeps_trait_private_static_binding_separate_from_class_lookup() {
+    let fixture = Fixture::new(
+        r#"<?php
+trait Feature { private static function choice(): int {} }
+class Base { use Feature; public function inspect() { /*base*/ } }
+class Child extends Base { public static function choice(): string {} }
+class Reused extends Base { use Feature; public function inspectReused() { /*reused*/ } }
+class Stranger { use Feature; public function inspectOther() { /*other*/ } }
+"#,
+    );
+    for receiver in ["Child", "Reused"] {
+        let items = fixture.items(
+            "/*base*/",
+            CompletionContext::MemberAccess {
+                object_expr: "$other".into(),
+                class_fqn: Some(receiver.into()),
+                member_prefix: String::new(),
+                access_mode: MemberAccessMode::Read,
+            },
+        );
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.label == "choice")
+                .expect("trait private static method")
+                .data,
+            Some(json!("Feature::choice"))
+        );
+    }
+    assert!(!fixture
+        .instance("/*other*/", "Reused", "$other")
+        .contains("choice"));
+    assert!(fixture
+        .instance("/*reused*/", "Reused", "$other")
+        .contains("choice"));
+    assert!(!fixture
+        .static_labels("/*base*/", "Reused", "Reused")
+        .contains("choice"));
+}
+
+#[test]
+fn inaccessible_nonstatic_redeclaration_blocks_static_ancestor_fallback() {
+    let fixture = Fixture::new(
+        r#"<?php
+class Base { private static function choice(): int {} public function inspect() { /*base*/ } }
+class Child extends Base { private function choice(): string {} }
+"#,
+    );
+    assert!(!fixture
+        .static_labels("/*base*/", "Child", "Child")
+        .contains("choice"));
+    let items = fixture.items(
+        "/*base*/",
+        CompletionContext::MemberAccess {
+            object_expr: "$other".into(),
+            class_fqn: Some("Child".into()),
+            member_prefix: String::new(),
+            access_mode: MemberAccessMode::Read,
+        },
+    );
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.label == "choice")
+            .unwrap()
+            .data,
+        Some(json!("Base::choice"))
+    );
+}
+
+#[test]
+fn static_phpdoc_virtual_methods_stay_class_only_while_native_methods_allow_object_calls() {
+    let fixture = Fixture::new(
+        r#"<?php
+/** @method static string virtualChoice() */
+class Subject {
+    /** @method static string nativeChoice() */
+    public static function nativeChoice(): string {}
+    public function inspect() { /*inside*/ }
+}
+"#,
+    );
+    let object = fixture.instance("/*inside*/", "Subject", "$other");
+    assert!(object.contains("nativeChoice"), "{object:?}");
+    assert!(!object.contains("virtualChoice"), "{object:?}");
+    let class = fixture.static_labels("/*inside*/", "Subject", "Subject");
+    assert!(class.contains("nativeChoice") && class.contains("virtualChoice"));
+}

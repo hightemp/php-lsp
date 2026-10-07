@@ -65,10 +65,15 @@ struct Fixture {
     service: LspService<PhpLspBackend>,
     uri: String,
     trait_uri: String,
+    source: String,
 }
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_source(SOURCE).await
+    }
+
+    async fn with_source(source: &str) -> Self {
         let (mut service, socket) = LspService::new(PhpLspBackend::new);
         tokio::spawn(async move {
             socket.collect::<Vec<_>>().await;
@@ -90,23 +95,28 @@ impl Fixture {
             did_open_notification(&trait_uri, TRAIT_SOURCE),
         )
         .await;
-        send(&mut service, did_open_notification(&uri, SOURCE)).await;
+        send(&mut service, did_open_notification(&uri, source)).await;
         Self {
             service,
             uri,
             trait_uri,
+            source: source.into(),
         }
     }
 
-    async fn labels(&mut self, marker: &str) -> BTreeSet<String> {
-        let before = &SOURCE[..SOURCE.find(marker).unwrap()];
+    async fn completion(&mut self, marker: &str) -> serde_json::Value {
+        let before = &self.source[..self.source.find(marker).unwrap()];
         let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32;
         let column = before.rsplit('\n').next().unwrap().encode_utf16().count() as u32;
-        let result = send(
+        send(
             &mut self.service,
             completion_request(2, &self.uri, line, column),
         )
-        .await;
+        .await
+    }
+
+    async fn labels(&mut self, marker: &str) -> BTreeSet<String> {
+        let result = self.completion(marker).await;
         completion_items_from_result(&result)
             .iter()
             .filter_map(|item| item["label"].as_str().map(str::to_string))
@@ -260,5 +270,134 @@ async fn composite_completion_uses_class_override_instead_of_suppressed_private_
         item["detail"].as_str().unwrap().contains("string"),
         "{item}"
     );
+    fixture.finish().await;
+}
+
+const OBJECT_STATIC_SOURCE: &str = r#"<?php
+namespace Scope;
+/** @method static string virtualChoice() */
+class Subject {
+    public static function visible(): string {}
+    protected static function guarded(): string {}
+    private static function secret(): string {}
+    public static int $counter;
+    public const VALUE = 1;
+    public function inspect(Subject $other, Subject|Child $union): void {
+        /* 😀 */ $other->inside;
+        $union->unionInside;
+    }
+}
+class Child extends Subject {}
+class Stranger { public function inspect(Subject $other): void { $other->foreign; } }
+function inspectOutside(Subject $other, Subject|Child $union): void {
+    $other?->outside;
+    $union?->unionOutside;
+}
+class StaticBase {
+    private static function choice(): int {}
+    public function inspect(StaticChild $other, StaticBase|StaticChild $union, PrivateChild $private): void {
+        $other->ordinaryBinding;
+        $union->compositeBinding;
+        StaticChild::namedBinding;
+        $private->privateObject;
+        PrivateChild::privateClass;
+    }
+}
+class StaticChild extends StaticBase { public static function choice(): string {} }
+class PrivateChild extends StaticBase { private function choice(): string {} }
+"#;
+
+#[tokio::test(flavor = "current_thread")]
+async fn object_static_method_visibility_agrees_for_ordinary_union_and_nullsafe_calls() {
+    for source in [
+        OBJECT_STATIC_SOURCE.to_string(),
+        OBJECT_STATIC_SOURCE.replace('\n', "\r\n"),
+    ] {
+        let mut fixture = Fixture::with_source(&source).await;
+        for marker in ["inside", "unionInside"] {
+            let labels = fixture.labels(marker).await;
+            for allowed in ["visible", "guarded", "secret"] {
+                assert!(
+                    labels.contains(allowed),
+                    "{marker}: missing {allowed}: {labels:?}"
+                );
+            }
+            for forbidden in ["counter", "$counter", "VALUE", "virtualChoice"] {
+                assert!(
+                    !labels.contains(forbidden),
+                    "{marker}: leaked {forbidden}: {labels:?}"
+                );
+            }
+        }
+        for marker in ["foreign", "outside", "unionOutside"] {
+            let labels = fixture.labels(marker).await;
+            assert!(labels.contains("visible"), "{marker}: {labels:?}");
+            assert!(!labels.contains("guarded") && !labels.contains("secret"));
+        }
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn object_and_class_calls_preserve_distinct_private_static_declaration_identity() {
+    let mut fixture = Fixture::with_source(OBJECT_STATIC_SOURCE).await;
+    for marker in ["ordinaryBinding", "compositeBinding", "privateObject"] {
+        let result = fixture.completion(marker).await;
+        let items = completion_items_from_result(&result);
+        let choice = items
+            .iter()
+            .find(|item| item["label"] == "choice")
+            .expect("private static object call");
+        assert!(
+            choice["detail"].as_str().unwrap().contains("int"),
+            "{marker}: {choice}"
+        );
+        if marker != "compositeBinding" {
+            assert_eq!(
+                choice["data"]["fqn"], "Scope\\StaticBase::choice",
+                "{choice}"
+            );
+            let resolved = send(
+                &mut fixture.service,
+                completion_resolve_request(3, choice.clone()),
+            )
+            .await;
+            assert!(
+                resolved["detail"].as_str().unwrap().contains("int"),
+                "{resolved}"
+            );
+        }
+    }
+    let result = fixture.completion("namedBinding").await;
+    let items = completion_items_from_result(&result);
+    let choice = items.iter().find(|item| item["label"] == "choice").unwrap();
+    assert_eq!(choice["data"]["fqn"], "Scope\\StaticChild::choice");
+    assert!(choice["detail"].as_str().unwrap().contains("string"));
+    assert!(!fixture.labels("privateClass").await.contains("choice"));
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unsaved_static_method_visibility_updates_object_completion_without_stale_access() {
+    let mut fixture = Fixture::with_source(OBJECT_STATIC_SOURCE).await;
+    assert!(fixture.labels("outside").await.contains("visible"));
+    fixture.source = fixture.source.replace(
+        "public static function visible",
+        "private static function visible",
+    );
+    send(
+        &mut fixture.service,
+        did_change_full_notification(&fixture.uri, 2, &fixture.source),
+    )
+    .await;
+    assert!(!fixture.labels("outside").await.contains("visible"));
+    assert!(fixture.labels("inside").await.contains("visible"));
+    fixture.source = OBJECT_STATIC_SOURCE.into();
+    send(
+        &mut fixture.service,
+        did_change_full_notification(&fixture.uri, 3, &fixture.source),
+    )
+    .await;
+    assert!(fixture.labels("outside").await.contains("visible"));
     fixture.finish().await;
 }

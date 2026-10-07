@@ -186,11 +186,11 @@ pub(super) fn members_for_access(
                 symbols,
                 &fqn,
                 current.as_deref(),
+                php_lsp_completion::visibility::MemberLookup::Object,
             );
             let mut candidates = index.get_members(&fqn);
             candidates.retain(|symbol| {
-                matches!(symbol.kind, PhpSymbolKind::Method | PhpSymbolKind::Property)
-                    && !symbol.modifiers.is_static
+                php_lsp_completion::provider::member_supports_object_access(symbol)
             });
             for symbol in visibility.filter_members(candidates) {
                 if php_lsp_completion::provider::phpdoc_property_access_for_symbol(&symbol)

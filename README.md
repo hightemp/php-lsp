@@ -81,6 +81,9 @@ phpstorm-stubs support.
   named static access, inheritance, and nested trait consumption. Inherited
   private trait members stay hidden from subclasses; unrelated consumers do
   not share private access.
+- Object member completion includes callable native static methods and honors
+  their class-scope access and private binding. Class constants, enum cases,
+  and static properties use `::` completion.
 - Signature help for functions, methods, constructors, and active parameter
   tracking.
 - Inlay hints for argument labels, inferred PHPDoc parameter/return types,

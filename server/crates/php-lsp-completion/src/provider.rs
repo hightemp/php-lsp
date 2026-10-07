@@ -297,10 +297,15 @@ fn provide_member_completions(
 
     if let Some(fqn) = class_fqn {
         let mut members = completion_members(index, file_symbols, &fqn);
-        let mut visibility =
-            crate::visibility::MemberVisibility::new(index, file_symbols, &fqn, current_class_fqn);
+        let mut visibility = crate::visibility::MemberVisibility::new(
+            index,
+            file_symbols,
+            &fqn,
+            current_class_fqn,
+            crate::visibility::MemberLookup::Object,
+        );
         let mut seen = HashSet::new();
-        members.retain(|member| !member.modifiers.is_static);
+        members.retain(|member| member_supports_object_access(member));
         for member in visibility.filter_members(members) {
             if let Some(property_access) = phpdoc_property_access_for_symbol(&member) {
                 if !phpdoc_property_matches_access(property_access, access_mode) {
@@ -540,21 +545,27 @@ fn provide_static_completions(
 
     let fqn = class_fqn.to_string();
 
-    let mut members = completion_members(index, file_symbols, &fqn);
-    let mut visibility =
-        crate::visibility::MemberVisibility::new(index, file_symbols, &fqn, current_class_fqn);
+    let members = completion_members(index, file_symbols, &fqn);
+    let mut visibility = crate::visibility::MemberVisibility::new(
+        index,
+        file_symbols,
+        &fqn,
+        current_class_fqn,
+        crate::visibility::MemberLookup::Class,
+    );
     let mut seen = HashSet::from([MemberCompletionKey::Constant("class".to_string())]);
-    members.retain(|member| {
+    for member in visibility.filter_members(members) {
         let is_parent_instance_method =
             class_expr == "parent" && member.kind == PhpSymbolKind::Method;
-        member.modifiers.is_static
+        let supports_class_access = member.modifiers.is_static
             || is_parent_instance_method
             || matches!(
                 member.kind,
                 PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase
-            )
-    });
-    for member in visibility.filter_members(members) {
+            );
+        if !supports_class_access {
+            continue;
+        }
         if let Some(key) = member_completion_key(member.kind, &member.name) {
             if !seen.insert(key) {
                 continue;
@@ -930,6 +941,24 @@ pub fn phpdoc_property_access_for_symbol(sym: &SymbolInfo) -> Option<PhpDocPrope
         .iter()
         .find(|property| property.name == property_name)
         .map(|property| property.access)
+}
+
+/// Native static methods can be called through objects. Static `@method`
+/// declarations retain their documented class-only magic-call contract.
+pub fn member_supports_object_access(symbol: &SymbolInfo) -> bool {
+    match symbol.kind {
+        PhpSymbolKind::Property => !symbol.modifiers.is_static,
+        PhpSymbolKind::Method => {
+            !symbol.modifiers.is_static
+                || symbol.range != symbol.selection_range
+                || !symbol.doc_comment.as_deref().is_some_and(|doc| {
+                    parse_phpdoc(doc).methods.iter().any(|method| {
+                        method.is_static && method.name.eq_ignore_ascii_case(&symbol.name)
+                    })
+                })
+        }
+        _ => false,
+    }
 }
 
 fn completion_prefix_rank(label: &str, member_prefix: Option<&str>) -> &'static str {

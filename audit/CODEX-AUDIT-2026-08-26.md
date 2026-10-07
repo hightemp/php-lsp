@@ -1259,6 +1259,16 @@ redeclarations, циклов и unsaved changes. Последовательны�
 прошёл 1217/1217 без ignored; Clippy, Rustfmt, diff check и повторный Verifier
 review на `gpt-6-sol` — GO. Исходное описание находки сохранено без изменений.
 
+Повторная проверка (2026-10-07): 6 дополнительных unit и 3 LSP RED-регрессии
+выявили потерю допустимых static-методов при object calls, неверный private
+binding, class constants/enum cases в `->` completion и fallback к static
+ancestor после скрытого nonstatic child member. Object/class lookup теперь
+различается по синтаксису вызова, а native candidate predicate общий для
+обычных и composite receivers. Static PHPDoc `@method` contracts остаются
+class-only. GREEN включает FQN/detail, completion resolve, nullsafe/union,
+Unicode/CRLF и unsaved changes; полный последовательный Rust-набор прошёл
+1226/1226 без ignored. Clippy, Rustfmt, diff check и Verifier на `gpt-6-sol` — GO.
+
 ### CODEX-P2-15. Signature Help пропускает nullsafe calls и ошибается на comments
 
 [`is_call_node`](server/crates/php-lsp-parser/src/signature_help.rs#L56) не

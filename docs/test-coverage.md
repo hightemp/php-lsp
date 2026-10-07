@@ -1,7 +1,7 @@
 # Project-wide test coverage baseline
 
 Coverage measurement snapshot: 2026-09-25; matrix evidence updated for P2-14 on
-2026-09-28. This is a **test-evidence matrix**, not a claim that every
+2026-10-07. This is a **test-evidence matrix**, not a claim that every
 possible combination works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
 is evidence for the stated scenario on Linux; it does not imply that the same

@@ -5,6 +5,15 @@ use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo, Visibility};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// PHP chooses private method binding from call syntax, even for static methods.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemberLookup {
+    /// An object call/access using `->` or `?->`.
+    Object,
+    /// A class call/access using `::`.
+    Class,
+}
+
 /// Per-receiver visibility context. Open-file type declarations override disk metadata.
 /// Callers hold an index read snapshot while collecting and filtering candidates.
 pub struct MemberVisibility<'a> {
@@ -12,6 +21,7 @@ pub struct MemberVisibility<'a> {
     file: &'a FileSymbols,
     receiver: String,
     current: Option<String>,
+    lookup: MemberLookup,
     types: HashMap<String, Option<Arc<SymbolInfo>>>,
     direct_members: HashMap<String, HashMap<(PhpSymbolKind, String), Visibility>>,
 }
@@ -22,12 +32,14 @@ impl<'a> MemberVisibility<'a> {
         file: &'a FileSymbols,
         receiver: &str,
         current: Option<&str>,
+        lookup: MemberLookup,
     ) -> Self {
         Self {
             index,
             file,
             receiver: receiver.into(),
             current: current.map(str::to_string),
+            lookup,
             types: HashMap::new(),
             direct_members: HashMap::new(),
         }
@@ -38,8 +50,7 @@ impl<'a> MemberVisibility<'a> {
     pub fn filter_members(&mut self, mut members: Vec<Arc<SymbolInfo>>) -> Vec<Arc<SymbolInfo>> {
         members.sort_by_cached_key(|member| {
             !(member.visibility == Visibility::Private
-                && !member.modifiers.is_static
-                && matches!(member.kind, PhpSymbolKind::Method | PhpSymbolKind::Property)
+                && self.scope_bound_object_member(member)
                 && self.is_visible(member))
         });
         let mut occupied = HashSet::new();
@@ -52,8 +63,7 @@ impl<'a> MemberVisibility<'a> {
             let accessible = self.is_visible(&member);
             let private_instance_binding = accessible
                 && member.visibility == Visibility::Private
-                && !member.modifiers.is_static
-                && matches!(member.kind, PhpSymbolKind::Method | PhpSymbolKind::Property);
+                && self.scope_bound_object_member(&member);
             if let Some(declaring) = member.parent_fqn.as_deref() {
                 let receiver = self.receiver.clone();
                 if self
@@ -68,8 +78,7 @@ impl<'a> MemberVisibility<'a> {
                 }
             }
             let occupies_lookup = member.visibility != Visibility::Private
-                || member.modifiers.is_static
-                || member.kind == PhpSymbolKind::ClassConstant;
+                || !self.scope_bound_object_member(&member);
             if accessible || (occupies_lookup && self.belongs_to_receiver(&member)) {
                 occupied.insert(key);
             }
@@ -78,6 +87,12 @@ impl<'a> MemberVisibility<'a> {
             }
         }
         visible
+    }
+
+    fn scope_bound_object_member(&self, member: &SymbolInfo) -> bool {
+        self.lookup == MemberLookup::Object
+            && (member.kind == PhpSymbolKind::Method
+                || (member.kind == PhpSymbolKind::Property && !member.modifiers.is_static))
     }
 
     fn belongs_to_receiver(&mut self, member: &SymbolInfo) -> bool {
@@ -110,7 +125,7 @@ impl<'a> MemberVisibility<'a> {
         };
         if declaration.kind == PhpSymbolKind::Trait {
             if member.visibility == Visibility::Private {
-                if member.modifiers.is_static || member.kind == PhpSymbolKind::ClassConstant {
+                if !self.scope_bound_object_member(member) {
                     return self
                         .trait_owner(&receiver, declaring, member, &mut HashSet::new())
                         .is_some_and(|owner| {

@@ -1009,8 +1009,8 @@ fn test_member_completion_filters_static_and_visibility() {
         "external private member should be hidden"
     );
     assert!(
-        !labels.contains(&"create"),
-        "static method should be hidden on `->`"
+        labels.contains(&"create"),
+        "native static methods may be called through `->`"
     );
 }
 
@@ -1971,7 +1971,8 @@ fn test_private_member_completion_matches_owner_fqn_using_php_class_rules() {
             &index,
             &file_symbols,
             "App\\Other",
-            Some("\\APP\\SERVICE")
+            Some("\\APP\\SERVICE"),
+            crate::visibility::MemberLookup::Object
         )
         .is_visible(&foreign_private),
         "a private member declared by another class must remain hidden"
