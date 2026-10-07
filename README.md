@@ -84,8 +84,9 @@ phpstorm-stubs support.
 - Object member completion includes callable native static methods and honors
   their class-scope access and private binding. Class constants, enum cases,
   and static properties use `::` completion.
-- Signature help for functions, methods, constructors, and active parameter
-  tracking.
+- Signature help for functions, methods, nullsafe calls and constructors, with
+  CST-based argument tracking that ignores comment/string punctuation and
+  supports recognizable incomplete calls.
 - Inlay hints for argument labels, inferred PHPDoc parameter/return types,
   useful inferred local variable types, and end-of-scope labels for functions,
   methods, closures, and large type/control-flow scopes.

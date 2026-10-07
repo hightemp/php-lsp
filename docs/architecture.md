@@ -130,6 +130,7 @@ and response helpers live in `tests/support/mod.rs`.
 |---|---|
 | `tests/e2e_initialize.rs` | initialize/shutdown, runtime configuration, project config trust. |
 | `tests/e2e_completion.rs` | completion, completion resolve, signature help, shape completion. |
+| `tests/e2e_signature_help.rs` | nullsafe/nested/incomplete calls, CST argument tracking, UTF-16/CRLF and cross-file method chains. |
 | `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
 | `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
 | `tests/e2e_references.rs` | document highlight, references, rename, code lens, cancellation. |
@@ -287,7 +288,7 @@ request cannot combine a new symbol index with an older editor buffer.
 | Hover | `src/lsp/hover.rs`, shared parameter/type Markdown helpers in `src/lsp/completion_helpers.rs`, call-site return inference reused from `src/lsp/inlay_hints.rs` | `resolve.rs`, PHPDoc helpers, indexed PHP 8 attribute extraction | `workspace.rs` symbol lookup plus `SymbolInfo` source ranges, attributes, class/method relations, templates, and bindings | `tests/e2e_hover.rs` |
 | Definition/declaration/type definition/implementation | `src/lsp/definition.rs` | `resolve.rs` | `workspace.rs`, lazy vendor lookup | `tests/e2e_definition.rs`, `tests/e2e_templates.rs` |
 | Completion | `src/lsp/completion.rs` | `php-lsp-completion/src/context.rs`, `provider.rs`, `visibility.rs` | `workspace.rs` members/symbols/stubs | completion unit tests + `tests/e2e_completion.rs`, `tests/e2e_visibility.rs` |
-| Signature help | `src/lsp/completion.rs` | call/member resolution helpers | `workspace.rs` signature lookup | `tests/e2e_completion.rs` |
+| Signature help | `src/lsp/completion.rs` | `signature_help.rs` CST call-site/argument detection and existing name/member resolution helpers | `workspace.rs` signature lookup | parser signature-help tests + `tests/e2e_signature_help.rs`, `tests/e2e_completion.rs` |
 | References/code lens | `src/lsp/references.rs` | `references.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs` |
 | Rename | `src/lsp/rename.rs` | `references.rs`, local variable search | `file_references`, symbol lookup | `tests/e2e_references.rs` |
 | Diagnostics | `src/lsp/diagnostics.rs` plus shared helpers in `server.rs` | `diagnostics.rs`, `semantic.rs` | `workspace.rs` symbol resolution | parser unit tests + `tests/e2e_diagnostics.rs` |
@@ -370,6 +371,18 @@ Member-access completion contexts also carry a read/write mode inferred from
 the text after the cursor. PHPDoc virtual properties use that mode to honor
 `@property-read` and `@property-write`: read contexts hide write-only virtual
 properties, and assignment contexts hide read-only virtual properties.
+
+Signature help selects the innermost call whose argument list owns the caret,
+including nullsafe method calls. Only direct CST argument separators change
+the active positional parameter; comments, strings, heredoc/nowdoc, arrays,
+closures and nested calls keep their own punctuation. The opening/closing
+parenthesis boundaries distinguish editing an argument from being before or
+after the call. For incomplete calls flattened into Tree-sitter `ERROR`, a
+delimiter-frame recovery uses the existing CST and namespace/import/member
+resolvers without reparsing the source. Trailing comment trivia stays attached
+to the recovered call; ambiguous error fragments and unknown dynamic inner
+calls return no recovered signature. LSP/template positions still convert to
+parser byte columns before this lookup.
 
 When ranges are nested, the innermost containing class-like symbol wins. This is
 important for anonymous classes declared inside methods or other class bodies:

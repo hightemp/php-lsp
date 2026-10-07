@@ -1282,6 +1282,27 @@ comments, heredoc/nowdoc и некоторые PHP tokens. Запятая вну
 Что исправить: использовать CST `argument` boundaries и cursor position;
 добавить nullsafe, comment, heredoc и incomplete-call tests.
 
+Реализация (2026-10-07): `nullsafe_member_call_expression` обрабатывается вместе
+с обычными member calls. Active positional parameter считает только прямые
+CST-разделители аргументов: comments, heredoc/nowdoc, strings и вложенные
+выражения не сдвигают индекс. Границы скобок и ближайший owning call определяют,
+принадлежит ли курсор аргументам. Для incomplete calls, развёрнутых Tree-sitter
+в `ERROR`, recovery использует CST delimiter frames и существующие
+namespace/import/member resolvers без повторного разбора. Trailing comments
+сохраняются; неоднозначные error fragments и неизвестный dynamic inner call
+не создают ложную recovered signature. UTF-16 LSP mapping сохранён.
+
+Статус (2026-10-07): исправлено через TDD. Добавлены 13 parser и 5 LSP регрессий;
+первоначальный RED воспроизвёл 8 parser и 4 LSP failures до исправления. GREEN
+покрывает nullsafe, comments, heredoc/nowdoc, strings, nested calls/arrays/closures,
+EOF, imports, отрицательные cursor/declaration cases, Unicode/CRLF, unsaved
+updates и complete/incomplete nullsafe chains между файлами. Адресные проверки:
+parser 17/17, LSP 5/5. Полный последовательный `CARGO_BUILD_JOBS=1 cargo test
+--all -q -- --test-threads=1` прошёл 1244/1244 без ignored. Clippy
+`--all-targets -D warnings`, Rustfmt, diff check и существующий Verifier на
+`gpt-6-sol` — GO. Документация и матрица тестов обновлены; исторические coverage
+измерения не выдаются за повторно измеренные. Исходное описание находки сохранено.
+
 ### CODEX-P2-16. Document Symbols ломают файлы с несколькими namespaces
 
 [`lsp_document_symbol`](server/crates/php-lsp-server/src/lsp/document_symbols.rs#L411)

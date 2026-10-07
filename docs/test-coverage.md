@@ -1,6 +1,6 @@
 # Project-wide test coverage baseline
 
-Coverage measurement snapshot: 2026-09-25; matrix evidence updated for P2-14 on
+Coverage measurement snapshot: 2026-09-25; matrix evidence updated for P2-14/P2-15 on
 2026-10-07. This is a **test-evidence matrix**, not a claim that every
 possible combination works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -33,7 +33,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Completion | lazy vendor first hit and warm repeated hit | T | B | B | [vendor metadata tests](../server/crates/php-lsp-server/tests/e2e_vendor_metadata.rs), [vendor symlink tests](../server/crates/php-lsp-server/src/indexing/vendor_symlink_tests.rs); latency budget is unmeasured. |
 | Hover and type inference | indexed, local, PHPDoc, composite receivers | T | B | B | [hover tests](../server/crates/php-lsp-server/tests/e2e_hover.rs), [composite receiver tests](../server/crates/php-lsp-server/tests/e2e_composite_receivers.rs). |
 | Definition/declaration/type definition/implementation | local, cross-file, inheritance, vendor | T | B | B | [definition protocol tests](../server/crates/php-lsp-server/tests/e2e_definition.rs). |
-| Signature help and inlay hints | call positions, inferred types | T | B | B | [completion tests](../server/crates/php-lsp-server/tests/e2e_completion.rs), [hover tests](../server/crates/php-lsp-server/tests/e2e_hover.rs). |
+| Signature help and inlay hints | call positions, nullsafe/incomplete calls, comment/string boundaries, inferred types | T | B | B | [signature-help tests](../server/crates/php-lsp-server/tests/e2e_signature_help.rs), [completion tests](../server/crates/php-lsp-server/tests/e2e_completion.rs), [hover tests](../server/crates/php-lsp-server/tests/e2e_hover.rs). |
 | References/highlights/code lens | open and indexed closed files | T | B | B | [references protocol tests](../server/crates/php-lsp-server/tests/e2e_references.rs). |
 | Workspace symbols | indexed search, ranking, URI/range | T | B | B | [workspace symbol tests](../server/crates/php-lsp-server/src/server_tests.rs), [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Rename | locals, imports, members, unsafe targets | T | B | B | [references protocol tests](../server/crates/php-lsp-server/tests/e2e_references.rs), [rename unit tests](../server/crates/php-lsp-server/src/lsp/rename_tests.rs). |
@@ -89,8 +89,8 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and regressions; coverage has
-not been remeasured after that change.
+These figures predate the P2-14 visibility module and P2-15 regressions; coverage has
+not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |
 |---|---:|---:|---:|

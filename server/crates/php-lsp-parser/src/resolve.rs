@@ -1367,7 +1367,7 @@ fn resolve_node(
 /// - `$this` → looks up parent class
 /// - `Foo::create()` (static call returning self/static) → `Foo`
 /// - `ClassName` (as scope in scoped expressions) → `ClassName`
-fn try_resolve_object_type<'a>(
+pub(crate) fn try_resolve_object_type<'a>(
     object_node: Node<'a>,
     source: &str,
     file_symbols: &FileSymbols,
