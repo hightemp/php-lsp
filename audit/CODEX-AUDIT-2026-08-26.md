@@ -1387,6 +1387,34 @@ member calls.
 Что исправить: строить hierarchy из precomputed resolved references и
 `SymbolReferenceReceiver`, применяя open-document overlay.
 
+Реализация (2026-10-07): legacy name-only walker и отдельный outgoing AST scan
+заменены общим typed call graph. `SymbolReference.call_site` сохраняет invocation
+kind и byte range named caller; сами reference ranges остаются UTF-16.
+First-class callable creation не становится вызовом; anonymous/arrow bodies
+и вложенные функции без `SymbolInfo` не приписываются внешнему caller.
+Canonical receiver lookup учитывает inheritance, overrides, lexical private
+binding и общий access model. Неоднозначные копии trait не дают произвольного
+ребра. Обрабатываются nullsafe, constructor и recursive calls.
+Open PHP snapshots заменяют индексированные references/type declarations;
+templates исключены. Closed resolved metadata используется без повторного
+разбора, matching unresolved candidates могут быть уточнены в bounded
+cancellable worker с source fingerprint check. Перед ответом проверяются
+runtime generation, index revision, document lifetime/version и closed-to-open
+переходы. Cache schema увеличена до 27; старые snapshots перестраиваются.
+
+Статус (2026-10-07): исправлено через TDD. Добавлены 14 LSP, 4 graph, 2 parser
+и 1 cache regression (21 total). Начальный RED воспроизвёл 8 LSP failures;
+дополнительные RED проверки закрепили lexical private/access rules,
+class/trait overrides, reused/protected trait copies и closed cross-file
+enrichment. GREEN: LSP 14/14, graph 4/4, parser 2/2, cache 26/26 и прежние
+hierarchy 2/2. Полный последовательный `CARGO_BUILD_JOBS=1 cargo test --all -q
+-- --test-threads=1` прошёл 1293/1293 без ignored. Clippy
+`--all-targets -D warnings`, Rustfmt и diff check прошли. Повторный Verifier
+на `gpt-6-sol` — GO после исправления найденных dispatch cases.
+Документация обновлена; прежние performance/coverage figures сохранены как
+исторические, schema-27 large-workspace timings не измерены. Исходное описание
+находки сохранено дословно.
+
 ### CODEX-P2-19. Definition PHPDoc virtual member может перейти к чужому comment
 
 [`phpdoc_virtual_member_location`](server/crates/php-lsp-server/src/lsp/definition.rs#L1004)

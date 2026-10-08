@@ -18,6 +18,90 @@ fn collect_refs(code: &str) -> Vec<SymbolReference> {
     collect_symbol_references_in_file(tree, code, &file_symbols)
 }
 
+#[test]
+fn collected_call_sites_keep_utf16_occurrences_and_byte_callable_ownership() {
+    let source="<?php\nclass Target { public function run() {} }\nfunction caller(?Target $target) { /* 😀 */ $target?->run(); Target::run(); new Target(); }\n";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let symbols = extract_file_symbols(parser.tree().unwrap(), source, "file:///test.php");
+    let caller = symbols
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "caller")
+        .unwrap();
+    let references = collect_symbol_references_in_file(parser.tree().unwrap(), source, &symbols);
+    let calls: Vec<_> = references
+        .iter()
+        .filter_map(|reference| reference.call_site.map(|call| (reference, call)))
+        .collect();
+    assert_eq!(calls.len(), 3);
+    for (_, call) in &calls {
+        assert_eq!(call.caller_range, Some(caller.range));
+    }
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(_, call)| call.kind == SymbolReferenceCallKind::Method)
+            .count(),
+        2
+    );
+    let call = calls
+        .iter()
+        .find(|(reference, _)| {
+            reference.receiver.receiver_fqn() == Some("Target") && reference.range.1 < 60
+        })
+        .unwrap();
+    let expected = source
+        .lines()
+        .nth(2)
+        .unwrap()
+        .split("run();")
+        .next()
+        .unwrap()
+        .encode_utf16()
+        .count() as u32;
+    assert_eq!(call.0.range, (2, expected, 2, expected + 3));
+    assert!(calls
+        .iter()
+        .any(|(_, call)| call.kind == SymbolReferenceCallKind::Constructor));
+}
+
+#[test]
+fn collected_call_sites_distinguish_invocations_from_first_class_and_anonymous_callers() {
+    let source="<?php function target() {} function named() { target(); $first=target(... /* , */); $anon=function(){target();}; $arrow=fn()=>target(); } target();";
+    let references = collect_refs(source);
+    let target: Vec<_> = references
+        .iter()
+        .filter(|reference| reference.target_fqn == "target" && !reference.is_declaration)
+        .collect();
+    assert_eq!(target.len(), 5, "navigation occurrences are preserved");
+    assert_eq!(
+        target
+            .iter()
+            .filter(|reference| reference.call_site.is_none())
+            .count(),
+        1
+    );
+    assert_eq!(
+        target
+            .iter()
+            .filter(|reference| reference
+                .call_site
+                .is_some_and(|call| call.caller_range.is_some()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        target
+            .iter()
+            .filter(|reference| reference
+                .call_site
+                .is_some_and(|call| call.caller_range.is_none()))
+            .count(),
+        3
+    );
+}
+
 fn synthetic_symbol_reference(
     target_kind: PhpSymbolKind,
     starts_with_dollar: bool,
@@ -32,6 +116,7 @@ fn synthetic_symbol_reference(
         rename_range: None,
         preserve_spelling_on_rename: false,
         is_import_target: false,
+        call_site: None,
         receiver: SymbolReferenceReceiver::ResolvedType {
             type_fqn: "App\\Target".to_string(),
         },

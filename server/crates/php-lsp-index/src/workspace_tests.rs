@@ -78,6 +78,7 @@ fn make_class_reference(fqn: &str) -> SymbolReference {
         rename_range: None,
         preserve_spelling_on_rename: false,
         is_import_target: false,
+        call_site: None,
         receiver: SymbolReferenceReceiver::None,
     }
 }

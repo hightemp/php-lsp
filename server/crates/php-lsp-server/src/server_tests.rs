@@ -646,6 +646,7 @@ fn symbol_reference_matching_uses_php_kind_specific_casing_rules() {
         rename_range: None,
         preserve_spelling_on_rename: false,
         is_import_target: false,
+        call_site: None,
         receiver: SymbolReferenceReceiver::None,
     };
 

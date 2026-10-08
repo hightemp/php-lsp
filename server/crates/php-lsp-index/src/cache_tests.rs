@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 26;
-const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3373;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0xcf30_7d9f_8044_00e8;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 27;
+const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3398;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0xcf25_4b62_a79e_9725;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -220,6 +220,7 @@ fn cache_schema_fixture() -> IndexCache {
                     rename_range: None,
                     preserve_spelling_on_rename: false,
                     is_import_target: false,
+                    call_site: None,
                     receiver: SymbolReferenceReceiver::None,
                 },
                 SymbolReference {
@@ -232,6 +233,10 @@ fn cache_schema_fixture() -> IndexCache {
                     rename_range: None,
                     preserve_spelling_on_rename: false,
                     is_import_target: false,
+                    call_site: Some(php_lsp_types::SymbolReferenceCallSite {
+                        kind: php_lsp_types::SymbolReferenceCallKind::Method,
+                        caller_range: Some((7, 0, 11, 1)),
+                    }),
                     receiver: SymbolReferenceReceiver::ResolvedType {
                         type_fqn: "App\\Foo".to_string(),
                     },
@@ -246,6 +251,7 @@ fn cache_schema_fixture() -> IndexCache {
                     rename_range: None,
                     preserve_spelling_on_rename: false,
                     is_import_target: false,
+                    call_site: None,
                     receiver: SymbolReferenceReceiver::StaticClass {
                         class_fqn: "App\\Foo".to_string(),
                     },
@@ -260,6 +266,7 @@ fn cache_schema_fixture() -> IndexCache {
                     rename_range: None,
                     preserve_spelling_on_rename: false,
                     is_import_target: false,
+                    call_site: None,
                     receiver: SymbolReferenceReceiver::Unresolved,
                 },
             ],
@@ -320,6 +327,27 @@ fn cache_schema_fixture_matches_version_guard() {
         "serialized cache fixture hash changed; bump CACHE_SCHEMA_VERSION and update \
              CACHE_SCHEMA_FIXTURE_* constants together"
     );
+}
+
+#[test]
+fn cache_roundtrip_preserves_call_roles_receiver_and_named_callable_ownership() {
+    let cache = cache_schema_fixture();
+    let restored: IndexCache = bincode::deserialize(&bincode::serialize(&cache).unwrap()).unwrap();
+    let reference = &restored.files[0].references[1];
+    assert_eq!(
+        reference.receiver,
+        SymbolReferenceReceiver::ResolvedType {
+            type_fqn: "App\\Foo".into()
+        }
+    );
+    assert_eq!(
+        reference.call_site,
+        Some(php_lsp_types::SymbolReferenceCallSite {
+            kind: php_lsp_types::SymbolReferenceCallKind::Method,
+            caller_range: Some((7, 0, 11, 1)),
+        })
+    );
+    assert!(restored.files[0].references[0].call_site.is_none());
 }
 
 #[test]
@@ -469,6 +497,7 @@ fn cache_roundtrip_loads_file_references() {
         preserve_spelling_on_rename: false,
         is_import_target: false,
         receiver: Default::default(),
+        call_site: None,
     }];
 
     let index = WorkspaceIndex::new();

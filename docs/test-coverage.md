@@ -1,7 +1,7 @@
 # Project-wide test coverage baseline
 
 Coverage measurement snapshot: 2026-09-25; matrix evidence updated for
-P2-14/P2-15/P2-16/P2-17 on 2026-10-07. This is a **test-evidence matrix**, not a claim that every
+P2-14/P2-15/P2-16/P2-17/P2-18 on 2026-10-07. This is a **test-evidence matrix**, not a claim that every
 possible combination works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
 is evidence for the stated scenario on Linux; it does not imply that the same
@@ -45,11 +45,11 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Selection and linked editing ranges | AST expansion, import roles/ambiguity, UTF-16 and buffer updates | T | B | B | [linked-editing unit tests](../server/crates/php-lsp-server/src/lsp/linked_editing_tests.rs), [linked-editing protocol tests](../server/crates/php-lsp-server/tests/e2e_linked_editing.rs), [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
 | Static document links | include/require targets | T | B | B | [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
 | Semantic tokens | full → delta and range requests | T | B | B | [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
-| Call/type hierarchy | incoming/outgoing, super/subtypes | T | B | B | [hierarchy protocol tests](../server/crates/php-lsp-server/tests/e2e_hierarchy.rs). |
+| Call/type hierarchy | receiver/private/trait identity, nullsafe/cached calls, snapshot changes, super/subtypes | T | B | B | [call-graph tests](../server/crates/php-lsp-server/src/lsp/call_hierarchy_graph_tests.rs), [receiver protocol tests](../server/crates/php-lsp-server/tests/e2e_call_hierarchy_receivers.rs), [hierarchy protocol tests](../server/crates/php-lsp-server/tests/e2e_hierarchy.rs). |
 | Blade virtual PHP | hover/completion/diagnostics/source ranges | T | B | B | [template protocol tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
 | Twig virtual PHP and context | controller → caller → partial; open/change/delete/rename | T | B | B | [Twig context protocol tests](../server/crates/php-lsp-server/tests/e2e_twig_context.rs), [template tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
 | Twig context cache | cold/warm, overlays, dependency changes, cancellation | T | B | B | [Twig context unit tests](../server/crates/php-lsp-server/src/indexing/twig_context_tests.rs), [regressions](../server/crates/php-lsp-server/src/indexing/twig_context_regression_tests.rs). |
-| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); warm-start timing after schema 26 is unmeasured. |
+| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); warm-start timing after schema 27 is unmeasured. |
 | Workspace index | watch create/change/delete and file operations | T | B | B | [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Workspace configuration | reconfigure parser/stubs/index, cancel old generation | T | B | B | [initialize tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [indexing tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Pre-create/pre-delete file requests | advertised no-edit response | B | B | B | Implementation is documented in [LSP features](lsp-features.md); no direct protocol regression found for either response. |
@@ -89,7 +89,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |

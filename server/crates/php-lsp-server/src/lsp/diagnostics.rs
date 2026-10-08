@@ -3325,34 +3325,6 @@ pub(in crate::server) fn check_property_assignment_type_compatibility(
     }
 }
 
-pub(in crate::server) fn resolve_reference_symbol_at_node(
-    tree: &tree_sitter::Tree,
-    source: &str,
-    node: tree_sitter::Node,
-    file_symbols: &php_lsp_types::FileSymbols,
-    index: &WorkspaceIndex,
-) -> Option<(SymbolAtPosition, Arc<php_lsp_types::SymbolInfo>)> {
-    let pos = node.start_position();
-    let member_type_resolver = |class_fqn: &str, member_name: &str| -> Option<String> {
-        resolve_member_type_from_index(index, class_fqn, member_name)
-    };
-    let callable_param_resolver =
-        |ctx: CallableParameterContext<'_>| -> Option<php_lsp_types::TypeInfo> {
-            resolve_callable_parameter_type_from_index(index, file_symbols, ctx)
-        };
-    let sym_at_pos = symbol_at_position_with_resolvers(
-        tree,
-        source,
-        pos.row as u32,
-        pos.column as u32,
-        file_symbols,
-        Some(&member_type_resolver),
-        Some(&callable_param_resolver),
-    )?;
-    let resolved = resolve_symbol_at_position_from_index(index, &sym_at_pos)?;
-    Some((sym_at_pos, resolved))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(in crate::server) fn symbol_at_position_with_request_cache(
     type_cache: &RequestTypeCache,

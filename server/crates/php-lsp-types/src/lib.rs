@@ -684,6 +684,24 @@ pub struct SymbolReference {
     /// Receiver resolution state for member references.
     #[serde(default)]
     pub receiver: SymbolReferenceReceiver,
+    /// Invocation metadata; absent for declarations, imports and first-class callables.
+    #[serde(default)]
+    pub call_site: Option<SymbolReferenceCallSite>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SymbolReferenceCallKind {
+    Function,
+    Method,
+    Constructor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SymbolReferenceCallSite {
+    pub kind: SymbolReferenceCallKind,
+    /// Tree-sitter byte-column range of the owning named function/method.
+    /// None for top-level calls and anonymous-function/arrow bodies.
+    pub caller_range: Option<(u32, u32, u32, u32)>,
 }
 
 #[cfg(test)]

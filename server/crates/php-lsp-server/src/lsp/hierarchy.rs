@@ -4,6 +4,12 @@ use crate::util::lsp_text::range_from_byte_range;
 
 use super::super::*;
 
+#[path = "call_hierarchy_graph.rs"]
+mod call_graph;
+
+type CallableSourceRange = (u32, u32, u32, u32);
+type GroupedCallRanges = (Arc<php_lsp_types::SymbolInfo>, Vec<Range>);
+
 fn is_call_hierarchy_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
     matches!(
         kind,
@@ -474,115 +480,6 @@ fn hierarchy_workspace_uri<'a>(data: Option<&'a serde_json::Value>, fallback: &'
         .unwrap_or(fallback)
 }
 
-fn incoming_call_hierarchy_for_file(
-    tree: &tree_sitter::Tree,
-    source: &str,
-    file_symbols: &php_lsp_types::FileSymbols,
-    target_fqn: &str,
-    target_kind: php_lsp_types::PhpSymbolKind,
-    calls_by_caller: &mut HashMap<String, (php_lsp_types::SymbolInfo, Vec<Range>)>,
-) {
-    let refs = find_references_in_file(tree, source, file_symbols, target_fqn, target_kind, false);
-
-    for reference in refs {
-        let Some(caller) = containing_callable_symbol(file_symbols, reference.range) else {
-            continue;
-        };
-        if caller.fqn == target_fqn {
-            continue;
-        }
-
-        calls_by_caller
-            .entry(caller.fqn.clone())
-            .or_insert_with(|| (caller.clone(), Vec::new()))
-            .1
-            .push(range_from_byte_range(source, reference.range));
-    }
-}
-
-struct OutgoingCallHierarchyContext<'a> {
-    tree: &'a tree_sitter::Tree,
-    source: &'a str,
-    file_symbols: &'a php_lsp_types::FileSymbols,
-    index: &'a WorkspaceIndex,
-    caller_range: (u32, u32, u32, u32),
-}
-
-fn outgoing_call_hierarchy_for_tree(
-    tree: &tree_sitter::Tree,
-    source: &str,
-    file_symbols: &php_lsp_types::FileSymbols,
-    index: &WorkspaceIndex,
-    caller: &php_lsp_types::SymbolInfo,
-) -> Vec<(Arc<php_lsp_types::SymbolInfo>, Vec<Range>)> {
-    let ctx = OutgoingCallHierarchyContext {
-        tree,
-        source,
-        file_symbols,
-        index,
-        caller_range: caller.range,
-    };
-    let mut calls_by_target: HashMap<String, (Arc<php_lsp_types::SymbolInfo>, Vec<Range>)> =
-        HashMap::new();
-    collect_outgoing_call_hierarchy(tree.root_node(), &ctx, &mut calls_by_target);
-
-    let mut calls: Vec<_> = calls_by_target.into_values().collect();
-    calls.sort_by(|left, right| left.0.name.cmp(&right.0.name));
-    calls
-}
-
-fn collect_outgoing_call_hierarchy(
-    node: tree_sitter::Node,
-    ctx: &OutgoingCallHierarchyContext<'_>,
-    calls_by_target: &mut HashMap<String, (Arc<php_lsp_types::SymbolInfo>, Vec<Range>)>,
-) {
-    let node_range = node_range_node(node);
-    if !byte_ranges_overlap(node_range, ctx.caller_range) {
-        return;
-    }
-
-    if matches!(node.kind(), "function_definition" | "method_declaration")
-        && node_range != ctx.caller_range
-        && byte_range_contains(ctx.caller_range, node_range)
-    {
-        return;
-    }
-
-    if matches!(
-        node.kind(),
-        "function_call_expression"
-            | "member_call_expression"
-            | "scoped_call_expression"
-            | "object_creation_expression"
-    ) {
-        if let Some(name_node) = call_target_name_node(node) {
-            if let Some((_, target)) = resolve_reference_symbol_at_node(
-                ctx.tree,
-                ctx.source,
-                name_node,
-                ctx.file_symbols,
-                ctx.index,
-            ) {
-                if is_call_hierarchy_symbol_kind(target.kind) {
-                    calls_by_target
-                        .entry(target.fqn.clone())
-                        .or_insert_with(|| (target.clone(), Vec::new()))
-                        .1
-                        .push(range_from_byte_range(
-                            ctx.source,
-                            node_range_node(name_node),
-                        ));
-                }
-            }
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_outgoing_call_hierarchy(child, ctx, calls_by_target);
-    }
-}
-
 impl PhpLspBackend {
     pub(in crate::server) async fn call_hierarchy_item_for_symbol(
         &self,
@@ -744,116 +641,36 @@ impl PhpLspBackend {
             return Ok(None);
         };
 
-        let mut calls_by_caller: HashMap<String, (php_lsp_types::SymbolInfo, Vec<Range>)> =
-            HashMap::new();
-        let mut file_uris: HashSet<String> = request_index
-            .read()
-            .file_symbols()
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        let open_file_uris: Vec<String> = self
-            .open_files
-            .iter()
-            .filter(|entry| {
-                request_index
-                    .read()
-                    .file_symbols()
-                    .contains_key(entry.key())
-            })
-            .map(|entry| entry.key().clone())
-            .collect();
-        file_uris.extend(
-            open_file_uris
-                .into_iter()
-                .filter(|file_uri| !self.template_documents.contains_key(file_uri)),
-        );
-
-        for file_uri in file_uris {
-            if let Some(OpenDocumentSnapshot {
-                tree,
-                source,
-                template_document,
-                file_symbols,
-                ..
-            }) = self.open_document_snapshot(&file_uri)
-            {
-                if template_document.is_some() {
-                    continue;
-                }
-                incoming_call_hierarchy_for_file(
-                    &tree,
-                    &source,
-                    &file_symbols,
-                    &target.fqn,
-                    target_kind,
-                    &mut calls_by_caller,
-                );
-                continue;
-            }
-
-            let Some(file_symbols) = request_index
-                .read()
-                .file_symbols()
-                .get(&file_uri)
-                .map(|entry| entry.value().clone())
-            else {
-                continue;
-            };
-            if self.open_files.contains_key(&file_uri)
-                || self.template_documents.contains_key(&file_uri)
+        let Some(graph) = self
+            .call_graph(&request, request_index.clone(), None, Some(target.clone()))
+            .await
+        else {
+            return Ok(None);
+        };
+        let mut groups: HashMap<(String, CallableSourceRange), GroupedCallRanges> = HashMap::new();
+        for edge in &graph.edges {
+            if edge.target.kind != target_kind
+                || !php_lsp_types::symbol_fqn_eq(&edge.target.fqn, &target.fqn, target_kind)
             {
                 continue;
             }
-            let Some(path) = uri_to_path(&file_uri) else {
-                continue;
-            };
-            let Ok(source) =
-                read_file_to_string_blocking(path, "callHierarchy/incoming read").await
-            else {
-                continue;
-            };
-            if let Some(OpenDocumentSnapshot {
-                tree,
-                source,
-                template_document,
-                file_symbols,
-                ..
-            }) = self.open_document_snapshot(&file_uri)
-            {
-                if template_document.is_none() {
-                    incoming_call_hierarchy_for_file(
-                        &tree,
-                        &source,
-                        &file_symbols,
-                        &target.fqn,
-                        target_kind,
-                        &mut calls_by_caller,
-                    );
-                }
-                continue;
-            }
-            if self.open_files.contains_key(&file_uri)
-                || self.template_documents.contains_key(&file_uri)
-            {
-                continue;
-            }
-            let mut parser = FileParser::new();
-            parser.parse_full(&source);
-            if let Some(tree) = parser.tree() {
-                incoming_call_hierarchy_for_file(
-                    tree,
-                    &source,
-                    &file_symbols,
-                    &target.fqn,
-                    target_kind,
-                    &mut calls_by_caller,
-                );
-            }
+            groups
+                .entry((edge.caller.uri.clone(), edge.caller.range))
+                .or_insert_with(|| (edge.caller.clone(), Vec::new()))
+                .1
+                .push(edge.range);
         }
-
         let mut calls = Vec::new();
-        for (caller, ranges) in calls_by_caller.into_values() {
+        for (caller, mut ranges) in groups.into_values() {
+            ranges.sort_by_key(|range| {
+                (
+                    range.start.line,
+                    range.start.character,
+                    range.end.line,
+                    range.end.character,
+                )
+            });
+            ranges.dedup();
             if let Some(from) = self
                 .call_hierarchy_item_for_symbol(
                     &request,
@@ -869,13 +686,19 @@ impl PhpLspBackend {
                 });
             }
         }
-        calls.sort_by(|left, right| left.from.name.cmp(&right.from.name));
-
-        if calls.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(calls))
+        if self.runtime_state_snapshot().await.generation != request.state.generation
+            || !graph.is_current(self, &request_index)
+        {
+            return Ok(None);
         }
+        calls.sort_by(|left, right| {
+            left.from
+                .uri
+                .as_str()
+                .cmp(right.from.uri.as_str())
+                .then_with(|| left.from.range.start.cmp(&right.from.range.start))
+        });
+        Ok((!calls.is_empty()).then_some(calls))
     }
 
     pub(crate) async fn lsp_outgoing_calls(
@@ -895,75 +718,32 @@ impl PhpLspBackend {
             return Ok(None);
         }
 
-        let file_uri = caller.uri.clone();
-        let call_targets = if let Some(OpenDocumentSnapshot {
-            tree,
-            source,
-            template_document,
-            file_symbols,
-            ..
-        }) = self.open_document_snapshot(&file_uri)
-        {
-            if template_document.is_some() {
-                return Ok(None);
-            }
-            outgoing_call_hierarchy_for_tree(&tree, &source, &file_symbols, &request_index, &caller)
-        } else {
-            let file_symbols = request_index
-                .read()
-                .file_symbols()
-                .get(&file_uri)
-                .map(|entry| entry.value().clone())
-                .unwrap_or_default();
-            let Some(path) = uri_to_path(&file_uri) else {
-                return Ok(None);
-            };
-            let Ok(source) =
-                read_file_to_string_blocking(path, "callHierarchy/outgoing read").await
-            else {
-                return Ok(None);
-            };
-            if let Some(OpenDocumentSnapshot {
-                tree,
-                source,
-                template_document,
-                file_symbols,
-                ..
-            }) = self.open_document_snapshot(&file_uri)
-            {
-                if template_document.is_some() {
-                    return Ok(None);
-                }
-                outgoing_call_hierarchy_for_tree(
-                    &tree,
-                    &source,
-                    &file_symbols,
-                    &request_index,
-                    &caller,
-                )
-            } else {
-                if self.open_files.contains_key(&file_uri)
-                    || self.template_documents.contains_key(&file_uri)
-                {
-                    return Ok(None);
-                }
-                let mut parser = FileParser::new();
-                parser.parse_full(&source);
-                let Some(tree) = parser.tree() else {
-                    return Ok(None);
-                };
-                outgoing_call_hierarchy_for_tree(
-                    tree,
-                    &source,
-                    &file_symbols,
-                    &request_index,
-                    &caller,
-                )
-            }
+        let Some(graph) = self
+            .call_graph(&request, request_index.clone(), Some(caller), None)
+            .await
+        else {
+            return Ok(None);
         };
-
+        let mut groups: HashMap<(String, String), (Arc<php_lsp_types::SymbolInfo>, Vec<Range>)> =
+            HashMap::new();
+        for edge in &graph.edges {
+            groups
+                .entry((edge.target.uri.clone(), edge.target.fqn.clone()))
+                .or_insert_with(|| (edge.target.clone(), Vec::new()))
+                .1
+                .push(edge.range);
+        }
         let mut calls = Vec::new();
-        for (target, ranges) in call_targets {
+        for (target, mut ranges) in groups.into_values() {
+            ranges.sort_by_key(|range| {
+                (
+                    range.start.line,
+                    range.start.character,
+                    range.end.line,
+                    range.end.character,
+                )
+            });
+            ranges.dedup();
             if let Some(to) = self
                 .call_hierarchy_item_for_symbol(
                     &request,
@@ -979,13 +759,18 @@ impl PhpLspBackend {
                 });
             }
         }
-        calls.sort_by(|left, right| left.to.name.cmp(&right.to.name));
-
-        if calls.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(calls))
+        if self.runtime_state_snapshot().await.generation != request.state.generation
+            || !graph.is_current(self, &request_index)
+        {
+            return Ok(None);
         }
+        calls.sort_by(|left, right| {
+            left.to
+                .name
+                .cmp(&right.to.name)
+                .then_with(|| left.to.uri.as_str().cmp(right.to.uri.as_str()))
+        });
+        Ok((!calls.is_empty()).then_some(calls))
     }
 
     pub(crate) async fn lsp_prepare_type_hierarchy(

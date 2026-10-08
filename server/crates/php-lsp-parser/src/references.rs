@@ -12,7 +12,8 @@ use crate::resolve::{
 };
 use crate::utf16::range_byte_to_utf16;
 use php_lsp_types::{
-    symbol_fqn_eq, FileSymbols, PhpSymbolKind, SymbolReference, SymbolReferenceReceiver, UseKind,
+    symbol_fqn_eq, FileSymbols, PhpSymbolKind, SymbolReference, SymbolReferenceCallKind,
+    SymbolReferenceCallSite, SymbolReferenceReceiver, UseKind,
 };
 use tree_sitter::{Node, Point, Tree};
 
@@ -208,6 +209,7 @@ pub fn collect_symbol_references_in_file_with_resolvers(
             preserve_spelling_on_rename: false,
             is_import_target: false,
             receiver: SymbolReferenceReceiver::None,
+            call_site: None,
         });
     }
 
@@ -246,6 +248,7 @@ fn sort_and_dedup_symbol_references(references: &mut Vec<SymbolReference>) {
             })
             .then_with(|| left.is_import_target.cmp(&right.is_import_target))
             .then_with(|| left.receiver.cmp(&right.receiver))
+            .then_with(|| left.call_site.cmp(&right.call_site))
     });
     references.dedup_by(symbol_references_equal_for_dedup);
 }
@@ -268,6 +271,7 @@ fn symbol_references_have_same_dedup_key(left: &SymbolReference, right: &SymbolR
         && left.preserve_spelling_on_rename == right.preserve_spelling_on_rename
         && left.is_import_target == right.is_import_target
         && left.receiver == right.receiver
+        && left.call_site == right.call_site
 }
 
 fn symbol_reference_kind_rank(kind: PhpSymbolKind) -> u8 {
@@ -307,7 +311,10 @@ fn collect_symbol_references_walk(
                 resolve_function_name_to_fqn(&function_name, file_symbols),
                 PhpSymbolKind::Function,
                 reference_range(source, selection),
-                CollectedReferenceOptions::default(),
+                CollectedReferenceOptions {
+                    call_site: reference_call_site(node, SymbolReferenceCallKind::Function),
+                    ..Default::default()
+                },
             );
         }
     }
@@ -341,6 +348,7 @@ fn collect_symbol_references_walk(
                             receiver: SymbolReferenceReceiver::StaticClass {
                                 class_fqn: scope_fqn,
                             },
+                            call_site: reference_call_site(node, SymbolReferenceCallKind::Method),
                             ..Default::default()
                         },
                     );
@@ -352,6 +360,7 @@ fn collect_symbol_references_walk(
                         reference_range(source, name_node),
                         CollectedReferenceOptions {
                             receiver: SymbolReferenceReceiver::Unresolved,
+                            call_site: reference_call_site(node, SymbolReferenceCallKind::Method),
                             ..Default::default()
                         },
                     );
@@ -454,6 +463,7 @@ fn collect_symbol_references_walk(
                     reference_range(source, name_node),
                     CollectedReferenceOptions {
                         receiver,
+                        call_site: reference_call_site(node, SymbolReferenceCallKind::Method),
                         ..Default::default()
                     },
                 );
@@ -501,6 +511,7 @@ fn collect_symbol_references_walk(
                     PhpSymbolKind::Function,
                     reference_range(source, func_node),
                     CollectedReferenceOptions {
+                        call_site: reference_call_site(node, SymbolReferenceCallKind::Function),
                         allows_global_fallback: unqualified_name_allows_global_fallback(
                             text,
                             UseKind::Function,
@@ -593,6 +604,12 @@ fn push_class_reference(
         PhpSymbolKind::Class,
         reference_range(source, node),
         CollectedReferenceOptions {
+            call_site: node
+                .parent()
+                .filter(|parent| parent.kind() == "object_creation_expression")
+                .and_then(|parent| {
+                    reference_call_site(parent, SymbolReferenceCallKind::Constructor)
+                }),
             rename_range: Some(terminal_identifier_range(source, node)),
             preserve_spelling_on_rename: explicit_import_alias_covers_entire_name(
                 text,
@@ -854,6 +871,7 @@ struct CollectedReferenceOptions {
     preserve_spelling_on_rename: bool,
     is_import_target: bool,
     receiver: SymbolReferenceReceiver,
+    call_site: Option<SymbolReferenceCallSite>,
 }
 
 impl Default for CollectedReferenceOptions {
@@ -865,6 +883,7 @@ impl Default for CollectedReferenceOptions {
             preserve_spelling_on_rename: false,
             is_import_target: false,
             receiver: SymbolReferenceReceiver::None,
+            call_site: None,
         }
     }
 }
@@ -887,7 +906,45 @@ fn push_symbol_reference(
         preserve_spelling_on_rename: options.preserve_spelling_on_rename,
         is_import_target: options.is_import_target,
         receiver: options.receiver,
+        call_site: options.call_site,
     });
+}
+
+fn reference_call_site(
+    node: Node,
+    kind: SymbolReferenceCallKind,
+) -> Option<SymbolReferenceCallSite> {
+    if node.has_error() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    if let Some(arguments) = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "arguments")
+    {
+        let mut cursor = arguments.walk();
+        if arguments
+            .named_children(&mut cursor)
+            .any(|child| child.kind() == "variadic_placeholder")
+        {
+            return None;
+        }
+    }
+    let mut parent = node.parent();
+    let mut caller_range = None;
+    while let Some(owner) = parent {
+        match owner.kind() {
+            "function_definition" | "method_declaration" => {
+                caller_range = Some(node_range(owner));
+                break;
+            }
+            "arrow_function" | "anonymous_function" | "anonymous_function_creation_expression" => {
+                break
+            }
+            _ => parent = owner.parent(),
+        }
+    }
+    Some(SymbolReferenceCallSite { kind, caller_range })
 }
 
 fn reference_range(source: &str, node: Node) -> (u32, u32, u32, u32) {

@@ -275,14 +275,11 @@ impl PhpLspBackend {
         !qualified_target_exists
     }
 
-    pub(in crate::server) fn reference_scan_matches(
+    pub(super) fn reference_scan_uris(
         &self,
         index: &WorkspaceIndex,
         request: Option<&WorkspaceRequestContext>,
-        target_fqn: &str,
-        target_kind: php_lsp_types::PhpSymbolKind,
-        include_declaration: bool,
-    ) -> Vec<(String, Vec<php_lsp_types::SymbolReference>)> {
+    ) -> (Vec<String>, Vec<String>) {
         let mut uris: HashSet<String> = index
             .read()
             .file_references()
@@ -315,6 +312,18 @@ impl PhpLspBackend {
 
         let mut uris: Vec<_> = uris.into_iter().collect();
         uris.sort();
+        (uris, open_uris)
+    }
+
+    pub(in crate::server) fn reference_scan_matches(
+        &self,
+        index: &WorkspaceIndex,
+        request: Option<&WorkspaceRequestContext>,
+        target_fqn: &str,
+        target_kind: php_lsp_types::PhpSymbolKind,
+        include_declaration: bool,
+    ) -> Vec<(String, Vec<php_lsp_types::SymbolReference>)> {
+        let (uris, open_uris) = self.reference_scan_uris(index, request);
         let mut open_symbol_cache = HashMap::new();
         let mut open_qualified_targets = HashSet::new();
         for uri in open_uris {

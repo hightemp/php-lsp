@@ -68,8 +68,8 @@ comparison rule.
 | `textDocument/documentSymbol` | Supported | Nested namespace/type/member symbols with signatures and deprecation tags. Bracketed and unbracketed namespace sections, including repeated or empty named sections, remain separate and preserve source order; global sections contribute root symbols. Namespace ranges cover their sections and select the declared name in UTF-16 coordinates. |
 | `workspace/symbol` | Supported | Ranked search over indexed workspace symbols, limited to 200 results. |
 | `textDocument/prepareCallHierarchy` | Supported | Functions, methods, constructors, and containing callable fallback. |
-| `callHierarchy/incomingCalls` | Partial | Scans indexed files and can read unopened files. Can be expensive on large workspaces. |
-| `callHierarchy/outgoingCalls` | Supported | Reads the target callable file and resolves outgoing calls through the index. |
+| `callHierarchy/incomingCalls` | Partial | Uses indexed invocation/receiver metadata with authoritative open PHP overlays, canonical member declarations and lexical access. Unrelated/unknown receivers and ambiguous private dispatch across reused trait copies are omitted. Fully resolved closed calls need no reparse; unresolved candidates may be enriched from verified source. Includes nullsafe calls, constructors and recursion; first-class callables and unrepresented anonymous/nested callable bodies are excluded. Workspace scans remain expensive on large projects. |
+| `callHierarchy/outgoingCalls` | Supported | Uses the same typed invocation graph, restricted to the selected named callable, including nullsafe/constructor/self-recursive calls. Only statically provable targets are returned; dynamic dispatch and ambiguous trait-copy binding remain conservative. |
 | `textDocument/prepareTypeHierarchy` | Supported | Classes, interfaces, traits, and enums. |
 | `typeHierarchy/supertypes` | Supported | Uses extends/implements/use relationships and lazy class indexing. |
 | `typeHierarchy/subtypes` | Supported | Uses indexed direct subtype relationships. |

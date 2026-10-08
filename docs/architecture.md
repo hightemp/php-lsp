@@ -53,6 +53,7 @@ server/crates/php-lsp-server/src/
     inlay_hints.rs           # inlayHint request handling
     semantic_tokens.rs       # full/delta/range semantic tokens
     hierarchy.rs             # call hierarchy and type hierarchy
+    call_hierarchy_graph.rs   # typed invocation graph, open overlays and snapshot validation
     document_symbols.rs      # document symbols, workspace symbols, selection/linked editing
     folding.rs               # folding ranges
     document_links.rs        # include/require document links
@@ -141,6 +142,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_document_symbols.rs` | namespace-section ownership, repeated/global/empty sections, native/PHPDoc member ownership, UTF-16/CRLF, unsaved updates and indexed/open-file parity. |
 | `tests/e2e_linked_editing.rs` | import-role pairs, independent namespace/path names, group/comma ambiguity and import kinds, malformed imports, UTF-16/CRLF and document updates/isolation. |
 | `tests/e2e_hierarchy.rs` | call hierarchy and type hierarchy. |
+| `tests/e2e_call_hierarchy_receivers.rs` | receiver/declaration identity, inheritance/private/trait access, unknown targets, nullsafe/constructor/recursive calls, first-class callable exclusions and UTF-16/CRLF updates. |
 | `tests/e2e_indexing.rs` | watched files, file operations, workspace folders, index-related inference. |
 | `tests/e2e_templates.rs` | Blade/Twig virtual PHP behavior. |
 
@@ -262,6 +264,21 @@ enough for workspace rename edits without a resolved receiver type.
 Reference metadata also records whether PHP's unqualified global fallback is
 legal and, for import targets, the exact rename range and whether explicit
 alias spelling must be preserved.
+
+Call hierarchy uses each reference's invocation kind and byte range of its
+owning named callable. Reference locations stay in UTF-16. First-class callable
+creation has no invocation metadata; anonymous/arrow bodies and nested named
+functions without extracted symbols are not assigned to their enclosing caller.
+Closed resolved occurrences are consumed without parsing their files; matching
+unresolved receiver candidates can be enriched on the bounded blocking pool
+after source-provenance validation. Current open PHP references and declarations
+replace indexed entries, while templates stay excluded. Canonical member lookup
+preserves inherited declaration identity, lexical object-call private binding,
+class/trait overrides and access checks. Reused trait copies whose lexical
+private binding cannot be proven yield no edge. Type/direct-member caches avoid
+repeated scans within a request. Index revision, open document lifetime/version,
+closed-to-open transitions and runtime generation are checked before returning
+results; document locks are acquired outside index publication barriers.
 
 ## Data Flow
 
@@ -829,8 +846,9 @@ commit lease. A short lease protects the final rename, with a cancellation
 check. A change in the unavoidable interval after the final check is rejected
 by the content hash on the next load. Workspace cache replay rechecks files
 before publishing symbols, and staged vendor/stub commits discard changed
-sources. Schema version 26 invalidates cache files written before provenance
-tracking.
+sources. Schema version 26 introduced provenance tracking; current schema 27
+also persists invocation kind and owning-callable ranges and invalidates older
+reference snapshots.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

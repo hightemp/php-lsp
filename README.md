@@ -208,7 +208,8 @@ phpstorm-stubs support.
   are persisted after the requested class is verified in the index; Composer
   vendor metadata is cached in memory with an LRU for lazy vendor symbols. The
   2026-05-28 large-workspace baseline met the warm cache target, but that timing
-  has not been rerun after schema 26 added source-provenance checks.
+  has not been rerun after schema 26 added source-provenance checks or schema
+  27 added call-site metadata.
   Installed-vendor first-hit behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses merge indexed
   closed-file references with ordinary open PHP snapshots, but still iterate

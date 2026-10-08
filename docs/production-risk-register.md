@@ -41,6 +41,8 @@ Current evidence:
   updated together.
 - `CODEX-P2-12` ties cached symbols to parsed source bytes, revalidates before
   publication, and invalidates pre-provenance cache files with schema 26.
+- `CODEX-P2-18` adds persisted invocation kind and named-caller ownership in
+  schema 27; older caches rebuild. No large-workspace timings were rerun.
 - Fixture smoke run shows cached workspace file symbols loading on second start.
 - `PV-002` large workspace run on `large-symfony` loaded 10575 workspace files
   from disk cache on warm start; ready time improved from 7349.48 ms cold to
@@ -54,7 +56,7 @@ Current evidence:
 Impact:
 
 - The recorded 2026-05-28 run met the `<5s` warm-start target on the primary
-  5k-10k PHP-file workspace. Current schema-26 timing is not yet measured.
+  5k-10k PHP-file workspace. Current schema-27 timing is not yet measured.
 - Changed-file invalidation remains covered by tests and normal dogfood watch,
   but is no longer considered a blocking production risk.
 - Vendor composer metadata cache/LRU is tracked separately by `R-008`.
@@ -74,8 +76,8 @@ Mitigation:
 Exit signal:
 
 - `IE-045` warm `large-symfony` run reaches `phase=ready` in `3436.05 ms`.
-- Rerun the cold/warm large-workspace profile with schema 26 to check the cost
-  of the additional source reads.
+- Rerun the cold/warm large-workspace profile with schema 27 to check the cost
+  of source revalidation and persisted call-site metadata.
 - Cache invalidates changed files without full rebuild; keep this covered by
   cache tests and reindex dogfood.
 - Cache schema and timestamp fallback behavior stay covered by focused
