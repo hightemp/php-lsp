@@ -2878,17 +2878,23 @@ pub(in crate::server) fn byte_range_contains(
 
 pub(in crate::server) fn node_inside_anonymous_class_body(
     node: tree_sitter::Node,
-    source: &str,
+    _source: &str,
 ) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if parent.kind() == "object_creation_expression" {
-            let text = &source[parent.byte_range()];
-            if text.trim_start().starts_with("new class") {
-                return text.find('{').is_some_and(|body_start| {
-                    node.start_byte() > parent.start_byte().saturating_add(body_start)
-                });
+        match parent.kind() {
+            "anonymous_class"
+                if parent.child_by_field_name("body").is_some_and(|body| {
+                    body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()
+                }) =>
+            {
+                return true
             }
+            "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration" => return false,
+            _ => {}
         }
         current = parent.parent();
     }
@@ -4733,21 +4739,6 @@ pub(in crate::server) fn is_duplicate_checked_symbol_kind(
             | php_lsp_types::PhpSymbolKind::Function
             | php_lsp_types::PhpSymbolKind::GlobalConstant
     )
-}
-
-pub(in crate::server) fn current_class_fqn(
-    file_symbols: &php_lsp_types::FileSymbols,
-) -> Option<String> {
-    file_symbols.symbols.iter().find_map(|sym| {
-        matches!(
-            sym.kind,
-            php_lsp_types::PhpSymbolKind::Class
-                | php_lsp_types::PhpSymbolKind::Interface
-                | php_lsp_types::PhpSymbolKind::Trait
-                | php_lsp_types::PhpSymbolKind::Enum
-        )
-        .then(|| sym.fqn.clone())
-    })
 }
 
 impl PhpLspBackend {

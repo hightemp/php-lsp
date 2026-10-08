@@ -4,6 +4,10 @@ use crate::template::TemplateShapeDefinitionTarget;
 
 use super::super::*;
 
+#[cfg(test)]
+#[path = "type_owner_tests.rs"]
+mod type_owner_tests;
+
 const DECLARATION_SCOPE_END_HINT_MIN_LINES: u32 = 2;
 const LARGE_SCOPE_END_HINT_MIN_LINES: u32 = 8;
 const CONTROL_SCOPE_END_HINT_MAX_CHARS: usize = 96;
@@ -1549,7 +1553,12 @@ pub(in crate::server) fn server_variable_type_info(
 
     call_site_variable_phpdoc_type(ctx, variable_node).map(|type_info| IndexedExpressionTypeInfo {
         type_info,
-        owner_fqn: current_class_fqn(ctx.file_symbols).unwrap_or_default(),
+        owner_fqn: if node_inside_anonymous_class_body(variable_node, ctx.source) {
+            String::new()
+        } else {
+            current_class_fqn_at_range(ctx.file_symbols, node_range_node(variable_node))
+                .unwrap_or_default()
+        },
         uri: String::new(),
     })
 }

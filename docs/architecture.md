@@ -133,6 +133,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_completion.rs` | completion, completion resolve, signature help, shape completion. |
 | `tests/e2e_signature_help.rs` | nullsafe/nested/incomplete calls, CST argument tracking, UTF-16/CRLF and cross-file method chains. |
 | `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
+| `tests/e2e_type_owner.rs` | lexical PHPDoc type owners, hover/inlay type links, namespace imports, anonymous-class boundaries and unsaved UTF-16/CRLF updates. |
 | `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
 | `tests/e2e_phpdoc_definition.rs` | exact PHPDoc member/owner selection, inheritance/native precedence, UTF-16/CRLF buffer edits, and Twig shape-key definitions before attributes. |
 | `tests/e2e_phpdoc_definition_stress.rs` | concurrent JSON-RPC definitions, edits, close/reopen, watched-file and full Composer reindex; exact stable disk/buffer results and progress watchdog. |
@@ -242,6 +243,17 @@ carry the same section identity. Repeated namespace names remain separate;
 alias expansion uses the source position of the referring symbol, including
 when an alias refers to another alias. Class PHPDoc aliases stay local to their
 own class.
+
+Local PHPDoc type inference carries the class-like owner at the variable's byte
+range, together with the active namespace/import section. Hover and foreach
+inlay links therefore resolve `self` and `static` against the containing type;
+`parent` links use that type's superclass. Free-function and global code have
+no class owner. The nearest anonymous-class body blocks borrowing an enclosing
+named type for `self`/`static`, while its constructor arguments retain the
+outer lexical scope. Anonymous `parent` scope lookup uses the CST base clause,
+including comments and attributes around the declaration. A type returned by
+an indexed member retains the member's declaring owner instead of adopting
+the caller's class.
 
 Document symbols group declarations by the lexical `NamespaceScope` range,
 keeping repeated and empty named sections as separate outline nodes. Global

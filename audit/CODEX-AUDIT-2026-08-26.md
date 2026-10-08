@@ -1504,6 +1504,29 @@ PHPDoc fallback записывает owner через `current_class_fqn(file_sy
 Что исправить: всегда передавать variable/call-site range и использовать
 `current_class_fqn_at_range`.
 
+Реализация (2026-10-08): PHPDoc fallback выбирает owner по byte-range
+переменной через `current_class_fqn_at_range`; global/free-function context
+не получает чужой класс. Namespace/import section определяется по позиции.
+Ближайшее тело anonymous class ограничивает `self`/`static`, а аргументы
+конструктора сохраняют внешний scope, включая строки с `{`. Для anonymous
+`parent` используются CST body/base clause, включая comments/attributes;
+вложенный scope не заимствует родителя внешнего класса. Типы из возвращаемых
+значений методов сохраняют declaring owner. Удалён helper первого класса.
+
+TDD: RED воспроизвёл `Decoy` вместо второго класса в hover/inlay и неверные
+ссылки, а также ошибки anonymous body/constructor scope. Добавлены 24 теста:
+11 server units, 5 parser regressions и 8 сквозных LSP-сценариев для
+`self/static/parent`, imports, trait/enum/closures, global scope, UTF-16/CRLF,
+несохранённых обновлений и declaring return owner. Недопустимые в PHP nested
+named declarations проверяются только как границы editor CST. Адресные
+проверки и полный последовательный Rust-набор прошли: 1341/1341,
+43 test-result targets, 0 ignored; `CARGO_BUILD_JOBS=1`, `--test-threads=1`.
+Clippy `--all-targets -- -D warnings`, Rustfmt и diff check прошли.
+Verifier на `gpt-6-sol` дал GO по реализации, тестам и документации.
+Статус: **исправлено**. Architecture и матрица test evidence обновлены;
+измерения покрытия и performance не повторялись, schema остаётся 28.
+Исходное описание находки сохранено.
+
 ### CODEX-P2-21. Runtime-настройка `logLevel` фактически не работает
 
 Server сохраняет `log_level` в mutex, но production-код больше нигде это поле

@@ -15,6 +15,10 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Point, Tree};
 
+#[cfg(test)]
+#[path = "resolve_type_owner_tests.rs"]
+mod type_owner_tests;
+
 const MAX_OBJECT_TYPE_RESOLVE_DEPTH: usize = 64;
 
 #[cfg(test)]
@@ -6887,6 +6891,16 @@ fn find_parent_class_fqn(
     let mut current = method_node.parent();
     while let Some(node) = current {
         match node.kind() {
+            "anonymous_class"
+                if node.child_by_field_name("body").is_some_and(|body| {
+                    body.start_byte() <= method_node.start_byte()
+                        && method_node.end_byte() <= body.end_byte()
+                }) =>
+            {
+                // Anonymous self/static cannot use an enclosing named type.
+                // Constructor arguments still execute in the outer scope.
+                return None;
+            }
             "class_declaration"
             | "interface_declaration"
             | "trait_declaration"
@@ -6910,12 +6924,20 @@ fn find_anonymous_class_parent_fqn(
 ) -> Option<String> {
     let mut current = Some(context_node);
     while let Some(node) = current {
-        if node.kind() == "object_creation_expression"
-            && source[node.byte_range()]
-                .trim_start()
-                .starts_with("new class")
-        {
-            return first_base_clause_fqn(node, source, file_symbols);
+        match node.kind() {
+            "anonymous_class"
+                if node.child_by_field_name("body").is_some_and(|body| {
+                    body.start_byte() <= context_node.start_byte()
+                        && context_node.end_byte() <= body.end_byte()
+                }) =>
+            {
+                return first_base_clause_fqn(node, source, file_symbols);
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration" => return None,
+            _ => {}
         }
         current = node.parent();
     }
