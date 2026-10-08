@@ -1537,6 +1537,38 @@ Server сохраняет `log_level` в mutex, но production-код боль�
 Что исправить: использовать reloadable tracing filter либо классифицировать
 `logLevel` как restart-required setting и автоматически перезапускать client.
 
+Реализация (2026-10-08): выбран согласованный live reload без перезапуска.
+`logging.rs` владеет reloadable EnvFilter и исходным startup-фильтром;
+stdio backend применяет общий `global.logLevel` при публикации runtime state.
+Фильтр меняется синхронно под тем же lock и отвергает superseded/duplicate
+generations. Явные пять уровней заменяют startup-фильтр, удаление ключа
+восстанавливает все исходные директивы `RUST_LOG`, некорректные значения
+сохраняют последний рабочий фильтр. Folder overrides на общий журнал не влияют;
+log-only updates сохраняют индексы. Обычный embedded backend не устанавливает
+глобальный subscriber. Прежний test-only mutex `log_level` удалён.
+
+Клиент сохраняет исходный process environment и передаёт только явный уровень
+в existing configuration snapshot. Изменение и удаление настройки используют
+тот же LanguageClient; после удаления popup показывает `Inherited startup
+filter`, а не вымышленный `info`.
+
+TDD: RED подтвердил включение/подавление DEBUG на настоящем stdio binary,
+ошибочную подмену `RUST_LOG` при client activation и неверный popup после reset.
+Дополнительная регрессия выявила принятие numeric-string `"4"` стандартным
+Level parser; настройка ограничена объявленными пятью уровнями.
+GREEN: 7 filter units, 4 backend/protocol tests и 5 stdio/CLI tests (16 новых
+Rust-тестов); activation VM check проверяет inherited env с директивами и без
+переменной, live notifications, removal, popup и сохранение client identity.
+Детерминированные конкурентные проверки покрывают задержанное старое поколение
+и queued configuration publication; все пять уровней проверены фактическими
+emitted/suppressed events. Полный последовательный Rust-набор: 1357/1357,
+44 test-result targets, 0 ignored; `CARGO_BUILD_JOBS=1`, `--test-threads=1`.
+Clippy `--all-targets -- -D warnings`, Rustfmt, client lint/build и diff check
+прошли. Повторный Verifier на `gpt-6-sol` дал GO по реализации и документации.
+Статус: **исправлено**. README, configuration, architecture, LSP behavior и
+test-evidence matrix обновлены; schema остаётся 28, исторические измерения
+покрытия/performance не менялись. Исходное описание находки сохранено.
+
 ### CODEX-P2-22. Cancellation token допускает потерянное пробуждение
 
 [`OperationCancellationToken::cancelled`](server/crates/php-lsp-server/src/server.rs#L751)

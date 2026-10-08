@@ -357,7 +357,7 @@
           ],
           "default": "info",
           "scope": "window",
-          "description": "Server log level"
+          "description": "Server log level; changes apply immediately to all workspace folders without restarting"
         }
       }
     },
@@ -419,10 +419,11 @@
     "check:indexing-status": "node scripts/check-indexing-status.mjs",
     "check:commands": "node scripts/check-commands.mjs",
     "check:lifecycle": "node scripts/check-lifecycle.mjs",
+    "check:logging": "node scripts/check-logging.mjs",
     "check:server-process": "node scripts/check-server-process.mjs",
     "check:vscode-engine": "node scripts/check-vscode-engine.mjs",
     "prepare:package": "node scripts/prepare-package-metadata.mjs",
-    "lint": "npm run check:vscode-engine && npm run check:lifecycle && npm run check:server-process && npm run check:configuration && npm run check:indexing-status && tsc --noEmit",
+    "lint": "npm run check:vscode-engine && npm run check:lifecycle && npm run check:server-process && npm run check:configuration && npm run check:indexing-status && npm run check:logging && tsc --noEmit",
     "package": "vsce package"
   },
   "dependencies": {

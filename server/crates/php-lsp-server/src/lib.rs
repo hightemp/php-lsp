@@ -6,6 +6,7 @@ pub mod analyze;
 pub mod config;
 pub mod fix;
 mod framework;
+pub mod logging;
 mod server;
 mod template;
 pub(crate) mod util;

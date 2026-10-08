@@ -5,6 +5,7 @@ import type { ChildProcess } from "child_process";
 import { phpLspCacheDirForRoot } from "./cachePath";
 import {
   buildClientConfigurationSnapshot,
+  buildExplicitClientSettings,
   selectStatusConfiguration,
 } from "./configuration";
 import {
@@ -199,7 +200,7 @@ class PhpLspStatusController implements Disposable {
       {
         label: "$(output) Log level",
         description: snapshot.logLevel,
-        detail: "Applied when the language server process starts",
+        detail: "Applied immediately to all workspace folders without restarting",
       },
       {
         label: "$(list-tree) Include paths",
@@ -390,6 +391,7 @@ function getExtensionSnapshot(context: ExtensionContext): ExtensionSnapshot {
       : undefined,
   );
   const config = selectedConfiguration.configuration;
+  const explicitLogLevel = buildExplicitClientSettings(workspace.getConfiguration("phpLsp"), undefined).logLevel;
   const binary = resolveServerBinary(context);
   if (binary.error) {
     lastBinaryResolutionError = binary.error;
@@ -417,7 +419,7 @@ function getExtensionSnapshot(context: ExtensionContext): ExtensionSnapshot {
     phpstanEnabled: config.get<boolean>("phpstan.enabled", false),
     psalmEnabled: config.get<boolean>("psalm.enabled", false),
     formattingProvider: config.get<string>("formatting.provider", "auto"),
-    logLevel: config.get<string>("logLevel", "info"),
+    logLevel: typeof explicitLogLevel === "string" ? explicitLogLevel : "Inherited startup filter",
     includePaths: config.get<string[]>("includePaths", []),
     excludePaths: config.get<string[]>("excludePaths", []),
   };
@@ -577,13 +579,6 @@ function createClientErrorHandler(clientProvider: () => LanguageClient | undefin
       });
       return { action: CloseAction.Restart, handled: true };
     },
-  };
-}
-
-function getServerEnvironment(logLevel: string): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    RUST_LOG: logLevel.trim() || "info",
   };
 }
 
@@ -819,9 +814,7 @@ function clientConfigurationSnapshot(context: ExtensionContext) {
 }
 
 function createLanguageClient(context: ExtensionContext, binary: ServerBinaryResolution): LanguageClient {
-  const config = workspace.getConfiguration("phpLsp");
-  const logLevel = config.get<string>("logLevel", "info");
-  const serverEnvironment = getServerEnvironment(logLevel);
+  const serverEnvironment = { ...process.env };
   let languageClient: LanguageClient | undefined;
   const fileEvents = WATCHED_FILE_GLOBS.map((glob) => workspace.createFileSystemWatcher(glob));
 

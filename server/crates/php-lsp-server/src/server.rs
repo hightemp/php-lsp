@@ -14,6 +14,7 @@ use crate::config::{
     global_config_candidates, load_toml_settings, merge_json_objects, normalize_client_settings,
     DEFAULT_INDEXING_MAX_ENTRIES, DEFAULT_INDEXING_MAX_FILES, PROJECT_CONFIG_FILE_NAME,
 };
+use crate::logging::{LogLevelSetting, RuntimeLogFilter};
 use crate::template::{
     is_blade_template_language_id, is_blade_template_uri, is_twig_template_language_id,
     is_twig_template_uri, preprocess_blade_template, preprocess_twig_template, TemplateDocument,
@@ -1736,7 +1737,7 @@ struct ResolvedRuntimeConfiguration {
     exclude_paths: Vec<PathBuf>,
     traversal_limits: TraversalLimits,
     stub_extensions: Option<Vec<String>>,
-    log_level: String,
+    log_level: LogLevelSetting,
     stubs_path: Option<PathBuf>,
     formatting: FormattingConfig,
     phpstan: PhpStanConfig,
@@ -1867,7 +1868,7 @@ impl Default for ResolvedRuntimeConfiguration {
                 max_entries: Some(DEFAULT_INDEXING_MAX_ENTRIES),
             },
             stub_extensions: None,
-            log_level: "info".to_string(),
+            log_level: LogLevelSetting::Inherit,
             stubs_path: None,
             formatting: FormattingConfig::default(),
             phpstan: PhpStanConfig::default(),
@@ -1925,9 +1926,8 @@ impl ResolvedRuntimeConfiguration {
         resolved.traversal_limits = traversal_limits_from_settings(settings);
         resolved.stub_extensions =
             settings_string_array(settings, "stubExtensions", &["stubs", "extensions"]);
-        if let Some(level) = settings_string(settings, "logLevel", &["logLevel"]) {
-            resolved.log_level = level.trim().to_ascii_lowercase();
-        }
+        resolved.log_level =
+            LogLevelSetting::parse(settings_value(settings, "logLevel", &["logLevel"]));
         resolved.stubs_path = settings_string_aliases(
             settings,
             "stubsPath",
@@ -2826,6 +2826,8 @@ pub struct PhpLspBackend {
     runtime_state: Arc<Mutex<Arc<WorkspaceRuntimeState>>>,
     configuration_reload: Mutex<()>,
     next_runtime_generation: AtomicU64,
+    /// Optional subscriber owned by this application's stdio entry point.
+    log_filter: Option<RuntimeLogFilter>,
     /// Trace level from InitializeParams (off/messages/verbose).
     trace_level: Mutex<TraceValue>,
     /// Last explicit client initialization/configuration settings.
@@ -2875,9 +2877,6 @@ pub struct PhpLspBackend {
     /// by setting an empty extensions list.
     #[cfg(test)]
     stub_extensions: Mutex<Option<Vec<String>>>,
-    /// Configured server log level label.
-    #[cfg(test)]
-    log_level: Mutex<String>,
     /// Whether the client advertised window/workDoneProgress support.
     work_done_progress_supported: Mutex<bool>,
     /// External formatter configuration.
@@ -2940,6 +2939,7 @@ impl PhpLspBackend {
             runtime_state,
             configuration_reload: Mutex::new(()),
             next_runtime_generation: AtomicU64::new(1),
+            log_filter: None,
             trace_level: Mutex::new(TraceValue::Off),
             client_settings: Mutex::new(serde_json::json!({})),
             #[cfg(test)]
@@ -2973,8 +2973,6 @@ impl PhpLspBackend {
             }),
             #[cfg(test)]
             stub_extensions: Mutex::new(None),
-            #[cfg(test)]
-            log_level: Mutex::new("info".to_string()),
             work_done_progress_supported: Mutex::new(false),
             #[cfg(test)]
             formatting_config: Mutex::new(FormattingConfig::default()),
@@ -2987,6 +2985,14 @@ impl PhpLspBackend {
             vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
             external_symlinks: ExternalSymlinkManager::new(client.clone()),
         }
+    }
+
+    /// Attach the application's reloadable subscriber without changing logging
+    /// owned by other embedded backends using `new`.
+    pub fn with_log_filter(client: Client, log_filter: RuntimeLogFilter) -> Self {
+        let mut backend = Self::new(client);
+        backend.log_filter = Some(log_filter);
+        backend
     }
 
     /// Log a message to the client if trace level is verbose.
@@ -3512,7 +3518,7 @@ impl PhpLspBackend {
             exclude_paths,
             traversal_limits,
             stub_extensions,
-            log_level,
+            log_level: _,
             stubs_path,
             formatting,
             phpstan,
@@ -3615,8 +3621,6 @@ impl PhpLspBackend {
                 applied.stubs_changed = true;
             }
         }
-
-        *self.log_level.lock().await = log_level;
 
         {
             let mut current = self.formatting_config.lock().await;
@@ -3801,6 +3805,13 @@ impl PhpLspBackend {
             .clone();
         {
             let mut current = self.runtime_state.lock().await;
+            if let Some(filter) = &self.log_filter {
+                if let Err(error) =
+                    filter.apply(runtime_state.generation, runtime_state.fallback.log_level)
+                {
+                    tracing::warn!("Failed to update server log filter: {error}");
+                }
+            }
             twig_context.configure(&runtime_state);
             *current = runtime_state.clone();
         }
@@ -4803,3 +4814,7 @@ impl LanguageServer for PhpLspBackend {
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "runtime_logging_tests.rs"]
+mod runtime_logging_tests;

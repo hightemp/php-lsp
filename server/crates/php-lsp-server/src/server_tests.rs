@@ -6746,7 +6746,10 @@ async fn test_runtime_configuration_resets_missing_fields_to_typed_defaults() {
         vec![PathBuf::from("generated")]
     );
     assert_eq!(*backend.stub_extensions.lock().await, Some(Vec::new()));
-    assert_eq!(backend.log_level.lock().await.as_str(), "debug");
+    assert_eq!(
+        ResolvedRuntimeConfiguration::from_settings(&custom).log_level,
+        LogLevelSetting::Override(tracing::Level::DEBUG)
+    );
     assert_eq!(
         *backend.stubs_path.lock().await,
         Some(PathBuf::from("/custom/stubs"))
@@ -6803,7 +6806,10 @@ async fn test_runtime_configuration_resets_missing_fields_to_typed_defaults() {
     assert!(backend.include_paths.lock().await.is_empty());
     assert!(backend.exclude_paths.lock().await.is_empty());
     assert_eq!(*backend.stub_extensions.lock().await, None);
-    assert_eq!(backend.log_level.lock().await.as_str(), "info");
+    assert_eq!(
+        ResolvedRuntimeConfiguration::default().log_level,
+        LogLevelSetting::Inherit
+    );
     assert_eq!(*backend.stubs_path.lock().await, None);
     assert_eq!(
         *backend.formatting_config.lock().await,

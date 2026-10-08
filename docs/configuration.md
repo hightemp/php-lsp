@@ -41,6 +41,29 @@ policy, formatter, PHPStan/Psalm, and analyzer code actions come from that
 owner. A file outside all configured roots uses only global/client fallback
 settings instead of inheriting the first workspace folder.
 
+## Server logging
+
+`phpLsp.logLevel` applies immediately without restarting the server. Supported
+values are `error`, `warn`, `info`, `debug`, and `trace`; level strings accept
+surrounding whitespace and any ASCII letter case. This is one setting for the
+whole VS Code window/process. In the versioned LSP configuration snapshot only
+`global.logLevel` controls logging; folder values do not change the filter.
+Legacy flat settings, including the `phpLsp` wrapper, remain supported.
+
+The server starts with the inherited `RUST_LOG` filter, or `info` when that
+variable is absent or invalid. An explicit LSP level replaces the entire startup
+filter. Removing the key restores the original filter, including target-specific
+directives. Without `RUST_LOG`, this also restores the usual `info` default.
+The extension leaves the process environment intact and forwards only explicitly
+configured settings, so deleting an override does not send a new `info` override.
+Malformed values, including empty strings and non-string JSON, leave the last
+working filter active and produce a warning when the active filter allows it.
+The status popup shows `Inherited startup filter` when no explicit level is set,
+so an inherited directive filter is not presented as a single `info` level.
+
+Tracing output uses stderr and does not share the JSON-RPC stdout transport.
+`phpLsp.trace.server` controls LSP transport tracing separately.
+
 ## Command Trust
 
 Project `.php-lsp.toml` is treated as untrusted for executable settings by

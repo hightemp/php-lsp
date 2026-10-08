@@ -1,7 +1,7 @@
 # Project-wide test coverage baseline
 
 Coverage measurement snapshot: 2026-09-25; matrix evidence updated for
-P2-14/P2-15/P2-16/P2-17/P2-18 on 2026-10-07 and P2-19/P2-20 on 2026-10-08.
+P2-14/P2-15/P2-16/P2-17/P2-18 on 2026-10-07 and P2-19/P2-20/P2-21 on 2026-10-08.
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -12,8 +12,9 @@ Platform marks: **T** = an automated test executes the behavior on Linux;
 **M** = a Node helper test or mock-based VSIX test executes it;
 **B** = the release workflow builds a binary for that OS, without executing
 this behavior; **—** = no matching automated test or build evidence. Rust
-protocol tests use an in-process LSP service; they do not exercise a real
-VS Code Extension Host. Linux here means the current x86-64 development host
+protocol tests mostly use an in-process LSP service; logging tests also execute
+the actual stdio binary. These checks do not exercise a real VS Code Extension
+Host. Linux here means the current x86-64 development host
 and Ubuntu CI, not every Linux architecture. The release build matrix has
 Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 
@@ -22,6 +23,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Function | State / transition | Linux | macOS | Windows | Evidence and remaining gap |
 |---|---|:---:|:---:|:---:|---|
 | LSP lifecycle | initialize, initialized, shutdown | T | B | B | [initialize protocol tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
+| Server logging | initialization/live/reset, invalid values, startup directives, global scope and ordered concurrent updates | T | B | B | [filter tests](../server/crates/php-lsp-server/src/logging_tests.rs), [runtime/protocol tests](../server/crates/php-lsp-server/src/runtime_logging_tests.rs), [stdio binary tests](../server/crates/php-lsp-server/tests/e2e_logging.rs). |
 | Parser and symbol extraction | ordinary PHP, namespaces, PHPDoc | T | B | B | [parser tests](../server/crates/php-lsp-parser/src/parser_tests.rs), [symbol tests](../server/crates/php-lsp-parser/src/symbols_tests.rs); grammar-version compatibility still needs separate fixtures. |
 | Parser incremental edits | UTF-16, past line end, chained edits | T | B | B | [incremental positions](../server/crates/php-lsp-server/tests/e2e_incremental_positions.rs), [parser tests](../server/crates/php-lsp-parser/src/parser_tests.rs). |
 | Diagnostics | open before/during/after cold indexing | T | B | B | [diagnostics protocol tests](../server/crates/php-lsp-server/tests/e2e_diagnostics.rs). |
@@ -70,7 +72,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 |---|---|:---:|:---:|:---:|---|
 | Client lifecycle | activation, start/stop, crash/restart, queued changes | M | — | — | [lifecycle check](../client/scripts/check-lifecycle.mjs), [packaged VSIX smoke](../scripts/smoke-vsix.sh); no real Extension Host test. |
 | Server process selection | supported platform/architecture, executable resolution | M | — | — | [server-process check](../client/scripts/check-server-process.mjs); native packaged launch on macOS/Windows is untested. |
-| Client configuration | defaults, scoped changes, trust | M | — | — | [configuration check](../client/scripts/check-configuration.mjs), [VSIX smoke](../scripts/smoke-vsix.sh). |
+| Client configuration | defaults, scoped changes, trust, logging startup/live/reset without restart | M | — | — | [configuration check](../client/scripts/check-configuration.mjs), [logging activation check](../client/scripts/check-logging.mjs), [VSIX smoke](../scripts/smoke-vsix.sh). |
 | Client status | run generation and stale notification handling | M | — | — | [indexing-status check](../client/scripts/check-indexing-status.mjs). |
 | Cache path | workspace and platform-specific path choice | M | — | — | [cache-path check](../client/scripts/check-cache-path.mjs); this check is not part of `npm run lint`. |
 | Commands | contributed commands versus registration | M | — | — | [command check](../client/scripts/check-commands.mjs); this check is not part of `npm run lint`. |
@@ -93,7 +95,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |
@@ -142,9 +144,9 @@ line denominator equals the physical line count of these source-mapped files;
 its line percentage should not be compared directly with LLVM's Rust line
 percentage.
 
-The matrix has 51 scenario rows: on Linux 42 have executed tests, seven have
+The matrix has 52 scenario rows: on Linux 43 have executed tests, seven have
 mock-based checks, one has build-only evidence, and one (native Extension Host)
-has no automated test or build evidence. The 42 Rust rows have macOS/Windows
+has no automated test or build evidence. The 43 Rust rows have macOS/Windows
 build evidence but no native runtime test; one of those Rust rows lacks a
 direct Linux protocol regression.
 The nine client rows have no native macOS/Windows runtime test. These are

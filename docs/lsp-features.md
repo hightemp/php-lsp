@@ -32,7 +32,7 @@ client-visible LSP behavior and known limits.
 | `textDocument/didSave` | Supported | Publishes full diagnostics, including enabled external analyzers. |
 | `textDocument/didClose` | Supported | Removes open parser/template/version state and its open-buffer index entry, clears request/diagnostic state, and guarded-restores saved disk symbols for ordinary PHP unless the URI is reopened first. |
 | `workspace/didChangeWatchedFiles` | Supported | Changed/created PHP files use authoritative open-buffer state when present; deleted PHP files are removed. |
-| `workspace/didChangeConfiguration` | Supported | Runtime updates for diagnostics, stubs, indexing, vendor, formatter, analyzers, and logging. |
+| `workspace/didChangeConfiguration` | Supported | Runtime updates for diagnostics, stubs, indexing, vendor, formatter, analyzers, and logging. Global `logLevel` changes immediately without restart; removing it restores the startup `RUST_LOG` filter. |
 | `workspace/didChangeWorkspaceFolders` | Supported | Adds/removes roots and indexes new roots. |
 | `workspace/willCreateFiles` | Partial | Advertised for PHP files but currently returns no edit. |
 | `workspace/didCreateFiles` | Supported | Reindexes created PHP files. |

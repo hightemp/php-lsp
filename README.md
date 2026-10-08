@@ -278,6 +278,7 @@ Runtime environment:
 | Environment variable | Default | Description |
 |---|---:|---|
 | `PHP_LSP_WORKER_THREAD_STACK_SIZE` | `8388608` | Tokio worker-thread stack size in bytes. Values below 1 MiB are ignored. Raising this can help unusually deep framework/type/template workloads, but the default is intended for normal editor use. |
+| `RUST_LOG` | `info` when unset | Startup server filter, including target-specific tracing directives. An explicit LSP `logLevel` overrides it until that setting is removed. |
 
 | Setting | Default | Description |
 |---|---:|---|
@@ -307,7 +308,7 @@ Runtime environment:
 | `phpLsp.psalm.timeoutMs` | `30000` | Psalm timeout per file. |
 | `phpLsp.analyzerCodeActions.enabled` | `false` | Enable opt-in quick fixes for PHPStan and Psalm diagnostics when diagnostic metadata is available. |
 | `phpLsp.trace.server` | `off` | LSP transport trace: `off`, `messages`, or `verbose`. |
-| `phpLsp.logLevel` | `info` | Server log level: `error`, `warn`, `info`, `debug`, or `trace`. |
+| `phpLsp.logLevel` | `info` | Server log level: `error`, `warn`, `info`, `debug`, or `trace`. Changes apply immediately without restarting, using one level for the whole window. Removing the explicit setting restores the startup `RUST_LOG` filter. |
 
 Shared project defaults can also be stored in `.php-lsp.toml`. Use
 `php-lsp init-config` to create a default file without overwriting an existing

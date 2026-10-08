@@ -34,6 +34,7 @@ prefer the focused module for its feature instead of growing `server.rs`.
 server/crates/php-lsp-server/src/
   server.rs                  # PhpLspBackend state, shared helpers, LanguageServer delegation
   config.rs                  # effective VS Code/global/project configuration
+  logging.rs                 # owned reloadable subscriber filter and startup restoration
   analyze.rs                 # analyze CLI
   fix.rs                     # fix CLI
   framework.rs               # framework metadata and static heuristics
@@ -130,6 +131,7 @@ and response helpers live in `tests/support/mod.rs`.
 | Test target | Covers |
 |---|---|
 | `tests/e2e_initialize.rs` | initialize/shutdown, runtime configuration, project config trust. |
+| `tests/e2e_logging.rs` | real stdio binary stderr filtering, initialization overrides, inherited/invalid RUST_LOG and separate CLI stdout. |
 | `tests/e2e_completion.rs` | completion, completion resolve, signature help, shape completion. |
 | `tests/e2e_signature_help.rs` | nullsafe/nested/incomplete calls, CST argument tracking, UTF-16/CRLF and cross-file method chains. |
 | `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
@@ -1148,7 +1150,19 @@ starting side effects:
 | Include/exclude paths | Reindex. |
 | Stub extensions/path | Reload stubs and republish diagnostics. |
 | `indexVendor` disabled | Clear vendor metadata, LRU entries, and indexed vendor symbols. |
-| Formatter/analyzer/log settings | Update runtime config for future requests. |
+| Formatter/analyzer settings | Update runtime config for future requests. |
+| `logLevel` | Replace the process tracing filter immediately; preserve indexes and restore the startup filter when the explicit key is removed. |
+
+`logging.rs` creates a reloadable EnvFilter layer for the stdio application's
+subscriber and passes its handle into `PhpLspBackend::with_log_filter`.
+The ordinary embedded-backend constructor leaves application-owned logging
+alone. Runtime publication applies the fallback/global logging setting
+synchronously under the same state lock, with no asynchronous filter update
+that can overwrite a newer generation. The handle rejects superseded/duplicate
+generations, preserves the last valid filter on malformed settings, and retains
+the complete startup filter for restoration. Folder-specific values do not
+control this process-level setting. The client preserves its inherited
+`RUST_LOG` and uses the existing explicit-settings snapshot for live changes.
 
 ## Cache Clearing
 

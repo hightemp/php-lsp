@@ -5,9 +5,11 @@
 use php_lsp_server::config::{
     write_default_project_config, InitConfigResult, PROJECT_CONFIG_FILE_NAME,
 };
+use php_lsp_server::logging::RuntimeLogFilter;
 use php_lsp_server::PhpLspBackend;
 use std::path::PathBuf;
 use tower_lsp::{LspService, Server};
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -30,12 +32,16 @@ async fn async_main() {
     }
 
     // Initialize tracing (logs go to stderr so they don't interfere with stdio LSP transport)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    let startup_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter_layer, log_filter) = RuntimeLogFilter::new(startup_filter);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
         )
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
         .init();
 
     tracing::info!("Starting php-lsp server");
@@ -43,7 +49,8 @@ async fn async_main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(PhpLspBackend::new);
+    let (service, socket) =
+        LspService::new(move |client| PhpLspBackend::with_log_filter(client, log_filter.clone()));
 
     Server::new(stdin, stdout, socket).serve(service).await;
 }
