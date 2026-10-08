@@ -1070,6 +1070,16 @@ actually exits, including after request timeout. Workspace, vendor and framework
 walkers and inlay-hint traversal check cooperative cancellation; formatter temp
 cleanup uses the same bounded worker capacity.
 
+Operation cancellation shares a monotonic atomic flag and a Notify across token
+clones. The asynchronous waiter creates its Notified future before checking the
+flag: Tokio's notify_waiters records a generation even before that future's first
+poll, closing the flag-check/await gap. A notification without cancellation
+rechecks the flag and waits again. Cancellation wakes all current waiters, while
+later waiters observe the stored flag immediately; dropping one waiter does not
+cancel the operation or disconnect others. The shared wait loop exposes an
+after-check hook for deterministic registration-race tests and uses a no-op hook
+in production. Bounded parallel tests supplement those exact event orders.
+
 ## Request Paths
 
 Low-latency requests such as hover, completion, signature help, definition, and

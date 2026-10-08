@@ -1581,6 +1581,32 @@ permit для ещё не зарегистрированного waiter, и futu
 `watch`/`CancellationToken` или другой примитив без lost-wakeup; добавить тест,
 где token отменён до входа в `cancelled()` и на границе регистрации.
 
+Проверка и закрепление (2026-10-08): порядок уже исправлен в `688f8b5`
+(2026-09-24, P2-05): `Notified` создаётся до чтения atomic flag. В используемом
+Tokio 1.49.0 `notify_waiters()` учитывается с момента создания этого future,
+даже до первого poll. Существующий механизм сохранён; общий wait loop выделен
+с no-op after-check hook для детерминированных тестов той же production-логики.
+
+TDD: временная мутация общего loop к исходному flag-before-notified порядку
+дала два немедленных RED-сбоя — отмена между false flag read и await,
+синхронная и из другого потока. Правильный порядок восстановлен в `finally`;
+13 постоянных регрессий прошли. Покрыты отмена до создания/первого poll,
+пробуждение suspended waiter, spurious notification и повторная регистрация,
+broadcast на 32 waiters, drop одного waiter, repeated cancel, clone identity
+и независимость tokens, потерявшая `select!` branch и создание нового waiter.
+Ограниченный stress: 128 rounds × 16 waiters на двух Tokio workers.
+Caller-проверки live cancellation внешней команды и pre-cancelled no-spawn
+также прошли. Это конечное покрытие порядков событий, не доказательство всех
+возможных schedules.
+
+Полный последовательный Rust-набор: 1370/1370, 44 test-result targets,
+0 ignored; `CARGO_BUILD_JOBS=1`, `--test-threads=1`. Clippy
+`--all-targets -- -D warnings`, Rustfmt и diff check прошли. Verifier на
+`gpt-6-sol` дал GO по механизму, тестам и документации.
+Статус: **исправлено ранее, подтверждено регрессиями**. Architecture и
+test-evidence matrix обновлены; schema остаётся 28, исторические измерения
+покрытия/performance сохранены. Исходное описание находки не переписано.
+
 ### CODEX-P2-23. PHPDoc способен заменить корректный native type
 
 Комментарий к

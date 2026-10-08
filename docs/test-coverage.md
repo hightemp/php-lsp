@@ -1,7 +1,7 @@
 # Project-wide test coverage baseline
 
 Coverage measurement snapshot: 2026-09-25; matrix evidence updated for
-P2-14/P2-15/P2-16/P2-17/P2-18 on 2026-10-07 and P2-19/P2-20/P2-21 on 2026-10-08.
+P2-14/P2-15/P2-16/P2-17/P2-18 on 2026-10-07 and P2-19/P2-20/P2-21/P2-22 on 2026-10-08.
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -24,6 +24,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 |---|---|:---:|:---:|:---:|---|
 | LSP lifecycle | initialize, initialized, shutdown | T | B | B | [initialize protocol tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Server logging | initialization/live/reset, invalid values, startup directives, global scope and ordered concurrent updates | T | B | B | [filter tests](../server/crates/php-lsp-server/src/logging_tests.rs), [runtime/protocol tests](../server/crates/php-lsp-server/src/runtime_logging_tests.rs), [stdio binary tests](../server/crates/php-lsp-server/tests/e2e_logging.rs). |
+| Operation cancellation | before poll, flag-check/await race, broadcast/drop/rearm, clone isolation and concurrent registration | T | B | B | [token regressions](../server/crates/php-lsp-server/src/operation_cancellation_tests.rs), [external-command caller tests](../server/crates/php-lsp-server/src/server_tests.rs). Exact-order tests detect the original lost-wakeup mutation; bounded two-worker stress exercises 128 rounds with 16 waiters. |
 | Parser and symbol extraction | ordinary PHP, namespaces, PHPDoc | T | B | B | [parser tests](../server/crates/php-lsp-parser/src/parser_tests.rs), [symbol tests](../server/crates/php-lsp-parser/src/symbols_tests.rs); grammar-version compatibility still needs separate fixtures. |
 | Parser incremental edits | UTF-16, past line end, chained edits | T | B | B | [incremental positions](../server/crates/php-lsp-server/tests/e2e_incremental_positions.rs), [parser tests](../server/crates/php-lsp-parser/src/parser_tests.rs). |
 | Diagnostics | open before/during/after cold indexing | T | B | B | [diagnostics protocol tests](../server/crates/php-lsp-server/tests/e2e_diagnostics.rs). |
@@ -95,7 +96,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |
@@ -144,9 +145,9 @@ line denominator equals the physical line count of these source-mapped files;
 its line percentage should not be compared directly with LLVM's Rust line
 percentage.
 
-The matrix has 52 scenario rows: on Linux 43 have executed tests, seven have
+The matrix has 53 scenario rows: on Linux 44 have executed tests, seven have
 mock-based checks, one has build-only evidence, and one (native Extension Host)
-has no automated test or build evidence. The 43 Rust rows have macOS/Windows
+has no automated test or build evidence. The 44 Rust rows have macOS/Windows
 build evidence but no native runtime test; one of those Rust rows lacks a
 direct Linux protocol regression.
 The nine client rows have no native macOS/Windows runtime test. These are

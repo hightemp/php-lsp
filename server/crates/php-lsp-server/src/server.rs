@@ -1262,11 +1262,19 @@ impl OperationCancellationToken {
     }
 
     async fn cancelled(&self) {
+        self.cancelled_with_after_check(|| {}).await;
+    }
+
+    // Share the production wait loop with deterministic registration-race tests.
+    // The no-op hook in cancelled() does not change its event ordering.
+    async fn cancelled_with_after_check(&self, mut after_check: impl FnMut()) {
         loop {
             // Capture the notification generation before checking the atomic
             // flag, so cancel() between the check and await cannot be lost.
             let notified = self.notify.notified();
-            if self.is_cancelled() {
+            let cancelled = self.is_cancelled();
+            after_check();
+            if cancelled {
                 return;
             }
             notified.await;
@@ -4818,3 +4826,7 @@ mod tests;
 #[cfg(test)]
 #[path = "runtime_logging_tests.rs"]
 mod runtime_logging_tests;
+
+#[cfg(test)]
+#[path = "operation_cancellation_tests.rs"]
+mod operation_cancellation_tests;
