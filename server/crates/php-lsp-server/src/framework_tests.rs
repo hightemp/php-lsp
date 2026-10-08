@@ -17,6 +17,7 @@ fn class_symbol(fqn: &str, extends: Vec<&str>) -> SymbolInfo {
         modifiers: php_lsp_types::SymbolModifiers::default(),
         attributes: Vec::new(),
         doc_comment: None,
+        doc_comment_range: None,
         signature: None,
         parent_fqn: None,
         extends: extends.into_iter().map(str::to_string).collect(),

@@ -817,7 +817,7 @@ fn collect_symbol_type_shape_definitions(
     let Some(comment) = symbol.doc_comment.as_deref() else {
         return Vec::new();
     };
-    let Some(doc_start) = symbol_doc_comment_start(symbol, comment) else {
+    let Some(doc_start) = symbol_doc_comment_start(symbol) else {
         return Vec::new();
     };
     let mut requests = Vec::new();
@@ -1050,13 +1050,9 @@ fn resolve_type_info_with_context(
     }
 }
 
-fn symbol_doc_comment_start(
-    symbol: &php_lsp_types::SymbolInfo,
-    comment: &str,
-) -> Option<(u32, u32)> {
-    let line_count = comment.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
-    let line = symbol.range.0.checked_sub(line_count)?;
-    Some((line, symbol.range.1))
+fn symbol_doc_comment_start(symbol: &php_lsp_types::SymbolInfo) -> Option<(u32, u32)> {
+    let range = symbol.doc_comment_range?;
+    Some((range.0, range.1))
 }
 
 fn doc_comment_relative_range_to_lsp(

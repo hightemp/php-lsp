@@ -25,6 +25,7 @@ fn make_symbol(
         },
         attributes: vec![],
         doc_comment: None,
+        doc_comment_range: None,
         signature: if matches!(kind, PhpSymbolKind::Method | PhpSymbolKind::Function) {
             Some(Signature {
                 params: vec![],
@@ -119,6 +120,7 @@ fn test_class_completion() {
             modifiers: SymbolModifiers::default(),
             attributes: vec![],
             doc_comment: None,
+            doc_comment_range: None,
             signature: None,
             parent_fqn: None,
             extends: vec![],
@@ -602,6 +604,7 @@ fn test_variable_completion() {
             modifiers: SymbolModifiers::default(),
             attributes: vec![],
             doc_comment: None,
+            doc_comment_range: None,
             signature: Some(Signature {
                 params: vec![ParamInfo {
                     name: "username".to_string(),
@@ -895,6 +898,7 @@ fn test_member_completion_uses_inferred_class_fqn() {
                 modifiers: SymbolModifiers::default(),
                 attributes: vec![],
                 doc_comment: None,
+                doc_comment_range: None,
                 signature: None,
                 parent_fqn: None,
                 extends: vec![],
@@ -914,6 +918,7 @@ fn test_member_completion_uses_inferred_class_fqn() {
                 modifiers: SymbolModifiers::default(),
                 attributes: vec![],
                 doc_comment: None,
+                doc_comment_range: None,
                 signature: Some(Signature {
                     params: vec![],
                     return_type: None,

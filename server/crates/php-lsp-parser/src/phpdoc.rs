@@ -66,24 +66,99 @@ pub fn parse_phpdoc(comment: &str) -> PhpDoc {
 fn strip_comment_markers(comment: &str) -> Vec<String> {
     let mut lines = Vec::new();
     for line in comment.lines() {
-        let trimmed = line.trim();
-        // Remove leading /** or */
-        let mut stripped = if let Some(rest) = trimmed.strip_prefix("/**") {
-            rest.trim()
-        } else if trimmed.starts_with("*/") {
-            continue;
-        } else if let Some(rest) = trimmed.strip_prefix('*') {
-            rest.trim_start()
-        } else {
-            trimmed
-        };
-        // Remove trailing */
-        if stripped.ends_with("*/") {
-            stripped = stripped[..stripped.len() - 2].trim_end();
-        }
-        lines.push(stripped.to_string());
+        lines.push(strip_comment_line_markers(line).to_string());
     }
     lines
+}
+
+fn strip_comment_line_markers(line: &str) -> &str {
+    let line = line.trim();
+    if line.starts_with("*/") {
+        return &line[..0];
+    }
+    let line = line
+        .strip_prefix("/**")
+        .or_else(|| line.strip_prefix('*'))
+        .unwrap_or(line)
+        .trim();
+    line.strip_suffix("*/").unwrap_or(line).trim_end()
+}
+
+/// Locate the declared member name in its PHPDoc tag, as comment byte offsets.
+/// Uses the same tag/token grammar as extraction, including multiline tags;
+/// mentions in summaries, types, parameters and descriptions are not declarations.
+pub fn phpdoc_member_name_span(
+    comment: &str,
+    name: &str,
+    kind: php_lsp_types::PhpSymbolKind,
+) -> Option<(usize, usize)> {
+    let mut text = String::new();
+    let mut segments = Vec::new();
+    for line in comment.lines().chain(std::iter::once("")) {
+        let content = strip_comment_line_markers(line);
+        if content.starts_with('@') || content.is_empty() {
+            if let Some(span) = member_span_in_tag(&text, name, kind) {
+                let map = |offset| {
+                    segments.iter().find_map(|&(start, end, original)| {
+                        (start <= offset && offset < end).then(|| original + offset - start)
+                    })
+                };
+                let start = map(span.0)?;
+                let end = map(span.1 - 1)? + 1;
+                return (end - start == span.1 - span.0).then_some((start, end));
+            }
+            text.clear();
+            segments.clear();
+        }
+        if content.is_empty() || (!content.starts_with('@') && text.is_empty()) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        let start = text.len();
+        text.push_str(content);
+        // All nonempty content slices borrow the original comment.
+        let original = content.as_ptr() as usize - comment.as_ptr() as usize;
+        segments.push((start, text.len(), original));
+    }
+    None
+}
+
+fn member_span_in_tag(
+    tag: &str,
+    name: &str,
+    kind: php_lsp_types::PhpSymbolKind,
+) -> Option<(usize, usize)> {
+    use php_lsp_types::PhpSymbolKind;
+    let (rest, start, end) = match kind {
+        PhpSymbolKind::Property => {
+            let rest = ["@property", "@property-read", "@property-write"]
+                .into_iter()
+                .find_map(|tag_name| strip_exact_tag(tag, tag_name))?;
+            let (start, end) = find_phpdoc_variable_token(rest)?;
+            if start == 0 || strip_param_prefix(&rest[start..end]) != name {
+                return None;
+            }
+            (rest, end - name.len(), end)
+        }
+        PhpSymbolKind::Method => {
+            let rest = strip_exact_tag(tag, "@method")?;
+            let rest = match split_first_word(rest) {
+                Some(("static", remaining)) => remaining.trim_start(),
+                _ => rest,
+            };
+            let (paren, _, _, declared) = find_method_signature_parens(rest)?;
+            if !declared.eq_ignore_ascii_case(name) {
+                return None;
+            }
+            let end = rest[..paren].trim_end().len();
+            (rest, end - declared.len(), end)
+        }
+        _ => return None,
+    };
+    let base = tag.len() - rest.len();
+    Some((base + start, base + end))
 }
 
 fn parse_tag(line: &str, doc: &mut PhpDoc) {

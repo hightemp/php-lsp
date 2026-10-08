@@ -15,6 +15,7 @@ fn dummy_symbol() -> Arc<SymbolInfo> {
         modifiers: Default::default(),
         attributes: vec![],
         doc_comment: None,
+        doc_comment_range: None,
         signature: None,
         parent_fqn: None,
         extends: vec![],
@@ -37,6 +38,7 @@ fn function_symbol(fqn: &str, params: Vec<ParamInfo>) -> Arc<SymbolInfo> {
         modifiers: Default::default(),
         attributes: vec![],
         doc_comment: None,
+        doc_comment_range: None,
         signature: Some(Signature {
             params,
             return_type: None,

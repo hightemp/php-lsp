@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 27;
-const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3398;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0xcf25_4b62_a79e_9725;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 28;
+const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3483;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x3292_bd51_a6ac_dd18;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -33,6 +33,7 @@ fn make_symbol(uri: &str) -> SymbolInfo {
         modifiers: SymbolModifiers::default(),
         attributes: vec![],
         doc_comment: None,
+        doc_comment_range: None,
         signature: None,
         parent_fqn: None,
         extends: vec![],
@@ -91,6 +92,7 @@ fn cache_schema_symbol(uri: &str, name: &str, kind: PhpSymbolKind) -> SymbolInfo
         },
         attributes: vec![],
         doc_comment: Some("/** @template T of object */".to_string()),
+        doc_comment_range: Some((0, 2, 0, 29)),
         signature: Some(Signature {
             params: vec![ParamInfo {
                 name: "items".to_string(),
@@ -327,6 +329,52 @@ fn cache_schema_fixture_matches_version_guard() {
         "serialized cache fixture hash changed; bump CACHE_SCHEMA_VERSION and update \
              CACHE_SCHEMA_FIXTURE_* constants together"
     );
+}
+
+#[test]
+fn cache_roundtrip_preserves_exact_phpdoc_owner_ranges() {
+    let root = unique_temp_dir("phpdoc-owner-range");
+    let file = root.join("Foo.php");
+    let source = "<?php\r\n/* 😀 */ /** @property string $slug */\r\n#[Marker]\r\nclass Foo {}";
+    fs::write(&file, source).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let symbols =
+        php_lsp_parser::symbols::extract_file_symbols(parser.tree().unwrap(), source, &uri);
+    let expected = symbols.symbols[0].doc_comment_range.unwrap();
+    let index = WorkspaceIndex::new();
+    update_disk_file(&index, &file, &uri, symbols);
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let path = root.join("index.bin");
+    save_cache_atomic(&path, &cache).unwrap();
+    let restored = WorkspaceIndex::new();
+    let report = load_valid_cached_files(
+        &restored,
+        &path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(report.loaded_files, 1);
+    let read = restored.read();
+    let file_symbols = read.file_symbols().get(&uri).unwrap();
+    assert_eq!(file_symbols.symbols.len(), 2);
+    for symbol in &file_symbols.symbols {
+        assert_eq!(symbol.doc_comment_range, Some(expected));
+        assert_eq!(
+            symbol.doc_comment.as_deref(),
+            Some("/** @property string $slug */")
+        );
+    }
+    assert_eq!(
+        restored.resolve_fqn("Foo").unwrap().doc_comment_range,
+        Some(expected)
+    );
+    drop(file_symbols);
+    drop(read);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

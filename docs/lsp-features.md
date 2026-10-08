@@ -45,7 +45,7 @@ client-visible LSP behavior and known limits.
 
 | LSP feature | Status | Notes |
 |---|---|---|
-| `textDocument/definition` | Supported | Handles indexed symbols, local variables, `$this`, constructors, PHPDoc virtual members, PHPDoc/literal shape keys, static framework string keys, template paths, Symfony Twig route keys, and lazy vendor fallback. |
+| `textDocument/definition` | Supported | Handles indexed symbols, local variables, `$this`, constructors, PHPDoc virtual members, PHPDoc/literal shape keys, static framework string keys, template paths, Symfony Twig route keys, and lazy vendor fallback. PHPDoc targets use their exact attached owner/tag spans, including repeated comments, multiline tags and attributes; missing/stale source provenance produces no guessed comment location. |
 | `textDocument/declaration` | Supported | Goes to import declarations when applicable, otherwise falls back to definition. |
 | `textDocument/typeDefinition` | Supported | Resolves variable/member/function return types where inferred or indexed, including common PHPDoc generic inheritance substitutions and PHPStan/Psalm type alias expansion. |
 | `textDocument/implementation` | Supported | Interface/trait/base type to implementations, and method implementation lookup. |

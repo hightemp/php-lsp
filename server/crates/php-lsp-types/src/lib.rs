@@ -407,6 +407,10 @@ pub struct SymbolInfo {
     pub attributes: Vec<SymbolAttribute>,
     /// Raw doc comment
     pub doc_comment: Option<String>,
+    /// Exact attached PHPDoc range, in LSP UTF-16 columns (unlike `range`).
+    /// Absent for synthetic symbols without source provenance.
+    #[serde(default)]
+    pub doc_comment_range: Option<(u32, u32, u32, u32)>,
     /// Parsed signature (for functions/methods)
     pub signature: Option<Signature>,
     /// Parent FQN (for methods/properties → class FQN)

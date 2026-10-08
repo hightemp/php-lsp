@@ -29,6 +29,7 @@ fn make_symbol(
         modifiers: SymbolModifiers::default(),
         attributes: vec![],
         doc_comment: None,
+        doc_comment_range: None,
         signature: None,
         parent_fqn: parent_fqn.map(|s| s.to_string()),
         extends: vec![],

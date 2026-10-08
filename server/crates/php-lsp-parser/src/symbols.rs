@@ -7,6 +7,10 @@ use php_lsp_types::*;
 use std::collections::HashSet;
 use tree_sitter::{Node, Tree};
 
+#[cfg(test)]
+#[path = "phpdoc_source_tests.rs"]
+mod phpdoc_source_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PhpSymbolExtractionVersion {
     pub major: u16,
@@ -108,6 +112,19 @@ fn extract_file_symbols_with_php_version(
         }
     }
 
+    // Declaration helpers stage exact CST byte ranges. Convert once per file,
+    // preserving the first-line UTF-16 prefix needed by template consumers.
+    let utf16 = crate::utf16::Utf16LineIndex::new(source);
+    for symbol in &mut result.symbols {
+        if let Some((line, column, end_line, end_column)) = symbol.doc_comment_range {
+            symbol.doc_comment_range = Some((
+                line,
+                utf16.byte_col_to_utf16(line, column),
+                end_line,
+                utf16.byte_col_to_utf16(end_line, end_column),
+            ));
+        }
+    }
     result
 }
 
@@ -621,6 +638,7 @@ fn extract_class_like(
         modifiers,
         attributes,
         doc_comment: doc_comment.clone(),
+        doc_comment_range: find_doc_comment_node(node, source).map(node_range),
         signature: None,
         parent_fqn: None,
         extends: extends_fqns,
@@ -647,7 +665,7 @@ fn extract_class_like(
             result,
             &fqn,
             node_range(name_node),
-            doc_node.start_position(),
+            node_range(doc_node),
         );
         extract_phpdoc_virtual_methods(
             doc,
@@ -655,7 +673,7 @@ fn extract_class_like(
             result,
             &fqn,
             node_range(name_node),
-            doc_node.start_position(),
+            node_range(doc_node),
         );
     }
 }
@@ -666,8 +684,9 @@ fn extract_phpdoc_virtual_properties(
     result: &mut FileSymbols,
     parent_fqn: &str,
     fallback_range: (u32, u32, u32, u32),
-    doc_start: tree_sitter::Point,
+    doc_range: (u32, u32, u32, u32),
 ) {
+    let doc_start = tree_sitter::Point::new(doc_range.0 as usize, doc_range.1 as usize);
     let phpdoc = crate::phpdoc::parse_phpdoc(doc_comment);
     let template_names: HashSet<String> = phpdoc
         .templates
@@ -706,6 +725,7 @@ fn extract_phpdoc_virtual_properties(
             modifiers: SymbolModifiers::default(),
             attributes: vec![],
             doc_comment: Some(doc_comment.to_string()),
+            doc_comment_range: Some(doc_range),
             signature: Some(Signature {
                 params: vec![],
                 return_type: Some(type_info),
@@ -726,8 +746,9 @@ fn extract_phpdoc_virtual_methods(
     result: &mut FileSymbols,
     parent_fqn: &str,
     fallback_range: (u32, u32, u32, u32),
-    doc_start: tree_sitter::Point,
+    doc_range: (u32, u32, u32, u32),
 ) {
+    let doc_start = tree_sitter::Point::new(doc_range.0 as usize, doc_range.1 as usize);
     let phpdoc = crate::phpdoc::parse_phpdoc(doc_comment);
     let template_names: HashSet<String> = phpdoc
         .templates
@@ -765,6 +786,7 @@ fn extract_phpdoc_virtual_methods(
             },
             attributes: vec![],
             doc_comment: Some(doc_comment.to_string()),
+            doc_comment_range: Some(doc_range),
             signature: Some(Signature {
                 params: method.params,
                 return_type,
@@ -855,6 +877,7 @@ fn push_enum_builtin_property(
         },
         attributes: vec![],
         doc_comment: None,
+        doc_comment_range: None,
         signature: Some(Signature {
             params: vec![],
             return_type: Some(type_info),
@@ -873,31 +896,7 @@ fn phpdoc_method_name_range(
     method_name: &str,
     doc_start: tree_sitter::Point,
 ) -> Option<(u32, u32, u32, u32)> {
-    for (line_idx, raw_line) in doc_comment.lines().enumerate() {
-        if !raw_line.contains("@method") {
-            continue;
-        }
-
-        let mut search_from = 0usize;
-        while let Some(relative_pos) = raw_line[search_from..].find(method_name) {
-            let name_start = search_from + relative_pos;
-            let after_name = &raw_line[name_start + method_name.len()..];
-            if after_name.trim_start().starts_with('(') {
-                let line = doc_start.row as u32 + line_idx as u32;
-                let line_base_col = if line_idx == 0 {
-                    doc_start.column as u32
-                } else {
-                    0
-                };
-                let start_col = line_base_col + name_start as u32;
-                let end_col = start_col + method_name.len() as u32;
-                return Some((line, start_col, line, end_col));
-            }
-            search_from = name_start + method_name.len();
-        }
-    }
-
-    None
+    phpdoc_member_name_range(doc_comment, method_name, PhpSymbolKind::Method, doc_start)
 }
 
 fn phpdoc_property_name_range(
@@ -905,27 +904,30 @@ fn phpdoc_property_name_range(
     property_name: &str,
     doc_start: tree_sitter::Point,
 ) -> Option<(u32, u32, u32, u32)> {
-    for (line_idx, raw_line) in doc_comment.lines().enumerate() {
-        if !raw_line.contains("@property") {
-            continue;
-        }
+    phpdoc_member_name_range(
+        doc_comment,
+        property_name,
+        PhpSymbolKind::Property,
+        doc_start,
+    )
+}
 
-        let needle = format!("${property_name}");
-        let Some(name_start) = raw_line.find(&needle) else {
-            continue;
-        };
-        let line = doc_start.row as u32 + line_idx as u32;
-        let line_base_col = if line_idx == 0 {
+fn phpdoc_member_name_range(
+    comment: &str,
+    name: &str,
+    kind: PhpSymbolKind,
+    doc_start: tree_sitter::Point,
+) -> Option<(u32, u32, u32, u32)> {
+    let (start, end) = crate::phpdoc::phpdoc_member_name_span(comment, name, kind)?;
+    let (line, column) = byte_offset_to_point(comment, start);
+    let column = column
+        + if line == 0 {
             doc_start.column as u32
         } else {
             0
         };
-        let start_col = line_base_col + name_start as u32 + 1;
-        let end_col = start_col + property_name.len() as u32;
-        return Some((line, start_col, line, end_col));
-    }
-
-    None
+    let line = doc_start.row as u32 + line;
+    Some((line, column, line, column + (end - start) as u32))
 }
 
 /// Extract members from a class/interface/trait/enum body.
@@ -1010,6 +1012,7 @@ fn extract_method(
         modifiers,
         attributes,
         doc_comment,
+        doc_comment_range: find_doc_comment_node(node, source).map(node_range),
         signature: Some(signature),
         parent_fqn: Some(parent_fqn.to_string()),
         extends: vec![],
@@ -1061,6 +1064,7 @@ fn extract_method(
                         modifiers: prop_mods,
                         attributes: prop_attributes,
                         doc_comment: prop_doc.clone(),
+                        doc_comment_range: find_doc_comment_node(child, source).map(node_range),
                         signature: prop_type.map(|t| Signature {
                             params: vec![],
                             return_type: Some(t),
@@ -1128,6 +1132,7 @@ fn extract_function(
         modifiers,
         attributes,
         doc_comment,
+        doc_comment_range: find_doc_comment_node(node, source).map(node_range),
         signature: Some(signature),
         parent_fqn: None,
         extends: vec![],
@@ -1197,6 +1202,7 @@ fn extract_properties(
                     modifiers,
                     attributes: attributes.clone(),
                     doc_comment: doc_comment.clone(),
+                    doc_comment_range: find_doc_comment_node(node, source).map(node_range),
                     signature: type_info.as_ref().map(|t| Signature {
                         params: vec![],
                         return_type: Some(t.clone()),
@@ -1441,6 +1447,7 @@ fn extract_class_constants(
                     modifiers,
                     attributes: attributes.clone(),
                     doc_comment: doc_comment.clone(),
+                    doc_comment_range: find_doc_comment_node(node, source).map(node_range),
                     signature: None,
                     parent_fqn: Some(parent_fqn.to_string()),
                     extends: vec![],
@@ -1503,6 +1510,7 @@ fn extract_global_constants(
                     modifiers,
                     attributes: attributes.clone(),
                     doc_comment: doc_comment.clone(),
+                    doc_comment_range: find_doc_comment_node(node, source).map(node_range),
                     signature: None,
                     parent_fqn: None,
                     extends: vec![],
@@ -1559,6 +1567,7 @@ fn extract_enum_case(
         modifiers,
         attributes,
         doc_comment,
+        doc_comment_range: find_doc_comment_node(node, source).map(node_range),
         signature: None,
         parent_fqn: Some(parent_fqn.to_string()),
         extends: vec![],
@@ -2342,17 +2351,19 @@ fn find_doc_comment(node: Node, source: &str) -> Option<String> {
 
 fn find_doc_comment_node<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
     let mut leading_doc = None;
+    let mut saw_leading_comment = false;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "attribute_list" => {}
             "comment" => {
+                saw_leading_comment = true;
                 leading_doc = node_text(child, source).starts_with("/**").then_some(child);
             }
             _ => break,
         }
     }
-    if leading_doc.is_some() {
+    if saw_leading_comment {
         return leading_doc;
     }
 

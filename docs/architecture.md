@@ -134,6 +134,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_signature_help.rs` | nullsafe/nested/incomplete calls, CST argument tracking, UTF-16/CRLF and cross-file method chains. |
 | `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
 | `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
+| `tests/e2e_phpdoc_definition.rs` | exact PHPDoc member/owner selection, inheritance/native precedence, UTF-16/CRLF buffer edits, and Twig shape-key definitions before attributes. |
 | `tests/e2e_references.rs` | document highlight, references, rename, code lens, cancellation. |
 | `tests/e2e_code_actions.rs` | quick fixes, organize imports, generate members, refactors, PHPDoc sync. |
 | `tests/e2e_diagnostics.rs` | diagnostics debounce/staleness, PHP version gates, vendor metadata refresh. |
@@ -165,12 +166,14 @@ crate boundaries.
 
 ### Position Model
 
-Tree-sitter and parser data use byte columns. LSP uses UTF-16 columns.
+Tree-sitter declaration ranges use byte columns. LSP ranges and recorded
+PHPDoc spans use UTF-16 columns.
 
 | Data | Position unit |
 |---|---|
 | `SymbolInfo.range` | Tree-sitter byte columns. |
 | `SymbolInfo.selection_range` | Tree-sitter byte columns. |
+| `SymbolInfo.doc_comment_range` | Exact attached PHPDoc range in LSP UTF-16 columns; absent without source provenance. |
 | `UseStatement.range` | Tree-sitter byte columns. |
 | `NamespaceScope.range` | Tree-sitter byte columns. |
 | Parser semantic diagnostic ranges | Tree-sitter byte columns unless converted at the server boundary. |
@@ -204,6 +207,15 @@ indexed in dedicated `WorkspaceIndex` maps. Members remain part of
 `FileSymbols.symbols` and are resolved through the owning type. Property
 `SymbolInfo.name` is stored without `$`, while property FQNs include `$` as in
 `Class::$prop`.
+
+Symbols retain the exact attached CST PHPDoc span, including comments preceding
+PHP 8 attributes. Virtual-member name selections share the PHPDoc parser's tag
+grammar and preserve original offsets across multiline tags. Definition uses
+the recorded owner span instead of searching for equal comment text. It checks
+the current open owner identity, or the closed owner and source fingerprint
+under one index publication lease, before returning a source location.
+Missing or stale provenance yields no fabricated comment location. Template shape-key definitions use the same UTF-16 anchor,
+including non-ASCII text before an inline docblock and CRLF line endings.
 
 `SymbolModifiers.is_deprecated` comes from the declaration's own PHPDoc
 `@deprecated` or a resolved built-in `#[\Deprecated]` attribute. Attribute
@@ -846,9 +858,9 @@ commit lease. A short lease protects the final rename, with a cancellation
 check. A change in the unavoidable interval after the final check is rejected
 by the content hash on the next load. Workspace cache replay rechecks files
 before publishing symbols, and staged vendor/stub commits discard changed
-sources. Schema version 26 introduced provenance tracking; current schema 27
-also persists invocation kind and owning-callable ranges and invalidates older
-reference snapshots.
+sources. Schema version 26 introduced provenance tracking; schema 27 added
+invocation kind and owning-callable ranges. Current schema 28 also persists
+exact PHPDoc owner ranges and invalidates older symbol/reference snapshots.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

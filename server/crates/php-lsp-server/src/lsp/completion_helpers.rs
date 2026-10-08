@@ -1247,37 +1247,16 @@ pub(in crate::server) fn phpdoc_virtual_member_range(
     doc_start: usize,
     member: &PhpDocVirtualMember,
 ) -> Option<(u32, u32, u32, u32)> {
-    let needle = match member.kind {
-        PhpDocVirtualMemberKind::Property => format!("${}", member.name),
-        PhpDocVirtualMemberKind::Method => format!("{}(", member.name),
+    let kind = match member.kind {
+        PhpDocVirtualMemberKind::Property => php_lsp_types::PhpSymbolKind::Property,
+        PhpDocVirtualMemberKind::Method => php_lsp_types::PhpSymbolKind::Method,
     };
-    let tag = match member.kind {
-        PhpDocVirtualMemberKind::Property => "@property",
-        PhpDocVirtualMemberKind::Method => "@method",
-    };
-
-    let mut line_offset = 0usize;
-    for line in doc_comment.split_inclusive('\n') {
-        if line.contains(tag) {
-            if let Some(local_start) = line.find(&needle) {
-                let name_start = if member.kind == PhpDocVirtualMemberKind::Method {
-                    local_start
-                } else {
-                    local_start + 1
-                };
-                let name_end = name_start + member.name.len();
-                let absolute_start = doc_start + line_offset + name_start;
-                let absolute_end = doc_start + line_offset + name_end;
-                return Some(byte_offsets_to_range(source, absolute_start, absolute_end));
-            }
-        }
-        line_offset += line.len();
-    }
-
+    let (start, end) =
+        php_lsp_parser::phpdoc::phpdoc_member_name_span(doc_comment, &member.name, kind)?;
     Some(byte_offsets_to_range(
         source,
-        doc_start,
-        doc_start + doc_comment.len().min(3),
+        doc_start + start,
+        doc_start + end,
     ))
 }
 

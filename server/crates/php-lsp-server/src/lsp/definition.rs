@@ -4,6 +4,10 @@ use super::super::*;
 use super::hierarchy::{implementation_symbols_for_method, implementation_symbols_for_type};
 use super::references::local_symbol_for_reference;
 
+#[cfg(test)]
+#[path = "phpdoc_definition_tests.rs"]
+mod phpdoc_definition_tests;
+
 fn local_type_symbol(
     file_symbols: &php_lsp_types::FileSymbols,
     fqn: &str,
@@ -921,7 +925,18 @@ impl PhpLspBackend {
                 sym_at_pos.allows_global_fallback,
             )
             .await
-            .filter(|symbol| symbol.uri != uri_str)
+            .and_then(|symbol| {
+                if symbol.uri == uri_str {
+                    // Inherited members can resolve to another declaration in
+                    // this file. Keep its authoritative snapshot rather than
+                    // falling through to a PHPDoc member with the same name.
+                    let mut resolved = sym_at_pos.clone();
+                    resolved.fqn.clone_from(&symbol.fqn);
+                    local_symbol_for_reference(&file_symbols, &resolved)
+                } else {
+                    Some(symbol)
+                }
+            })
         };
 
         // For constructor refs (`new ClassName()`), fall back to the class
@@ -1200,10 +1215,71 @@ impl PhpLspBackend {
         let source = self
             .source_for_uri_in_request(request, &symbol.uri, label)
             .await?;
+        // Extracted virtual members select their tag name as their entire
+        // symbol range. They pass the same provenance gate as fallback members.
+        if symbol.doc_comment.is_some()
+            && symbol.range == symbol.selection_range
+            && matches!(
+                symbol.kind,
+                php_lsp_types::PhpSymbolKind::Method | php_lsp_types::PhpSymbolKind::Property
+            )
+        {
+            self.validate_phpdoc_symbol_source(request, symbol, &source)?;
+        }
         Some(Location {
             uri: symbol.uri.parse::<Uri>().ok()?,
             range: range_from_byte_range(&source, symbol.selection_range),
         })
+    }
+
+    fn validate_phpdoc_symbol_source(
+        &self,
+        request: &WorkspaceRequestContext,
+        symbol: &php_lsp_types::SymbolInfo,
+        source: &str,
+    ) -> Option<()> {
+        let doc_comment = symbol.doc_comment.as_ref()?;
+        let doc_range = range_from_lsp_tuple(symbol.doc_comment_range?);
+        if text_at_lsp_range(source, doc_range)? != doc_comment {
+            return None;
+        }
+        if text_at_lsp_range(
+            source,
+            range_from_byte_range(source, symbol.selection_range),
+        )? != symbol.name
+        {
+            return None;
+        }
+        let matches_symbol = |candidate: &php_lsp_types::SymbolInfo| {
+            candidate.kind == symbol.kind
+                && php_lsp_types::symbol_fqn_eq(&candidate.fqn, &symbol.fqn, candidate.kind)
+                && candidate.selection_range == symbol.selection_range
+                && candidate.doc_comment_range == symbol.doc_comment_range
+                && candidate.doc_comment == symbol.doc_comment
+        };
+        if let Some(snapshot) = self.open_document_snapshot(&symbol.uri) {
+            if snapshot.source != source
+                || !snapshot.file_symbols.symbols.iter().any(matches_symbol)
+            {
+                return None;
+            }
+        } else {
+            let index = request.index(&self.index);
+            // Match the captured symbol and fingerprint in one publication
+            // lease; a newer file fingerprint cannot validate an older owner.
+            let published = index.read();
+            let expected = published
+                .source_fingerprints()
+                .get(&symbol.uri)
+                .map(|entry| *entry.value())?;
+            let symbols = published.file_symbols().get(&symbol.uri)?;
+            if !symbols.symbols.iter().any(matches_symbol)
+                || expected != SourceFingerprint::from_bytes(source.as_bytes())
+            {
+                return None;
+            }
+        }
+        Some(())
     }
 
     pub(in crate::server) async fn phpdoc_virtual_member_location(
@@ -1218,10 +1294,10 @@ impl PhpLspBackend {
                 "phpdoc virtual member source read",
             )
             .await?;
+        self.validate_phpdoc_symbol_source(request, &member.owner, &source)?;
         let doc_comment = member.owner.doc_comment.as_ref()?;
-        let owner_start =
-            byte_offset_for_line_col(&source, member.owner.range.0, member.owner.range.1)?;
-        let doc_start = source.get(..owner_start)?.rfind(doc_comment)?;
+        let doc_range = range_from_lsp_tuple(member.owner.doc_comment_range?);
+        let doc_start = lsp_position_to_byte(&source, doc_range.start)?;
         let range = phpdoc_virtual_member_range(&source, doc_comment, doc_start, member)?;
         let utf16_range = range_byte_to_utf16(&source, range);
         Some(Location {

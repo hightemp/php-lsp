@@ -1430,6 +1430,38 @@ hierarchy 2/2. Полный последовательный `CARGO_BUILD_JOBS=1
 Что исправить: хранить range PHPDoc owner/tag при extraction или искать только
 в диапазоне конкретного owner symbol.
 
+Реализация (2026-10-08): `SymbolInfo.doc_comment_range` хранит точный диапазон
+прикреплённого CST PHPDoc в UTF-16. Parser virtual-member selection и server
+fallback используют общий поиск объявленного имени тега, включая multiline
+PHPDoc; части других имён и упоминания в descriptions не считаются declaration.
+Обычный comment между атрибутом и declaration останавливает привязку PHPDoc.
+
+И fallback, и индексированные virtual symbols сверяют текст comment/name и
+актуальную идентичность владельца. Open snapshots являются авторитетными;
+для closed source обязательны совпадающие `FileSymbols` и source fingerprint
+под одной index publication lease. Новая публикация индекса не может подтвердить
+старый owner только новым fingerprint. При отсутствующей provenance переход
+не угадывается. Native inherited declarations из того же файла сохраняют
+приоритет над одноимённым `@method` через актуальный request snapshot.
+
+Twig shape-key definitions используют тот же точный UTF-16 anchor вместо
+арифметики по строкам declaration. Сохранены logical URI, inline non-ASCII
+prefixes, CRLF и обновления открытых буферов. Cache schema увеличена до 28;
+старые symbol snapshots перестраиваются. Новые performance/coverage измерения
+не выполнялись; прежние baseline figures остаются историческими.
+
+Статус (2026-10-08): исправлено через TDD. Добавлены 18 regressions: 5 parser,
+9 server/helper, 3 LSP и 1 cache round-trip. Начальный RED воспроизвёл 4 server
+и 2 parser failures; дополнительные RED проверки закрепили comment barriers,
+несохранённые/closed namespace changes, native precedence, indexed virtual
+path, отсутствие fingerprint/span и замену опубликованного индекса после
+захвата owner/tag. Финальный последовательный `CARGO_BUILD_JOBS=1 cargo test
+--all -- --test-threads=1` прошёл 1311/1311 без ignored. Clippy
+`--all-targets -D warnings`, Rustfmt и diff check прошли. Повторный Verifier
+на `gpt-6-sol` — GO после устранения замечаний по provenance. Архитектура,
+feature/test matrix и cache baseline notes обновлены; новые измерения не
+заявлены. Исходное описание находки сохранено дословно.
+
 ### CODEX-P2-20. Inlay/hover type owner выбирается как первый класс файла
 
 В [`server_variable_type_info`](server/crates/php-lsp-server/src/lsp/inlay_hints.rs#L1468)

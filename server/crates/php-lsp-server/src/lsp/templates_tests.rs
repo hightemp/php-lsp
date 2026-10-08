@@ -623,6 +623,7 @@ fn finds_phpdoc_list_shape_definition_after_non_ascii_text() {
         modifiers: php_lsp_types::SymbolModifiers::default(),
         attributes: Vec::new(),
         doc_comment: Some(comment.to_string()),
+        doc_comment_range: Some((9, 4, 11, 3)),
         signature: None,
         parent_fqn: Some("App\\Repository\\MessageLogRepository".to_string()),
         extends: Vec::new(),
@@ -668,6 +669,27 @@ fn finds_phpdoc_list_shape_definition_after_non_ascii_text() {
     );
     assert_eq!(definition.range.0, 10);
     assert_eq!(definition.range.1, expected_character);
+}
+
+#[test]
+fn phpdoc_definition_shape_uses_attached_comment_with_attributes_and_trivia() {
+    for source in [
+        "<?php\nclass Owned {\n/** @return array{slug: string} */\n#[Marker]\n#[Other]\n\npublic function rows() {}\n}",
+        "<?php\r\nclass Owned {\r\n/**\r\n * @return array{slug: string}\r\n */\r\n\r\n#[Marker]\r\npublic function rows() {}\r\n}",
+        "<?php\nclass Owned { /* 😀 */ /** @return array{slug: string} */ #[Marker] public function rows() {} }",
+    ] {
+        let symbols = parse_test_file_symbols(source, "file:///phpdoc-shape.php");
+        let method = symbols.symbols.iter().find(|symbol| symbol.name == "rows").unwrap();
+        let definitions = collect_symbol_type_shape_definitions(
+            &WorkspaceIndex::new(), &symbols, method, "Owned",
+            method.signature.as_ref().unwrap().return_type.as_ref().unwrap(),
+            TemplateShapeDefinitionTarget::Direct,
+        );
+        let definition = definitions.iter().find(|definition| definition.path == ["slug"]).unwrap();
+        let offset = source.find("slug:").unwrap();
+        let expected = range_byte_to_utf16(source, byte_offsets_to_range(source, offset, offset + 4));
+        assert_eq!(definition.range, expected, "{source}");
+    }
 }
 
 #[test]
