@@ -135,6 +135,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
 | `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
 | `tests/e2e_phpdoc_definition.rs` | exact PHPDoc member/owner selection, inheritance/native precedence, UTF-16/CRLF buffer edits, and Twig shape-key definitions before attributes. |
+| `tests/e2e_phpdoc_definition_stress.rs` | concurrent JSON-RPC definitions, edits, close/reopen, watched-file and full Composer reindex; exact stable disk/buffer results and progress watchdog. |
 | `tests/e2e_references.rs` | document highlight, references, rename, code lens, cancellation. |
 | `tests/e2e_code_actions.rs` | quick fixes, organize imports, generate members, refactors, PHPDoc sync. |
 | `tests/e2e_diagnostics.rs` | diagnostics debounce/staleness, PHP version gates, vendor metadata refresh. |
@@ -818,9 +819,17 @@ therefore wait for an in-progress commit and cannot observe an intermediate
 file generation. Async handlers clone the data they need before releasing the
 lease and awaiting other work. The revision barrier remains separate: it
 serializes source writers with staged aggregate and derived-data commits.
+Index cleanup snapshots URI keys before entering the parser map; it holds a
+vacant parser entry during removal so a concurrent open cannot lose its
+snapshot. Parser-map access never occurs under an index read lease.
 Composer metadata changes also rebuild the aggregate in staging; a
 metadata-only refresh repeats a superseded staged build until it can publish
 against the current source revisions or a newer runtime generation takes over.
+An owned indexing run also retries a changed source revision with its original
+leases, refreshing staging before each attempt. Replacement, root removal,
+shutdown and worker failures stop this work. This preserves progress to
+`ready` when edits overlap configuration reload, Composer invalidation or
+indexing postprocessing; revision checks remain mandatory for publication.
 
 ## Disk Cache Model
 
@@ -850,7 +859,10 @@ and top-level symbol snapshots.
 
 Disk symbols and references carry a fingerprint of the exact raw bytes parsed,
 even when parser input uses lossy UTF-8 conversion. Open-buffer and derived
-snapshots have no disk fingerprint and cannot be written to disk cache. Cache
+snapshots have no disk fingerprint and cannot be written to disk cache.
+Closing a PHP document restores the parsed disk fingerprint with its corresponding
+PHP-version symbols into aggregate, primary and secondary indexes. Reopened
+buffers invalidate the old close token and use buffer provenance. Cache
 construction includes a file only when its current bytes match that published
 fingerprint; changed files remain eligible for reparsing. Source checks run in
 bounded blocking work before cache publication, outside the indexing run's

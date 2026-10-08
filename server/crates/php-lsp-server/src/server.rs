@@ -402,6 +402,7 @@ where
             ctx.uri_str,
             snapshot.file_symbols.clone(),
             references,
+            None,
         );
     } else {
         let root_index = ctx.root_index.unwrap_or(ctx.index);
@@ -432,12 +433,14 @@ struct ClosedPhpSecondaryIndexUpdate<'a> {
     index: &'a WorkspaceIndex,
     file_symbols: Option<php_lsp_types::FileSymbols>,
     references: Vec<php_lsp_types::SymbolReference>,
+    source_fingerprint: Option<SourceFingerprint>,
 }
 
 fn commit_closed_php_index_if_current_with_hook<F>(
     ctx: ClosedPhpIndexCommitContext<'_>,
     file_symbols: Option<php_lsp_types::FileSymbols>,
     references: Vec<php_lsp_types::SymbolReference>,
+    source_fingerprint: Option<SourceFingerprint>,
     secondary_updates: Vec<ClosedPhpSecondaryIndexUpdate<'_>>,
     before_open_lock: F,
 ) -> bool
@@ -467,6 +470,7 @@ where
             ctx.uri_str,
             file_symbols,
             references,
+            source_fingerprint,
         );
     } else {
         let root_index = ctx.root_index.unwrap_or(ctx.index);
@@ -474,9 +478,18 @@ where
     }
     for update in secondary_updates {
         if let Some(symbols) = update.file_symbols {
-            update
-                .index
-                .update_file_with_references(ctx.uri_str, symbols, update.references);
+            if let Some(source) = update.source_fingerprint {
+                update.index.update_file_with_references_from_source(
+                    ctx.uri_str,
+                    symbols,
+                    update.references,
+                    source,
+                );
+            } else {
+                update
+                    .index
+                    .update_file_with_references(ctx.uri_str, symbols, update.references);
+            }
         } else {
             update.index.remove_file(ctx.uri_str);
         }
@@ -2346,10 +2359,20 @@ fn update_aggregate_and_root_index(
     uri: &str,
     file_symbols: php_lsp_types::FileSymbols,
     references: Vec<php_lsp_types::SymbolReference>,
+    source_fingerprint: Option<SourceFingerprint>,
 ) {
-    root_index.update_file_with_references(uri, file_symbols.clone(), references.clone());
+    let publish = |index: &WorkspaceIndex,
+                   symbols: php_lsp_types::FileSymbols,
+                   references: Vec<php_lsp_types::SymbolReference>| {
+        if let Some(source) = source_fingerprint {
+            index.update_file_with_references_from_source(uri, symbols, references, source);
+        } else {
+            index.update_file_with_references(uri, symbols, references);
+        }
+    };
+    publish(root_index, file_symbols.clone(), references.clone());
     if !std::ptr::eq(aggregate, root_index) {
-        aggregate.update_file_with_references(uri, file_symbols, references);
+        publish(aggregate, file_symbols, references);
     }
 }
 
@@ -2368,18 +2391,34 @@ fn clear_non_stub_symbols(
     index: &WorkspaceIndex,
     open_files: Option<&DashMap<String, FileParser>>,
 ) {
+    clear_non_stub_symbols_with_hook(index, open_files, || {});
+}
+
+fn clear_non_stub_symbols_with_hook<F: FnOnce()>(
+    index: &WorkspaceIndex,
+    open_files: Option<&DashMap<String, FileParser>>,
+    before_open_lookup: F,
+) {
+    // Never acquire the parser map while holding an index publication lease:
+    // document writers hold the parser entry before publishing their index.
     let uris: Vec<String> = index
         .read()
         .file_symbols()
         .iter()
-        .filter(|entry| {
-            !entry.key().starts_with("phpstub://")
-                && open_files.is_none_or(|open_files| !open_files.contains_key(entry.key()))
-        })
+        .filter(|entry| !entry.key().starts_with("phpstub://"))
         .map(|entry| entry.key().clone())
         .collect();
+    before_open_lookup();
     for uri in uris {
-        index.remove_file(&uri);
+        if let Some(open_files) = open_files {
+            // Keep absence and removal atomic with didOpen in the same
+            // parser-entry -> index order used by document writers.
+            if let dashmap::mapref::entry::Entry::Vacant(_closed) = open_files.entry(uri.clone()) {
+                index.remove_file(&uri);
+            }
+        } else {
+            index.remove_file(&uri);
+        }
     }
 }
 

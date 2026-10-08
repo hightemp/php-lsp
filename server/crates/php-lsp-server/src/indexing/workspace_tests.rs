@@ -1187,3 +1187,83 @@ fn post_index_diagnostics_require_the_latest_runtime_config_and_index() {
         &runtime,
     ));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_aggregate_retry_preserves_lease_and_stops_on_replacement_or_shutdown() {
+    // The hook forces a source commit after staging; scheduler timing is not
+    // needed to exercise the retry, supersession and cancellation branches.
+    for mode in ["retry", "replace", "remove", "shutdown"] {
+        let root = std::env::temp_dir().join(format!("php-lsp-aggregate-retry-{mode}"));
+        let uri = php_lsp_types::uri::path_to_uri(&root.join("Subject.php")).unwrap();
+        let (_, before, _) = parsed_document(&uri, "<?php class Before {}");
+        let (_, after, _) = parsed_document(&uri, "<?php class After {}");
+        let source = Arc::new(WorkspaceIndex::new());
+        source.update_file(&uri, before);
+        let aggregate = Arc::new(WorkspaceIndex::new());
+        let coordinator = Arc::new(IndexingRunCoordinator::default());
+        let owner = coordinator.start(root.clone());
+        let lease = owner.lease();
+        let original_id = lease.run_id();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let replacement = Arc::new(StdMutex::new(None));
+        coordinator.set_before_aggregate_commit_hook({
+            let attempts = attempts.clone();
+            let source = source.clone();
+            let uri = uri.clone();
+            let coordinator = Arc::downgrade(&coordinator);
+            let root = root.clone();
+            let replacement = replacement.clone();
+            Arc::new(move || {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    source.update_file(&uri, after.clone());
+                    let coordinator = coordinator.upgrade().unwrap();
+                    match mode {
+                        "retry" => {}
+                        "replace" => {
+                            *replacement.lock().unwrap() = Some(coordinator.start(root.clone()))
+                        }
+                        "remove" => coordinator.cancel_and_remove(&root),
+                        "shutdown" => coordinator.cancel_all(),
+                        _ => unreachable!(),
+                    }
+                }
+            })
+        });
+        let config = WorkspaceRootConfig {
+            workspace_folder: root.clone(),
+            root,
+            namespace_map: None,
+            runtime_config: ResolvedRuntimeConfiguration::default(),
+            index: source,
+            vendor_file_lru: Arc::new(Mutex::new(VendorFileLru::default())),
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            rebuild_aggregate_for_indexing_runs_with_outcome(
+                &coordinator,
+                &Arc::new(Mutex::new(())),
+                &aggregate,
+                vec![config],
+                PhpVersion::DEFAULT,
+                Arc::new(DashMap::new()),
+                Arc::new(DashMap::new()),
+                Arc::new(DashMap::new()),
+                std::slice::from_ref(&lease),
+            ),
+        )
+        .await
+        .expect("aggregate retry did not stop");
+        if mode == "retry" {
+            assert!(outcome == AggregateRebuildOutcome::Published);
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(lease.run_id(), original_id);
+            assert!(lease.is_current());
+            assert!(aggregate.resolve_fqn("After").is_some());
+            assert!(aggregate.resolve_fqn("Before").is_none());
+        } else {
+            assert!(outcome == AggregateRebuildOutcome::Stale, "{mode}");
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(aggregate.resolve_fqn("After").is_none());
+        }
+    }
+}

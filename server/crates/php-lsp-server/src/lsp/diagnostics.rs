@@ -597,6 +597,7 @@ impl PhpLspBackend {
                             &uri_str,
                             file_symbols,
                             references,
+                            None,
                         );
                         Some(sym_count)
                     } else {
@@ -641,6 +642,7 @@ impl PhpLspBackend {
                             &uri_str,
                             file_symbols,
                             references,
+                            None,
                         );
                         Some(sym_count)
                     } else {
@@ -852,6 +854,7 @@ impl PhpLspBackend {
                             &uri_str,
                             file_symbols,
                             references,
+                            None,
                         );
                     } else {
                         remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
@@ -1059,14 +1062,19 @@ impl PhpLspBackend {
                         references: snapshot
                             .map(|item| item.references.clone())
                             .unwrap_or_default(),
+                        source_fingerprint: snapshot.and_then(|item| item.source_fingerprint),
                     }
                 })
                 .collect::<Vec<_>>();
             let primary = if updates.is_empty() {
-                (None, Vec::new())
+                (None, Vec::new(), None)
             } else {
                 let first = updates.remove(0);
-                (first.file_symbols, first.references)
+                (
+                    first.file_symbols,
+                    first.references,
+                    first.source_fingerprint,
+                )
             };
             let committed = commit_closed_php_index_if_current_with_hook(
                 ClosedPhpIndexCommitContext {
@@ -1080,6 +1088,7 @@ impl PhpLspBackend {
                 },
                 primary.0,
                 primary.1,
+                primary.2,
                 updates,
                 || {},
             );

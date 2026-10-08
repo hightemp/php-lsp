@@ -2261,58 +2261,71 @@ pub(in crate::server) async fn rebuild_aggregate_for_indexing_runs_with_outcome(
     runs: &[IndexingRunLease],
 ) -> AggregateRebuildOutcome {
     let _aggregate_rebuild = aggregate_rebuild.lock().await;
-    if runs.iter().any(|run| !run.is_current()) {
-        return AggregateRebuildOutcome::Stale;
-    }
-    let expected_source_revision = coordinator.aggregate_source_revision();
-    let mut source_indexes = configs
-        .iter()
-        .map(|config| config.index.clone())
-        .collect::<Vec<_>>();
-    source_indexes.sort_by_key(|index| Arc::as_ptr(index) as usize);
-    source_indexes.dedup_by(|left, right| Arc::ptr_eq(left, right));
-    let expected_index_revisions = source_indexes
-        .iter()
-        .map(|index| index.revision_snapshot())
-        .collect::<Vec<_>>();
-    let staged = Arc::new(WorkspaceIndex::new());
-    let staged_for_build = staged.clone();
-    let built = tokio::task::spawn_blocking(move || {
-        rebuild_aggregate_index(
-            &staged_for_build,
-            &configs,
-            fallback_php_version,
-            &open_files,
-            &template_documents,
-            &document_versions,
-        );
-    })
-    .await
-    .is_ok();
-    if !built {
-        return AggregateRebuildOutcome::Failed;
-    }
-    let coordinator = coordinator.clone();
-    let runs = runs.to_vec();
-    let aggregate_index = aggregate_index.clone();
-    match tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
-        coordinator.before_aggregate_commit_for_test();
-        coordinator
-            .commit_aggregate_if_current(&runs, expected_source_revision, || {
-                aggregate_index.replace_from_staged_if_sources_current(
-                    &staged,
-                    &source_indexes,
-                    &expected_index_revisions,
-                )
-            })
-            .is_some_and(|committed| committed)
-    })
-    .await
-    {
-        Ok(true) => AggregateRebuildOutcome::Published,
-        Ok(false) => AggregateRebuildOutcome::Stale,
-        Err(_) => AggregateRebuildOutcome::Failed,
+    loop {
+        if runs.iter().any(|run| !run.is_current()) {
+            return AggregateRebuildOutcome::Stale;
+        }
+        let expected_source_revision = coordinator.aggregate_source_revision();
+        let mut source_indexes = configs
+            .iter()
+            .map(|config| config.index.clone())
+            .collect::<Vec<_>>();
+        source_indexes.sort_by_key(|index| Arc::as_ptr(index) as usize);
+        source_indexes.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let expected_index_revisions = source_indexes
+            .iter()
+            .map(|index| index.revision_snapshot())
+            .collect::<Vec<_>>();
+        let staged = Arc::new(WorkspaceIndex::new());
+        let staged_for_build = staged.clone();
+        let configs_for_build = configs.clone();
+        let build_open_files = open_files.clone();
+        let build_templates = template_documents.clone();
+        let build_versions = document_versions.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            rebuild_aggregate_index(
+                &staged_for_build,
+                &configs_for_build,
+                fallback_php_version,
+                &build_open_files,
+                &build_templates,
+                &build_versions,
+            );
+        })
+        .await
+        .is_ok();
+        if !built {
+            return AggregateRebuildOutcome::Failed;
+        }
+        let coordinator = coordinator.clone();
+        let committed_runs = runs.to_vec();
+        let aggregate_for_commit = aggregate_index.clone();
+        match tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            coordinator.before_aggregate_commit_for_test();
+            coordinator
+                .commit_aggregate_if_current(&committed_runs, expected_source_revision, || {
+                    aggregate_for_commit.replace_from_staged_if_sources_current(
+                        &staged,
+                        &source_indexes,
+                        &expected_index_revisions,
+                    )
+                })
+                .is_some_and(|committed| committed)
+        })
+        .await
+        {
+            Ok(true) => return AggregateRebuildOutcome::Published,
+            Err(_) => return AggregateRebuildOutcome::Failed,
+            Ok(false) if runs.is_empty() || runs.iter().any(|run| !run.is_current()) => {
+                return AggregateRebuildOutcome::Stale
+            }
+            Ok(false) => {
+                // An owned indexing run stays pending when only its input revision
+                // changed. Retry the same leases; replacement/removal cancels them.
+                tokio::task::yield_now().await;
+            }
+        }
     }
 }
 
@@ -3638,6 +3651,7 @@ impl PhpLspBackend {
                         &new_uri_str,
                         file_symbols,
                         references,
+                        None,
                     );
                 } else {
                     remove_from_aggregate_and_root_index(&self.index, &new_index, &new_uri_str);

@@ -588,6 +588,7 @@ fn closed_index_restore_cannot_overwrite_a_reopened_document() {
             },
             Some(disk_symbols),
             Vec::new(),
+            None,
             Vec::new(),
             || {
                 ready_tx.send(()).expect("announce parsed disk snapshot");
@@ -9591,4 +9592,108 @@ fn test_resolve_vendor_paths() {
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn closed_restore_keeps_fingerprints_in_aggregate_primary_and_secondary_indexes() {
+    let uri = "file:///closed-restore-fingerprints.php";
+    let source = "<?php /** @property string $slug */ class Restored {}";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let symbols = extract_file_symbols(parser.tree().unwrap(), source, uri);
+    let fingerprint = SourceFingerprint::from_bytes(source.as_bytes());
+    let open = DashMap::new();
+    let versions = DashMap::new();
+    let tokens = DashMap::new();
+    tokens.insert(uri.to_string(), 1);
+    let aggregate = WorkspaceIndex::new();
+    let primary = WorkspaceIndex::new();
+    let secondary = WorkspaceIndex::new();
+    assert!(commit_closed_php_index_if_current_with_hook(
+        ClosedPhpIndexCommitContext {
+            open_files: &open,
+            document_versions: &versions,
+            reload_tokens: &tokens,
+            index: &aggregate,
+            root_index: Some(&primary),
+            uri_str: uri,
+            token: 1,
+        },
+        Some(symbols.clone()),
+        Vec::new(),
+        Some(fingerprint),
+        vec![ClosedPhpSecondaryIndexUpdate {
+            index: &secondary,
+            file_symbols: Some(symbols),
+            references: Vec::new(),
+            source_fingerprint: Some(fingerprint),
+        }],
+        || {},
+    ));
+    for index in [&aggregate, &primary, &secondary] {
+        let published = index.read();
+        assert_eq!(
+            *published.source_fingerprints().get(uri).unwrap().value(),
+            fingerprint
+        );
+        assert_eq!(published.file_symbols().get(uri).unwrap().symbols.len(), 2);
+    }
+    assert!(!tokens.contains_key(uri));
+}
+
+#[test]
+fn index_cleanup_releases_publication_lease_before_waiting_for_open_document() {
+    let uri = "file:///cleanup-lock-order.php";
+    let index = Arc::new(WorkspaceIndex::new());
+    index.update_file(uri, FileSymbols::default());
+    let open_files = Arc::new(DashMap::new());
+    open_files.insert(uri.to_string(), FileParser::new());
+    let parser_guard = open_files.entry(uri.to_string());
+    let (at_lookup_tx, at_lookup_rx) = std::sync::mpsc::channel();
+    let cleanup_index = index.clone();
+    let cleanup_open = open_files.clone();
+    let cleanup = std::thread::spawn(move || {
+        clear_non_stub_symbols_with_hook(&cleanup_index, Some(&cleanup_open), || {
+            at_lookup_tx.send(()).unwrap();
+        });
+    });
+    at_lookup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (mutated_tx, mutated_rx) = std::sync::mpsc::channel();
+    let mutation_index = index.clone();
+    let mutation = std::thread::spawn(move || {
+        mutation_index.update_file(uri, FileSymbols::default());
+        mutated_tx.send(()).unwrap();
+    });
+    let independent_index_write_completed =
+        mutated_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+    // Release before joining/asserting, so even the old inversion produces a
+    // bounded test failure instead of leaving the unit-test binary deadlocked.
+    drop(parser_guard);
+    cleanup.join().unwrap();
+    mutation.join().unwrap();
+    assert!(
+        independent_index_write_completed,
+        "cleanup held an index lease while waiting on the parser entry"
+    );
+    assert!(index.read().file_symbols().contains_key(uri));
+}
+
+#[test]
+fn index_cleanup_preserves_a_document_opened_after_its_key_snapshot() {
+    let uri = "file:///cleanup-open-race.php";
+    let index = WorkspaceIndex::new();
+    index.update_file(uri, FileSymbols::default());
+    let open_files = DashMap::new();
+    clear_non_stub_symbols_with_hook(&index, Some(&open_files), || {
+        let dashmap::mapref::entry::Entry::Vacant(entry) = open_files.entry(uri.to_string()) else {
+            panic!("fixture must be closed");
+        };
+        let mut parser = FileParser::new();
+        let source = "<?php class NewlyOpened {}";
+        parser.parse_full(source);
+        let symbols = extract_file_symbols(parser.tree().unwrap(), source, uri);
+        index.update_file(uri, symbols);
+        entry.insert(parser);
+    });
+    assert!(index.resolve_fqn("NewlyOpened").is_some());
 }

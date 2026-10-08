@@ -1462,6 +1462,35 @@ path, отсутствие fingerprint/span и замену опубликова
 feature/test matrix и cache baseline notes обновлены; новые измерения не
 заявлены. Исходное описание находки сохранено дословно.
 
+Дополнительная конкурентная проверка (2026-10-08): добавлен JSON-RPC stress
+с двумя readers, edit/close/reopen и watched/full Composer reindex на двух
+Tokio workers. Mutex диспетчера освобождается до ожидания обработчика;
+проверяются точные допустимые owner locations, стабильные состояния после
+удаления тегов, положительные ответы и продвижение latest reindex к `ready`.
+Отдельный watchdog обнаруживает блокировки, при которых Tokio timeout не может
+выполниться. Конечное состояние проверяет disk → unsaved buffer → удаление
+PHPDoc → восстановление disk.
+
+Проверка выявила и через RED → GREEN закрепила три дефекта: close терял
+fingerprint дискового разбора; изменение source revision обрывало действующий
+reindex на `discovering`; cleanup удерживал index read lease при обращении
+к parser map, создавая инверсию с editor writer. Теперь fingerprint передаётся
+в aggregate/primary/secondary с соответствующими PHP-version symbols;
+aggregate staging повторяется с теми же действующими leases и прекращается
+при replacement/removal/shutdown/failure; cleanup освобождает index lease
+до parser lookup и удерживает vacant parser entry при удалении.
+
+Добавлены 6 follow-up regressions: 2 protocol и 4 unit, включая управляемые
+source-revision/run-lifecycle и lock/open interleavings. После последнего fix
+прошли 20/20 stress-пар с метриками и 10/10 с обычным captured output:
+46 080 concurrent definitions, до 4 overlapping handlers; в каждом прогоне
+64 edits, 16 close/reopen, 64 watched events и 8 completed full reindexes.
+Полный последовательный Rust-набор: 1317/1317, 42 targets, 0 ignored;
+Clippy, Rustfmt и diff check прошли. Повторный Verifier `gpt-6-sol` — GO.
+Schema остаётся 28; новые performance/coverage measurements не заявлены.
+Это конечная стресс-проверка, а не доказательство всех возможных schedules.
+Исходная находка и предыдущие записи реализации/проверок сохранены.
+
 ### CODEX-P2-20. Inlay/hover type owner выбирается как первый класс файла
 
 В [`server_variable_type_info`](server/crates/php-lsp-server/src/lsp/inlay_hints.rs#L1468)
