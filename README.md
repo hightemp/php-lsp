@@ -36,6 +36,9 @@ phpstorm-stubs support.
   missing properties, and missing class constants.
 - Basic type compatibility checks for assignments, returns, arguments,
   properties, and member calls.
+- Native type contracts remain authoritative when PHPDoc contradicts them;
+  compatible generics/shapes refine inference, and proven annotation conflicts
+  produce diagnostics.
 - Best-effort PHPDoc template metadata, PHPStan/Psalm type aliases and imported
   aliases, and inherited generic member type substitution for common repository
   and collection patterns, including foreach values from PHPDoc-generic
@@ -209,7 +212,8 @@ phpstorm-stubs support.
   vendor metadata is cached in memory with an LRU for lazy vendor symbols. The
   2026-05-28 large-workspace baseline met the warm cache target, but that timing
   has not been rerun after source-provenance checks (schema 26), call-site
-  metadata (schema 27), or exact PHPDoc owner ranges (current schema 28).
+  metadata (schema 27), exact PHPDoc owner ranges (schema 28), or separate
+  native/PHPDoc type provenance (current schema 29).
   Installed-vendor first-hit behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses merge indexed
   closed-file references with ordinary open PHP snapshots, but still iterate

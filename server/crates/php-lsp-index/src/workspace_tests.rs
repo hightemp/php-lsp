@@ -2021,6 +2021,8 @@ fn test_template_substitution_for_generic_repository_method() {
         signature: Some(Signature {
             params: vec![],
             return_type: Some(TypeInfo::Simple("TEntity".to_string())),
+
+            ..Default::default()
         }),
         parent_fqn: Some("App\\Repository".to_string()),
         extends: vec![],
@@ -2097,6 +2099,8 @@ fn test_template_substitution_for_collection_item_type() {
         signature: Some(Signature {
             params: vec![],
             return_type: Some(TypeInfo::Simple("TItem".to_string())),
+
+            ..Default::default()
         }),
         parent_fqn: Some("App\\Collection".to_string()),
         extends: vec![],
@@ -2169,6 +2173,8 @@ fn test_type_alias_expands_class_scoped_array_shape() {
         signature: Some(Signature {
             params: vec![],
             return_type: Some(TypeInfo::Simple("UserShape".to_string())),
+
+            ..Default::default()
         }),
         parent_fqn: Some("App\\UserService".to_string()),
         extends: vec![],
@@ -2238,6 +2244,8 @@ fn test_imported_type_alias_expands_from_source_class() {
         signature: Some(Signature {
             params: vec![],
             return_type: Some(TypeInfo::Simple("LocalShape".to_string())),
+
+            ..Default::default()
         }),
         parent_fqn: Some("App\\UserService".to_string()),
         extends: vec![],
@@ -2287,6 +2295,8 @@ fn test_file_level_type_alias_expands_function_return() {
         signature: Some(Signature {
             params: vec![],
             return_type: Some(TypeInfo::Simple("UserShape".to_string())),
+
+            ..Default::default()
         }),
         parent_fqn: None,
         extends: vec![],
@@ -2424,6 +2434,8 @@ fn test_recursive_type_alias_falls_back_to_raw_alias() {
         signature: Some(Signature {
             params: vec![],
             return_type: Some(TypeInfo::Simple("A".to_string())),
+
+            ..Default::default()
         }),
         parent_fqn: Some("App\\LoopService".to_string()),
         extends: vec![],

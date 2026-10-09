@@ -6368,3 +6368,29 @@ change.
   - Validation target: behavior-preserving test seam if needed; RED against the original audited ordering → restore/fix → GREEN, focused caller regressions, full sequential CARGO_BUILD_JOBS=1 Rust checks with --test-threads=1, Clippy, Rustfmt, diff check, documentation/status verification and reused Verifier on gpt-6-sol to GO.
   - Implemented: confirmed the existing notification-before-flag correction from commit 688f8b5 (2026-09-24/P2-05) against Tokio 1.49.0's creation-time notify_waiters generation contract. Extracted the same production wait loop with a no-op after-check hook for deterministic races. Added 13 regressions covering synchronous/cross-thread check-to-await cancellation, pre-cancellation, suspended/rearmed waiters, broadcast, waiter drop, repeated cancellation, clone identity/isolation, select branch recreation and bounded 128×16 parallel registration.
   - Validation: original audited order mutation gave two immediate RED behavior failures (single-thread and cross-thread check/await gap, exit101); finally restored the existing safe order. GREEN13/13 plus two focused external-command cancellation/no-spawn callers. Full sequential Rust suite1370/1370 across44 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check passed. Reused Verifier on gpt-6-sol returned GO. Final documentation distinguishes the prior P2-05 correction from current regression coverage, retains original audit and prior journal, matrix53 rows/105 valid links, schema28 and historical coverage/performance dates. Bounded stress provides finite evidence for128 rounds×16 waiters, not exhaustive scheduling proof.
+
+### Milestone: CODEX-P2-23 native/PHPDoc type provenance (2026-10-08 -> 2026-10-08)
+
+**Статус:** done
+**Цель:** Preserve native contracts, accept compatible PHPDoc refinements and diagnose proven contradictions without silently replacing native types.
+
+#### Exit criteria
+
+- Behavioral RED regressions before implementation, then compatible/incompatible/unknown type cases through parser, index/cache and LSP.
+- Separate native/PHPDoc provenance, one compatibility policy, stable namespace/template resolution and schema migration.
+- Full sequential Rust validation with CARGO_BUILD_JOBS=1 and --test-threads=1, Clippy, Rustfmt, diff check, original audit retained, final documentation verification and reused Verifier on gpt-6-sol to GO.
+
+#### Задачи
+
+- [x] **P223-001-2026-10-08** Protect extracted/native signatures and retain PHPDoc provenance through TDD. *(done 2026-10-08)*
+  - Scope: parameter and return metadata, structural refinements, aliases/templates and class relations; keep valid PHPDoc fallbacks and compatible richer types.
+  - Implemented: separate native/PHPDoc provenance and safe effective projections for params, returns and properties. Shared Compatible/Incompatible/Unknown policy uses declaration-scoped imports/aliases, template bounds and bounded class relations; native static and DNF contracts remain intact.
+  - Validation: initial RED reproduced overwritten native params and specificity-based returns; 7 shared-type and 10 parser regressions cover compatible/incompatible/unknown cases, globals/imports/templates, structural types and key-of/callable controls.
+- [x] **P223-002-2026-10-08** Apply the shared policy to inference and diagnostics. *(done 2026-10-08)*
+  - Scope: parser/index/server consumers, actual hover/completion/signature/definition behavior, proven contradiction diagnostics, UTF-16/CRLF and unsaved updates.
+  - Implemented: parser bodies and index/server consumers share safe projected types; dependency changes recalculate indexed refinements. Proven conflicts produce phpdoc-type-mismatch at attached UTF-16 PHPDoc spans under existing typeCompatibility severity. Method/constructor/accessor generation reads native fields, keeping compatible detail in comments.
+  - Validation: RED reproduced signature help, assignment hover, valid native-call rejection, lost generic parameter detail, false key-of/callable rules and generated PHP type replacement. GREEN includes 4 index tests (256 concurrent replacements/256 snapshot reads with a common start barrier), 4 server/helper and 10 LSP tests covering completion/typeDefinition, static owner, CRLF/UTF-16 and unsaved doc correction. Concurrent evidence is bounded, not exhaustive scheduling proof.
+- [x] **P223-003-2026-10-08** Validate cache migration, full checks and final review/documentation. *(done 2026-10-08)*
+  - Scope: cache schema/fixture/round-trip, regression tests, sequential full Rust suite, Verifier and preserved audit wording.
+  - Implemented: schema 29 and updated binary fixture retain native/PHPDoc provenance; permanent cache round-trip regression added. Updated README, architecture, LSP behavior, coverage matrix and audit implementation status without rewriting original findings or prior journal entries.
+  - Validation: 36 new regressions total; full sequential Rust suite1406/1406 across45 test-result targets,0 ignored; CARGO_BUILD_JOBS=1 and --test-threads=1. Clippy --all-targets -D warnings, Rustfmt and diff check passed; after lint-only cleanup parser10/10 and cache fixture1/1 passed again. Reused Verifier on gpt-6-sol gave repeated GO for implementation, tests and final documentation. Original audit finding and earlier TASKS bytes verified unchanged. Matrix54 rows/111 valid local evidence links; historical coverage/performance dates retained and schema29 warm timing unmeasured.

@@ -136,6 +136,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_signature_help.rs` | nullsafe/nested/incomplete calls, CST argument tracking, UTF-16/CRLF and cross-file method chains. |
 | `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
 | `tests/e2e_type_owner.rs` | lexical PHPDoc type owners, hover/inlay type links, namespace imports, anonymous-class boundaries and unsaved UTF-16/CRLF updates. |
+| `tests/e2e_phpdoc_native.rs` | native/PHPDoc contracts, signature and assignment hover, compatible parameter generics, late-static owner and UTF-16/CRLF document updates. |
 | `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
 | `tests/e2e_phpdoc_definition.rs` | exact PHPDoc member/owner selection, inheritance/native precedence, UTF-16/CRLF buffer edits, and Twig shape-key definitions before attributes. |
 | `tests/e2e_phpdoc_definition_stress.rs` | concurrent JSON-RPC definitions, edits, close/reopen, watched-file and full Composer reindex; exact stable disk/buffer results and progress watchdog. |
@@ -479,12 +480,23 @@ quoted strings, booleans, null, decimal/binary/octal/hex integers with numeric
 separators, and decimal or scientific floats. Unsupported or malformed numeric
 forms remain plain type names rather than guessed literals.
 
-Member-return inference prefers a more specific PHPDoc return type over a
-wider native return type when both are available, for example
-`@return Collection<int, Item>` on a method declared as `: Collection`.
-Parser-side same-file inference resolves those PHPDoc class names relative to
-the declaring symbol before foreach value completion uses them, so an open
-edited file and an indexed cross-file call follow the same type path.
+Signatures retain native and PHPDoc parameter/return types separately, alongside
+their safe effective projection. `php-lsp-types/src/type_refinement.rs` defines one
+conservative compatible/incompatible/unknown policy. Parser same-file inference
+and index materialization resolve declaration-scoped imports, aliases, template
+bounds and class relations before promoting PHPDoc. For example,
+`Collection<int, Item>` can refine native `Collection`; an object PHPDoc cannot
+replace native `int`. Unknown hierarchy evidence retains the native contract and
+is reconsidered after dependency indexing changes. Native `static` retains its
+late-bound owner; `self` and a fixed owner class cannot broaden it.
+Proven contradictions produce `phpdoc-type-mismatch` warnings at the attached
+UTF-16 PHPDoc span, controlled by the existing typeCompatibility severity setting.
+Valid fallbacks and richer compatible generic/shape types remain available.
+Unresolved `key-of` domains keep native string/int contracts without false
+contradiction warnings. Closure inheritance can prove callability, but absence
+of that inheritance cannot disprove `__invoke`; unsupported proofs stay unknown.
+Generated PHP method and property-member declarations
+read native provenance; compatible refinements remain in their PHPDoc.
 
 ## Startup Flow
 
@@ -885,8 +897,9 @@ check. A change in the unavoidable interval after the final check is rejected
 by the content hash on the next load. Workspace cache replay rechecks files
 before publishing symbols, and staged vendor/stub commits discard changed
 sources. Schema version 26 introduced provenance tracking; schema 27 added
-invocation kind and owning-callable ranges. Current schema 28 also persists
-exact PHPDoc owner ranges and invalidates older symbol/reference snapshots.
+invocation kind and owning-callable ranges. Schema 28 added exact PHPDoc owner
+ranges. Current schema 29 also retains native/PHPDoc type provenance separately
+and invalidates older symbol/reference snapshots.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

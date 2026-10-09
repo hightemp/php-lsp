@@ -192,6 +192,8 @@ fn test_param(name: &str) -> php_lsp_types::ParamInfo {
         is_variadic: false,
         is_by_ref: false,
         is_promoted: false,
+
+        ..Default::default()
     }
 }
 
@@ -706,6 +708,8 @@ fn test_conditional_return_uses_subject_parameter_position_for_positional_argume
     let signature = Signature {
         params: vec![test_param("prefix"), test_param("abstract")],
         return_type: None,
+
+        ..Default::default()
     };
     let function_resolver = |function_name: &str| -> Option<ResolvedFunctionType> {
         (function_name == "App\\helper").then(|| {
@@ -772,10 +776,14 @@ fn test_conditional_return_uses_defaulted_subject_argument_when_omitted() {
     let response_signature = Signature {
         params: vec![defaulted_test_param("content", "null")],
         return_type: None,
+
+        ..Default::default()
     };
     let redirect_signature = Signature {
         params: vec![defaulted_test_param("to", "null")],
         return_type: None,
+
+        ..Default::default()
     };
     let function_resolver = |function_name: &str| -> Option<ResolvedFunctionType> {
         match function_name {

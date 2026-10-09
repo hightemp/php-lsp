@@ -14,4 +14,5 @@ pub mod semantic;
 pub mod semantic_tokens;
 pub mod signature_help;
 pub mod symbols;
+pub mod type_contract;
 pub mod utf16;

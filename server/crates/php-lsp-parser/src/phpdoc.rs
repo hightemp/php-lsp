@@ -553,13 +553,16 @@ fn parse_method_param(param: &str) -> Option<ParamInfo> {
         return None;
     }
 
+    let type_info = (!type_part.is_empty()).then(|| parse_type_string(type_part));
     Some(ParamInfo {
+        phpdoc_type_info: type_info.clone(),
         name,
-        type_info: (!type_part.is_empty()).then(|| parse_type_string(type_part)),
+        type_info,
         default_value,
         is_variadic: name_str.contains("..."),
         is_by_ref: name_str.contains('&'),
         is_promoted: false,
+        ..Default::default()
     })
 }
 
@@ -812,7 +815,7 @@ fn find_phpdoc_variable_token(rest: &str) -> Option<(usize, usize)> {
 }
 
 /// Parse a PHPDoc type string into TypeInfo.
-fn parse_type_string(s: &str) -> TypeInfo {
+pub(crate) fn parse_type_string(s: &str) -> TypeInfo {
     let s = s.trim();
 
     if let Some(callable) = parse_callable_signature(s) {

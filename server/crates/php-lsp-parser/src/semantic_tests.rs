@@ -42,6 +42,8 @@ fn function_symbol(fqn: &str, params: Vec<ParamInfo>) -> Arc<SymbolInfo> {
         signature: Some(Signature {
             params,
             return_type: None,
+
+            ..Default::default()
         }),
         parent_fqn: None,
         extends: vec![],
@@ -60,6 +62,8 @@ fn variadic_param(name: &str) -> ParamInfo {
         is_variadic: true,
         is_by_ref: false,
         is_promoted: false,
+
+        ..Default::default()
     }
 }
 
@@ -263,6 +267,8 @@ Collision();
         is_variadic: false,
         is_by_ref: false,
         is_promoted: false,
+
+        ..Default::default()
     };
     let diags = parse_and_check_typed(code, |fqn, expected_kinds| {
         if expected_kinds.contains(&PhpSymbolKind::Function) {
@@ -423,6 +429,8 @@ helper();
                         is_variadic: false,
                         is_by_ref: false,
                         is_promoted: false,
+
+                        ..Default::default()
                     },
                     ParamInfo {
                         name: "b".to_string(),
@@ -431,6 +439,8 @@ helper();
                         is_variadic: false,
                         is_by_ref: false,
                         is_promoted: false,
+
+                        ..Default::default()
                     },
                 ],
             ))
@@ -469,6 +479,8 @@ strlen("x", "y");
                     is_variadic: false,
                     is_by_ref: false,
                     is_promoted: false,
+
+                    ..Default::default()
                 }],
             )
             .as_ref()
@@ -550,6 +562,8 @@ fn builtin_literal_unpack_retains_strict_upper_bound() {
                     is_variadic: false,
                     is_by_ref: false,
                     is_promoted: false,
+
+                    ..Default::default()
                 }],
             )
             .as_ref()
@@ -582,6 +596,8 @@ fn builtin_constructor_retains_strict_upper_bound() {
                     is_variadic: false,
                     is_by_ref: false,
                     is_promoted: false,
+
+                    ..Default::default()
                 }],
             )
             .as_ref()
@@ -804,6 +820,8 @@ preg_replace_callback('/x/', function(){}, 'input');
                         is_variadic: false,
                         is_by_ref: false,
                         is_promoted: false,
+
+                        ..Default::default()
                     },
                     ParamInfo {
                         name: "callback".to_string(),
@@ -812,6 +830,8 @@ preg_replace_callback('/x/', function(){}, 'input');
                         is_variadic: false,
                         is_by_ref: false,
                         is_promoted: false,
+
+                        ..Default::default()
                     },
                     ParamInfo {
                         name: "subject".to_string(),
@@ -820,6 +840,8 @@ preg_replace_callback('/x/', function(){}, 'input');
                         is_variadic: false,
                         is_by_ref: false,
                         is_promoted: false,
+
+                        ..Default::default()
                     },
                     ParamInfo {
                         name: "limit".to_string(),
@@ -828,6 +850,8 @@ preg_replace_callback('/x/', function(){}, 'input');
                         is_variadic: false,
                         is_by_ref: false,
                         is_promoted: false,
+
+                        ..Default::default()
                     },
                     ParamInfo {
                         name: "count".to_string(),
@@ -836,6 +860,8 @@ preg_replace_callback('/x/', function(){}, 'input');
                         is_variadic: false,
                         is_by_ref: true,
                         is_promoted: false,
+
+                        ..Default::default()
                     },
                     ParamInfo {
                         name: "flags".to_string(),
@@ -844,6 +870,8 @@ preg_replace_callback('/x/', function(){}, 'input');
                         is_variadic: false,
                         is_by_ref: false,
                         is_promoted: false,
+
+                        ..Default::default()
                     },
                 ],
             ))

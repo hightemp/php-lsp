@@ -1,5 +1,96 @@
 use super::*;
 
+#[test]
+fn generated_property_members_preserve_native_contract_and_only_safe_doc_detail() {
+    for (native, doc, keep_doc) in [
+        ("int", "Wrong", false),
+        ("array", "array<int, string>", true),
+        ("Base", "Child", true),
+    ] {
+        let source = format!("<?php class Wrong {{}} class Base {{}} class Child extends Base {{}} class Owner {{ /** @var {doc} */ public {native} $value; }}");
+        let mut parser = FileParser::new();
+        parser.parse_full(&source);
+        let file = extract_file_symbols(
+            parser.tree().unwrap(),
+            &source,
+            "file:///property-contract.php",
+        );
+        let properties = constructor_generation_properties(&source, &file, "Owner");
+        let property = properties[0].symbol;
+        let constructor =
+            render_constructor_method(&properties, None, "", "    ", PhpVersion::DEFAULT);
+        let getter = render_accessor_method(
+            property,
+            AccessorKind::Getter,
+            "getValue",
+            "",
+            "    ",
+            PhpVersion::DEFAULT,
+        );
+        let setter = render_accessor_method(
+            property,
+            AccessorKind::Setter,
+            "setValue",
+            "",
+            "    ",
+            PhpVersion::DEFAULT,
+        );
+        assert!(
+            constructor.contains(&format!("function __construct({native} $value)")),
+            "unsafe constructor: {constructor}"
+        );
+        assert!(
+            getter.contains(&format!("function getValue(): {native}")),
+            "unsafe getter: {getter}"
+        );
+        assert!(
+            setter.contains(&format!("function setValue({native} $value): void")),
+            "unsafe setter: {setter}"
+        );
+        for text in [constructor, getter, setter] {
+            if keep_doc {
+                assert!(text.contains(doc), "lost compatible detail: {text}");
+            } else {
+                assert!(!text.contains(doc), "propagated incompatible doc: {text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn generated_method_contract_uses_native_types_instead_of_phpdoc_refinements() {
+    for (native, doc, expected) in [
+        ("array", "array<int, string>", "array"),
+        ("Base", "Child", "Base"),
+        ("", "Child", ""),
+    ] {
+        let source = format!("<?php class Base {{}} class Child extends Base {{}} interface Contract {{ /**\n * @param {doc} $value\n * @return {doc}\n */ public function subject({native} $value){}; }}", if native.is_empty() { String::new() } else { format!(": {native}") });
+        let mut parser = FileParser::new();
+        parser.parse_full(&source);
+        let file = extract_file_symbols(parser.tree().unwrap(), &source, "file:///contract.php");
+        let method = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "subject")
+            .unwrap();
+        let text = render_missing_method_stub(method, None, "", "    ", PhpVersion::DEFAULT);
+        let param = if expected.is_empty() {
+            "$value".into()
+        } else {
+            format!("{expected} $value")
+        };
+        let ret = if expected.is_empty() {
+            String::new()
+        } else {
+            format!(": {expected}")
+        };
+        assert!(
+            text.contains(&format!("function subject({param}){ret}\n")),
+            "native contract changed: {text}"
+        );
+    }
+}
+
 fn byte_range_for(source: &str, needle: &str, last: bool) -> (u32, u32, u32, u32) {
     let start = if last {
         source.rfind(needle)

@@ -33,7 +33,8 @@ samples, so it does not replace these measurements. The 2026-09-25 cache
 provenance change (schema 26) added source revalidation; cold and warm
 large-workspace timings have not been rerun for that implementation or the
 2026-10-07 call-site metadata change (schema 27) or the 2026-10-08 exact PHPDoc
-owner-range change (current schema 28).
+owner-range change (schema 28) or separate native/PHPDoc type provenance
+(current schema 29).
 
 ## Latest Performance Acceptance Snapshot
 

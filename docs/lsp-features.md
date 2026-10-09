@@ -126,6 +126,13 @@ behavior cannot be established).
 | `textDocument/semanticTokens/full/delta` | Supported | Delta edits from previous full snapshots. |
 | `textDocument/semanticTokens/range` | Supported | Range semantic token requests for open files. |
 
+Native parameter, property and return types remain authoritative. PHPDoc can
+refine them when its compatibility is proven; uncertain relations retain the
+native type. Proven contradictions produce `phpdoc-type-mismatch` diagnostics
+at the attached PHPDoc span under the existing type-compatibility severity
+setting. Generated implementations, constructors and accessors preserve native
+PHP declarations while retaining compatible PHPDoc detail.
+
 ## Template Documents
 
 | Area | Status | Notes |

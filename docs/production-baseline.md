@@ -352,7 +352,8 @@ acceptance are tracked separately by `PV-003` and `PV-004`.
 These are historical measurements. Warm-start time has not been remeasured
 after the 2026-09-25 schema-26 source-provenance checks or the 2026-10-07
 schema-27 call-site metadata change or the 2026-10-08 schema-28 PHPDoc
-owner-range change.
+owner-range change or the 2026-10-08 schema-29 native/PHPDoc type-provenance
+change.
 
 ### Large Workspace Latency
 

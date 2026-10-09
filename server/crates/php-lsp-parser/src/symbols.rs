@@ -11,6 +11,10 @@ use tree_sitter::{Node, Tree};
 #[path = "phpdoc_source_tests.rs"]
 mod phpdoc_source_tests;
 
+#[cfg(test)]
+#[path = "phpdoc_native_tests.rs"]
+mod phpdoc_native_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PhpSymbolExtractionVersion {
     pub major: u16,
@@ -124,6 +128,10 @@ fn extract_file_symbols_with_php_version(
                 utf16.byte_col_to_utf16(end_line, end_column),
             ));
         }
+    }
+    let snapshot = result.clone();
+    for symbol in &mut result.symbols {
+        crate::type_contract::select_signature_types(symbol, &snapshot);
     }
     result
 }
@@ -727,8 +735,11 @@ fn extract_phpdoc_virtual_properties(
             doc_comment: Some(doc_comment.to_string()),
             doc_comment_range: Some(doc_range),
             signature: Some(Signature {
+                phpdoc_return_type: Some(type_info.clone()),
                 params: vec![],
                 return_type: Some(type_info),
+
+                ..Default::default()
             }),
             parent_fqn: Some(parent_fqn.to_string()),
             extends: vec![],
@@ -788,8 +799,11 @@ fn extract_phpdoc_virtual_methods(
             doc_comment: Some(doc_comment.to_string()),
             doc_comment_range: Some(doc_range),
             signature: Some(Signature {
+                phpdoc_return_type: return_type.clone(),
                 params: method.params,
                 return_type,
+
+                ..Default::default()
             }),
             parent_fqn: Some(parent_fqn.to_string()),
             extends: vec![],
@@ -881,6 +895,8 @@ fn push_enum_builtin_property(
         signature: Some(Signature {
             params: vec![],
             return_type: Some(type_info),
+
+            ..Default::default()
         }),
         parent_fqn: Some(parent_fqn.to_string()),
         extends: vec![],
@@ -1068,6 +1084,8 @@ fn extract_method(
                         signature: prop_type.map(|t| Signature {
                             params: vec![],
                             return_type: Some(t),
+
+                            ..Default::default()
                         }),
                         parent_fqn: Some(parent_fqn.to_string()),
                         extends: vec![],
@@ -1204,6 +1222,10 @@ fn extract_properties(
                     doc_comment: doc_comment.clone(),
                     doc_comment_range: find_doc_comment_node(node, source).map(node_range),
                     signature: type_info.as_ref().map(|t| Signature {
+                        native_return_type: native_type_info.clone(),
+                        phpdoc_return_type: doc_comment
+                            .as_deref()
+                            .and_then(|doc| phpdoc_var_type_for_property(doc, raw_name)),
                         params: vec![],
                         return_type: Some(t.clone()),
                     }),
@@ -1585,13 +1607,13 @@ fn extract_enum_case(
 ///   parameters that are optional in PHP but have no explicit default value.
 fn apply_phpdoc_to_signature(signature: &mut Signature, doc_comment: &str) {
     let phpdoc = crate::phpdoc::parse_phpdoc(doc_comment);
-
-    // Fallback: @return type
-    if signature.return_type.is_none() {
-        if let Some(ret) = phpdoc.return_type {
-            signature.return_type = Some(ret);
-        }
-    }
+    signature.phpdoc_return_type = phpdoc.return_type;
+    signature.return_type = php_lsp_types::type_refinement::preferred_type(
+        signature.native_return_type.as_ref(),
+        signature.phpdoc_return_type.as_ref(),
+        signature.return_type.as_ref(),
+        &|_, _| None,
+    );
 
     // Mark [optional] params with a synthetic default value
     for phpdoc_param in &phpdoc.params {
@@ -1601,7 +1623,13 @@ fn apply_phpdoc_to_signature(signature: &mut Signature, doc_comment: &str) {
             .find(|p| p.name == phpdoc_param.name)
         {
             if let Some(type_info) = phpdoc_param.type_info.as_ref() {
-                sig_param.type_info = Some(type_info.clone());
+                sig_param.phpdoc_type_info = Some(type_info.clone());
+                sig_param.type_info = php_lsp_types::type_refinement::preferred_type(
+                    sig_param.native_type_info.as_ref(),
+                    sig_param.phpdoc_type_info.as_ref(),
+                    sig_param.type_info.as_ref(),
+                    &|_, _| None,
+                );
             }
         }
 
@@ -1903,8 +1931,11 @@ fn extract_signature(
         .map(|t| parse_type_node(t, source));
 
     Signature {
+        native_return_type: return_type.clone(),
         params,
         return_type,
+
+        ..Default::default()
     }
 }
 
@@ -1964,17 +1995,24 @@ fn extract_param(node: Node, source: &str) -> ParamInfo {
     let is_promoted = node.kind() == "property_promotion_parameter";
 
     ParamInfo {
+        native_type_info: type_info.clone(),
         name,
         type_info,
         default_value,
         is_variadic,
         is_by_ref,
         is_promoted,
+
+        ..Default::default()
     }
 }
 
 /// Parse a type node into TypeInfo.
 fn parse_type_node(node: Node, source: &str) -> TypeInfo {
+    let text = node_text(node, source);
+    if text.contains('(') && (text.contains('|') || text.contains('&')) {
+        return crate::phpdoc::parse_type_string(text);
+    }
     match node.kind() {
         "union_type" => {
             let mut types = Vec::new();

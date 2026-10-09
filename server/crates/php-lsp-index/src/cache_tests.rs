@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 28;
-const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3483;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x3292_bd51_a6ac_dd18;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 29;
+const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3998;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x43d3156f43a8f96e;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -96,6 +96,11 @@ fn cache_schema_symbol(uri: &str, name: &str, kind: PhpSymbolKind) -> SymbolInfo
         signature: Some(Signature {
             params: vec![ParamInfo {
                 name: "items".to_string(),
+                native_type_info: Some(TypeInfo::Simple("array".to_string())),
+                phpdoc_type_info: Some(TypeInfo::Generic {
+                    base: "array".to_string(),
+                    args: vec![TypeInfo::Simple("int".to_string())],
+                }),
                 type_info: Some(TypeInfo::Generic {
                     base: "array".to_string(),
                     args: vec![TypeInfo::ArrayShape(vec![ArrayShapeItem {
@@ -110,6 +115,10 @@ fn cache_schema_symbol(uri: &str, name: &str, kind: PhpSymbolKind) -> SymbolInfo
                 is_promoted: false,
             }],
             return_type: Some(TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple(
+                "App\\Foo".to_string(),
+            ))))),
+            native_return_type: Some(TypeInfo::Simple("string".to_string())),
+            phpdoc_return_type: Some(TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple(
                 "App\\Foo".to_string(),
             ))))),
         }),
@@ -329,6 +338,49 @@ fn cache_schema_fixture_matches_version_guard() {
         "serialized cache fixture hash changed; bump CACHE_SCHEMA_VERSION and update \
              CACHE_SCHEMA_FIXTURE_* constants together"
     );
+}
+
+#[test]
+fn serialized_symbols_preserve_native_and_conflicting_phpdoc_provenance() {
+    let source="<?php class Wrong {} /**\n * @param Wrong $value\n * @return Wrong\n */ function subject(int $value): int {return $value;}";
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let symbols = php_lsp_parser::symbols::extract_file_symbols(
+        parser.tree().unwrap(),
+        source,
+        "file:///cache-native.php",
+    );
+    let bytes = bincode::serialize(&symbols).unwrap();
+    let restored: php_lsp_types::FileSymbols = bincode::deserialize(&bytes).unwrap();
+    let signature = restored
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "subject")
+        .unwrap()
+        .signature
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        signature.params[0].native_type_info,
+        Some(TypeInfo::Simple("int".into()))
+    );
+    assert_eq!(
+        signature.params[0].phpdoc_type_info,
+        Some(TypeInfo::Simple("Wrong".into()))
+    );
+    assert_eq!(
+        signature.params[0].type_info,
+        Some(TypeInfo::Simple("int".into()))
+    );
+    assert_eq!(
+        signature.native_return_type,
+        Some(TypeInfo::Simple("int".into()))
+    );
+    assert_eq!(
+        signature.phpdoc_return_type,
+        Some(TypeInfo::Simple("Wrong".into()))
+    );
+    assert_eq!(signature.return_type, Some(TypeInfo::Simple("int".into())));
 }
 
 #[test]

@@ -8,6 +8,10 @@ use super::super::*;
 #[path = "type_owner_tests.rs"]
 mod type_owner_tests;
 
+#[cfg(test)]
+#[path = "phpdoc_native_return_tests.rs"]
+mod phpdoc_native_return_tests;
+
 const DECLARATION_SCOPE_END_HINT_MIN_LINES: u32 = 2;
 const LARGE_SCOPE_END_HINT_MIN_LINES: u32 = 8;
 const CONTROL_SCOPE_END_HINT_MAX_CHARS: usize = 96;
@@ -2447,10 +2451,11 @@ pub(in crate::server) fn resolve_call_site_return_type(
 pub(in crate::server) fn symbol_effective_return_type(
     symbol: &php_lsp_types::SymbolInfo,
 ) -> Option<php_lsp_types::TypeInfo> {
-    let native = symbol
-        .signature
-        .as_ref()
-        .and_then(|signature| signature.return_type.as_ref());
+    let signature = symbol.signature.as_ref();
+    if let Some(signature) = signature.filter(|signature| signature.has_type_provenance()) {
+        return signature.return_type.clone();
+    }
+    let native = signature.and_then(|signature| signature.return_type.as_ref());
     let phpdoc = symbol.doc_comment.as_deref().and_then(|doc| {
         let parsed = parse_phpdoc(doc);
         if symbol.kind == php_lsp_types::PhpSymbolKind::Property {
@@ -2459,81 +2464,7 @@ pub(in crate::server) fn symbol_effective_return_type(
             parsed.return_type
         }
     });
-
-    match (native, phpdoc) {
-        (Some(native), Some(phpdoc))
-            if type_info_specificity_score(&phpdoc) > type_info_specificity_score(native) =>
-        {
-            Some(phpdoc)
-        }
-        (Some(native), _) => Some(native.clone()),
-        (None, Some(phpdoc)) => Some(phpdoc),
-        (None, None) => None,
-    }
-}
-
-pub(in crate::server) fn type_info_specificity_score(type_info: &php_lsp_types::TypeInfo) -> usize {
-    match type_info {
-        php_lsp_types::TypeInfo::Mixed
-        | php_lsp_types::TypeInfo::Void
-        | php_lsp_types::TypeInfo::Never
-        | php_lsp_types::TypeInfo::LiteralNull => 0,
-        php_lsp_types::TypeInfo::Simple(name) => {
-            if is_builtin_type_name(name) {
-                1
-            } else {
-                3
-            }
-        }
-        php_lsp_types::TypeInfo::Self_
-        | php_lsp_types::TypeInfo::Static_
-        | php_lsp_types::TypeInfo::Parent_ => 3,
-        php_lsp_types::TypeInfo::Nullable(inner) => type_info_specificity_score(inner),
-        php_lsp_types::TypeInfo::Union(types) | php_lsp_types::TypeInfo::Intersection(types) => {
-            types.iter().map(type_info_specificity_score).sum()
-        }
-        php_lsp_types::TypeInfo::Generic { args, .. } => {
-            4 + args.iter().map(type_info_specificity_score).sum::<usize>()
-        }
-        php_lsp_types::TypeInfo::ArrayShape(items) => {
-            5 + items
-                .iter()
-                .map(|item| type_info_specificity_score(&item.value))
-                .sum::<usize>()
-        }
-        php_lsp_types::TypeInfo::ObjectShape(items) => {
-            5 + items
-                .iter()
-                .map(|item| type_info_specificity_score(&item.value))
-                .sum::<usize>()
-        }
-        php_lsp_types::TypeInfo::Callable {
-            params,
-            return_type,
-        } => {
-            3 + params
-                .iter()
-                .map(type_info_specificity_score)
-                .sum::<usize>()
-                + return_type
-                    .as_ref()
-                    .map(|return_type| type_info_specificity_score(return_type))
-                    .unwrap_or_default()
-        }
-        php_lsp_types::TypeInfo::ClassString(inner) => {
-            3 + inner
-                .as_ref()
-                .map(|inner| type_info_specificity_score(inner))
-                .unwrap_or_default()
-        }
-        php_lsp_types::TypeInfo::LiteralString(_)
-        | php_lsp_types::TypeInfo::LiteralInt(_)
-        | php_lsp_types::TypeInfo::LiteralFloat(_)
-        | php_lsp_types::TypeInfo::LiteralBool(_) => 2,
-        php_lsp_types::TypeInfo::Conditional {
-            if_type, else_type, ..
-        } => 3 + type_info_specificity_score(if_type) + type_info_specificity_score(else_type),
-    }
+    php_lsp_types::type_refinement::preferred_type(native, phpdoc.as_ref(), native, &|_, _| None)
 }
 
 pub(in crate::server) fn call_site_arguments_by_param(

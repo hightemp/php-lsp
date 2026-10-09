@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod type_refinement;
 pub mod uri;
 
 /// Kind of a PHP symbol.
@@ -226,10 +227,17 @@ pub fn normalize_shape_key_text(key: &str) -> String {
 }
 
 /// Parameter information for a function/method.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParamInfo {
     pub name: String,
+    /// Safe effective type, after compatible PHPDoc refinement.
     pub type_info: Option<TypeInfo>,
+    /// Original PHP declaration, independent of PHPDoc.
+    #[serde(default)]
+    pub native_type_info: Option<TypeInfo>,
+    /// PHPDoc declaration, retained even when incompatible with native.
+    #[serde(default)]
+    pub phpdoc_type_info: Option<TypeInfo>,
     pub default_value: Option<String>,
     pub is_variadic: bool,
     pub is_by_ref: bool,
@@ -237,10 +245,42 @@ pub struct ParamInfo {
 }
 
 /// Function/method signature.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
     pub params: Vec<ParamInfo>,
     pub return_type: Option<TypeInfo>,
+    #[serde(default)]
+    pub native_return_type: Option<TypeInfo>,
+    #[serde(default)]
+    pub phpdoc_return_type: Option<TypeInfo>,
+}
+
+impl ParamInfo {
+    /// Legacy synthetic signatures use only type_info; extracted signatures keep
+    /// explicit provenance, including an absent native declaration.
+    pub fn declared_native_type(&self) -> Option<&TypeInfo> {
+        self.native_type_info.as_ref().or_else(|| {
+            self.phpdoc_type_info
+                .is_none()
+                .then_some(self.type_info.as_ref())
+                .flatten()
+        })
+    }
+}
+
+impl Signature {
+    pub fn declared_native_return_type(&self) -> Option<&TypeInfo> {
+        self.native_return_type.as_ref().or_else(|| {
+            self.phpdoc_return_type
+                .is_none()
+                .then_some(self.return_type.as_ref())
+                .flatten()
+        })
+    }
+
+    pub fn has_type_provenance(&self) -> bool {
+        self.native_return_type.is_some() || self.phpdoc_return_type.is_some()
+    }
 }
 
 /// Variance declared for a PHPDoc template parameter.

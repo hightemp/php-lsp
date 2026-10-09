@@ -2580,7 +2580,7 @@ fn extract_preceding_phpdoc_var_inference(
     })
 }
 
-fn expand_file_type_aliases(
+pub(crate) fn expand_file_type_aliases(
     type_info: &TypeInfo,
     file_symbols: &FileSymbols,
     visited: &mut Vec<String>,
@@ -2761,6 +2761,38 @@ fn infer_variable_in_scope(
                                     callable_resolver,
                                 ) {
                                     inferred = callable_info;
+                                }
+                            }
+                            if let Some(declaration) = file_symbols.symbols.iter().find(|symbol| {
+                                matches!(
+                                    symbol.kind,
+                                    PhpSymbolKind::Function | PhpSymbolKind::Method
+                                ) && symbol.range == node_range(scope_node)
+                            }) {
+                                if let Some(type_info) = declaration
+                                    .signature
+                                    .as_ref()
+                                    .and_then(|signature| {
+                                        signature.params.iter().find(|param| {
+                                            param.name.trim_start_matches('$')
+                                                == var_name.trim_start_matches('$')
+                                        })
+                                    })
+                                    .and_then(|param| param.type_info.as_ref())
+                                {
+                                    let qualified = resolve_type_info_relative_to_symbol(
+                                        type_info,
+                                        declaration,
+                                        file_symbols,
+                                    );
+                                    inferred.type_display = Some(type_info.to_string());
+                                    inferred.resolved_type_fqn = resolve_phpdoc_var_type(
+                                        &qualified,
+                                        param,
+                                        source,
+                                        file_symbols,
+                                    );
+                                    inferred.type_info = Some(qualified);
                                 }
                             }
                             break;
@@ -3768,10 +3800,14 @@ fn resolve_symbol_type_info_to_object_fqn(
 }
 
 fn symbol_effective_type_info(symbol: &SymbolInfo, file_symbols: &FileSymbols) -> Option<TypeInfo> {
-    let native = symbol
-        .signature
-        .as_ref()
-        .and_then(|signature| signature.return_type.as_ref());
+    let signature = symbol.signature.as_ref();
+    if let Some(signature) = signature.filter(|signature| signature.has_type_provenance()) {
+        return signature
+            .return_type
+            .as_ref()
+            .map(|ty| resolve_type_info_relative_to_symbol(ty, symbol, file_symbols));
+    }
+    let native = signature.and_then(|signature| signature.return_type.as_ref());
     let phpdoc = symbol.doc_comment.as_deref().and_then(|doc| {
         let parsed = parse_phpdoc(doc);
         if symbol.kind == php_lsp_types::PhpSymbolKind::Property {
@@ -3780,30 +3816,8 @@ fn symbol_effective_type_info(symbol: &SymbolInfo, file_symbols: &FileSymbols) -
             parsed.return_type
         }
     });
-
-    match (native, phpdoc) {
-        (Some(native), Some(phpdoc))
-            if parser_type_info_specificity_score(&phpdoc)
-                > parser_type_info_specificity_score(native) =>
-        {
-            Some(resolve_type_info_relative_to_symbol(
-                &phpdoc,
-                symbol,
-                file_symbols,
-            ))
-        }
-        (Some(native), _) => Some(resolve_type_info_relative_to_symbol(
-            native,
-            symbol,
-            file_symbols,
-        )),
-        (None, Some(phpdoc)) => Some(resolve_type_info_relative_to_symbol(
-            &phpdoc,
-            symbol,
-            file_symbols,
-        )),
-        (None, None) => None,
-    }
+    php_lsp_types::type_refinement::preferred_type(native, phpdoc.as_ref(), native, &|_, _| None)
+        .map(|ty| resolve_type_info_relative_to_symbol(&ty, symbol, file_symbols))
 }
 
 /// Resolve every class leaf, including shapes, in the declaration's scope.
@@ -3917,6 +3931,7 @@ fn resolve_type_name_relative_to_symbol(
     if type_name.is_empty()
         || type_name.starts_with('\\')
         || is_builtin_non_object_type(type_name)
+        || php_lsp_types::type_refinement::is_primitive(&type_name.to_ascii_lowercase())
         || matches!(type_name, "$this" | "self" | "static" | "parent")
     {
         return type_name.to_string();
@@ -3928,25 +3943,25 @@ fn resolve_type_name_relative_to_symbol(
     let (first_part, rest) = type_name
         .split_once('\\')
         .map_or((type_name, None), |(first, rest)| (first, Some(rest)));
-    if let Some(namespace) = owner_namespace {
-        for use_stmt in &file_symbols.use_statements {
-            if use_stmt.kind != UseKind::Class || use_stmt.namespace.as_deref() != Some(namespace) {
-                continue;
-            }
-            let alias = use_stmt
-                .alias
-                .as_deref()
-                .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-            if alias.eq_ignore_ascii_case(first_part) {
-                let mut resolved = use_stmt.fqn.trim_start_matches('\\').to_string();
-                if let Some(rest) = rest {
-                    resolved.push('\\');
-                    resolved.push_str(rest);
-                }
-                return format!("\\{resolved}");
-            }
+    for use_stmt in &file_symbols.use_statements {
+        if use_stmt.kind != UseKind::Class || use_stmt.namespace != file_symbols.namespace {
+            continue;
         }
+        let alias = use_stmt
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
+        if alias.eq_ignore_ascii_case(first_part) {
+            let mut resolved = use_stmt.fqn.trim_start_matches('\\').to_string();
+            if let Some(rest) = rest {
+                resolved.push('\\');
+                resolved.push_str(rest);
+            }
+            return format!("\\{resolved}");
+        }
+    }
 
+    if let Some(namespace) = owner_namespace {
         if type_name.contains('\\') {
             let namespace_root = namespace.split('\\').next().unwrap_or(namespace);
             if first_part == namespace_root {
@@ -3961,71 +3976,6 @@ fn resolve_type_name_relative_to_symbol(
         format!("\\{}", type_name.trim_start_matches('\\'))
     } else {
         type_name.to_string()
-    }
-}
-
-fn parser_type_info_specificity_score(type_info: &TypeInfo) -> usize {
-    match type_info {
-        TypeInfo::Mixed | TypeInfo::Void | TypeInfo::Never | TypeInfo::LiteralNull => 0,
-        TypeInfo::Simple(name) => {
-            if is_builtin_non_object_type(name) {
-                1
-            } else {
-                3
-            }
-        }
-        TypeInfo::Self_ | TypeInfo::Static_ | TypeInfo::Parent_ => 3,
-        TypeInfo::Nullable(inner) => parser_type_info_specificity_score(inner),
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
-            types.iter().map(parser_type_info_specificity_score).sum()
-        }
-        TypeInfo::Generic { args, .. } => {
-            4 + args
-                .iter()
-                .map(parser_type_info_specificity_score)
-                .sum::<usize>()
-        }
-        TypeInfo::ArrayShape(items) => {
-            5 + items
-                .iter()
-                .map(|item| parser_type_info_specificity_score(&item.value))
-                .sum::<usize>()
-        }
-        TypeInfo::ObjectShape(items) => {
-            5 + items
-                .iter()
-                .map(|item| parser_type_info_specificity_score(&item.value))
-                .sum::<usize>()
-        }
-        TypeInfo::Callable {
-            params,
-            return_type,
-        } => {
-            3 + params
-                .iter()
-                .map(parser_type_info_specificity_score)
-                .sum::<usize>()
-                + return_type
-                    .as_ref()
-                    .map(|return_type| parser_type_info_specificity_score(return_type))
-                    .unwrap_or_default()
-        }
-        TypeInfo::ClassString(inner) => {
-            3 + inner
-                .as_ref()
-                .map(|inner| parser_type_info_specificity_score(inner))
-                .unwrap_or_default()
-        }
-        TypeInfo::LiteralString(_)
-        | TypeInfo::LiteralInt(_)
-        | TypeInfo::LiteralFloat(_)
-        | TypeInfo::LiteralBool(_) => 2,
-        TypeInfo::Conditional {
-            if_type, else_type, ..
-        } => {
-            3 + parser_type_info_specificity_score(if_type)
-                + parser_type_info_specificity_score(else_type)
-        }
     }
 }
 

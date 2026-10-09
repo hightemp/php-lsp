@@ -1735,7 +1735,7 @@ pub(crate) fn render_method_param(
     php_version: PhpVersion,
 ) -> String {
     let mut text = String::new();
-    if let Some(type_info) = &param.type_info {
+    if let Some(type_info) = param.declared_native_type() {
         if let Some(type_text) = generated_member_native_type_hint_text(
             type_info,
             php_version,
@@ -1895,6 +1895,8 @@ pub(crate) fn render_missing_method_stub(
         .unwrap_or(php_lsp_types::Signature {
             params: Vec::new(),
             return_type: None,
+
+            ..Default::default()
         });
     let params = signature
         .params
@@ -1927,9 +1929,12 @@ pub(crate) fn render_missing_method_stub(
     text.push('(');
     text.push_str(&params);
     text.push(')');
-    if let Some(return_type) = signature.return_type.as_ref().and_then(|return_type| {
-        native_type_hint_text(return_type, php_version, TypeHintPosition::Return)
-    }) {
+    if let Some(return_type) = signature
+        .declared_native_return_type()
+        .and_then(|return_type| {
+            native_type_hint_text(return_type, php_version, TypeHintPosition::Return)
+        })
+    {
         text.push_str(": ");
         text.push_str(&return_type);
     }
@@ -2184,6 +2189,12 @@ pub(crate) fn property_type_info(
         .and_then(|signature| signature.return_type.as_ref())
 }
 
+fn property_native_type_info(
+    property: &php_lsp_types::SymbolInfo,
+) -> Option<&php_lsp_types::TypeInfo> {
+    property.signature.as_ref()?.declared_native_return_type()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PropertyDocType {
     type_info: Option<php_lsp_types::TypeInfo>,
@@ -2278,15 +2289,17 @@ pub(crate) fn property_contract_type_text(
     property: &php_lsp_types::SymbolInfo,
 ) -> Option<PropertyDocType> {
     let doc_type = property_doc_type(property);
-    let native_type = property_type_info(property);
+    let native_type = property_native_type_info(property);
 
     if let Some(doc_type) = doc_type {
         if let (Some(doc_info), Some(native)) = (doc_type.type_info.as_ref(), native_type) {
-            if type_info_refines_native(doc_info, native) {
+            if type_info_refines_native(doc_info, native)
+                || property_type_info(property) == Some(doc_info)
+            {
                 return Some(doc_type);
             }
         }
-        if native_type.map(ToString::to_string).as_deref() != Some(doc_type.type_text.as_str()) {
+        if native_type.is_none() || doc_type.type_info.is_none() {
             return Some(doc_type);
         }
     }
@@ -2304,9 +2317,11 @@ pub(crate) fn property_doc_type_needed(
     position: TypeHintPosition,
 ) -> Option<PropertyDocType> {
     let contract = property_contract_type_text(property)?;
-    let native_hint = contract.type_info.as_ref().and_then(|type_info| {
-        generated_member_native_type_hint_text(type_info, php_version, position)
-    });
+    let native_hint = property_native_type_info(property)
+        .or(contract.type_info.as_ref())
+        .and_then(|type_info| {
+            generated_member_native_type_hint_text(type_info, php_version, position)
+        });
 
     if native_hint.as_deref() == Some(contract.type_text.as_str()) {
         None
@@ -2495,10 +2510,12 @@ pub(crate) fn render_constructor_param(
 ) -> String {
     let mut text = String::new();
     let contract_type = property_contract_type_text(property.symbol);
-    let type_info = contract_type
-        .as_ref()
-        .and_then(|contract| contract.type_info.as_ref())
-        .or_else(|| property_type_info(property.symbol));
+    let type_info = property_native_type_info(property.symbol).or_else(|| {
+        contract_type
+            .as_ref()
+            .and_then(|contract| contract.type_info.as_ref())
+            .or_else(|| property_type_info(property.symbol))
+    });
     if let Some(type_info) = type_info {
         if let Some(type_text) = generated_member_native_type_hint_text(
             type_info,
@@ -2636,10 +2653,12 @@ pub(crate) fn render_accessor_method(
 ) -> String {
     let is_static = property.modifiers.is_static;
     let contract_type = property_contract_type_text(property);
-    let type_hint = contract_type
-        .as_ref()
-        .and_then(|contract| contract.type_info.as_ref())
-        .or_else(|| property_type_info(property));
+    let type_hint = property_native_type_info(property).or_else(|| {
+        contract_type
+            .as_ref()
+            .and_then(|contract| contract.type_info.as_ref())
+            .or_else(|| property_type_info(property))
+    });
     let mut text = String::new();
     let doc_type = property_doc_type_needed(
         property,
@@ -5557,98 +5576,12 @@ pub(crate) fn symbol_has_native_return_type(
         .is_some_and(|after_params| after_params.trim_start().starts_with(':'))
 }
 
-pub(crate) fn type_name_eq(left: &str, right: &str) -> bool {
-    left.trim_start_matches('\\')
-        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
-}
-
 pub(crate) fn type_info_refines_native(
     phpdoc_type: &php_lsp_types::TypeInfo,
     native_type: &php_lsp_types::TypeInfo,
 ) -> bool {
-    use php_lsp_types::TypeInfo;
-
-    if phpdoc_type == native_type {
-        return true;
-    }
-
-    match (phpdoc_type, native_type) {
-        (_, TypeInfo::Mixed) => true,
-        (TypeInfo::Simple(phpdoc), TypeInfo::Simple(native)) => {
-            let phpdoc = phpdoc.trim_start_matches('\\').to_ascii_lowercase();
-            let native = native.trim_start_matches('\\').to_ascii_lowercase();
-            phpdoc == native
-                || matches!(
-                    (phpdoc.as_str(), native.as_str()),
-                    (
-                        "positive-int"
-                            | "negative-int"
-                            | "non-negative-int"
-                            | "non-positive-int"
-                            | "non-zero-int",
-                        "int"
-                    ) | (
-                        "non-empty-string"
-                            | "numeric-string"
-                            | "literal-string"
-                            | "lowercase-string"
-                            | "class-string",
-                        "string"
-                    ) | ("non-empty-array" | "list" | "non-empty-list", "array")
-                )
-        }
-        (TypeInfo::Generic { base, .. }, TypeInfo::Simple(native)) => {
-            type_name_eq(base, native)
-                || (native.eq_ignore_ascii_case("array")
-                    && matches!(
-                        base.to_ascii_lowercase().as_str(),
-                        "list" | "non-empty-list" | "non-empty-array"
-                    ))
-        }
-        (TypeInfo::ArrayShape(_), TypeInfo::Simple(native)) => native.eq_ignore_ascii_case("array"),
-        (TypeInfo::ObjectShape(_), TypeInfo::Simple(native)) => {
-            native.eq_ignore_ascii_case("object")
-        }
-        (TypeInfo::Callable { .. }, TypeInfo::Simple(native)) => {
-            native.eq_ignore_ascii_case("callable")
-        }
-        (TypeInfo::ClassString(_), TypeInfo::Simple(native)) => {
-            native.eq_ignore_ascii_case("string") || native.eq_ignore_ascii_case("class-string")
-        }
-        (TypeInfo::Nullable(phpdoc_inner), TypeInfo::Nullable(native_inner)) => {
-            type_info_refines_native(phpdoc_inner, native_inner)
-        }
-        (TypeInfo::Union(phpdoc_parts), TypeInfo::Nullable(native_inner)) => {
-            let mut has_null = false;
-            let mut has_refined_inner = false;
-            for part in phpdoc_parts {
-                match part {
-                    TypeInfo::LiteralNull => has_null = true,
-                    other if type_info_refines_native(other, native_inner) => {
-                        has_refined_inner = true;
-                    }
-                    _ => return false,
-                }
-            }
-            has_null && has_refined_inner
-        }
-        (TypeInfo::Nullable(phpdoc_inner), TypeInfo::Union(native_parts)) => {
-            native_parts
-                .iter()
-                .any(|part| matches!(part, TypeInfo::LiteralNull))
-                && native_parts
-                    .iter()
-                    .any(|part| type_info_refines_native(phpdoc_inner, part))
-        }
-        (TypeInfo::Union(phpdoc_parts), TypeInfo::Union(native_parts)) => {
-            phpdoc_parts.iter().all(|phpdoc_part| {
-                native_parts
-                    .iter()
-                    .any(|native_part| type_info_refines_native(phpdoc_part, native_part))
-            })
-        }
-        _ => false,
-    }
+    php_lsp_types::type_refinement::phpdoc_refines_native(phpdoc_type, native_type)
+        == php_lsp_types::type_refinement::TypeRefinement::Compatible
 }
 
 pub(crate) fn preferred_phpdoc_type_text(

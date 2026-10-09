@@ -1626,6 +1626,47 @@ signature help, hover и completion.
 уточнение только после проверки совместимости, а противоречие диагностировать,
 не подменять молча.
 
+**Реализация (2026-10-08, CODEX-P2-23):**
+
+Через RED → исправление → GREEN разделены native/PHPDoc поля параметров,
+возвращаемых типов и свойств; effective type выбирается общей консервативной
+проверкой Compatible/Incompatible/Unknown. PHPDoc уточняет контракт только
+при доказанной совместимости. Учитываются namespace/import/alias scope,
+структурные generic/shape/union/intersection/nullable типы, template bounds
+и известное наследование. Неизвестное отношение сохраняет native тип;
+index пересчитывает результат при изменении или удалении зависимостей.
+Native `static` сохраняет позднее связывание, а DNF `(A&B)|C` — структуру.
+
+Противоречия дают `phpdoc-type-mismatch` на точном UTF-16 span прикреплённого
+PHPDoc через существующую severity typeCompatibility. У `key-of` нельзя
+доказать string/int domain без анализа ключей; отсутствие наследования от
+`Closure` не опровергает `__invoke`. Эти случаи не дают ложных предупреждений
+и не подменяют native контракт. Генерация implementation/constructor/accessor
+использует native поля, сохраняя только совместимые уточнения в PHPDoc.
+Cache schema 29 и binary fixture сохраняют provenance и перестраивают старый кеш.
+
+Добавлены 36 постоянных регрессий: 7 shared-type, 10 parser, 4 index,
+1 cache, 4 server/helper и 10 LSP. Исходный RED воспроизвёл подмену native
+параметра, return inference, неверный signature help/hover и ложный отказ
+корректного native вызова. Дополнительные RED выявили потерю `static`,
+глобальных imports, ложные правила `key-of`/`callable` и подмену генерируемых
+PHP-сигнатур. GREEN покрывает также completion/typeDefinition, сохранение
+совместимых generics в теле функции, UTF-16/CRLF и версии несохранённого
+документа. Bounded concurrent index test выполняет 256 замен и 256 чтений
+с общим стартовым barrier, проверяя согласованность native/doc/effective
+полей каждого snapshot; это конечная проверка, не доказательство всех schedules.
+
+Полный последовательный Rust-набор: 1406/1406, 45 test-result targets,
+0 ignored; `CARGO_BUILD_JOBS=1`, `--test-threads=1`. Clippy
+`--all-targets -- -D warnings`, Rustfmt и diff check прошли. После замечаний
+Clippy, не меняющих поведение, повторно прошли parser-контролы 10/10 и binary
+cache fixture 1/1. Повторяемый review Verifier на `gpt-6-sol` дал GO по коду,
+тестам и финальной документации; milestone в TASKS.md закрыт.
+Статус: **исправлено**. README, architecture, LSP features и test-evidence
+matrix обновлены (54 scenario rows/111 действующих локальных ссылок).
+Исходное описание находки сохранено; исторические измерения
+coverage/performance не обновлялись; warm timing после schema 29 не измерен.
+
 ### CODEX-P2-24. Квалифицированные PHP-имена иногда считаются абсолютными
 
 [`resolve_type_name_relative_to_symbol`](server/crates/php-lsp-parser/src/resolve.rs#L3641)

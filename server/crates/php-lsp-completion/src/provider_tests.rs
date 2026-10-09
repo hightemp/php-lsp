@@ -30,6 +30,8 @@ fn make_symbol(
             Some(Signature {
                 params: vec![],
                 return_type: None,
+
+                ..Default::default()
             })
         } else {
             None
@@ -52,6 +54,8 @@ fn with_params(mut symbol: SymbolInfo, params: Vec<ParamInfo>) -> SymbolInfo {
     symbol.signature = Some(Signature {
         params,
         return_type: None,
+
+        ..Default::default()
     });
     symbol
 }
@@ -64,6 +68,8 @@ fn test_param(name: &str, type_info: Option<TypeInfo>, is_promoted: bool) -> Par
         is_variadic: false,
         is_by_ref: false,
         is_promoted,
+
+        ..Default::default()
     }
 }
 
@@ -613,8 +619,12 @@ fn test_variable_completion() {
                     is_variadic: false,
                     is_by_ref: false,
                     is_promoted: false,
+
+                    ..Default::default()
                 }],
                 return_type: None,
+
+                ..Default::default()
             }),
             parent_fqn: None,
             extends: vec![],
@@ -922,6 +932,8 @@ fn test_member_completion_uses_inferred_class_fqn() {
                 signature: Some(Signature {
                     params: vec![],
                     return_type: None,
+
+                    ..Default::default()
                 }),
                 parent_fqn: Some("App\\Test\\Baz".to_string()),
                 extends: vec![],

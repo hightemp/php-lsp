@@ -1373,6 +1373,43 @@ impl WorkspaceIndex {
             changed = true;
         }
 
+        if let Some(mut signature) = materialized.signature.take() {
+            for param in &mut signature.params {
+                let native = param.declared_native_type().cloned();
+                if let Some(doc) = param.phpdoc_type_info.as_ref() {
+                    param.type_info = if native.is_none()
+                        || self.refinement_for_symbol(&materialized, Some(doc), native.as_ref())
+                            == Some(php_lsp_types::type_refinement::TypeRefinement::Compatible)
+                    {
+                        Some(doc.clone())
+                    } else {
+                        native
+                    };
+                }
+            }
+            if signature.has_type_provenance() {
+                let relation = self.refinement_for_symbol(
+                    &materialized,
+                    signature.phpdoc_return_type.as_ref(),
+                    signature.declared_native_return_type(),
+                );
+                signature.return_type = match relation {
+                    Some(php_lsp_types::type_refinement::TypeRefinement::Compatible) => {
+                        signature.phpdoc_return_type.clone()
+                    }
+                    _ => signature
+                        .native_return_type
+                        .clone()
+                        .or_else(|| signature.phpdoc_return_type.clone())
+                        .or_else(|| signature.return_type.clone()),
+                };
+            }
+            if symbol.signature.as_ref() != Some(&signature) {
+                changed = true;
+            }
+            materialized.signature = Some(signature);
+        }
+
         if changed {
             Arc::new(materialized)
         } else {
@@ -1391,9 +1428,16 @@ impl WorkspaceIndex {
                 .iter()
                 .map(|param| {
                     let mut param = param.clone();
-                    param.type_info = param.type_info.as_ref().map(|type_info| {
-                        self.expand_type_aliases(type_info, scope, &mut Vec::new())
-                    });
+                    param.phpdoc_type_info = param
+                        .phpdoc_type_info
+                        .as_ref()
+                        .map(|ty| self.expand_type_aliases(ty, scope, &mut Vec::new()));
+                    if param.native_type_info.is_none() {
+                        param.type_info = param
+                            .type_info
+                            .as_ref()
+                            .map(|ty| self.expand_type_aliases(ty, scope, &mut Vec::new()));
+                    }
                     param
                 })
                 .collect(),
@@ -1401,6 +1445,137 @@ impl WorkspaceIndex {
                 .return_type
                 .as_ref()
                 .map(|type_info| self.expand_type_aliases(type_info, scope, &mut Vec::new())),
+
+            native_return_type: signature.native_return_type.clone(),
+            phpdoc_return_type: signature
+                .phpdoc_return_type
+                .as_ref()
+                .map(|ty| self.expand_type_aliases(ty, scope, &mut Vec::new())),
+        }
+    }
+
+    pub fn phpdoc_type_refinement(
+        &self,
+        symbol: &SymbolInfo,
+        doc: &TypeInfo,
+        native: &TypeInfo,
+    ) -> php_lsp_types::type_refinement::TypeRefinement {
+        let _publication = self.publication_barrier.read_recursive();
+        self.refinement_for_symbol(symbol, Some(doc), Some(native))
+            .unwrap()
+    }
+
+    fn refinement_for_symbol(
+        &self,
+        symbol: &SymbolInfo,
+        doc: Option<&TypeInfo>,
+        native: Option<&TypeInfo>,
+    ) -> Option<php_lsp_types::type_refinement::TypeRefinement> {
+        let (doc, native) = (doc?, native?);
+        let scope = alias_scope_for_symbol(symbol);
+        let doc = self.expand_type_aliases(doc, &scope, &mut Vec::new());
+        let file = self
+            .tables
+            .file_symbols
+            .get(&symbol.uri)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default();
+        let mut templates = symbol.templates.clone();
+        if let Some(owner) = symbol
+            .parent_fqn
+            .as_deref()
+            .and_then(|name| self.get_type(name))
+        {
+            templates.extend(owner.templates.clone());
+        }
+        let doc = php_lsp_parser::resolve::map_receiver_type_names(&doc, &|name| {
+            if matches!(name, "self" | "static" | "parent")
+                || templates.iter().any(|template| template.name == name)
+            {
+                return None;
+            }
+            match php_lsp_parser::resolve::resolve_type_info_relative_to_symbol(
+                &TypeInfo::Simple(name.to_string()),
+                symbol,
+                &file,
+            ) {
+                TypeInfo::Simple(name) => Some(name),
+                _ => None,
+            }
+        });
+        let native =
+            php_lsp_parser::resolve::resolve_type_info_relative_to_symbol(native, symbol, &file);
+        Some(
+            php_lsp_types::type_refinement::phpdoc_refines_native_with_templates(
+                &doc,
+                &native,
+                &|d, n| self.class_relation_for_symbol(symbol, d, n),
+                &templates,
+            ),
+        )
+    }
+
+    fn class_relation_for_symbol(
+        &self,
+        symbol: &SymbolInfo,
+        doc: &str,
+        native: &str,
+    ) -> Option<bool> {
+        let file = self
+            .tables
+            .file_symbols
+            .get(&symbol.uri)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default();
+        let qualify = |name: &str| {
+            if matches!(name, "self" | "static") {
+                return symbol.parent_fqn.clone();
+            }
+            if name == "parent" {
+                return symbol
+                    .parent_fqn
+                    .as_deref()
+                    .and_then(|name| self.get_type(name))
+                    .and_then(|owner| owner.extends.first().cloned());
+            }
+            let ty = php_lsp_parser::resolve::resolve_type_info_relative_to_symbol(
+                &TypeInfo::Simple(name.to_string()),
+                symbol,
+                &file,
+            );
+            if let TypeInfo::Simple(name) = ty {
+                Some(name)
+            } else {
+                None
+            }
+        };
+        let (doc, native) = (qualify(doc)?, qualify(native)?);
+        if same_fqn(&doc, &native) {
+            return Some(true);
+        }
+        let mut pending = vec![doc];
+        let mut visited = HashSet::new();
+        let mut incomplete = false;
+        while let Some(current) = pending.pop() {
+            if !visited.insert(case_insensitive_fqn_key(&current)) {
+                continue;
+            }
+            if visited.len() > 64 {
+                return None;
+            }
+            if same_fqn(&current, &native) {
+                return Some(true);
+            }
+            let Some(class) = self.get_type(&current) else {
+                incomplete = true;
+                continue;
+            };
+            pending.extend(class.extends.iter().chain(&class.implements).cloned());
+        }
+        if incomplete {
+            None
+        } else {
+            Some(false)
         }
     }
 
@@ -1709,6 +1884,10 @@ fn same_fqn(left: &str, right: &str) -> bool {
         .eq_ignore_ascii_case(right.trim_start_matches('\\'))
 }
 
+#[cfg(test)]
+#[path = "phpdoc_native_index_tests.rs"]
+mod phpdoc_native_index_tests;
+
 fn alias_scope_for_symbol(symbol: &SymbolInfo) -> TypeAliasScope {
     if let Some(parent_fqn) = symbol.parent_fqn.as_ref() {
         TypeAliasScope::Class(parent_fqn.clone())
@@ -1975,6 +2154,10 @@ fn substitute_signature(signature: &Signature, substitutions: &TemplateSubstitut
                     .type_info
                     .as_ref()
                     .map(|type_info| substitute_type_info(type_info, substitutions));
+                param.phpdoc_type_info = param
+                    .phpdoc_type_info
+                    .as_ref()
+                    .map(|ty| substitute_type_info(ty, substitutions));
                 param
             })
             .collect(),
@@ -1982,6 +2165,12 @@ fn substitute_signature(signature: &Signature, substitutions: &TemplateSubstitut
             .return_type
             .as_ref()
             .map(|type_info| substitute_type_info(type_info, substitutions)),
+
+        native_return_type: signature.native_return_type.clone(),
+        phpdoc_return_type: signature
+            .phpdoc_return_type
+            .as_ref()
+            .map(|ty| substitute_type_info(ty, substitutions)),
     }
 }
 

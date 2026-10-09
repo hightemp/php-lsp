@@ -1,6 +1,9 @@
 //! Diagnostics LSP handlers extracted from `server.rs`.
 
 use super::super::*;
+
+#[path = "phpdoc_native_diagnostics.rs"]
+mod phpdoc_native_diagnostics;
 use php_lsp_parser::resolve::{
     symbol_at_position_with_full_resolvers, FunctionTypeResolver, ResolvedFunctionType,
 };
@@ -1590,6 +1593,12 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
             diagnostics.push(diagnostic);
         }
     }
+
+    diagnostics.extend(apply_diagnostic_category(
+        phpdoc_native_diagnostics::phpdoc_native_type_diagnostics(&file_symbols, index),
+        DiagnosticCategory::TypeCompatibility,
+        diagnostic_severity,
+    ));
 
     let member_type_budget_exceeded = member_type_diagnostic_budget_exceeded(
         tree.root_node(),
