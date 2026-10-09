@@ -12,6 +12,10 @@ mod type_owner_tests;
 #[path = "phpdoc_native_return_tests.rs"]
 mod phpdoc_native_return_tests;
 
+#[cfg(test)]
+#[path = "qualified_type_tests.rs"]
+mod qualified_type_tests;
+
 const DECLARATION_SCOPE_END_HINT_MIN_LINES: u32 = 2;
 const LARGE_SCOPE_END_HINT_MIN_LINES: u32 = 8;
 const CONTROL_SCOPE_END_HINT_MAX_CHARS: usize = 96;
@@ -1054,6 +1058,7 @@ pub(in crate::server) fn server_member_access_expression_type_info(
     }
 
     let type_info = symbol_effective_return_type(&symbol)?;
+    let type_info = type_info_in_symbol_declaration_scope(ctx.index, &symbol, &type_info);
     let owner_fqn = symbol
         .parent_fqn
         .clone()
@@ -1111,6 +1116,7 @@ pub(in crate::server) fn indexed_call_expression_type_info(
         .or_else(|| symbol.parent_fqn.clone())
         .unwrap_or_else(|| symbol.fqn.clone());
     let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
+    let type_info = type_info_in_symbol_declaration_scope(ctx.index, &symbol, &type_info);
     let type_info =
         doctrine_collection_getter_return_type_info(ctx, &symbol, &owner_fqn, &type_info)
             .unwrap_or(type_info);
@@ -1132,6 +1138,7 @@ pub(in crate::server) fn server_member_call_expression_type_info(
     let return_type = symbol_effective_return_type(&symbol)?;
     let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&receiver_fqn);
     let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
+    let type_info = type_info_in_symbol_declaration_scope(ctx.index, &symbol, &type_info);
     Some(IndexedExpressionTypeInfo {
         type_info,
         owner_fqn: owner_fqn.to_string(),
@@ -1508,7 +1515,7 @@ pub(in crate::server) fn server_expression_type_info(
                 .map(|symbol| symbol.uri.clone())
                 .unwrap_or_default();
             Some(IndexedExpressionTypeInfo {
-                type_info: php_lsp_types::TypeInfo::Simple(fqn.clone()),
+                type_info: php_lsp_types::TypeInfo::Simple(format!("\\{fqn}")),
                 owner_fqn: fqn,
                 uri,
             })
@@ -1612,6 +1619,7 @@ pub(in crate::server) fn doctrine_repository_call_type_info(
             let return_type = symbol_effective_return_type(&symbol)?;
             let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&repository_fqn);
             let type_info = resolve_call_site_return_type(ctx, expression, &symbol, &return_type);
+            let type_info = type_info_in_symbol_declaration_scope(ctx.index, &symbol, &type_info);
             return Some(IndexedExpressionTypeInfo {
                 type_info,
                 owner_fqn: owner_fqn.to_string(),
@@ -1775,7 +1783,8 @@ pub(in crate::server) fn doctrine_standard_repository_method_return_type(
     method_name: &str,
     entity_fqn: &str,
 ) -> Option<php_lsp_types::TypeInfo> {
-    let entity = php_lsp_types::TypeInfo::Simple(entity_fqn.to_string());
+    let entity =
+        php_lsp_types::TypeInfo::Simple(format!("\\{}", entity_fqn.trim_start_matches('\\')));
     if matches!(method_name, "find" | "findOneBy") || method_name.starts_with("findOneBy") {
         return Some(php_lsp_types::TypeInfo::Nullable(Box::new(entity)));
     }
@@ -1845,7 +1854,7 @@ pub(in crate::server) fn doctrine_collection_getter_return_type_info(
         base: collection_base,
         args: vec![
             php_lsp_types::TypeInfo::Simple("int".to_string()),
-            php_lsp_types::TypeInfo::Simple(target_fqn),
+            php_lsp_types::TypeInfo::Simple(format!("\\{target_fqn}")),
         ],
     })
 }
@@ -1878,7 +1887,7 @@ pub(in crate::server) fn doctrine_collection_property_type_info(
         base: collection_base,
         args: vec![
             php_lsp_types::TypeInfo::Simple("int".to_string()),
-            php_lsp_types::TypeInfo::Simple(target_fqn),
+            php_lsp_types::TypeInfo::Simple(format!("\\{target_fqn}")),
         ],
     })
 }
@@ -2269,7 +2278,7 @@ pub(in crate::server) fn call_site_argument_type_from_text(
 
     if let Some(class_fqn) = class_string_fqn_from_expression_text(raw, file_symbols, index) {
         return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
-            php_lsp_types::TypeInfo::Simple(class_fqn),
+            php_lsp_types::TypeInfo::Simple(format!("\\{class_fqn}")),
         ))));
     }
 
@@ -2284,7 +2293,7 @@ pub(in crate::server) fn call_site_argument_type_from_text(
                 .any(|symbol| symbol.fqn.eq_ignore_ascii_case(&resolved))
         {
             return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
-                php_lsp_types::TypeInfo::Simple(resolved),
+                php_lsp_types::TypeInfo::Simple(format!("\\{resolved}")),
             ))));
         }
         return Some(php_lsp_types::TypeInfo::LiteralString(raw.to_string()));
@@ -2516,7 +2525,7 @@ pub(in crate::server) fn call_site_argument_type_uncached(
 
     if let Some(class_fqn) = class_string_fqn_from_expression_text(raw, file_symbols, ctx.index) {
         return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
-            php_lsp_types::TypeInfo::Simple(class_fqn),
+            php_lsp_types::TypeInfo::Simple(format!("\\{class_fqn}")),
         ))));
     }
 
@@ -2531,7 +2540,7 @@ pub(in crate::server) fn call_site_argument_type_uncached(
                 .any(|symbol| symbol.fqn.eq_ignore_ascii_case(&resolved))
         {
             return Some(php_lsp_types::TypeInfo::ClassString(Some(Box::new(
-                php_lsp_types::TypeInfo::Simple(resolved),
+                php_lsp_types::TypeInfo::Simple(format!("\\{resolved}")),
             ))));
         }
         return Some(php_lsp_types::TypeInfo::LiteralString(raw.to_string()));
@@ -2564,7 +2573,7 @@ pub(in crate::server) fn call_site_argument_type_uncached(
             .trim_start_matches('\\')
             .to_string();
         if !fqn.is_empty() {
-            return Some(php_lsp_types::TypeInfo::Simple(fqn));
+            return Some(php_lsp_types::TypeInfo::Simple(format!("\\{fqn}")));
         }
     }
 
@@ -3034,73 +3043,15 @@ pub(in crate::server) fn resolve_call_site_type_names(
     type_info: &php_lsp_types::TypeInfo,
     file_symbols: &php_lsp_types::FileSymbols,
 ) -> php_lsp_types::TypeInfo {
-    match type_info {
-        php_lsp_types::TypeInfo::Simple(name) if is_builtin_type_name(name) => {
-            php_lsp_types::TypeInfo::Simple(name.clone())
+    php_lsp_parser::resolve::map_receiver_type_names(type_info, &|name| {
+        if is_builtin_type_name(name)
+            || php_lsp_types::type_refinement::is_primitive(&name.to_ascii_lowercase())
+        {
+            return None;
         }
-        php_lsp_types::TypeInfo::Simple(name) => php_lsp_types::TypeInfo::Simple(
-            resolve_class_name_pub(name, file_symbols)
-                .trim_start_matches('\\')
-                .to_string(),
-        ),
-        php_lsp_types::TypeInfo::Generic { base, args } => php_lsp_types::TypeInfo::Generic {
-            base: if is_builtin_type_name(base) {
-                base.clone()
-            } else {
-                resolve_class_name_pub(base, file_symbols)
-                    .trim_start_matches('\\')
-                    .to_string()
-            },
-            args: args
-                .iter()
-                .map(|arg| resolve_call_site_type_names(arg, file_symbols))
-                .collect(),
-        },
-        php_lsp_types::TypeInfo::ClassString(Some(inner)) => php_lsp_types::TypeInfo::ClassString(
-            Some(Box::new(resolve_call_site_type_names(inner, file_symbols))),
-        ),
-        php_lsp_types::TypeInfo::Conditional {
-            subject,
-            target,
-            if_type,
-            else_type,
-        } => php_lsp_types::TypeInfo::Conditional {
-            subject: subject.clone(),
-            target: Box::new(resolve_call_site_type_names(target, file_symbols)),
-            if_type: Box::new(resolve_call_site_type_names(if_type, file_symbols)),
-            else_type: Box::new(resolve_call_site_type_names(else_type, file_symbols)),
-        },
-        php_lsp_types::TypeInfo::Union(types) => php_lsp_types::TypeInfo::Union(
-            types
-                .iter()
-                .map(|type_info| resolve_call_site_type_names(type_info, file_symbols))
-                .collect(),
-        ),
-        php_lsp_types::TypeInfo::Intersection(types) => php_lsp_types::TypeInfo::Intersection(
-            types
-                .iter()
-                .map(|type_info| resolve_call_site_type_names(type_info, file_symbols))
-                .collect(),
-        ),
-        php_lsp_types::TypeInfo::Nullable(inner) => php_lsp_types::TypeInfo::Nullable(Box::new(
-            resolve_call_site_type_names(inner, file_symbols),
-        )),
-        php_lsp_types::TypeInfo::ArrayShape(_)
-        | php_lsp_types::TypeInfo::ObjectShape(_)
-        | php_lsp_types::TypeInfo::Callable { .. }
-        | php_lsp_types::TypeInfo::ClassString(None)
-        | php_lsp_types::TypeInfo::LiteralString(_)
-        | php_lsp_types::TypeInfo::LiteralInt(_)
-        | php_lsp_types::TypeInfo::LiteralFloat(_)
-        | php_lsp_types::TypeInfo::LiteralBool(_)
-        | php_lsp_types::TypeInfo::LiteralNull
-        | php_lsp_types::TypeInfo::Void
-        | php_lsp_types::TypeInfo::Never
-        | php_lsp_types::TypeInfo::Mixed
-        | php_lsp_types::TypeInfo::Self_
-        | php_lsp_types::TypeInfo::Static_
-        | php_lsp_types::TypeInfo::Parent_ => type_info.clone(),
-    }
+        let resolved = resolve_class_name_pub(name, file_symbols);
+        Some(format!("\\{}", resolved.trim_start_matches('\\')))
+    })
 }
 
 pub(in crate::server) fn same_type_name(left: &str, right: &str) -> bool {
@@ -3533,7 +3484,7 @@ pub(in crate::server) fn local_variable_type_info_display(
         | php_lsp_types::TypeInfo::LiteralNull
         | php_lsp_types::TypeInfo::Void
         | php_lsp_types::TypeInfo::Never
-        | php_lsp_types::TypeInfo::Mixed => type_info.to_string(),
+        | php_lsp_types::TypeInfo::Mixed => resolved_type_info_display(type_info),
     }
 }
 
@@ -3601,28 +3552,9 @@ pub(in crate::server) fn simple_type_fqn_from_owner_or_index(
         return simple_type_fqn_from_index(index, uri, type_name);
     }
 
-    if let Some(imported) = imported_type_fqn_for_owner(index, owner_fqn, uri, type_name) {
-        return Some(imported);
-    }
-
-    if !owner_fqn.contains('\\') && index.resolve_fqn(type_name).is_some() {
-        return Some(type_name.to_string());
-    }
-
-    if type_name.contains('\\') {
-        return Some(resolve_qualified_type_fqn_from_owner_or_index(
-            index, owner_fqn, uri, type_name,
-        ));
-    }
-
-    if let Some((owner_namespace, _)) = owner_fqn.rsplit_once('\\') {
-        let candidate = format!("{owner_namespace}\\{type_name}");
-        if index.resolve_fqn(&candidate).is_some() {
-            return Some(candidate);
-        }
-    }
-
-    simple_type_fqn_from_index(index, uri, type_name)
+    Some(resolve_qualified_type_fqn_from_owner_or_index(
+        index, owner_fqn, uri, type_name,
+    ))
 }
 
 fn resolve_qualified_type_fqn_from_owner_or_index(
@@ -3631,90 +3563,26 @@ fn resolve_qualified_type_fqn_from_owner_or_index(
     uri: &str,
     type_name: &str,
 ) -> String {
-    let raw = type_name.trim_start_matches('\\');
-    if index.resolve_fqn(raw).is_some() {
-        return raw.to_string();
-    }
-
-    let Some((owner_namespace, _)) = owner_fqn.rsplit_once('\\') else {
-        return raw.to_string();
-    };
-    let first_part = raw.split('\\').next().unwrap_or(raw);
-
-    if let Some(imported) = imported_type_fqn_for_owner(index, owner_fqn, uri, raw) {
-        return imported;
-    }
-
-    let namespace_root = owner_namespace
-        .split('\\')
-        .next()
-        .unwrap_or(owner_namespace);
-    if first_part == namespace_root {
-        return raw.to_string();
-    }
-
-    format!("{owner_namespace}\\{raw}")
-}
-
-pub(in crate::server) fn imported_type_fqn_for_owner(
-    index: &WorkspaceIndex,
-    owner_fqn: &str,
-    uri: &str,
-    type_name: &str,
-) -> Option<String> {
-    let owner_namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
-    let raw = type_name.trim_start_matches('\\');
-    let (first_part, rest) = raw.split_once('\\').unwrap_or((raw, ""));
-    let file_symbols = index
+    let file = index
         .read()
         .file_symbols()
         .get(uri)
-        .map(|entry| Arc::clone(entry.value()))?;
-    let scoped_file_symbols = file_symbols
+        .map(|entry| Arc::clone(entry.value()))
+        .unwrap_or_default();
+    let owner = file
         .symbols
         .iter()
-        .find(|symbol| {
-            symbol.fqn.eq_ignore_ascii_case(owner_fqn)
-                && matches!(
-                    symbol.kind,
-                    php_lsp_types::PhpSymbolKind::Class
-                        | php_lsp_types::PhpSymbolKind::Interface
-                        | php_lsp_types::PhpSymbolKind::Trait
-                        | php_lsp_types::PhpSymbolKind::Enum
-                        | php_lsp_types::PhpSymbolKind::Function
-                )
-        })
-        .map(|symbol| file_symbols.scoped_at_byte_position(symbol.range.0, symbol.range.1))
-        .unwrap_or_else(|| std::borrow::Cow::Borrowed(file_symbols.as_ref()));
-    let use_statement = scoped_file_symbols
-        .use_statements
-        .iter()
-        .find(|statement| {
-            if statement.kind != php_lsp_types::UseKind::Class
-                || statement.namespace.as_deref() != owner_namespace
-            {
-                return false;
-            }
-
-            statement
-                .alias
-                .as_deref()
-                .unwrap_or_else(|| {
-                    statement
-                        .fqn
-                        .rsplit('\\')
-                        .next()
-                        .unwrap_or(statement.fqn.as_str())
-                })
-                .eq_ignore_ascii_case(first_part)
-        })?;
-
-    let mut resolved = use_statement.fqn.trim_start_matches('\\').to_string();
-    if !rest.is_empty() {
-        resolved.push('\\');
-        resolved.push_str(rest);
+        .find(|symbol| symbol.fqn.eq_ignore_ascii_case(owner_fqn));
+    let mut scoped = owner
+        .map(|symbol| file.scoped_at_byte_position(symbol.range.0, symbol.range.1))
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed(file.as_ref()));
+    if !owner_fqn.is_empty() {
+        let namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
+        if scoped.namespace.as_deref() != namespace {
+            scoped.to_mut().namespace = namespace.map(str::to_string);
+        }
     }
-    Some(resolved)
+    resolve_class_name_pub(type_name, scoped.as_ref())
 }
 
 pub(in crate::server) fn is_explicit_local_variable_type_hint(
@@ -4031,6 +3899,7 @@ fn markdown_type_name_link(
     display: &str,
     target_fqn: Option<&str>,
 ) -> (String, bool) {
+    let display = display.trim_start_matches('\\');
     let Some(target_fqn) = target_fqn else {
         return (markdown_code_span(display), false);
     };

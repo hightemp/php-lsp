@@ -230,7 +230,7 @@ VSIX contents reported by `vsce`:
 - Packaging output is intentionally written under `target/php-lsp-profile/` so release artifacts in `client/` are not overwritten during baseline collection.
 - The initial baseline validated correctness and package size only. Later,
   explicitly dated sections contain the production performance measurements;
-  the 2026-07-21 acceptance did not refresh them.
+  the acceptance (2026-07-21) did not refresh them.
 
 ## Perf Harness Smoke Run
 
@@ -350,10 +350,10 @@ Result: the primary large workspace meets the warm-start target `< 5s`
 acceptance are tracked separately by `PV-003` and `PV-004`.
 
 These are historical measurements. Warm-start time has not been remeasured
-after the 2026-09-25 schema-26 source-provenance checks or the 2026-10-07
-schema-27 call-site metadata change or the 2026-10-08 schema-28 PHPDoc
-owner-range change or the 2026-10-08 schema-29 native/PHPDoc type-provenance
-change.
+after source-provenance checks (schema 26; 2026-09-25), call-site metadata
+(schema 27; 2026-10-07), exact PHPDoc owner ranges (schema 28; 2026-10-08),
+native/PHPDoc type provenance (schema 29; 2026-10-08), or qualified
+type/reference resolution (schema 30; 2026-10-09).
 
 ### Large Workspace Latency
 

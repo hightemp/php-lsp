@@ -840,7 +840,7 @@ fn append_hover_resolved_return_line(
 
     content.push('\n');
     content.push_str("**Resolved returns:** ");
-    content.push_str(&type_info_raw_with_links(
+    content.push_str(&resolved_type_info_raw_with_links(
         index,
         file_symbols,
         &info.owner_fqn,
@@ -913,7 +913,10 @@ fn append_hover_repository_metadata_line(
                     file_symbols,
                     owner_fqn,
                     &symbol.uri,
-                    &php_lsp_types::TypeInfo::Simple(binding.target.clone()),
+                    &php_lsp_types::TypeInfo::Simple(format!(
+                        "\\{}",
+                        binding.target.trim_start_matches('\\')
+                    )),
                 ))
             } else {
                 None
@@ -1696,7 +1699,7 @@ fn hover_relation_entry_markdown(
         file_symbols,
         owner_fqn,
         &symbol.uri,
-        &php_lsp_types::TypeInfo::Simple(target.to_string()),
+        &php_lsp_types::TypeInfo::Simple(format!("\\{}", target.trim_start_matches('\\'))),
     );
     if !args.is_empty() {
         let args = args

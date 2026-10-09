@@ -1016,7 +1016,44 @@ pub(in crate::server) fn type_info_raw_with_links(
     uri: &str,
     type_info: &php_lsp_types::TypeInfo,
 ) -> String {
-    let raw = markdown_code_span(&type_info.to_string());
+    type_info_with_display_links(
+        index,
+        file_symbols,
+        owner_fqn,
+        uri,
+        type_info,
+        &type_info.to_string(),
+    )
+}
+
+pub(in crate::server) fn resolved_type_info_raw_with_links(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+) -> String {
+    let display = resolved_type_info_display(type_info);
+    type_info_with_display_links(index, file_symbols, owner_fqn, uri, type_info, &display)
+}
+
+pub(in crate::server) fn resolved_type_info_display(type_info: &php_lsp_types::TypeInfo) -> String {
+    php_lsp_parser::resolve::map_receiver_type_names(type_info, &|name| {
+        name.starts_with('\\')
+            .then(|| name.trim_start_matches('\\').to_string())
+    })
+    .to_string()
+}
+
+fn type_info_with_display_links(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    owner_fqn: &str,
+    uri: &str,
+    type_info: &php_lsp_types::TypeInfo,
+    display: &str,
+) -> String {
+    let raw = markdown_code_span(display);
     match markdown_type_info_class_links(index, file_symbols, owner_fqn, uri, type_info) {
         Some(links) => format!("{raw} — {links}"),
         None => raw,
@@ -2380,12 +2417,38 @@ pub(in crate::server) fn resolve_function_return_type_from_index(
     symbol_return_type_text_from_index(index, &sym.fqn, &sym)
 }
 
+pub(in crate::server) fn type_info_in_symbol_declaration_scope(
+    index: &WorkspaceIndex,
+    symbol: &php_lsp_types::SymbolInfo,
+    ty: &php_lsp_types::TypeInfo,
+) -> php_lsp_types::TypeInfo {
+    let file = index
+        .read()
+        .file_symbols()
+        .get(&symbol.uri)
+        .map(|entry| Arc::clone(entry.value()));
+    match file {
+        Some(file) => {
+            php_lsp_parser::resolve::resolve_type_info_relative_to_symbol(ty, symbol, &file)
+        }
+        None => ty.clone(),
+    }
+}
+
+fn symbol_return_type_in_declaration_scope(
+    index: &WorkspaceIndex,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Option<php_lsp_types::TypeInfo> {
+    symbol_effective_return_type(symbol)
+        .map(|ty| type_info_in_symbol_declaration_scope(index, symbol, &ty))
+}
+
 pub(in crate::server) fn symbol_return_type_fqn(
     index: &WorkspaceIndex,
     owner_fqn: &str,
     sym: &php_lsp_types::SymbolInfo,
 ) -> Option<String> {
-    let ret = symbol_effective_return_type(sym)?;
+    let ret = symbol_return_type_in_declaration_scope(index, sym)?;
     tracing::debug!("resolve_member_type: {} -> return type '{}'", sym.fqn, ret);
 
     type_info_fqn_from_index(index, owner_fqn, &sym.uri, &ret)
@@ -2396,7 +2459,7 @@ pub(in crate::server) fn symbol_return_type_text_from_index(
     owner_fqn: &str,
     sym: &php_lsp_types::SymbolInfo,
 ) -> Option<String> {
-    let ret = symbol_effective_return_type(sym)?;
+    let ret = symbol_return_type_in_declaration_scope(index, sym)?;
     tracing::debug!(
         "resolve_member_type: {} -> return type text '{}'",
         sym.fqn,
@@ -2414,12 +2477,6 @@ pub(in crate::server) fn type_info_fqn_from_index(
 ) -> Option<String> {
     match type_info {
         php_lsp_types::TypeInfo::Simple(name) => {
-            if owner_fqn.is_empty() {
-                let raw = name.trim().trim_start_matches('\\');
-                if !raw.is_empty() && index.resolve_fqn(raw).is_some() {
-                    return Some(raw.to_string());
-                }
-            }
             simple_type_fqn_from_owner_or_index(index, owner_fqn, uri, name)
         }
         php_lsp_types::TypeInfo::Nullable(inner) => {
@@ -2549,28 +2606,7 @@ fn resolved_type_text_from_index(
         return resolved;
     }
 
-    if type_name.trim().starts_with('\\')
-        || index.resolve_fqn(&resolved).is_some()
-        || type_name_resolved_by_class_import(index, owner_fqn, uri, type_name, &resolved)
-    {
-        format!("\\{}", resolved.trim_start_matches('\\'))
-    } else {
-        resolved
-    }
-}
-
-fn type_name_resolved_by_class_import(
-    index: &WorkspaceIndex,
-    owner_fqn: &str,
-    uri: &str,
-    type_name: &str,
-    resolved: &str,
-) -> bool {
-    imported_type_fqn_for_owner(index, owner_fqn, uri, type_name).is_some_and(|imported| {
-        imported
-            .trim_start_matches('\\')
-            .eq_ignore_ascii_case(resolved.trim_start_matches('\\'))
-    })
+    format!("\\{}", resolved.trim_start_matches('\\'))
 }
 
 fn resolved_owner_type_text_from_index(index: &WorkspaceIndex, owner_fqn: &str) -> String {

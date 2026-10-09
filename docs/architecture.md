@@ -137,6 +137,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
 | `tests/e2e_type_owner.rs` | lexical PHPDoc type owners, hover/inlay type links, namespace imports, anonymous-class boundaries and unsaved UTF-16/CRLF updates. |
 | `tests/e2e_phpdoc_native.rs` | native/PHPDoc contracts, signature and assignment hover, compatible parameter generics, late-static owner and UTF-16/CRLF document updates. |
+| `tests/e2e_qualified_types.rs` | qualified relative/absolute type targets, competing indexed classes, PHPDoc/native returns, Unicode/CRLF inlays, unsaved updates and controller-to-Twig propagation. |
 | `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
 | `tests/e2e_phpdoc_definition.rs` | exact PHPDoc member/owner selection, inheritance/native precedence, UTF-16/CRLF buffer edits, and Twig shape-key definitions before attributes. |
 | `tests/e2e_phpdoc_definition_stress.rs` | concurrent JSON-RPC definitions, edits, close/reopen, watched-file and full Composer reindex; exact stable disk/buffer results and progress watchdog. |
@@ -246,6 +247,19 @@ carry the same section identity. Repeated namespace names remain separate;
 alias expansion uses the source position of the referring symbol, including
 when an alias refers to another alias. Class PHPDoc aliases stay local to their
 own class.
+
+Qualified class/type names follow the same lexical PHP resolution rules in
+parser and server inference: an explicit leading `\` is absolute,
+`namespace\...` bypasses imports, and other qualified names expand a class
+alias or prepend the declaration namespace. In `App\Sub`, `App\Foo` therefore
+means `App\Sub\App\Foo`, even if `App\Foo` already exists in the index.
+Resolved internal type leaves retain an explicit absolute marker, including
+PHPDoc containers, class-string/template arguments and synthesized Doctrine
+and Laravel result types and parsed template bindings, so reuse cannot qualify
+them a second time. Inherited ordinary return leaves are qualified in their
+declaration scope before receiver binding.
+Computed hover/inlay text hides these markers on a display copy; source PHPDoc
+keeps its written spelling and navigation uses the original type identity.
 
 Local PHPDoc type inference carries the class-like owner at the variable's byte
 range, together with the active namespace/import section. Hover and foreach
@@ -898,12 +912,14 @@ by the content hash on the next load. Workspace cache replay rechecks files
 before publishing symbols, and staged vendor/stub commits discard changed
 sources. Schema version 26 introduced provenance tracking; schema 27 added
 invocation kind and owning-callable ranges. Schema 28 added exact PHPDoc owner
-ranges. Current schema 29 also retains native/PHPDoc type provenance separately
-and invalidates older symbol/reference snapshots.
+ranges. Schema 29 retains native/PHPDoc type provenance separately. Current
+schema 30 invalidates references derived with the former namespace-root
+heuristic, even though their serialized field layout has not changed.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized
-`php-lsp-types` fields must bump `CACHE_SCHEMA_VERSION` in
+`php-lsp-types` fields, or binding semantics that alter persisted references,
+must bump `CACHE_SCHEMA_VERSION` in
 `php-lsp-index/src/cache.rs`. The index crate keeps a representative serialized
 fixture hash/length test so CI catches schema-shape changes before old
 `index.bin` files are accidentally treated as current.
@@ -1129,10 +1145,10 @@ unopened files from disk through blocking/background IO. The current production
 target is to keep common open-file requests responsive while heavier operations
 are measured on large projects.
 
-The latest correctness and compatibility acceptance refresh was captured on
-2026-07-21. It did not collect new performance samples. The latest
-large-workspace performance refresh remains 2026-05-28: on the primary 10k-file
-Symfony workspace, warm open-file p95 for hover/completion/definition stayed
+The latest correctness and compatibility acceptance refresh (2026-07-21)
+collected no new performance samples. The latest large-workspace performance
+refresh (2026-05-28) measured the primary 10k-file Symfony workspace: warm
+open-file p95 for hover/completion/definition stayed
 under 7 ms, while heavy `references` and rename dry-run requests kept unrelated
 hover/completion below 10 ms p95.
 

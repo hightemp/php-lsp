@@ -201,8 +201,8 @@ phpstorm-stubs support.
 
 ## Known Limitations
 
-- The latest large-workspace production baseline remains the 2026-05-28 IDE
-  intelligence refresh. It measures a primary 10k-file Symfony workspace and
+- The latest large-workspace production baseline remains the IDE intelligence
+  refresh (2026-05-28). It measures a primary 10k-file Symfony workspace and
   two additional Laravel-like workspaces. Later per-feature behavior is tracked
   in `docs/lsp-features.md`; remaining risk/watch items are tracked in
   `docs/production-risk-register.md` and `docs/production-baseline.md`.
@@ -210,10 +210,11 @@ phpstorm-stubs support.
   namespaces with mtime, size, and content-hash validation. Lazy vendor files
   are persisted after the requested class is verified in the index; Composer
   vendor metadata is cached in memory with an LRU for lazy vendor symbols. The
-  2026-05-28 large-workspace baseline met the warm cache target, but that timing
+  large-workspace baseline (2026-05-28) met the warm cache target, but that timing
   has not been rerun after source-provenance checks (schema 26), call-site
-  metadata (schema 27), exact PHPDoc owner ranges (schema 28), or separate
-  native/PHPDoc type provenance (current schema 29).
+  metadata (schema 27), exact PHPDoc owner ranges (schema 28), native/PHPDoc
+  type provenance (schema 29), or corrected qualified type/reference binding
+  (current schema 30).
   Installed-vendor first-hit behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses merge indexed
   closed-file references with ordinary open PHP snapshots, but still iterate

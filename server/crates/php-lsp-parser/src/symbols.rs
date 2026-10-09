@@ -1264,7 +1264,7 @@ fn refine_doctrine_collection_type_from_target_entity(
         base: collection_base,
         args: vec![
             TypeInfo::Simple("int".to_string()),
-            TypeInfo::Simple(target_fqn),
+            TypeInfo::Simple(format!("\\{target_fqn}")),
         ],
     }
 }
@@ -1699,12 +1699,18 @@ fn resolve_template_type_info_in_file(
         {
             TypeInfo::Simple(name)
         }
-        TypeInfo::Simple(name) => TypeInfo::Simple(resolve_class_name_in_file(&name, file_symbols)),
+        TypeInfo::Simple(name) => TypeInfo::Simple(format!(
+            "\\{}",
+            resolve_class_name_in_file(&name, file_symbols).trim_start_matches('\\')
+        )),
         TypeInfo::Generic { base, args } => {
             let base = if template_names.contains(&base) || is_phpdoc_builtin_type(&base) {
                 base
             } else {
-                resolve_class_name_in_file(&base, file_symbols)
+                format!(
+                    "\\{}",
+                    resolve_class_name_in_file(&base, file_symbols).trim_start_matches('\\')
+                )
             };
             TypeInfo::Generic {
                 base,

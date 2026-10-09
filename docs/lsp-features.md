@@ -60,6 +60,9 @@ imports retain each class/function/constant clause kind, qualified relative and
 explicit `namespace\...` names resolve from the active namespace, and
 lookup/rename casing follows the referenced symbol kind rather than one blanket
 comparison rule.
+A matching namespace root or an existing indexed FQN does not make a qualified
+name absolute: in `App\Sub`, `App\Foo` resolves to `App\Sub\App\Foo` unless
+its first segment is imported. Use `\App\Foo` for the absolute type.
 
 ## Symbols And Hierarchies
 

@@ -22,6 +22,10 @@ mod type_owner_tests;
 const MAX_OBJECT_TYPE_RESOLVE_DEPTH: usize = 64;
 
 #[cfg(test)]
+#[path = "resolve_qualified_type_tests.rs"]
+mod qualified_type_tests;
+
+#[cfg(test)]
 #[path = "resolve_composite_tests.rs"]
 mod composite_tests;
 
@@ -3936,46 +3940,17 @@ fn resolve_type_name_relative_to_symbol(
     {
         return type_name.to_string();
     }
-    let scoped_file_symbols = file_symbols.scoped_at_byte_position(symbol.range.0, symbol.range.1);
-    let file_symbols = scoped_file_symbols.as_ref();
+    let mut scoped = file_symbols.scoped_at_byte_position(symbol.range.0, symbol.range.1);
     let owner_fqn = symbol.parent_fqn.as_deref().unwrap_or(&symbol.fqn);
     let owner_namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
-    let (first_part, rest) = type_name
-        .split_once('\\')
-        .map_or((type_name, None), |(first, rest)| (first, Some(rest)));
-    for use_stmt in &file_symbols.use_statements {
-        if use_stmt.kind != UseKind::Class || use_stmt.namespace != file_symbols.namespace {
-            continue;
-        }
-        let alias = use_stmt
-            .alias
-            .as_deref()
-            .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-        if alias.eq_ignore_ascii_case(first_part) {
-            let mut resolved = use_stmt.fqn.trim_start_matches('\\').to_string();
-            if let Some(rest) = rest {
-                resolved.push('\\');
-                resolved.push_str(rest);
-            }
-            return format!("\\{resolved}");
-        }
+    if scoped.namespace.as_deref() != owner_namespace {
+        scoped.to_mut().namespace = owner_namespace.map(str::to_string);
     }
-
-    if let Some(namespace) = owner_namespace {
-        if type_name.contains('\\') {
-            let namespace_root = namespace.split('\\').next().unwrap_or(namespace);
-            if first_part == namespace_root {
-                return format!("\\{}", type_name.trim_start_matches('\\'));
-            }
-        }
-
-        return format!("\\{namespace}\\{type_name}");
-    }
-
-    if type_name.contains('\\') {
-        format!("\\{}", type_name.trim_start_matches('\\'))
+    let resolved = resolve_class_name(type_name, scoped.as_ref());
+    if owner_namespace.is_none() && !type_name.contains('\\') && resolved == type_name {
+        resolved
     } else {
-        type_name.to_string()
+        format!("\\{}", resolved.trim_start_matches('\\'))
     }
 }
 

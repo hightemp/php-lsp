@@ -1679,6 +1679,52 @@ namespace. В namespace `App\Sub` имя `App\Foo` по правилам PHP я�
 leading `\`. Нужно удалить эвристику namespace root и разрешать qualified names
 строго по PHP name-resolution rules.
 
+**Реализация (2026-10-09, CODEX-P2-24):**
+
+RED воспроизвёл ошибочное разрешение native/PHPDoc return types, передачу
+чужих completion members и сохранение ошибочного receiver/callee в references.
+Parser и server теперь используют существующий class-name resolver в namespace
+и import scope объявления: `App\Foo` внутри `App\Sub` означает
+`App\Sub\App\Foo`, независимо от совпадения первого segment или наличия
+`App\Foo` в индексе. Explicit `\` и `namespace\...`, class aliases,
+разные import kinds и повторные namespace sections проверяются раздельно.
+
+Дополнительные RED проверки выявили потерю абсолютного маркера уже разрешённых
+внутренних типов. Маркер сохраняется в PHPDoc containers, class-string/template
+arguments, object arguments, Doctrine targetEntity/repository/collection types
+и известных Laravel relation/model/fluent/cast результатах. Уже разрешённые
+template binding arguments также сохраняют маркер. Native декларации
+сохраняют исходный scope; наследуемые обычные return types разрешаются в
+declaring namespace до привязки receiver. Варианты self/static/parent
+сохраняют существующую привязку. Проверены hover/type links, inlay links, versioned
+unsaved updates, Unicode/CRLF и controller-to-Twig propagation. Generic factory
+сценарии проверяют поддерживаемые resolved-return hover/inlay пути; расширение
+completion для всех generic factory вызовов не заявляется.
+
+Cache schema 30 перестраивает ранее вычисленные ошибочные references, хотя
+layout их полей не изменён. Binary fixture обновлена, отдельная round-trip
+регрессия проверяет receiver/callee и остальные reference metadata после replay;
+существующий stale-schema тест отклоняет предыдущую schema 29.
+
+Добавлены 38 постоянных регрессий: 11 parser, 18 server/helper, 1 cache,
+8 LSP. Начальный RED воспроизвёл 5 parser, 5 server и 2 LSP ошибки;
+дальнейшие RED покрыли cached references, потерю маркера, template binding,
+framework результаты и inherited declaring scope. Полный набор дополнительно
+проверяет existing completion/PHPDoc, hover и Twig shape display: исходное
+написание PHPDoc сохранено, маркеры вычисленных типов скрываются только в
+копии для отображения, поиск использует исходный TypeInfo.
+
+Полный последовательный Rust-набор: 1444/1444, 46 test-result targets,
+0 ignored; `CARGO_BUILD_JOBS=1`, `--test-threads=1`. Clippy
+`--all-targets -- -D warnings`, Rustfmt и diff check прошли. После OOM
+запуски изолированы во временной user scope с MemoryHigh2G/MemoryMax3G,
+MemorySwapMax1G, одним доступным CPU и nice15; глобальные настройки не менялись.
+Повторяемый review Verifier на `gpt-6-sol` дал GO по коду, тестам и
+финальной документации; задача в TASKS.md отмечена выполненной.
+Статус: **исправлено**. Матрица содержит 55 scenario rows/115 действующих
+локальных ссылок. Исходное описание находки сохранено. Исторические измерения
+coverage/performance не обновлялись; warm timing после schema 30 не измерен.
+
 ### CODEX-P2-25. Local definition/type inference имеет неполные scope barriers
 
 [`find_variable_definition_before`](server/crates/php-lsp-parser/src/resolve.rs#L6198)

@@ -27,14 +27,14 @@ are still production blockers.
 Latest large-workspace performance numbers are recorded in
 `docs/production-baseline.md` under "Production Validation Large Workspace Run".
 The latest intelligence milestone refresh is recorded there under
-"IE-045 Intelligence Milestone Acceptance Refresh". The newer 2026-07-21
-post-audit correctness and compatibility acceptance added no performance
-samples, so it does not replace these measurements. The 2026-09-25 cache
-provenance change (schema 26) added source revalidation; cold and warm
-large-workspace timings have not been rerun for that implementation or the
-2026-10-07 call-site metadata change (schema 27) or the 2026-10-08 exact PHPDoc
-owner-range change (schema 28) or separate native/PHPDoc type provenance
-(current schema 29).
+"IE-045 Intelligence Milestone Acceptance Refresh". The newer post-audit
+correctness and compatibility acceptance (2026-07-21) added no performance
+samples, so it does not replace these measurements. The cache provenance
+change (schema 26; 2026-09-25) added source revalidation. Cold and warm
+large-workspace timings have not been rerun after that change, call-site
+metadata (schema 27; 2026-10-07), exact PHPDoc owner ranges (schema 28;
+2026-10-08), native/PHPDoc type provenance (schema 29; 2026-10-08), or qualified
+type/reference resolution (current schema 30; 2026-10-09).
 
 ## Latest Performance Acceptance Snapshot
 

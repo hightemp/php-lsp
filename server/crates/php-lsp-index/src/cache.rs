@@ -21,10 +21,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `bincode` is not self-describing. Bump this whenever `IndexCache`,
 /// `CachedFile`, `CachedFileMetadata`, `CachedTopLevelSymbols`, or nested
 /// serialized `php-lsp-types` fields change in a way that can affect persisted
-/// bytes. The cache schema fixture test below guards the representative binary
+/// bytes, or when resolution semantics change persisted references.
+/// The cache schema fixture test below guards the representative binary
 /// shape so CI fails until this version and its fingerprint are updated
 /// together.
-pub const CACHE_SCHEMA_VERSION: u32 = 29;
+pub const CACHE_SCHEMA_VERSION: u32 = 30;
 pub const CACHE_FILE_NAME: &str = "index.bin";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;

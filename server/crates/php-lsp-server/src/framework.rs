@@ -851,7 +851,10 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
                         query.kind,
                         "Laravel Eloquent builder dynamic method",
                     );
-                    member.type_info = Some(TypeInfo::Simple(query.owner_fqn.clone()));
+                    member.type_info = Some(TypeInfo::Simple(format!(
+                        "\\{}",
+                        query.owner_fqn.trim_start_matches('\\')
+                    )));
                     return vec![member];
                 }
                 false
@@ -1800,7 +1803,10 @@ fn laravel_relation_property_type_for_relation_fqn(
 ) -> Option<TypeInfo> {
     if let Some(related_model) = related_model {
         if is_laravel_single_model_relation_fqn(ctx, relation_fqn) {
-            return Some(TypeInfo::Simple(related_model.to_string()));
+            return Some(TypeInfo::Simple(format!(
+                "\\{}",
+                related_model.trim_start_matches('\\')
+            )));
         }
         if is_laravel_collection_relation_fqn(ctx, relation_fqn) {
             return Some(laravel_eloquent_collection_type(related_model));
@@ -1809,7 +1815,7 @@ fn laravel_relation_property_type_for_relation_fqn(
 
     if is_laravel_single_model_relation_fqn(ctx, relation_fqn) {
         return Some(TypeInfo::Simple(
-            "Illuminate\\Database\\Eloquent\\Model".to_string(),
+            "\\Illuminate\\Database\\Eloquent\\Model".to_string(),
         ));
     }
 
@@ -1871,14 +1877,24 @@ fn laravel_type_info_from_text(type_text: &str) -> Option<TypeInfo> {
     let type_info = parse_phpdoc(&format!("/** @var {type_text} */"))
         .var_type
         .unwrap_or_else(|| TypeInfo::Simple(type_text.to_string()));
-    Some(laravel_normalize_type_info_names(&type_info))
+    // These strings describe already-resolved owners/receivers, not PHP syntax.
+    Some(php_lsp_parser::resolve::map_receiver_type_names(
+        &type_info,
+        &|name| {
+            if is_builtin_type_name(name) || matches!(name, "TModel" | "TRelatedModel") {
+                None
+            } else {
+                Some(format!("\\{}", name.trim_start_matches('\\')))
+            }
+        },
+    ))
 }
 
 fn laravel_normalize_type_info_names(type_info: &TypeInfo) -> TypeInfo {
     match type_info {
-        TypeInfo::Simple(name) => TypeInfo::Simple(name.trim_start_matches('\\').to_string()),
+        TypeInfo::Simple(name) => TypeInfo::Simple(name.clone()),
         TypeInfo::Generic { base, args } => TypeInfo::Generic {
-            base: base.trim_start_matches('\\').to_string(),
+            base: base.clone(),
             args: args.iter().map(laravel_normalize_type_info_names).collect(),
         },
         TypeInfo::Nullable(inner) => {
@@ -2103,10 +2119,10 @@ fn is_laravel_collection_relation_fqn(ctx: &FrameworkProviderContext<'_>, fqn: &
 
 fn laravel_eloquent_collection_type(related_model: &str) -> TypeInfo {
     TypeInfo::Generic {
-        base: "Illuminate\\Database\\Eloquent\\Collection".to_string(),
+        base: "\\Illuminate\\Database\\Eloquent\\Collection".to_string(),
         args: vec![
             TypeInfo::Simple("int".to_string()),
-            TypeInfo::Simple(related_model.to_string()),
+            TypeInfo::Simple(format!("\\{}", related_model.trim_start_matches('\\'))),
         ],
     }
 }
@@ -2251,7 +2267,10 @@ fn laravel_builder_scope_virtual_methods(
             ctx,
             &owner,
             builder_fqn,
-            Some(TypeInfo::Simple(builder_fqn.to_string())),
+            Some(TypeInfo::Simple(format!(
+                "\\{}",
+                builder_fqn.trim_start_matches('\\')
+            ))),
             &mut methods,
             &mut seen,
         );
@@ -2353,7 +2372,10 @@ fn laravel_model_dynamic_method_return_type(
         lower.as_str(),
         "find" | "findorfail" | "first" | "firstorfail" | "firstornew" | "firstorcreate" | "create"
     ) {
-        return Some(TypeInfo::Simple(model_fqn.to_string()));
+        return Some(TypeInfo::Simple(format!(
+            "\\{}",
+            model_fqn.trim_start_matches('\\')
+        )));
     }
 
     if matches!(lower.as_str(), "count") {
@@ -2526,7 +2548,10 @@ fn laravel_relation_dynamic_method_return_type(
         lower.as_str(),
         "find" | "findorfail" | "first" | "firstorfail" | "firstornew" | "firstorcreate" | "create"
     ) {
-        return Some(TypeInfo::Simple(related_model));
+        return Some(TypeInfo::Simple(format!(
+            "\\{}",
+            related_model.trim_start_matches('\\')
+        )));
     }
     if lower.as_str() == "findmany" {
         return Some(laravel_eloquent_collection_type(&related_model));
@@ -2602,13 +2627,15 @@ fn substitute_laravel_model_templates_in_type_info(
 ) -> TypeInfo {
     match type_info {
         TypeInfo::Simple(name) if matches!(name.as_str(), "TModel" | "TRelatedModel") => {
-            TypeInfo::Simple(related_model.to_string())
+            TypeInfo::Simple(format!("\\{}", related_model.trim_start_matches('\\')))
         }
         TypeInfo::Simple(_) => laravel_normalize_type_info_names(type_info),
         TypeInfo::Generic { base, args } => TypeInfo::Generic {
             base: match base.as_str() {
-                "TModel" | "TRelatedModel" => related_model.to_string(),
-                _ => base.trim_start_matches('\\').to_string(),
+                "TModel" | "TRelatedModel" => {
+                    format!("\\{}", related_model.trim_start_matches('\\'))
+                }
+                _ => base.clone(),
             },
             args: args
                 .iter()
@@ -2747,11 +2774,14 @@ fn laravel_builder_type_for_model(
     model_fqn: &str,
 ) -> Option<TypeInfo> {
     laravel_custom_builder_for_model(ctx, model_fqn)
-        .map(TypeInfo::Simple)
+        .map(|fqn| TypeInfo::Simple(format!("\\{}", fqn.trim_start_matches('\\'))))
         .or_else(|| {
             Some(TypeInfo::Generic {
-                base: "Illuminate\\Database\\Eloquent\\Builder".to_string(),
-                args: vec![TypeInfo::Simple(model_fqn.to_string())],
+                base: "\\Illuminate\\Database\\Eloquent\\Builder".to_string(),
+                args: vec![TypeInfo::Simple(format!(
+                    "\\{}",
+                    model_fqn.trim_start_matches('\\')
+                ))],
             })
         })
 }
@@ -2885,103 +2915,13 @@ fn resolve_laravel_type_info_relative_to_owner(
     owner: &SymbolInfo,
     type_info: &TypeInfo,
 ) -> TypeInfo {
-    match type_info {
-        TypeInfo::Simple(name) => TypeInfo::Simple(
+    php_lsp_parser::resolve::map_receiver_type_names(type_info, &|name| {
+        if is_builtin_type_name(name) || matches!(name, "TModel" | "TRelatedModel") {
+            None
+        } else {
             resolve_laravel_type_name_relative_to_owner(ctx, owner, name)
-                .unwrap_or_else(|| name.trim_start_matches('\\').to_string()),
-        ),
-        TypeInfo::Generic { base, args } => TypeInfo::Generic {
-            base: resolve_laravel_type_name_relative_to_owner(ctx, owner, base)
-                .unwrap_or_else(|| base.trim_start_matches('\\').to_string()),
-            args: args
-                .iter()
-                .map(|arg| resolve_laravel_type_info_relative_to_owner(ctx, owner, arg))
-                .collect(),
-        },
-        TypeInfo::Nullable(inner) => TypeInfo::Nullable(Box::new(
-            resolve_laravel_type_info_relative_to_owner(ctx, owner, inner),
-        )),
-        TypeInfo::Union(types) => TypeInfo::Union(
-            types
-                .iter()
-                .map(|type_info| resolve_laravel_type_info_relative_to_owner(ctx, owner, type_info))
-                .collect(),
-        ),
-        TypeInfo::Intersection(types) => TypeInfo::Intersection(
-            types
-                .iter()
-                .map(|type_info| resolve_laravel_type_info_relative_to_owner(ctx, owner, type_info))
-                .collect(),
-        ),
-        TypeInfo::ClassString(Some(inner)) => TypeInfo::ClassString(Some(Box::new(
-            resolve_laravel_type_info_relative_to_owner(ctx, owner, inner),
-        ))),
-        TypeInfo::Conditional {
-            subject,
-            target,
-            if_type,
-            else_type,
-        } => TypeInfo::Conditional {
-            subject: subject.clone(),
-            target: Box::new(resolve_laravel_type_info_relative_to_owner(
-                ctx, owner, target,
-            )),
-            if_type: Box::new(resolve_laravel_type_info_relative_to_owner(
-                ctx, owner, if_type,
-            )),
-            else_type: Box::new(resolve_laravel_type_info_relative_to_owner(
-                ctx, owner, else_type,
-            )),
-        },
-        TypeInfo::ArrayShape(items) => TypeInfo::ArrayShape(
-            items
-                .iter()
-                .map(|item| php_lsp_types::ArrayShapeItem {
-                    key: item.key.clone(),
-                    optional: item.optional,
-                    value: resolve_laravel_type_info_relative_to_owner(ctx, owner, &item.value),
-                })
-                .collect(),
-        ),
-        TypeInfo::ObjectShape(items) => TypeInfo::ObjectShape(
-            items
-                .iter()
-                .map(|item| php_lsp_types::ArrayShapeItem {
-                    key: item.key.clone(),
-                    optional: item.optional,
-                    value: resolve_laravel_type_info_relative_to_owner(ctx, owner, &item.value),
-                })
-                .collect(),
-        ),
-        TypeInfo::Callable {
-            params,
-            return_type,
-        } => TypeInfo::Callable {
-            params: params
-                .iter()
-                .map(|param| resolve_laravel_type_info_relative_to_owner(ctx, owner, param))
-                .collect(),
-            return_type: return_type.as_ref().map(|return_type| {
-                Box::new(resolve_laravel_type_info_relative_to_owner(
-                    ctx,
-                    owner,
-                    return_type,
-                ))
-            }),
-        },
-        TypeInfo::Self_
-        | TypeInfo::Static_
-        | TypeInfo::Parent_
-        | TypeInfo::ClassString(None)
-        | TypeInfo::LiteralString(_)
-        | TypeInfo::LiteralInt(_)
-        | TypeInfo::LiteralFloat(_)
-        | TypeInfo::LiteralBool(_)
-        | TypeInfo::LiteralNull
-        | TypeInfo::Void
-        | TypeInfo::Never
-        | TypeInfo::Mixed => type_info.clone(),
-    }
+        }
+    })
 }
 
 fn resolve_laravel_type_name_relative_to_owner(
@@ -2989,45 +2929,40 @@ fn resolve_laravel_type_name_relative_to_owner(
     owner: &SymbolInfo,
     type_name: &str,
 ) -> Option<String> {
-    let normalized = type_name.trim().trim_start_matches('\\');
-    if normalized.is_empty()
-        || is_builtin_type_name(normalized)
-        || matches!(normalized, "$this" | "self" | "static" | "parent")
-        || matches!(normalized, "TModel" | "TRelatedModel")
+    let type_name = type_name.trim();
+    if type_name.is_empty()
+        || is_builtin_type_name(type_name)
+        || matches!(
+            type_name,
+            "$this" | "self" | "static" | "parent" | "TModel" | "TRelatedModel"
+        )
     {
-        return Some(normalized.to_string());
+        return Some(type_name.to_string());
     }
-
-    if normalized.contains('\\') {
-        return Some(normalized.to_string());
-    }
-
-    let owner_fqn = owner.parent_fqn.as_deref().unwrap_or(&owner.fqn);
-    let owner_namespace = owner_fqn.rsplit_once('\\').map(|(namespace, _)| namespace);
-    if let Some(namespace) = owner_namespace {
-        if let Some(file_symbols) = ctx.index.read().file_symbols().get(owner.uri.as_str()) {
-            let scoped_file_symbols =
-                file_symbols.scoped_at_byte_position(owner.range.0, owner.range.1);
-            for use_stmt in &scoped_file_symbols.use_statements {
-                if use_stmt.kind != UseKind::Class
-                    || use_stmt.namespace.as_deref() != Some(namespace)
-                {
-                    continue;
-                }
-                let alias = use_stmt
-                    .alias
-                    .as_deref()
-                    .unwrap_or_else(|| use_stmt.fqn.rsplit('\\').next().unwrap_or(&use_stmt.fqn));
-                if alias.eq_ignore_ascii_case(normalized) {
-                    return Some(use_stmt.fqn.trim_start_matches('\\').to_string());
-                }
-            }
-        }
-
-        return Some(format!("{namespace}\\{normalized}"));
-    }
-
-    Some(normalized.to_string())
+    let indexed = ctx
+        .index
+        .read()
+        .file_symbols()
+        .get(&owner.uri)
+        .map(|entry| entry.value().clone());
+    let source = indexed.as_deref().or_else(|| {
+        ctx.source_uri
+            .filter(|uri| *uri == owner.uri)
+            .and(ctx.file_symbols)
+    });
+    let fallback = FileSymbols {
+        namespace: owner
+            .parent_fqn
+            .as_deref()
+            .unwrap_or(&owner.fqn)
+            .rsplit_once('\\')
+            .map(|(namespace, _)| namespace.to_string()),
+        ..Default::default()
+    };
+    let file = source.unwrap_or(&fallback);
+    let scoped = file.scoped_at_byte_position(owner.range.0, owner.range.1);
+    let resolved = resolve_class_name(type_name, scoped.as_ref());
+    Some(format!("\\{}", resolved.trim_start_matches('\\')))
 }
 
 fn resolve_type_name_to_fqn(
@@ -3035,34 +2970,15 @@ fn resolve_type_name_to_fqn(
     owner: &SymbolInfo,
     type_name: &str,
 ) -> Option<String> {
-    let type_name = type_name.trim().trim_start_matches('\\');
-    if type_name.is_empty() || is_builtin_type_name(type_name) {
-        return None;
-    }
-    if type_name.contains(['|', '&', '<', '>', '{', '}', '(', ')', ',', ' ']) {
-        return None;
-    }
-    if type_name.contains('\\') {
-        return Some(type_name.to_string());
-    }
-
-    if let Some(file_symbols) = ctx.index.read().file_symbols().get(owner.uri.as_str()) {
-        let scoped_file_symbols =
-            file_symbols.scoped_at_byte_position(owner.range.0, owner.range.1);
-        return Some(resolve_class_name(type_name, scoped_file_symbols.as_ref()));
-    }
-    if ctx
-        .source_uri
-        .is_some_and(|source_uri| source_uri == owner.uri.as_str())
+    let type_name = type_name.trim();
+    if type_name.is_empty()
+        || is_builtin_type_name(type_name)
+        || type_name.contains(['|', '&', '<', '>', '{', '}', '(', ')', ',', ' '])
     {
-        if let Some(file_symbols) = ctx.file_symbols {
-            let scoped_file_symbols =
-                file_symbols.scoped_at_byte_position(owner.range.0, owner.range.1);
-            return Some(resolve_class_name(type_name, scoped_file_symbols.as_ref()));
-        }
+        return None;
     }
-
-    Some(type_name.to_string())
+    resolve_laravel_type_name_relative_to_owner(ctx, owner, type_name)
+        .map(|resolved| resolved.trim_start_matches('\\').to_string())
 }
 
 fn is_builtin_type_name(type_name: &str) -> bool {
@@ -3258,9 +3174,7 @@ fn next_quoted_string(text: &str, start: usize) -> Option<(String, usize, usize)
 fn cast_value_to_type(value: &str) -> Option<TypeInfo> {
     let mut normalized = value.trim().trim_matches(['\'', '"']).to_string();
     if let Some(class_name) = normalized.strip_suffix("::class") {
-        return Some(TypeInfo::Simple(
-            class_name.trim_start_matches('\\').to_string(),
-        ));
+        return Some(TypeInfo::Simple(class_name.to_string()));
     }
     if let Some(rest) = normalized.strip_prefix("encrypted:") {
         normalized = rest.to_string();
@@ -3279,14 +3193,12 @@ fn cast_value_to_type(value: &str) -> Option<TypeInfo> {
         "array" | "json" => Some(TypeInfo::Simple("array".to_string())),
         "object" => Some(TypeInfo::Simple("object".to_string())),
         "collection" => Some(TypeInfo::Simple(
-            "Illuminate\\Support\\Collection".to_string(),
+            "\\Illuminate\\Support\\Collection".to_string(),
         )),
         "date" | "datetime" | "immutable_date" | "immutable_datetime" | "timestamp" => {
-            Some(TypeInfo::Simple("Carbon\\CarbonInterface".to_string()))
+            Some(TypeInfo::Simple("\\Carbon\\CarbonInterface".to_string()))
         }
-        _ if normalized.contains('\\') => Some(TypeInfo::Simple(
-            normalized.trim_start_matches('\\').to_string(),
-        )),
+        _ if normalized.contains('\\') => Some(TypeInfo::Simple(normalized.to_string())),
         _ => None,
     }
 }

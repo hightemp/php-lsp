@@ -718,7 +718,7 @@ class UserRepository extends BaseRepository {}
     assert_eq!(cls.template_bindings[1].target, "Vendor\\Builder");
     assert_eq!(
         cls.template_bindings[1].args,
-        vec![TypeInfo::Simple("Vendor\\Entity\\User".to_string())]
+        vec![TypeInfo::Simple("\\Vendor\\Entity\\User".to_string())]
     );
 }
 

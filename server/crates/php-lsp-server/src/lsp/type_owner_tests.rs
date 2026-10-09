@@ -74,7 +74,7 @@ fn phpdoc_variable_owner_and_imports_follow_the_active_namespace_section() {
     let source = "<?php namespace First { use Vendor\\Left as Alias; class Decoy {} } namespace Second { use Vendor\\Right as Alias; class Actual { function run() { /** @var array<int, Alias> $items */ $items = []; foreach ($items as $value) { $value; } } } }";
     let info = inferred_variable(source, "$value;");
     assert_eq!(info.owner_fqn, "Second\\Actual");
-    assert_eq!(info.type_info.to_string(), "Vendor\\Right");
+    assert_eq!(info.type_info.to_string(), "\\Vendor\\Right");
 }
 
 #[test]

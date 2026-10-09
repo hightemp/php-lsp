@@ -454,7 +454,7 @@ class Team extends Model {}
             .and_then(|property| property.type_info.as_ref())
             .map(ToString::to_string)
             .as_deref(),
-        Some("Illuminate\\Database\\Eloquent\\Collection<int, App\\Models\\Post>")
+        Some("\\Illuminate\\Database\\Eloquent\\Collection<int, \\App\\Models\\Post>")
     );
     assert_eq!(
         by_name
@@ -462,7 +462,7 @@ class Team extends Model {}
             .and_then(|property| property.type_info.as_ref())
             .map(ToString::to_string)
             .as_deref(),
-        Some("App\\Models\\Team")
+        Some("\\App\\Models\\Team")
     );
     assert_eq!(
         by_name
@@ -516,7 +516,7 @@ class Team extends Model {}
             .as_ref()
             .map(ToString::to_string)
             .as_deref(),
-        Some(relation_owner)
+        Some("\\Illuminate\\Database\\Eloquent\\Relations\\HasMany<\\App\\Models\\Post, \\App\\Models\\User>")
     );
 
     let find_or_fail = registry.virtual_members(
@@ -534,7 +534,7 @@ class Team extends Model {}
             .as_ref()
             .map(ToString::to_string)
             .as_deref(),
-        Some("App\\Models\\Post")
+        Some("\\App\\Models\\Post")
     );
 
     let get = registry.virtual_members(
@@ -552,7 +552,7 @@ class Team extends Model {}
             .as_ref()
             .map(ToString::to_string)
             .as_deref(),
-        Some("Illuminate\\Database\\Eloquent\\Collection<int, App\\Models\\Post>")
+        Some("\\Illuminate\\Database\\Eloquent\\Collection<int, \\App\\Models\\Post>")
     );
 
     let unknown = registry.virtual_members(
@@ -605,7 +605,7 @@ class HasMany extends Relation {}
             .as_ref()
             .map(ToString::to_string)
             .as_deref(),
-        Some("Illuminate\\Database\\Eloquent\\Relations\\HasMany")
+        Some("\\Illuminate\\Database\\Eloquent\\Relations\\HasMany")
     );
 
     let collection_method = registry.virtual_members(
@@ -665,7 +665,7 @@ class HasMany extends Relation {}
             .as_ref()
             .map(ToString::to_string)
             .as_deref(),
-        Some("Illuminate\\Database\\Eloquent\\Collection<int, App\\Models\\User>")
+        Some("\\Illuminate\\Database\\Eloquent\\Collection<int, \\App\\Models\\User>")
     );
 }
 
@@ -721,7 +721,7 @@ class AppServiceProvider
             .as_ref()
             .map(ToString::to_string)
             .as_deref(),
-        Some("Illuminate\\Database\\Eloquent\\Collection<int, App\\Models\\User>")
+        Some("\\Illuminate\\Database\\Eloquent\\Collection<int, \\App\\Models\\User>")
     );
     assert!(members[0]
         .sources
@@ -975,7 +975,7 @@ class AppServiceProvider
             .as_ref()
             .map(ToString::to_string)
             .as_deref(),
-        Some("Illuminate\\Database\\Eloquent\\Collection<int, App\\Models\\Vault>")
+        Some("\\Illuminate\\Database\\Eloquent\\Collection<int, \\App\\Models\\Vault>")
     );
     assert!(members[0]
         .sources
@@ -1168,7 +1168,7 @@ class User extends Model
             .and_then(|member| member.type_info.as_ref())
             .map(ToString::to_string)
             .as_deref(),
-        Some("App\\Database\\UserBuilder")
+        Some("\\App\\Database\\UserBuilder")
     );
 
     let builder_scope = registry.virtual_members(
@@ -1185,7 +1185,7 @@ class User extends Model
             .and_then(|member| member.type_info.as_ref())
             .map(ToString::to_string)
             .as_deref(),
-        Some("App\\Database\\UserBuilder")
+        Some("\\App\\Database\\UserBuilder")
     );
 
     let first = index
@@ -1196,7 +1196,7 @@ class User extends Model
             .signature
             .as_ref()
             .and_then(|signature| signature.return_type.clone()),
-        Some(TypeInfo::Simple("App\\Models\\User".to_string()))
+        Some(TypeInfo::Simple("\\App\\Models\\User".to_string()))
     );
 }
 
