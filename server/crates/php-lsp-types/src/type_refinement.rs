@@ -279,7 +279,7 @@ fn names_refine(
     Incompatible
 }
 
-fn normalized_leaf(name: &str) -> Option<TypeInfo> {
+pub(crate) fn normalized_leaf(name: &str) -> Option<TypeInfo> {
     match name.to_ascii_lowercase().as_str() {
         "mixed" => Some(TypeInfo::Mixed),
         "never" | "never-return" | "no-return" => Some(TypeInfo::Never),
@@ -297,7 +297,7 @@ fn normalized_leaf(name: &str) -> Option<TypeInfo> {
     }
 }
 
-fn family(name: &str) -> &str {
+pub(crate) fn family(name: &str) -> &str {
     match name {
         "positive-int" | "negative-int" | "non-negative-int" | "non-positive-int"
         | "non-zero-int" | "int-mask" | "int-mask-of" => "int",

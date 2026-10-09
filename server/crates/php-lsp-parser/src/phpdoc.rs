@@ -822,6 +822,10 @@ pub(crate) fn parse_type_string(s: &str) -> TypeInfo {
         return callable;
     }
 
+    if let Some(conditional) = parse_conditional_type(s) {
+        return conditional;
+    }
+
     if let Some(parts) = split_top_level(s, '|') {
         let parts: Vec<TypeInfo> = parts.into_iter().map(parse_type_string).collect();
         return TypeInfo::Union(parts);
@@ -830,10 +834,6 @@ pub(crate) fn parse_type_string(s: &str) -> TypeInfo {
     if let Some(parts) = split_top_level(s, '&') {
         let parts: Vec<TypeInfo> = parts.into_iter().map(parse_type_string).collect();
         return TypeInfo::Intersection(parts);
-    }
-
-    if let Some(conditional) = parse_conditional_type(s) {
-        return conditional;
     }
 
     if let Some(inner) = s.strip_prefix('?') {
@@ -886,33 +886,93 @@ fn parse_array_suffix_type(s: &str) -> Option<TypeInfo> {
 
 fn parse_conditional_type(s: &str) -> Option<TypeInfo> {
     let s = strip_enclosing_parentheses(s).unwrap_or(s).trim();
-    let question = find_top_level_char(s, '?')?;
-    let colon = find_top_level_char_from(s, ':', question + 1)?;
+    let is = find_top_level_str(s, " is ")?;
+    let question = conditional_question(s, is + " is ".len())?;
+    let colon = conditional_colon(s, question + 1)?;
     let condition = s[..question].trim();
     let if_type = s[question + 1..colon].trim();
     let else_type = s[colon + 1..].trim();
-    if condition.is_empty() || if_type.is_empty() || else_type.is_empty() {
+    if if_type.is_empty() || else_type.is_empty() {
         return None;
     }
-
-    let (subject, target) = split_conditional_is_condition(condition)?;
-    Some(TypeInfo::Conditional {
-        subject: subject.to_string(),
-        target: Box::new(parse_type_string(target)),
-        if_type: Box::new(parse_type_string(if_type)),
-        else_type: Box::new(parse_type_string(else_type)),
-    })
-}
-
-fn split_conditional_is_condition(condition: &str) -> Option<(&str, &str)> {
-    let needle = " is ";
-    let idx = find_top_level_str(condition, needle)?;
-    let subject = condition[..idx].trim();
-    let target = condition[idx + needle.len()..].trim();
+    let subject = condition[..is].trim();
+    let mut target = condition[is + " is ".len()..].trim();
+    let negated = target.strip_prefix("not ");
+    if let Some(inner) = negated {
+        target = inner.trim();
+    }
     if subject.is_empty() || target.is_empty() {
         return None;
     }
-    Some((subject, target))
+    let (if_type, else_type) = (parse_type_string(if_type), parse_type_string(else_type));
+    Some(TypeInfo::Conditional {
+        subject: subject.to_string(),
+        target: Box::new(parse_type_string(target)),
+        if_type: Box::new(if negated.is_some() {
+            else_type.clone()
+        } else {
+            if_type.clone()
+        }),
+        else_type: Box::new(if negated.is_some() {
+            if_type
+        } else {
+            else_type
+        }),
+    })
+}
+
+fn conditional_question(s: &str, mut start: usize) -> Option<usize> {
+    loop {
+        let question = find_top_level_char_from(s, '?', start)?;
+        let prefix = s[..question].trim_end();
+        // Nullable prefixes follow a type boundary, not a completed type.
+        if !prefix.ends_with(" is")
+            && !prefix.ends_with(" is not")
+            && !prefix.ends_with(['|', '&', ':', '?', ','])
+        {
+            return Some(question);
+        }
+        start = question + 1;
+    }
+}
+
+fn conditional_colon(s: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
+    let mut nested = 0usize;
+    loop {
+        let colon = find_top_level_char_from(s, ':', cursor)?;
+        if s[colon..].starts_with("::") {
+            cursor = colon + 2;
+            continue;
+        }
+        let question = conditional_question(s, cursor).filter(|q| *q < colon);
+        if question.is_none() && find_top_level_char_from(s, ':', colon + 1).is_some() {
+            let prefix = s[cursor..colon].trim();
+            let tail = split_top_level(prefix, '|')
+                .and_then(|parts| parts.last().copied())
+                .unwrap_or(prefix);
+            if matches!(
+                parse_callable_signature(tail),
+                Some(TypeInfo::Callable {
+                    return_type: None,
+                    ..
+                })
+            ) {
+                cursor = colon + 1;
+                continue;
+            }
+        }
+        if let Some(question) = question {
+            nested += 1;
+            cursor = question + 1;
+            continue;
+        }
+        if nested == 0 {
+            return Some(colon);
+        }
+        nested -= 1;
+        cursor = colon + 1;
+    }
 }
 
 fn parse_generic_type(s: &str) -> Option<TypeInfo> {
@@ -1623,3 +1683,7 @@ fn digits_with_separators(s: &str, is_digit: impl Fn(char) -> bool) -> bool {
 #[cfg(test)]
 #[path = "phpdoc_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "phpdoc_conditional_tests.rs"]
+mod conditional_tests;

@@ -45,7 +45,7 @@ pub fn refinement_for_symbol(
     )
 }
 
-fn class_relation(
+pub(crate) fn class_relation(
     symbol: &SymbolInfo,
     doc: &str,
     native: &str,

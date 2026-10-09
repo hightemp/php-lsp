@@ -811,19 +811,27 @@ impl PhpLspBackend {
                 let return_type = symbol_effective_return_type(&symbol)?;
                 let arguments =
                     completion_call_arguments_by_param(member_text, signature, file_symbols, index);
-                let template_names: HashSet<String> = symbol
-                    .templates
-                    .iter()
-                    .map(|template| template.name.clone())
-                    .collect();
-                let substitutions =
-                    call_site_template_substitutions(&arguments, signature, &template_names);
+                let template_names =
+                    callable_template_names_from_index(index, &symbol, &symbol.fqn);
+                let receiver = parse_phpdoc(&format!("/** @var {class_fqn} */")).var_type;
+                let mut substitutions =
+                    receiver_bindings_for_type(index, file_symbols, &symbol.fqn, receiver.as_ref());
+                for template in &symbol.templates {
+                    substitutions.remove(&template.name);
+                }
+                for (name, value) in
+                    call_site_template_substitutions(&arguments, signature, &template_names)
+                {
+                    substitutions.entry(name).or_insert(value);
+                }
                 let resolved = resolve_call_site_type_info(
                     &return_type,
                     &arguments,
                     &template_names,
                     &substitutions,
+                    &|actual, expected| index.class_relation_for_symbol(&symbol, actual, expected),
                 );
+                let resolved = constrain_call_site_return_type(index, &symbol, resolved);
                 type_info_resolved_text_from_index(index, class_fqn, &symbol.uri, &resolved)
             },
         )

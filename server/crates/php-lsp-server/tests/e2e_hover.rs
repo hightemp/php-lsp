@@ -3333,10 +3333,13 @@ class CdbHandler extends BaseHandler {
         "expected class-string template and conditional return hints, got: {:?}",
         labels
     );
+    let (fallback_line, fallback_col) = utf16_position_after(code, "$fallback");
     assert!(
-        labels.iter().any(|label| label == ": T|object"),
-        "expected unresolved conditional return fallback union hint, got: {:?}",
-        labels
+        !hints.iter().any(|hint| {
+            hint["position"] == json!({"line": fallback_line, "character": fallback_col})
+        }),
+        "unbound conditional result is mixed and must not acquire a T|object hint: {}",
+        result
     );
     assert!(
         labels.iter().any(|label| label == ": ?PortingProcess"),

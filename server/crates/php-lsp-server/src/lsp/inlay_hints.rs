@@ -20,6 +20,10 @@ mod qualified_type_tests;
 #[path = "variable_scope_tests.rs"]
 mod variable_scope_tests;
 
+#[cfg(test)]
+#[path = "conditional_type_tests.rs"]
+mod conditional_type_tests;
+
 const DECLARATION_SCOPE_END_HINT_MIN_LINES: u32 = 2;
 const LARGE_SCOPE_END_HINT_MIN_LINES: u32 = 8;
 const CONTROL_SCOPE_END_HINT_MAX_CHARS: usize = 96;
@@ -2456,14 +2460,34 @@ pub(in crate::server) fn resolve_call_site_return_type(
         return return_type.clone();
     };
 
+    let _published = ctx.index.read();
     let arguments = call_site_arguments_by_param(ctx, call_node, signature);
-    let template_names: HashSet<String> = symbol
-        .templates
-        .iter()
-        .map(|template| template.name.clone())
-        .collect();
-    let substitutions = call_site_template_substitutions(&arguments, signature, &template_names);
-    resolve_call_site_type_info(return_type, &arguments, &template_names, &substitutions)
+    let template_names = callable_template_names_from_index(ctx.index, symbol, &symbol.fqn);
+    let receiver = call_node
+        .child_by_field_name("object")
+        .and_then(|object| call_site_argument_type(ctx, object));
+    let mut substitutions =
+        receiver_bindings_for_type(ctx.index, ctx.file_symbols, &symbol.fqn, receiver.as_ref());
+    for template in &symbol.templates {
+        substitutions.remove(&template.name);
+    }
+    for (name, value) in call_site_template_substitutions(&arguments, signature, &template_names) {
+        substitutions.entry(name).or_insert(value);
+    }
+    let result = resolve_call_site_type_info(
+        return_type,
+        &arguments,
+        &template_names,
+        &substitutions,
+        &|actual, expected| {
+            if matches!(actual, "self" | "static" | "parent") {
+                return None;
+            }
+            ctx.index
+                .class_relation_for_symbol(symbol, actual, expected)
+        },
+    );
+    constrain_call_site_return_type(ctx.index, symbol, result)
 }
 
 pub(in crate::server) fn symbol_effective_return_type(
@@ -2491,19 +2515,44 @@ pub(in crate::server) fn call_site_arguments_by_param(
     signature: &php_lsp_types::Signature,
 ) -> HashMap<String, php_lsp_types::TypeInfo> {
     let mut arguments = HashMap::new();
+    let mut provided = HashSet::new();
+    let mut unpacked = false;
     for (arg_index, arg) in call_arguments(call_node, ctx.source)
         .into_iter()
         .enumerate()
     {
+        if arg.value_node.kind() == "variadic_unpacking" {
+            unpacked = true;
+            continue;
+        }
+        if unpacked && arg.name.is_none() {
+            continue;
+        }
         let Some(param) = signature_param_for_call_arg(signature, arg_index, arg.name.as_deref())
         else {
             continue;
         };
+        provided.insert(param.name.trim_start_matches('$').to_string());
         let Some(type_info) = call_site_argument_type(ctx, arg.value_node) else {
             continue;
         };
         arguments.insert(param.name.trim_start_matches('$').to_string(), type_info);
     }
+    if !unpacked {
+        for param in &signature.params {
+            let key = param.name.trim_start_matches('$');
+            if !provided.contains(key) {
+                if let Some(actual) = param
+                    .default_value
+                    .as_deref()
+                    .and_then(php_lsp_types::conditional::literal_default_type)
+                {
+                    arguments.insert(key.to_string(), actual);
+                }
+            }
+        }
+    }
+
     arguments
 }
 
@@ -2716,26 +2765,88 @@ pub(in crate::server) fn receiver_template_substitutions_from_index(
     file_symbols: &php_lsp_types::FileSymbols,
     ctx: &CallableParameterContext<'_>,
 ) -> HashMap<String, php_lsp_types::TypeInfo> {
-    let mut substitutions = HashMap::new();
-    let Some((class_fqn, _)) = ctx.target_fqn.rsplit_once("::") else {
-        return substitutions;
+    receiver_bindings_for_type(index, file_symbols, ctx.target_fqn, ctx.receiver_type)
+}
+
+pub(in crate::server) fn receiver_bindings_for_type(
+    index: &WorkspaceIndex,
+    file_symbols: &php_lsp_types::FileSymbols,
+    target_fqn: &str,
+    receiver: Option<&php_lsp_types::TypeInfo>,
+) -> HashMap<String, php_lsp_types::TypeInfo> {
+    let Some((owner, _)) = target_fqn.rsplit_once("::") else {
+        return HashMap::new();
     };
-    let Some(php_lsp_types::TypeInfo::Generic { base, args }) = ctx.receiver_type else {
-        return substitutions;
+    let (base, args) = match receiver {
+        Some(php_lsp_types::TypeInfo::Generic { base, args }) => (base.as_str(), args.as_slice()),
+        Some(php_lsp_types::TypeInfo::Simple(base)) => (base.as_str(), &[][..]),
+        _ => return HashMap::new(),
     };
-    let resolved_base = resolve_class_name_pub(base, file_symbols)
-        .trim_start_matches('\\')
-        .to_string();
-    if resolved_base != class_fqn.trim_start_matches('\\') {
-        return substitutions;
-    }
-    let Some(class_symbol) = index.resolve_fqn(class_fqn) else {
-        return substitutions;
+    let base = resolve_class_name_pub(base, file_symbols);
+    let Some(class) = index.get_type(&base) else {
+        return HashMap::new();
     };
-    for (template, arg) in class_symbol.templates.iter().zip(args.iter()) {
-        substitutions.insert(template.name.clone(), arg.clone());
-    }
-    substitutions
+    let initial = class
+        .templates
+        .iter()
+        .zip(args)
+        .map(|(t, a)| (t.name.clone(), a.clone()))
+        .collect();
+    index
+        .receiver_template_bindings(&base, owner, &initial)
+        .unwrap_or_default()
+}
+
+pub(in crate::server) fn native_return_type_from_index(
+    index: &WorkspaceIndex,
+    symbol: &php_lsp_types::SymbolInfo,
+) -> Option<php_lsp_types::TypeInfo> {
+    let native = symbol.signature.as_ref()?.native_return_type.as_ref()?;
+    let published = index.read();
+    let file = published
+        .file_symbols()
+        .get(&symbol.uri)
+        .map(|f| f.value().clone())
+        .unwrap_or_default();
+    let mut scope = file
+        .scoped_at_byte_position(symbol.range.0, symbol.range.1)
+        .into_owned();
+    let owner = symbol.parent_fqn.as_deref().unwrap_or(&symbol.fqn);
+    scope.namespace = owner.rsplit_once('\\').map(|(ns, _)| ns.to_string());
+    let native =
+        php_lsp_parser::resolve::resolve_type_info_relative_to_symbol(native, symbol, &file);
+    Some(php_lsp_parser::resolve::map_receiver_type_names(
+        &native,
+        &|name| {
+            if name.starts_with('\\')
+                || matches!(name, "self" | "static" | "parent")
+                || is_builtin_type_name(name)
+            {
+                return None;
+            }
+            Some(format!(
+                "\\{}",
+                resolve_class_name_pub(name, &scope).trim_start_matches('\\')
+            ))
+        },
+    ))
+}
+
+pub(in crate::server) fn constrain_call_site_return_type(
+    index: &WorkspaceIndex,
+    symbol: &php_lsp_types::SymbolInfo,
+    result: php_lsp_types::TypeInfo,
+) -> php_lsp_types::TypeInfo {
+    let Some(native) = native_return_type_from_index(index, symbol) else {
+        return result;
+    };
+    php_lsp_types::type_refinement::preferred_type(
+        Some(&native),
+        Some(&result),
+        None,
+        &|actual, expected| index.class_relation_for_symbol(symbol, actual, expected),
+    )
+    .unwrap_or(native)
 }
 
 pub(in crate::server) fn callable_param_type_from_type_info(
@@ -2779,44 +2890,15 @@ pub(in crate::server) fn resolve_call_site_type_info(
     arguments: &HashMap<String, php_lsp_types::TypeInfo>,
     template_names: &HashSet<String>,
     substitutions: &HashMap<String, php_lsp_types::TypeInfo>,
+    class_relation: &impl Fn(&str, &str) -> Option<bool>,
 ) -> php_lsp_types::TypeInfo {
-    let substituted = substitute_call_site_type_info(type_info, substitutions);
-    match substituted {
-        php_lsp_types::TypeInfo::Conditional {
-            subject,
-            target,
-            if_type,
-            else_type,
-        } => {
-            let subject_key = subject.trim().trim_start_matches('$');
-            let Some(actual) = arguments.get(subject_key) else {
-                return conditional_union_fallback(*if_type, *else_type);
-            };
-            let mut branch_substitutions = substitutions.clone();
-            if type_pattern_matches_actual(
-                &target,
-                actual,
-                template_names,
-                &mut branch_substitutions,
-            ) {
-                substitute_call_site_type_info(&if_type, &branch_substitutions)
-            } else {
-                substitute_call_site_type_info(&else_type, &branch_substitutions)
-            }
-        }
-        other => other,
-    }
-}
-
-pub(in crate::server) fn conditional_union_fallback(
-    if_type: php_lsp_types::TypeInfo,
-    else_type: php_lsp_types::TypeInfo,
-) -> php_lsp_types::TypeInfo {
-    if if_type == else_type {
-        if_type
-    } else {
-        php_lsp_types::TypeInfo::Union(vec![if_type, else_type])
-    }
+    php_lsp_types::conditional::resolve_conditionals(
+        type_info,
+        arguments,
+        template_names,
+        substitutions,
+        class_relation,
+    )
 }
 
 pub(in crate::server) fn substitute_call_site_type_info(
@@ -2957,97 +3039,6 @@ pub(in crate::server) fn bind_template_type_info(
     }
 }
 
-pub(in crate::server) fn type_pattern_matches_actual(
-    pattern: &php_lsp_types::TypeInfo,
-    actual: &php_lsp_types::TypeInfo,
-    template_names: &HashSet<String>,
-    substitutions: &mut HashMap<String, php_lsp_types::TypeInfo>,
-) -> bool {
-    match (pattern, actual) {
-        (php_lsp_types::TypeInfo::Mixed, _) => true,
-        (php_lsp_types::TypeInfo::Simple(name), actual) if template_names.contains(name) => {
-            substitutions
-                .entry(name.clone())
-                .or_insert_with(|| actual.clone());
-            true
-        }
-        (php_lsp_types::TypeInfo::Simple(expected), php_lsp_types::TypeInfo::Simple(actual)) => {
-            same_type_name(expected, actual)
-        }
-        (
-            php_lsp_types::TypeInfo::ClassString(Some(pattern_inner)),
-            php_lsp_types::TypeInfo::ClassString(Some(actual_inner)),
-        ) => {
-            type_pattern_matches_actual(pattern_inner, actual_inner, template_names, substitutions)
-        }
-        (php_lsp_types::TypeInfo::ClassString(None), php_lsp_types::TypeInfo::ClassString(_)) => {
-            true
-        }
-        (
-            php_lsp_types::TypeInfo::Generic {
-                base: expected_base,
-                args: expected_args,
-            },
-            php_lsp_types::TypeInfo::Generic {
-                base: actual_base,
-                args: actual_args,
-            },
-        ) if same_type_name(expected_base, actual_base)
-            && expected_args.len() == actual_args.len() =>
-        {
-            expected_args
-                .iter()
-                .zip(actual_args.iter())
-                .all(|(expected_arg, actual_arg)| {
-                    type_pattern_matches_actual(
-                        expected_arg,
-                        actual_arg,
-                        template_names,
-                        substitutions,
-                    )
-                })
-        }
-        (php_lsp_types::TypeInfo::Union(types), actual) => types.iter().any(|type_info| {
-            let mut branch_substitutions = substitutions.clone();
-            let matches = type_pattern_matches_actual(
-                type_info,
-                actual,
-                template_names,
-                &mut branch_substitutions,
-            );
-            if matches {
-                *substitutions = branch_substitutions;
-            }
-            matches
-        }),
-        (php_lsp_types::TypeInfo::Intersection(types), actual) => types.iter().all(|type_info| {
-            type_pattern_matches_actual(type_info, actual, template_names, substitutions)
-        }),
-        (php_lsp_types::TypeInfo::Nullable(_), php_lsp_types::TypeInfo::LiteralNull) => true,
-        (php_lsp_types::TypeInfo::Nullable(inner), actual) => {
-            type_pattern_matches_actual(inner, actual, template_names, substitutions)
-        }
-        (
-            php_lsp_types::TypeInfo::LiteralString(expected),
-            php_lsp_types::TypeInfo::LiteralString(actual),
-        )
-        | (
-            php_lsp_types::TypeInfo::LiteralInt(expected),
-            php_lsp_types::TypeInfo::LiteralInt(actual),
-        )
-        | (
-            php_lsp_types::TypeInfo::LiteralFloat(expected),
-            php_lsp_types::TypeInfo::LiteralFloat(actual),
-        ) => expected == actual,
-        (
-            php_lsp_types::TypeInfo::LiteralBool(expected),
-            php_lsp_types::TypeInfo::LiteralBool(actual),
-        ) => expected == actual,
-        (php_lsp_types::TypeInfo::LiteralNull, php_lsp_types::TypeInfo::LiteralNull) => true,
-        _ => false,
-    }
-}
-
 pub(in crate::server) fn resolve_call_site_type_names(
     type_info: &php_lsp_types::TypeInfo,
     file_symbols: &php_lsp_types::FileSymbols,
@@ -3061,11 +3052,6 @@ pub(in crate::server) fn resolve_call_site_type_names(
         let resolved = resolve_class_name_pub(name, file_symbols);
         Some(format!("\\{}", resolved.trim_start_matches('\\')))
     })
-}
-
-pub(in crate::server) fn same_type_name(left: &str, right: &str) -> bool {
-    left.trim_start_matches('\\')
-        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
 }
 
 pub(in crate::server) fn local_variable_inlay_type_from_cast_expression(

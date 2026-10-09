@@ -354,8 +354,9 @@ after source-provenance checks (schema 26; 2026-09-25), call-site metadata
 (schema 27; 2026-10-07), exact PHPDoc owner ranges (schema 28; 2026-10-08),
 native/PHPDoc type provenance (schema 29; 2026-10-08), qualified
 type/reference resolution (schema 30; 2026-10-09), lexical variable/capture
-binding (schema 31; 2026-10-09), or constant-expression roles
-(schema 32; 2026-10-09).
+binding (schema 31; 2026-10-09), constant-expression roles
+(schema 32; 2026-10-09), or conditional PHPDoc specialization
+(schema 33; 2026-10-09).
 
 ### Large Workspace Latency
 

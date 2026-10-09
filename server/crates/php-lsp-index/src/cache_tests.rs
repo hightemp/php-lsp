@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 32;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 33;
 const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3998;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x57aaa9645a67bbf;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x3049917b463f25b2;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -546,6 +546,68 @@ fn cache_roundtrip_preserves_constant_expression_roles() {
     assert_eq!(report.parse_files, vec![file.clone()]);
     assert!(!stale.read().file_references().contains_key(&uri));
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn cache_roundtrip_preserves_conditional_branches_and_rejects_schema32() {
+    let root = unique_temp_dir("conditional-return");
+    let file = root.join("Service.php");
+    let source = "<?php namespace Ns; class Hit {} class Other {} class Miss {} /**\n * @template T\n * @param class-string<T> $value\n * @return ($value is string ? Hit|Other : Miss)\n */ function choose($value) {}";
+    fs::write(&file, source).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let symbols =
+        php_lsp_parser::symbols::extract_file_symbols(parser.tree().unwrap(), source, &uri);
+    let callable = symbols.symbols.iter().find(|s| s.name == "choose").unwrap();
+    let expected = TypeInfo::Conditional {
+        subject: "$value".into(),
+        target: Box::new(TypeInfo::Simple("string".into())),
+        if_type: Box::new(TypeInfo::Union(vec![
+            TypeInfo::Simple("Hit".into()),
+            TypeInfo::Simple("Other".into()),
+        ])),
+        else_type: Box::new(TypeInfo::Simple("Miss".into())),
+    };
+    assert_eq!(
+        callable.signature.as_ref().unwrap().return_type,
+        Some(expected)
+    );
+    assert_eq!(callable.templates[0].name, "T");
+    let index = WorkspaceIndex::new();
+    update_disk_file(&index, &file, &uri, symbols.clone());
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let path = root.join("index.bin");
+    save_cache_atomic(&path, &cache).unwrap();
+    let restored = WorkspaceIndex::new();
+    let report = load_valid_cached_files(
+        &restored,
+        &path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(report.loaded_files, 1);
+    assert_eq!(
+        bincode::serialize(restored.read().file_symbols().get(&uri).unwrap().as_ref()).unwrap(),
+        bincode::serialize(&symbols).unwrap()
+    );
+
+    // Schema 32 could persist a union split outside the conditional or a guessed receiver.
+    let mut legacy = cache;
+    legacy.schema_version = 32;
+    save_cache_atomic(&path, &legacy).unwrap();
+    let stale = WorkspaceIndex::new();
+    let report =
+        load_valid_cached_files(&stale, &path, &root, std::slice::from_ref(&file), &config);
+    assert_eq!(
+        report.loaded_files, 0,
+        "conditional metadata from schema 32 must be rebuilt"
+    );
+    assert_eq!(report.parse_files, vec![file.clone()]);
+    assert!(!stale.read().file_symbols().contains_key(&uri));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

@@ -2301,7 +2301,7 @@ fn resolve_declared_property_type_from_index(
         .and_then(|sym| symbol_return_type_text_from_index(index, class_fqn, &sym))
 }
 
-fn resolve_function_type_from_index(
+pub(in crate::server) fn resolve_function_type_from_index(
     index: &WorkspaceIndex,
     function_fqn: &str,
 ) -> Option<ResolvedFunctionType> {
@@ -2309,6 +2309,8 @@ fn resolve_function_type_from_index(
     symbol_return_type_text_from_index(index, &sym.fqn, &sym).map(|type_text| {
         ResolvedFunctionType::with_signature(type_text, sym.signature.clone())
             .with_symbol_fqn(sym.fqn.clone())
+            .with_template_names(sym.templates.iter().map(|template| template.name.clone()))
+            .with_native_return_type(native_return_type_from_index(index, &sym))
     })
 }
 

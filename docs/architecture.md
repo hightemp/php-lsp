@@ -138,6 +138,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_type_owner.rs` | lexical PHPDoc type owners, hover/inlay type links, namespace imports, anonymous-class boundaries and unsaved UTF-16/CRLF updates. |
 | `tests/e2e_phpdoc_native.rs` | native/PHPDoc contracts, signature and assignment hover, compatible parameter generics, late-static owner and UTF-16/CRLF document updates. |
 | `tests/e2e_qualified_types.rs` | qualified relative/absolute type targets, competing indexed classes, PHPDoc/native returns, Unicode/CRLF inlays, unsaved updates and controller-to-Twig propagation. |
+| `tests/e2e_conditional_types.rs` | conditional PHPDoc literals/subtypes, independent template bindings, declaration scope, native guarantees, exact branch definitions and versioned unsaved edits. |
 | `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
 | `tests/e2e_phpdoc_definition.rs` | exact PHPDoc member/owner selection, inheritance/native precedence, UTF-16/CRLF buffer edits, and Twig shape-key definitions before attributes. |
 | `tests/e2e_phpdoc_definition_stress.rs` | concurrent JSON-RPC definitions, edits, close/reopen, watched-file and full Composer reindex; exact stable disk/buffer results and progress watchdog. |
@@ -519,6 +520,22 @@ PHPDoc literal parsing accepts the supported scalar subset deliberately:
 quoted strings, booleans, null, decimal/binary/octal/hex integers with numeric
 separators, and decimal or scientific floats. Unsupported or malformed numeric
 forms remain plain type names rather than guessed literals.
+
+Conditional PHPDoc parsing pairs nested `?`/`:` branches before splitting union
+or intersection types; nullable prefixes and callable return colons keep their
+own meaning. `is not` swaps the semantic branches. Parser and server share the
+conservative matcher in `php-lsp-types/src/conditional.rs`: literal values match
+their primitive supertypes, indexed inheritance can prove a class relation,
+and an unknown or partially matching union retains both possible results.
+Only declared templates participate; conditions test bindings established by
+parameters or receiver inheritance and never invent bindings themselves.
+Declaration-scoped class names and template identities survive the resolver's
+type-text boundary. Unbound result templates become `mixed`, subject to the
+native return guarantee. Generic variance without sufficient evidence stays
+unknown. Bounded matching/substitution and receiver graph traversal stop with
+unknown evidence; receiver bindings use one pinned index publication. An
+unresolved conditional never projects to its first object branch; iterable
+keys/values require both branches and combine their results.
 
 Signatures retain native and PHPDoc parameter/return types separately, alongside
 their safe effective projection. `php-lsp-types/src/type_refinement.rs` defines one
@@ -941,10 +958,11 @@ invocation kind and owning-callable ranges. Schema 28 added exact PHPDoc owner
 ranges. Schema 29 retains native/PHPDoc type provenance separately. Schema 30
 invalidated references derived with the former namespace-root heuristic.
 Schema 31 invalidated receiver/callee references computed with incomplete
-lexical variable boundaries and capture rules. Current schema 32 invalidates
+lexical variable boundaries and capture rules. Schema 32 invalidated
 false global-constant occurrences and missing/mistyped attribute and dynamic
-expression references. These binding changes did not alter the serialized field
-layout.
+expression references. Current schema 33 invalidates conditional types parsed
+with the old precedence and references derived by guessing their first object
+branch. These semantic changes did not alter the serialized field layout.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod conditional;
 pub mod type_refinement;
 pub mod uri;
 

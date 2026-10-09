@@ -1310,6 +1310,70 @@ impl WorkspaceIndex {
         }
     }
 
+    /// Independently established receiver bindings in a member's declaring owner.
+    /// Incomplete, cyclic, or over-budget paths produce no speculative binding.
+    pub fn receiver_template_bindings(
+        &self,
+        receiver: &str,
+        owner: &str,
+        initial: &HashMap<String, TypeInfo>,
+    ) -> Option<HashMap<String, TypeInfo>> {
+        let _publication = self.publication_barrier.read_recursive();
+        let entries = initial.iter().collect::<Vec<_>>();
+        let values = php_lsp_types::conditional::try_substitute_type_list(
+            entries.iter().map(|(_, v)| *v),
+            &HashMap::new(),
+        )?;
+        let initial: HashMap<String, TypeInfo> = entries
+            .into_iter()
+            .zip(values)
+            .map(|((key, _), value)| (key.clone(), value))
+            .collect();
+        let mut pending = vec![(receiver.to_string(), initial, Vec::<String>::new())];
+        let mut result: Option<HashMap<String, TypeInfo>> = None;
+        let mut visited = 0usize;
+        while let Some((current, bindings, mut path)) = pending.pop() {
+            visited += 1;
+            if visited > 64 {
+                return None;
+            }
+            let key = case_insensitive_fqn_key(&current);
+            if path.contains(&key) {
+                return None;
+            }
+            let class = self.get_type(&current)?;
+            if same_fqn(&current, owner) {
+                if let Some(result) = &mut result {
+                    result.retain(|key, value| bindings.get(key) == Some(value));
+                } else {
+                    result = Some(bindings);
+                }
+                continue;
+            }
+            path.push(key);
+            for target in class
+                .extends
+                .iter()
+                .chain(&class.implements)
+                .chain(&class.traits)
+                .chain(
+                    class
+                        .template_bindings
+                        .iter()
+                        .filter(|b| b.kind == TemplateBindingKind::Mixin)
+                        .map(|b| &b.target),
+                )
+            {
+                if pending.len() + visited >= 64 {
+                    return None;
+                }
+                let edge = self.template_substitutions_for_edge(&class, target, &bindings);
+                pending.push((target.clone(), edge, path.clone()));
+            }
+        }
+        result
+    }
+
     fn template_substitutions_for_edge(
         &self,
         from: &SymbolInfo,
@@ -1331,11 +1395,20 @@ impl WorkspaceIndex {
             return TemplateSubstitutions::new();
         };
 
+        if target.templates.len() > php_lsp_types::conditional::MAX_MATCH_STEPS {
+            return TemplateSubstitutions::new();
+        }
+        let Some(args) = php_lsp_types::conditional::try_substitute_type_list(
+            binding.args.iter().take(target.templates.len()),
+            inherited,
+        ) else {
+            return TemplateSubstitutions::new();
+        };
         target
             .templates
             .iter()
-            .zip(binding.args.iter())
-            .map(|(template, arg)| (template.name.clone(), substitute_type_info(arg, inherited)))
+            .zip(args)
+            .map(|(template, arg)| (template.name.clone(), arg))
             .collect()
     }
 
@@ -1515,12 +1588,14 @@ impl WorkspaceIndex {
         )
     }
 
-    fn class_relation_for_symbol(
+    /// Prove nominal subtyping in the declaration's import scope, with a bounded walk.
+    pub fn class_relation_for_symbol(
         &self,
         symbol: &SymbolInfo,
         doc: &str,
         native: &str,
     ) -> Option<bool> {
+        let _publication = self.publication_barrier.read_recursive();
         let file = self
             .tables
             .file_symbols
@@ -2276,3 +2351,7 @@ mod tests;
 #[cfg(test)]
 #[path = "workspace_dependency_tests.rs"]
 mod dependency_tests;
+
+#[cfg(test)]
+#[path = "conditional_index_tests.rs"]
+mod conditional_tests;

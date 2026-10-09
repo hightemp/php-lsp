@@ -1,8 +1,6 @@
 //! Typed receiver algebra shared by completion, navigation and diagnostics.
 use super::super::*;
-use php_lsp_parser::resolve::{
-    is_builtin_non_object_type as is_builtin_type_name, ResolvedFunctionType,
-};
+use php_lsp_parser::resolve::is_builtin_non_object_type as is_builtin_type_name;
 use php_lsp_types::{FileSymbols, PhpSymbolKind, SymbolInfo, TypeInfo};
 use std::collections::BTreeMap;
 
@@ -468,9 +466,7 @@ fn expression_resolution_inner(
     let callable = |ctx: CallableParameterContext<'_>| {
         resolve_callable_parameter_type_from_index(index, symbols, ctx)
     };
-    let function = |name: &str| {
-        resolve_function_return_type_from_index(index, name).map(ResolvedFunctionType::new)
-    };
+    let function = |name: &str| resolve_function_type_from_index(index, name);
     let ty = php_lsp_parser::resolve::infer_expression_type_info_with_function_resolver(
         node,
         source,

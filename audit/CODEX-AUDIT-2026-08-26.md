@@ -1866,6 +1866,42 @@ intersection разбираются до conditional type. Поэтому top-le
 передавать реальный набор declared templates и реализовать subtype/literal
 matching вместо точного сравнения enum variants.
 
+**Реализация (2026-10-09):** conditional распознаётся до union/intersection;
+вложенные `?`/`:` сопоставляются с учётом nullable, callable и literal tokens,
+`is not` нормализуется перестановкой ветвей. Parser и server используют общий
+консервативный matcher: литералы соответствуют базовым scalar types, известное
+наследование может доказать subtype, неизвестное условие сохраняет обе ветви.
+Передаются только declared templates; условие проверяет независимые bindings
+параметров/receiver, а не создаёт их само. Сохранены declaration scope и native
+return contract; unbound result template не становится одноимённым классом.
+Локальные method/static calls специализируют и вложенные контейнеры. Убрано
+выбирание первой object-ветви; iterable keys/values объединяют обе возможные
+ветви. Receiver bindings читаются под единой publication lease, matching и
+подстановка ограничены бюджетами. Schema 33 перестраивает старые conditional
+metadata/references, включая кеш schema 32. Исходное описание выше сохранено.
+
+**Проверки:** RED-регрессии выявили precedence/nesting, literal matching,
+выдуманные template bindings, ошибочную generic variance, namespace/template
+collision, выбор чужой branch definition, вложенный method return, отсутствие
+local subtype proof и принятие schema 32. Постоянные unit/cache/LSP тесты
+проверяют также unknown/union/nullable, named/default/unpacked arguments,
+native guarantees, UTF-16/CRLF, unsaved edits/close/reopen и атомарность receiver
+bindings при отложенном writer. Добавлено 62 регрессии: 13 shared types,
+17 parser, 9 server helper, 5 index/cache, 18 LSP. Старое ожидание inlay `T|object`
+заменено проверкой отсутствия подсказки у конкретной переменной с неопределённым
+результатом; положительные template/conditional подсказки сохранены. Итоговый
+GREEN: полный `cargo test --all` — 1560/1560, 49 test-result targets, 0 ignored;
+Clippy `--all-targets -- -D warnings`, Rustfmt и `git diff --check` прошли.
+Rust-проверки выполнялись последовательно с `CARGO_BUILD_JOBS=1` и
+`--test-threads=1`, одним CPU и ограничением памяти; OOM не зафиксирован.
+README, архитектура, LSP matrix, cache/performance caveats и test-coverage
+matrix обновлены; исторические замеры не изменены. Матрица содержит 58 строк
+и 130 действительных локальных ссылок.
+
+**Статус (2026-10-09):** исправлено и проверено. Повторный read-only review
+Verifier на `gpt-6-sol` завершился GO после исправления замечаний и проверки
+итогового кода, тестов, документации и логов; milestone в TASKS.md завершён.
+
 ### CODEX-P2-28. Post-guard `instanceof` narrowing не учитывает булеву логику
 
 [`negative_instanceof_guard_for_var`](server/crates/php-lsp-parser/src/resolve.rs#L2298)

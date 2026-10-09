@@ -152,6 +152,15 @@ at the attached PHPDoc span under the existing type-compatibility severity
 setting. Generated implementations, constructors and accessors preserve native
 PHP declarations while retaining compatible PHPDoc detail.
 
+Conditional PHPDoc returns support nested branches, unions/intersections inside
+branches, nullable targets and `is not`. Literal arguments match their primitive
+types; known indexed subtypes can satisfy class conditions. Named arguments,
+omitted literal defaults and independently bound declared templates participate
+in specialization. Unknown arguments, unresolved templates, partial unions and
+unsupported generic variance preserve both branches. Native returns remain
+authoritative, and unresolved conditional navigation never guesses the first
+branch. This is conservative inference, not full PHPStan/Psalm equivalence.
+
 ## Template Documents
 
 | Area | Status | Notes |

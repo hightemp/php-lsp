@@ -705,8 +705,12 @@ fn test_resolve_method_call_on_new() {
 
 #[test]
 fn test_conditional_return_uses_subject_parameter_position_for_positional_arguments() {
+    let mut abstract_param = test_param("abstract");
+    abstract_param.type_info = Some(TypeInfo::ClassString(Some(Box::new(TypeInfo::Simple(
+        "TClass".into(),
+    )))));
     let signature = Signature {
-        params: vec![test_param("prefix"), test_param("abstract")],
+        params: vec![test_param("prefix"), abstract_param],
         return_type: None,
 
         ..Default::default()
@@ -717,6 +721,7 @@ fn test_conditional_return_uses_subject_parameter_position_for_positional_argume
                 "($abstract is class-string<TClass> ? TClass : mixed)",
                 Some(signature.clone()),
             )
+            .with_template_names(["TClass".to_string()])
         })
     };
 

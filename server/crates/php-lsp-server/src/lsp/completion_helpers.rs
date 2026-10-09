@@ -2429,7 +2429,27 @@ pub(in crate::server) fn type_info_in_symbol_declaration_scope(
         .map(|entry| Arc::clone(entry.value()));
     match file {
         Some(file) => {
-            php_lsp_parser::resolve::resolve_type_info_relative_to_symbol(ty, symbol, &file)
+            let templates = callable_template_names_from_index(index, symbol, &symbol.fqn);
+            let native = symbol
+                .signature
+                .as_ref()
+                .and_then(|sig| sig.native_return_type.as_ref())
+                == Some(ty);
+            php_lsp_parser::resolve::map_receiver_type_names(ty, &|name| {
+                if matches!(name, "self" | "static" | "parent")
+                    || (!native && templates.contains(name))
+                {
+                    return None;
+                }
+                match php_lsp_parser::resolve::resolve_type_info_relative_to_symbol(
+                    &php_lsp_types::TypeInfo::Simple(name.into()),
+                    symbol,
+                    &file,
+                ) {
+                    php_lsp_types::TypeInfo::Simple(name) => Some(name),
+                    _ => None,
+                }
+            })
         }
         None => ty.clone(),
     }
@@ -2459,14 +2479,22 @@ pub(in crate::server) fn symbol_return_type_text_from_index(
     owner_fqn: &str,
     sym: &php_lsp_types::SymbolInfo,
 ) -> Option<String> {
+    let _published = index.read();
     let ret = symbol_return_type_in_declaration_scope(index, sym)?;
-    tracing::debug!(
-        "resolve_member_type: {} -> return type text '{}'",
-        sym.fqn,
-        ret
-    );
-
-    type_info_resolved_text_from_index(index, owner_fqn, &sym.uri, &ret)
+    let templates = callable_template_names_from_index(index, sym, &sym.fqn);
+    let encoded = php_lsp_parser::resolve::map_receiver_type_names(&ret, &|name| {
+        if templates.contains(name) {
+            return None;
+        }
+        let leaf = match name {
+            "self" => php_lsp_types::TypeInfo::Self_,
+            "static" => php_lsp_types::TypeInfo::Static_,
+            "parent" => php_lsp_types::TypeInfo::Parent_,
+            _ => php_lsp_types::TypeInfo::Simple(name.into()),
+        };
+        type_info_resolved_text_from_index(index, owner_fqn, &sym.uri, &leaf)
+    });
+    Some(php_lsp_parser::resolve::receiver_type_text(&encoded))
 }
 
 pub(in crate::server) fn type_info_fqn_from_index(

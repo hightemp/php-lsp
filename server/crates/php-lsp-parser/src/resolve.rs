@@ -30,6 +30,10 @@ mod qualified_type_tests;
 mod variable_scope_tests;
 
 #[cfg(test)]
+#[path = "resolve_conditional_tests.rs"]
+mod conditional_tests;
+
+#[cfg(test)]
 #[path = "resolve_composite_tests.rs"]
 mod composite_tests;
 
@@ -82,6 +86,8 @@ pub struct ResolvedFunctionType {
     pub type_text: String,
     pub signature: Option<Signature>,
     pub symbol_fqn: Option<String>,
+    pub template_names: HashSet<String>,
+    pub native_return_type: Option<TypeInfo>,
 }
 
 impl ResolvedFunctionType {
@@ -90,6 +96,8 @@ impl ResolvedFunctionType {
             type_text: type_text.into(),
             signature: None,
             symbol_fqn: None,
+            template_names: HashSet::new(),
+            native_return_type: None,
         }
     }
 
@@ -98,11 +106,22 @@ impl ResolvedFunctionType {
             type_text: type_text.into(),
             signature,
             symbol_fqn: None,
+            template_names: HashSet::new(),
+            native_return_type: None,
         }
     }
 
     pub fn with_symbol_fqn(mut self, symbol_fqn: impl Into<String>) -> Self {
         self.symbol_fqn = Some(symbol_fqn.into());
+        self
+    }
+
+    pub fn with_template_names(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.template_names = names.into_iter().collect();
+        self
+    }
+    pub fn with_native_return_type(mut self, native: Option<TypeInfo>) -> Self {
+        self.native_return_type = native;
         self
     }
 }
@@ -1621,7 +1640,14 @@ fn try_resolve_object_type_inner<'a>(
             let method_fqn = format!("{}::{}", class_fqn, method_name);
             for sym in &file_symbols.symbols {
                 if symbol_fqn_eq(&sym.fqn, &method_fqn, PhpSymbolKind::Method) {
-                    if let Some(ret) = symbol_effective_type_info(sym, file_symbols) {
+                    if let Some(ret) = symbol_call_type_info(
+                        sym,
+                        object_node,
+                        source,
+                        file_symbols,
+                        resolver,
+                        callable_resolver,
+                    ) {
                         if let Some(resolved) = resolve_symbol_type_info_to_object_fqn(
                             &ret,
                             &class_fqn,
@@ -1806,17 +1832,7 @@ fn object_fqn_from_resolved_member_type_info(
                 Some(base.trim_start_matches('\\').to_string())
             }
         }
-        TypeInfo::Conditional {
-            if_type, else_type, ..
-        } => object_fqn_from_resolved_member_type_info(if_type, context_node, source, file_symbols)
-            .or_else(|| {
-                object_fqn_from_resolved_member_type_info(
-                    else_type,
-                    context_node,
-                    source,
-                    file_symbols,
-                )
-            }),
+        TypeInfo::Conditional { .. } => None,
         TypeInfo::ClassString(_)
         | TypeInfo::ArrayShape(_)
         | TypeInfo::ObjectShape(_)
@@ -3907,10 +3923,7 @@ fn resolve_phpdoc_var_type(
                 Some(resolve_class_name(base, file_symbols))
             }
         }
-        TypeInfo::Conditional {
-            if_type, else_type, ..
-        } => resolve_phpdoc_var_type(if_type, context_node, source, file_symbols)
-            .or_else(|| resolve_phpdoc_var_type(else_type, context_node, source, file_symbols)),
+        TypeInfo::Conditional { .. } => None,
         TypeInfo::ClassString(_)
         | TypeInfo::ArrayShape(_)
         | TypeInfo::ObjectShape(_)
@@ -3981,11 +3994,24 @@ fn resolve_symbol_type_info_to_object_fqn(
 
 fn symbol_effective_type_info(symbol: &SymbolInfo, file_symbols: &FileSymbols) -> Option<TypeInfo> {
     let signature = symbol.signature.as_ref();
+    let templates = callable_template_names(symbol, &symbol.fqn, file_symbols);
+    let qualify = |ty: &TypeInfo| {
+        let native = signature.and_then(|sig| sig.native_return_type.as_ref()) == Some(ty);
+        map_receiver_type_names(ty, &|name| {
+            if matches!(name, "self" | "static" | "parent") || (!native && templates.contains(name))
+            {
+                None
+            } else {
+                Some(resolve_type_name_relative_to_symbol(
+                    name,
+                    symbol,
+                    file_symbols,
+                ))
+            }
+        })
+    };
     if let Some(signature) = signature.filter(|signature| signature.has_type_provenance()) {
-        return signature
-            .return_type
-            .as_ref()
-            .map(|ty| resolve_type_info_relative_to_symbol(ty, symbol, file_symbols));
+        return signature.return_type.as_ref().map(qualify);
     }
     let native = signature.and_then(|signature| signature.return_type.as_ref());
     let phpdoc = symbol.doc_comment.as_deref().and_then(|doc| {
@@ -3997,7 +4023,49 @@ fn symbol_effective_type_info(symbol: &SymbolInfo, file_symbols: &FileSymbols) -
         }
     });
     php_lsp_types::type_refinement::preferred_type(native, phpdoc.as_ref(), native, &|_, _| None)
-        .map(|ty| resolve_type_info_relative_to_symbol(&ty, symbol, file_symbols))
+        .map(|ty| qualify(&ty))
+}
+
+fn symbol_call_type_info(
+    symbol: &SymbolInfo,
+    call: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    let ty = symbol_effective_type_info(symbol, file_symbols)?;
+    if !php_lsp_types::conditional::may_contain_conditional(&ty) {
+        return Some(ty);
+    }
+    let names = callable_template_names(symbol, &symbol.fqn, file_symbols);
+    let specialized = resolve_function_call_return_type_at_call_site(
+        &ty,
+        symbol.signature.as_ref(),
+        &names,
+        call,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        Some(symbol),
+    );
+    let native = symbol
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.native_return_type.as_ref())
+        .map(|native| resolve_type_info_relative_to_symbol(native, symbol, file_symbols));
+    Some(
+        php_lsp_types::type_refinement::preferred_type(
+            native.as_ref(),
+            Some(&specialized),
+            native.as_ref(),
+            &|actual, expected| {
+                crate::type_contract::class_relation(symbol, actual, expected, file_symbols)
+            },
+        )
+        .unwrap_or(specialized),
+    )
 }
 
 /// Resolve every class leaf, including shapes, in the declaration's scope.
@@ -4199,54 +4267,103 @@ fn try_resolve_function_call_return_type_info(
         function_resolver,
     )?;
     let type_info = type_info_from_type_text(&resolved.type_text);
-    Some(resolve_function_call_return_type_at_call_site(
+    let specialized = resolve_function_call_return_type_at_call_site(
         &type_info,
         resolved.signature.as_ref(),
+        &resolved.template_names,
         node,
         source,
         file_symbols,
         resolver,
         callable_resolver,
-    ))
+        None,
+    );
+    Some(if let Some(native) = resolved.native_return_type.as_ref() {
+        php_lsp_types::type_refinement::preferred_type(
+            Some(native),
+            Some(&specialized),
+            None,
+            &|_, _| None,
+        )
+        .unwrap_or_else(|| native.clone())
+    } else {
+        specialized
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_function_call_return_type_at_call_site(
     type_info: &TypeInfo,
     signature: Option<&Signature>,
+    template_names: &HashSet<String>,
     call_node: Node,
     source: &str,
     file_symbols: &FileSymbols,
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    declaration: Option<&SymbolInfo>,
 ) -> TypeInfo {
-    match type_info {
-        TypeInfo::Conditional {
-            subject,
-            target,
-            if_type,
-            else_type,
-        } => {
-            let Some(actual) = conditional_subject_argument_type(
+    let mut arguments = HashMap::new();
+    if let Some(signature) = signature {
+        for param in &signature.params {
+            let name = param.name.trim_start_matches('$');
+            if let Some(actual) = conditional_subject_argument_type(
                 call_node,
-                subject,
-                signature,
+                name,
+                Some(signature),
                 source,
                 file_symbols,
                 resolver,
                 callable_resolver,
-            ) else {
-                return (**else_type).clone();
-            };
-            let template_names = conditional_template_names(type_info);
-            let mut substitutions = HashMap::new();
-            if type_pattern_matches_actual(target, &actual, &template_names, &mut substitutions) {
-                substitute_type_info(if_type, &substitutions)
-            } else {
-                substitute_type_info(else_type, &substitutions)
+            ) {
+                arguments.insert(name.to_string(), actual);
             }
         }
-        _ => type_info.clone(),
+    } else {
+        for argument in call_arguments(call_node, source) {
+            if let Some(name) = argument.name {
+                if let Some(actual) = infer_conditional_argument_type(
+                    argument.value_node,
+                    source,
+                    file_symbols,
+                    resolver,
+                    callable_resolver,
+                ) {
+                    arguments.insert(name, actual);
+                }
+            }
+        }
     }
+    let mut substitutions = HashMap::new();
+    if let Some(signature) = signature {
+        for param in &signature.params {
+            if let (Some(pattern), Some(actual)) = (
+                param.type_info.as_ref(),
+                arguments.get(param.name.trim_start_matches('$')),
+            ) {
+                bind_template_type_info(pattern, actual, template_names, &mut substitutions);
+            }
+        }
+    }
+    let symbol = declaration.or_else(|| {
+        call_node.child_by_field_name("function").and_then(|name| {
+            let fqn = resolve_function_name(&source[name.byte_range()], file_symbols);
+            file_symbols.symbols.iter().find(|s| {
+                s.kind == PhpSymbolKind::Function && fqn_eq_ignore_ascii_case(&s.fqn, &fqn)
+            })
+        })
+    });
+    php_lsp_types::conditional::resolve_conditionals(
+        type_info,
+        &arguments,
+        template_names,
+        &substitutions,
+        &|actual, expected| {
+            symbol.and_then(|symbol| {
+                crate::type_contract::class_relation(symbol, actual, expected, file_symbols)
+            })
+        },
+    )
 }
 
 fn conditional_subject_argument_type(
@@ -4264,7 +4381,7 @@ fn conditional_subject_argument_type(
         .iter()
         .find(|arg| arg.name.as_deref() == Some(subject_name))
     {
-        return infer_expression_type_info(
+        return infer_conditional_argument_type(
             argument.value_node,
             source,
             file_symbols,
@@ -4283,13 +4400,20 @@ fn conditional_subject_argument_type(
         .filter(|arg| arg.name.is_none())
         .nth(parameter_index)
     {
-        return infer_expression_type_info(
+        return infer_conditional_argument_type(
             argument.value_node,
             source,
             file_symbols,
             resolver,
             callable_resolver,
         );
+    }
+
+    if arguments
+        .iter()
+        .any(|arg| arg.value_node.kind() == "variadic_unpacking")
+    {
+        return None;
     }
 
     signature
@@ -4300,147 +4424,29 @@ fn conditional_subject_argument_type(
         .and_then(infer_default_value_type_info)
 }
 
+fn infer_conditional_argument_type(
+    mut node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<TypeInfo> {
+    while node.kind() == "parenthesized_expression" {
+        node = first_expression_child(node)?;
+    }
+    if let Some(literal) =
+        php_lsp_types::conditional::literal_default_type(&source[node.byte_range()])
+    {
+        return Some(literal);
+    }
+    if matches!(node.kind(), "string" | "encapsed_string") {
+        return Some(TypeInfo::Simple("string".into()));
+    }
+    infer_expression_type_info(node, source, file_symbols, resolver, callable_resolver)
+}
+
 fn infer_default_value_type_info(default_value: &str) -> Option<TypeInfo> {
-    let text = default_value.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if text.eq_ignore_ascii_case("null") {
-        return Some(TypeInfo::LiteralNull);
-    }
-    if text.eq_ignore_ascii_case("true") {
-        return Some(TypeInfo::LiteralBool(true));
-    }
-    if text.eq_ignore_ascii_case("false") {
-        return Some(TypeInfo::LiteralBool(false));
-    }
-    if text.starts_with(['\'', '"']) {
-        return Some(TypeInfo::Simple("string".to_string()));
-    }
-    if matches!(text, "[]" | "array()") {
-        return Some(TypeInfo::Simple("array".to_string()));
-    }
-    if text.parse::<i64>().is_ok() {
-        return Some(TypeInfo::Simple("int".to_string()));
-    }
-    if text.parse::<f64>().is_ok() {
-        return Some(TypeInfo::Simple("float".to_string()));
-    }
-    None
-}
-
-fn conditional_template_names(type_info: &TypeInfo) -> HashSet<String> {
-    let mut names = HashSet::new();
-    collect_conditional_template_names(type_info, &mut names);
-    names
-}
-
-fn collect_conditional_template_names(type_info: &TypeInfo, names: &mut HashSet<String>) {
-    match type_info {
-        TypeInfo::ClassString(Some(inner)) => collect_template_name_leaf(inner, names),
-        TypeInfo::Conditional {
-            target,
-            if_type,
-            else_type,
-            ..
-        } => {
-            collect_conditional_template_names(target, names);
-            collect_conditional_template_names(if_type, names);
-            collect_conditional_template_names(else_type, names);
-        }
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
-            for ty in types {
-                collect_conditional_template_names(ty, names);
-            }
-        }
-        TypeInfo::Nullable(inner) => collect_conditional_template_names(inner, names),
-        _ => {}
-    }
-}
-
-fn collect_template_name_leaf(type_info: &TypeInfo, names: &mut HashSet<String>) {
-    if let TypeInfo::Simple(name) = type_info {
-        if !is_builtin_non_object_type(name) && !name.contains('\\') {
-            names.insert(name.clone());
-        }
-    }
-}
-
-fn type_pattern_matches_actual(
-    pattern: &TypeInfo,
-    actual: &TypeInfo,
-    template_names: &HashSet<String>,
-    substitutions: &mut HashMap<String, TypeInfo>,
-) -> bool {
-    match (pattern, actual) {
-        (TypeInfo::Mixed, _) => true,
-        (TypeInfo::Simple(name), actual) if template_names.contains(name) => {
-            substitutions
-                .entry(name.clone())
-                .or_insert_with(|| actual.clone());
-            true
-        }
-        (TypeInfo::Simple(expected), TypeInfo::Simple(actual)) => same_type_name(expected, actual),
-        (TypeInfo::ClassString(Some(pattern_inner)), TypeInfo::ClassString(Some(actual_inner))) => {
-            type_pattern_matches_actual(pattern_inner, actual_inner, template_names, substitutions)
-        }
-        (TypeInfo::ClassString(None), TypeInfo::ClassString(_)) => true,
-        (
-            TypeInfo::Generic {
-                base: expected_base,
-                args: expected_args,
-            },
-            TypeInfo::Generic {
-                base: actual_base,
-                args: actual_args,
-            },
-        ) if same_type_name(expected_base, actual_base)
-            && expected_args.len() == actual_args.len() =>
-        {
-            expected_args
-                .iter()
-                .zip(actual_args.iter())
-                .all(|(expected_arg, actual_arg)| {
-                    type_pattern_matches_actual(
-                        expected_arg,
-                        actual_arg,
-                        template_names,
-                        substitutions,
-                    )
-                })
-        }
-        (TypeInfo::Union(types), actual) => types.iter().any(|type_info| {
-            let mut branch_substitutions = substitutions.clone();
-            let matches = type_pattern_matches_actual(
-                type_info,
-                actual,
-                template_names,
-                &mut branch_substitutions,
-            );
-            if matches {
-                *substitutions = branch_substitutions;
-            }
-            matches
-        }),
-        (TypeInfo::Intersection(types), actual) => types.iter().all(|type_info| {
-            type_pattern_matches_actual(type_info, actual, template_names, substitutions)
-        }),
-        (TypeInfo::Nullable(_), TypeInfo::LiteralNull) => true,
-        (TypeInfo::Nullable(inner), actual) => {
-            type_pattern_matches_actual(inner, actual, template_names, substitutions)
-        }
-        (TypeInfo::LiteralString(expected), TypeInfo::LiteralString(actual))
-        | (TypeInfo::LiteralInt(expected), TypeInfo::LiteralInt(actual))
-        | (TypeInfo::LiteralFloat(expected), TypeInfo::LiteralFloat(actual)) => expected == actual,
-        (TypeInfo::LiteralBool(expected), TypeInfo::LiteralBool(actual)) => expected == actual,
-        (TypeInfo::LiteralNull, TypeInfo::LiteralNull) => true,
-        _ => false,
-    }
-}
-
-fn same_type_name(left: &str, right: &str) -> bool {
-    left.trim_start_matches('\\')
-        .eq_ignore_ascii_case(right.trim_start_matches('\\'))
+    php_lsp_types::conditional::literal_default_type(default_value)
 }
 
 fn try_resolve_function_call_object_fqn(
@@ -4846,11 +4852,7 @@ fn resolver_type_info_to_object_fqn(
                 Some(resolve_class_name(base, file_symbols))
             }
         }
-        TypeInfo::Conditional {
-            if_type, else_type, ..
-        } => resolver_type_info_to_object_fqn(if_type, context_node, source, file_symbols).or_else(
-            || resolver_type_info_to_object_fqn(else_type, context_node, source, file_symbols),
-        ),
+        TypeInfo::Conditional { .. } => None,
         TypeInfo::ClassString(_)
         | TypeInfo::ArrayShape(_)
         | TypeInfo::ObjectShape(_)
@@ -5363,7 +5365,16 @@ pub fn infer_expression_type_info_with_function_resolver(
                 .iter()
                 .find_map(|sym| {
                     symbol_fqn_eq(&sym.fqn, &method_fqn, PhpSymbolKind::Method)
-                        .then(|| symbol_effective_type_info(sym, file_symbols))
+                        .then(|| {
+                            symbol_call_type_info(
+                                sym,
+                                node,
+                                source,
+                                file_symbols,
+                                resolver,
+                                callable_resolver,
+                            )
+                        })
                         .flatten()
                 })
                 .or_else(|| {
@@ -5525,7 +5536,8 @@ fn infer_scoped_call_expression_type_info(
         .iter()
         .find(|sym| symbol_fqn_eq(&sym.fqn, &method_fqn, PhpSymbolKind::Method))
     {
-        let return_type = symbol_effective_type_info(symbol, file_symbols)?;
+        let return_type =
+            symbol_call_type_info(symbol, node, source, file_symbols, resolver, None)?;
         let return_type = resolve_type_info_relative_to_symbol(&return_type, symbol, file_symbols);
         return Some(scope_return_type_info_for_owner(&return_type, &class_fqn));
     }
@@ -6169,8 +6181,10 @@ pub fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) ->
         TypeInfo::ArrayShape(items) => array_shape_value_type(items, key_text).cloned(),
         TypeInfo::Conditional {
             if_type, else_type, ..
-        } => iterable_value_type_info(if_type, key_text)
-            .or_else(|| iterable_value_type_info(else_type, key_text)),
+        } => Some(merge_type_infos(vec![
+            iterable_value_type_info(if_type, key_text)?,
+            iterable_value_type_info(else_type, key_text)?,
+        ])),
         _ => None,
     }
 }
@@ -6202,7 +6216,10 @@ fn iterable_key_type_info(type_info: &TypeInfo) -> Option<TypeInfo> {
         TypeInfo::ArrayShape(items) => array_shape_key_type(items),
         TypeInfo::Conditional {
             if_type, else_type, ..
-        } => iterable_key_type_info(if_type).or_else(|| iterable_key_type_info(else_type)),
+        } => Some(merge_type_infos(vec![
+            iterable_key_type_info(if_type)?,
+            iterable_key_type_info(else_type)?,
+        ])),
         _ => None,
     }
 }
