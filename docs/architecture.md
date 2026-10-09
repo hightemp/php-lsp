@@ -261,6 +261,19 @@ declaration scope before receiver binding.
 Computed hover/inlay text hides these markers on a display copy; source PHPDoc
 keeps its written spelling and navigation uses the original type identity.
 
+`php-lsp-parser::variable_scope` defines lexical variable boundaries and shared
+binding roles for definition, references/rename, completion and type inference.
+Named callables and class bodies isolate locals. Anonymous-class constructor
+arguments execute in the outer scope. Closures import only explicit `use`
+variables, arrows capture outer variables automatically, and parameters shadow
+captures. By-value types come from the parent before callable creation; later
+parent writes do not change that snapshot. Reference captures retain navigation
+and rename identity, but inference does not freeze their future value at creation.
+Local assignments in their bodies can still supply a type. Writable destructuring
+values and reference assignments are declarations; dynamic destructuring keys
+remain reads. Server hover/inlay helpers reuse the same boundaries, including
+arrow-local assignments inside expressions.
+
 Local PHPDoc type inference carries the class-like owner at the variable's byte
 range, together with the active namespace/import section. Hover and foreach
 inlay links therefore resolve `self` and `static` against the containing type;
@@ -912,9 +925,11 @@ by the content hash on the next load. Workspace cache replay rechecks files
 before publishing symbols, and staged vendor/stub commits discard changed
 sources. Schema version 26 introduced provenance tracking; schema 27 added
 invocation kind and owning-callable ranges. Schema 28 added exact PHPDoc owner
-ranges. Schema 29 retains native/PHPDoc type provenance separately. Current
-schema 30 invalidates references derived with the former namespace-root
-heuristic, even though their serialized field layout has not changed.
+ranges. Schema 29 retains native/PHPDoc type provenance separately. Schema 30
+invalidated references derived with the former namespace-root heuristic.
+Current schema 31 invalidates receiver/callee references computed with incomplete
+lexical variable boundaries and capture rules. Neither binding change altered
+the serialized field layout.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 30;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 31;
 const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3998;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x8f6f3992b014946d;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0xe05be310fe813230;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -429,6 +429,66 @@ fn cache_roundtrip_preserves_relative_qualified_type_reference_targets() {
         *restored.read().file_references().get(&uri).unwrap(),
         references
     );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn cache_roundtrip_preserves_capture_receiver_bindings() {
+    let root = unique_temp_dir("capture-reference");
+    let file = root.join("Service.php");
+    let source = "<?php\r\nclass Right {function walk(){}} class Wrong {function walk(){}} function outer() {$value=new Right; $fn=function() use($value) {/* 😀 */ $value->walk();}; $value=new Wrong;}";
+    fs::write(&file, source).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let symbols = php_lsp_parser::symbols::extract_file_symbols(tree, source, &uri);
+    let references =
+        php_lsp_parser::references::collect_symbol_references_in_file(tree, source, &symbols);
+    let actual = references
+        .iter()
+        .filter(|reference| {
+            !reference.is_declaration
+                && reference.target_kind == PhpSymbolKind::Method
+                && reference.target_fqn.ends_with("::walk")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), 1);
+    assert_eq!(actual[0].target_fqn, "Right::walk");
+    assert_eq!(actual[0].receiver.receiver_fqn(), Some("Right"));
+    let index = WorkspaceIndex::new();
+    update_disk_file_with_references(&index, &file, &uri, symbols, references.clone());
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let path = root.join("index.bin");
+    save_cache_atomic(&path, &cache).unwrap();
+    let restored = WorkspaceIndex::new();
+    let report = load_valid_cached_files(
+        &restored,
+        &path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(report.loaded_files, 1);
+    assert_eq!(
+        *restored.read().file_references().get(&uri).unwrap(),
+        references
+    );
+
+    // Schema 30 stored receiver targets computed without lexical capture barriers.
+    let mut legacy = cache;
+    legacy.schema_version = 30;
+    save_cache_atomic(&path, &legacy).unwrap();
+    let stale = WorkspaceIndex::new();
+    let report =
+        load_valid_cached_files(&stale, &path, &root, std::slice::from_ref(&file), &config);
+    assert_eq!(
+        report.loaded_files, 0,
+        "old capture bindings must be rebuilt"
+    );
+    assert_eq!(report.parse_files, vec![file.clone()]);
+    assert!(!stale.read().file_references().contains_key(&uri));
     fs::remove_dir_all(&root).unwrap();
 }
 

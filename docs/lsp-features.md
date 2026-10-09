@@ -64,6 +64,14 @@ A matching namespace root or an existing indexed FQN does not make a qualified
 name absolute: in `App\Sub`, `App\Foo` resolves to `App\Sub\App\Foo` unless
 its first segment is imported. Use `\App\Foo` for the absolute type.
 
+Local definitions, references/rename and inferred types respect callable
+boundaries. Closures require explicit `use`, arrows capture outer variables,
+and parameters shadow those captures. By-value captures use the type at
+creation; by-reference captures keep their navigation/rename binding but do
+not claim a fixed parent type across later writes. Local arrow assignments,
+reference assignments and destructuring targets participate in navigation and
+inference; unknown destructuring writes discard an earlier inferred type.
+
 ## Symbols And Hierarchies
 
 | LSP feature | Status | Notes |

@@ -4,7 +4,7 @@
 //! position and resolves it to an identifier name, considering namespace context
 //! and use statements.
 
-use crate::cst::{argument_index, argument_name, is_by_ref_output_argument_variable};
+use crate::cst::{argument_index, argument_name};
 use crate::phpdoc::{parse_phpdoc, strip_exact_tag};
 use crate::utf16::utf16_col_to_byte;
 use php_lsp_types::{
@@ -24,6 +24,10 @@ const MAX_OBJECT_TYPE_RESOLVE_DEPTH: usize = 64;
 #[cfg(test)]
 #[path = "resolve_qualified_type_tests.rs"]
 mod qualified_type_tests;
+
+#[cfg(test)]
+#[path = "resolve_variable_scope_tests.rs"]
+mod variable_scope_tests;
 
 #[cfg(test)]
 #[path = "resolve_composite_tests.rs"]
@@ -308,12 +312,29 @@ pub fn variable_definition_at_position(
 
     let var_name = normalize_var_name(&source[node.byte_range()]);
     let usage_start = node.start_byte();
-    let scope = find_enclosing_function(node).unwrap_or(root);
-
-    let mut best: Option<(usize, (u32, u32, u32, u32))> = None;
-    find_variable_definition_before(scope, &var_name, usage_start, source, &mut best);
-
-    best.map(|(_, range)| range)
+    let mut scope = crate::variable_scope::lexical_scope(node);
+    let mut before = usage_start;
+    let mut include_current = true;
+    for _ in 0..MAX_OBJECT_TYPE_RESOLVE_DEPTH {
+        let mut best = None;
+        find_variable_definition_before(
+            scope,
+            scope.id(),
+            &var_name,
+            before,
+            include_current,
+            source,
+            &mut best,
+        );
+        if let Some((_, range)) = best {
+            return Some(range);
+        }
+        let (parent, capture) = crate::variable_scope::captured_parent(scope, source, &var_name)?;
+        scope = parent;
+        before = capture;
+        include_current = false;
+    }
+    None
 }
 
 /// Collect local variables declared before a position in the current scope.
@@ -1797,20 +1818,7 @@ fn infer_variable_type(
 
 /// Find the enclosing function/method node.
 fn find_enclosing_function(node: Node) -> Option<Node> {
-    let mut current = node.parent();
-    while let Some(n) = current {
-        match n.kind() {
-            "method_declaration"
-            | "function_definition"
-            | "arrow_function"
-            | "anonymous_function"
-            | "anonymous_function_creation_expression" => {
-                return Some(n);
-            }
-            _ => current = n.parent(),
-        }
-    }
-    None
+    node.parent().map(crate::variable_scope::lexical_scope)
 }
 
 /// Find the enclosing class/interface/trait declaration node.
@@ -2006,6 +2014,19 @@ fn find_variable_inference_before_usage(
             continue;
         }
 
+        if let Some(info) = destructuring_inference_for_var(
+            stmt,
+            var_name,
+            usage_start,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        ) {
+            inferred = Some((stmt.start_byte(), info));
+            continue;
+        }
+
         // Assignment inference: $var = <expr>;
         if let Some(right) = assignment_rhs {
             if let Some(type_info) = infer_literal_array_shape_type(
@@ -2114,6 +2135,9 @@ fn find_nested_variable_inference_before_usage(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableInference> {
+    if crate::variable_scope::is_scope_boundary(node) {
+        return None;
+    }
     let mut inferred: Option<(usize, VariableInference)> = None;
 
     for i in 0..node.named_child_count() {
@@ -2130,6 +2154,19 @@ fn find_nested_variable_inference_before_usage(
 
         let assignment_rhs = assignment_rhs_for_var(child, var_name, source)
             .filter(|right| right.end_byte() <= usage_start);
+
+        if let Some(info) = destructuring_inference_for_var(
+            child,
+            var_name,
+            usage_start,
+            source,
+            file_symbols,
+            resolver,
+            callable_resolver,
+        ) {
+            inferred = Some((child.start_byte(), info));
+            continue;
+        }
 
         if let Some(doc_info) = extract_preceding_phpdoc_var_inference(
             child,
@@ -2223,18 +2260,7 @@ fn find_nested_variable_inference_before_usage(
 }
 
 fn is_variable_inference_scope_boundary(node: Node) -> bool {
-    matches!(
-        node.kind(),
-        "method_declaration"
-            | "function_definition"
-            | "arrow_function"
-            | "anonymous_function"
-            | "anonymous_function_creation_expression"
-            | "class_declaration"
-            | "interface_declaration"
-            | "trait_declaration"
-            | "enum_declaration"
-    )
+    crate::variable_scope::is_scope_boundary(node)
 }
 
 fn instanceof_guard_inference(
@@ -2451,13 +2477,106 @@ fn class_name_after_instanceof(condition: &str) -> Option<String> {
     (!class_name.is_empty()).then_some(class_name)
 }
 
-fn assignment_rhs_for_var<'a>(stmt: Node<'a>, var_name: &str, source: &str) -> Option<Node<'a>> {
-    if stmt.kind() != "expression_statement" {
+fn destructuring_inference_for_var(
+    node: Node,
+    var_name: &str,
+    usage: usize,
+    source: &str,
+    symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<VariableInference> {
+    let assignment = if node.kind() == "expression_statement" {
+        node.named_child(0)?
+    } else {
+        node
+    };
+    if !matches!(
+        assignment.kind(),
+        "assignment_expression"
+            | "reference_assignment_expression"
+            | "by_ref_assignment_expression"
+    ) {
         return None;
     }
+    let left = assignment.child_by_field_name("left")?;
+    if left.kind() != "list_literal" {
+        return None;
+    }
+    let right = assignment.child_by_field_name("right")?;
+    if right.end_byte() > usage {
+        return None;
+    }
+    let path = crate::variable_scope::destructuring_path(left, var_name, source)?;
+    let literal_value = literal_destructuring_value_text(source[right.byte_range()].trim(), &path);
+    let mut ty = literal_value.map(|text| {
+        infer_literal_value_type_text(text, right, source, symbols, resolver, callable_resolver)
+    });
+    if ty.is_none() {
+        ty = infer_expression_type_info(right, source, symbols, resolver, callable_resolver);
+        for key in &path {
+            ty = ty.and_then(|ty| {
+                key.as_deref()
+                    .and_then(|key| iterable_value_type_info(&ty, Some(key)))
+            });
+        }
+    }
+    Some(match ty {
+        Some(ty) => VariableInference {
+            type_display: Some(ty.to_string()),
+            resolved_type_fqn: resolve_phpdoc_var_type(&ty, node, source, symbols),
+            type_info: Some(ty),
+            phpdoc_comment: None,
+        },
+        None => VariableInference::default(),
+    })
+}
 
-    let expr = stmt.named_child(0)?;
-    if expr.kind() != "assignment_expression" {
+fn literal_destructuring_value_text<'a>(
+    mut text: &'a str,
+    path: &[Option<String>],
+) -> Option<&'a str> {
+    for key in path {
+        let key = key.as_deref()?;
+        let (body, _) = literal_array_body(text)?;
+        let mut selected = None;
+        let mut next_index = 0i64;
+        for part in split_top_level_text(body, ',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (element_key, value) = match find_top_level_text(part, "=>") {
+                Some(arrow) => (
+                    normalize_array_access_key(part[..arrow].trim())?,
+                    part[arrow + 2..].trim(),
+                ),
+                None => (next_index.to_string(), part),
+            };
+            if let Ok(index) = element_key.parse::<i64>() {
+                next_index = next_index.max(index.saturating_add(1));
+            }
+            if element_key == key {
+                selected = Some(value);
+            }
+        }
+        text = selected?;
+    }
+    Some(text)
+}
+
+fn assignment_rhs_for_var<'a>(stmt: Node<'a>, var_name: &str, source: &str) -> Option<Node<'a>> {
+    let expr = if stmt.kind() == "expression_statement" {
+        stmt.named_child(0)?
+    } else {
+        stmt
+    };
+    if !matches!(
+        expr.kind(),
+        "assignment_expression"
+            | "by_ref_assignment_expression"
+            | "reference_assignment_expression"
+    ) {
         return None;
     }
 
@@ -2720,7 +2839,23 @@ fn infer_variable_in_scope(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> VariableInference {
-    let mut inferred = VariableInference::default();
+    let Some(_depth) = ObjectTypeResolveDepthGuard::enter() else {
+        return VariableInference::default();
+    };
+    let mut inferred = crate::variable_scope::captured_parent(scope_node, source, var_name)
+        .filter(|_| !crate::variable_scope::capture_is_by_reference(scope_node, var_name, source))
+        .map(|(parent, before)| {
+            infer_variable_in_scope(
+                parent,
+                var_name,
+                before,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            )
+        })
+        .unwrap_or_default();
 
     // 1. Check function parameters for typed variables.
     if let Some(params) = scope_node.child_by_field_name("parameters") {
@@ -6593,78 +6728,42 @@ fn extract_use_clause_fqn(node: Node, parent: Node, source: &str) -> String {
 #[allow(clippy::type_complexity)]
 fn find_variable_definition_before(
     node: Node,
+    scope_id: usize,
     var_name: &str,
     usage_start: usize,
+    include_current: bool,
     source: &str,
     best: &mut Option<(usize, (u32, u32, u32, u32))>,
 ) {
-    if node.start_byte() >= usage_start {
+    if node.start_byte() > usage_start
+        || (!include_current && node.start_byte() == usage_start)
+        || (node.id() != scope_id && crate::variable_scope::is_scope_boundary(node))
+    {
         return;
     }
-
-    match node.kind() {
-        "variable_name" if is_by_ref_output_argument_variable(node, source) => {
-            if normalize_var_name(&source[node.byte_range()]) == var_name {
-                let start = node.start_byte();
-                if start < usage_start {
-                    *best = Some((start, node_range(node)));
-                }
-            }
+    if node.kind() == "variable_name"
+        && normalize_var_name(&source[node.byte_range()]) == var_name
+        && crate::variable_scope::is_variable_declaration(node, source, var_name)
+        && !crate::variable_scope::is_closure_capture_token(node)
+        && (include_current
+            || !crate::variable_scope::is_pending_assignment_binding(node, usage_start))
+    {
+        let start = node.start_byte();
+        if best.as_ref().is_none_or(|(previous, _)| start > *previous) {
+            *best = Some((start, node_range(node)));
         }
-        "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                if normalize_var_name(&source[name_node.byte_range()]) == var_name {
-                    let start = name_node.start_byte();
-                    if start < usage_start {
-                        *best = Some((start, node_range(name_node)));
-                    }
-                }
-            }
-        }
-        "assignment_expression" => {
-            if let Some(left) = node.child_by_field_name("left") {
-                if normalize_var_name(&source[left.byte_range()]) == var_name {
-                    let start = left.start_byte();
-                    if start < usage_start {
-                        *best = Some((start, node_range(left)));
-                    }
-                }
-            }
-        }
-        "foreach_statement" => {
-            for var_node in [
-                foreach_key_variable_node(node, source),
-                foreach_value_variable_node(node, source),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if normalize_var_name(&source[var_node.byte_range()]) == var_name {
-                    let start = var_node.start_byte();
-                    if start <= usage_start {
-                        *best = Some((start, node_range(var_node)));
-                    }
-                }
-            }
-        }
-        "catch_clause" => {
-            for field in ["name", "variable"] {
-                if let Some(var_node) = node.child_by_field_name(field) {
-                    if normalize_var_name(&source[var_node.byte_range()]) == var_name {
-                        let start = var_node.start_byte();
-                        if start < usage_start {
-                            *best = Some((start, node_range(var_node)));
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
     }
-
-    let cursor = &mut node.walk();
-    for child in node.named_children(cursor) {
-        find_variable_definition_before(child, var_name, usage_start, source, best);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        find_variable_definition_before(
+            child,
+            scope_id,
+            var_name,
+            usage_start,
+            include_current,
+            source,
+            best,
+        );
     }
 }
 
@@ -6675,25 +6774,9 @@ fn collect_visible_variable_declarations_before(
     vars: &mut Vec<(usize, String)>,
 ) {
     if scope.kind() == "arrow_function" {
-        let outer_scope = find_enclosing_function(scope).unwrap_or_else(|| find_root_node(scope));
-        let mut capture_start = scope.start_byte();
-        let mut current = scope.parent();
-        while let Some(parent) = current {
-            if parent.id() == outer_scope.id() {
-                break;
-            }
-            if matches!(
-                parent.kind(),
-                "assignment_expression" | "by_ref_assignment_expression"
-            ) && parent.child_by_field_name("right").is_some_and(|right| {
-                right.start_byte() <= scope.start_byte() && right.end_byte() >= scope.end_byte()
-            }) {
-                capture_start = parent.start_byte();
-                break;
-            }
-            current = parent.parent();
+        if let Some(parent) = crate::variable_scope::parent_variable_scope(scope) {
+            collect_visible_variable_declarations_before(parent, scope.start_byte(), source, vars);
         }
-        collect_visible_variable_declarations_before(outer_scope, capture_start, source, vars);
     }
 
     collect_variable_declarations_before(scope, scope.id(), usage_start, source, vars);
@@ -6709,55 +6792,18 @@ fn collect_variable_declarations_before(
     if node.start_byte() >= usage_start {
         return;
     }
-    if node.id() != scope_id
-        && matches!(
-            node.kind(),
-            "method_declaration"
-                | "function_definition"
-                | "arrow_function"
-                | "anonymous_function"
-                | "anonymous_function_creation_expression"
-        )
-    {
+    if node.id() != scope_id && crate::variable_scope::is_scope_boundary(node) {
         return;
     }
-
-    match node.kind() {
-        "variable_name" if is_by_ref_output_argument_variable(node, source) => {
-            collect_variable_node(node, usage_start, source, vars);
-        }
-        "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                collect_variable_node(name_node, usage_start, source, vars);
-            }
-        }
-        "assignment_expression" | "by_ref_assignment_expression" => {
-            if let Some(left) = node.child_by_field_name("left") {
-                collect_variable_node(left, usage_start, source, vars);
-            }
-        }
-        "foreach_statement" => {
-            for var_node in [
-                foreach_key_variable_node(node, source),
-                foreach_value_variable_node(node, source),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                collect_variable_node(var_node, usage_start, source, vars);
-            }
-        }
-        "catch_clause" => {
-            for field in ["name", "variable"] {
-                if let Some(var_node) = node.child_by_field_name(field) {
-                    collect_variable_node(var_node, usage_start, source, vars);
-                }
-            }
-        }
-        "anonymous_function_use_clause" => {
-            collect_variable_name_descendants(node, usage_start, source, vars);
-        }
-        _ => {}
+    if node.kind() == "variable_name"
+        && !crate::variable_scope::is_pending_assignment_binding(node, usage_start)
+        && (crate::variable_scope::is_variable_declaration(
+            node,
+            source,
+            &normalize_var_name(&source[node.byte_range()]),
+        ) || crate::variable_scope::is_closure_capture_token(node))
+    {
+        collect_variable_node(node, usage_start, source, vars);
     }
 
     let cursor = &mut node.walk();

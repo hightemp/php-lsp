@@ -16,3 +16,4 @@ pub mod signature_help;
 pub mod symbols;
 pub mod type_contract;
 pub mod utf16;
+pub mod variable_scope;

@@ -2,7 +2,7 @@
 
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
-P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), and P2-24 (2026-10-09).
+P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), and P2-24/P2-25 (2026-10-09).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -41,6 +41,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Native/PHPDoc contracts | contradictions/refinements, aliases/templates, native generation, dependency changes, concurrent publication, cache and document versions | T | B | B | [shared type rules](../server/crates/php-lsp-types/src/type_refinement_tests.rs), [parser provenance tests](../server/crates/php-lsp-parser/src/phpdoc_native_tests.rs), [index tests](../server/crates/php-lsp-index/src/phpdoc_native_index_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs), [generation tests](../server/crates/php-lsp-server/src/lsp/code_action_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_phpdoc_native.rs). |
 | Hover/inlay type owners | multi-class, namespace imports, self/static/parent, anonymous boundaries, UTF-16/CRLF and unsaved edits | T | B | B | [owner unit tests](../server/crates/php-lsp-server/src/lsp/type_owner_tests.rs), [parser boundary tests](../server/crates/php-lsp-parser/src/resolve_type_owner_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_type_owner.rs). |
 | Definition/declaration/type definition/implementation | local, cross-file, inheritance, vendor | T | B | B | [definition protocol tests](../server/crates/php-lsp-server/tests/e2e_definition.rs). |
+| Lexical variable bindings | nested scopes, captures/shadowing, reference/destructuring writes, arrow-local types, buffer edits/reopen and cache replay | T | B | B | [parser regressions](../server/crates/php-lsp-parser/src/resolve_variable_scope_tests.rs), [server scope tests](../server/crates/php-lsp-server/src/lsp/variable_scope_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_variable_scopes.rs), [cache replay](../server/crates/php-lsp-index/src/cache_tests.rs). |
 | PHPDoc definitions | repeated owners, attributes/trivia, exact multiline tags, stale source, buffer edits, Twig shape keys | T | B | B | [PHPDoc source tests](../server/crates/php-lsp-parser/src/phpdoc_source_tests.rs), [owner tests](../server/crates/php-lsp-server/src/lsp/phpdoc_definition_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_phpdoc_definition.rs), [cache round-trip tests](../server/crates/php-lsp-index/src/cache_tests.rs). |
 | PHPDoc definitions and indexing | parallel definition/edit/close-reopen/watch/full reindex; disk restoration and latest-run progress | T | B | B | [concurrent RPC stress and close regressions](../server/crates/php-lsp-server/tests/e2e_phpdoc_definition_stress.rs), [owned aggregate retry tests](../server/crates/php-lsp-server/src/indexing/workspace_tests.rs), [close fingerprint publication tests](../server/crates/php-lsp-server/src/server_tests.rs). Test callbacks force source changes and run replacement/removal/shutdown; the stress uses two Tokio threads and overlapping JSON-RPC futures, with exact stable end-state checks and an independent watchdog. This is finite stress evidence, not proof of every scheduling order. |
 | Signature help and inlay hints | call positions, nullsafe/incomplete calls, comment/string boundaries, inferred types | T | B | B | [signature-help tests](../server/crates/php-lsp-server/tests/e2e_signature_help.rs), [completion tests](../server/crates/php-lsp-server/tests/e2e_completion.rs), [hover tests](../server/crates/php-lsp-server/tests/e2e_hover.rs). |
@@ -59,7 +60,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Blade virtual PHP | hover/completion/diagnostics/source ranges | T | B | B | [template protocol tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
 | Twig virtual PHP and context | controller → caller → partial; open/change/delete/rename | T | B | B | [Twig context protocol tests](../server/crates/php-lsp-server/tests/e2e_twig_context.rs), [template tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
 | Twig context cache | cold/warm, overlays, dependency changes, cancellation | T | B | B | [Twig context unit tests](../server/crates/php-lsp-server/src/indexing/twig_context_tests.rs), [regressions](../server/crates/php-lsp-server/src/indexing/twig_context_regression_tests.rs). |
-| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); warm-start timing after schema 30 is unmeasured. |
+| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); warm-start timing after schema 31 is unmeasured. |
 | Workspace index | watch create/change/delete and file operations | T | B | B | [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Workspace configuration | reconfigure parser/stubs/index, cancel old generation | T | B | B | [initialize tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [indexing tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Pre-create/pre-delete file requests | advertised no-edit response | B | B | B | Implementation is documented in [LSP features](lsp-features.md); no direct protocol regression found for either response. |
@@ -99,7 +100,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |
@@ -148,9 +149,9 @@ line denominator equals the physical line count of these source-mapped files;
 its line percentage should not be compared directly with LLVM's Rust line
 percentage.
 
-The matrix has 55 scenario rows: on Linux 46 have executed tests, seven have
+The matrix has 56 scenario rows: on Linux 47 have executed tests, seven have
 mock-based checks, one has build-only evidence, and one (native Extension Host)
-has no automated test or build evidence. The 46 Rust rows have macOS/Windows
+has no automated test or build evidence. The 47 Rust rows have macOS/Windows
 build evidence but no native runtime test; one of those Rust rows lacks a
 direct Linux protocol regression.
 The nine client rows have no native macOS/Windows runtime test. These are

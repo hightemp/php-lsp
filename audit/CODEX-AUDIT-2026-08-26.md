@@ -1742,6 +1742,50 @@ scope. Для переменной внутри arrow поиск начинае�
 hover и inlay; отдельные правила closure `use` и arrow auto-capture; тесты в обе
 стороны каждой вложенной границы.
 
+**Реализация и проверки (2026-10-09):**
+
+Общая модель `php-lsp-parser::variable_scope` используется для lexical boundaries,
+правил capture/shadowing и writable bindings. Definition и type inference не
+переходят во вложенные callable/class bodies; constructor arguments anonymous
+class сохраняют внешний scope. Closures импортируют только явные `use`, arrows
+автоматически захватывают внешние переменные, параметры затеняют captures.
+By-value inference использует состояние до создания callable и исключает ещё
+не завершённое присваивание самого callable. Для `use (&$value)` definition и
+rename сохраняют внешнюю связь, но тип не фиксируется как creation-time snapshot:
+ссылка может увидеть последующие внешние записи. Локальные записи внутри closure
+по-прежнему могут дать тип.
+
+By-ref assignments и writable destructuring values участвуют в definition и
+completion; dynamic keys остаются reads. Поддерживаемые статические literal/shape
+RHS дают тип destructured value, неизвестная destructuring запись сбрасывает
+предыдущий тип. Server hover/inlay используют общий scope, включая локальный RHS
+в arrow expression; inlay collector видит assignment внутри выражения.
+
+Добавлены 27 постоянных регрессий: 17 parser, 1 server/helper, 1 cache и 8 LSP.
+RED воспроизвёл переходы к чужим nested assignments, потерю captures/arrow RHS,
+by-ref/destructuring definitions и типов, сохранение старого типа при неизвестной
+записи, ошибочный value snapshot для reference capture и выбор незавершённого
+assignment при capture. Отдельный RED проверил сохранение уже завершённых записей
+в предыдущих RHS элементах перед arrow/closure, включая одинаковое имя
+незавершённого внешнего assignment. LSP проверяет definition/hover/inlay/completion/rename,
+точные rename ranges, Unicode/CRLF, unsaved edits, удаление `use`, затенение
+параметром и close/reopen. Проверки жизненного цикла используют заданный порядок
+событий; отдельный параллельный stress для P2-25 не заявляется.
+Schema 31 инвалидирует старые receiver/callee bindings; cache regression проверяет
+полный replay metadata и явное отклонение schema 30. Исторические измерения
+coverage/performance сохранены; warm timing после schema 31 не измерен.
+
+Полный последовательный Rust-набор: 1471/1471, 47 test-result targets,
+0 ignored; `CARGO_BUILD_JOBS=1`, `--test-threads=1`. Clippy
+`--all-targets -- -D warnings`, Rustfmt и diff check прошли. Сборки и тесты
+выполнены во временных user scopes с MemoryHigh2G/MemoryMax3G/MemorySwapMax1G,
+одним доступным CPU и nice15. Матрица содержит 56 scenario rows/119 действующих
+локальных ссылок. Исходное описание находки и предыдущие записи TASKS сохранены.
+
+Повторяемый review Verifier на `gpt-6-sol` дал GO по коду, тестам и
+финальной документации/доказательствам. Задача в TASKS отмечена выполненной.
+Статус: **исправлено**.
+
 ### CODEX-P2-26. Обычные `name` nodes превращаются в ссылки на global constants
 
 [`push_constant_reference_if_plain_name`](server/crates/php-lsp-parser/src/references.rs#L701)

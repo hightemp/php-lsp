@@ -16,6 +16,10 @@ mod phpdoc_native_return_tests;
 #[path = "qualified_type_tests.rs"]
 mod qualified_type_tests;
 
+#[cfg(test)]
+#[path = "variable_scope_tests.rs"]
+mod variable_scope_tests;
+
 const DECLARATION_SCOPE_END_HINT_MIN_LINES: u32 = 2;
 const LARGE_SCOPE_END_HINT_MIN_LINES: u32 = 8;
 const CONTROL_SCOPE_END_HINT_MAX_CHARS: usize = 96;
@@ -601,7 +605,7 @@ pub(in crate::server) fn collect_local_variable_type_inlay_hints_inner(
         return;
     }
     match node.kind() {
-        "expression_statement" => {
+        "assignment_expression" => {
             add_assignment_variable_type_inlay_hint(ctx, node, hints, seen);
         }
         "foreach_statement" => {
@@ -622,8 +626,13 @@ pub(in crate::server) fn add_assignment_variable_type_inlay_hint(
     hints: &mut Vec<InlayHint>,
     seen: &mut HashSet<(u32, u32, String)>,
 ) {
-    let Some(expr) = statement.named_child(0) else {
-        return;
+    let expr = if statement.kind() == "expression_statement" {
+        let Some(expr) = statement.named_child(0) else {
+            return;
+        };
+        expr
+    } else {
+        statement
     };
     if expr.kind() != "assignment_expression" {
         return;
@@ -3331,37 +3340,15 @@ pub(in crate::server) fn assignment_rhs_for_variable_node<'tree>(
 }
 
 pub(in crate::server) fn local_variable_scope_node(
-    mut node: tree_sitter::Node,
-) -> tree_sitter::Node {
-    loop {
-        if matches!(
-            node.kind(),
-            "method_declaration" | "function_definition" | "anonymous_function"
-        ) {
-            return node;
-        }
-        let Some(parent) = node.parent() else {
-            return node;
-        };
-        node = parent;
-    }
+    node: tree_sitter::Node<'_>,
+) -> tree_sitter::Node<'_> {
+    php_lsp_parser::variable_scope::lexical_scope(node)
 }
 
 pub(in crate::server) fn is_variable_inference_scope_boundary_for_hover(
     node: tree_sitter::Node,
 ) -> bool {
-    matches!(
-        node.kind(),
-        "method_declaration"
-            | "function_definition"
-            | "arrow_function"
-            | "anonymous_function"
-            | "anonymous_function_creation_expression"
-            | "class_declaration"
-            | "interface_declaration"
-            | "trait_declaration"
-            | "enum_declaration"
-    )
+    php_lsp_parser::variable_scope::is_scope_boundary(node)
 }
 
 pub(in crate::server) fn local_variable_type_from_hover_info(

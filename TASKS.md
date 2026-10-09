@@ -6407,3 +6407,22 @@ change.
   - Scope: baseline/cache-history paragraphs and coverage evidence dates; preserve measurement dates, results, audit findings and earlier journal entries.
   - Implemented: moved explanatory baseline, acceptance, cache-change and matrix-update dates into parentheses in README, architecture, performance, production baseline and coverage documentation; preserved the meaning and measurement chronology.
   - Validation: reviewed the edited paragraphs and ran git diff --check; documentation-only change, no builds required.
+
+### Milestone: CODEX-P2-25 lexical variable scopes (2026-10-09 -> 2026-10-09)
+
+**Статус:** done
+**Цель:** Keep local definition, references/rename and type inference inside the correct lexical binding, with explicit closure captures and arrow captures.
+
+#### Задачи
+
+- [x] **P225-001-2026-10-09** Add RED regressions for nested scopes, captures, writes and local type visibility before implementation. *(done 2026-10-09)*
+  - Implemented: 27 permanent regressions (17 parser,1 server/helper,1 cache,8 LSP), with adversarial nested scopes, value/reference captures, parameter shadowing, by-ref/destructuring writes, arrow RHS, pending enclosing assignments and completed RHS sibling writes.
+  - Validation: RED reproduced the original definition/type leaks, lost captures/arrow hints and stale reference/cache bindings; focused GREEN includes full parser437/437, LSP8/8 and cache29/29. Exact rename ranges, Unicode/CRLF, unsaved removal/shadowing and close/reopen are covered.
+- [x] **P225-002-2026-10-09** Reuse a shared lexical scope model across parser/server consumers and fix the reproduced definition/inference errors. *(done 2026-10-09)*
+  - Implemented: extracted existing reference binding helpers into parser variable_scope; reused boundaries/roles for definition, references/rename, completion, inference and server hover/inlay. Value captures use completed parent writes at creation; reference captures retain binding identity with conservative parent-value inference. Nested callable/class bodies isolate locals while anonymous constructor arguments remain outer. Schema31 rebuilds persisted receiver/callee targets and updates the binary fixture.
+  - Validation: repeated read-only Verifier review on gpt-6-sol gave GO after reference-value snapshot and pending/sibling assignment corrections. Existing parser/reference regressions pass; async publication and generation coordination remain unchanged.
+- [x] **P225-003-2026-10-09** Complete sequential memory-limited Rust validation, Verifier on gpt-6-sol to GO, audit/documentation verification and final status. *(done 2026-10-09)*
+  - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; transient MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scope, one available CPU and nice15. Preserve original audit wording, earlier journal entries and existing runtime/index-generation protections.
+  - Implemented: README, architecture, LSP behavior, current cache/performance caveats and coverage matrix updated; original audit finding retained with appended implementation/evidence. Matrix56 rows/119 valid local links; historical measured percentages and timings unchanged.
+  - Validation: full Rust1471/1471 across47 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Shared source functions introduce no new async state; deterministic edit/remove-capture/shadow/close-reopen coverage is present, with no claim of a dedicated parallel P2-25 stress run.
+  - Final review: reused Verifier on gpt-6-sol returned GO for source, tests and final documentation/evidence. Original audit finding and earlier TASKS bytes verified unchanged; all new source files are formatted and documentation links resolve.
