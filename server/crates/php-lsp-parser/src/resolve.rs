@@ -933,6 +933,46 @@ fn resolve_node(
         });
     }
 
+    if let Some(name) = crate::cst::constant_name_at(node) {
+        let text = &source[name.byte_range()];
+        return Some(SymbolAtPosition {
+            fqn: resolve_constant_name(text, file_symbols),
+            name: text.to_string(),
+            ref_kind: RefKind::GlobalConstant,
+            allows_global_fallback: unqualified_name_allows_global_fallback(
+                text,
+                UseKind::Constant,
+                file_symbols,
+            ),
+            object_expr: None,
+            range: node_range(name),
+        });
+    }
+    if matches!(parent_kind, "const_element" | "enum_case") {
+        if let Some(symbol) = file_symbols.symbols.iter().find(|s| {
+            s.selection_range == node_range(node)
+                && matches!(
+                    s.kind,
+                    php_lsp_types::PhpSymbolKind::GlobalConstant
+                        | php_lsp_types::PhpSymbolKind::ClassConstant
+                        | php_lsp_types::PhpSymbolKind::EnumCase
+                )
+        }) {
+            return Some(SymbolAtPosition {
+                fqn: symbol.fqn.clone(),
+                name: symbol.name.clone(),
+                ref_kind: if symbol.kind == php_lsp_types::PhpSymbolKind::GlobalConstant {
+                    RefKind::GlobalConstant
+                } else {
+                    RefKind::ClassConstant
+                },
+                allows_global_fallback: false,
+                object_expr: None,
+                range: node_range(node),
+            });
+        }
+    }
+
     match parent_kind {
         // Member access: $obj->method() or $obj->property
         "member_access_expression" | "nullsafe_member_access_expression" => {
@@ -1205,8 +1245,9 @@ fn resolve_node(
 
         // Class constant access: self::CONST / ClassName::CONST
         "class_constant_access_expression" => {
-            let scope_node = parent.named_child(0);
-            let name_node = parent.named_child(1);
+            let (scope, name) = crate::cst::class_constant_parts(parent)?;
+            let scope_node = Some(scope);
+            let name_node = Some(name);
 
             if name_node.map(|n| n.id()) == Some(node.id()) {
                 let scope_text = scope_node.map(|s| source[s.byte_range()].to_string());
@@ -6343,25 +6384,21 @@ fn resolve_name_node(
         });
     }
 
-    // Resolve as global/user constant in expression-like contexts.
-    if is_constant_reference_context(parent_kind) {
-        let resolved = resolve_constant_name(text, file_symbols);
-        return Some(SymbolAtPosition {
-            fqn: resolved,
-            name: text.to_string(),
-            ref_kind: RefKind::GlobalConstant,
-            allows_global_fallback: unqualified_name_allows_global_fallback(
-                text,
-                UseKind::Constant,
-                file_symbols,
-            ),
-            object_expr: None,
-            range: node_range(node),
-        });
+    let qname = find_qualified_name_ancestor(node);
+    let class_context = is_inside_class_reference_context(node)
+        || qname.parent().is_some_and(|p| p.kind() == "attribute")
+        || (parent_kind == "binary_expression"
+            && node.parent().is_some_and(|p| {
+                p.child_by_field_name("operator")
+                    .is_some_and(|op| op.kind() == "instanceof")
+                    && p.child_by_field_name("right")
+                        .is_some_and(|right| right.id() == node.id())
+            }));
+    if !class_context {
+        return None;
     }
-
     // Try to resolve as class name first
-    let resolved = resolve_class_name(text, file_symbols);
+    let resolved = resolve_class_name(&source[qname.byte_range()], file_symbols);
     Some(SymbolAtPosition {
         fqn: resolved,
         name: text.to_string(),
@@ -6626,30 +6663,6 @@ fn resolve_constant_name(name: &str, file_symbols: &FileSymbols) -> String {
     }
 
     qualify_in_current_namespace(name, file_symbols)
-}
-
-fn is_constant_reference_context(parent_kind: &str) -> bool {
-    !matches!(
-        parent_kind,
-        "class_declaration"
-            | "interface_declaration"
-            | "trait_declaration"
-            | "enum_declaration"
-            | "function_definition"
-            | "method_declaration"
-            | "named_type"
-            | "optional_type"
-            | "union_type"
-            | "intersection_type"
-            | "object_creation_expression"
-            | "function_call_expression"
-            | "scoped_call_expression"
-            | "member_call_expression"
-            | "nullsafe_member_call_expression"
-            | "namespace_use_clause"
-            | "namespace_definition"
-            | "use_declaration"
-    )
 }
 
 /// Check if a node is inside a `namespace_use_clause` (a use statement).

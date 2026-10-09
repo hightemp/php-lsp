@@ -2,6 +2,156 @@
 
 use tree_sitter::Node;
 
+fn previous_token(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        node = node.prev_sibling()?;
+        if !node.is_extra() {
+            return Some(node);
+        }
+    }
+}
+
+fn next_token(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        node = node.next_sibling()?;
+        if !node.is_extra() {
+            return Some(node);
+        }
+    }
+}
+
+/// Braced member names evaluate an expression rather than naming a static member.
+pub(crate) fn is_dynamic_member_name(node: Node<'_>) -> bool {
+    previous_token(node).is_some_and(|n| n.kind() == "{")
+        && next_token(node).is_some_and(|n| n.kind() == "}")
+        && node.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "member_access_expression"
+                    | "nullsafe_member_access_expression"
+                    | "member_call_expression"
+                    | "nullsafe_member_call_expression"
+                    | "scoped_call_expression"
+                    | "class_constant_access_expression"
+            )
+        })
+}
+
+pub(crate) fn class_constant_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor).filter(|n| !n.is_extra());
+    Some((children.next()?, children.next()?))
+}
+
+/// Only identifiers in proven expression slots are global constant reads.
+/// Unknown/declaration/type/member-label roles deliberately fail closed.
+pub(crate) fn is_constant_reference(node: Node<'_>) -> bool {
+    if node.is_error()
+        || node.is_missing()
+        || node.has_error()
+        || !(node.kind() == "qualified_name"
+            || (node.kind() == "name" && node.named_child_count() == 0))
+    {
+        return false;
+    }
+    let Some(parent) = node.parent().filter(|p| !p.is_error()) else {
+        return false;
+    };
+    let field = |name| {
+        parent
+            .child_by_field_name(name)
+            .is_some_and(|n| n.id() == node.id())
+    };
+    match parent.kind() {
+        // The grammar wraps dynamic class-constant expressions in an aliased name.
+        "name" => {
+            is_dynamic_member_name(parent)
+                && parent.start_byte() == node.start_byte()
+                && parent.end_byte() == node.end_byte()
+        }
+        "assignment_expression"
+        | "reference_assignment_expression"
+        | "augmented_assignment_expression" => field("right"),
+        "binary_expression" => {
+            field("left")
+                || (field("right")
+                    && parent
+                        .child_by_field_name("operator")
+                        .is_none_or(|n| n.kind() != "instanceof"))
+        }
+        "argument" => !field("name"),
+        "const_element" => previous_token(node).is_some_and(|n| n.kind() == "="),
+        "enum_case" | "static_variable_declaration" | "cast_expression" | "case_statement" => {
+            field("value")
+        }
+        "simple_parameter" | "property_promotion_parameter" | "property_element" => {
+            field("default_value")
+        }
+        "arrow_function" | "property_hook" => field("body"),
+        "conditional_expression" => field("condition") || field("body") || field("alternative"),
+        "for_statement" => field("initialize") || field("condition") || field("update"),
+        "foreach_statement" => {
+            let mut cursor = parent.walk();
+            let first = parent.named_children(&mut cursor).find(|n| !n.is_extra());
+            first.is_some_and(|n| n.id() == node.id())
+        }
+        "match_conditional_expression" | "match_default_expression" => field("return_expression"),
+        "unary_op_expression" => field("argument"),
+        "member_access_expression"
+        | "nullsafe_member_access_expression"
+        | "member_call_expression"
+        | "nullsafe_member_call_expression" => field("object") || is_dynamic_member_name(node),
+        "scoped_call_expression" | "class_constant_access_expression" => {
+            is_dynamic_member_name(node)
+        }
+        "dynamic_variable_name" => previous_token(node).is_some_and(|n| n.kind() == "{"),
+        "list_literal" => next_token(node).is_some_and(|n| n.kind() == "=>"),
+        "subscript_expression" => {
+            // "$items[KEY]" uses a literal key; "{$items[KEY]}" evaluates KEY.
+            !parent.parent().is_some_and(|outer| {
+                matches!(
+                    outer.kind(),
+                    "encapsed_string" | "heredoc_body" | "shell_command_expression"
+                ) && previous_token(parent).is_none_or(|n| n.kind() != "{")
+            })
+        }
+        "expression_statement"
+        | "return_statement"
+        | "echo_statement"
+        | "parenthesized_expression"
+        | "array_element_initializer"
+        | "sequence_expression"
+        | "match_condition_list"
+        | "throw_expression"
+        | "yield_expression"
+        | "include_expression"
+        | "include_once_expression"
+        | "require_expression"
+        | "require_once_expression"
+        | "print_intrinsic"
+        | "exit_statement"
+        | "clone_expression"
+        | "error_suppression_expression"
+        | "variadic_unpacking"
+        | "break_statement"
+        | "continue_statement" => true,
+        _ => false,
+    }
+}
+
+/// Promote cursor positions within a qualified name to its single expression.
+pub(crate) fn constant_name_at(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent().filter(|p| {
+        matches!(
+            p.kind(),
+            "qualified_name" | "namespace_name" | "namespace_name_as_prefix"
+        )
+    }) {
+        node = parent;
+    }
+    is_constant_reference(node).then_some(node)
+}
+
 pub(crate) fn is_foreach_header_declared_variable(node: Node, source: &str) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {

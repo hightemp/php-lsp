@@ -2,6 +2,10 @@
 
 use super::super::*;
 
+#[cfg(test)]
+#[path = "constant_reference_tests.rs"]
+mod constant_reference_tests;
+
 #[path = "phpdoc_native_diagnostics.rs"]
 mod phpdoc_native_diagnostics;
 use php_lsp_parser::resolve::{
@@ -1444,7 +1448,17 @@ pub(in crate::server) fn reference_kind_matches(
         return true;
     }
 
-    is_class_like_kind(reference_kind) && is_class_like_kind(target_kind)
+    (is_class_like_kind(reference_kind) && is_class_like_kind(target_kind))
+        || matches!(
+            (reference_kind, target_kind),
+            (
+                php_lsp_types::PhpSymbolKind::ClassConstant,
+                php_lsp_types::PhpSymbolKind::EnumCase
+            ) | (
+                php_lsp_types::PhpSymbolKind::EnumCase,
+                php_lsp_types::PhpSymbolKind::ClassConstant
+            )
+        )
 }
 
 pub(in crate::server) fn is_class_like_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {

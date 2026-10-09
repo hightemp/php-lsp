@@ -6426,3 +6426,21 @@ change.
   - Implemented: README, architecture, LSP behavior, current cache/performance caveats and coverage matrix updated; original audit finding retained with appended implementation/evidence. Matrix56 rows/119 valid local links; historical measured percentages and timings unchanged.
   - Validation: full Rust1471/1471 across47 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Shared source functions introduce no new async state; deterministic edit/remove-capture/shadow/close-reopen coverage is present, with no claim of a dedicated parallel P2-25 stress run.
   - Final review: reused Verifier on gpt-6-sol returned GO for source, tests and final documentation/evidence. Original audit finding and earlier TASKS bytes verified unchanged; all new source files are formatted and documentation links resolve.
+
+### Milestone: CODEX-P2-26 constant reference roles (2026-10-09 -> 2026-10-09)
+
+**Статус:** done
+**Цель:** Collect global constant occurrences only in proven expression roles, preserving declaration identity and safe references/rename/import analysis.
+
+#### Задачи
+
+- [x] **P226-001-2026-10-09** Add RED regressions for declaration/member/attribute/named-argument names and positive constant-expression cases before implementation. *(done 2026-10-09)*
+  - Implemented: 27 permanent regressions (18 parser,1 server/helper,1 cache,7 LSP), with positive expression matrices and negative declaration/type/member/label/variable contexts, dynamic and qualified names, exact ranges and import roles.
+  - Validation: RED reproduced false occurrences, duplicate declarations, wrong cursor identity, dynamic class-scope loss, prefix prepare-rename ranges, false import use and enum matching. Focused GREEN: parser455/455, index107/107, LSP7/7 and server/helper1/1.
+- [x] **P226-002-2026-10-09** Replace blacklist classification with shared CST expression-role checks, preserve actual constants and rebuild stale cached occurrences. *(done 2026-10-09)*
+  - Implemented: shared cst expression-slot whitelist replaces collector/walker/cursor blacklists and gates constant import usage. Declarations retain global/class/enum identity, qualified reads keep their full range, dynamic member names keep expression/class references, attributes keep Class identity, and enum queries accept constant syntax with owner/name/kind checks. Schema32 and its fixture invalidate old occurrences.
+  - Validation: repeated read-only Verifier on gpt-6-sol gave GO after dynamic scope and qualified range RED corrections. Reference/import lifecycle tests cover Unicode/CRLF, unsaved edits and close/reopen; publication coordination is unchanged.
+- [x] **P226-003-2026-10-09** Validate parser, cache and LSP behavior, full sequential Rust checks, repeated Verifier on gpt-6-sol to GO and final audit/documentation integrity. *(done 2026-10-09)*
+  - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; transient MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scope, one available CPU and nice15. Preserve original audit text and prior journal entries; update documentation only for resulting behavior and evidence.
+  - Implemented: README, architecture, LSP behavior, cache/performance caveats and coverage evidence updated; original audit section retained with appended implementation and validation. Matrix57 rows/123 valid local links; historical timing/coverage measurements unchanged.
+  - Validation: full sequential Rust1498/1498 across48 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. After two equivalent lint-only boolean simplifications the full parser455/455 passed again. Final reused Verifier on gpt-6-sol returned GO for source, tests, documentation and evidence. Original audit/prior journal bytes and all local matrix links verified; task completed.

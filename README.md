@@ -213,8 +213,9 @@ phpstorm-stubs support.
   large-workspace baseline (2026-05-28) met the warm cache target, but that timing
   has not been rerun after source-provenance checks (schema 26), call-site
   metadata (schema 27), exact PHPDoc owner ranges (schema 28), native/PHPDoc
-  type provenance (schema 29), or corrected qualified type/reference binding
-  (schema 30), or corrected lexical variable/capture binding (current schema 31).
+  type provenance (schema 29), qualified type/reference binding (schema 30),
+  lexical variable/capture binding (schema 31), or constant-expression roles
+  (current schema 32).
   Installed-vendor first-hit behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses merge indexed
   closed-file references with ordinary open PHP snapshots, but still iterate

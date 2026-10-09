@@ -1798,6 +1798,56 @@ references, rename, code lens и unused-import analysis.
 AST-ролей; проверять declaration/reference identity и добавить negative matrix
 по method names, const elements, named arguments, attributes и nullsafe access.
 
+**Реализация и проверки (2026-10-09):**
+
+Blacklist заменён общим whitelist expression roles в parser cst.rs. Его используют
+indexed occurrences, file reference walker, cursor resolver и проверка использования
+constant imports. Declaration/type/member names, variable-name children, labels,
+attribute class names и named-argument labels больше не становятся GlobalConstant.
+Defaults, аргументы и их значения, операторы, control-flow/array/match/yield/include
+выражения продолжают учитывать настоящие константы. Убрана class-type blacklist
+фильтрация слов вроде string/int в expression roles: они допустимы как имена
+пользовательских констант. Unbraced interpolated array keys остаются literal keys;
+complex braced interpolation учитывает выражения.
+
+Braced dynamic member names не создают выдуманный static member target; константы
+внутри выражения и class scope сохраняются. Для dynamic class constants учтены
+aliased expression wrappers грамматики и comment extras. Qualified constants
+записываются одним occurrence и разрешаются целиком при курсоре на любом сегменте;
+prepareRename и rename выбирают terminal identifier. Const/enum declarations
+сохраняют extracted global/class/enum identity, declaration не дублируется как read.
+EnumCase queries принимают class-constant access syntax с сохранением owner, case
+члена и остальных symbol-kind ограничений. Attribute names имеют Class identity,
+а constant arguments сохраняют свою identity; organize imports не теряет class
+imports и удаляет constant alias, используемый только как чужое имя.
+
+Добавлены 27 постоянных регрессий: 18 parser matrices, 1 server/helper, 1 cache и
+7 LSP. RED воспроизвёл ложные indexed/scanned references, дубли declarations,
+неверные cursor targets, потерю braced expression reads и class scopes, неправильный
+prepareRename range, unused-import false use, потерю attribute class identity и
+отказ EnumCase matching. LSP проверяет точные references/rename ranges, отказ
+navigation/rename для named-argument label, organize imports, method code lens,
+Unicode/CRLF, unsaved смену роли и close/reopen. Проверки lifecycle используют
+заданный порядок событий; отдельный параллельный P2-26 stress не заявляется.
+
+Schema 32 перестраивает старые ложные occurrences и обновляет binary fixture.
+Cache regression проверяет полный replay reference metadata и явное отклонение
+schema 31. Исторические coverage/performance измерения сохранены; warm timing после
+schema 32 не измерен. Документация поведения, архитектуры и test-evidence обновлена.
+
+Полный последовательный Rust-набор: 1498/1498, 48 test-result targets,
+0 ignored; `CARGO_BUILD_JOBS=1`, `--test-threads=1`. Clippy
+`--all-targets -- -D warnings`, Rustfmt и diff check прошли. После двух
+эквивалентных boolean упрощений по замечанию Clippy parser455/455 прошёл повторно.
+Сборки/тесты выполнены во временных user scopes с MemoryHigh2G/MemoryMax3G,
+MemorySwapMax1G, одним доступным CPU и nice15. Матрица содержит 57 scenario rows/
+123 действующие локальные ссылки. Исходное описание находки и прежний журнал
+TASKS сохранены.
+
+Повторяемый review Verifier на `gpt-6-sol` дал GO по коду, тестам и
+финальной документации/доказательствам. Задача в TASKS отмечена выполненной.
+Статус: **исправлено**.
+
 ### CODEX-P2-27. Conditional PHPDoc types разбираются и сопоставляются неверно
 
 В [`parse_type_string`](server/crates/php-lsp-parser/src/phpdoc.rs#L738) union и

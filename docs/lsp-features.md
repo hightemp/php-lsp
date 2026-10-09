@@ -72,6 +72,14 @@ not claim a fixed parent type across later writes. Local arrow assignments,
 reference assignments and destructuring targets participate in navigation and
 inference; unknown destructuring writes discard an earlier inferred type.
 
+Global constant navigation and rename include actual expression uses.
+Declaration names, static member names, named-argument labels and attribute/type
+names do not count as constant uses. Argument values and expressions inside
+braced dynamic member names do count; unbraced interpolated array keys remain
+literal strings. Qualified constant rename selects the terminal identifier,
+including when initiated from a prefix segment. Constant import diagnostics and
+organize imports follow these same roles.
+
 ## Symbols And Hierarchies
 
 | LSP feature | Status | Notes |

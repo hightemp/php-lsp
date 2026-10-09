@@ -320,6 +320,19 @@ Reference metadata also records whether PHP's unqualified global fallback is
 legal and, for import targets, the exact rename range and whether explicit
 alias spelling must be preserved.
 
+Global constant reads use shared expression-role checks in parser cst.rs.
+The occurrence collector, file reference walker, cursor resolver and constant
+import-use diagnostics share those checks. Declaration/type/member names,
+attribute class names, named-argument labels, variables and labels are not
+constant reads; defaults, argument values and braced member-name expressions can
+be. Unbraced interpolated array keys remain literal strings. Qualified names
+form one occurrence and cursor resolution retains the whole expression range
+so rename selects its terminal identifier. Constant declarations retain their
+extracted global/class/enum identity. Enum-case queries accept class-constant
+access syntax while keeping owner, member spelling and other symbol kinds
+distinct. Dynamic member expressions do not fabricate a static member target;
+their class scopes and constant expressions remain references.
+
 Call hierarchy uses each reference's invocation kind and byte range of its
 owning named callable. Reference locations stay in UTF-16. First-class callable
 creation has no invocation metadata; anonymous/arrow bodies and nested named
@@ -927,9 +940,11 @@ sources. Schema version 26 introduced provenance tracking; schema 27 added
 invocation kind and owning-callable ranges. Schema 28 added exact PHPDoc owner
 ranges. Schema 29 retains native/PHPDoc type provenance separately. Schema 30
 invalidated references derived with the former namespace-root heuristic.
-Current schema 31 invalidates receiver/callee references computed with incomplete
-lexical variable boundaries and capture rules. Neither binding change altered
-the serialized field layout.
+Schema 31 invalidated receiver/callee references computed with incomplete
+lexical variable boundaries and capture rules. Current schema 32 invalidates
+false global-constant occurrences and missing/mistyped attribute and dynamic
+expression references. These binding changes did not alter the serialized field
+layout.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

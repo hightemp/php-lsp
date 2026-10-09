@@ -336,7 +336,10 @@ fn collect_symbol_references_walk(
             if let Some(scope_node) = node.child_by_field_name("scope") {
                 push_class_reference(scope_node, source, file_symbols, references);
             }
-            if let Some(name_node) = node.child_by_field_name("name") {
+            if let Some(name_node) = node
+                .child_by_field_name("name")
+                .filter(|name| !crate::cst::is_dynamic_member_name(*name))
+            {
                 let member_name = &source[name_node.byte_range()];
                 if let Some(scope_fqn) = scoped_member_reference_class(node, source, file_symbols) {
                     push_symbol_reference(
@@ -371,7 +374,10 @@ fn collect_symbol_references_walk(
             if let Some(scope_node) = node.child_by_field_name("scope") {
                 push_class_reference(scope_node, source, file_symbols, references);
             }
-            if let Some(name_node) = node.child_by_field_name("name") {
+            if let Some(name_node) = node
+                .child_by_field_name("name")
+                .filter(|name| !crate::cst::is_dynamic_member_name(*name))
+            {
                 let raw_name = &source[name_node.byte_range()];
                 let bare_name = raw_name.trim_start_matches('$');
                 let kind = if raw_name.starts_with('$') {
@@ -414,7 +420,10 @@ fn collect_symbol_references_walk(
             }
         }
         "member_access_expression" | "nullsafe_member_access_expression" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
+            if let Some(name_node) = node
+                .child_by_field_name("name")
+                .filter(|name| !crate::cst::is_dynamic_member_name(*name))
+            {
                 let text = &source[name_node.byte_range()];
                 let (target_fqn, receiver) = resolved_instance_member_reference(
                     tree,
@@ -444,7 +453,10 @@ fn collect_symbol_references_walk(
             }
         }
         "member_call_expression" | "nullsafe_member_call_expression" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
+            if let Some(name_node) = node
+                .child_by_field_name("name")
+                .filter(|name| !crate::cst::is_dynamic_member_name(*name))
+            {
                 let text = &source[name_node.byte_range()];
                 let (target_fqn, receiver) = resolved_instance_member_reference(
                     tree,
@@ -470,36 +482,37 @@ fn collect_symbol_references_walk(
             }
         }
         "class_constant_access_expression" => {
-            if let (Some(scope_node), Some(name_node)) = (node.named_child(0), node.named_child(1))
-            {
+            if let Some((scope_node, name_node)) = crate::cst::class_constant_parts(node) {
                 push_class_reference(scope_node, source, file_symbols, references);
-                let text = &source[name_node.byte_range()];
-                let scope_fqn = scoped_member_reference_class_from_scope(
-                    scope_node,
-                    node,
-                    source,
-                    file_symbols,
-                );
-                let (target, receiver) = if let Some(scope_fqn) = scope_fqn {
-                    (
-                        format!("{}::{}", scope_fqn, text),
-                        SymbolReferenceReceiver::StaticClass {
-                            class_fqn: scope_fqn,
+                if !crate::cst::is_dynamic_member_name(name_node) {
+                    let text = &source[name_node.byte_range()];
+                    let scope_fqn = scoped_member_reference_class_from_scope(
+                        scope_node,
+                        node,
+                        source,
+                        file_symbols,
+                    );
+                    let (target, receiver) = if let Some(scope_fqn) = scope_fqn {
+                        (
+                            format!("{}::{}", scope_fqn, text),
+                            SymbolReferenceReceiver::StaticClass {
+                                class_fqn: scope_fqn,
+                            },
+                        )
+                    } else {
+                        (format!("::{}", text), SymbolReferenceReceiver::Unresolved)
+                    };
+                    push_symbol_reference(
+                        references,
+                        target,
+                        PhpSymbolKind::ClassConstant,
+                        reference_range(source, name_node),
+                        CollectedReferenceOptions {
+                            receiver,
+                            ..Default::default()
                         },
-                    )
-                } else {
-                    (format!("::{}", text), SymbolReferenceReceiver::Unresolved)
-                };
-                push_symbol_reference(
-                    references,
-                    target,
-                    PhpSymbolKind::ClassConstant,
-                    reference_range(source, name_node),
-                    CollectedReferenceOptions {
-                        receiver,
-                        ..Default::default()
-                    },
-                );
+                    );
+                }
             }
         }
         "function_call_expression" => {
@@ -528,7 +541,7 @@ fn collect_symbol_references_walk(
                 );
             }
         }
-        "named_type" | "base_clause" | "class_interface_clause" => {
+        "named_type" | "base_clause" | "class_interface_clause" | "attribute" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 if child.kind() == "name" || child.kind() == "qualified_name" {
@@ -737,37 +750,10 @@ fn push_constant_reference_if_plain_name(
     file_symbols: &FileSymbols,
     references: &mut Vec<SymbolReference>,
 ) {
-    if namespace_relative_function_call(node, source).is_some() {
+    if !crate::cst::is_constant_reference(node) {
         return;
     }
-    let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
-    if matches!(
-        parent_kind,
-        "function_call_expression"
-            | "object_creation_expression"
-            | "class_declaration"
-            | "interface_declaration"
-            | "trait_declaration"
-            | "enum_declaration"
-            | "function_definition"
-            | "named_type"
-            | "qualified_name"
-            | "namespace_name"
-            | "use_declaration"
-            | "namespace_use_clause"
-            | "scoped_call_expression"
-            | "scoped_property_access_expression"
-            | "class_constant_access_expression"
-            | "member_access_expression"
-            | "member_call_expression"
-    ) {
-        return;
-    }
-
     let text = &source[node.byte_range()];
-    if is_builtin_or_relative_class_name(text) {
-        return;
-    }
     push_symbol_reference(
         references,
         resolve_constant_name_to_fqn(text, file_symbols),
@@ -1273,7 +1259,10 @@ fn walk_for_member_refs(
         "member_access_expression" | "nullsafe_member_access_expression" => {
             if target_kind != PhpSymbolKind::Property {
                 // Method targets must not match property-access syntax.
-            } else if let Some(name_node) = node.child_by_field_name("name") {
+            } else if let Some(name_node) = node
+                .child_by_field_name("name")
+                .filter(|name| !crate::cst::is_dynamic_member_name(*name))
+            {
                 let text = &source[name_node.byte_range()];
                 if member_reference_name_matches(text, member_name, target_kind) {
                     let start = name_node.start_position();
@@ -1294,7 +1283,10 @@ fn walk_for_member_refs(
         "member_call_expression" | "nullsafe_member_call_expression" => {
             if target_kind != PhpSymbolKind::Method {
                 // Property targets should not match method calls with the same short name.
-            } else if let Some(name_node) = node.child_by_field_name("name") {
+            } else if let Some(name_node) = node
+                .child_by_field_name("name")
+                .filter(|name| !crate::cst::is_dynamic_member_name(*name))
+            {
                 let text = &source[name_node.byte_range()];
                 if member_reference_name_matches(text, member_name, target_kind) {
                     let start = name_node.start_position();
@@ -1315,7 +1307,10 @@ fn walk_for_member_refs(
         "scoped_call_expression" => {
             if target_kind != PhpSymbolKind::Method {
                 // Constant/property targets should not match scoped method calls.
-            } else if let Some(name_node) = node.child_by_field_name("name") {
+            } else if let Some(name_node) = node
+                .child_by_field_name("name")
+                .filter(|name| !crate::cst::is_dynamic_member_name(*name))
+            {
                 let text = &source[name_node.byte_range()];
                 if member_reference_name_matches(text, member_name, target_kind) {
                     // For scoped access, also check that the scope resolves to the right class
@@ -1347,7 +1342,10 @@ fn walk_for_member_refs(
 
         // ClassName::$prop or ClassName::CONST
         "scoped_property_access_expression" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
+            if let Some(name_node) = node
+                .child_by_field_name("name")
+                .filter(|name| !crate::cst::is_dynamic_member_name(*name))
+            {
                 let text = &source[name_node.byte_range()];
                 let syntax_matches_target = match target_kind {
                     PhpSymbolKind::Property => text.starts_with('$'),
@@ -1393,8 +1391,8 @@ fn walk_for_member_refs(
                 PhpSymbolKind::ClassConstant | PhpSymbolKind::EnumCase
             ) {
                 // Method/property targets should not match class constant access.
-            } else if let (Some(scope_node), Some(name_node)) =
-                (node.named_child(0), node.named_child(1))
+            } else if let Some((scope_node, name_node)) = crate::cst::class_constant_parts(node)
+                .filter(|(_, name)| !crate::cst::is_dynamic_member_name(*name))
             {
                 let text = &source[name_node.byte_range()];
                 if member_reference_name_matches(text, member_name, target_kind) {
@@ -1492,49 +1490,22 @@ fn walk_for_constant_refs(
         file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
     let file_symbols = scoped_file_symbols.as_ref();
 
-    // Constants appear as "name" nodes that are not function calls, class names, etc.
-    if node.kind() == "name" || node.kind() == "qualified_name" {
-        let parent = node.parent();
-        let parent_kind = parent.map(|p| p.kind()).unwrap_or("");
-
-        // Skip nodes that are part of other constructs
-        if parent_kind != "function_call_expression"
-            && parent_kind != "object_creation_expression"
-            && parent_kind != "class_declaration"
-            && parent_kind != "interface_declaration"
-            && parent_kind != "trait_declaration"
-            && parent_kind != "enum_declaration"
-            && parent_kind != "function_definition"
-            && parent_kind != "named_type"
-            && parent_kind != "qualified_name"
-            && parent_kind != "namespace_name"
-            && parent_kind != "use_declaration"
-            && parent_kind != "namespace_use_clause"
-        {
-            let text = &source[node.byte_range()];
-            // Try resolving as constant
-            let resolved = resolve_constant_name_to_fqn(text, file_symbols);
-            if resolved_name_matches_target(
-                &resolved,
-                target_fqn,
-                PhpSymbolKind::GlobalConstant,
-                unqualified_name_allows_global_fallback(text, UseKind::Constant, file_symbols)
-                    && !file_symbols.symbols.iter().any(|symbol| {
-                        symbol.kind == PhpSymbolKind::GlobalConstant
-                            && symbol_fqn_eq(&symbol.fqn, &resolved, PhpSymbolKind::GlobalConstant)
-                    }),
-            ) {
-                let start = node.start_position();
-                let end = node.end_position();
-                results.push(ReferenceLocation {
-                    range: (
-                        start.row as u32,
-                        start.column as u32,
-                        end.row as u32,
-                        end.column as u32,
-                    ),
-                });
-            }
+    if crate::cst::is_constant_reference(node) {
+        let text = &source[node.byte_range()];
+        let resolved = resolve_constant_name_to_fqn(text, file_symbols);
+        if resolved_name_matches_target(
+            &resolved,
+            target_fqn,
+            PhpSymbolKind::GlobalConstant,
+            unqualified_name_allows_global_fallback(text, UseKind::Constant, file_symbols)
+                && !file_symbols.symbols.iter().any(|symbol| {
+                    symbol.kind == PhpSymbolKind::GlobalConstant
+                        && symbol_fqn_eq(&symbol.fqn, &resolved, PhpSymbolKind::GlobalConstant)
+                }),
+        ) {
+            results.push(ReferenceLocation {
+                range: node_range(node),
+            });
         }
     }
 
@@ -1604,3 +1575,7 @@ fn binding_component_has_global_declaration(scope: Node, source: &str, var_name:
 #[cfg(test)]
 #[path = "references_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "constant_reference_tests.rs"]
+mod constant_reference_tests;

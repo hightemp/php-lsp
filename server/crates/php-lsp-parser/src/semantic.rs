@@ -799,6 +799,9 @@ fn import_name_is_used(
             return false;
         }
         let first = first_name_segment(text);
+        if import_kind == UseKind::Constant && !crate::cst::is_constant_reference(node) {
+            return false;
+        }
         if if matches!(import_kind, UseKind::Class | UseKind::Function) {
             first.eq_ignore_ascii_case(imported_name)
         } else {
