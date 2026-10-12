@@ -24,6 +24,10 @@ mod variable_scope_tests;
 #[path = "conditional_type_tests.rs"]
 mod conditional_type_tests;
 
+#[cfg(test)]
+#[path = "foreach_binding_tests.rs"]
+mod foreach_binding_tests;
+
 const DECLARATION_SCOPE_END_HINT_MIN_LINES: u32 = 2;
 const LARGE_SCOPE_END_HINT_MIN_LINES: u32 = 8;
 const CONTROL_SCOPE_END_HINT_MAX_CHARS: usize = 96;
@@ -983,6 +987,7 @@ pub(in crate::server) fn enclosing_foreach_statement_for_variable<'tree>(
             && variable_node.start_byte() >= node.start_byte()
             && variable_node.end_byte() <= node.end_byte()
             && foreach_value_variable_node_for_inlay(node, source)
+                .filter(|value_node| value_node.start_byte() <= variable_node.start_byte())
                 .and_then(|value_node| variable_text_for_node(source, value_node))
                 .as_deref()
                 == Some(variable_name.as_str())
@@ -1009,9 +1014,7 @@ pub(in crate::server) fn enclosing_foreach_statement_for_variable<'tree>(
 pub(in crate::server) fn foreach_iterable_node_for_inlay(
     statement: tree_sitter::Node,
 ) -> Option<tree_sitter::Node> {
-    (statement.kind() == "foreach_statement")
-        .then(|| statement.named_child(0))
-        .flatten()
+    php_lsp_parser::resolve::foreach_iterable_node(statement)
 }
 
 pub(in crate::server) fn server_member_access_expression_type_info(
@@ -1503,6 +1506,15 @@ pub(in crate::server) fn server_expression_type_info(
     ctx: &InlayHintContext<'_>,
     expression: tree_sitter::Node,
 ) -> Option<IndexedExpressionTypeInfo> {
+    php_lsp_parser::resolve::within_type_resolution_budget(|| {
+        server_expression_type_info_inner(ctx, expression)
+    })
+}
+
+fn server_expression_type_info_inner(
+    ctx: &InlayHintContext<'_>,
+    expression: tree_sitter::Node,
+) -> Option<IndexedExpressionTypeInfo> {
     let expression = normalized_expression_node(expression);
     match expression.kind() {
         "object_creation_expression" => {
@@ -1542,6 +1554,15 @@ pub(in crate::server) fn server_expression_type_info(
 }
 
 pub(in crate::server) fn server_variable_type_info(
+    ctx: &InlayHintContext<'_>,
+    variable_node: tree_sitter::Node,
+) -> Option<IndexedExpressionTypeInfo> {
+    php_lsp_parser::resolve::within_type_resolution_budget(|| {
+        server_variable_type_info_inner(ctx, variable_node)
+    })
+}
+
+fn server_variable_type_info_inner(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
 ) -> Option<IndexedExpressionTypeInfo> {
@@ -3123,10 +3144,14 @@ pub(in crate::server) fn foreach_value_variable_node_for_inlay<'tree>(
     statement: tree_sitter::Node<'tree>,
     source: &str,
 ) -> Option<tree_sitter::Node<'tree>> {
-    let value_expr = match statement.named_child(1)? {
+    let value_expr = match php_lsp_parser::variable_scope::foreach_binding_target(statement)? {
         pair if pair.kind() == "pair" => {
-            let count = pair.named_child_count();
-            pair.named_child(count.saturating_sub(1))?
+            let mut cursor = pair.walk();
+            let value = pair
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra())
+                .last();
+            value?
         }
         value => value,
     };

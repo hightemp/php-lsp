@@ -38,8 +38,15 @@ type/reference resolution (schema 30; 2026-10-09), lexical variable/capture
 binding (schema 31; 2026-10-09), constant-expression roles
 (schema 32; 2026-10-09), conditional PHPDoc specialization
 (schema 33; 2026-10-09), proven instanceof guard binding
-(schema 34; 2026-10-09), or exact shape-key binding
-(current schema 35; 2026-10-12).
+(schema 34; 2026-10-09), exact shape-key binding (schema 35; 2026-10-12),
+or bounded foreach/receiver inference (current schema 36; 2026-10-12).
+
+A separate real-project incident profile (2026-10-12) verifies schema 36 on
+4160 indexed files with one CPU: ready in 39.13s cold and 2.19s warm, with all
+4160 files loaded from cache on the second run. See
+[the incident evidence](production-baseline.md#indexing-receiver-inference-incident-2026-10-12).
+This smaller constrained run does not refresh the historical 10k-workspace
+performance or interactive-latency baseline.
 
 ## Latest Performance Acceptance Snapshot
 

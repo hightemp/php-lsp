@@ -349,7 +349,7 @@ Result: the primary large workspace meets the warm-start target `< 5s`
 (`3423.19 ms` to `phase=ready`) from disk cache. Latency and heavy-request
 acceptance are tracked separately by `PV-003` and `PV-004`.
 
-These are historical measurements. Warm-start time has not been remeasured
+These are historical measurements. These large-workspace scenarios have not been remeasured
 after source-provenance checks (schema 26; 2026-09-25), call-site metadata
 (schema 27; 2026-10-07), exact PHPDoc owner ranges (schema 28; 2026-10-08),
 native/PHPDoc type provenance (schema 29; 2026-10-08), qualified
@@ -357,8 +357,8 @@ type/reference resolution (schema 30; 2026-10-09), lexical variable/capture
 binding (schema 31; 2026-10-09), constant-expression roles
 (schema 32; 2026-10-09), conditional PHPDoc specialization
 (schema 33; 2026-10-09), proven instanceof guard binding
-(schema 34; 2026-10-09), or exact shape-key binding
-(schema 35; 2026-10-12).
+(schema 34; 2026-10-09), exact shape-key binding (schema 35; 2026-10-12),
+or bounded foreach/receiver inference (schema 36; 2026-10-12).
 
 ### Large Workspace Latency
 
@@ -505,3 +505,44 @@ Notes:
   dependency policy requires a clean audit.
 - Interactive VS Code UI dogfood checks for status popup and command palette
   behavior still require a GUI session.
+
+## Indexing Receiver-Inference Incident (2026-10-12)
+
+The installed Linux server stalled near 99% while three indexing threads
+consumed CPU. Matching installed/release Build IDs and live debugger stacks
+located the work in reference collection's variable/foreach type inference.
+The former depth limit did not bound repeated scans and branching fallbacks.
+Foreach helpers also treated a reused variable in the iterable as the newly
+bound value; server inference had the same cycle without a shared guard.
+Comment-sensitive positional child lookup was corrected using the actual
+`as` token and non-extra nodes.
+
+The fixed host release was profiled against the same local `bdpn-ui/app`
+with the previously open `PortingProcessWorkflowService.php`. Both runs used
+`scripts/profile-workspace.py`, `client/stubs` and one isolated XDG cache.
+They ran sequentially on one CPU with nice15 and MemoryHigh2G/MemoryMax3G/
+MemorySwapMax1G. The project was read-only and the installed VS Code process
+was not replaced or restarted.
+
+| Measurement | Cold | Warm |
+|---|---:|---:|
+| Indexed files / symbols | 4160 / 32804 | 4160 / 32804 |
+| Stub files | 539 | 539 |
+| Workspace files loaded from cache | 0 | 4160 |
+| Process start to ready | 39128.70 ms | 2186.51 ms |
+| Server indexing elapsed | 33862 ms | 1555 ms |
+| First diagnostic publication after open | 267.21 ms | 295.51 ms |
+| Peak RSS | 758059008 bytes | 762748928 bytes |
+| Indexing errors / traversal truncation | 0 / false | 0 / false |
+
+Artifacts: `server/target/indexing-hang-2026-10-12/profile/bdpn-inference-{cold,warm}.json`.
+The unstripped host binary has SHA256
+`09f706fc479ff72513cbc6d70717cbf048d047bf2416ff3c523d86e8f62396d2`
+and Build ID `6489ffa261e94bec8873aae524a9f76a7198e3b8`.
+Cache schema 36 rebuilds receiver references affected by binding and
+conservative inference exhaustion. The internal operation budgets are
+documented in `architecture.md`.
+
+This verifies completion for this project, including warm cache replay. It
+does not refresh the historical 10k-workspace timing, measure editor request
+latency under load, or prove every PHP source has bounded helper cost.

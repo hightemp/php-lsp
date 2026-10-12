@@ -40,8 +40,15 @@ mod guard_tests;
 #[path = "resolve_shape_key_tests.rs"]
 mod shape_key_tests;
 
+#[cfg(test)]
+#[path = "resolve_foreach_recursion_tests.rs"]
+mod foreach_recursion_tests;
+
 #[path = "resolve_guards.rs"]
 mod guards;
+
+#[path = "resolve_budget.rs"]
+pub(crate) mod budget;
 
 pub use guards::exiting_then_before_usage;
 
@@ -51,6 +58,8 @@ mod composite_tests;
 
 thread_local! {
     static OBJECT_TYPE_RESOLVE_DEPTH: Cell<usize> = const { Cell::new(0) };
+    #[cfg(test)]
+    static TYPE_RESOLUTION_TEST_ENTRIES: Cell<usize> = const { Cell::new(0) };
 }
 
 struct ObjectTypeResolveDepthGuard {
@@ -59,9 +68,18 @@ struct ObjectTypeResolveDepthGuard {
 
 impl ObjectTypeResolveDepthGuard {
     fn enter() -> Option<Self> {
+        #[cfg(test)]
+        TYPE_RESOLUTION_TEST_ENTRIES.with(|entries| entries.set(entries.get() + 1));
         OBJECT_TYPE_RESOLVE_DEPTH.with(|depth| {
             let previous = depth.get();
+            if previous == 0 {
+                budget::begin();
+            }
+            if !budget::consume() {
+                return None;
+            }
             if previous >= MAX_OBJECT_TYPE_RESOLVE_DEPTH {
+                budget::exhaust();
                 return None;
             }
 
@@ -77,10 +95,10 @@ impl Drop for ObjectTypeResolveDepthGuard {
     }
 }
 
-/// Share the existing synchronous type-resolution depth budget across consumers.
+/// Share synchronous inference depth/work limits across parser and server helpers.
 pub fn within_type_resolution_budget<T>(resolve: impl FnOnce() -> Option<T>) -> Option<T> {
     let _depth = ObjectTypeResolveDepthGuard::enter()?;
-    resolve()
+    budget::completed(resolve())
 }
 
 /// Callback for resolving a member's type from an external source (e.g., workspace index).
@@ -1477,14 +1495,14 @@ pub(crate) fn try_resolve_object_type<'a>(
     function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<String> {
     let _depth_guard = ObjectTypeResolveDepthGuard::enter()?;
-    try_resolve_object_type_inner(
+    budget::completed(try_resolve_object_type_inner(
         object_node,
         source,
         file_symbols,
         resolver,
         callable_resolver,
         function_resolver,
-    )
+    ))
 }
 
 fn try_resolve_object_type_inner<'a>(
@@ -2023,6 +2041,9 @@ fn find_variable_inference_before_usage(
     let mut inferred: Option<(usize, VariableInference)> = None;
 
     for i in 0..body.named_child_count() {
+        if !budget::consume() {
+            return None;
+        }
         let stmt = match body.named_child(i) {
             Some(s) => s,
             None => continue,
@@ -2213,6 +2234,9 @@ fn find_nested_variable_inference_before_usage(
         .flatten();
 
     for i in 0..node.named_child_count() {
+        if !budget::consume() {
+            return None;
+        }
         let child = match node.named_child(i) {
             Some(child) => child,
             None => continue,
@@ -2878,6 +2902,27 @@ fn infer_variable_in_scope(
     let Some(_depth) = ObjectTypeResolveDepthGuard::enter() else {
         return VariableInference::default();
     };
+    budget::completed(Some(infer_variable_in_scope_inner(
+        scope_node,
+        var_name,
+        usage_start,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )))
+    .unwrap_or_default()
+}
+
+fn infer_variable_in_scope_inner(
+    scope_node: Node,
+    var_name: &str,
+    usage_start: usize,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> VariableInference {
     let mut inferred = crate::variable_scope::captured_parent(scope_node, source, var_name)
         .filter(|_| !crate::variable_scope::capture_is_by_reference(scope_node, var_name, source))
         .map(|(parent, before)| {
@@ -5149,6 +5194,24 @@ pub fn infer_expression_type_info_with_function_resolver(
     function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
     let _depth = ObjectTypeResolveDepthGuard::enter()?;
+    budget::completed(infer_expression_type_info_inner(
+        node,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        function_resolver,
+    ))
+}
+
+fn infer_expression_type_info_inner(
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    function_resolver: Option<FunctionTypeResolver<'_>>,
+) -> Option<TypeInfo> {
     if let Some(class_string) = class_string_type_info_from_expression(node, source, file_symbols) {
         return Some(class_string);
     }
@@ -5952,10 +6015,14 @@ fn foreach_variable_inference(
         return None;
     }
 
-    let key_node = foreach_key_variable_node(stmt, source)
-        .filter(|key_node| normalize_var_name(&source[key_node.byte_range()]) == var_name);
-    let value_node = foreach_value_variable_node(stmt, source)
-        .filter(|value_node| normalize_var_name(&source[value_node.byte_range()]) == var_name);
+    let key_node = foreach_key_variable_node(stmt, source).filter(|key_node| {
+        key_node.start_byte() <= usage_start
+            && normalize_var_name(&source[key_node.byte_range()]) == var_name
+    });
+    let value_node = foreach_value_variable_node(stmt, source).filter(|value_node| {
+        value_node.start_byte() <= usage_start
+            && normalize_var_name(&source[value_node.byte_range()]) == var_name
+    });
     if key_node.is_none() && value_node.is_none() {
         return None;
     }
@@ -5986,15 +6053,26 @@ fn foreach_variable_inference(
     })
 }
 
-fn foreach_iterable_node(stmt: Node) -> Option<Node> {
-    stmt.named_child(0)
+pub fn foreach_iterable_node(stmt: Node) -> Option<Node> {
+    if stmt.kind() != "foreach_statement" {
+        return None;
+    }
+    let mut cursor = stmt.walk();
+    let iterable = stmt
+        .named_children(&mut cursor)
+        .find(|child| !child.is_extra());
+    iterable.filter(|child| !child.is_error() && !child.is_missing())
 }
 
 fn foreach_value_variable_node<'a>(stmt: Node<'a>, source: &str) -> Option<Node<'a>> {
-    let value_expr = match stmt.named_child(1)? {
+    let value_expr = match crate::variable_scope::foreach_binding_target(stmt)? {
         pair if pair.kind() == "pair" => {
-            let count = pair.named_child_count();
-            pair.named_child(count.saturating_sub(1))?
+            let mut cursor = pair.walk();
+            let value = pair
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra())
+                .last();
+            value?
         }
         value => value,
     };
@@ -6002,11 +6080,15 @@ fn foreach_value_variable_node<'a>(stmt: Node<'a>, source: &str) -> Option<Node<
 }
 
 fn foreach_key_variable_node<'a>(stmt: Node<'a>, source: &str) -> Option<Node<'a>> {
-    let pair = stmt.named_child(1)?;
+    let pair = crate::variable_scope::foreach_binding_target(stmt)?;
     if pair.kind() != "pair" {
         return None;
     }
-    variable_node_in_foreach_part(pair.named_child(0)?, source)
+    let mut cursor = pair.walk();
+    let key = pair
+        .named_children(&mut cursor)
+        .find(|child| !child.is_extra())?;
+    variable_node_in_foreach_part(key, source)
 }
 
 fn variable_node_in_foreach_part<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {

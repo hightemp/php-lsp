@@ -6534,3 +6534,22 @@ change.
   - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; one CPU, nice15, MemoryHigh2G/MemoryMax3G/MemorySwapMax1G transient scopes. No remote actions, new settings or unrelated cache migration.
   - Implemented: README, architecture, LSP behavior and coverage matrix updated; audit implementation appended without rewriting the original finding. Matrix62 rows/145 valid local links; historical measurements unchanged.
   - Validation: full sequential Rust1666/1666 across53 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Original audit/prior journal bytes,145 matrix links,31-test count and new-file whitespace verified. Reused gpt-6-sol Verifier returned final GO for source, tests, documentation and logs after repeated reviews/fixes; task completed.
+
+### Milestone: INDEX-INFERENCE-HANG-2026-10-12 live VS Code indexing stall (2026-10-12 -> 2026-10-12)
+
+**Статус:** complete *(done 2026-10-12)*
+**Цель:** Reproduce and fix CPU-bound recursive type inference that leaves workspace indexing at 99%, using live stack evidence and bounded TDD checks.
+
+#### Задачи
+
+- [x] **IIH-001-2026-10-12** Capture local process/log evidence and add bounded RED regressions for recursive foreach receiver inference without stressing the desktop. *(done 2026-10-12)*
+  - Implemented: matched installed Build ID and sudo gdb stacks; bounded RED foreach member receiver expanded376 times and a seven-member chain111970 times at depth16. Follow-up RED exposed schema35 cache acceptance, non-sticky depth exhaustion and server foreach lookup covering its own iterable. LSP regression also reproduced a server inference stack overflow.
+  - Validation: evidence in ignored server/target/indexing-hang-2026-10-12/. Real Doctrine file parses in about10ms but old reference collection exceeded8s; initial budget replay completes in1.4s in debug. Final release workspace replay remains in IIH-002.
+- [x] **IIH-002-2026-10-12** Fix inference binding/recursion boundaries, preserve supported member targets and symlinks, and verify the affected real workspace read-only. *(done 2026-10-12)*
+  - Implemented: binding positions and comment-safe foreach targets; shared parser/server inference depth/work budgets and per-file reference budget with conservative sticky exhaustion, RAII cleanup and thread isolation. Cache schema36 rejects old receivers. Symlink traversal/watch behavior is unchanged.
+  - Validation: 19 regressions across parser16, server1, LSP1 and cache1. Parser550/550 and focused server/LSP pass; real host release profiles4160 files/32804 symbols/539 stubs, no indexing errors or truncation. One CPU cold ready39128.70ms; warm ready2186.51ms with4160 cache hits. Isolated cache only; installed VS Code process untouched. Full final gates are in IIH-003.
+- [x] **IIH-003-2026-10-12** Run focused/full sequential Rust gates, repeated gpt-6-sol Verifier review, document evidence and complete the task. *(done 2026-10-12)*
+  - Evidence: installed binary build ID matches the current host release; live PID2948044 has three 100% CPU indexing workers. sudo gdb snapshots show collect_symbol_references_in_file -> foreach/variable inference recursion. Logs/stacks are in ignored server/target/indexing-hang-2026-10-12/. No restart or project/server changes performed.
+  - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; one CPU, nice15 and transient MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scopes. Preserve all prior audit/journal content.
+  - Implemented: README, architecture, performance/baseline evidence and coverage matrix updated; original audit and prior journal retained. Matrix63 rows/150 valid local links. Historical coverage and 10k-workspace/latency samples remain unchanged.
+  - Validation: final full Rust1685/1685 across54 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Repeated read-only gpt-6-sol Verifier review returned final GO after checking source,19 regressions, release hash, full gates and real cold/warm profiles. Validated binary is ready; installation/restart of the user's existing VS Code server is a separate unperformed action.

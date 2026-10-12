@@ -3,7 +3,7 @@
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
 P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
-and P2-29/P2-30/P2-31 (2026-10-12).
+and P2-29/P2-30/P2-31 plus bounded inference (2026-10-12).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -67,7 +67,8 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Blade virtual PHP | hover/completion/diagnostics/source ranges | T | B | B | [template protocol tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
 | Twig virtual PHP and context | controller → caller → partial; open/change/delete/rename | T | B | B | [Twig context protocol tests](../server/crates/php-lsp-server/tests/e2e_twig_context.rs), [template tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
 | Twig context cache | cold/warm, overlays, dependency changes, cancellation | T | B | B | [Twig context unit tests](../server/crates/php-lsp-server/src/indexing/twig_context_tests.rs), [regressions](../server/crates/php-lsp-server/src/indexing/twig_context_regression_tests.rs). |
-| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); warm-start timing after schema 35 is unmeasured. |
+| Bounded receiver inference | reused foreach bindings and comments, unknown member chains, depth/work/file exhaustion, partial types, unwind and thread isolation; cold/repeated indexing | T | B | B | [parser regressions](../server/crates/php-lsp-parser/src/resolve_foreach_recursion_tests.rs), [budget tests](../server/crates/php-lsp-parser/src/resolve_budget.rs), [server binding tests](../server/crates/php-lsp-server/src/lsp/foreach_binding_tests.rs), [indexing protocol test](../server/crates/php-lsp-server/tests/e2e_inference_budget.rs), [cache migration](../server/crates/php-lsp-index/src/cache_tests.rs). Controlled two-thread barriers test budget isolation; operation counts do not bound every helper's wall time. |
+| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); the historical 10k-workspace warm-start timing after schema 36 is unmeasured. |
 | Workspace index | watch create/change/delete and file operations | T | B | B | [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Workspace configuration | reconfigure parser/stubs/index, cancel old generation | T | B | B | [initialize tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [indexing tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Pre-create/pre-delete file requests | advertised no-edit response | B | B | B | Implementation is documented in [LSP features](lsp-features.md); no direct protocol regression found for either response. |

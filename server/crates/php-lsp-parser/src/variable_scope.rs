@@ -281,7 +281,8 @@ pub(crate) fn is_foreach_binding_variable(node: Node) -> bool {
     false
 }
 
-pub(crate) fn foreach_binding_target(statement: Node) -> Option<Node> {
+/// Return the foreach target after the actual `as` token, ignoring comments.
+pub fn foreach_binding_target(statement: Node) -> Option<Node> {
     let mut after_as = false;
     let mut cursor = statement.walk();
     for child in statement.children(&mut cursor) {

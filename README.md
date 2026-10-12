@@ -222,8 +222,11 @@ phpstorm-stubs support.
   type provenance (schema 29), qualified type/reference binding (schema 30),
   lexical variable/capture binding (schema 31), constant-expression roles
   (schema 32), conditional PHPDoc specialization (schema 33), proven
-  instanceof guard binding (schema 34), or exact shape-key binding
-  (current schema 35).
+  instanceof guard binding (schema 34), exact shape-key binding (schema 35),
+  or bounded foreach/receiver inference (current schema 36).
+  A smaller real-project regression profile (2026-10-12) completed 4160 files
+  on one CPU, reaching ready in 39.13s cold and 2.19s warm; see
+  [the incident profile](docs/production-baseline.md#indexing-receiver-inference-incident-2026-10-12).
   Installed-vendor first-hit behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses merge indexed
   closed-file references with ordinary open PHP snapshots, but still iterate

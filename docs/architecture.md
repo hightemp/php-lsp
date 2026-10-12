@@ -281,6 +281,21 @@ values and reference assignments are declarations; dynamic destructuring keys
 remain reads. Server hover/inlay helpers reuse the same boundaries, including
 arrow-local assignments inside expressions.
 
+Foreach key/value bindings apply from their declaration onward; an iterable
+that reuses its value's name retains the earlier receiver type. Parser and
+server share the iterable/target lookup, skipping comments and binding at the
+actual `as` token. Both inference layers share synchronous depth and work limits:
+at most 64 nested
+inference entries and 8192 charged entries/statement-scan steps per outer
+inference. Reference collection additionally shares 131072 steps per file,
+including nested collectors. Exhaustion is sticky for the active inference:
+partial earlier types are discarded and affected instance references remain
+unresolved. Declarations and directly named references still traverse normally.
+Thread-local counters contain no source/type data, reset for independent calls
+and files, and use RAII cleanup on unwind. These operation limits bound repeated
+inference expansion; they are not a wall-clock timeout or a cost bound for every
+individual helper.
+
 Local PHPDoc type inference carries the class-like owner at the variable's byte
 range, together with the active namespace/import section. Hover and foreach
 inlay links therefore resolve `self` and `static` against the containing type;
@@ -1000,9 +1015,11 @@ false global-constant occurrences and missing/mistyped attribute and dynamic
 expression references. Schema 33 invalidated conditional types parsed
 with the old precedence and references derived by guessing their first object
 branch. Schema 34 invalidated receivers inferred from the former
-text-based instanceof guard/exit heuristics. Current schema 35 invalidates
+text-based instanceof guard/exit heuristics. Schema 35 invalidated
 shape keys and receiver references derived from first-field fallback or
-lossy key normalization. These semantic changes did not
+lossy key normalization. Current schema 36 invalidates receiver references
+derived from premature foreach bindings or partial inference beyond the work
+and depth budgets. These semantic changes did not
 alter the serialized field layout.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.

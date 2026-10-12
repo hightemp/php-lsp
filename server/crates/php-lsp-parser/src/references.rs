@@ -192,6 +192,7 @@ pub fn collect_symbol_references_in_file_with_resolvers(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Vec<SymbolReference> {
+    let _inference_budget = crate::resolve::budget::FileInferenceBudget::enter();
     let mut references = Vec::new();
 
     for symbol in &file_symbols.symbols {
