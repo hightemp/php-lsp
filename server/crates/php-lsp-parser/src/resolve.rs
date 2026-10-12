@@ -8,8 +8,7 @@ use crate::cst::{argument_index, argument_name};
 use crate::phpdoc::{parse_phpdoc, strip_exact_tag};
 use crate::utf16::utf16_col_to_byte;
 use php_lsp_types::{
-    normalize_shape_key_text, symbol_fqn_eq, FileSymbols, PhpSymbolKind, Signature, SymbolInfo,
-    TypeInfo, UseKind,
+    symbol_fqn_eq, FileSymbols, PhpSymbolKind, Signature, SymbolInfo, TypeInfo, UseKind,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +35,10 @@ mod conditional_tests;
 #[cfg(test)]
 #[path = "resolve_guard_tests.rs"]
 mod guard_tests;
+
+#[cfg(test)]
+#[path = "resolve_shape_key_tests.rs"]
+mod shape_key_tests;
 
 #[path = "resolve_guards.rs"]
 mod guards;
@@ -3940,6 +3943,8 @@ pub fn is_builtin_non_object_type(name: &str) -> bool {
             | "self"
             | "static"
             | "parent"
+            | "..."
+            | "array-key"
     )
 }
 
@@ -6154,7 +6159,7 @@ pub fn iterable_value_type_info(type_info: &TypeInfo, key_text: Option<&str>) ->
         }
         TypeInfo::Simple(name) if is_plain_iterable_type_name(name) => Some(TypeInfo::Mixed),
         TypeInfo::Generic { base, args } => generic_value_type_arg(base, args).cloned(),
-        TypeInfo::ArrayShape(items) => array_shape_value_type(items, key_text).cloned(),
+        TypeInfo::ArrayShape(items) => array_shape_value_type(items, key_text),
         TypeInfo::Conditional {
             if_type, else_type, ..
         } => Some(merge_type_infos(vec![
@@ -6291,51 +6296,187 @@ fn generic_key_type_arg(base: &str, args: &[TypeInfo]) -> Option<TypeInfo> {
 }
 
 fn array_shape_key_type(items: &[php_lsp_types::ArrayShapeItem]) -> Option<TypeInfo> {
-    let mut keys = items
-        .iter()
-        .filter_map(|item| item.key.as_deref())
-        .map(|key| {
-            if key.parse::<i64>().is_ok() {
-                TypeInfo::LiteralInt(key.to_string())
-            } else {
-                TypeInfo::LiteralString(format!("'{}'", key))
-            }
-        })
-        .collect::<Vec<_>>();
-    match keys.len() {
-        0 => None,
-        1 => keys.pop(),
-        _ => Some(TypeInfo::Union(keys)),
+    if items.len() > php_lsp_types::conditional::MAX_MATCH_STEPS {
+        return None;
     }
-}
-
-fn array_shape_value_type<'a>(
-    items: &'a [php_lsp_types::ArrayShapeItem],
-    key_text: Option<&str>,
-) -> Option<&'a TypeInfo> {
-    let key = key_text.and_then(normalize_array_access_key);
-    if let Some(key) = key {
-        if let Some(item) = items.iter().find(|item| {
-            item.key
-                .as_deref()
-                .and_then(normalize_array_access_key)
-                .as_deref()
-                == Some(key.as_str())
-        }) {
-            return Some(&item.value);
+    let mut keys = Vec::new();
+    let mut domains = Vec::new();
+    let mut next = Some(0u64);
+    for item in items {
+        if let Some(key) = &item.key {
+            keys.push(
+                if let Some(integer) = php_lsp_types::canonical_shape_key_integer(key) {
+                    TypeInfo::LiteralInt(integer.to_string())
+                } else {
+                    TypeInfo::LiteralString(php_lsp_types::quote_shape_key_text(key))
+                },
+            );
+            update_shape_next_index(&mut next, key);
+        } else if is_shape_open_tail(&item.value) {
+            match &item.value {
+                TypeInfo::Generic { args, .. } if args.len() == 2 => domains.push(&args[0]),
+                _ => return Some(TypeInfo::Simple("array-key".into())),
+            }
+        } else {
+            keys.push(
+                next.map(|index| TypeInfo::LiteralInt(index.to_string()))
+                    .unwrap_or_else(|| TypeInfo::Simple("int".into())),
+            );
+            next = next.and_then(|index| index.checked_add(1));
         }
     }
-
-    items
-        .iter()
-        .find(|item| item.key.is_none())
-        .or_else(|| items.first())
-        .map(|item| &item.value)
+    let domains = php_lsp_types::conditional::try_substitute_type_list(domains, &HashMap::new())?;
+    keys.extend(domains.iter().map(array_key_compatible_type_info));
+    if keys.is_empty() {
+        return None;
+    }
+    let merged = merge_type_infos(keys);
+    if matches!(&merged,TypeInfo::Union(parts) if parts.iter().any(|ty|matches!(ty,TypeInfo::Simple(name) if name=="array-key")))
+    {
+        Some(TypeInfo::Simple("array-key".into()))
+    } else {
+        Some(merged)
+    }
 }
 
-fn normalize_array_access_key(raw: &str) -> Option<String> {
-    let trimmed = normalize_shape_key_text(raw);
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+fn update_shape_next_index(next_index: &mut Option<u64>, name: &str) {
+    if let Some(index) = php_lsp_types::canonical_shape_key_integer(name) {
+        if index >= 0 {
+            let following = index
+                .checked_add(1)
+                .and_then(|next| u64::try_from(next).ok());
+            *next_index = next_index
+                .zip(following)
+                .map(|(current, next)| current.max(next));
+        } else {
+            // Implicit indexing after negative keys is PHP-version-specific.
+            *next_index = None;
+        }
+    }
+}
+
+/// A sealed shape never supplies a neighbor's type for a failed lookup.
+fn array_shape_value_type(
+    items: &[php_lsp_types::ArrayShapeItem],
+    key_text: Option<&str>,
+) -> Option<TypeInfo> {
+    fn combined(values: Vec<&TypeInfo>) -> Option<TypeInfo> {
+        let values = php_lsp_types::conditional::try_substitute_type_list(values, &HashMap::new())?;
+        if values.is_empty() {
+            None
+        } else if values.contains(&TypeInfo::Mixed) {
+            Some(TypeInfo::Mixed)
+        } else {
+            Some(merge_type_infos(values))
+        }
+    }
+    if items.len() > php_lsp_types::conditional::MAX_MATCH_STEPS {
+        return None;
+    }
+    if key_text.is_none() {
+        return combined(
+            items
+                .iter()
+                .map(|item| shape_open_tail_value(item, None).unwrap_or(&item.value))
+                .collect(),
+        );
+    }
+    let key = normalize_array_access_key(key_text?)?;
+    let mut next_index = Some(0u64);
+    let mut exact = Vec::new();
+    let mut fallback = Vec::new();
+    for item in items {
+        if let Some(name) = &item.key {
+            // Keys in the type model are already decoded data.
+            if name == &key {
+                exact.push(&item.value);
+            }
+            update_shape_next_index(&mut next_index, name);
+        } else if is_shape_open_tail(&item.value) {
+            if let Some(value) = shape_open_tail_value(item, Some(&key)) {
+                fallback.push(value);
+            }
+        } else {
+            // An unkeyed tuple slot has its own numeric key, not every key.
+            if next_index.is_some_and(|index| index.to_string() == key) {
+                exact.push(&item.value);
+            }
+            next_index = next_index.and_then(|index| index.checked_add(1));
+        }
+    }
+    if exact.is_empty() {
+        combined(fallback)
+    } else {
+        combined(exact)
+    }
+}
+
+fn is_shape_open_tail(ty: &TypeInfo) -> bool {
+    matches!(ty,TypeInfo::Simple(name) if name=="...")
+        || matches!(ty,TypeInfo::Generic{base,..} if base=="...")
+}
+
+fn shape_open_tail_value<'a>(
+    item: &'a php_lsp_types::ArrayShapeItem,
+    key: Option<&str>,
+) -> Option<&'a TypeInfo> {
+    if item.key.is_some() {
+        return None;
+    }
+    match &item.value {
+        TypeInfo::Simple(name) if name == "..." => Some(&TypeInfo::Mixed),
+        TypeInfo::Generic { base, args } if base == "..." => {
+            if let (Some(key), [domain, _]) = (key, args.as_slice()) {
+                let actual = if let Some(value) = php_lsp_types::canonical_shape_key_integer(key) {
+                    TypeInfo::LiteralInt(value.to_string())
+                } else {
+                    TypeInfo::LiteralString(php_lsp_types::quote_shape_key_text(key))
+                };
+                if php_lsp_types::conditional::match_type_pattern(
+                    domain,
+                    &actual,
+                    &HashSet::new(),
+                    &HashMap::new(),
+                    &|_, _| None,
+                ) != php_lsp_types::conditional::PatternMatch::Yes
+                {
+                    return None;
+                }
+            }
+            match args.as_slice() {
+                [value] | [_, value] => Some(value),
+                _ => Some(&TypeInfo::Mixed),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Only a self-contained string or canonical decimal integer is a known key.
+pub fn normalize_array_access_key(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let first = *raw.as_bytes().first()?;
+    if matches!(first, b'\'' | b'"') {
+        if raw.len() < 2 || raw.as_bytes().last() != Some(&first) {
+            return None;
+        }
+        let inner = &raw[1..raw.len() - 1];
+        let mut escaped = false;
+        for byte in inner.bytes() {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == first || first == b'"' && byte == b'$' {
+                return None;
+            }
+        }
+        if escaped {
+            return None;
+        }
+        return php_lsp_types::decode_shape_key_token(raw);
+    }
+    php_lsp_types::canonical_shape_key_integer(raw).map(|integer| integer.to_string())
 }
 
 fn position_to_byte(source: &str, line: u32, character: u32) -> usize {

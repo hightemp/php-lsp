@@ -195,6 +195,27 @@ fn display_shape_key_text(key: &str) -> String {
     if shape_key_can_display_unquoted(key) {
         return key.to_string();
     }
+    quote_shape_key_text(key)
+}
+
+/// Quote decoded key data as a literal without changing escapes or control bytes.
+pub fn quote_shape_key_text(key: &str) -> String {
+    if key.chars().any(char::is_control) {
+        let mut escaped = String::new();
+        for ch in key.chars() {
+            match ch {
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '$' => escaped.push_str("\\$"),
+                ch if ch.is_control() => escaped.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+                ch => escaped.push(ch),
+            }
+        }
+        return format!("\"{escaped}\"");
+    }
 
     let escaped = key.replace('\\', "\\\\").replace('\'', "\\'");
     format!("'{escaped}'")
@@ -205,8 +226,7 @@ fn shape_key_can_display_unquoted(key: &str) -> bool {
         return false;
     }
 
-    let digits = key.strip_prefix('-').unwrap_or(key);
-    if !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()) {
+    if canonical_shape_key_integer(key).is_some() {
         return true;
     }
 
@@ -218,14 +238,120 @@ fn shape_key_can_display_unquoted(key: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-/// Normalize a PHPDoc or source array/object-shape key for lookup/comparison.
-pub fn normalize_shape_key_text(key: &str) -> String {
-    key.trim()
-        .trim_end_matches('?')
-        .trim()
-        .trim_matches(|ch| ch == '\'' || ch == '"')
-        .to_string()
+/// Canonical decimal array-key cast on the supported 64-bit targets.
+pub fn canonical_shape_key_integer(key: &str) -> Option<i64> {
+    key.parse::<i64>()
+        .ok()
+        .filter(|integer| integer.to_string() == key)
 }
+
+/// Normalize a written PHPDoc/source key token, preserving its literal content.
+/// Optional syntax is removed by the PHPDoc parser; decoded keys stay unchanged.
+pub fn normalize_shape_key_text(key: &str) -> String {
+    decode_shape_key_token(key).unwrap_or_else(|| key.trim().to_string())
+}
+
+/// Decode a written key literal without interpolation; retain unquoted PHPDoc names.
+/// Malformed literals or byte escapes that are not UTF-8 remain unresolved.
+pub fn decode_shape_key_token(key: &str) -> Option<String> {
+    let key = key.trim();
+    let bytes = key.as_bytes();
+    let Some(&quote) = bytes.first() else {
+        return Some(String::new());
+    };
+    if !matches!(quote, b'\'' | b'"') {
+        return Some(key.to_string());
+    }
+    if bytes.len() < 2 || bytes.last() != Some(&quote) {
+        return None;
+    }
+    let input = &bytes[1..bytes.len() - 1];
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        let byte = input[i];
+        i += 1;
+        if byte == quote {
+            return None;
+        }
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+        let next = *input.get(i)?;
+        i += 1;
+        if quote == b'\'' {
+            if !matches!(next, b'\'' | b'\\') {
+                out.push(b'\\');
+            }
+            out.push(next);
+            continue;
+        }
+        match next {
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(11),
+            b'e' => out.push(27),
+            b'f' => out.push(12),
+            b'\\' | b'"' | b'$' => out.push(next),
+            b'0'..=b'7' => {
+                let mut value = u16::from(next - b'0');
+                for _ in 0..2 {
+                    let Some(&digit) = input.get(i).filter(|digit| matches!(digit, b'0'..=b'7'))
+                    else {
+                        break;
+                    };
+                    value = value * 8 + u16::from(digit - b'0');
+                    i += 1;
+                }
+                out.push((value & 255) as u8);
+            }
+            b'x' => {
+                let mut value = 0u8;
+                let mut digits = 0;
+                while digits < 2 {
+                    let Some(digit) = input.get(i).and_then(|b| char::from(*b).to_digit(16)) else {
+                        break;
+                    };
+                    value = value * 16 + digit as u8;
+                    digits += 1;
+                    i += 1;
+                }
+                if digits == 0 {
+                    out.extend_from_slice(b"\\x");
+                } else {
+                    out.push(value);
+                }
+            }
+            b'u' if input.get(i) == Some(&b'{') => {
+                i += 1;
+                let start = i;
+                while input.get(i).is_some_and(u8::is_ascii_hexdigit) {
+                    i += 1;
+                }
+                if i == start || input.get(i) != Some(&b'}') {
+                    return None;
+                }
+                let code =
+                    u32::from_str_radix(std::str::from_utf8(&input[start..i]).ok()?, 16).ok()?;
+                let ch = char::from_u32(code)?;
+                let mut encoded = [0; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+                i += 1;
+            }
+            _ => {
+                out.push(b'\\');
+                out.push(next);
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+#[path = "shape_key_tests.rs"]
+mod shape_key_tests;
 
 /// Parameter information for a function/method.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

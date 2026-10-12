@@ -1973,6 +1973,45 @@ Verifier на `gpt-6-sol` завершился GO после исправлен�
 разрешать только для явного unkeyed/open item; optional marker удалять во время
 парсинга синтаксиса, а не общей нормализацией значения key.
 
+**Реализация (2026-10-12):** sealed shape больше не заимствует тип соседнего
+поля при отсутствующем или динамическом ключе. Tuple entries сопоставляются
+с числовой позицией; fallback допускается только для явного open tail
+`...` / `...<V>` / `...<K,V>` с проверкой известного key domain.
+Foreach объединяет возможные значения и ключи, включая tail domains.
+Неоднозначные и превышающие существующий type budget случаи остаются
+неразрешёнными.
+
+Optional `?` удаляется только из синтаксиса PHPDoc. Decoded keys сохраняют
+literal `?`, пустую строку, пробелы и escape semantics; повторный вывод PHPDoc
+не меняет значение ключа. Числовые строки `'01'` / `'-0'` сохраняют string
+identity. Completion deduplication и definition сравнивают точные значения,
+а source selection сохраняет исходное написание и конвертируется в UTF-16.
+Cache schema 35 перестраивает старые shape keys и receiver references.
+Публичные LSP-настройки и координация async publication не менялись.
+
+**Регрессии:** 33 новых теста (types5, parser14, server helpers5, LSP8,
+cache1): exact/missing/dynamic/nested keys, optional/literal punctuation,
+пустые и escaped keys, tuple/open-tail/foreach domains, namespace returns,
+лимиты, cache replay и отказ schema34. LSP проверяет hover/completion/
+definition/inlay, UTF-16/CRLF, unsaved/stale versions, close/reopen и
+20 конкурентных edit/definition раундов на двух Tokio workers с точной
+проверкой конечного target. Это ограниченная проверка конкурентности,
+а не доказательство всех порядков исполнения.
+
+**Проверки (2026-10-12):** RED зафиксирован до исправлений; адресные GREEN:
+types34/34, parser504/504, server helpers5/5, index114/114 и LSP8/8.
+Полный последовательный Rust-набор: 1617/1617, 51 test-result target,
+0 ignored; `CARGO_BUILD_JOBS=1` и `--test-threads=1`, один CPU,
+MemoryHigh2G/MemoryMax3G/MemorySwapMax1G.
+Clippy `--all-targets -- -D warnings`, Rustfmt и `git diff --check` прошли.
+README, architecture, LSP behavior, cache/performance caveats и coverage matrix
+актуализированы. Исходное описание аудита и прежний журнал сохранены;
+матрица содержит 60 сценариев и 139 корректных локальных ссылок.
+
+**Статус (2026-10-12):** исправлено и проверено. Повторный read-only review
+Verifier на `gpt-6-sol` завершился финальным GO по коду, тестам,
+документации и логам после исправления замечаний; milestone в TASKS.md завершён.
+
 ### CODEX-P2-30. Diagnostic pipeline повторно конвертирует UTF-16 и анализирует не тот snapshot
 
 Parser уже возвращает syntax ranges в UTF-16:

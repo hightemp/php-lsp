@@ -140,6 +140,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_qualified_types.rs` | qualified relative/absolute type targets, competing indexed classes, PHPDoc/native returns, Unicode/CRLF inlays, unsaved updates and controller-to-Twig propagation. |
 | `tests/e2e_conditional_types.rs` | conditional PHPDoc literals/subtypes, independent template bindings, declaration scope, native guarantees, exact branch definitions and versioned unsaved edits. |
 | `tests/e2e_guard_narrowing.rs` | proven boolean instanceof exit guards, exact inherited/member targets, UTF-16/CRLF, stale edits/reopen and bounded concurrent edit/definition checks. |
+| `tests/e2e_shape_keys.rs` | missing/exact/escaped shape keys, heterogeneous foreach values, namespaced return types and open tails, UTF-16/CRLF key ranges, unsaved edits/reopen and bounded concurrent edit/definition checks. |
 | `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
 | `tests/e2e_phpdoc_definition.rs` | exact PHPDoc member/owner selection, inheritance/native precedence, UTF-16/CRLF buffer edits, and Twig shape-key definitions before attributes. |
 | `tests/e2e_phpdoc_definition_stress.rs` | concurrent JSON-RPC definitions, edits, close/reopen, watched-file and full Composer reindex; exact stable disk/buffer results and progress watchdog. |
@@ -522,10 +523,24 @@ the positional API.
 
 Array-shape key completion can trigger either after `[` or inside quoted string
 keys. Completion after `[` inserts a quoted key, while completion inside an
-existing quote inserts only the key text. Parser PHPDoc shapes, completion
-items, and shape-key definition lookups all normalize quoted/optional shape keys
-through `php_lsp_types::normalize_shape_key_text(...)` so lookup and display do
-not diverge.
+existing quote inserts only the key text. Shape keys in `TypeInfo` are decoded
+data. The PHPDoc parser removes the optional marker from the written key token
+before decoding it; literal question marks, whitespace and empty keys remain
+part of the key. Shared token decoding follows single/double-quoted escape
+rules, and PHPDoc rendering quotes decoded keys without changing their value.
+Definition selection compares decoded keys while retaining their original
+source spans and converting them to UTF-16 at the LSP boundary.
+
+A known missing sealed-shape key, dynamic expression, malformed token or
+non-UTF-8 decoded key supplies no guessed field type. Unkeyed tuple entries
+have numeric positions. Only explicit open tails (`...`, `...<V>` or
+`...<K,V>`) can supply a missing static key, with typed key domains checked
+conservatively. Foreach values combine possible field and tail types; foreach
+keys include named, tuple and tail domains. Canonical decimal keys use integer
+identity on the supported 64-bit targets; strings such as `'01'` remain
+strings. Shape width and copied type depth are bounded by the existing type
+inference budget. Internal rest markers retain their meaning across namespace
+qualification.
 
 PHPDoc tag parsing treats tag names as exact tokens: analyzer-specific tags such
 as `@param-out`, malformed `@returnFoo`, and vendor-specific `@var-*` tags do
@@ -980,8 +995,10 @@ lexical variable boundaries and capture rules. Schema 32 invalidated
 false global-constant occurrences and missing/mistyped attribute and dynamic
 expression references. Schema 33 invalidated conditional types parsed
 with the old precedence and references derived by guessing their first object
-branch. Current schema 34 invalidates receivers inferred from the former
-text-based instanceof guard/exit heuristics. These semantic changes did not
+branch. Schema 34 invalidated receivers inferred from the former
+text-based instanceof guard/exit heuristics. Current schema 35 invalidates
+shape keys and receiver references derived from first-field fallback or
+lossy key normalization. These semantic changes did not
 alter the serialized field layout.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.

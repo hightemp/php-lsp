@@ -1,7 +1,10 @@
 //! Shared hover/completion/definition helpers extracted from `server.rs`.
 
 use super::super::*;
-use php_lsp_types::normalize_shape_key_text;
+
+#[cfg(test)]
+#[path = "shape_key_tests.rs"]
+mod shape_key_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum PhpDocVirtualMemberKind {
@@ -1459,7 +1462,7 @@ pub(in crate::server) fn collect_named_shape_items(
         let Some(key) = item.key.as_ref() else {
             continue;
         };
-        if seen.insert(normalize_shape_key_text(key)) {
+        if seen.insert(key.clone()) {
             out.push(item.clone());
         }
     }
@@ -1567,10 +1570,9 @@ pub(in crate::server) fn array_shape_key_access_at_position(
     if rel < key_start || rel > key_end {
         return None;
     }
-    let key = normalize_shape_key_text(&line_text[key_start..key_end]);
-    if key.is_empty() {
-        return None;
-    }
+    let key = php_lsp_parser::resolve::normalize_array_access_key(
+        line_text.get(quote_start..key_end + 1)?,
+    )?;
 
     let array_expr = extract_shape_base_expr(&line_text[..bracket])?;
     let (root_var, mut segments) = shape_array_expr_segments(&array_expr)
@@ -1720,13 +1722,11 @@ pub(in crate::server) fn shape_array_expr_segments(
         }
         let close = find_matching_pair(expr, idx, '[', ']').unwrap_or(expr.len());
         let key_text = expr[idx + 1..close].trim();
-        let key = normalize_shape_key_text(key_text);
-        if !key.is_empty() {
-            segments.push(ShapePathSegment {
-                key,
-                kind: ShapeDefinitionKind::Array,
-            });
-        }
+        let key = php_lsp_parser::resolve::normalize_array_access_key(key_text)?;
+        segments.push(ShapePathSegment {
+            key,
+            kind: ShapeDefinitionKind::Array,
+        });
         if close >= expr.len() {
             break;
         }
@@ -1862,7 +1862,7 @@ pub(in crate::server) fn find_literal_array_key_range_in_body(
     let segment = segments.first()?;
     for (item_start, item_end) in split_top_level_ranges(source, body_start, body_end, ',') {
         let arrow = find_top_level_needle(source, item_start, item_end, "=>")?;
-        let (key, key_start, key_end) = shape_key_from_raw_range(source, item_start, arrow)?;
+        let (key, key_start, key_end) = shape_key_from_raw_range(source, item_start, arrow, false)?;
         if key != segment.key {
             continue;
         }
@@ -1919,7 +1919,7 @@ pub(in crate::server) fn find_shape_key_range_in_body(
         let Some(colon) = find_top_level_char_in_range(text, item_start, item_end, ':') else {
             continue;
         };
-        let (key, key_start, key_end) = shape_key_from_raw_range(text, item_start, colon)?;
+        let (key, key_start, key_end) = shape_key_from_raw_range(text, item_start, colon, true)?;
         if key != segment.key {
             continue;
         }
@@ -1942,6 +1942,7 @@ pub(in crate::server) fn shape_key_from_raw_range(
     text: &str,
     start: usize,
     end: usize,
+    phpdoc: bool,
 ) -> Option<(String, usize, usize)> {
     let mut key_start = start;
     let mut key_end = end;
@@ -1951,12 +1952,18 @@ pub(in crate::server) fn shape_key_from_raw_range(
     while key_end > key_start && text.as_bytes()[key_end - 1].is_ascii_whitespace() {
         key_end -= 1;
     }
-    if key_end > key_start && text.as_bytes()[key_end - 1] == b'?' {
+    if phpdoc && key_end > key_start && text.as_bytes()[key_end - 1] == b'?' {
         key_end -= 1;
         while key_end > key_start && text.as_bytes()[key_end - 1].is_ascii_whitespace() {
             key_end -= 1;
         }
     }
+    let token = &text[key_start..key_end];
+    let key = if phpdoc {
+        php_lsp_types::decode_shape_key_token(token)?
+    } else {
+        php_lsp_parser::resolve::normalize_array_access_key(token)?
+    };
     if key_end > key_start + 1 {
         let first = text.as_bytes()[key_start];
         let last = text.as_bytes()[key_end - 1];
@@ -1965,8 +1972,7 @@ pub(in crate::server) fn shape_key_from_raw_range(
             key_end -= 1;
         }
     }
-    let key = normalize_shape_key_text(&text[key_start..key_end]);
-    (!key.is_empty()).then_some((key, key_start, key_end))
+    Some((key, key_start, key_end))
 }
 
 pub(in crate::server) fn split_top_level_ranges(
@@ -2536,7 +2542,7 @@ pub(in crate::server) fn type_info_resolved_text_from_index(
             if name.is_empty() {
                 return None;
             }
-            if is_builtin_type_name(name) {
+            if is_builtin_type_name(name) || matches!(name, "..." | "array-key") {
                 return Some(name.trim_start_matches('\\').to_string());
             }
             Some(resolved_type_text_from_index(index, owner_fqn, uri, name))
@@ -2546,7 +2552,7 @@ pub(in crate::server) fn type_info_resolved_text_from_index(
             if base.is_empty() {
                 return None;
             }
-            let base_text = if is_builtin_type_name(base) {
+            let base_text = if is_builtin_type_name(base) || matches!(base, "..." | "array-key") {
                 base.trim_start_matches('\\').to_string()
             } else {
                 resolved_type_text_from_index(index, owner_fqn, uri, base)

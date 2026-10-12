@@ -619,7 +619,7 @@ fn collect_literal_array_shape_definitions(
         if let Some(arrow) = find_top_level_double_arrow(ctx.source, span.0, span.1) {
             let value_range = trim_source_range(ctx.source, arrow + 2, span.1);
             let Some((key, key_start, key_end)) =
-                shape_key_from_raw_range(ctx.source, span.0, arrow)
+                shape_key_from_raw_range(ctx.source, span.0, arrow, false)
             else {
                 continue;
             };
@@ -938,10 +938,7 @@ fn collect_shape_items_definition_requests(
         let Some(key) = item.key.as_deref() else {
             continue;
         };
-        let key = php_lsp_types::normalize_shape_key_text(key);
-        if key.is_empty() {
-            continue;
-        }
+        let key = key.to_string();
         let mut path = path_prefix.to_vec();
         path.push(key.clone());
         let mut segments = segment_prefix.to_vec();
@@ -1324,7 +1321,7 @@ fn infer_twig_context_literal_array_type_info(
                 )
                 .unwrap_or(php_lsp_types::TypeInfo::Mixed);
                 shape_items.push(php_lsp_types::ArrayShapeItem {
-                    key: Some(php_lsp_types::normalize_shape_key_text(&key)),
+                    key: Some(key),
                     optional: false,
                     value,
                 });
@@ -2527,7 +2524,7 @@ fn symfony_form_fields_from_source(source: &str, range: (usize, usize)) -> Vec<S
             let first_arg = trim_source_range(source, first_arg.0, first_arg.1);
             if php_string_literal_value_at_range(source, first_arg.0, first_arg.1).is_some() {
                 if let Some((name, key_start, key_end)) =
-                    shape_key_from_raw_range(source, first_arg.0, first_arg.1)
+                    shape_key_from_raw_range(source, first_arg.0, first_arg.1, false)
                 {
                     if !name.is_empty() && !fields.iter().any(|field| field.name == name) {
                         fields.push(SymfonyFormField {

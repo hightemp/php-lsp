@@ -37,8 +37,9 @@ metadata (schema 27; 2026-10-07), exact PHPDoc owner ranges (schema 28;
 type/reference resolution (schema 30; 2026-10-09), lexical variable/capture
 binding (schema 31; 2026-10-09), constant-expression roles
 (schema 32; 2026-10-09), conditional PHPDoc specialization
-(schema 33; 2026-10-09), or proven instanceof guard binding
-(current schema 34; 2026-10-09).
+(schema 33; 2026-10-09), proven instanceof guard binding
+(schema 34; 2026-10-09), or exact shape-key binding
+(current schema 35; 2026-10-12).
 
 ## Latest Performance Acceptance Snapshot
 

@@ -50,7 +50,9 @@ phpstorm-stubs support.
   literal subtype checks and declared template bindings preserve both possible
   results when the condition cannot be proven.
 - Shape-aware inference for PHPDoc `array{...}` / `object{...}` and literal
-  array shapes in completion and key navigation.
+  array shapes in completion and key navigation. Missing or unresolved array
+  keys do not borrow a neighboring field's type; quoted keys preserve literal
+  punctuation and escapes.
 - Closure and arrow-function parameter inference from `callable(...)`
   signatures, including generic map/filter-style collection callbacks and
   `array_map`-style helpers.
@@ -217,8 +219,9 @@ phpstorm-stubs support.
   metadata (schema 27), exact PHPDoc owner ranges (schema 28), native/PHPDoc
   type provenance (schema 29), qualified type/reference binding (schema 30),
   lexical variable/capture binding (schema 31), constant-expression roles
-  (schema 32), conditional PHPDoc specialization (schema 33), or proven
-  instanceof guard binding (current schema 34).
+  (schema 32), conditional PHPDoc specialization (schema 33), proven
+  instanceof guard binding (schema 34), or exact shape-key binding
+  (current schema 35).
   Installed-vendor first-hit behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses merge indexed
   closed-file references with ordinary open PHP snapshots, but still iterate

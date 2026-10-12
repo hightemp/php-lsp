@@ -2,7 +2,8 @@
 
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
-P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), and P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09).
+P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
+and P2-29 (2026-10-12).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -37,6 +38,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Completion | incomplete member access and unsaved edit | T | B | B | [completion protocol tests](../server/crates/php-lsp-server/tests/e2e_completion.rs). |
 | Completion | lazy vendor first hit and warm repeated hit | T | B | B | [vendor metadata tests](../server/crates/php-lsp-server/tests/e2e_vendor_metadata.rs), [vendor symlink tests](../server/crates/php-lsp-server/src/indexing/vendor_symlink_tests.rs); latency budget is unmeasured. |
 | Hover and type inference | indexed, local, PHPDoc, composite receivers | T | B | B | [hover tests](../server/crates/php-lsp-server/tests/e2e_hover.rs), [composite receiver tests](../server/crates/php-lsp-server/tests/e2e_composite_receivers.rs). |
+| Shape-key identity and inference | missing/exact/dynamic/nested keys, optional syntax, escaping, tuple/open-tail/foreach domains, type budgets, cache replay, unsaved edits/reopen and concurrent definitions | T | B | B | [shared key tests](../server/crates/php-lsp-types/src/shape_key_tests.rs), [parser regressions](../server/crates/php-lsp-parser/src/resolve_shape_key_tests.rs), [key range/completion tests](../server/crates/php-lsp-server/src/lsp/shape_key_tests.rs), [cache replay](../server/crates/php-lsp-index/src/cache_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_shape_keys.rs). Twenty concurrent edit/definition rounds check coherent old/new targets and the exact final target after each edit; this is finite concurrency evidence. |
 | Qualified type resolution | relative/absolute names, namespace-root decoys, import kinds/sections, inherited/template/framework types, cache replay, document updates and Twig | T | B | B | [parser regressions](../server/crates/php-lsp-parser/src/resolve_qualified_type_tests.rs), [server regressions](../server/crates/php-lsp-server/src/lsp/qualified_type_tests.rs), [cache round-trip](../server/crates/php-lsp-index/src/cache_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_qualified_types.rs). |
 | Native/PHPDoc contracts | contradictions/refinements, aliases/templates, native generation, dependency changes, concurrent publication, cache and document versions | T | B | B | [shared type rules](../server/crates/php-lsp-types/src/type_refinement_tests.rs), [parser provenance tests](../server/crates/php-lsp-parser/src/phpdoc_native_tests.rs), [index tests](../server/crates/php-lsp-index/src/phpdoc_native_index_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs), [generation tests](../server/crates/php-lsp-server/src/lsp/code_action_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_phpdoc_native.rs). |
 | Conditional PHPDoc returns | precedence/nesting, literal and subtype relations, declared templates/receiver bindings, unknown branches, defaults/unpack, native guarantees, document updates and cache replay | T | B | B | [shared matcher tests](../server/crates/php-lsp-types/src/conditional_tests.rs), [PHPDoc parser tests](../server/crates/php-lsp-parser/src/phpdoc_conditional_tests.rs), [parser inference tests](../server/crates/php-lsp-parser/src/resolve_conditional_tests.rs), [server inference tests](../server/crates/php-lsp-server/src/lsp/conditional_type_tests.rs), [receiver publication tests](../server/crates/php-lsp-index/src/conditional_index_tests.rs), [cache replay](../server/crates/php-lsp-index/src/cache_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_conditional_types.rs). A barrier test pins old receiver bindings during a pending publication; finite depth/width cases verify conservative budget exhaustion. |
@@ -63,7 +65,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Blade virtual PHP | hover/completion/diagnostics/source ranges | T | B | B | [template protocol tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
 | Twig virtual PHP and context | controller → caller → partial; open/change/delete/rename | T | B | B | [Twig context protocol tests](../server/crates/php-lsp-server/tests/e2e_twig_context.rs), [template tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
 | Twig context cache | cold/warm, overlays, dependency changes, cancellation | T | B | B | [Twig context unit tests](../server/crates/php-lsp-server/src/indexing/twig_context_tests.rs), [regressions](../server/crates/php-lsp-server/src/indexing/twig_context_regression_tests.rs). |
-| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); warm-start timing after schema 34 is unmeasured. |
+| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); warm-start timing after schema 35 is unmeasured. |
 | Workspace index | watch create/change/delete and file operations | T | B | B | [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Workspace configuration | reconfigure parser/stubs/index, cancel old generation | T | B | B | [initialize tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [indexing tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Pre-create/pre-delete file requests | advertised no-edit response | B | B | B | Implementation is documented in [LSP features](lsp-features.md); no direct protocol regression found for either response. |
@@ -103,7 +105,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |
@@ -152,9 +154,9 @@ line denominator equals the physical line count of these source-mapped files;
 its line percentage should not be compared directly with LLVM's Rust line
 percentage.
 
-The matrix has 59 scenario rows: on Linux 50 have executed tests, seven have
+The matrix has 60 scenario rows: on Linux 51 have executed tests, seven have
 mock-based checks, one has build-only evidence, and one (native Extension Host)
-has no automated test or build evidence. The 50 Rust rows have macOS/Windows
+has no automated test or build evidence. The 51 Rust rows have macOS/Windows
 build evidence but no native runtime test; one of those Rust rows lacks a
 direct Linux protocol regression.
 The nine client rows have no native macOS/Windows runtime test. These are

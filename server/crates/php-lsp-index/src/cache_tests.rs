@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 34;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 35;
 const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3998;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x59311f5bc5f345c1;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x9790bc7fda37b714;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -546,6 +546,66 @@ fn cache_roundtrip_preserves_constant_expression_roles() {
     assert_eq!(report.parse_files, vec![file.clone()]);
     assert!(!stale.read().file_references().contains_key(&uri));
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn cache_roundtrip_keeps_exact_shape_receivers_and_rejects_schema34() {
+    let root = unique_temp_dir("shape-keys");
+    let file = root.join("Shape.php");
+    let source="<?php class Plain {function common(){}} class Question {function common(){}} function run(){/** @var array{ready: Plain, 'ready?': Question} $shape */ $shape=[]; $shape['missing']->common(); $shape['ready?']->common();}";
+    fs::write(&file, source).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let symbols = php_lsp_parser::symbols::extract_file_symbols(tree, source, &uri);
+    let references =
+        php_lsp_parser::references::collect_symbol_references_in_file(tree, source, &symbols);
+    assert!(
+        !references
+            .iter()
+            .any(|r| !r.is_declaration && r.target_fqn == "Plain::common"),
+        "{references:?}"
+    );
+    assert_eq!(
+        references
+            .iter()
+            .filter(|r| !r.is_declaration && r.target_fqn == "Question::common")
+            .count(),
+        1
+    );
+    let index = WorkspaceIndex::new();
+    update_disk_file_with_references(&index, &file, &uri, symbols, references.clone());
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let path = root.join("index.bin");
+    save_cache_atomic(&path, &cache).unwrap();
+    let restored = WorkspaceIndex::new();
+    let report = load_valid_cached_files(
+        &restored,
+        &path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(report.loaded_files, 1);
+    assert_eq!(
+        *restored.read().file_references().get(&uri).unwrap(),
+        references
+    );
+    let mut old = cache;
+    old.schema_version = 34;
+    save_cache_atomic(&path, &old).unwrap();
+    let stale = WorkspaceIndex::new();
+    let report =
+        load_valid_cached_files(&stale, &path, &root, std::slice::from_ref(&file), &config);
+    assert_eq!(
+        report.loaded_files, 0,
+        "old shape facts and fabricated receivers must be rebuilt"
+    );
+    assert_eq!(report.parse_files, vec![file]);
+    assert!(!stale.read().file_references().contains_key(&uri));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

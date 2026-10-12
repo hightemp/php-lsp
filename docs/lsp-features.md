@@ -168,6 +168,17 @@ unsupported generic variance preserve both branches. Native returns remain
 authoritative, and unresolved conditional navigation never guesses the first
 branch. This is conservative inference, not full PHPStan/Psalm equivalence.
 
+Shape-key inference preserves decoded key identity, including `ready?`,
+quoted empty keys, whitespace and supported PHP string escapes. A missing
+sealed-shape key or unresolved dynamic key produces no guessed member type
+for completion, hover, definition or inlay hints. Tuple entries use numeric
+positions; explicit open tails can provide a missing static key within their
+declared key domain. Foreach combines possible field/tail values and key
+domains. Numeric strings such as `'01'` remain string keys. Malformed,
+non-UTF-8 decoded keys and exhausted type budgets remain unresolved.
+This applies to the supported PHPDoc `array{...}` / `object{...}` and literal
+array inference; it does not add other PHPStan shape syntaxes.
+
 ## Template Documents
 
 | Area | Status | Notes |

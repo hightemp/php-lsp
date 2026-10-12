@@ -6,8 +6,8 @@
 //! and @phpstan-import-type/@psalm-import-type.
 
 use php_lsp_types::{
-    normalize_shape_key_text, ArrayShapeItem, ParamInfo, PhpDoc, PhpDocMethod, PhpDocParam,
-    PhpDocProperty, PhpDocPropertyAccess, PhpDocTypeAlias, PhpDocTypeAliasImport, TemplateBinding,
+    ArrayShapeItem, ParamInfo, PhpDoc, PhpDocMethod, PhpDocParam, PhpDocProperty,
+    PhpDocPropertyAccess, PhpDocTypeAlias, PhpDocTypeAliasImport, TemplateBinding,
     TemplateBindingKind, TemplateParam, TemplateVariance, TypeInfo,
 };
 
@@ -1079,8 +1079,15 @@ fn parse_shape_type(s: &str) -> Option<TypeInfo> {
     let items = split_top_level_allow_trailing(body, ',')
         .into_iter()
         .filter(|part| !part.trim().is_empty())
-        .map(parse_array_shape_item)
-        .collect::<Vec<_>>();
+        .map(|part| {
+            if find_top_level_char(part, ':')
+                .is_some_and(|colon| part[..colon].trim().trim_end_matches('?').trim().is_empty())
+            {
+                return None;
+            }
+            parse_array_shape_item(part)
+        })
+        .collect::<Option<Vec<_>>>()?;
 
     match shape_kind {
         "array" => Some(TypeInfo::ArrayShape(items)),
@@ -1089,23 +1096,27 @@ fn parse_shape_type(s: &str) -> Option<TypeInfo> {
     }
 }
 
-fn parse_array_shape_item(s: &str) -> ArrayShapeItem {
+fn parse_array_shape_item(s: &str) -> Option<ArrayShapeItem> {
     let s = s.trim();
     if let Some(colon) = find_top_level_char(s, ':') {
         let raw_key = s[..colon].trim();
         let optional = raw_key.trim_end().ends_with('?');
-        let key = normalize_shape_key_text(raw_key);
-        ArrayShapeItem {
-            key: (!key.is_empty()).then_some(key),
+        let key = php_lsp_types::decode_shape_key_token(if optional {
+            raw_key[..raw_key.len() - 1].trim_end()
+        } else {
+            raw_key
+        })?;
+        Some(ArrayShapeItem {
+            key: Some(key),
             optional,
             value: parse_type_string(&s[colon + 1..]),
-        }
+        })
     } else {
-        ArrayShapeItem {
+        Some(ArrayShapeItem {
             key: None,
             optional: false,
             value: parse_type_string(s),
-        }
+        })
     }
 }
 

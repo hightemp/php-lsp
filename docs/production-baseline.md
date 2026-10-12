@@ -356,8 +356,9 @@ native/PHPDoc type provenance (schema 29; 2026-10-08), qualified
 type/reference resolution (schema 30; 2026-10-09), lexical variable/capture
 binding (schema 31; 2026-10-09), constant-expression roles
 (schema 32; 2026-10-09), conditional PHPDoc specialization
-(schema 33; 2026-10-09), or proven instanceof guard binding
-(schema 34; 2026-10-09).
+(schema 33; 2026-10-09), proven instanceof guard binding
+(schema 34; 2026-10-09), or exact shape-key binding
+(schema 35; 2026-10-12).
 
 ### Large Workspace Latency
 

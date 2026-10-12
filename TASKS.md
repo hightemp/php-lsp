@@ -6480,3 +6480,21 @@ change.
   - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; MemoryHigh2G/MemoryMax3G/MemorySwapMax1G transient scopes, one CPU and nice15. Historical performance/coverage measurements remain dated; no new public settings.
   - Implemented: README, architecture, LSP behavior, cache/performance caveats and coverage evidence updated; original audit wording and prior journal bytes preserved. Matrix59 rows/134 valid local links; historical measurements unchanged.
   - Validation: final sequential Rust1584/1584 across50 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Repeated source reviews on gpt-6-sol gave GO after dead-arm sharing and jump-boundary regressions. Final reused Verifier returned GO for source, tests, documentation and evidence. Original audit/prior journal bytes,134 local matrix links and new-file whitespace verified; task completed.
+
+### Milestone: CODEX-P2-29 exact array-shape key lookup (2026-10-12 -> 2026-10-12)
+
+**Статус:** complete *(done 2026-10-12)*
+**Цель:** Prevent missing array-shape keys from borrowing unrelated field types and keep literal key punctuation separate from PHPDoc optional syntax.
+
+#### Задачи
+
+- [x] **P229-001-2026-10-12** Add adversarial RED tests for missing/exact/dynamic keys, optional and literal question marks, nested shapes, LSP behavior and cache replay before fixes. *(done 2026-10-12)*
+  - Implemented: 33 regressions across shared types (5), parser (14), server helpers (5), LSP (8) and cache (1). Additional RED cases expose escaped-key collisions, PHPDoc render round-trip loss, numeric-string/tail key-domain mistakes and inference budget violations; cache schema 34 acceptance failed explicitly before the migration.
+  - Validation: initial parser9/10, types1/3, helpers3/3 and LSP5/5 failed; cache replay fabricated a receiver. Focused GREEN parser504/504, types34/34, helpers5/5 and index114/114 include the final fixes; logs are under ignored server/target/p2-29-*.
+- [x] **P229-002-2026-10-12** Correct shared key handling and shape lookup, preserving supported known keys and explicit fallback semantics without fabricated member targets. *(done 2026-10-12)*
+  - Implemented: decoded key identity is preserved; optional syntax belongs to the PHPDoc parser. Sealed/dynamic missing keys stay unknown, tuple positions and explicit open-tail domains are checked, foreach combines possible values/keys, and bounded type copies fail conservatively. Source ranges retain written spelling; cache schema35 rejects old receivers.
+  - Validation: repeated read-only source review by gpt-6-sol Verifier returned GO after escape, numeric-string and tail-domain regressions; final full gates and documentation review remain in P229-003.
+- [x] **P229-003-2026-10-12** Run focused/full sequential Rust gates, repeated gpt-6-sol Verifier review to GO, update resulting behavior/evidence and retain original audit/journal text. *(done 2026-10-12)*
+  - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; transient MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scopes, one CPU and nice15. Preserve dated historical coverage/performance evidence; no new LSP settings.
+  - Implemented: README, architecture, LSP behavior, cache/performance caveats and coverage matrix updated. Original audit wording and prior journal bytes are unchanged; matrix60 rows/139 valid local links. Historical measurements are unchanged.
+  - Validation: full sequential Rust1617/1617 across51 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Original audit/prior journal bytes,139 local matrix links and new-file whitespace verified. Reused gpt-6-sol Verifier returned final GO for source, tests, documentation and logs after repeated reviews/fixes; task completed.

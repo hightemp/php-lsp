@@ -1495,11 +1495,7 @@ fn shape_item_type_info(
     let normalized = php_lsp_types::normalize_shape_key_text(property_name);
     items
         .iter()
-        .find(|item| {
-            item.key
-                .as_deref()
-                .is_some_and(|key| php_lsp_types::normalize_shape_key_text(key) == normalized)
-        })
+        .find(|item| item.key.as_deref().is_some_and(|key| key == normalized))
         .map(|item| item.value.clone())
 }
 

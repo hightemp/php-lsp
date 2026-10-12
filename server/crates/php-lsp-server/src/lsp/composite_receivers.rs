@@ -159,7 +159,7 @@ pub(super) fn members_for_access(
             .filter_map(|item| {
                 let name = item.key.as_ref()?;
                 Some((
-                    format!("property:{}", php_lsp_types::normalize_shape_key_text(name)),
+                    format!("property:{name}"),
                     Member {
                         declarations: Vec::new(),
                         virtual_properties: Vec::new(),
