@@ -139,6 +139,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_phpdoc_native.rs` | native/PHPDoc contracts, signature and assignment hover, compatible parameter generics, late-static owner and UTF-16/CRLF document updates. |
 | `tests/e2e_qualified_types.rs` | qualified relative/absolute type targets, competing indexed classes, PHPDoc/native returns, Unicode/CRLF inlays, unsaved updates and controller-to-Twig propagation. |
 | `tests/e2e_conditional_types.rs` | conditional PHPDoc literals/subtypes, independent template bindings, declaration scope, native guarantees, exact branch definitions and versioned unsaved edits. |
+| `tests/e2e_guard_narrowing.rs` | proven boolean instanceof exit guards, exact inherited/member targets, UTF-16/CRLF, stale edits/reopen and bounded concurrent edit/definition checks. |
 | `tests/e2e_definition.rs` | definition, declaration, type definition, implementation. |
 | `tests/e2e_phpdoc_definition.rs` | exact PHPDoc member/owner selection, inheritance/native precedence, UTF-16/CRLF buffer edits, and Twig shape-key definitions before attributes. |
 | `tests/e2e_phpdoc_definition_stress.rs` | concurrent JSON-RPC definitions, edits, close/reopen, watched-file and full Composer reindex; exact stable disk/buffer results and progress watchdog. |
@@ -446,6 +447,23 @@ callable body. Narrowing rejects loops/nested uses, backward jumps, dynamic
 symbol-table access and bindings that may escape, be referenced, or be
 overwritten; existing object-or-false APIs such as SimpleXML retain inference
 after their explicit error guard.
+
+Post-guard `instanceof` inference uses bounded CST proofs in
+`php-lsp-parser/src/resolve_guards.rs`. A continuing path must make the guard
+condition false and thereby guarantee a static class test, with `!`, `&&`/`and`
+and `||`/`or` following their parsed grouping. The then branch must structurally
+terminate through return, throw, exit/die, or complete terminating if/else arms;
+comments, strings and nested callable bodies supply no exit evidence. Parser
+and server assignment collectors share the proof that excludes assignments
+from a terminating then arm from later continuation in that block. Caught
+throws across an outer block boundary are not discarded this way. Branch
+jumps or labels make the exit proof unknown even when a return appears later.
+Only direct
+continuations in the same block are supported. Intervening writes, potential
+by-reference calls/captures, aliases, jumps and dynamic symbol-table
+operations discard the proof; dynamic class operands and exhausted traversal
+budgets supply no receiver proof. This is conservative flow inference,
+not a general control-flow graph or complete analyzer.
 
 The LSP completion path calls `provide_completions_at_range(...)` with the
 cursor byte-column range. The completion provider uses that range to find the
@@ -960,9 +978,11 @@ invalidated references derived with the former namespace-root heuristic.
 Schema 31 invalidated receiver/callee references computed with incomplete
 lexical variable boundaries and capture rules. Schema 32 invalidated
 false global-constant occurrences and missing/mistyped attribute and dynamic
-expression references. Current schema 33 invalidates conditional types parsed
+expression references. Schema 33 invalidated conditional types parsed
 with the old precedence and references derived by guessing their first object
-branch. These semantic changes did not alter the serialized field layout.
+branch. Current schema 34 invalidates receivers inferred from the former
+text-based instanceof guard/exit heuristics. These semantic changes did not
+alter the serialized field layout.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

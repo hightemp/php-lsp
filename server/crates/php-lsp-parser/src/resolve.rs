@@ -34,6 +34,15 @@ mod variable_scope_tests;
 mod conditional_tests;
 
 #[cfg(test)]
+#[path = "resolve_guard_tests.rs"]
+mod guard_tests;
+
+#[path = "resolve_guards.rs"]
+mod guards;
+
+pub use guards::exiting_then_before_usage;
+
+#[cfg(test)]
 #[path = "resolve_composite_tests.rs"]
 mod composite_tests;
 
@@ -2196,6 +2205,9 @@ fn find_nested_variable_inference_before_usage(
         return None;
     }
     let mut inferred: Option<(usize, VariableInference)> = None;
+    let exiting_body = guards::exiting_then_before_usage(node, usage_start, source)
+        .then(|| node.child_by_field_name("body"))
+        .flatten();
 
     for i in 0..node.named_child_count() {
         let child = match node.named_child(i) {
@@ -2206,6 +2218,9 @@ fn find_nested_variable_inference_before_usage(
             break;
         }
         if is_variable_inference_scope_boundary(child) {
+            continue;
+        }
+        if exiting_body.is_some_and(|body| body.id() == child.id()) {
             continue;
         }
 
@@ -2337,14 +2352,7 @@ fn instanceof_guard_inference(
         );
     }
 
-    let condition = if_condition_text(stmt, source)?;
-    if !negative_instanceof_guard_for_var(condition, var_name)
-        || !if_then_branch_exits(stmt, source)
-    {
-        return None;
-    }
-
-    let class_name = class_name_after_instanceof(condition)?;
+    let class_name = guards::post_guard_class(stmt, var_name, usage_start, source)?;
     let resolved = resolve_class_name(&class_name, file_symbols);
     Some(VariableInference {
         type_display: Some(class_name),
@@ -2412,31 +2420,6 @@ fn if_condition_node(stmt: Node) -> Option<Node> {
         .max_by_key(|child| child.start_byte())
 }
 
-fn if_condition_text<'a>(stmt: Node, source: &'a str) -> Option<&'a str> {
-    let text = &source[stmt.byte_range()];
-    let start = text.find('(')?;
-    let mut depth = 0usize;
-    for (offset, ch) in text[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(&text[start + 1..start + offset]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn negative_instanceof_guard_for_var(condition: &str, var_name: &str) -> bool {
-    let compact: String = condition.chars().filter(|ch| !ch.is_whitespace()).collect();
-    compact.starts_with(&format!("!{}instanceof", var_name))
-        || compact.starts_with(&format!("!({}instanceof", var_name))
-}
-
 fn positive_instanceof_class_for_var(
     condition: Node,
     source: &str,
@@ -2481,21 +2464,33 @@ fn positive_instanceof_expression_class_for_var(
     match node.kind() {
         "instanceof_expression" => {}
         "binary_expression"
-            if binary_operator_text(node, source)
-                .is_some_and(|operator| operator.eq_ignore_ascii_case("instanceof")) => {}
+            if node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind().eq_ignore_ascii_case("instanceof")) => {}
         _ => return None,
     }
 
-    let left = node
+    let mut left = node
         .child_by_field_name("left")
         .or_else(|| node.named_child(0))?;
-    if source.get(left.byte_range()).map(str::trim) != Some(var_name) {
+    for _ in 0..MAX_OBJECT_TYPE_RESOLVE_DEPTH {
+        if left.kind() != "parenthesized_expression" {
+            break;
+        }
+        left = first_expression_child(left)?;
+    }
+    if left.kind() != "variable_name"
+        || source.get(left.byte_range()).map(str::trim) != Some(var_name)
+    {
         return None;
     }
 
     let right = node
         .child_by_field_name("right")
         .or_else(|| node.named_child(1))?;
+    if !matches!(right.kind(), "name" | "qualified_name") {
+        return None;
+    }
     let class_name = source.get(right.byte_range())?.trim();
     (!class_name.is_empty()).then(|| class_name.to_string())
 }
@@ -2513,25 +2508,6 @@ fn binary_operator_text<'a>(node: Node, source: &'a str) -> Option<&'a str> {
     source
         .get(left.end_byte()..right.start_byte())
         .map(str::trim)
-}
-
-fn if_then_branch_exits(stmt: Node, source: &str) -> bool {
-    let text = &source[stmt.byte_range()];
-    let then_text = text.split("else").next().unwrap_or(text);
-    then_text.contains("throw ")
-        || then_text.contains("return")
-        || then_text.contains("exit")
-        || then_text.contains("die(")
-}
-
-fn class_name_after_instanceof(condition: &str) -> Option<String> {
-    let (_, after) = condition.split_once("instanceof")?;
-    let class_name: String = after
-        .trim_start()
-        .chars()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '\\')
-        .collect();
-    (!class_name.is_empty()).then_some(class_name)
 }
 
 fn destructuring_inference_for_var(

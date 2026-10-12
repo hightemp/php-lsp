@@ -217,7 +217,8 @@ phpstorm-stubs support.
   metadata (schema 27), exact PHPDoc owner ranges (schema 28), native/PHPDoc
   type provenance (schema 29), qualified type/reference binding (schema 30),
   lexical variable/capture binding (schema 31), constant-expression roles
-  (schema 32), or conditional PHPDoc specialization (current schema 33).
+  (schema 32), conditional PHPDoc specialization (schema 33), or proven
+  instanceof guard binding (current schema 34).
   Installed-vendor first-hit behavior remains a watch item.
 - `references`, `rename`, and reference-count code lenses merge indexed
   closed-file references with ordinary open PHP snapshots, but still iterate

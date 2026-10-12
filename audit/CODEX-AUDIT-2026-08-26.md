@@ -1914,6 +1914,49 @@ comments, strings или nested closure также способен повлия
 Что исправить: анализировать CST boolean expression и exits конкретной ветви;
 поддерживать только логически доказанные guards, остальные оставлять unknown.
 
+**Реализация (2026-10-09):** текстовые эвристики заменены ограниченным CST proof
+в `resolve_guards.rs`. Сужение после guard требует доказать, что ложность
+условия гарантирует статический `instanceof`; учитываются `!`, `&&`/`and`,
+`||`/`or`, реальные скобки и operator tokens. Выход проверяется по конкретной
+then-ветви: return/throw/exit/die либо полный набор завершающихся if/else arms.
+Comments, strings, вложенные callable bodies и условные exits доказательством
+не являются. Сужение ограничено прямым продолжением в том же блоке и стабильным
+binding: записи, потенциальная передача по ссылке (включая constructor args),
+aliases, reference captures, jumps и dynamic symbol-table access отменяют proof.
+Глубина, посещённые и ожидающие CST nodes ограничены; unsupported/исчерпанные
+proofs сохраняют прежний тип. Присваивания из доказанно выходящей then-ветви
+не переносятся в продолжение того же блока в parser и server collectors;
+пойманные за пределами блока исключения таким доказательством не считаются.
+Jumps/labels внутри ветви отменяют exit proof, включая goto перед последующим
+return. Cache schema 34 перестраивает старые receivers,
+включая schema 33. Public settings и async publication coordination не менялись.
+Исходное описание выше сохранено.
+
+**Проверки:** исходный parser RED — 11/13 групп, LSP RED — 4/4; отдельные RED
+подтвердили parenthesized variable operand, constructor reference escape,
+принятие старого кеша, перенос присваивания из завершившейся then-ветви и
+достижимое присваивание при goto перед return.
+Добавлено 24 постоянных теста: 18 parser, 1 server helper, 1 cache, 4 LSP.
+Проверяются truth tables/De Morgan, реальные/fake/nested exits,
+namespace/imports, alias/write/reference effects и depth/width budgets.
+Сквозные hover/completion/definition/inlay проверки используют UTF-16/CRLF,
+точный owner/range одноимённых методов, unsaved/stale edits и close/reopen.
+Конкурентный тест выполняет 20 раундов на двух Tokio workers с отдельными
+заданиями и стартовым барьером: допускает целостный old/new snapshot и проверяет
+точный актуальный target после каждого edit; это ограниченное concurrency
+покрытие. Адресный GREEN: parser 490/490, index 113/113, server helper 1/1,
+LSP 4/4. Финальный полный `cargo test --all` — 1584/1584, 50 test-result
+targets, 0 ignored; Clippy `--all-targets -- -D warnings`, Rustfmt и
+`git diff --check` прошли. Проверки выполнялись последовательно с
+`CARGO_BUILD_JOBS=1`, `--test-threads=1`, одним CPU и ограничением памяти.
+Обновлены архитектура, LSP matrix, cache/performance caveats и test-coverage
+matrix (59 строк/134 действительные локальные ссылки). Исторические замеры
+покрытия и производительности не изменены.
+
+**Статус (2026-10-09):** исправлено и проверено. Повторный read-only review
+Verifier на `gpt-6-sol` завершился GO после исправления замечаний и проверки
+итогового кода, тестов, документации и логов; milestone в TASKS.md завершён.
+
 ### CODEX-P2-29. Неизвестный array-shape key получает тип первого поля
 
 [`array_shape_value_type`](server/crates/php-lsp-parser/src/resolve.rs#L5747)

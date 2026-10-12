@@ -72,6 +72,13 @@ not claim a fixed parent type across later writes. Local arrow assignments,
 reference assignments and destructuring targets participate in navigation and
 inference; unknown destructuring writes discard an earlier inferred type.
 
+After an `instanceof` exit guard, inference narrows a direct continuation only
+when CST boolean logic proves the class and the then branch really terminates.
+For example, `if (!($x instanceof Foo) || $flag) return;` proves `Foo` afterward,
+while `&& $flag` does not. Nested callable exits and keyword text in comments or
+strings do not count. Writes, possible reference effects, jumps, dynamic class
+operands and unsupported nested control flow keep inference conservative.
+
 Global constant navigation and rename include actual expression uses.
 Declaration names, static member names, named-argument labels and attribute/type
 names do not count as constant uses. Argument values and expressions inside

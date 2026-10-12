@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 33;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 34;
 const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3998;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x3049917b463f25b2;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x59311f5bc5f345c1;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -546,6 +546,63 @@ fn cache_roundtrip_preserves_constant_expression_roles() {
     assert_eq!(report.parse_files, vec![file.clone()]);
     assert!(!stale.read().file_references().contains_key(&uri));
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn cache_roundtrip_preserves_proven_guard_receivers_and_rejects_schema33() {
+    let root = unique_temp_dir("guard-references");
+    let file = root.join("Guard.php");
+    let source="<?php interface Input {function common();} class Foo implements Input {function common(){}} function run(Input $value, bool $flag) {if(!($value instanceof Foo) && $flag)return; $value->common();}";
+    fs::write(&file, source).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let symbols = php_lsp_parser::symbols::extract_file_symbols(tree, source, &uri);
+    let references =
+        php_lsp_parser::references::collect_symbol_references_in_file(tree, source, &symbols);
+    let calls = references
+        .iter()
+        .filter(|reference| {
+            !reference.is_declaration
+                && reference.target_kind == PhpSymbolKind::Method
+                && reference.target_fqn.ends_with("::common")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1, "{references:?}");
+    assert_eq!(calls[0].target_fqn, "Input::common");
+    let index = WorkspaceIndex::new();
+    update_disk_file_with_references(&index, &file, &uri, symbols, references.clone());
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let path = root.join("index.bin");
+    save_cache_atomic(&path, &cache).unwrap();
+    let restored = WorkspaceIndex::new();
+    let report = load_valid_cached_files(
+        &restored,
+        &path,
+        &root,
+        std::slice::from_ref(&file),
+        &config,
+    );
+    assert_eq!(report.loaded_files, 1);
+    assert_eq!(
+        *restored.read().file_references().get(&uri).unwrap(),
+        references
+    );
+    let mut legacy = cache;
+    legacy.schema_version = 33;
+    save_cache_atomic(&path, &legacy).unwrap();
+    let stale = WorkspaceIndex::new();
+    let report =
+        load_valid_cached_files(&stale, &path, &root, std::slice::from_ref(&file), &config);
+    assert_eq!(
+        report.loaded_files, 0,
+        "old guessed guard receivers must be rebuilt"
+    );
+    assert_eq!(report.parse_files, vec![file]);
+    assert!(!stale.read().file_references().contains_key(&uri));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

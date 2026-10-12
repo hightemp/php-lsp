@@ -3290,10 +3290,17 @@ pub(in crate::server) fn collect_latest_assignment_rhs_before_usage<'tree>(
         }
     }
 
+    let exiting_body =
+        php_lsp_parser::resolve::exiting_then_before_usage(node, usage_start, source)
+            .then(|| node.child_by_field_name("body"))
+            .flatten();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.start_byte() > usage_start {
             break;
+        }
+        if exiting_body.is_some_and(|body| body.id() == child.id()) {
+            continue;
         }
         collect_latest_assignment_rhs_before_usage(
             child,
