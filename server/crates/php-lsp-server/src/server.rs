@@ -32,7 +32,7 @@ use php_lsp_index::cache::{self, CacheNamespace, CacheSourceFile, IndexCacheConf
 use php_lsp_index::composer::{parse_composer_json, NamespaceMap};
 use php_lsp_index::stubs;
 use php_lsp_index::workspace::{SourceFingerprint, WorkspaceIndex};
-use php_lsp_parser::diagnostics::extract_syntax_errors;
+use php_lsp_parser::diagnostics::extract_syntax_errors_utf16;
 use php_lsp_parser::parser::FileParser;
 use php_lsp_parser::phpdoc::parse_phpdoc;
 use php_lsp_parser::references::{
@@ -505,6 +505,7 @@ struct DiagnosticPublishRequest {
     version: Option<i32>,
     expected_state: Option<OpenDocumentState>,
     expected_template: Option<TemplateDocument>,
+    expected_analyzer_source: Option<AnalyzerSourceSnapshot>,
     require_idle_index: bool,
     expected_runtime_generation: u64,
     indexing_workspace_folder: Option<PathBuf>,
@@ -737,7 +738,7 @@ fn spawn_diagnostics_publish_worker(
                 if requests.is_empty() {
                     break;
                 }
-                for request in requests {
+                for mut request in requests {
                     let uri_str = request.uri.as_str().to_string();
                     if current_computation_sequences
                         .get(&uri_str)
@@ -769,12 +770,37 @@ fn spawn_diagnostics_publish_worker(
                     {
                         continue;
                     }
-                    if !diagnostic_publish_request_is_current(
-                        &request,
-                        &open_files,
-                        &document_versions,
-                        &template_documents,
-                    ) {
+                    if let Some(proof) = &request.expected_analyzer_source {
+                        if !proof.matches_disk(None).await {
+                            request.diagnostics.retain(|diagnostic| {
+                                !matches!(diagnostic.source.as_deref(), Some("phpstan" | "psalm"))
+                            });
+                        }
+                        // Validation can yield to edits, configuration changes,
+                        // replacement indexing runs or a newer computation.
+                        let current_runtime = runtime_state.lock().await.clone();
+                        if !diagnostic_runtime_request_is_current(&request, &current_runtime)
+                            || !diagnostic_indexing_run_is_latest(&request, &indexing_run)
+                            || request.require_idle_index
+                                && request
+                                    .indexing_workspace_folder
+                                    .as_deref()
+                                    .is_some_and(|root| indexing_run.is_active(root))
+                            || worker_stopped.load(Ordering::SeqCst)
+                        {
+                            continue;
+                        }
+                    }
+                    if current_computation_sequences
+                        .get(&uri_str)
+                        .is_none_or(|sequence| *sequence != request.computation_sequence)
+                        || !diagnostic_publish_request_is_current(
+                            &request,
+                            &open_files,
+                            &document_versions,
+                            &template_documents,
+                        )
+                    {
                         continue;
                     }
 
@@ -3365,6 +3391,7 @@ impl PhpLspBackend {
                 version: None,
                 expected_state: None,
                 expected_template: None,
+                expected_analyzer_source: None,
                 require_idle_index: false,
                 expected_runtime_generation,
                 indexing_workspace_folder: None,
@@ -3481,6 +3508,7 @@ impl PhpLspBackend {
                 version: Some(version),
                 expected_state: Some(expected),
                 expected_template: template_document,
+                expected_analyzer_source: None,
                 require_idle_index: diagnostics_config.mode == DiagnosticsMode::BasicSemantic,
                 expected_runtime_generation,
                 indexing_workspace_folder,

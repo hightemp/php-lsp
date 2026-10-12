@@ -265,6 +265,15 @@ workspace root. `phpstan.memory_limit` is added to the PHPStan command unless
 the command already contains `--memory-limit`; `{memory_limit}` can be used in a
 custom command template for explicit placement.
 
+PHPStan/Psalm diagnostics run only in `basic-semantic` mode, when there are
+no syntax errors and the open PHP buffer matches the file on disk byte for
+byte. Unsaved or missing files retain built-in buffer diagnostics; external
+analysis resumes on save once disk and buffer match. Raising a semantic
+category to `error` does not disable external analyzers. Disk contents are
+revalidated between commands and before queued results are published;
+changed or unreadable files contribute no external diagnostics. Existing
+command trust, timeout and cancellation settings still apply.
+
 ## Formatter Resolution
 
 `[formatting] provider = "auto"` is the default. The formatter provider is

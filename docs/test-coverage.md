@@ -3,7 +3,7 @@
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
 P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
-and P2-29 (2026-10-12).
+and P2-29/P2-30 (2026-10-12).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -32,6 +32,7 @@ Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64 targets.
 | Diagnostics | open before/during/after cold indexing | T | B | B | [diagnostics protocol tests](../server/crates/php-lsp-server/tests/e2e_diagnostics.rs). |
 | Diagnostics | rapid unsaved changes, stale versions, close/reopen | T | B | B | [diagnostics protocol tests](../server/crates/php-lsp-server/tests/e2e_diagnostics.rs). |
 | Diagnostics | syntax, semantic, PHP version, suppression budgets | T | B | B | [parser diagnostic tests](../server/crates/php-lsp-parser/src/diagnostics_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_diagnostics.rs). |
+| Diagnostic coordinates and analyzer snapshots | UTF-16/CRLF, syntax versus semantic ERROR, dirty/save/delete/recreate, symlinks, chunk limits, queued results and cancellation/supersession/reopen | T | B | B | [parser range/kind tests](../server/crates/php-lsp-parser/src/diagnostics_tests.rs), [snapshot and barrier regressions](../server/crates/php-lsp-server/src/lsp/diagnostic_pipeline_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_diagnostic_snapshots.rs). Fake analyzer commands and controlled barriers cover event orders; this does not measure compatibility with every installed PHPStan/Psalm version. |
 | External analyzers | trusted/untrusted PHPStan configuration, output location | T | B | B | [initialize tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [server tests](../server/crates/php-lsp-server/src/server_tests.rs); real installed PHPStan/Psalm versions are not a compatibility matrix. |
 | Completion | symbol/import kind, deduplication, class/trait visibility | T | B | B | [completion protocol tests](../server/crates/php-lsp-server/tests/e2e_completion.rs), [visibility protocol tests](../server/crates/php-lsp-server/tests/e2e_visibility.rs), [provider tests](../server/crates/php-lsp-completion/src/provider_tests.rs). |
 | Completion resolve | enriched item detail and stale/merged type state | T | B | B | [composite receiver tests](../server/crates/php-lsp-server/tests/e2e_composite_receivers.rs), [definition tests](../server/crates/php-lsp-server/tests/e2e_definition.rs). |
@@ -105,7 +106,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29/P2-30 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |
@@ -154,9 +155,9 @@ line denominator equals the physical line count of these source-mapped files;
 its line percentage should not be compared directly with LLVM's Rust line
 percentage.
 
-The matrix has 60 scenario rows: on Linux 51 have executed tests, seven have
+The matrix has 61 scenario rows: on Linux 52 have executed tests, seven have
 mock-based checks, one has build-only evidence, and one (native Extension Host)
-has no automated test or build evidence. The 51 Rust rows have macOS/Windows
+has no automated test or build evidence. The 52 Rust rows have macOS/Windows
 build evidence but no native runtime test; one of those Rust rows lacks a
 direct Linux protocol regression.
 The nine client rows have no native macOS/Windows runtime test. These are

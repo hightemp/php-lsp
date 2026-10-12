@@ -2031,6 +2031,54 @@ source, но их ranges/messages публикуются на текущую edi
 анализировать temp snapshot текущего buffer или явно не запускать analyzer на
 dirty document; определять syntax errors по code/kind, а не severity/source.
 
+**Реализация (2026-10-12):** parser предоставляет типизированный
+`Utf16SyntaxDiagnostic` API и сохраняет совместимый extraction API.
+Server копирует готовый UTF-16 range без повторной byte-конверсии и сохраняет
+стабильный код `syntax-error`. Проверка синтаксических ошибок использует code/kind,
+поэтому semantic severity ERROR больше не блокирует PHPStan/Psalm.
+
+Выбран предусмотренный выше вариант пропуска внешнего анализа dirty document.
+Встроенная диагностика продолжает анализировать captured open buffer.
+Внешние команды запускаются только при точном побайтовом совпадении с обычным
+дисковым файлом; симлинки, включая внешние цели, сохраняются. Содержимое
+проверяется перед командами, между ними, после них и в очереди публикации.
+При несовпадении отбрасываются только внешние diagnostics.
+После нового await повторно проверяются lifetime/version документа,
+computation sequence, runtime config/index identity, indexing run/activity
+и shutdown. Используется существующий отменяемый I/O worker pool с лимитами;
+сравнение не выделяет память по размеру дискового файла и читает не больше
+captured source length + 1 byte.
+
+Это проверки на границах операции: блокировка файлов от сторонних writers,
+атомарный snapshot всех зависимостей analyzer и новая LSP-настройка не добавлены.
+Cache schema 35 не меняется, поскольку исправление не меняет persisted symbols
+или references.
+
+**Регрессии:** 18 новых тестов (parser2, pipeline14, LSP2):
+Unicode/CRLF syntax ranges и stable kind; dirty/save/delete/
+recreate; semantic ERROR и реальные syntax errors; queued disk replacement;
+chunk boundaries, отсутствующий файл/каталог, external symlink и отмена
+ожидания I/O. Управляемые command barriers проверяют edit, close/reopen с той же
+версией и замену analyzer run. Отдельный validation barrier проверяет
+повторную проверку document/runtime/indexing/sequence перед публикацией.
+Сквозные LSP-тесты проверяют ranges, unsaved/stale versions, save и reopen.
+Мутация с удалением post-await guards снова сделала barrier-тест RED:
+он обнаружил `old result` для нового lifetime документа.
+
+**Проверки (2026-10-12):** исходные behavioral RED5/5; адресные GREEN
+pipeline14/14, LSP2/2 и полный parser506/506. Полный последовательный
+Rust-набор: 1635/1635, 52 test-result targets, 0 ignored.
+Все сборки выполнялись с `CARGO_BUILD_JOBS=1`, тесты с `--test-threads=1`,
+на одном CPU в MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scope.
+Clippy `--all-targets -- -D warnings`, Rustfmt и `git diff --check` прошли.
+Документация и coverage matrix актуализированы; исходное описание аудита
+и прежний TASKS.md сохранены. Матрица содержит 61 сценарий и 142 корректные
+локальные ссылки.
+
+**Статус (2026-10-12):** исправлено и проверено. Повторный read-only review
+Verifier на `gpt-6-sol` завершился финальным GO по коду, тестам,
+документации и логам; milestone в TASKS.md завершён.
+
 ### CODEX-P2-31. Undefined-variable diagnostics не моделируют control flow
 
 Collector объединяет declarations/reads по порядку исходника, а не по CFG.

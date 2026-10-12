@@ -25,7 +25,7 @@ phpstorm-stubs support.
 
 ### Language Intelligence
 
-- Syntax diagnostics with incremental tree-sitter parsing.
+- Syntax diagnostics with incremental tree-sitter parsing and UTF-16 ranges.
 - Semantic diagnostics for unknown classes, functions, imports, members, and
   duplicate top-level or class-member declarations.
 - PHP-compatible name resolution across bracketed and unbracketed namespace

@@ -2,6 +2,14 @@
 
 use super::super::*;
 
+#[path = "analyzer_snapshot.rs"]
+mod analyzer_snapshot;
+pub(in crate::server) use analyzer_snapshot::AnalyzerSourceSnapshot;
+
+#[cfg(test)]
+#[path = "diagnostic_pipeline_tests.rs"]
+mod diagnostic_pipeline_tests;
+
 #[cfg(test)]
 #[path = "constant_reference_tests.rs"]
 mod constant_reference_tests;
@@ -1555,20 +1563,18 @@ pub(in crate::server) fn compute_diagnostics_with_config_for_version(
     let framework_cache = crate::framework::FrameworkProviderCache::default();
 
     // Syntax errors (ERROR / MISSING nodes)
-    let lsp_diags = extract_syntax_errors(tree, &source);
+    let lsp_diags = extract_syntax_errors_utf16(tree, &source);
     let mut diagnostics: Vec<Diagnostic> = lsp_diags
         .into_iter()
         .map(|d| {
-            // tree-sitter positions use byte columns; convert to UTF-16
-            let start_char =
-                utf16_index.byte_col_to_utf16(d.range.start.line, d.range.start.character);
-            let end_char = utf16_index.byte_col_to_utf16(d.range.end.line, d.range.end.character);
+            let d = d.into_lsp_diagnostic();
             Diagnostic {
-                range: Range {
-                    start: Position::new(d.range.start.line, start_char),
-                    end: Position::new(d.range.end.line, end_char),
-                },
+                range: lsp_range_to_ls(d.range),
                 severity: Some(DiagnosticSeverity::ERROR),
+                code: d.code.map(|code| match code {
+                    lsp_types::NumberOrString::Number(number) => NumberOrString::Number(number),
+                    lsp_types::NumberOrString::String(text) => NumberOrString::String(text),
+                }),
                 source: Some("php-lsp".to_string()),
                 message: d.message,
                 ..Default::default()
@@ -5003,28 +5009,37 @@ impl PhpLspBackend {
 
         let has_syntax_errors = diagnostics.iter().any(|diagnostic| {
             diagnostic.source.as_deref() == Some("php-lsp")
-                && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                && matches!(&diagnostic.code,Some(NumberOrString::String(code)) if code==php_lsp_parser::diagnostics::SYNTAX_ERROR_CODE)
         });
+        let mut expected_analyzer_source = None;
         if template_document.is_none()
             && effective_diagnostics_mode == DiagnosticsMode::BasicSemantic
             && !has_syntax_errors
+            && (runtime_config.phpstan.enabled || runtime_config.psalm.enabled)
+            && uri_is_php_file(uri)
         {
             let Some(analyzer_token) = self.start_analyzer_run(&uri_str, document_state).await
             else {
                 return;
             };
-            diagnostics.extend(
-                self.phpstan_diagnostics_for_uri(uri, &request, analyzer_token.clone())
-                    .await,
-            );
-            if analyzer_token.is_cancelled() {
-                self.finish_analyzer_run(&uri_str, &analyzer_token).await;
-                return;
+            if let Some((path, source)) = uri_to_path(&uri_str).zip(source.as_deref()) {
+                let proof = AnalyzerSourceSnapshot::new(path, Arc::from(source));
+                if proof.matches_disk(Some(&analyzer_token)).await {
+                    let mut external = self
+                        .phpstan_diagnostics_for_uri(uri, &request, analyzer_token.clone())
+                        .await;
+                    if proof.matches_disk(Some(&analyzer_token)).await {
+                        external.extend(
+                            self.psalm_diagnostics_for_uri(uri, &request, analyzer_token.clone())
+                                .await,
+                        );
+                        if proof.matches_disk(Some(&analyzer_token)).await && !external.is_empty() {
+                            diagnostics.extend(external);
+                            expected_analyzer_source = Some(proof);
+                        }
+                    }
+                }
             }
-            diagnostics.extend(
-                self.psalm_diagnostics_for_uri(uri, &request, analyzer_token.clone())
-                    .await,
-            );
             if analyzer_token.is_cancelled() {
                 self.finish_analyzer_run(&uri_str, &analyzer_token).await;
                 return;
@@ -5086,6 +5101,7 @@ impl PhpLspBackend {
                 version,
                 expected_state: document_state,
                 expected_template: template_document,
+                expected_analyzer_source,
                 require_idle_index: effective_diagnostics_mode == DiagnosticsMode::BasicSemantic,
                 expected_runtime_generation: request.state.generation,
                 indexing_workspace_folder,

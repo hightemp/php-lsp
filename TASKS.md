@@ -6498,3 +6498,21 @@ change.
   - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; transient MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scopes, one CPU and nice15. Preserve dated historical coverage/performance evidence; no new LSP settings.
   - Implemented: README, architecture, LSP behavior, cache/performance caveats and coverage matrix updated. Original audit wording and prior journal bytes are unchanged; matrix60 rows/139 valid local links. Historical measurements are unchanged.
   - Validation: full sequential Rust1617/1617 across51 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Original audit/prior journal bytes,139 local matrix links and new-file whitespace verified. Reused gpt-6-sol Verifier returned final GO for source, tests, documentation and logs after repeated reviews/fixes; task completed.
+
+### Milestone: CODEX-P2-30 diagnostic coordinates and source snapshots (2026-10-12 -> 2026-10-12)
+
+**Статус:** complete *(done 2026-10-12)*
+**Цель:** Publish syntax diagnostics in their original UTF-16 domain and prevent disk analyzer output from being attached to a different editor snapshot.
+
+#### Задачи
+
+- [x] **P230-001-2026-10-12** Add RED regressions for Unicode/CRLF syntax ranges, analyzer eligibility by syntax kind, dirty/missing disk snapshots and deterministic publication races. *(done 2026-10-12)*
+  - Implemented: 18 regressions (parser2, pipeline14, LSP2) cover exact Unicode/CRLF spans, stable syntax kind, semantic ERROR, dirty/save/delete/recreate, chunk boundaries, non-files, external symlinks, cancelled I/O and queued disk mutation. Command/validation barriers force edit, same-version reopen, run replacement and post-validation document/runtime/indexing/sequence changes.
+  - Validation: five behavioral RED failures before implementation; additional mutation removing post-await guards failed with an old-lifetime publication. Focused GREEN pipeline14/14, LSP2/2, full parser506/506; logs under ignored server/target/p2-30-*.
+- [x] **P230-002-2026-10-12** Fix coordinate handling and external analyzer snapshot validation with existing cancellation/version/generation guards; retain trust and resource limits. *(done 2026-10-12)*
+  - Implemented: typed UTF-16 syntax extraction/copy with stable syntax-error code; semantic severity no longer suppresses analyzers. Dirty buffers skip disk commands; bounded cancellable byte checks gate commands and queued external diagnostics, preserving builtin buffer results. Post-await publication guards remain active. No new settings or cache version change.
+  - Validation: initial read-only gpt-6-sol Verifier review supported the chosen dirty-skip policy; planned publisher checks and deterministic regressions added. Final source/docs review and full gates are tracked by P230-003.
+- [x] **P230-003-2026-10-12** Run focused/full sequential Rust checks, repeated gpt-6-sol Verifier review to GO, and update documentation/audit evidence without rewriting prior findings or journal entries. *(done 2026-10-12)*
+  - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; one CPU, nice15 and transient MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scopes. No public settings, no unrelated cache migration, no remote server changes.
+  - Implemented: README, architecture position/diagnostic contracts, configuration, LSP behavior and coverage evidence updated; original audit and prior journal retained. Matrix61 rows/142 valid local links; historical coverage/performance figures unchanged.
+  - Validation: full sequential Rust1635/1635 across52 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Original audit/prior TASKS bytes,142 matrix links and new-file whitespace verified. Reused gpt-6-sol Verifier returned final GO for source, tests, documentation and logs after repeated reviews; task completed.

@@ -42,6 +42,7 @@ server/crates/php-lsp-server/src/
   lsp/
     lifecycle.rs             # initialize/shutdown
     diagnostics.rs           # didOpen/didChange/didSave/didClose
+    analyzer_snapshot.rs     # bounded disk/buffer checks for external diagnostics
     completion.rs            # completion, completion resolve, signature help
     completion_helpers.rs    # virtual members, shapes, local variables, auto-import edits
     composite_receivers.rs   # typed union/intersection member selection and receiver loading
@@ -147,6 +148,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_references.rs` | document highlight, references, rename, code lens, cancellation. |
 | `tests/e2e_code_actions.rs` | quick fixes, organize imports, generate members, refactors, PHPDoc sync. |
 | `tests/e2e_diagnostics.rs` | diagnostics debounce/staleness, PHP version gates, vendor metadata refresh. |
+| `tests/e2e_diagnostic_snapshots.rs` | exact UTF-16 syntax ranges through buffer versions/reopen, dirty/save/delete/recreate analyzer eligibility and built-in buffer diagnostics at semantic ERROR severity. |
 | `tests/e2e_formatting.rs` | document/range/on-type formatting. |
 | `tests/e2e_symbols.rs` | semantic tokens, document/workspace symbols, selection range, folding, document links. |
 | `tests/e2e_document_symbols.rs` | namespace-section ownership, repeated/global/empty sections, native/PHPDoc member ownership, UTF-16/CRLF, unsaved updates and indexed/open-file parity. |
@@ -186,6 +188,7 @@ PHPDoc spans use UTF-16 columns.
 | `UseStatement.range` | Tree-sitter byte columns. |
 | `NamespaceScope.range` | Tree-sitter byte columns. |
 | Parser semantic diagnostic ranges | Tree-sitter byte columns unless converted at the server boundary. |
+| Parser syntax diagnostics / `Utf16SyntaxDiagnostic` | LSP UTF-16 columns, already converted in the parser. |
 | `SymbolReference.range` | LSP UTF-16 columns. |
 | `SymbolReference.rename_range` | LSP UTF-16 columns when a rename needs a narrower import-target edit. |
 | `FoldingRange.start_character` / `end_character` | LSP UTF-16 columns after conversion at the server boundary. |
@@ -1088,6 +1091,26 @@ Vendor:
   when `phpLsp.indexVendor` is enabled.
 
 ## Diagnostics Pipeline
+
+Parser syntax diagnostics use the `Utf16SyntaxDiagnostic` API: CST byte
+columns are converted once in the parser and copied across the LSP type bridge.
+The compatibility extraction API also returns UTF-16 ranges. Syntax errors have
+the stable `syntax-error` code; semantic diagnostics retain their separate
+byte-backed range conversion. Analyzer eligibility checks syntax kind rather
+than diagnostic severity or message.
+
+`lsp/analyzer_snapshot.rs` compares captured open-buffer bytes with a regular
+disk file, following supported symlinks. Dirty/missing/non-file sources skip
+PHPStan/Psalm while built-in diagnostics continue to use the captured buffer.
+The check runs before, between and after commands, and a queued publication
+carries the same source proof. The publisher revalidates disk contents and
+removes only external diagnostics on mismatch, preserving current built-in
+results. Its post-await guards recheck document lifetime/version, computation
+sequence, runtime configuration and index identity, indexing activity/run and
+shutdown. Validation uses the existing bounded cancellable I/O worker pool,
+compares fixed-size chunks and reads at most the captured source length plus
+one byte. These are boundary checks; the server does not lock project files
+against unrelated filesystem writers or snapshot an entire analyzer project.
 
 Diagnostics are controlled by `phpLsp.diagnostics.mode`:
 

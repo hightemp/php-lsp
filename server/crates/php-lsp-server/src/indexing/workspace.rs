@@ -2600,6 +2600,7 @@ pub(in crate::server) async fn postprocess_workspace_indexing_runs(
                 version,
                 expected_state: document_state,
                 expected_template: template_document,
+                expected_analyzer_source: None,
                 require_idle_index: false,
                 expected_runtime_generation: runtime_generation,
                 indexing_workspace_folder: Some(config.workspace_folder.clone()),
