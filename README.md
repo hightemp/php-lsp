@@ -28,6 +28,8 @@ phpstorm-stubs support.
 - Syntax diagnostics with incremental tree-sitter parsing and UTF-16 ranges.
 - Semantic diagnostics for unknown classes, functions, imports, members, and
   duplicate top-level or class-member declarations.
+- Undefined-variable diagnostics follow reachable branches, guards and loops,
+  including null-coalescing assignment and closure captures.
 - PHP-compatible name resolution across bracketed and unbracketed namespace
   sections, including mixed class/function/constant group imports,
   namespace-relative qualified names, and symbol-kind-specific casing and

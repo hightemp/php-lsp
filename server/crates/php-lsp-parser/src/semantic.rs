@@ -3,9 +3,16 @@
 //! Walks the CST and checks class/function/use references
 //! against a resolver function (typically backed by the workspace index).
 
+#[cfg(test)]
+#[path = "semantic_flow_tests.rs"]
+mod flow_tests;
+
+#[path = "variable_flow.rs"]
+mod variable_flow;
+
 use crate::cst::{
     ancestor_field_contains, argument_name, has_ancestor_before_scope,
-    is_by_ref_output_argument_variable, is_foreach_header_declared_variable, node_contains,
+    is_by_ref_output_argument_variable, is_foreach_header_declared_variable,
 };
 use php_lsp_types::{
     global_constant_fqn_key, FileSymbols, PhpDoc, PhpSymbolKind, Signature, SymbolInfo, TypeInfo,
@@ -1219,39 +1226,29 @@ fn collect_arrow_capture_reads(
         resolver,
         &mut local_occurrences,
     );
-    local_occurrences.sort_by_key(|occurrence| occurrence.start_byte);
-    let mut bound_locals = HashSet::new();
-    let mut pending_bindings: Vec<(String, usize)> = Vec::new();
-    for occurrence in local_occurrences {
-        pending_bindings.retain(|(name, end)| {
-            if *end <= occurrence.start_byte {
-                bound_locals.insert(name.clone());
-                false
-            } else {
-                true
-            }
-        });
-        if parameter_names.contains(&occurrence.name)
-            || bound_locals.contains(&occurrence.name)
-            || !occurrence.capture_eligible
-        {
+    let undefined =
+        variable_flow::undefined_reads(scope, source, &local_occurrences).unwrap_or_default();
+    for (index, occurrence) in local_occurrences.into_iter().enumerate() {
+        if parameter_names.contains(&occurrence.name) || !occurrence.capture_eligible {
             continue;
         }
-        let is_read = occurrence.declaration_kind.is_none();
         if occurrence.declaration_kind == Some(VariableDeclarationKind::Variable) {
-            if let Some(end) = assignment_binding_end(scope, occurrence.start_byte) {
-                pending_bindings.push((occurrence.name.clone(), end));
-            } else {
-                bound_locals.insert(occurrence.name.clone());
-            }
-        } else if occurrence.explicit_by_ref_capture && !occurrence.implicit_capture {
-            // A direct `use (&$name)` creates a binding in this arrow even
-            // when there is no outer variable to capture.
-            bound_locals.insert(occurrence.name.clone());
+            occurrences.push(VariableOccurrence {
+                declaration_kind: None,
+                null_coalesce_probe: true,
+                implicit_capture: true,
+                ..occurrence
+            });
+            continue;
+        }
+        if occurrence.declaration_kind.is_some() {
+            continue;
+        }
+        if !undefined.contains(&index) && !occurrence.null_coalesce_probe {
+            continue;
         }
         occurrences.push(VariableOccurrence {
             declaration_kind: None,
-            null_coalesce_probe: occurrence.null_coalesce_probe || !is_read,
             capture_eligible: true,
             implicit_capture: true,
             ..occurrence
@@ -1692,9 +1689,12 @@ fn report_variable_diagnostics<F>(
     } else {
         HashSet::new()
     };
-    for occurrence in occurrences
+    let flow_undefined =
+        variable_flow::undefined_reads(scope, source, occurrences).unwrap_or_default();
+    for (_, occurrence) in occurrences
         .iter()
-        .filter(|occurrence| occurrence.declaration_kind.is_none())
+        .enumerate()
+        .filter(|(index, _)| flow_undefined.contains(index))
     {
         if scope.kind() == "arrow_function"
             && (occurrence.capture_eligible
@@ -1708,26 +1708,7 @@ fn report_variable_diagnostics<F>(
         if occurrence.name == "$this" {
             continue;
         }
-        if occurrence.null_coalesce_probe {
-            continue;
-        }
-
-        let declared_before = declared_by_name
-            .get(occurrence.name.as_str())
-            .is_some_and(|decls| {
-                decls.iter().any(|decl| {
-                    declaration_available_before(
-                        scope,
-                        decl,
-                        occurrence.start_byte,
-                        occurrence.explicit_by_ref_capture,
-                    )
-                })
-            });
-
-        if !declared_before
-            && !occurrence.explicit_by_ref_capture
-            && reported_undefined.insert(occurrence.name.clone())
+        if !occurrence.explicit_by_ref_capture && reported_undefined.insert(occurrence.name.clone())
         {
             diagnostics.push(SemanticDiagnostic {
                 range: occurrence.range,
@@ -1945,7 +1926,17 @@ fn variable_declaration_kind(
     if is_foreach_header_declared_variable(node, source) {
         return Some(VariableDeclarationKind::Variable);
     }
-    if is_assignment_left_hand_declared_variable(node) {
+    if crate::variable_scope::is_assignment_binding_variable(node)
+        || node.parent().is_some_and(|parent| {
+            parent.kind() == "augmented_assignment_expression"
+                && parent
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| op.kind() == "??=")
+                && parent
+                    .child_by_field_name("left")
+                    .is_some_and(|left| left.id() == node.id())
+        })
+    {
         return Some(VariableDeclarationKind::Variable);
     }
     if ancestor_field_contains(node, "catch_clause", &["name", "variable"]) {
@@ -1969,10 +1960,6 @@ fn variable_declaration_kind(
             .child_by_field_name("name")
             .is_some_and(|name| name.id() == node.id())
             .then_some(VariableDeclarationKind::PromotedProperty),
-        "assignment_expression" => parent
-            .child_by_field_name("left")
-            .is_some_and(|left| left.id() == node.id() || node_contains(left, node))
-            .then_some(VariableDeclarationKind::Variable),
         "global_declaration" | "static_variable_declaration" => {
             Some(VariableDeclarationKind::Variable)
         }
@@ -1987,27 +1974,6 @@ fn variable_declaration_kind(
         }
         _ => None,
     }
-}
-
-fn is_assignment_left_hand_declared_variable(node: tree_sitter::Node) -> bool {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        match parent.kind() {
-            "assignment_expression" | "by_ref_assignment_expression" => {
-                return parent
-                    .child_by_field_name("left")
-                    .is_some_and(|left| left.id() == node.id() || node_contains(left, node));
-            }
-            "method_declaration"
-            | "function_definition"
-            | "arrow_function"
-            | "anonymous_function"
-            | "anonymous_function_creation_expression"
-            | "program" => return false,
-            _ => current = parent.parent(),
-        }
-    }
-    false
 }
 
 fn normalize_var_name(text: &str) -> String {

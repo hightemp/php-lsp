@@ -149,6 +149,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_code_actions.rs` | quick fixes, organize imports, generate members, refactors, PHPDoc sync. |
 | `tests/e2e_diagnostics.rs` | diagnostics debounce/staleness, PHP version gates, vendor metadata refresh. |
 | `tests/e2e_diagnostic_snapshots.rs` | exact UTF-16 syntax ranges through buffer versions/reopen, dirty/save/delete/recreate analyzer eligibility and built-in buffer diagnostics at semantic ERROR severity. |
+| `tests/e2e_variable_flow.rs` | control-flow variable diagnostics with exact UTF-16/CRLF ranges, unsaved/stale versions/reopen and 20 concurrent edit/save rounds. |
 | `tests/e2e_formatting.rs` | document/range/on-type formatting. |
 | `tests/e2e_symbols.rs` | semantic tokens, document/workspace symbols, selection range, folding, document links. |
 | `tests/e2e_document_symbols.rs` | namespace-section ownership, repeated/global/empty sections, native/PHPDoc member ownership, UTF-16/CRLF, unsaved updates and indexed/open-file parity. |
@@ -1141,6 +1142,35 @@ credited as implicit captures at the arrow's creation site, including through
 nested arrows. A same-named arrow parameter does not count as a read of the
 outer variable. Static names passed to `compact()` are checked in the scope
 where the call executes, but do not create implicit captures on their own.
+
+Undefined reads are decided by `php-lsp-parser/src/variable_flow.rs`. Each
+lexical scope gets an explicit CFG with reachable basic blocks and a forward
+worklist over interned-variable must/may-defined bitsets. Joins intersect
+definite definitions and union possible definitions; unreachable predecessors
+do not contribute. A read without a definite definition uses the existing
+`php-lsp.undefinedVariable` diagnostic and severity category. Existing
+unused-variable/parameter reporting remains separate.
+
+Transfers model assignment after RHS evaluation, writable destructuring
+targets versus read indices/receivers, `unset`, reference output bindings,
+structured namespace/declare bodies,
+`isset`/`empty`/`??` probes and successful guards, short-circuit boolean
+expressions, `??=`, ternaries, nullsafe chains, loops with break/continue,
+switch fallthrough and match arms. Foreach may execute zero times; do-while
+executes its body before testing. Catch bindings belong to exceptional paths.
+Throw edges originate at modeled potentially throwing operations and unmatched
+match paths; finally applies separately to surviving and abrupt paths, while
+`exit` bypasses it. Literal match labels and safe literal integer arithmetic
+avoid some impossible paths. Exception types and general value relationships
+are not a complete PHP static analysis.
+
+Closure reads use the creation path, and arrow-local branch assignments cannot
+hide a required outer capture. CFG facts are request-local and never persisted
+in the symbol cache. AST nodes/depth, variables, CFG blocks and worklist updates
+have internal caps. Unsupported goto/labels or exhausted caps suppress
+undefined checks for that scope; dynamic local-symbol-table effects propagate
+unknown state. The engine does not fall back to source-order guesses. These
+limits are separate from the configurable member/type diagnostic budget.
 
 Member access and type-compatibility diagnostics share a latency budget because
 they can resolve many call sites and inferred types in large files. The default

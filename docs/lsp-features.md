@@ -152,6 +152,14 @@ behavior cannot be established).
 | `textDocument/semanticTokens/full/delta` | Supported | Delta edits from previous full snapshots. |
 | `textDocument/semanticTokens/range` | Supported | Range semantic token requests for open files. |
 
+Undefined-variable diagnostics track definitions along supported control-flow
+paths. An assignment in one branch does not define the variable in its sibling;
+`??=` defines its target after evaluating the fallback. Guards, short-circuit
+expressions, loops, catch/finally, destructuring and closure captures participate
+in the analysis. A variable defined only on some reachable paths can still be
+reported. Unsupported jumps, dynamic symbol-table effects and exhausted CFG
+budgets remain conservative rather than using a textual declaration fallback.
+
 Native parameter, property and return types remain authoritative. PHPDoc can
 refine them when its compatibility is proven; uncertain relations retain the
 native type. Proven contradictions produce `phpdoc-type-mismatch` diagnostics

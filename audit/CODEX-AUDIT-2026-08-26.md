@@ -2092,6 +2092,51 @@ declaration, поэтому последующий `$value` может оста�
 нужен must/may-defined dataflow по basic blocks и явная семантика `isset`, `empty`,
 `??`, `??=`, destructuring и loop/catch variables.
 
+**Реализация (2026-10-12):** `variable_flow.rs` строит отдельный CFG для
+лексической области и рассчитывает reachable must/may-defined состояния
+worklist-алгоритмом с bitsets. Undefined reads проверяются по входящим
+состояниям basic blocks; противоположные ветки и zero-iteration loops
+больше не обмениваются гарантированными definitions.
+
+Моделируются RHS-before-write, `??=`, short-circuit/ternary/nullsafe paths,
+`isset`/`empty`/`??` probes и guards, `unset`, destructuring key/index reads,
+reference output bindings, loop break/continue, switch fallthrough,
+match labels/unmatched throw, catch и finally. Потенциальные exception edges
+начинаются в соответствующих операциях, а не безусловно до try; `exit`
+отличается от return и не исполняет finally. Captures учитывают путь создания;
+arrow-local присваивания в другой ветке не скрывают outer read.
+Unused reporting остаётся отдельным; диагностический code/severity и
+byte→UTF-16 граница сохранены.
+
+AST/CFG/variable/worklist бюджеты и unsupported goto/labels дают unknown
+для undefined checks области; dynamic symbol-table effects распространяют
+unknown по достижимым путям. Textual fallback не используется.
+Это ограниченный анализ поддержанных конструкций, без полной модели типов
+исключений, всех отношений значений или runtime symbol-table semantics.
+Новые настройки и cache schema migration не добавлены: CFG facts не
+попадают в persisted symbol/reference snapshots.
+
+**Регрессии:** 31 новый тест (parser28, LSP3), включая исходные RED14/15,
+дополнительные RED для exception precision, mixed destructuring targets,
+match, multi-isset, namespace/declare wrappers и сохранённые lexical/unused controls.
+LSP3/3 проверяет exact UTF-16/CRLF ranges,
+unsaved/stale versions, close/reopen и 20 конкурентных edit/save раундов
+на двух Tokio workers с start barrier и точной проверкой конечной версии.
+Read-only review Verifier на `gpt-6-sol` дал GO по исправленному CFG;
+итоговый documentation/evidence review ещё выполняется.
+
+**Проверки (2026-10-12):** полный parser534/534 и итоговый последовательный
+Rust-набор 1666/1666, 53 test-result targets, 0 ignored.
+Сборки `CARGO_BUILD_JOBS=1`, тесты `--test-threads=1`, один CPU и
+MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scopes.
+Clippy `--all-targets -- -D warnings`, Rustfmt и `git diff --check` прошли.
+Документация актуализирована; исходный аудит и прежний TASKS.md сохранены.
+Матрица содержит 62 сценария и 145 корректных локальных ссылок.
+
+**Статус (2026-10-12):** исправлено и проверено. Повторный read-only review
+Verifier на `gpt-6-sol` завершился финальным GO по коду, тестам,
+документации и логам после исправления замечаний; milestone в TASKS.md завершён.
+
 ### CODEX-P2-32. Framework/type helpers возвращают уверенные, но неверные типы
 
 [`laravel_model_dynamic_method_return_type`](server/crates/php-lsp-server/src/framework.rs#L2238)

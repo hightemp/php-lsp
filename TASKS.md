@@ -6516,3 +6516,21 @@ change.
   - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; one CPU, nice15 and transient MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scopes. No public settings, no unrelated cache migration, no remote server changes.
   - Implemented: README, architecture position/diagnostic contracts, configuration, LSP behavior and coverage evidence updated; original audit and prior journal retained. Matrix61 rows/142 valid local links; historical coverage/performance figures unchanged.
   - Validation: full sequential Rust1635/1635 across52 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Original audit/prior TASKS bytes,142 matrix links and new-file whitespace verified. Reused gpt-6-sol Verifier returned final GO for source, tests, documentation and logs after repeated reviews; task completed.
+
+### Milestone: CODEX-P2-31 control-flow variable diagnostics (2026-10-12 -> 2026-10-12)
+
+**Статус:** complete *(done 2026-10-12)*
+**Цель:** Diagnose reads using reachable control-flow states, preserving lexical scopes and existing unused-variable behavior.
+
+#### Задачи
+
+- [x] **P231-001-2026-10-12** Add adversarial RED regressions for branch joins, early exits, short-circuit/probe/??= semantics, loops, catch/finally, destructuring/captures and LSP document versions. *(done 2026-10-12)*
+  - Implemented: 31 regressions (parser28,LSP3) cover structured branches, loops/exits, probes/??=, reference outputs, mixed destructuring, captures/compact, exception/finally/Halt, switch/match, nullsafe argument chains, namespace/declare wrappers, budgets and document versions. LSP uses20 two-worker edit/save rounds with spawned jobs, start barriers and exact accepted-version/range assertions.
+  - Validation: initial RED14/15; follow-up RED for exception precision, mixed indexed targets, non-exhaustive match, literal arithmetic, multi-isset short-circuit and namespace/declare wrappers. Full parser534/534 and LSP3/3 GREEN. Existing lexical/unused controls retained.
+- [x] **P231-002-2026-10-12** Introduce bounded per-scope must/may-defined CFG analysis, preserving byte/UTF-16 contracts, capture isolation and conservative handling of unsupported dynamic flow. *(done 2026-10-12)*
+  - Implemented: variable_flow.rs owns explicit blocks/edges, interned bitsets and reachable worklist joins; semantic.rs separates undefined flow facts from existing unused reporting and uses CFG facts for arrow captures. Unsupported jumps, dynamic symbol-table effects and internal budgets remain unknown, with no positional fallback.
+  - Validation: repeated read-only gpt-6-sol Verifier review returned source GO after exception, destructuring and unmatched-match corrections. Clippy --all-targets -D warnings passed; full gates/docs evidence review tracked by P231-003. CFG facts are not persisted, so cache schema35 remains unchanged.
+- [x] **P231-003-2026-10-12** Run focused/full sequential Rust gates and repeated gpt-6-sol Verifier review, update behavior/coverage docs and append audit status without rewriting original findings. *(done 2026-10-12)*
+  - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; one CPU, nice15, MemoryHigh2G/MemoryMax3G/MemorySwapMax1G transient scopes. No remote actions, new settings or unrelated cache migration.
+  - Implemented: README, architecture, LSP behavior and coverage matrix updated; audit implementation appended without rewriting the original finding. Matrix62 rows/145 valid local links; historical measurements unchanged.
+  - Validation: full sequential Rust1666/1666 across53 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Original audit/prior journal bytes,145 matrix links,31-test count and new-file whitespace verified. Reused gpt-6-sol Verifier returned final GO for source, tests, documentation and logs after repeated reviews/fixes; task completed.
