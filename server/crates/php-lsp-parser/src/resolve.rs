@@ -44,8 +44,18 @@ mod shape_key_tests;
 #[path = "resolve_foreach_recursion_tests.rs"]
 mod foreach_recursion_tests;
 
+#[cfg(test)]
+#[path = "resolve_inference_regression_tests.rs"]
+mod inference_regression_tests;
+
 #[path = "resolve_guards.rs"]
 mod guards;
+
+#[path = "resolve_foreach.rs"]
+mod foreach;
+pub use foreach::{
+    enclosing_foreach_binding, foreach_binding, foreach_binding_type_info, ForeachBinding,
+};
 
 #[path = "resolve_budget.rs"]
 pub(crate) mod budget;
@@ -58,6 +68,7 @@ mod composite_tests;
 
 thread_local! {
     static OBJECT_TYPE_RESOLVE_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static CST_TYPE_SCAN_DEPTH: Cell<usize> = const { Cell::new(0) };
     #[cfg(test)]
     static TYPE_RESOLUTION_TEST_ENTRIES: Cell<usize> = const { Cell::new(0) };
 }
@@ -99,6 +110,47 @@ impl Drop for ObjectTypeResolveDepthGuard {
 pub fn within_type_resolution_budget<T>(resolve: impl FnOnce() -> Option<T>) -> Option<T> {
     let _depth = ObjectTypeResolveDepthGuard::enter()?;
     budget::completed(resolve())
+}
+
+struct CstTypeScanDepthGuard {
+    previous: usize,
+    _root: Option<ObjectTypeResolveDepthGuard>,
+}
+
+impl CstTypeScanDepthGuard {
+    fn enter() -> Option<Self> {
+        let root = if OBJECT_TYPE_RESOLVE_DEPTH.with(Cell::get) == 0
+            && CST_TYPE_SCAN_DEPTH.with(Cell::get) == 0
+        {
+            Some(ObjectTypeResolveDepthGuard::enter()?)
+        } else {
+            None
+        };
+        if !budget::consume() {
+            return None;
+        }
+        let previous = CST_TYPE_SCAN_DEPTH.with(Cell::get);
+        if previous >= MAX_OBJECT_TYPE_RESOLVE_DEPTH {
+            budget::exhaust();
+            return None;
+        }
+        CST_TYPE_SCAN_DEPTH.with(|depth| depth.set(previous + 1));
+        Some(Self {
+            previous,
+            _root: root,
+        })
+    }
+}
+impl Drop for CstTypeScanDepthGuard {
+    fn drop(&mut self) {
+        CST_TYPE_SCAN_DEPTH.with(|depth| depth.set(self.previous));
+    }
+}
+
+/// Bound structural statement scans, including consumers outside parser inference.
+pub fn within_type_scan_budget<T>(scan: impl FnOnce() -> Option<T>) -> Option<T> {
+    let _scan = CstTypeScanDepthGuard::enter()?;
+    budget::completed(scan())
 }
 
 /// Callback for resolving a member's type from an external source (e.g., workspace index).
@@ -2038,6 +2090,7 @@ fn find_variable_inference_before_usage(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableInference> {
+    let _scan = CstTypeScanDepthGuard::enter()?;
     let mut inferred: Option<(usize, VariableInference)> = None;
 
     for i in 0..body.named_child_count() {
@@ -2056,6 +2109,11 @@ fn find_variable_inference_before_usage(
 
         let assignment_rhs = assignment_rhs_for_var(stmt, var_name, source)
             .filter(|right| right.end_byte() <= usage_start);
+
+        if invalidating_write_for_var(stmt, var_name, usage_start, source) {
+            inferred = Some((stmt.start_byte(), VariableInference::default()));
+            continue;
+        }
 
         // Inline PHPDoc immediately before statement:
         //  - apply named @var always when variable matches
@@ -2101,7 +2159,9 @@ fn find_variable_inference_before_usage(
             callable_resolver,
         ) {
             inferred = Some((stmt.start_byte(), foreach_info));
-            continue;
+            if stmt.end_byte() <= usage_start {
+                continue;
+            }
         }
 
         if let Some(info) = destructuring_inference_for_var(
@@ -2159,6 +2219,7 @@ fn find_variable_inference_before_usage(
                 ));
             } else if let Some(type_info) =
                 infer_expression_type_info(right, source, file_symbols, resolver, callable_resolver)
+                    .or_else(|| infer_literal_expression_type_info(right, source))
             {
                 let resolved_type_fqn =
                     resolve_phpdoc_var_type(&type_info, right, source, file_symbols);
@@ -2171,6 +2232,8 @@ fn find_variable_inference_before_usage(
                         type_info: Some(type_info),
                     },
                 ));
+            } else {
+                inferred = Some((stmt.start_byte(), VariableInference::default()));
             }
         }
 
@@ -2225,6 +2288,7 @@ fn find_nested_variable_inference_before_usage(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableInference> {
+    let _scan = CstTypeScanDepthGuard::enter()?;
     if crate::variable_scope::is_scope_boundary(node) {
         return None;
     }
@@ -2253,6 +2317,11 @@ fn find_nested_variable_inference_before_usage(
 
         let assignment_rhs = assignment_rhs_for_var(child, var_name, source)
             .filter(|right| right.end_byte() <= usage_start);
+
+        if invalidating_write_for_var(child, var_name, usage_start, source) {
+            inferred = Some((child.start_byte(), VariableInference::default()));
+            continue;
+        }
 
         if let Some(info) = destructuring_inference_for_var(
             child,
@@ -2325,6 +2394,7 @@ fn find_nested_variable_inference_before_usage(
                 ));
             } else if let Some(type_info) =
                 infer_expression_type_info(right, source, file_symbols, resolver, callable_resolver)
+                    .or_else(|| infer_literal_expression_type_info(right, source))
             {
                 let resolved_type_fqn =
                     resolve_phpdoc_var_type(&type_info, right, source, file_symbols);
@@ -2337,6 +2407,8 @@ fn find_nested_variable_inference_before_usage(
                         type_info: Some(type_info),
                     },
                 ));
+            } else {
+                inferred = Some((child.start_byte(), VariableInference::default()));
             }
         }
 
@@ -2567,7 +2639,12 @@ fn destructuring_inference_for_var(
     if right.end_byte() > usage {
         return None;
     }
-    let path = crate::variable_scope::destructuring_path(left, var_name, source)?;
+    let (_, path) = crate::variable_scope::destructuring_binding_with_budget(
+        left,
+        var_name,
+        source,
+        budget::consume,
+    )?;
     let literal_value = literal_destructuring_value_text(source[right.byte_range()].trim(), &path);
     let mut ty = literal_value.map(|text| {
         infer_literal_value_type_text(text, right, source, symbols, resolver, callable_resolver)
@@ -2576,8 +2653,9 @@ fn destructuring_inference_for_var(
         ty = infer_expression_type_info(right, source, symbols, resolver, callable_resolver);
         for key in &path {
             ty = ty.and_then(|ty| {
-                key.as_deref()
-                    .and_then(|key| iterable_value_type_info(&ty, Some(key)))
+                key.as_deref().and_then(|key| {
+                    iterable_value_type_info(&ty, Some(&php_lsp_types::quote_shape_key_text(key)))
+                })
             });
         }
     }
@@ -2647,6 +2725,48 @@ fn assignment_rhs_for_var<'a>(stmt: Node<'a>, var_name: &str, source: &str) -> O
         Some(right)
     } else {
         None
+    }
+}
+
+/// Completed non-assignment writes whose previous object type cannot be retained.
+pub fn invalidating_write_for_var(node: Node, variable: &str, usage: usize, source: &str) -> bool {
+    let node = if node.kind() == "expression_statement" {
+        let mut cursor = node.walk();
+        let Some(child) = node
+            .named_children(&mut cursor)
+            .find(|child| !child.is_extra())
+        else {
+            return false;
+        };
+        child
+    } else {
+        node
+    };
+    if node.end_byte() > usage {
+        return false;
+    }
+    let direct = |target: Node| {
+        target.kind() == "variable_name" && source.get(target.byte_range()) == Some(variable)
+    };
+    match node.kind() {
+        "variable_name"
+            if direct(node) && crate::cst::is_by_ref_output_argument_variable(node, source) =>
+        {
+            let Some(argument) = crate::cst::ancestor_before_scope(node, "argument") else {
+                return false;
+            };
+            crate::variable_scope::argument_value_node(argument)
+                .is_some_and(|value| value.id() == node.id())
+                && crate::cst::ancestor_before_scope(node, "function_call_expression")
+                    .is_some_and(|call| call.end_byte() <= usage)
+        }
+        "augmented_assignment_expression" => node.child_by_field_name("left").is_some_and(direct),
+        "update_expression" | "unset_statement" => {
+            let mut cursor = node.walk();
+            let found = node.named_children(&mut cursor).any(direct);
+            found
+        }
+        _ => false,
     }
 }
 
@@ -6015,17 +6135,7 @@ fn foreach_variable_inference(
         return None;
     }
 
-    let key_node = foreach_key_variable_node(stmt, source).filter(|key_node| {
-        key_node.start_byte() <= usage_start
-            && normalize_var_name(&source[key_node.byte_range()]) == var_name
-    });
-    let value_node = foreach_value_variable_node(stmt, source).filter(|value_node| {
-        value_node.start_byte() <= usage_start
-            && normalize_var_name(&source[value_node.byte_range()]) == var_name
-    });
-    if key_node.is_none() && value_node.is_none() {
-        return None;
-    }
+    let binding = foreach_binding(stmt, var_name, usage_start, source)?;
 
     let iterable_node = foreach_iterable_node(stmt)?;
     let iterable_type = infer_expression_type_info(
@@ -6034,14 +6144,14 @@ fn foreach_variable_inference(
         file_symbols,
         resolver,
         callable_resolver,
-    )?;
-
-    let (type_info, variable_node) = if let Some(key_node) = key_node {
-        (iterable_key_type_info(&iterable_type)?, key_node)
-    } else {
-        let value_node = value_node?;
-        (iterable_value_type_info(&iterable_type, None)?, value_node)
+    );
+    let Some(type_info) = iterable_type
+        .as_ref()
+        .and_then(|ty| foreach_binding_type_info(ty, &binding))
+    else {
+        return Some(VariableInference::default());
     };
+    let variable_node = binding.variable;
 
     let resolved_type_fqn =
         resolve_phpdoc_var_type(&type_info, variable_node, source, file_symbols);
@@ -6062,47 +6172,6 @@ pub fn foreach_iterable_node(stmt: Node) -> Option<Node> {
         .named_children(&mut cursor)
         .find(|child| !child.is_extra());
     iterable.filter(|child| !child.is_error() && !child.is_missing())
-}
-
-fn foreach_value_variable_node<'a>(stmt: Node<'a>, source: &str) -> Option<Node<'a>> {
-    let value_expr = match crate::variable_scope::foreach_binding_target(stmt)? {
-        pair if pair.kind() == "pair" => {
-            let mut cursor = pair.walk();
-            let value = pair
-                .named_children(&mut cursor)
-                .filter(|child| !child.is_extra())
-                .last();
-            value?
-        }
-        value => value,
-    };
-    variable_node_in_foreach_part(value_expr, source)
-}
-
-fn foreach_key_variable_node<'a>(stmt: Node<'a>, source: &str) -> Option<Node<'a>> {
-    let pair = crate::variable_scope::foreach_binding_target(stmt)?;
-    if pair.kind() != "pair" {
-        return None;
-    }
-    let mut cursor = pair.walk();
-    let key = pair
-        .named_children(&mut cursor)
-        .find(|child| !child.is_extra())?;
-    variable_node_in_foreach_part(key, source)
-}
-
-fn variable_node_in_foreach_part<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
-    if node.kind() == "variable_name" && source[node.byte_range()].starts_with('$') {
-        return Some(node);
-    }
-    for i in 0..node.named_child_count() {
-        if let Some(child) = node.named_child(i) {
-            if let Some(found) = variable_node_in_foreach_part(child, source) {
-                return Some(found);
-            }
-        }
-    }
-    None
 }
 
 fn infer_textual_expression_type_info(

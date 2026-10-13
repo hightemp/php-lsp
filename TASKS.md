@@ -6553,3 +6553,39 @@ change.
   - Validation target: CARGO_BUILD_JOBS=1, --test-threads=1; one CPU, nice15 and transient MemoryHigh2G/MemoryMax3G/MemorySwapMax1G scopes. Preserve all prior audit/journal content.
   - Implemented: README, architecture, performance/baseline evidence and coverage matrix updated; original audit and prior journal retained. Matrix63 rows/150 valid local links. Historical coverage and 10k-workspace/latency samples remain unchanged.
   - Validation: final full Rust1685/1685 across54 test-result targets,0 ignored; Clippy --all-targets -D warnings, Rustfmt and diff check pass. Repeated read-only gpt-6-sol Verifier review returned final GO after checking source,19 regressions, release hash, full gates and real cold/warm profiles. Validated binary is ready; installation/restart of the user's existing VS Code server is a separate unperformed action.
+
+### Milestone: INFERENCE-REVIEW-2026-10-12 adjacent coverage and correctness review (2026-10-12 -> 2026-10-12)
+
+**Статус:** complete *(done 2026-10-12)*
+**Цель:** Recheck recursive receiver inference, foreach bindings and indexed references for adjacent defects and missing test scenarios; distinguish reproduced failures from unverified risks.
+
+#### Задачи
+
+- [x] **IIR-001-2026-10-12** Review relevant implementations and existing assertions, including declaration/call cursor selection, nested scopes, foreach targets and budget boundaries. *(done 2026-10-12)*
+  - Implemented: Codegraph/source review identifies foreach body writes, server capture barriers, unknown/scalar overwrites, property/offset targets, destructuring, CST recursion and two misleading test assertions. Findings are recorded as IIR-F01..F06, IIR-R01 and IIR-T01 in the appended audit section.
+- [x] **IIR-002-2026-10-12** Run bounded adversarial reproductions sequentially with CARGO_BUILD_JOBS=1 and --test-threads=1 where applicable; keep experiment artifacts isolated and avoid installed server/project changes. *(done 2026-10-12)*
+  - Validation: isolated debug and optimized parser probes each6PASS/9FAIL across15 finite cases; release stdio7 scenarios/12 assertions yield5PASS/7FAIL. Matching pre-fix LSP responses confirm the tested semantic issues predate eb1fbac. Deep CST aborts with512debug/1024optimized nesting on limited test-thread stacks; optimized failure reconfirmed with RUST_MIN_STACK2097152 and debugger. Default8MiB stdio passes1024; smaller-stack stdio is inconclusive. PHP8.5.11 same-name key/value and typed acyclic7-link controls pass. Artifacts under ignored server/target/inference-review-2026-10-12/.
+- [x] **IIR-003-2026-10-12** Record confirmed findings, test gaps and limits of evidence without rewriting original audit descriptions; complete documentation and diff checks. *(done 2026-10-12)*
+  - Implemented: original audit/journal bytes preserved; coverage document links the new gaps without changing matrix marks or historical percentages. Runtime and normal Cargo tests are unchanged; isolated RED probes are not counted as new CI coverage. Findings remain unfixed pending implementation work.
+  - Validation: reused gpt-6-sol Verifier returned GO for report accuracy, explicitly not product correctness, after independently checking source, logs, JSON, old/new comparisons and PHP controls. Diff check and151 local coverage links pass. The previous1685/1685 full Rust run remains the last complete baseline; no new full run was claimed for this documentation-only review.
+
+### Milestone: INFERENCE-FIX-2026-10-12 adjacent receiver inference TDD (2026-10-12 -> 2026-10-12)
+
+**Статус:** complete *(done 2026-10-12)*
+**Цель:** Implement IIR-F01..F06, IIR-R01 and IIR-T01 with permanent RED/GREEN regressions while preserving bounded work, lexical identity, exact references and existing symlink/snapshot protections.
+
+#### Задачи
+
+- [x] **IIF-001-2026-10-12** Add permanent failing regressions for foreach body writes, scope/captures, unknown/scalar overwrites, writable/destructured targets, deep CST, per-function fairness and real cache/call-site assertions. *(done 2026-10-12)*
+  - Implemented: 50 permanent tests (parser matrix27,budget6,stack1,server5,cache1,LSP10), plus two tightened existing call-site/cache assertions. Cases cover nested/duplicate/interpolated patterns, owner reads, output arguments, capture barriers, native receivers in64 later callables and current/stale PHPDoc.
+  - Validation: initial RED parser9/server3/LSP5, plus follow-up RED for stack, output/width, cache migration, duplicate bindings, hints, interpolation and local namespace aliases. Existing server tests caught10 current-write PHPDoc regressions; fixed before GREEN. Logs under ignored server/target/inference-fix-2026-10-12/.
+- [x] **IIF-002-2026-10-12** Fix shared parser/server inference and resource coordination without removing safety budgets; invalidate old semantic caches and verify exact type/reference targets. *(done 2026-10-12)*
+  - Implemented: shared reaching foreach bindings/paths, unknown-write invalidation, bounded CST scans, iterative reference traversal and original-derived namespace views. Callable reservations retain the 131072 hard file cap and nested/unwind ownership. Schema 37 rebuilds old references; debug events expose limited attempts without claiming complete inference coverage.
+  - Validation: parser583/583 +2MiB-stack subprocess1/1, server511/511, index116/116 and focused protocol10+1 pass. Reused gpt-6-sol Verifier approved final source deltas; full gates/profile/final evidence review remain in IIF-003.
+- [x] **IIF-003-2026-10-12** Cover buffer/cache transitions and deterministic concurrent edits/definitions, run focused then full sequential Rust gates, and repeat gpt-6-sol Verifier review to GO. *(done 2026-10-12)*
+  - Implemented: twenty two-worker barrier rounds verify coherent old/new definitions and exact final accepted targets; close restores disk references before buffer reopen, and warm-cache requests inspect a closed file before didOpen. Native-stack watchdog and thread-local budget barriers remain permanent.
+  - Validation: full Rust 1735/1735 across 56 test-result blocks, 0 ignored; post-run Clippy --all-targets -D warnings, Rustfmt and diff check pass. Schema 37 host release profile: 4160 files/32804 symbols/539 stubs, ready 26054.56ms cold/2055.73ms warm, 4160 warm hits, no indexing errors/traversal truncation. Repeated read-only gpt-6-sol Verifier returned final GO after independent source/tests/docs/log/profile checks.
+- [x] **IIF-004-2026-10-12** Append implementation evidence to the audit without overwriting findings, update resulting architecture/coverage documentation, and mark this milestone complete. *(done 2026-10-12)*
+  - Implemented: README, architecture, performance/baseline and coverage matrix updated; audit implementation appended after preserved findings. Scope quotas, unknown-type tradeoff, limit-attempt metrics and finite concurrency evidence are explicit. Matrix 64 rows/154 valid local links; historical coverage percentages and 10k-workspace samples unchanged.
+  - Validation: original audit/prior journal exact prefixes, new-file whitespace, links/anchors and release hash verified. Verifier final GO covers implementation, all gates and documented resource limits. Installed VS Code server and user-project files were not modified; no installation performed.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice15 and MemoryHigh2G/MemoryMax3G/MemorySwapMax1G transient scopes. Preserve pre-existing audit-review changes; installed server/project files stay untouched.

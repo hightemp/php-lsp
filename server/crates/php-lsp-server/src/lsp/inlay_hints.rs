@@ -667,14 +667,56 @@ pub(in crate::server) fn add_foreach_variable_type_inlay_hint(
     hints: &mut Vec<InlayHint>,
     seen: &mut HashSet<(u32, u32, String)>,
 ) {
-    let Some(value_node) = foreach_value_variable_node_for_inlay(statement, ctx.source) else {
-        return;
-    };
-    if !byte_ranges_overlap(node_range_node(value_node), ctx.requested_range) {
-        return;
-    }
-
-    add_local_variable_type_inlay_hint(ctx, value_node, value_node.end_byte(), None, hints, seen);
+    let _ = php_lsp_parser::resolve::within_type_scan_budget(|| {
+        let (key, value) = php_lsp_parser::variable_scope::foreach_targets(statement)?;
+        for target in key.into_iter().chain(std::iter::once(value)) {
+            let mut cursor = target.walk();
+            loop {
+                php_lsp_parser::resolve::within_type_scan_budget(|| Some(()))?;
+                if ctx
+                    .cancellation
+                    .is_some_and(OperationCancellationToken::is_cancelled)
+                {
+                    return None;
+                }
+                let node = cursor.node();
+                if node.kind() == "variable_name"
+                    && php_lsp_parser::resolve::foreach_binding(
+                        statement,
+                        node_text(ctx.source, node),
+                        node.start_byte(),
+                        ctx.source,
+                    )
+                    .is_some_and(|binding| binding.variable.id() == node.id())
+                    && byte_ranges_overlap(node_range_node(node), ctx.requested_range)
+                {
+                    add_local_variable_type_inlay_hint(
+                        ctx,
+                        node,
+                        node.end_byte(),
+                        None,
+                        hints,
+                        seen,
+                    );
+                }
+                if cursor.goto_first_child() {
+                    continue;
+                }
+                loop {
+                    if cursor.goto_next_sibling() {
+                        break;
+                    }
+                    if !cursor.goto_parent() {
+                        break;
+                    }
+                }
+                if cursor.node().id() == target.id() {
+                    break;
+                }
+            }
+        }
+        Some(())
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -956,10 +998,12 @@ pub(in crate::server) fn foreach_variable_inlay_type_from_index(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
 ) -> Option<LocalVariableInlayType> {
-    let foreach_stmt = enclosing_foreach_statement_for_variable(ctx.source, variable_node)?;
+    let (foreach_stmt, binding) =
+        php_lsp_parser::resolve::enclosing_foreach_binding(variable_node, ctx.source)?;
     let iterable_node = foreach_iterable_node_for_inlay(foreach_stmt)?;
     let iterable_type = server_expression_type_info(ctx, iterable_node)?;
-    let value_type = iterable_value_type_info(&iterable_type.type_info, None)?;
+    let value_type =
+        php_lsp_parser::resolve::foreach_binding_type_info(&iterable_type.type_info, &binding)?;
 
     local_variable_inlay_type_from_type_info(
         ctx,
@@ -974,41 +1018,8 @@ pub(in crate::server) fn enclosing_foreach_statement_for_variable<'tree>(
     source: &str,
     variable_node: tree_sitter::Node<'tree>,
 ) -> Option<tree_sitter::Node<'tree>> {
-    let variable_name = variable_text_for_node(source, variable_node)?;
-    let mut root = variable_node;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
-
-    let mut best = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "foreach_statement"
-            && variable_node.start_byte() >= node.start_byte()
-            && variable_node.end_byte() <= node.end_byte()
-            && foreach_value_variable_node_for_inlay(node, source)
-                .filter(|value_node| value_node.start_byte() <= variable_node.start_byte())
-                .and_then(|value_node| variable_text_for_node(source, value_node))
-                .as_deref()
-                == Some(variable_name.as_str())
-            && best
-                .map(|candidate: tree_sitter::Node| node.start_byte() > candidate.start_byte())
-                .unwrap_or(true)
-        {
-            best = Some(node);
-        }
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if variable_node.start_byte() >= child.start_byte()
-                && variable_node.start_byte() <= child.end_byte()
-            {
-                stack.push(child);
-            }
-        }
-    }
-
-    best
+    php_lsp_parser::resolve::enclosing_foreach_binding(variable_node, source)
+        .map(|(statement, _)| statement)
 }
 
 pub(in crate::server) fn foreach_iterable_node_for_inlay(
@@ -1566,11 +1577,13 @@ fn server_variable_type_info_inner(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
 ) -> Option<IndexedExpressionTypeInfo> {
-    if let Some(foreach_stmt) = enclosing_foreach_statement_for_variable(ctx.source, variable_node)
+    if let Some((foreach_stmt, binding)) =
+        php_lsp_parser::resolve::enclosing_foreach_binding(variable_node, ctx.source)
     {
         let iterable_node = foreach_iterable_node_for_inlay(foreach_stmt)?;
         let iterable_type = server_expression_type_info(ctx, iterable_node)?;
-        let value_type = iterable_value_type_info(&iterable_type.type_info, None)?;
+        let value_type =
+            php_lsp_parser::resolve::foreach_binding_type_info(&iterable_type.type_info, &binding)?;
         return Some(IndexedExpressionTypeInfo {
             type_info: value_type,
             owner_fqn: iterable_type.owner_fqn,
@@ -1578,7 +1591,7 @@ fn server_variable_type_info_inner(
         });
     }
 
-    if let Some(mut type_info) = server_variable_assignment_type_info(ctx, variable_node) {
+    if let Some(Some(mut type_info)) = server_variable_assignment_type_info(ctx, variable_node) {
         if let Some(narrowed) = php_lsp_parser::resolve::narrow_type_after_exit_guards(
             &type_info.type_info,
             local_variable_scope_node(variable_node),
@@ -1592,6 +1605,9 @@ fn server_variable_type_info_inner(
         return Some(type_info);
     }
 
+    // The parser supplies PHPDoc only for the reaching write. This preserves
+    // a current assignment's @var without reviving an older annotation after
+    // an unknown write or an aborted scan.
     call_site_variable_phpdoc_type(ctx, variable_node).map(|type_info| IndexedExpressionTypeInfo {
         type_info,
         owner_fqn: if node_inside_anonymous_class_body(variable_node, ctx.source) {
@@ -1607,20 +1623,20 @@ fn server_variable_type_info_inner(
 fn server_variable_assignment_type_info(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
-) -> Option<IndexedExpressionTypeInfo> {
+) -> Option<Option<IndexedExpressionTypeInfo>> {
     let variable_name = variable_text_for_node(ctx.source, variable_node)?;
     let scope = local_variable_scope_node(variable_node);
-    let (_, rhs) = latest_assignment_rhs_before_usage(
+    let (_, rhs) = latest_variable_write_before_usage(
         scope,
         &variable_name,
         variable_node.start_byte(),
         ctx.source,
     )?;
+    let Some(rhs) = rhs else {
+        return Some(None);
+    };
     let rhs = normalized_expression_node(rhs);
-    if rhs.kind() == "variable_name" {
-        return None;
-    }
-    server_expression_type_info(ctx, rhs)
+    Some(server_expression_type_info(ctx, rhs))
 }
 
 pub(in crate::server) fn doctrine_repository_call_type_info(
@@ -3140,40 +3156,6 @@ pub(in crate::server) fn is_plain_assignment_expression(
             .is_some_and(|between| between.trim() == "=")
 }
 
-pub(in crate::server) fn foreach_value_variable_node_for_inlay<'tree>(
-    statement: tree_sitter::Node<'tree>,
-    source: &str,
-) -> Option<tree_sitter::Node<'tree>> {
-    let value_expr = match php_lsp_parser::variable_scope::foreach_binding_target(statement)? {
-        pair if pair.kind() == "pair" => {
-            let mut cursor = pair.walk();
-            let value = pair
-                .named_children(&mut cursor)
-                .filter(|child| !child.is_extra())
-                .last();
-            value?
-        }
-        value => value,
-    };
-    variable_node_in_foreach_part_for_inlay(value_expr, source)
-}
-
-pub(in crate::server) fn variable_node_in_foreach_part_for_inlay<'tree>(
-    node: tree_sitter::Node<'tree>,
-    source: &str,
-) -> Option<tree_sitter::Node<'tree>> {
-    if node.kind() == "variable_name" && node_text(source, node).starts_with('$') {
-        return Some(node);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = variable_node_in_foreach_part_for_inlay(child, source) {
-            return Some(found);
-        }
-    }
-    None
-}
-
 pub(in crate::server) fn local_variable_hover_data(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
@@ -3272,6 +3254,16 @@ pub(in crate::server) fn latest_assignment_rhs_before_usage<'tree>(
     usage_start: usize,
     source: &str,
 ) -> Option<(usize, tree_sitter::Node<'tree>)> {
+    latest_variable_write_before_usage(node, variable_name, usage_start, source)
+        .and_then(|(position, rhs)| rhs.map(|rhs| (position, rhs)))
+}
+
+fn latest_variable_write_before_usage<'tree>(
+    node: tree_sitter::Node<'tree>,
+    variable_name: &str,
+    usage_start: usize,
+    source: &str,
+) -> Option<(usize, Option<tree_sitter::Node<'tree>>)> {
     let mut best = None;
     collect_latest_assignment_rhs_before_usage(
         node,
@@ -3289,7 +3281,32 @@ pub(in crate::server) fn collect_latest_assignment_rhs_before_usage<'tree>(
     variable_name: &str,
     usage_start: usize,
     source: &str,
-    best: &mut Option<(usize, tree_sitter::Node<'tree>)>,
+    best: &mut Option<(usize, Option<tree_sitter::Node<'tree>>)>,
+    is_scope_root: bool,
+) {
+    if php_lsp_parser::resolve::within_type_scan_budget(|| {
+        collect_latest_assignment_rhs_before_usage_inner(
+            node,
+            variable_name,
+            usage_start,
+            source,
+            best,
+            is_scope_root,
+        );
+        Some(())
+    })
+    .is_none()
+    {
+        *best = None;
+    }
+}
+
+fn collect_latest_assignment_rhs_before_usage_inner<'tree>(
+    node: tree_sitter::Node<'tree>,
+    variable_name: &str,
+    usage_start: usize,
+    source: &str,
+    best: &mut Option<(usize, Option<tree_sitter::Node<'tree>>)>,
     is_scope_root: bool,
 ) {
     if node.start_byte() > usage_start {
@@ -3302,13 +3319,23 @@ pub(in crate::server) fn collect_latest_assignment_rhs_before_usage<'tree>(
     if let Some(rhs) = assignment_rhs_for_variable_node(node, variable_name, source)
         .filter(|rhs| rhs.end_byte() <= usage_start)
     {
-        let candidate = (node.start_byte(), rhs);
+        let candidate = (node.start_byte(), Some(rhs));
         if best
             .as_ref()
             .is_none_or(|(best_start, _)| candidate.0 >= *best_start)
         {
             *best = Some(candidate);
         }
+    } else if php_lsp_parser::resolve::invalidating_write_for_var(
+        node,
+        variable_name,
+        usage_start,
+        source,
+    ) && best
+        .as_ref()
+        .is_none_or(|(position, _)| *position <= node.start_byte())
+    {
+        *best = Some((node.start_byte(), None));
     }
 
     let exiting_body =
@@ -3339,14 +3366,20 @@ pub(in crate::server) fn assignment_rhs_for_variable_node<'tree>(
     variable_name: &str,
     source: &str,
 ) -> Option<tree_sitter::Node<'tree>> {
-    if node.kind() != "assignment_expression" {
+    if !matches!(
+        node.kind(),
+        "assignment_expression"
+            | "reference_assignment_expression"
+            | "by_ref_assignment_expression"
+    ) {
         return None;
     }
     let left = node.child_by_field_name("left")?;
     let right = node.child_by_field_name("right")?;
     if left.kind() != "variable_name"
         || variable_text_for_node(source, left).as_deref() != Some(variable_name)
-        || !is_plain_assignment_expression(left, right, source)
+        || node.kind() == "assignment_expression"
+            && !is_plain_assignment_expression(left, right, source)
     {
         return None;
     }

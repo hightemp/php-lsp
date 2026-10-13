@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 36;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 37;
 const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3998;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x65c08bb722be8da3;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x62072c1dce11bb66;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -591,6 +591,58 @@ fn cache_schema35_reparses_foreach_binding_receivers() {
     assert_eq!(
         report.loaded_files, 0,
         "pre-fix foreach receiver metadata must be rebuilt"
+    );
+    assert_eq!(report.parse_files, vec![file]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cache_rebuilds_schema36_and_preserves_foreach_body_write_receivers() {
+    let root = unique_temp_dir("foreach-body-receivers");
+    let file = root.join("Loop.php");
+    let source="<?php class Item{function run(){}} class Other{function run(){}} /** @param Item[] $rows */ function walk(array $rows){foreach($rows as $value){$value=new Other;$value->run();}}";
+    fs::write(&file, source).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let symbols = php_lsp_parser::symbols::extract_file_symbols(tree, source, &uri);
+    let refs =
+        php_lsp_parser::references::collect_symbol_references_in_file(tree, source, &symbols);
+    assert!(refs
+        .iter()
+        .any(|reference| !reference.is_declaration && reference.target_fqn == "Other::run"));
+    assert!(!refs
+        .iter()
+        .any(|reference| !reference.is_declaration && reference.target_fqn == "Item::run"));
+    let index = WorkspaceIndex::new();
+    update_disk_file_with_references(&index, &file, &uri, symbols, refs.clone());
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let path = root.join("index.bin");
+    save_cache_atomic(&path, &cache).unwrap();
+    let restored = WorkspaceIndex::new();
+    assert_eq!(
+        load_valid_cached_files(
+            &restored,
+            &path,
+            &root,
+            std::slice::from_ref(&file),
+            &config
+        )
+        .loaded_files,
+        1
+    );
+    assert_eq!(*restored.read().file_references().get(&uri).unwrap(), refs);
+    let mut legacy = cache;
+    legacy.schema_version = 36;
+    save_cache_atomic(&path, &legacy).unwrap();
+    let stale = WorkspaceIndex::new();
+    let report =
+        load_valid_cached_files(&stale, &path, &root, std::slice::from_ref(&file), &config);
+    assert_eq!(
+        report.loaded_files, 0,
+        "schema36 may contain stale or unfairly truncated receiver references"
     );
     assert_eq!(report.parse_files, vec![file]);
     fs::remove_dir_all(root).unwrap();

@@ -157,6 +157,8 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_hierarchy.rs` | call hierarchy and type hierarchy. |
 | `tests/e2e_call_hierarchy_receivers.rs` | receiver/declaration identity, inheritance/private/trait access, unknown targets, nullsafe/constructor/recursive calls, first-class callable exclusions and UTF-16/CRLF updates. |
 | `tests/e2e_indexing.rs` | watched files, file operations, workspace folders, index-related inference. |
+| `tests/e2e_inference_budget.rs` | bounded unknown receiver chains, cold/warm completion, asserted cache hits and exact references in a closed file before didOpen. |
+| `tests/e2e_inference_bindings.rs` | reaching foreach writes, captures, writable/destructured targets, hover/definition/completion/references/inlays, close-to-disk restoration and bounded concurrent edit/definition rounds. |
 | `tests/e2e_templates.rs` | Blade/Twig virtual PHP behavior. |
 
 Run all split protocol tests with:
@@ -283,18 +285,41 @@ arrow-local assignments inside expressions.
 
 Foreach key/value bindings apply from their declaration onward; an iterable
 that reuses its value's name retains the earlier receiver type. Parser and
-server share the iterable/target lookup, skipping comments and binding at the
-actual `as` token. Both inference layers share synchronous depth and work limits:
-at most 64 nested
-inference entries and 8192 charged entries/statement-scan steps per outer
-inference. Reference collection additionally shares 131072 steps per file,
-including nested collectors. Exhaustion is sticky for the active inference:
-partial earlier types are discarded and affected instance references remain
-unresolved. Declarations and directly named references still traverse normally.
-Thread-local counters contain no source/type data, reset for independent calls
-and files, and use RAII cleanup on unwind. These operation limits bound repeated
-inference expansion; they are not a wall-clock timeout or a cost bound for every
-individual helper.
+server share target identity and static destructuring paths, skipping comments
+and binding at the actual `as` token. Property/offset owners remain reads.
+Each written destructuring variable gets its own field type, including nested
+patterns and positional holes; a repeated variable uses the last written field.
+Dynamic keys, including interpolated strings, have unknown field types. Later
+completed writes inside a loop replace the element type, and unknown/scalar,
+unset or supported reference-output writes invalidate an earlier object type.
+A completed loop body's assignment is not treated as a definite post-loop write.
+Server foreach lookup follows the same lexical and capture barriers as parser
+inference, with by-value capture types taken before callable creation.
+
+Both inference layers share synchronous limits: at most 64 nested inference or
+recursive CST-scan entries and 8192 charged entries/statement-scan steps per
+outer inference. Pattern lookup and server foreach hints debit the same work
+budget. Reference collection first inventories callable scopes with a linear
+cursor traversal, then reserves equal shares of a hard 131072-step file budget
+for the global scope and each callable. Nested collectors share that file cap;
+nested callable exits restore the parent's remaining share without refunding
+file work. A costly sibling cannot consume another callable's reservation.
+Equal shares can still leave large callables unresolved in files with many
+scopes; this is a conservative precision limit, not complete type coverage.
+
+Exhaustion is sticky for the active inference: partial earlier types are
+discarded and affected instance references remain unresolved. Declarations and
+directly named references still traverse normally. The reference walker uses
+an iterative TreeCursor, preserving named-child order and callable entry/exit
+without growing the native stack with CST depth. Namespace views are derived
+from the original file metadata so section transitions retain their own imports
+and PHPDoc aliases. Thread-local counters contain no source/type data, reset
+for independent calls and files, and use RAII cleanup on unwind. A debug
+`receiver inference limited` event reports the file URI, charged work, scope
+quota and limit events during reference collection. Limit events count attempts,
+not unique missing links; they are not persisted as cache coverage metadata.
+These operation limits bound repeated inference expansion, not wall time or
+every helper's individual cost.
 
 Local PHPDoc type inference carries the class-like owner at the variable's byte
 range, together with the active namespace/import section. Hover and foreach
@@ -1017,10 +1042,12 @@ with the old precedence and references derived by guessing their first object
 branch. Schema 34 invalidated receivers inferred from the former
 text-based instanceof guard/exit heuristics. Schema 35 invalidated
 shape keys and receiver references derived from first-field fallback or
-lossy key normalization. Current schema 36 invalidates receiver references
+lossy key normalization. Schema 36 invalidated receiver references
 derived from premature foreach bindings or partial inference beyond the work
-and depth budgets. These semantic changes did not
-alter the serialized field layout.
+and depth budgets. Current schema 37 invalidates receivers derived from stale
+assignments, incorrect foreach targets/destructuring or lost namespace aliases,
+and references omitted by unfair file-budget consumption. These semantic
+changes did not alter the serialized field layout.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

@@ -358,7 +358,8 @@ binding (schema 31; 2026-10-09), constant-expression roles
 (schema 32; 2026-10-09), conditional PHPDoc specialization
 (schema 33; 2026-10-09), proven instanceof guard binding
 (schema 34; 2026-10-09), exact shape-key binding (schema 35; 2026-10-12),
-or bounded foreach/receiver inference (schema 36; 2026-10-12).
+bounded foreach/receiver inference (schema 36; 2026-10-12), or shared foreach
+bindings and callable budget reservations (schema 37; 2026-10-12).
 
 ### Large Workspace Latency
 
@@ -546,3 +547,45 @@ documented in `architecture.md`.
 This verifies completion for this project, including warm cache replay. It
 does not refresh the historical 10k-workspace timing, measure editor request
 latency under load, or prove every PHP source has bounded helper cost.
+
+## Adjacent Receiver-Inference Validation (2026-10-12)
+
+Source: `eb1fbac` plus the IIR-F01..F06/R01/T01 implementation working tree,
+cache schema 37. This is a separate run from the schema 36 incident profile
+above. The host release was built with `CARGO_BUILD_JOBS=1`; both profiles
+ran sequentially on one CPU, nice15, MemoryHigh2G/MemoryMax3G/MemorySwapMax1G.
+The same local `bdpn-ui/app`, `client/stubs` and
+`PortingProcessWorkflowService.php` probe were used, with a fresh isolated XDG
+cache. Parser debug logging was enabled to observe inference limits.
+No installed server restart/replacement or project-file changes were performed.
+
+| Measurement | Cold | Warm |
+|---|---:|---:|
+| Indexed files / symbols | 4160 / 32804 | 4160 / 32804 |
+| Stub files | 539 | 539 |
+| Workspace files loaded from cache | 0 | 4160 |
+| Process start to ready | 26054.56 ms | 2055.73 ms |
+| Server indexing elapsed | 21858 ms | 1489 ms |
+| First diagnostic publication after open | 184.56 ms | 237.03 ms |
+| Peak RSS | 792338432 bytes | 833437696 bytes |
+| Indexing errors / traversal truncation | 0 / false | 0 / false |
+
+Artifacts: `server/target/inference-fix-2026-10-12/profile/bdpn-adjacent-{cold,warm}.json`
+and corresponding stderr logs. The unstripped host binary has SHA256
+`4c16d3e4bb1d9e3d8f2a3637b20f4739d785b8dd5953ecd5c55c07018ab1cf1b`
+and Build ID `51948a3819b545ee45247b3a1bd73b1d2d2748ec`.
+
+Cold reference collection emitted 248 inference-limit reports for 243 distinct
+workspace source URIs, totalling 6424 limited attempts. The largest reported
+charged work was 76388, within the hard file cap of 131072. The warm run emitted
+five reports for the reopened probe, totalling 205 attempts. These are parse
+attempt metrics, not counts of unique missing links; warm replay does not
+recompute or report inference coverage for cached files. Symbols/file counts
+and `truncated=false` therefore do not establish complete receiver resolution.
+Summary: `profile/inference-limits-summary.json` in the same artifact directory.
+
+This run verifies completion and full warm cache hits for the selected 4160
+files. It does not refresh the historical 10k-workspace or interactive-latency
+baseline, and the internal equal-scope quotas retain a precision tradeoff for
+large callables. See [the inference contract](architecture.md#shared-invariants)
+for operation/depth limits and conservative unknown types.

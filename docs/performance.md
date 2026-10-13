@@ -39,7 +39,8 @@ binding (schema 31; 2026-10-09), constant-expression roles
 (schema 32; 2026-10-09), conditional PHPDoc specialization
 (schema 33; 2026-10-09), proven instanceof guard binding
 (schema 34; 2026-10-09), exact shape-key binding (schema 35; 2026-10-12),
-or bounded foreach/receiver inference (current schema 36; 2026-10-12).
+bounded foreach/receiver inference (schema 36; 2026-10-12), or shared foreach
+bindings and callable budget reservations (current schema 37; 2026-10-12).
 
 A separate real-project incident profile (2026-10-12) verifies schema 36 on
 4160 indexed files with one CPU: ready in 39.13s cold and 2.19s warm, with all
@@ -47,6 +48,15 @@ A separate real-project incident profile (2026-10-12) verifies schema 36 on
 [the incident evidence](production-baseline.md#indexing-receiver-inference-incident-2026-10-12).
 This smaller constrained run does not refresh the historical 10k-workspace
 performance or interactive-latency baseline.
+
+The subsequent schema 37 validation (2026-10-12) indexed the same 4160 selected
+files and 32804 symbols on one CPU, reaching ready in 26.05s cold and 2.06s
+warm, with all 4160 files loaded from cache on the second run. See
+[the adjacent-inference validation](production-baseline.md#adjacent-receiver-inference-validation-2026-10-12).
+Debug logs record limited inference attempts in 243 distinct source URIs on
+the cold run; file/symbol counts do not imply complete receiver resolution.
+This run also leaves the historical 10k-workspace and request-latency samples
+unchanged.
 
 ## Latest Performance Acceptance Snapshot
 

@@ -2,56 +2,152 @@
 use crate::cst::{ancestor_field_contains, is_by_ref_output_argument_variable, node_contains};
 use tree_sitter::Node;
 
-/// Static element path written by a destructuring target. Dynamic keys remain unknown.
-pub(crate) fn destructuring_path(
-    target: Node<'_>,
+const MAX_BINDING_PATTERN_NODES: usize = 8192;
+
+/// A local variable written by a plain/reference/destructuring target, plus
+/// its element path. Property/offset owners and destructuring keys are reads.
+pub fn destructuring_binding<'tree>(
+    target: Node<'tree>,
     variable: &str,
     source: &str,
-) -> Option<Vec<Option<String>>> {
+) -> Option<(Node<'tree>, Vec<Option<String>>)> {
+    destructuring_binding_with_budget(target, variable, source, || true)
+}
+
+/// Type consumers charge each visited pattern node to their shared work budget.
+pub fn destructuring_binding_with_budget<'tree>(
+    target: Node<'tree>,
+    variable: &str,
+    source: &str,
+    charge: impl FnMut() -> bool,
+) -> Option<(Node<'tree>, Vec<Option<String>>)> {
+    destructuring_binding_before_with_budget(target, variable, usize::MAX, source, charge)
+}
+
+/// Select the last matching write visible at this source position.
+pub fn destructuring_binding_before_with_budget<'tree>(
+    target: Node<'tree>,
+    variable: &str,
+    before: usize,
+    source: &str,
+    mut charge: impl FnMut() -> bool,
+) -> Option<(Node<'tree>, Vec<Option<String>>)> {
+    let mut remaining = MAX_BINDING_PATTERN_NODES;
+    binding_in_pattern(
+        target,
+        variable,
+        before,
+        source,
+        0,
+        &mut remaining,
+        &mut charge,
+    )
+}
+
+fn binding_in_pattern<'tree>(
+    target: Node<'tree>,
+    variable: &str,
+    before: usize,
+    source: &str,
+    depth: usize,
+    remaining: &mut usize,
+    charge: &mut impl FnMut() -> bool,
+) -> Option<(Node<'tree>, Vec<Option<String>>)> {
+    const MAX_PATTERN_DEPTH: usize = 64;
+    if depth >= MAX_PATTERN_DEPTH || *remaining == 0 || !charge() {
+        return None;
+    }
+    *remaining -= 1;
     if target.kind() == "variable_name" {
-        return (normalize_var_name(&source[target.byte_range()]) == variable).then(Vec::new);
+        return (target.start_byte() <= before
+            && normalize_var_name(&source[target.byte_range()]) == variable)
+            .then(|| (target, Vec::new()));
     }
     if target.kind() == "by_ref" {
-        return target
-            .named_child(0)
-            .and_then(|child| destructuring_path(child, variable, source));
+        let mut cursor = target.walk();
+        let child = target
+            .named_children(&mut cursor)
+            .find(|child| !child.is_extra())?;
+        return binding_in_pattern(
+            child,
+            variable,
+            before,
+            source,
+            depth + 1,
+            remaining,
+            charge,
+        );
     }
-    if target.kind() != "list_literal" {
+    if target.kind() != "list_literal"
+        && !(target.kind() == "array_creation_expression"
+            && source[target.byte_range()].trim_start().starts_with('['))
+    {
         return None;
     }
     let mut segments = vec![Vec::new()];
     let mut cursor = target.walk();
     for child in target.children(&mut cursor) {
+        if *remaining == 0 || !charge() {
+            return None;
+        }
+        *remaining -= 1;
         if child.kind() == "," {
             segments.push(Vec::new());
         } else if !child.is_extra() {
             segments.last_mut().unwrap().push(child);
         }
     }
+    let mut found = None;
     for (index, segment) in segments.into_iter().enumerate() {
-        let nodes = segment
+        let mut nodes = segment
             .iter()
             .copied()
             .filter(|node| node.is_named())
             .collect::<Vec<_>>();
+        let mut keyed = segment.iter().any(|node| node.kind() == "=>");
+        if let Some(element) = nodes
+            .last()
+            .copied()
+            .filter(|node| node.kind() == "array_element_initializer")
+        {
+            let mut cursor = element.walk();
+            keyed = element
+                .children(&mut cursor)
+                .any(|child| child.kind() == "=>");
+            let mut cursor = element.walk();
+            nodes = element
+                .named_children(&mut cursor)
+                .filter(|node| !node.is_extra())
+                .collect();
+        }
         let Some(value) = nodes.last().copied() else {
             continue;
         };
-        let Some(mut rest) = destructuring_path(value, variable, source) else {
+        let Some((binding, mut rest)) = binding_in_pattern(
+            value,
+            variable,
+            before,
+            source,
+            depth + 1,
+            remaining,
+            charge,
+        ) else {
             continue;
         };
-        let key = if segment.iter().any(|node| node.kind() == "=>") {
+        let key = if keyed {
             nodes
                 .first()
                 .filter(|node| matches!(node.kind(), "string" | "encapsed_string" | "integer"))
-                .map(|node| php_lsp_types::normalize_shape_key_text(&source[node.byte_range()]))
+                .and_then(|node| {
+                    crate::resolve::normalize_array_access_key(&source[node.byte_range()])
+                })
         } else {
             Some(index.to_string())
         };
         rest.insert(0, key);
-        return Some(rest);
+        found = Some((binding, rest));
     }
-    None
+    found
 }
 
 /// Closest callable, class body, or program containing this node.
@@ -70,6 +166,15 @@ pub fn lexical_scope(mut node: Node<'_>) -> Node<'_> {
     }
 }
 
+/// Canonical callable boundary for traversal accounting (one quota per closure).
+pub fn is_callable_scope(node: Node) -> bool {
+    is_variable_scope_node(node)
+        && !(node.kind() == "anonymous_function"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "anonymous_function_creation_expression"))
+}
+
 /// Stop traversal into a nested callable or class body, but keep constructor arguments.
 pub fn is_scope_boundary(node: Node<'_>) -> bool {
     is_variable_scope_node(node)
@@ -83,7 +188,7 @@ pub fn is_scope_boundary(node: Node<'_>) -> bool {
         )
 }
 
-pub(crate) fn captured_parent<'tree>(
+pub fn captured_parent<'tree>(
     scope: Node<'tree>,
     source: &str,
     variable: &str,
@@ -106,7 +211,7 @@ pub(crate) fn captured_parent<'tree>(
 }
 
 /// Reference capture is an alias whose future value cannot be frozen at creation.
-pub(crate) fn capture_is_by_reference(scope: Node<'_>, variable: &str, source: &str) -> bool {
+pub fn capture_is_by_reference(scope: Node<'_>, variable: &str, source: &str) -> bool {
     let mut cursor = scope.walk();
     for clause in scope
         .named_children(&mut cursor)
@@ -230,7 +335,7 @@ pub(crate) fn is_closure_capture_token(node: Node) -> bool {
 }
 
 pub(crate) fn is_variable_declaration(node: Node, source: &str, var_name: &str) -> bool {
-    if is_foreach_binding_variable(node)
+    if is_foreach_binding_variable(node, source)
         || is_by_ref_output_binding_variable(node, source)
         || is_assignment_binding_variable(node)
         || ancestor_field_contains(node, "catch_clause", &["name", "variable"])
@@ -265,13 +370,47 @@ pub(crate) fn is_variable_declaration(node: Node, source: &str, var_name: &str) 
     }
 }
 
-pub(crate) fn is_foreach_binding_variable(node: Node) -> bool {
+/// Whether this exact variable node is a local foreach target rather than a read.
+pub fn is_foreach_binding_variable(node: Node, source: &str) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == "foreach_statement" {
-            return foreach_binding_target(parent)
-                .filter(|target| node_contains(*target, node))
-                .is_some_and(|target| is_writable_target_variable(node, target));
+            return foreach_targets(parent).is_some_and(|(key, value)| {
+                key.into_iter().chain(std::iter::once(value)).any(|target| {
+                    let mut branch = node;
+                    loop {
+                        if branch.id() == target.id() {
+                            return true;
+                        }
+                        let Some(parent) = branch.parent() else {
+                            return false;
+                        };
+                        if !node_contains(target, parent) {
+                            return false;
+                        }
+                        match parent.kind() {
+                            "by_ref" => {}
+                            "list_literal" => {
+                                if !list_literal_has_writable_variable(parent, node) {
+                                    return false;
+                                }
+                            }
+                            "array_element_initializer" => {
+                                if !array_element_initializer_has_writable_variable(parent, node) {
+                                    return false;
+                                }
+                            }
+                            "array_creation_expression" => {
+                                if !source[parent.byte_range()].trim_start().starts_with('[') {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        }
+                        branch = parent;
+                    }
+                })
+            });
         }
         if is_variable_scope_node(parent) || parent.kind() == "program" {
             return false;
@@ -295,6 +434,21 @@ pub fn foreach_binding_target(statement: Node) -> Option<Node> {
         }
     }
     None
+}
+
+/// Foreach key/value expressions, excluding comment nodes.
+pub fn foreach_targets(statement: Node) -> Option<(Option<Node>, Node)> {
+    let target = foreach_binding_target(statement)?;
+    if target.kind() != "pair" {
+        return Some((None, target));
+    }
+    let mut cursor = target.walk();
+    let mut children = target
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra());
+    let key = children.next()?;
+    let value = children.last()?;
+    Some((Some(key), value))
 }
 
 pub(crate) fn is_assignment_binding_variable(node: Node) -> bool {

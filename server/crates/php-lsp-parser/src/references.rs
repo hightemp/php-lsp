@@ -192,7 +192,7 @@ pub fn collect_symbol_references_in_file_with_resolvers(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Vec<SymbolReference> {
-    let _inference_budget = crate::resolve::budget::FileInferenceBudget::enter();
+    let _inference_budget = crate::resolve::budget::FileInferenceBudget::for_tree(tree.root_node());
     let mut references = Vec::new();
 
     for symbol in &file_symbols.symbols {
@@ -223,6 +223,22 @@ pub fn collect_symbol_references_in_file_with_resolvers(
         resolver,
         callable_resolver,
     );
+    if let Some(report) = _inference_budget
+        .report()
+        .filter(|report| report.limit_events > 0)
+    {
+        tracing::debug!(
+            file_uri = file_symbols
+                .symbols
+                .first()
+                .map(|symbol| symbol.uri.as_str())
+                .unwrap_or(""),
+            charged_work = report.charged_work,
+            scope_quota = report.scope_quota,
+            limit_events = report.limit_events,
+            "receiver inference limited"
+        );
+    }
     sort_and_dedup_symbol_references(&mut references);
     references
 }
@@ -300,11 +316,89 @@ fn collect_symbol_references_walk(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) {
-    let start = node.start_position();
-    let scoped_file_symbols =
-        file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
-    let file_symbols = scoped_file_symbols.as_ref();
+    let mut cursor = node.walk();
+    let mut active_scope = None;
+    let mut scoped = std::borrow::Cow::Borrowed(file_symbols);
+    let mut callables = Vec::new();
+    loop {
+        let current = cursor.node();
+        let start = current.start_position();
+        let section = file_symbols
+            .namespace_scope_at_byte_position(start.row as u32, start.column as u32)
+            .map(|scope| scope.range);
+        if active_scope != Some(section) {
+            // Re-scope the original metadata, never a view whose aliases and
+            // imports were already filtered. Keep only the current section's
+            // view instead of cloning the full symbol table per CST node.
+            scoped = file_symbols.scoped_at_byte_position(start.row as u32, start.column as u32);
+            active_scope = Some(section);
+        }
+        if crate::variable_scope::is_callable_scope(current) {
+            callables.push((
+                current.id(),
+                crate::resolve::budget::CallableInferenceBudget::enter(),
+            ));
+        }
+        collect_symbol_reference_node(
+            tree,
+            current,
+            source,
+            scoped.as_ref(),
+            references,
+            resolver,
+            callable_resolver,
+        );
+        if first_named_child(&mut cursor) {
+            continue;
+        }
+        loop {
+            let leaving = cursor.node().id();
+            if callables.last().is_some_and(|(id, _)| *id == leaving) {
+                callables.pop();
+            }
+            if next_named_sibling(&mut cursor) {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
+    }
+}
 
+fn first_named_child(cursor: &mut tree_sitter::TreeCursor<'_>) -> bool {
+    if !cursor.goto_first_child() {
+        return false;
+    }
+    loop {
+        if cursor.node().is_named() {
+            return true;
+        }
+        if !cursor.goto_next_sibling() {
+            cursor.goto_parent();
+            return false;
+        }
+    }
+}
+
+fn next_named_sibling(cursor: &mut tree_sitter::TreeCursor<'_>) -> bool {
+    while cursor.goto_next_sibling() {
+        if cursor.node().is_named() {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_symbol_reference_node(
+    tree: &Tree,
+    node: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    references: &mut Vec<SymbolReference>,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) {
     if node.kind() == "namespace_definition" {
         if let Some((function_name, selection)) = namespace_relative_function_call(node, source) {
             push_symbol_reference(
@@ -585,19 +679,6 @@ fn collect_symbol_references_walk(
             push_constant_reference_if_plain_name(node, source, file_symbols, references);
         }
         _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_symbol_references_walk(
-            tree,
-            child,
-            source,
-            file_symbols,
-            references,
-            resolver,
-            callable_resolver,
-        );
     }
 }
 

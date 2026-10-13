@@ -2992,3 +2992,294 @@ constructor, выход vendor metadata за containment и комбинатор
 
 *Отчёт подготовлен Codex (OpenAI). Runtime-код проекта в рамках аудита не
 изменялся.*
+
+## Дополнительная проверка receiver inference и покрытия (2026-10-12)
+
+Основание: commit `eb1fbac`, после исправления зависания индексации.
+Область: parser/server type inference, foreach bindings, сбор instance references,
+границы scopes и depth/work/file budgets. Исходные finding descriptions выше
+сохранены. Runtime-код и штатные Cargo tests в этом проходе не изменялись.
+
+Эксперименты находятся в игнорируемом
+`server/target/inference-review-2026-10-12/`: `probes.rs`,
+`parser-probes-final.log`, `parser-probes-release.log`, `lsp-results.json`,
+`lsp-checks.json`, `old-lsp-results.json`, `deep-stacks.txt` и `deep-*.log`.
+Это отдельные audit probes, а не новые прошедшие CI-регрессии.
+Они запускались последовательно, на одном CPU, с nice15 и ограничениями
+MemoryHigh2G/MemoryMax3G/MemorySwapMax1G; тестовые harnesses используют
+`--test-threads=1`, сборки — `CARGO_BUILD_JOBS=1`.
+Установленный сервер и файлы пользовательского проекта не менялись.
+
+| Проверка | Результат |
+|---|---|
+| 15 ограниченных parser probes, debug и optimized | 6 PASS / 9 FAIL в обоих вариантах; stack probe исключён и запускался отдельно |
+| Release stdio LSP, 7 коротких сценариев | 12 проверок hover/definition: 5 PASS / 7 FAIL |
+| Те же 7 LSP-сценариев на сохранённом бинарнике до исправления | Ответы hover/definition совпадают; проверенные семантические ошибки существовали раньше |
+| 512 вложенных if, debug parser, обычный test-thread stack | Abort из-за stack overflow; debugger указывает на `find_nested_variable_inference_before_usage` |
+| 1024 вложенных if, optimized parser, явно заданный RUST_MIN_STACK=2097152 | Abort из-за stack overflow; debugger подтверждает ту же CST scan recursion |
+| 1024 вложенных if, release stdio LSP со стандартным стеком 8 МиБ | PASS: hover вернул `Known`; падение стандартного LSP этим примером не подтверждено |
+| PHP 8.5.11, одинаковое имя key/value в foreach | Результат — строковый key; гипотеза об ошибке при выборе key отвергнута |
+| Полностью типизированная ациклическая цепочка из 7 присваиваний | PASS: тип `Node` сохранён |
+
+Предыдущий полный Rust-набор 1685/1685 относится к зафиксированному исправлению.
+В этом проходе полный набор повторно не запускался: менялись только отчёт и
+журнал, новые проверки изолированы от Cargo suite. Их RED-результаты показывают
+пробелы прежнего набора, а не заменяют его validation record.
+
+### IIR-F01 (P1): присваивание внутри foreach не заменяет тип элемента
+
+Источник: `php-lsp-parser/src/resolve.rs:2094-2104` и
+`:6005-6053`. Успешный `foreach_variable_inference` вызывает `continue`
+до сканирования тела, поэтому более позднее присваивание в теле теряется.
+
+```php
+/** @param Item[] $rows */
+function walk(array $rows) {
+    foreach ($rows as $value) {
+        $value = new Other;
+        $value->run();
+    }
+}
+```
+
+Ожидание: `Other` / `Other::run`. Parser возвращает `Item`.
+Release LSP подтверждает рассогласование: hover показывает `Other $value`,
+definition ведёт к `Item::run`. Необходимы проверки обеих функций и точного
+range цели после присваивания, включая nested if и несохранённые изменения.
+
+### IIR-F02 (P1): серверный foreach lookup протекает через границы функций
+
+Источник: `php-lsp-server/src/lsp/inlay_hints.rs:973-1011`,
+`:1565-1578` и `:3223-3236`. Поиск проверяет текстовое вложение позиции и имя,
+но не lexical scope / capture identity. Внешний foreach получает приоритет
+перед типом независимого параметра или отсутствующим capture.
+
+```php
+/** @var Item[] $rows */ $rows = [];
+foreach ($rows as $value) {
+    function separate(Other $value) { $value->run(); }
+    $shadow = function (Other $value) { $value->run(); };
+    $uncaptured = function () { $value->run(); };
+}
+```
+
+Release LSP: в первых двух вложенных callables hover ошибочно показывает
+`Item` вместо `Other`, хотя definition находит `Other::run`. В uncaptured
+closure ошибочны оба результата: hover — `Item`, definition — `Item::run`.
+Parser-контроль с named function и native `Other` проходит: проблема в
+серверном fallback/приоритете, а не во всех общих scope helpers.
+Нужна матрица named/anonymous/arrow/anonymous-class scopes с независимыми
+параметрами, без capture, с explicit use и implicit arrow capture.
+
+### IIR-F03 (P1): неизвестное или scalar-присваивание оставляет старый object type
+
+Источник: `php-lsp-parser/src/resolve.rs:2118-2180`,
+`:2254-2340` и `:3030-3040`. Когда новое присваивание либо foreach binding
+не выводит тип, `None` означает отсутствие обновления и сохраняет прежний
+`VariableInference`. Для clone отдельный путь уже заменяет старое значение,
+но обычные присваивания не имеют такой гарантии.
+
+```php
+$value = new Known;
+$value = $unknown; // либо $value = 42
+echo $value;
+
+$value = new Known;
+foreach ($unknown as $value) { echo $value; }
+```
+
+Все три parser probes сохраняют `Known`. Release hover после `= 42` также
+показывает `Known $value`. Требуется различать «нет записи», «новая запись с
+неизвестным типом» и «анализ прерван бюджетом». Проверки должны исключать
+старую точную привязку после каждой формы записи, включая refs/unset и
+переиндексацию кеша.
+
+### IIR-F04 (P1): property/offset target foreach превращает base variable в binding
+
+Источник: `php-lsp-parser/src/resolve.rs:6067-6105` и
+`php-lsp-server/src/lsp/inlay_hints.rs:3143-3174`. Helper рекурсивно выбирает
+первый `variable_name` из target-expression, не отличая запись самого
+binding от чтения объекта/контейнера.
+
+```php
+/** @param Item[] $rows */
+function walk(array $rows) {
+    $holder = new Holder;
+    foreach ($rows as $holder->child) { $holder->run(); }
+}
+// Также воспроизведено с Holder extends ArrayObject и target $holder[0].
+```
+
+Ожидание: объект остаётся `Holder`. Parser присваивает base variable тип `Item`.
+Release LSP показывает `Holder` в hover, но definition ведёт к `Item::run`.
+Нужны writable-target tests с plain variable, by-reference variable,
+property/offset owners и динамическими ключами; чтения target нельзя
+регистрировать как новые локальные bindings.
+
+### IIR-F05 (P2): foreach destructuring не выводит тип каждого поля
+
+Источник: `php-lsp-parser/src/resolve.rs:6042-6043`, `:6067-6105`.
+Вместо сопоставления путей отдельных bindings helper выбирает первую
+переменную и присваивает ей весь iterable value type.
+
+```php
+/** @param array<int,array{first:Item,second:Other}> $rows */
+function walk(array $rows) {
+    foreach ($rows as ['first' => $first, 'second' => $second]) {
+        echo $first;
+        echo $second;
+    }
+}
+```
+
+Parser возвращает для `$first` весь `array{first: Item, second: Other}`,
+для `$second` — `None`. Ожидание: `Item` и `Other`.
+Проверки definition существующих destructuring bindings не доказывают
+корректность их типов. Нужны positional/keyed/nested patterns и несколько
+bindings, проверяемых отдельно через parser, completion, hover и references.
+
+### IIR-F06 (P2, зависит от размера стека): CST scan обходит ограничитель глубины
+
+Источник: `php-lsp-parser/src/resolve.rs:2219-2357`.
+`find_nested_variable_inference_before_usage` рекурсивно вызывает себя;
+он расходует work budget, но не входит в depth guard при спуске по CST.
+Количество ещё доступных операций не гарантирует достаточный native stack.
+
+Воспроизведение: после native-параметра `Known $value` разместить завершённый
+блок из повторённых `if ($flag) {`, затем `echo 0;`, закрывающие скобки и
+обращение к `$value`. При 512 уровнях debug parser aborts; debugger показывает
+цепочку `find_nested_variable_inference_before_usage`. При 1024 уровнях
+optimized parser harness со стеком test thread 2 МиБ также aborts.
+
+`php-lsp-server/src/main.rs:15-23` задаёт стандартному runtime стек 8 МиБ:
+release stdio LSP с этим примером прошёл. Поэтому это подтверждённый пробел
+защиты parser/library consumers и тестового окружения; падение стандартного
+8-МиБ LSP этим воспроизведением не заявляется. Дополнительный stdio probe
+с 2 МиБ не дал ответа за 8 секунд, но не подтвердил abort и не включён в
+число доказанных crash-сценариев.
+Нужен child-process тест глубокой структуры с ограниченным стеком и безопасным
+watchdog; варианты исправления — итеративный scan либо отдельный CST depth budget.
+
+### IIR-R01: файловый лимит ухудшает точность независимых функций
+
+Это воспроизведённый компромисс введённого file budget, а не новый путь
+неограниченной рекурсии. Источник: `resolve_budget.rs:7-43` и
+`references.rs:195`.
+
+Fixture: `function expensive(Known $value)` с 1000 `echo 0;` и 100
+`$value->run();`, после неё `function healthy(Known $ok) { $ok->run(); }`.
+Последняя ссылка становится `::run` / `Unresolved`. Та же `healthy` без
+предыдущей нагрузки корректно даёт `Known::run`.
+
+Текущие budget unit tests подтверждают общий предел и reset следующего файла,
+но не сохраняемую точность следующей функции внутри того же файла.
+Публичного признака такого неполного inference coverage нет; `truncated=false`
+относится к filesystem traversal. `cache.rs:535-580` сохраняет полученные
+references без причины их unresolved-состояния; этот эффект хранения
+подтверждён кодом, отдельный cache replay этой fixture не запускался.
+Нужны метрики исчерпания/причин unresolved, сравнение точных связей до/после
+лимита, callback/source snapshot cases и стратегия повторного использования
+результатов, прежде чем обещать отсутствие потерь точности.
+
+### IIR-T01: два конкретных пробела в уже существующих тестах
+
+1. `resolve_tests.rs:1495-1522` ищет первое `randomBased` и `generateId`
+   через `find_line_col` (`:249-256`). Выбранные позиции находятся в
+   объявлениях методов, а не в вызовах ниже. Тест не доказывает заявленную
+   безопасность self-reassignment RHS. Нужны уникальные call-site markers и
+   проверка соответствующей роли/позиции.
+2. `tests/e2e_inference_budget.rs:62-96` дважды запускает root, но не проверяет
+   `cacheFilesLoaded`. Перед definition он открывает `Known.php`, заменяя
+   дисковый snapshot буфером. Поэтому успешный повтор не доказывает, что LSP
+   использовал сохранённые receiver references. Нужны проверка cache hit и
+   запросы к закрытому файлу до didOpen. Cache unit round-trip и реальный
+   warm profile существуют отдельно; они не заменяют этот protocol assertion.
+
+Матрица следующих регрессий должна пересекать position (iterable/binding/body/
+после записи), target kind, lexical/capture scope, known/unknown/scalar type,
+feature (hover/completion/definition/references/rename) и disk/buffer/cache
+snapshot. Для ресурсов отдельно нужны depth, width, отмена во время CST scan,
+частичное покрытие файла и детерминированные проверки edit/close/reindex.
+Эти комбинации пока являются выявленными пробелами, а не пройденным покрытием.
+
+## Реализация соседних исправлений receiver inference (2026-10-12)
+
+Исходные описания IIR-F01..F06, IIR-R01 и IIR-T01 выше сохранены как результаты
+предшествующей проверки. Ниже — отдельный статус реализации через TDD.
+Артефакты RED/GREEN находятся в игнорируемом
+`server/target/inference-fix-2026-10-12/`.
+
+| Finding | Реализация и постоянная регрессия |
+|---|---|
+| IIR-F01 | Сканирование продолжается внутри содержащего usage foreach после binding: завершённое присваивание в body заменяет тип элемента. Проверяются точные hover/definition/references и completion после удаления присваивания. Присваивание в уже завершённом loop body не считается безусловным post-loop write. |
+| IIR-F02 | Parser/server используют общий поиск binding с lexical/capture barriers: независимые функции, параметры closure/arrow и uncaptured locals не заимствуют foreach type. By-value captures сохраняют тип на момент создания; by-reference не замораживают будущий тип. |
+| IIR-F03 | Факт завершённой записи отделён от успешного вывода типа: unknown/scalar/reference assignment, unset и поддерживаемые output-аргументы не возвращают старый object type. Незавершённый вызов ещё не инвалидирует прежнее значение. |
+| IIR-F04 | Общий writable-target matcher различает plain/by-reference local bindings и чтение property/offset owner. Проверяются тип владельца и точное место local definition. |
+| IIR-F05 | Каждый destructuring binding получает собственный статический путь: keyed/positional/nested, holes и повтор имени. Последняя завершённая запись выигрывает; dynamic/interpolated keys остаются unknown. Все записываемые поля могут получить отдельный inlay hint. |
+| IIR-F06 | CST type scans ограничены глубиной и общим work budget. Усиленный subprocess-тест дополнительно воспроизвёл независимый stack overflow reference walker; тот переведён на итеративный TreeCursor с сохранением named-child order и callable guards. |
+| IIR-R01 | Перед сбором ссылок линейно считаются callable scopes. Равные резервируемые доли сохраняют работу следующих функций внутри общего hard cap 131072; вложенные collectors не пополняют cap. Проверяются одна и 64 простые функции после дорогой, unwind и отсутствие возврата потраченного file work. Debug event показывает charged work, scope quota и limit attempts. |
+| IIR-T01 | Старый self-reassignment test теперь утверждает call-site ranges, а не declaration positions. Protocol warm run утверждает два cache hits и ищет ссылку в закрытом файле до didOpen; отдельный cache round-trip проверяет корректный body-write receiver. |
+
+Дополнительный review выявил прежнюю потерю file-level PHPDoc aliases при
+повторном сужении уже отфильтрованной namespace view. Отдельная регрессия
+проверяет разные aliases/imports в повторяющихся namespace sections и переход
+в global section. View каждого раздела строится из исходного FileSymbols;
+это соседнее исправление, не регрессия итеративного обхода.
+
+Первый RED: parser 6 PASS / 9 FAIL, серверные helpers 2 PASS / 3 FAIL,
+пять protocol-сценариев 0 PASS / 5 FAIL. Затем отдельные RED обнаружили
+output-аргумент, uncharged wide pattern, ошибочные call-site assertions,
+принятие schema36 cache, duplicate binding, пропущенный второй hint и
+интерполированный ключ. Stack overflow проверяется в дочернем процессе со
+стеком 2 МиБ и watchdog 10s, без падения основного test harness.
+Отдельный RED local `@var Rows` воспроизвёл `::run` в обеих namespace sections;
+контроль с уже раскрытым `@param Rows` проходил. Серверный полный прогон затем
+обнаружил 10 регрессий current-write PHPDoc owner от слишком раннего отказа
+assignment helper; fallback исправлен, все 511 server unit tests прошли.
+LSP positive current-write `@var` является контролем, не RED. Negative stale
+annotation проверяет последующую неизвестную запись.
+
+Постоянное пополнение: 50 тестов — parser matrix27, budget6, stack subprocess1,
+server helpers5, cache1, protocol10. Дополнительно усилены два существующих
+теста IIR-T01. Адресный GREEN: parser583 + stack1, server511, index116,
+protocol bindings10 + indexing/cache1. Эти числа относятся к указанным
+наборам; результат полного workspace run фиксируется отдельно ниже.
+
+Cache schema **37** перестраивает сохранённые receiver references; layout
+сериализуемых полей не менялся. Обычные Rust-проверки идут последовательно:
+`CARGO_BUILD_JOBS=1`, `--test-threads=1`, один CPU, nice15 и transient
+MemoryHigh2G/MemoryMax3G/MemorySwapMax1G. Файлы пользовательского проекта
+и установленный VS Code server не меняются.
+
+Граница результата: типы по-прежнему могут быть unknown при исчерпании
+лимитов. Равная доля может быть недостаточна большой функции в файле с многими
+callables. Debug limit events считают попытки, не уникальные потерянные ссылки;
+они не сохраняются как coverage metadata кеша. `truncated=false` по-прежнему
+описывает filesystem traversal. Двадцать двухпоточных edit/definition-раундов
+проверяют согласованность old/new targets и точный конечный accepted target;
+это ограниченная проверка гонок, не доказательство всех scheduling orders.
+
+Повторный host release profile (schema 37) на том же read-only проекте:
+4160 файлов, 32804 символа, 539 stubs; ready 26054.56ms cold и 2055.73ms warm,
+во втором запуске 4160 cache hits, indexing errors 0, traversal truncated=false.
+Peak RSS 792338432/833437696 bytes. Cold debug logs содержат 248 limit reports
+по 243 разным workspace URI и 6424 ограниченных попытки; максимум charged work
+76388 ниже hard cap 131072. Warm replay не пересчитывает inference coverage
+кешированных файлов; его 5 reports относятся к одному открытому probe.
+Это подтверждает завершение индексации и кеш, но не отсутствие unknown receivers.
+JSON/stderr/summary: `server/target/inference-fix-2026-10-12/profile/`;
+подробности и SHA256/Build ID — в
+[production baseline](../docs/production-baseline.md#adjacent-receiver-inference-validation-2026-10-12).
+
+Полный последовательный GREEN: `cargo test --all -- --test-threads=1` —
+**1735 PASS, 0 FAIL, 0 ignored**, 56 test-result blocks; затем
+`cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check` и
+`git diff --check` прошли. Логи: `all-final.log`, `clippy-post-all.log`,
+`fmt-final.log`, `diff-final.log` в каталоге реализации. Матрица покрытия
+содержит 64 строки и 154 корректные локальные ссылки; историческое процентное
+покрытие не пересчитывалось. Исходные audit/journal сохранены точным префиксом.
+Повторяемый read-only Verifier на `gpt-6-sol` выдал итоговый **GO** после
+исправления замечаний и независимой проверки кода, тестов, документации,
+логов полного набора, release identity и cold/warm profile. IIR-F01..F06,
+IIR-R01 и IIR-T01 закрыты в указанных границах; milestone INFERENCE-FIX
+отмечен выполненным в TASKS.md. Установленный сервер не обновлялся.

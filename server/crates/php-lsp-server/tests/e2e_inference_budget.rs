@@ -60,7 +60,7 @@ async fn indexing_unknown_member_chains_reaches_ready_and_preserves_foreach_targ
     let root_uri = path_to_uri(tmp.path()).unwrap();
     // Repeat with the same root: both cold parsing and persisted references must
     // complete, keeping the exact Item declaration rather than Container::run.
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let (mut service, mut socket) = LspService::new(PhpLspBackend::new);
         let (tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -80,7 +80,35 @@ async fn indexing_unknown_member_chains_reaches_ready_and_preserves_foreach_targ
         )
         .await;
         send(&mut service, initialized_notification()).await;
-        wait_for_indexing_phase(&mut notifications, "ready", Duration::from_secs(10)).await;
+        let ready =
+            next_indexing_status_for_phase(&mut notifications, "ready", Duration::from_secs(10))
+                .await;
+        assert_eq!(ready["indexedFiles"], 2, "{ready}");
+        if attempt == 1 {
+            assert_eq!(
+                ready["cacheFilesLoaded"], 2,
+                "second run must replay disk references: {ready}"
+            );
+        }
+        // Query from another open document while Known.php remains closed, so
+        // its receiver references must come from cold indexing / cache replay.
+        let probe_uri = path_to_uri(&tmp.path().join("Probe.php")).unwrap();
+        let probe = "<?php function probe(Item $item){$item->run();}";
+        send(&mut service, did_open_notification(&probe_uri, probe)).await;
+        let (line, column) = utf16_position_after(probe, "$item->");
+        let refs = send(
+            &mut service,
+            references_request(3, &probe_uri, line, column + 1, false),
+        )
+        .await;
+        let (line, column) = utf16_position_after(source, "/*CALL*/");
+        assert!(
+            refs.as_array()
+                .is_some_and(|items| items.iter().any(|item| item["uri"] == uri
+                    && item["range"]["start"] == json!({"line":line,"character":column}))),
+            "closed-file receiver missing: {refs}"
+        );
+        send(&mut service, did_close_notification(&probe_uri)).await;
         send(&mut service, did_open_notification(&uri, source)).await;
         let (line, column) = utf16_position_after(source, "/*CALL*/");
         let result = send(&mut service, definition_request(2, &uri, line, column + 1)).await;
@@ -95,6 +123,7 @@ async fn indexing_unknown_member_chains_reaches_ready_and_preserves_foreach_targ
             json!({"line":line,"character":column}),
             "{result}"
         );
+        send(&mut service, did_close_notification(&uri)).await;
         send(&mut service, shutdown_request(99)).await;
     }
 }

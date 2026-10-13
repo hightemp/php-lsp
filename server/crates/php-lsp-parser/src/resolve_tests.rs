@@ -1509,14 +1509,26 @@ class Demo {
     }
 }
 "#;
-    let (line, col) = find_line_col(code, "randomBased");
+    let (line, col) = find_line_col(code, "$generator->randomBased");
+    let col = col + "$generator->".len() as u32;
     let reassignment_call =
         parse_and_resolve(code, line, col).expect("self-reassignment RHS should resolve");
     assert_eq!(reassignment_call.fqn, "App\\Generator::randomBased");
+    let (call_line, _) = find_line_col(code, "$generator = $generator->randomBased");
+    assert_eq!(
+        reassignment_call.range.0, call_line,
+        "test must resolve the actual reassignment call"
+    );
 
-    let (line, col) = find_line_col(code, "generateId");
+    let (line, col) = find_line_col(code, "$generator->generateId");
+    let col = col + "$generator->".len() as u32;
     let later_call = parse_and_resolve(code, line, col).expect("later method call should resolve");
     assert_eq!(later_call.fqn, "App\\Generator::generateId");
+    let (call_line, _) = find_line_col(code, "$generator->generateId");
+    assert_eq!(
+        later_call.range.0, call_line,
+        "test must resolve the actual later call"
+    );
 }
 
 #[test]
