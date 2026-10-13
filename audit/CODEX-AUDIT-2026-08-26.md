@@ -2278,6 +2278,8 @@ GREEN-лога, Clippy/Rustfmt/diff, release identity, Laravel JSON и доку�
 
 ### CODEX-P2-33. Blade/Twig conversion повреждает часть корректных выражений
 
+**Статус (2026-10-13):** выполнено и проверено; Verifier `gpt-6-astra` — **GO**.
+
 - `@{{ value }}` — стандартная escaped Blade echo — после пропуска `@` всё равно
   распознаётся как `{{ ... }}` в
   [`preprocess_blade_template`](server/crates/php-lsp-server/src/template.rs#L524).
@@ -2292,6 +2294,78 @@ GREEN-лога, Clippy/Rustfmt/diff, release identity, Laravel JSON и доку�
 
 Что исправить: grammar/token-aware preprocessing, явный result/error incremental
 apply и переход в require-full-sync при любой невалидной template edit.
+
+#### Реализация CODEX-P2-33 (2026-10-13)
+
+Исходное описание задачи сохранено. Реализация выполнена через TDD:
+начальный RED — 8 FAIL / 1 PASS; отдельные RED подтвердили decimal `08` и
+пограничный случай незавершённого escaped Blade opener. Логи находятся в
+игнорируемом `server/target/p2-33-2026-10-13/`.
+
+- Blade `@{{ ... }}` и `@{!! ... !!}` исключены из virtual PHP/source map:
+  внутри них нет PHP hover, definition, signature help или semantic tokens.
+  Завершённый escaped echo потребляется целиком; незавершённый маркер не
+  скрывает последующие распознаваемые директивы. Обычные соседние echo работают.
+- Общий Twig number scanner используется в converter, classifier и извлечении
+  частичных выражений/root variables. Он сохраняет дробь, exponent и digit
+  separators; decimal dot не превращается в member access, `1e3` не создаёт
+  фиктивную `$e3`. Leading-zero integers нормализуются в decimal PHP: `08`
+  становится `8`, `012` — `12`. Строки, member dots и границы `..` различаются.
+- `{% for key, value in items %}` генерирует PHP foreach с отдельными mapping
+  segments обоих объявлений. Проверены пробелы, переносы, nesting, value-only
+  control и поддерживаемый filter/slice fallback, key/value types и навигация
+  из реального PHP controller context. Полная модель Twig loop scope и engine
+  semantics этим изменением не добавляется.
+- Template edit API возвращает `Result` с typed error. Весь пакет изменений
+  собирается во временном template snapshot; каждый range применяется к
+  результату предыдущего edit. Только полный успех публикует source, virtual
+  parser, mapping и version под существующим parser-entry lock. Неверная строка
+  или reversed range сохраняют старое состояние и ставят generation-scoped
+  require-full-sync. Последующие incrementals игнорируются до успешного пакета,
+  начинающегося с full text, либо reopen. Нового LSP-метода resync нет.
+- Сохранены общие UTF-16 правила зажима колонок и half-surrogate positions,
+  CRLF, допустимые EOF/empty edits, URI isolation и close/reopen generation.
+  Не меняются публичные настройки или cache schema 38: template snapshots
+  остаются transient и не добавляются в workspace symbol cache.
+
+Постоянное покрытие: **25 новых тестов** — conversion14, synchronization7,
+LSP4. Unit/backend проверки покрывают
+весь откат пакета, failed full-text recovery, успешный full+incremental batch,
+точные source-map ranges и устаревшие versions. Двадцать двухпоточных раундов
+для каждого вида шаблона через barrier и явный порядок completion проверяют
+invalid-before-full и full-before-invalid, согласованный snapshot reader и
+точную конечную version/desync state. Это конечное покрытие гонок, не
+доказательство всех scheduling orders. Четыре protocol-сценария проверяют
+функции редактора, controller → key/value Twig и восстановление после edit.
+
+Правила сверены с [Blade escaping](https://laravel.com/docs/12.x/blade#blade-and-javascript-frameworks),
+[Twig for](https://twig.symfony.com/doc/3.x/tags/for.html#iterating-over-keys-and-values)
+и [Twig Lexer](https://github.com/twigphp/Twig/blob/3.x/src/Lexer.php).
+Полная Blade/Twig engine parity, runtime execution и остальные unsupported
+Twig expressions остаются вне границ задачи.
+
+Первый запуск широких адресных проверок (`targeted-final.log`) остановлен
+kernel memcg OOM внутри нашей build scope при hard limit1536M; он не считается
+проверкой GREEN. Повторные проверки отключают только debug information
+серверного crate (`--config 'profile.test.package.php-lsp-server.debug=0'`),
+сохраняя test/debug assertions. Сборки идут последовательно: один CPU,
+`CARGO_BUILD_JOBS=1`, тесты `--test-threads=1`, nice19/idle IO,
+MemoryMax1536M/MemorySwapMax256M без soft MemoryHigh throttling.
+
+Итоговый последовательный GREEN: **1800 PASS, 0 FAIL, 0 ignored**,
+58 test-result blocks (`all-verified.log`). После усиления race-reader и
+same-line emoji/CRLF assertions повторён весь набор. Clippy
+`--all-targets -- -D warnings`, Rustfmt и `git diff --check` прошли;
+для Clippy тот же package debug override задан в dev/test профилях.
+Архитектура, feature matrix, README и матрица покрытия обновлены:
+66 сценариев/166 корректных локальных ссылок. Процентное покрытие и
+performance baseline не пересчитывались. Исходный текст P2-33 и все остальные
+разделы аудита сохранены; статус и результаты находятся в этом разделе.
+
+Повторяемый read-only Verifier на **gpt-6-astra** завершился итоговым **GO**:
+проверены финальный diff, 25 тестов, полный GREEN, Clippy/Rustfmt/diff,
+совпадение SHA256 пяти Rust-файлов с проверенным набором и документация.
+Milestone P2-33 отмечен выполненным в TASKS.md в описанных границах.
 
 ### CODEX-P2-34. Twig include context не соответствует наследованию переменных
 

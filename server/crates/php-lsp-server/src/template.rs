@@ -256,13 +256,17 @@ impl TemplateDocument {
         encode_semantic_tokens(&absolute)
     }
 
-    pub(crate) fn apply_change(&self, range: Option<Range>, text: &str) -> Self {
+    pub(crate) fn apply_change(
+        &self,
+        range: Option<Range>,
+        text: &str,
+    ) -> Result<Self, TemplateEditError> {
         let mut source = self.original_source.clone();
-        apply_text_change(&mut source, range, text);
-        match self.kind {
+        apply_text_change(&mut source, range, text)?;
+        Ok(match self.kind {
             TemplateKind::Blade => preprocess_blade_template(&source),
             TemplateKind::Twig => preprocess_twig_template(&source, &self.twig_variable_types),
-        }
+        })
     }
 
     pub(crate) fn twig_template_path_context_at_position(
@@ -528,6 +532,18 @@ pub(crate) fn preprocess_blade_template(source: &str) -> TemplateDocument {
     let mut offset = 0usize;
 
     while offset < source.len() {
+        // Escaped echo bodies belong to the client template, including any
+        // identifiers or directives inside them. Consume the entire span.
+        if let Some((open, close)) = [("@{{", "}}"), ("@{!!", "!!}")]
+            .into_iter()
+            .find(|(open, _)| source[offset..].starts_with(open))
+        {
+            offset = source[offset + open.len()..]
+                .find(close)
+                .map(|relative| offset + open.len() + relative + close.len())
+                .unwrap_or(offset + open.len());
+            continue;
+        }
         if source[offset..].starts_with("{{--") {
             let end = source[offset + 4..]
                 .find("--}}")
@@ -1368,11 +1384,23 @@ fn push_twig_for_fragment(
     macro_aliases: &HashSet<String>,
 ) {
     let rest_start = skip_ascii_ws_in_range(source, start, end);
-    let item_start = rest_start;
-    let item_end = scan_identifier_end(source, item_start).min(end);
+    let mut item_start = rest_start;
+    let mut item_end = scan_twig_identifier_end(source, item_start, end);
     if item_end <= item_start {
         return;
     }
+    let after_first = skip_ascii_ws_in_range(source, item_end, end);
+    let key_range = if source.as_bytes().get(after_first) == Some(&b',') {
+        let key = (item_start, item_end);
+        item_start = skip_ascii_ws_in_range(source, after_first + 1, end);
+        item_end = scan_twig_identifier_end(source, item_start, end);
+        if item_end <= item_start {
+            return;
+        }
+        Some(key)
+    } else {
+        None
+    };
     let after_item = skip_ascii_ws_in_range(source, item_end, end);
     if !source
         .get(after_item..end)
@@ -1419,6 +1447,13 @@ fn push_twig_for_fragment(
         virtual_source.push_str("(array) []");
     }
     virtual_source.push_str(" as ");
+    if let Some((key_start, key_end)) = key_range {
+        let virtual_key_start = virtual_source.len();
+        virtual_source.push('$');
+        virtual_source.push_str(&source[key_start..key_end]);
+        source_map.push_segment(key_start, key_end, virtual_key_start, virtual_source.len());
+        virtual_source.push_str(" => ");
+    }
     let virtual_item_start = virtual_source.len();
     virtual_source.push('$');
     virtual_source.push_str(source.get(item_start..item_end).unwrap_or(""));
@@ -1742,6 +1777,10 @@ fn twig_partial_member_chain_ranges(
             continue;
         }
 
+        if let Some(number_end) = scan_twig_number_end(source, offset, original_end) {
+            offset = number_end;
+            continue;
+        }
         if !is_twig_identifier_start(ch) {
             offset += ch.len_utf8();
             continue;
@@ -1828,6 +1867,10 @@ fn twig_root_variable_ranges(
             continue;
         }
 
+        if let Some(number_end) = scan_twig_number_end(source, offset, original_end) {
+            offset = number_end;
+            continue;
+        }
         if !is_twig_identifier_start(ch) {
             offset += ch.len_utf8();
             continue;
@@ -1971,6 +2014,15 @@ fn unsupported_twig_expression(
             continue;
         }
 
+        if let Some(number_end) = scan_twig_number_end(source, offset, original_end) {
+            if after_member_access {
+                return Some(UnsupportedTwigExpression::ComplexAttributeAccess);
+            }
+            offset = number_end;
+            after_member_access = false;
+            current_chain_root = None;
+            continue;
+        }
         if ch == '|' {
             return Some(UnsupportedTwigExpression::Filter);
         }
@@ -2064,6 +2116,27 @@ fn convert_twig_expression_to_php(
             break;
         };
 
+        if let Some(number_end) = scan_twig_number_end(source, offset, original_end) {
+            let number = &source[offset..number_end];
+            let virtual_start = converted.len();
+            // Twig integers are decimal, whereas PHP treats a leading zero as
+            // octal. Keep float/exponent spelling and normalize only integers.
+            if number.starts_with('0') && !number.contains(['.', 'e', 'E']) {
+                let decimal = number.trim_start_matches(['0', '_']);
+                converted.push_str(if decimal.is_empty() { "0" } else { decimal });
+            } else {
+                converted.push_str(number);
+            }
+            segments.push(TwigExpressionSegment {
+                original_start: offset,
+                original_end: number_end,
+                virtual_start,
+                virtual_end: converted.len(),
+            });
+            offset = number_end;
+            after_member_access = false;
+            continue;
+        }
         if ch == '|' {
             break;
         }
@@ -2156,6 +2229,38 @@ fn convert_twig_expression_to_php(
     }
 
     (converted, segments)
+}
+
+/// Twig's decimal number token: digits with optional separators, fraction and
+/// exponent. The range operator's `..` and member dots are separate tokens.
+fn scan_twig_number_end(source: &str, start: usize, end: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if start >= end || !bytes.get(start)?.is_ascii_digit() {
+        return None;
+    }
+    let digits_end = |mut cursor: usize| {
+        while cursor < end && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+            if cursor + 1 < end && bytes[cursor] == b'_' && bytes[cursor + 1].is_ascii_digit() {
+                cursor += 1;
+            }
+        }
+        cursor
+    };
+    let mut cursor = digits_end(start);
+    if cursor + 1 < end && bytes[cursor] == b'.' && bytes[cursor + 1].is_ascii_digit() {
+        cursor = digits_end(cursor + 1);
+    }
+    if cursor < end && matches!(bytes[cursor], b'e' | b'E') {
+        let mut exponent = cursor + 1;
+        if exponent < end && matches!(bytes[exponent], b'+' | b'-') {
+            exponent += 1;
+        }
+        if exponent < end && bytes[exponent].is_ascii_digit() {
+            cursor = digits_end(exponent);
+        }
+    }
+    Some(cursor)
 }
 
 fn trim_ascii_range(source: &str, mut start: usize, mut end: usize) -> (usize, usize) {
@@ -2531,19 +2636,44 @@ fn find_matching_paren(source: &str, open: usize) -> Option<usize> {
     None
 }
 
-pub(crate) fn apply_text_change(source: &mut String, range: Option<Range>, text: &str) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TemplateEditError {
+    ReversedRange(Range),
+    InvalidLine(u32),
+}
+
+impl std::fmt::Display for TemplateEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReversedRange(range) => write!(f, "reversed template edit range: {range:?}"),
+            Self::InvalidLine(line) => {
+                write!(f, "template edit line {line} is outside the document")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TemplateEditError {}
+
+pub(crate) fn apply_text_change(
+    source: &mut String,
+    range: Option<Range>,
+    text: &str,
+) -> Result<(), TemplateEditError> {
     let Some(range) = range else {
         source.clear();
         source.push_str(text);
-        return;
+        return Ok(());
     };
-    let Some(start) = byte_offset_for_position(source, range.start) else {
-        return;
-    };
-    let Some(end) = byte_offset_for_position(source, range.end) else {
-        return;
-    };
-    source.replace_range(start.min(end)..end.max(start), text);
+    if position_before(range.end, range.start) {
+        return Err(TemplateEditError::ReversedRange(range));
+    }
+    let start = byte_offset_for_position(source, range.start)
+        .ok_or(TemplateEditError::InvalidLine(range.start.line))?;
+    let end = byte_offset_for_position(source, range.end)
+        .ok_or(TemplateEditError::InvalidLine(range.end.line))?;
+    source.replace_range(start..end, text);
+    Ok(())
 }
 
 fn byte_offset_for_position(source: &str, position: Position) -> Option<usize> {
@@ -2720,3 +2850,7 @@ fn position_before(left: Position, right: Position) -> bool {
 #[cfg(test)]
 #[path = "template_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "template_conversion_tests.rs"]
+mod conversion_tests;

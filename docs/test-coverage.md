@@ -3,7 +3,7 @@
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
 P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
-P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), and P2-32 (2026-10-13).
+P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), and P2-32/P2-33 (2026-10-13).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -74,8 +74,9 @@ percentages have not been remeasured.
 | Static document links | include/require targets | T | B | B | [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
 | Semantic tokens | full → delta and range requests | T | B | B | [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
 | Call/type hierarchy | receiver/private/trait identity, nullsafe/cached calls, snapshot changes, super/subtypes | T | B | B | [call-graph tests](../server/crates/php-lsp-server/src/lsp/call_hierarchy_graph_tests.rs), [receiver protocol tests](../server/crates/php-lsp-server/tests/e2e_call_hierarchy_receivers.rs), [hierarchy protocol tests](../server/crates/php-lsp-server/tests/e2e_hierarchy.rs). |
-| Blade virtual PHP | hover/completion/diagnostics/source ranges | T | B | B | [template protocol tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
-| Twig virtual PHP and context | controller → caller → partial; open/change/delete/rename | T | B | B | [Twig context protocol tests](../server/crates/php-lsp-server/tests/e2e_twig_context.rs), [template tests](../server/crates/php-lsp-server/tests/e2e_templates.rs). |
+| Blade virtual PHP | escaped client echoes, PHP feature suppression/restoration, hover/completion/diagnostics/source ranges | T | B | B | [template protocol tests](../server/crates/php-lsp-server/tests/e2e_templates.rs), [conversion unit tests](../server/crates/php-lsp-server/src/template_conversion_tests.rs), [conversion protocol tests](../server/crates/php-lsp-server/tests/e2e_template_conversion.rs). |
+| Twig virtual PHP and context | numeric tokens, key/value loops, exact UTF-16/CRLF ranges; controller → caller → partial; open/change/delete/rename | T | B | B | [Twig context protocol tests](../server/crates/php-lsp-server/tests/e2e_twig_context.rs), [template tests](../server/crates/php-lsp-server/tests/e2e_templates.rs), [conversion protocol tests](../server/crates/php-lsp-server/tests/e2e_template_conversion.rs). |
+| Template incremental synchronization | invalid/reversed ranges, atomic batches, full-sync recovery, URI/generation isolation, close/reopen and ordered races | T | B | B | [synchronization tests](../server/crates/php-lsp-server/src/lsp/template_sync_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_template_conversion.rs). Twenty two-worker rounds per template kind explicitly order invalid-before-full and full-before-invalid updates while a reader checks coherent snapshots; this is finite concurrency coverage. |
 | Twig context cache | cold/warm, overlays, dependency changes, cancellation | T | B | B | [Twig context unit tests](../server/crates/php-lsp-server/src/indexing/twig_context_tests.rs), [regressions](../server/crates/php-lsp-server/src/indexing/twig_context_regression_tests.rs). |
 | Bounded receiver inference | reused foreach bindings and comments, unknown member chains, depth/work/file exhaustion, callable reservations, partial types, unwind and thread isolation; cold/warm indexing | T | B | B | [parser recursion tests](../server/crates/php-lsp-parser/src/resolve_foreach_recursion_tests.rs), [budget tests](../server/crates/php-lsp-parser/src/resolve_budget.rs), [small-stack subprocess](../server/crates/php-lsp-parser/tests/inference_stack.rs), [server binding tests](../server/crates/php-lsp-server/src/lsp/foreach_binding_tests.rs), [indexing protocol test](../server/crates/php-lsp-server/tests/e2e_inference_budget.rs), [cache migration](../server/crates/php-lsp-index/src/cache_tests.rs). Controlled two-thread barriers test budget isolation; warm replay asserts cache hits and queries a closed file before didOpen. Operation counts do not bound every helper's wall time. |
 | Foreach reaching types and references | body writes, unknown/scalar/reference outputs, captures, property/offset owners, nested/duplicate/dynamic destructuring, namespace aliases, edits/close/reopen and concurrent definitions | T | B | B | [parser regression matrix](../server/crates/php-lsp-parser/src/resolve_inference_regression_tests.rs), [protocol regressions](../server/crates/php-lsp-server/tests/e2e_inference_bindings.rs). Twenty two-worker rounds use a start barrier and assert coherent old/new definitions plus the exact final accepted target; this is finite concurrency evidence. |
@@ -169,9 +170,9 @@ line denominator equals the physical line count of these source-mapped files;
 its line percentage should not be compared directly with LLVM's Rust line
 percentage.
 
-The matrix has 65 scenario rows: on Linux 56 have executed tests, seven have
+The matrix has 66 scenario rows: on Linux 57 have executed tests, seven have
 mock-based checks, one has build-only evidence, and one (native Extension Host)
-has no automated test or build evidence. The 56 Rust rows have macOS/Windows
+has no automated test or build evidence. The 57 Rust rows have macOS/Windows
 build evidence but no native runtime test; one of those Rust rows lacks a
 direct Linux protocol regression.
 The nine client rows have no native macOS/Windows runtime test. These are

@@ -6619,3 +6619,21 @@ change.
 - [x] **DOC-AUDIT-COMPLETION-2026-10-13** Move the P2-32 completion status and implementation/validation text into the original P2-32 audit section; retain the original finding and all reported limitations. *(done 2026-10-13)*
   - Implemented: explicit completion status and the full implementation/validation block now sit under P2-32, before P2-33. The separate trailing block was moved, with its heading anchor retained; the Monica limitation remains explicit.
   - Validation: original finding and all unrelated report text are unchanged; one implementation block remains, nested under the correct task. Diff check passes. Documentation-only relocation; no builds rerun.
+
+### Milestone: CODEX-P2-33 Blade/Twig conversion and synchronization (2026-10-13 -> 2026-10-13)
+
+**Статус:** complete *(done 2026-10-13)*
+**Цель:** Preserve escaped Blade echoes, Twig numeric tokens and key/value loops; reject invalid template incremental edits without publishing a mismatched source/version snapshot.
+
+#### Задачи
+
+- [x] **P233-001-2026-10-13** Add RED regressions for escaped echoes, numeric/member token boundaries, key/value loops, exact source maps and malformed incremental ranges. *(done 2026-10-13)*
+  - Implemented:25 permanent tests (conversion14, synchronization7, LSP4). Initial RED8FAIL/1PASS plus decimal and unterminated-opener RED. Coverage includes exact same-line emoji/CRLF ranges, decimal/exponent/separator tokens, phantom fallback variables, nested/filter loop bindings and rejected edits.
+- [x] **P233-002-2026-10-13** Fix conversion with existing token/source-map helpers and reuse the document desynchronization/full-sync recovery contract; preserve supported template context and scope behavior. *(done 2026-10-13)*
+  - Implemented: escaped Blade spans remain unmapped; shared Twig numeric scanning preserves tokens and decimal integers; key/value foreach has independent declaration mappings. Typed edit errors and staged batches preserve source/parser/map/version on failure, require successful full sync or reopen, and keep shared UTF-16 clamping. No public settings or cache-schema change.
+- [x] **P233-003-2026-10-13** Cover protocol behavior, edit batches, full-sync recovery, close/reopen and controlled concurrent event orders; run focused then full sequential Rust checks and repeat gpt-6-astra Verifier review to GO. *(done 2026-10-13)*
+  - Validation:547 server unit tests,4 new protocol tests and25 existing template protocol tests pass. Final full Rust1800/1800 across58 blocks,0 ignored; Clippy -D warnings, Rustfmt and diff check pass. Twenty two-worker rounds per template kind explicitly cover both invalid/full-sync orders with varied PHP source, original/virtual snapshot checks and exact final version. gpt-6-astra Verifier returned final GO after checking source hashes, tests, logs and documentation.
+- [x] **P233-004-2026-10-13** Add completion status and implementation/validation evidence directly under the original P2-33 audit finding, preserve its text, update relevant documentation and mark the milestone complete. *(done 2026-10-13)*
+  - Implemented: audit status/results are directly under P2-33; original finding and unrelated audit sections remain unchanged. README, architecture/features and coverage matrix updated;66 rows/166 local links verified. Historical coverage percentages/performance samples unchanged; full template-engine parity remains outside scope.
+  - Validation policy: one CPU, CARGO_BUILD_JOBS=1, --test-threads=1, nice19/idle IO, hard MemoryMax1536M/MemorySwapMax256M limits. Avoid soft-limit reclaim pressure on the desktop; no simultaneous builds/profiles, installed or remote server changes, or automatic commit.
+  - Build adaptation: the initial wide test compilation hit our memcg limit and is excluded from GREEN. Successful tests use CLI profile.test.package.php-lsp-server.debug=0, with the corresponding dev override for Clippy; test/debug assertions remain enabled. No persistent Cargo profile configuration was changed.

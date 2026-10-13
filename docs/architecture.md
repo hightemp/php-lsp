@@ -161,6 +161,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_inference_bindings.rs` | reaching foreach writes, captures, writable/destructured targets, hover/definition/completion/references/inlays, close-to-disk restoration and bounded concurrent edit/definition rounds. |
 | `tests/e2e_framework_types.rs` | nullable Eloquent terminals, conservative finder unions, foreign relation owners, case-insensitive method links, builtin output definitions and concurrent cross-file function shadows. |
 | `tests/e2e_templates.rs` | Blade/Twig virtual PHP behavior. |
+| `tests/e2e_template_conversion.rs` | escaped Blade echo isolation, Twig numeric types and key/value navigation, atomic rejected template edits and full-sync recovery. |
 
 Run all split protocol tests with:
 
@@ -843,15 +844,37 @@ stores a `TemplateDocument` next to the virtual `FileParser`:
   reporting whole-template errors.
 
 Blade support covers escaped/raw echo blocks and common `@if`, `@foreach`,
-`@isset`, and `@empty` directives. Twig support is a separate language path for
+`@isset`, and `@empty` directives. Client-side escaped echoes `@{{ ... }}` and
+`@{!! ... !!}` are consumed as literal spans with no PHP source-map or semantic
+tokens. An unterminated opener does not hide subsequent recognized directives.
+Twig support is a separate language path for
 `.twig` / `.html.twig` files and covers `{{ expr }}`, `{% if %}`,
-`{% for item in items %}`, `{% set name = expr %}`, common structural tags, and
+`{% for item in items %}`, `{% for key, item in items %}`,
+`{% set name = expr %}`, common structural tags, and
 static include/extends/embed path lookup. Definition also has a direct
 original-source fallback for literal Twig template paths that exist under
 `templates/`, including ordinary HTML attribute values, and for Symfony
 `path()` / `url()` route keys. Route definitions use the same framework
 string-key cache and scan PHP 8 `#[Route(..., name: ...)]` attributes without
 booting Symfony.
+
+Template changes are staged before publication under the existing per-document
+parser lock. Each range applies to the result of the preceding edit; only a
+fully successful batch replaces the original source, virtual PHP, source map
+and document version. Reversed ranges or nonexistent lines return a typed
+error and mark that URI/generation as requiring full synchronization. Later
+incremental notifications are ignored until a successful batch beginning with
+full text, or a reopen, restores synchronization. Oversized columns and
+half-surrogate positions retain the shared UTF-16 clamping rules. The server
+does not add a new LSP resynchronization method or setting.
+
+Twig decimal, fraction and exponent tokens share one scanner across conversion,
+classification and fallback extraction, including digit separators. Numeric
+dots remain numeric; member dots remain accessors and `..` remains an
+unsupported range expression. Leading-zero integers are emitted as decimal PHP
+to avoid octal reinterpretation. Key/value loop declarations receive separate
+source-map segments, so keys and values use ordinary PHP foreach inference and
+navigation. This does not implement full Twig loop scope or engine semantics.
 
 Twig expression conversion is intentionally conservative. Simple variable,
 literal, operator, dot-member, and object method-call expressions can be mapped

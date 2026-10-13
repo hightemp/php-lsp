@@ -272,13 +272,17 @@ phpstorm-stubs support.
   subexpressions are source-mapped where possible for hover, completion,
   signature help, definition, type definition, implementation, and inlay hints.
   Current supported Twig cases include simple
-  member/root variables inside otherwise unsupported expressions,
+  member/root variables inside otherwise unsupported expressions, decimal and
+  exponent numbers, key/value `for` bindings,
   type-preserving `slice`/`filter` foreach inference, getter-backed
   property-style labels, static template-path and route-key navigation, static
   render-context inference, one-level include context, Doctrine collection
   items, Symfony form/app globals, PHPDoc/literal shape keys, and open-template
   context refresh after relevant PHP changes. See `docs/lsp-features.md` for
   the exact supported template surface.
+- Blade `@{{ ... }}` and `@{!! ... !!}` stay outside PHP feature mapping.
+  Invalid template edit ranges require a successful full-text update or reopen;
+  a rejected batch preserves the previous source and document version.
 - The initial disk workspace scan currently treats an unopened `*.blade.php`
   file as raw PHP because of its suffix. Opening or template-aware reindexing
   removes that raw PHP index entry; virtual template state is never added to the

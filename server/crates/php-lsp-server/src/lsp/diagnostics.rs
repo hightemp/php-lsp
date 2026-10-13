@@ -14,6 +14,10 @@ mod diagnostic_pipeline_tests;
 #[path = "constant_reference_tests.rs"]
 mod constant_reference_tests;
 
+#[cfg(test)]
+#[path = "template_sync_tests.rs"]
+mod template_sync_tests;
+
 #[path = "phpdoc_native_diagnostics.rs"]
 mod phpdoc_native_diagnostics;
 use php_lsp_parser::resolve::{
@@ -804,21 +808,31 @@ impl PhpLspBackend {
                     generation: current.generation,
                 };
 
-                let template_change = self.template_document(&uri_str).map(|template| {
-                    let updated = params
+                let template_change = if let Some(template) = self.template_document(&uri_str) {
+                    let updated = match params
                         .content_changes
                         .iter()
-                        .fold(template, |template, change| {
+                        .try_fold(template, |template, change| {
                             template.apply_change(change.range, &change.text)
-                        });
+                        }) {
+                        Ok(updated) => updated,
+                        Err(error) => {
+                            self.documents_requiring_full_sync
+                                .insert(uri_str.clone(), current.generation);
+                            tracing::warn!("Rejected template didChange for {} version {}: {}; full-text synchronization required", uri_str, version, error);
+                            return;
+                        }
+                    };
                     let refresh_twig_contexts = updated.kind() == TemplateKind::Twig;
                     let mut parser = FileParser::new();
                     parser.parse_full(updated.virtual_source());
                     self.template_documents.insert(uri_str.clone(), updated);
                     remove_from_aggregate_and_root_index(&self.index, &request_index, &uri_str);
                     entry.insert(parser);
-                    refresh_twig_contexts
-                });
+                    Some(refresh_twig_contexts)
+                } else {
+                    None
+                };
 
                 let indexed_file = if template_change.is_none() {
                     let parser = entry.get_mut();
