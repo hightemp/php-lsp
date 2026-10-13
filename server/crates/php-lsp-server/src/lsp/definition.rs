@@ -660,6 +660,8 @@ impl PhpLspBackend {
                 resolve_callable_parameter_type_from_index(&request_index, &file_symbols, ctx)
             };
 
+            let _names =
+                function_name_scope_from_index(&request_index, tree, &source, &file_symbols);
             let local_var_def = variable_definition_at_position(tree, &source, pos.line, byte_col)
                 .map(|d| range_byte_to_utf16(&source, d));
             let shape_def = shape_definition_at_position(&source, pos.line, byte_col)

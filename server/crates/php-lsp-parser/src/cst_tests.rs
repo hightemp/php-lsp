@@ -85,3 +85,42 @@ $outer = function () use ($captured) {
         "anonymous_function_use_clause"
     ));
 }
+
+#[test]
+fn p232_foreign_preg_match_calls_do_not_write_output_arguments() {
+    for (declaration, call) in [
+        ("", "\\Vendor\\preg_match"),
+        ("", "namespace\\preg_match"),
+        ("function preg_match($a,$b,$c) {}", "preg_match"),
+        ("use function Vendor\\preg_match;", "preg_match"),
+        ("use function Vendor\\preg_match as rx;", "rx"),
+    ] {
+        let source=format!("<?php namespace App; {declaration} function run($text){{{call}('/x/',$text,$matches);}}");
+        let mut parser = FileParser::new();
+        parser.parse_full(&source);
+        let nodes = variable_nodes(parser.tree().unwrap().root_node(), &source, "$matches");
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            !is_by_ref_output_argument_variable(nodes[0], &source),
+            "foreign output {call}"
+        );
+    }
+}
+
+#[test]
+fn p232_imported_global_preg_match_alias_keeps_output_binding() {
+    let source="<?php namespace App; use function preg_match as rx; function run($text){RX('/x/',$text,matches:$matches);}";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let nodes = variable_nodes(parser.tree().unwrap().root_node(), source, "$matches");
+    assert!(is_by_ref_output_argument_variable(nodes[0], source));
+}
+
+#[test]
+fn p232_named_non_output_parameter_is_not_positional_output() {
+    let source = "<?php preg_match('/x/',$text,flags:$flags);";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let nodes = variable_nodes(parser.tree().unwrap().root_node(), source, "$flags");
+    assert!(!is_by_ref_output_argument_variable(nodes[0], source));
+}

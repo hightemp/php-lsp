@@ -159,6 +159,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_indexing.rs` | watched files, file operations, workspace folders, index-related inference. |
 | `tests/e2e_inference_budget.rs` | bounded unknown receiver chains, cold/warm completion, asserted cache hits and exact references in a closed file before didOpen. |
 | `tests/e2e_inference_bindings.rs` | reaching foreach writes, captures, writable/destructured targets, hover/definition/completion/references/inlays, close-to-disk restoration and bounded concurrent edit/definition rounds. |
+| `tests/e2e_framework_types.rs` | nullable Eloquent terminals, conservative finder unions, foreign relation owners, case-insensitive method links, builtin output definitions and concurrent cross-file function shadows. |
 | `tests/e2e_templates.rs` | Blade/Twig virtual PHP behavior. |
 
 Run all split protocol tests with:
@@ -282,6 +283,48 @@ Local assignments in their bodies can still supply a type. Writable destructurin
 values and reference assignments are declarations; dynamic destructuring keys
 remain reads. Server hover/inlay helpers reuse the same boundaries, including
 arrow-local assignments inside expressions.
+
+Framework type fallbacks require the canonical Laravel owner FQN or indexed
+inheritance. An unrelated `App\HasMany` is not a relation. Actual method
+declarations, including ones with unknown return types, take priority over
+dynamic rules. Model/relation `first` and `firstWhere` are nullable;
+`firstOrFail` and supported create-like terminals are non-null. Argument-free
+virtual `find` metadata is a nullable model-or-collection union, and
+`findOrFail` is a non-null model-or-collection union. This layer deliberately
+does not specialize scalar versus array arguments. Builder terminals use
+their result type instead of blanket builder-self; unsupported returns stay
+unknown. Assignment inference preserves nullable/union call results, binds
+`self` to the receiver and retains nullsafe receiver nullability. Hover,
+completion and navigation share a metadata-only terminal fallback when no
+indexed method declaration exists; it does not scan disk macro registrations.
+Generic model arguments must be concrete: an unbound template, a composite
+argument or a relation's second (declaring-model) argument cannot supply one
+model FQN. The first-model-slot rule applies only to canonical Laravel generic
+owners and binding targets. Custom reordered template chains remain unknown
+until their binding can be proven; indexed inheritance alone is insufficient.
+
+`php-lsp-parser::function_names` shares builtin identity checks between array
+type helpers and preg-match output binding. Explicit global calls and global
+function imports keep their canonical identity; qualified foreign names and
+function shadows do not acquire builtin behavior. An unqualified namespaced
+call requires a function-aware view with a positive global function symbol and
+no known namespaced override. A member-only callback is not such proof.
+Source-only discovery leaves ambiguous namespace calls unknown, including
+persisted reference collection without an index resolver. These facts follow
+the current index: lazy, excluded or runtime-created function definitions can
+remain unknown, so absence in the index is not a claim about every runtime
+function. Ordinary PHP function fallback and declared return types still use
+the indexed resolver.
+
+Name facts are owned by one synchronous operation and shared by nested calls;
+existing FileSymbols are reused when available. CST-only entry points extract
+metadata once per operation, not once per variable. The Rc/RAII scope restores
+parent facts on nested-source exit and unwind, is isolated per thread, borrows
+the source/tree lifetime and cannot move across async tasks. Server definition,
+references, highlights, rename and local completion supply index evidence
+inside short synchronous blocks. Facts do not persist across requests or enter
+disk caches. Method-level hover Implements/Overrides links use PHP's method
+casing without changing property/constant casing.
 
 Foreach key/value bindings apply from their declaration onward; an iterable
 that reuses its value's name retains the earlier receiver type. Parser and
@@ -1044,10 +1087,12 @@ text-based instanceof guard/exit heuristics. Schema 35 invalidated
 shape keys and receiver references derived from first-field fallback or
 lossy key normalization. Schema 36 invalidated receiver references
 derived from premature foreach bindings or partial inference beyond the work
-and depth budgets. Current schema 37 invalidates receivers derived from stale
+and depth budgets. Schema 37 invalidated receivers derived from stale
 assignments, incorrect foreach targets/destructuring or lost namespace aliases,
-and references omitted by unfair file-budget consumption. These semantic
-changes did not alter the serialized field layout.
+and references omitted by unfair file-budget consumption. Current schema 38
+invalidates foreign-builtin receivers and nullable/framework call results
+derived by the former helpers. These semantic changes did not alter the
+serialized field layout.
 
 Because the cache uses `bincode`, the snapshot format is not self-describing.
 Any change to `IndexCache`, nested cached structs, or serialized

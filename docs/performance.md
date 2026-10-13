@@ -40,7 +40,9 @@ binding (schema 31; 2026-10-09), constant-expression roles
 (schema 33; 2026-10-09), proven instanceof guard binding
 (schema 34; 2026-10-09), exact shape-key binding (schema 35; 2026-10-12),
 bounded foreach/receiver inference (schema 36; 2026-10-12), or shared foreach
-bindings and callable budget reservations (current schema 37; 2026-10-12).
+bindings and callable budget reservations (schema 37; 2026-10-12), or
+framework/builtin identity and nullable call results (current schema 38;
+2026-10-13).
 
 A separate real-project incident profile (2026-10-12) verifies schema 36 on
 4160 indexed files with one CPU: ready in 39.13s cold and 2.19s warm, with all

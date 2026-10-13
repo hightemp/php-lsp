@@ -1603,7 +1603,7 @@ fn hover_direct_method_for_type(
         .iter()
         .find(|candidate| {
             candidate.kind == php_lsp_types::PhpSymbolKind::Method
-                && candidate.name == method_name
+                && candidate.matches_member_lookup_name(method_name)
                 && candidate.parent_fqn.as_deref().is_some_and(|parent_fqn| {
                     normalized_hover_relation_target(parent_fqn)
                         == normalized_hover_relation_target(type_fqn)
@@ -1851,5 +1851,35 @@ fn hover_visibility_label(visibility: php_lsp_types::Visibility) -> &'static str
         php_lsp_types::Visibility::Public => "public",
         php_lsp_types::Visibility::Protected => "protected",
         php_lsp_types::Visibility::Private => "private",
+    }
+}
+
+#[cfg(test)]
+mod method_identity_tests {
+    use super::*;
+
+    #[test]
+    fn p232_hover_direct_method_uses_method_casing_and_exact_owner() {
+        let source="<?php interface Contract {function RUN();} class ParentType {function Run(){}} class Foreign {function run(){}}";
+        let mut parser = php_lsp_parser::parser::FileParser::new();
+        parser.parse_full(source);
+        let index = WorkspaceIndex::new();
+        index.update_file(
+            "file:///hover-identity.php",
+            php_lsp_parser::symbols::extract_file_symbols(
+                parser.tree().unwrap(),
+                source,
+                "file:///hover-identity.php",
+            ),
+        );
+        for (owner, target) in [
+            ("contract", "Contract::RUN"),
+            ("PARENTTYPE", "ParentType::Run"),
+        ] {
+            let method = hover_direct_method_for_type(&index, owner, "run")
+                .expect("case-insensitive method");
+            assert_eq!(method.fqn, target);
+        }
+        assert!(hover_direct_method_for_type(&index, "Missing", "run").is_none());
     }
 }

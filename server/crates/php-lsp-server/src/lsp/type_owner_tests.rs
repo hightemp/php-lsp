@@ -140,3 +140,64 @@ fn phpdoc_parent_link_uses_the_actual_owner_parent() {
     );
     assert!(!markdown.contains("#L2"), "foreign parent: {markdown}");
 }
+
+#[test]
+fn p232_nonblocking_variable_hover_does_not_read_disk_only_macro_registrations() {
+    let dir = std::env::temp_dir().join(format!("php-lsp-p232-hover-macro-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("macros.php");
+    let macro_source = "<?php \\Illuminate\\Support\\Collection::macro('diskOnly', function () { return $this; });";
+    std::fs::write(&path, macro_source).unwrap();
+    let macro_uri = crate::util::uri::path_to_uri(&path).unwrap();
+    let uri = "file:///hover.php";
+    let source = "<?php function inspect(\\Illuminate\\Support\\Collection $items) { $value = $items->diskOnly(); $value; }";
+    let mut parser = FileParser::new();
+    parser.parse_full(macro_source);
+    let index = WorkspaceIndex::new();
+    index.update_file(
+        &macro_uri,
+        extract_file_symbols(parser.tree().unwrap(), macro_source, &macro_uri),
+    );
+    // The macro exists only on disk: no source/AST is supplied to this control.
+    assert!(framework_virtual_member_type_fqn(
+        &index,
+        "Illuminate\\Support\\Collection",
+        "diskOnly",
+        None,
+        None,
+        None
+    )
+    .is_some());
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let symbols = extract_file_symbols(tree, source, uri);
+    index.update_file(uri, symbols.clone());
+    let offset = source.rfind("$value;").unwrap();
+    let mut node = tree
+        .root_node()
+        .named_descendant_for_byte_range(offset, offset + 1)
+        .unwrap();
+    while node.kind() != "variable_name" {
+        node = node.parent().unwrap();
+    }
+    let cache = RequestTypeCache::new(uri, Some(1));
+    let utf16 = Utf16LineIndex::new(source);
+    let ctx = InlayHintContext {
+        tree,
+        source,
+        file_symbols: &symbols,
+        index: &index,
+        type_cache: &cache,
+        utf16_index: &utf16,
+        requested_range: (0, 0, u32::MAX, u32::MAX),
+        allow_twig_property_accessors: false,
+        allow_blocking_file_io: false,
+        cancellation: None,
+    };
+    let hint = local_variable_hover_data(&ctx, node).and_then(|data| data.type_hint);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(
+        hint.is_none(),
+        "nonblocking hover discovered an uncached disk-only macro"
+    );
+}

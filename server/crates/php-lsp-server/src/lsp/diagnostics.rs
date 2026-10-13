@@ -2312,7 +2312,9 @@ pub(in crate::server) fn resolve_function_type_from_index(
     function_fqn: &str,
 ) -> Option<ResolvedFunctionType> {
     let sym = resolve_fqn_with_ref_kind(index, function_fqn, RefKind::FunctionCall, false)?;
-    symbol_return_type_text_from_index(index, &sym.fqn, &sym).map(|type_text| {
+    let type_text =
+        symbol_return_type_text_from_index(index, &sym.fqn, &sym).unwrap_or_else(|| "mixed".into());
+    Some({
         ResolvedFunctionType::with_signature(type_text, sym.signature.clone())
             .with_symbol_fqn(sym.fqn.clone())
             .with_template_names(sym.templates.iter().map(|template| template.name.clone()))

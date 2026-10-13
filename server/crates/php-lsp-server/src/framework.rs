@@ -713,6 +713,22 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
         ctx: &FrameworkProviderContext<'_>,
         query: &VirtualMemberQuery,
     ) -> Vec<VirtualMember> {
+        // Static rules fill missing dynamic members, never replace an actual
+        // declaration whose return type may be unknown or deliberately custom.
+        if query.kind == VirtualMemberKind::Method {
+            let owner = laravel_type_text_base_name(&query.owner_fqn)
+                .unwrap_or_else(|| query.owner_fqn.clone());
+            if ctx
+                .index
+                .resolve_member_matching_kinds(
+                    &format!("{owner}::{}", query.member_name),
+                    &[PhpSymbolKind::Method],
+                )
+                .is_some()
+            {
+                return Vec::new();
+            }
+        }
         let is_model = is_laravel_model(ctx, &query.owner_fqn);
         let relation_base_fqn = laravel_relation_base_fqn(ctx, &query.owner_fqn);
         let is_relation = relation_base_fqn.is_some();
@@ -851,10 +867,11 @@ impl VirtualMemberProvider for LaravelEloquentProvider {
                         query.kind,
                         "Laravel Eloquent builder dynamic method",
                     );
-                    member.type_info = Some(TypeInfo::Simple(format!(
-                        "\\{}",
-                        query.owner_fqn.trim_start_matches('\\')
-                    )));
+                    member.type_info = laravel_builder_dynamic_method_return_type(
+                        ctx,
+                        &query.owner_fqn,
+                        &query.member_name,
+                    );
                     return vec![member];
                 }
                 false
@@ -1755,9 +1772,12 @@ fn laravel_relation_property_type_from_type_info(
     match type_info {
         TypeInfo::Generic { base, args } => {
             let relation_fqn = resolve_type_name_to_fqn(ctx, owner, base)?;
+            if !laravel_model_is_first_parameter(&relation_fqn) {
+                return None;
+            }
             let related_model = args
-                .iter()
-                .find_map(|arg| type_info_to_fqn(ctx, owner, arg));
+                .first()
+                .and_then(|arg| laravel_concrete_model_argument(ctx, Some(owner), arg, false));
             related_model.as_deref().and_then(|related_model| {
                 laravel_relation_property_type_for_relation_fqn(
                     ctx,
@@ -1828,13 +1848,13 @@ fn laravel_relation_related_model_from_type_info(
     type_info: &TypeInfo,
 ) -> Option<String> {
     match type_info {
-        TypeInfo::Generic { base, args }
-            if resolve_type_name_to_fqn(ctx, owner, base)
-                .as_deref()
-                .is_some_and(|fqn| is_laravel_relation_fqn(ctx, fqn)) =>
-        {
-            args.iter()
-                .find_map(|arg| type_info_to_fqn(ctx, owner, arg))
+        TypeInfo::Generic { base, args } => {
+            let fqn = resolve_type_name_to_fqn(ctx, owner, base)?;
+            if !is_laravel_relation_fqn(ctx, &fqn) || !laravel_model_is_first_parameter(&fqn) {
+                return None;
+            }
+            args.first()
+                .and_then(|arg| laravel_concrete_model_argument(ctx, Some(owner), arg, false))
         }
         TypeInfo::Nullable(inner) => {
             laravel_relation_related_model_from_type_info(ctx, owner, inner)
@@ -2013,108 +2033,120 @@ fn laravel_relation_owner_type_info(relation_type_text: &str) -> Option<TypeInfo
     laravel_type_info_from_text(relation_type_text)
 }
 
-fn laravel_relation_related_model_from_owner_type(relation_type_text: &str) -> Option<String> {
-    let type_info = laravel_type_info_from_text(relation_type_text)?;
-    laravel_relation_related_model_from_owner_type_info(&type_info)
+fn laravel_relation_related_model_from_owner_type(
+    ctx: &FrameworkProviderContext<'_>,
+    relation_type_text: &str,
+) -> Option<String> {
+    // Inspect original spelling before resolved-owner normalization adds a '\\'.
+    let TypeInfo::Generic { base, args } =
+        parse_phpdoc(&format!("/** @var {relation_type_text} */")).var_type?
+    else {
+        return None;
+    };
+    if !laravel_model_is_first_parameter(&base) {
+        return None;
+    }
+    let owner = ctx.index.get_type(&base);
+    laravel_concrete_model_argument(ctx, owner.as_deref(), args.first()?, true)
 }
 
-fn laravel_relation_related_model_from_owner_type_info(type_info: &TypeInfo) -> Option<String> {
-    match type_info {
-        TypeInfo::Generic { args, .. } => args.iter().find_map(laravel_direct_object_type_name),
-        TypeInfo::Nullable(inner) => laravel_relation_related_model_from_owner_type_info(inner),
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => types
-            .iter()
-            .find_map(laravel_relation_related_model_from_owner_type_info),
-        _ => None,
+fn laravel_model_is_first_parameter(owner: &str) -> bool {
+    if fqn_matches(owner, LARAVEL_ELOQUENT_BUILDER_FQN) {
+        return true;
     }
+    // A custom subclass can reorder its own template parameters. Its bindings
+    // need independent proof; inheritance alone does not establish this slot.
+    [
+        "Relation",
+        "BelongsTo",
+        "HasOne",
+        "HasOneThrough",
+        "MorphOne",
+        "MorphTo",
+        "BelongsToMany",
+        "HasMany",
+        "HasManyThrough",
+        "MorphMany",
+        "MorphToMany",
+        "MorphedByMany",
+    ]
+    .iter()
+    .any(|name| {
+        fqn_matches(
+            owner,
+            &format!("Illuminate\\Database\\Eloquent\\Relations\\{name}"),
+        )
+    })
 }
 
-fn laravel_direct_object_type_name(type_info: &TypeInfo) -> Option<String> {
-    match type_info {
-        TypeInfo::Simple(name) | TypeInfo::Generic { base: name, .. } => {
-            let name = name.trim_start_matches('\\');
-            (!name.is_empty()
-                && !matches!(name, "$this" | "self" | "static" | "parent")
-                && !is_builtin_type_name(name))
-            .then(|| name.to_string())
-        }
-        TypeInfo::Nullable(inner) => laravel_direct_object_type_name(inner),
-        TypeInfo::Union(types) | TypeInfo::Intersection(types) => {
-            types.iter().find_map(laravel_direct_object_type_name)
-        }
-        TypeInfo::ClassString(Some(inner)) => laravel_direct_object_type_name(inner),
-        _ => None,
+fn laravel_concrete_model_argument(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: Option<&SymbolInfo>,
+    argument: &TypeInfo,
+    already_resolved: bool,
+) -> Option<String> {
+    // A composite or class-string argument cannot be represented by one model
+    // FQN. Never select its first branch or a relation's declaring-model slot.
+    let TypeInfo::Simple(name) = argument else {
+        return None;
+    };
+    let bare = name.trim_start_matches('\\');
+    if bare.is_empty()
+        || is_builtin_type_name(bare)
+        || matches!(bare, "$this" | "self" | "static" | "parent")
+        || owner.is_some_and(|owner| owner.templates.iter().any(|param| param.name == bare))
+    {
+        return None;
     }
+    let fqn = if already_resolved {
+        bare.to_string()
+    } else {
+        resolve_type_name_to_fqn(ctx, owner?, name)?
+    };
+    // Bare unresolved arguments can be arbitrary template parameters. Explicit
+    // qualified names remain usable before their lazy vendor source is indexed.
+    (name.contains('\\') || ctx.index.get_type(&fqn).is_some()).then_some(fqn)
 }
 
 fn is_laravel_relation_fqn(ctx: &FrameworkProviderContext<'_>, fqn: &str) -> bool {
-    let fqn = fqn.trim_start_matches('\\');
     ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\Relation")
-        || matches!(
-            fqn.rsplit('\\').next().unwrap_or(fqn),
-            "Relation"
-                | "BelongsTo"
-                | "BelongsToMany"
-                | "HasMany"
-                | "HasManyThrough"
-                | "HasOne"
-                | "HasOneThrough"
-                | "MorphMany"
-                | "MorphOne"
-                | "MorphTo"
-                | "MorphToMany"
-                | "MorphedByMany"
-        )
+        || is_laravel_single_model_relation_fqn(ctx, fqn)
+        || is_laravel_collection_relation_fqn(ctx, fqn)
 }
 
 fn is_laravel_single_model_relation_fqn(ctx: &FrameworkProviderContext<'_>, fqn: &str) -> bool {
-    ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\BelongsTo")
-        || ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\HasOne")
-        || ctx.class_is_or_extends(
+    [
+        "BelongsTo",
+        "HasOne",
+        "HasOneThrough",
+        "MorphOne",
+        "MorphTo",
+    ]
+    .iter()
+    .any(|name| {
+        ctx.class_is_or_extends(
             fqn,
-            "Illuminate\\Database\\Eloquent\\Relations\\HasOneThrough",
+            &format!("Illuminate\\Database\\Eloquent\\Relations\\{name}"),
         )
-        || ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\MorphOne")
-        || ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\MorphTo")
-        || matches!(
-            fqn.trim_start_matches('\\')
-                .rsplit('\\')
-                .next()
-                .unwrap_or(fqn),
-            "BelongsTo" | "HasOne" | "HasOneThrough" | "MorphOne" | "MorphTo"
-        )
+    })
 }
 
 fn is_laravel_collection_relation_fqn(ctx: &FrameworkProviderContext<'_>, fqn: &str) -> bool {
-    ctx.class_is_or_extends(
-        fqn,
-        "Illuminate\\Database\\Eloquent\\Relations\\BelongsToMany",
-    ) || ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\HasMany")
-        || ctx.class_is_or_extends(
+    [
+        "BelongsToMany",
+        "HasMany",
+        "HasManyThrough",
+        "MorphMany",
+        "MorphToMany",
+        "MorphedByMany",
+    ]
+    .iter()
+    .any(|name| {
+        ctx.class_is_or_extends(
             fqn,
-            "Illuminate\\Database\\Eloquent\\Relations\\HasManyThrough",
+            &format!("Illuminate\\Database\\Eloquent\\Relations\\{name}"),
         )
-        || ctx.class_is_or_extends(fqn, "Illuminate\\Database\\Eloquent\\Relations\\MorphMany")
-        || ctx.class_is_or_extends(
-            fqn,
-            "Illuminate\\Database\\Eloquent\\Relations\\MorphToMany",
-        )
-        || ctx.class_is_or_extends(
-            fqn,
-            "Illuminate\\Database\\Eloquent\\Relations\\MorphedByMany",
-        )
-        || matches!(
-            fqn.trim_start_matches('\\')
-                .rsplit('\\')
-                .next()
-                .unwrap_or(fqn),
-            "BelongsToMany"
-                | "HasMany"
-                | "HasManyThrough"
-                | "MorphMany"
-                | "MorphToMany"
-                | "MorphedByMany"
-        )
+    })
 }
 
 fn laravel_eloquent_collection_type(related_model: &str) -> TypeInfo {
@@ -2353,6 +2385,9 @@ fn laravel_model_dynamic_method_return_type(
     model_fqn: &str,
     method_name: &str,
 ) -> Option<TypeInfo> {
+    if !is_laravel_model(ctx, model_fqn) {
+        return None;
+    }
     let lower = method_name.to_ascii_lowercase();
     if matches!(
         lower.as_str(),
@@ -2368,20 +2403,108 @@ fn laravel_model_dynamic_method_return_type(
         return laravel_builder_type_for_model(ctx, model_fqn);
     }
 
-    if matches!(
-        lower.as_str(),
-        "find" | "findorfail" | "first" | "firstorfail" | "firstornew" | "firstorcreate" | "create"
-    ) {
-        return Some(TypeInfo::Simple(format!(
-            "\\{}",
-            model_fqn.trim_start_matches('\\')
-        )));
-    }
+    laravel_model_terminal_return_type(model_fqn, method_name)
+}
 
-    if matches!(lower.as_str(), "count") {
-        return Some(TypeInfo::Simple("int".to_string()));
+/// Without call arguments, find/findOrFail can also return a collection of IDs.
+fn laravel_model_terminal_return_type(model_fqn: &str, method_name: &str) -> Option<TypeInfo> {
+    let model = TypeInfo::Simple(format!("\\{}", model_fqn.trim_start_matches('\\')));
+    match method_name.to_ascii_lowercase().as_str() {
+        "first" | "firstwhere" => Some(TypeInfo::Nullable(Box::new(model))),
+        "find" => Some(TypeInfo::Union(vec![
+            TypeInfo::Nullable(Box::new(model)),
+            laravel_eloquent_collection_type(model_fqn),
+        ])),
+        "findorfail" => Some(TypeInfo::Union(vec![
+            model,
+            laravel_eloquent_collection_type(model_fqn),
+        ])),
+        "firstorfail" | "firstornew" | "firstorcreate" | "updateorcreate" | "create"
+        | "forcecreate" => Some(model),
+        "findmany" | "get" => Some(laravel_eloquent_collection_type(model_fqn)),
+        "count" => Some(TypeInfo::Simple("int".into())),
+        "exists" => Some(TypeInfo::Simple("bool".into())),
+        _ => None,
     }
+}
 
+/// Metadata-only fallback shared by hover, completion and navigation. It must
+/// not read model sources or invoke a framework container from request code.
+pub(crate) fn framework_terminal_return_type_from_index(
+    index: &WorkspaceIndex,
+    owner: &str,
+    method: &str,
+) -> Option<TypeInfo> {
+    let base = laravel_type_text_base_name(owner)?;
+    if index
+        .resolve_member_matching_kinds(&format!("{base}::{method}"), &[PhpSymbolKind::Method])
+        .is_some()
+    {
+        return None;
+    }
+    let ctx = FrameworkProviderContext::new(index);
+    let model = if is_laravel_model(&ctx, &base) {
+        Some(base.clone())
+    } else if laravel_relation_base_fqn(&ctx, owner).is_some() {
+        laravel_relation_related_model_for_owner(&ctx, owner)
+    } else if ctx.class_is_or_extends(&base, LARAVEL_ELOQUENT_BUILDER_FQN) {
+        laravel_relation_related_model_from_owner_type(&ctx, owner).or_else(|| {
+            let builder = index.get_type(&base)?;
+            laravel_model_from_builder_bindings(&ctx, &builder)
+        })
+    } else {
+        None
+    };
+    if let Some(model) = model {
+        return laravel_model_terminal_return_type(&model, method);
+    }
+    if is_laravel_builder(&ctx, &base)
+        && matches!(method.to_ascii_lowercase().as_str(), "count" | "exists")
+    {
+        return laravel_model_terminal_return_type("", method);
+    }
+    None
+}
+
+fn laravel_builder_dynamic_method_return_type(
+    ctx: &FrameworkProviderContext<'_>,
+    owner: &str,
+    method: &str,
+) -> Option<TypeInfo> {
+    let base = laravel_type_text_base_name(owner)?;
+    if !is_laravel_builder(ctx, &base) {
+        return None;
+    }
+    if matches!(method.to_ascii_lowercase().as_str(), "count" | "exists") {
+        return laravel_model_terminal_return_type("", method);
+    }
+    if ctx.class_is_or_extends(&base, LARAVEL_ELOQUENT_BUILDER_FQN) {
+        if let Some(model) =
+            laravel_relation_related_model_from_owner_type(ctx, owner).or_else(|| {
+                let builder = ctx.index.get_type(&base)?;
+                laravel_model_from_builder_bindings(ctx, &builder)
+            })
+        {
+            if let Some(terminal) = laravel_model_terminal_return_type(&model, method) {
+                return Some(terminal);
+            }
+        }
+    }
+    let lower = method.to_ascii_lowercase();
+    if lower.starts_with("where")
+        || lower.starts_with("orwhere")
+        || matches!(
+            lower.as_str(),
+            "with"
+                | "without"
+                | "query"
+                | "newquery"
+                | "newmodelquery"
+                | "newquerywithoutrelationships"
+        )
+    {
+        return laravel_type_info_from_text(owner);
+    }
     None
 }
 
@@ -2523,6 +2646,7 @@ fn laravel_relation_dynamic_method_return_type(
     relation_fqn: &str,
     method_name: &str,
 ) -> Option<TypeInfo> {
+    laravel_relation_base_fqn(ctx, relation_fqn)?;
     let lower = method_name.to_ascii_lowercase();
     if matches!(
         lower.as_str(),
@@ -2544,20 +2668,7 @@ fn laravel_relation_dynamic_method_return_type(
     }
 
     let related_model = laravel_relation_related_model_for_owner(ctx, relation_fqn)?;
-    if matches!(
-        lower.as_str(),
-        "find" | "findorfail" | "first" | "firstorfail" | "firstornew" | "firstorcreate" | "create"
-    ) {
-        return Some(TypeInfo::Simple(format!(
-            "\\{}",
-            related_model.trim_start_matches('\\')
-        )));
-    }
-    if lower.as_str() == "findmany" {
-        return Some(laravel_eloquent_collection_type(&related_model));
-    }
-
-    None
+    laravel_model_terminal_return_type(&related_model, method_name)
 }
 
 fn laravel_relation_lazy_forwarded_method_return_type(
@@ -2579,7 +2690,7 @@ fn laravel_relation_related_model_for_owner(
     ctx: &FrameworkProviderContext<'_>,
     relation_fqn: &str,
 ) -> Option<String> {
-    laravel_relation_related_model_from_owner_type(relation_fqn).or_else(|| {
+    laravel_relation_related_model_from_owner_type(ctx, relation_fqn).or_else(|| {
         laravel_relation_base_fqn(ctx, relation_fqn)
             .as_deref()
             .and_then(|relation_fqn| {
@@ -2755,11 +2866,13 @@ fn laravel_relation_related_model_from_relation_symbol(
         ) {
             continue;
         }
-        if is_laravel_relation_fqn(ctx, &binding.target) {
+        if is_laravel_relation_fqn(ctx, &binding.target)
+            && laravel_model_is_first_parameter(&binding.target)
+        {
             if let Some(model) = binding
                 .args
-                .iter()
-                .find_map(|arg| type_info_to_fqn(ctx, &relation, arg))
+                .first()
+                .and_then(|arg| laravel_concrete_model_argument(ctx, Some(&relation), arg, false))
             {
                 return Some(model);
             }
@@ -2855,24 +2968,8 @@ fn laravel_model_for_builder(
 ) -> Option<String> {
     let builder = ctx.index.get_type(builder_fqn)?;
 
-    for binding in &builder.template_bindings {
-        if !matches!(
-            binding.kind,
-            TemplateBindingKind::Extends
-                | TemplateBindingKind::Implements
-                | TemplateBindingKind::Mixin
-        ) {
-            continue;
-        }
-        if is_laravel_builder(ctx, &binding.target) {
-            if let Some(model) = binding
-                .args
-                .iter()
-                .find_map(|arg| type_info_to_fqn(ctx, &builder, arg))
-            {
-                return Some(model);
-            }
-        }
+    if let Some(model) = laravel_model_from_builder_bindings(ctx, &builder) {
+        return Some(model);
     }
 
     for entry in ctx.index.read().types().iter() {
@@ -2885,6 +2982,33 @@ fn laravel_model_for_builder(
             .is_some_and(|custom_builder| fqn_matches(custom_builder, builder_fqn))
         {
             return Some(symbol.fqn.clone());
+        }
+    }
+
+    None
+}
+
+fn laravel_model_from_builder_bindings(
+    ctx: &FrameworkProviderContext<'_>,
+    builder: &SymbolInfo,
+) -> Option<String> {
+    for binding in &builder.template_bindings {
+        if !matches!(
+            binding.kind,
+            TemplateBindingKind::Extends
+                | TemplateBindingKind::Implements
+                | TemplateBindingKind::Mixin
+        ) {
+            continue;
+        }
+        if fqn_matches(&binding.target, LARAVEL_ELOQUENT_BUILDER_FQN) {
+            if let Some(model) = binding
+                .args
+                .first()
+                .and_then(|arg| laravel_concrete_model_argument(ctx, Some(builder), arg, false))
+            {
+                return Some(model);
+            }
         }
     }
 
@@ -4098,3 +4222,7 @@ fn hash_relevant_files(paths: &[PathBuf]) -> u64 {
 #[cfg(test)]
 #[path = "framework_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "framework_type_identity_tests.rs"]
+mod type_identity_tests;

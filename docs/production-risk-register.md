@@ -1,7 +1,7 @@
 # Production Risk Register
 
 Date: 2026-05-22
-Last updated: 2026-07-22
+Last updated: 2026-10-13
 Scope: production readiness through the post-audit correctness and
 compatibility acceptance.
 
@@ -20,7 +20,7 @@ The format is intentionally operational: every risk is tied to an owner task in
 | R-005 | Request cancellation coverage for heavy operations | High | `PR-021`, `PR-050`, `PV-004`, `IE-045` | Mitigated |
 | R-006 | Open-document ordering and atomicity | High | `PR-020`, `PR-050`, `AUD-20260721-003`, `AUD-20260721-013`, `AUD-20260721-014` | Mitigated |
 | R-007 | Runtime compatibility and package integrity | Medium | `PR-030`, `PR-011`, `PHA-005`, `AUD-20260721-001`, `AUD-20260721-002`, `AUD-20260721-012` | Mitigated |
-| R-008 | Lazy vendor indexing scale validation | Medium | `PR-012`, `PR-011`, `PV-014`, `PHB-017` | Partially mitigated |
+| R-008 | Lazy vendor indexing scale validation | Medium | `PR-012`, `PR-011`, `PV-014`, `PHB-017`, `LARAVEL-VENDOR-FIRST-HIT-2026-10-13` | Open first-hit/latency evidence |
 | R-009 | PHPDoc/type model depth for production PHP | Medium | `PR-031`, `PR-032`, `PR-040`, `PR-041`, `IE-030`, `IE-031`, `PV-012`, `IE-045`, `PHB-003`, `PHB-016` | Accepted limitation |
 | R-010 | LSP polish/capability mismatch risk | Medium | `PR-043`, `PR-051`, `PR-052`, `IE-045`, `PHB-001`, `PHB-002`, `PHB-004`, `PHB-005`, `PHB-012`, `PHB-014`, `AUD-20260721-004`-`012`, `H-INDEXING-UNOPENED-BLADE-DISK-SCAN-2026-07-22` | Mitigated with tracked limitation |
 
@@ -58,7 +58,9 @@ Current evidence:
 Impact:
 
 - The recorded 2026-05-28 run met the `<5s` warm-start target on the primary
-  5k-10k PHP-file workspace. Current schema-28 timing is not yet measured.
+  5k-10k PHP-file workspace. This historical workspace has not been remeasured
+  with current schema 38. Separate schema-36/37 incident profiles and the
+  P2-32 Laravel validation are recorded in `production-baseline.md`.
 - Changed-file invalidation remains covered by tests and normal dogfood watch,
   but is no longer considered a blocking production risk.
 - Vendor composer metadata cache/LRU is tracked separately by `R-008`.
@@ -78,7 +80,7 @@ Mitigation:
 Exit signal:
 
 - `IE-045` warm `large-symfony` run reaches `phase=ready` in `3436.05 ms`.
-- Rerun the cold/warm large-workspace profile with schema 28 to check the cost
+- Rerun the cold/warm large-workspace profile with the current schema to check the cost
   of source revalidation, persisted call-site metadata and PHPDoc owner ranges.
 - Cache invalidates changed files without full rebuild; keep this covered by
   cache tests and reindex dogfood.
@@ -337,10 +339,26 @@ Current evidence:
 - `IE-045` did not change the installed-vendor evidence; the primary large
   Symfony checkout used for acceptance still lacks installed Composer vendor
   metadata.
+- P2-32 validation (2026-10-13) reproduced a first-hit limit on the local Monica
+  checkout with installed Laravel dependencies: early model `didOpen` exceeded
+  a 120-second candidate budget, and model completion exceeded 30 seconds.
+  Controlled old schema-37 and intermediate schema-38 runs both exceeded a
+  separate 30-second early-open budget. A stack sample in our test child showed
+  `resolve_vendor_paths_from_map_with_limits_cancellable` in the shared walker
+  and filesystem canonicalization. It does not prove every slow call has the
+  same cause. See the separate final-candidate evidence in
+  [production baseline](production-baseline.md#laravel-framework-type-validation-2026-10-13).
+- The final P2-32 binary passes seven corrected Monica semantic/navigation
+  checks, then method definition exceeds 30 seconds; completion is not reached.
+  No-open cold/warm ready takes 12.11/14.50 seconds despite all 1330 warm cache
+  hits. CRM passes all nine probes, but its vendor metadata is absent.
 
 Impact:
 
-- Large vendor directories may still have unpredictable first-hit latency until acceptance is measured on real projects with installed vendor metadata.
+- Installed-vendor first-hit latency remains an open measured limitation;
+  reaching workspace ready without an open document does not establish
+  interactive acceptance. The local CRM checkout lacks installed vendor
+  metadata and cannot validate this path.
 - The LRU cap is conservative and may need tuning after Laravel/Symfony-size profiling.
 
 Mitigation:

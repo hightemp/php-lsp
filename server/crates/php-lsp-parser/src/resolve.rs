@@ -370,6 +370,22 @@ pub fn symbol_at_position_with_full_resolvers(
     function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<SymbolAtPosition> {
     let root = tree.root_node();
+    let has_function = |fqn: &str| {
+        function_resolver
+            .and_then(|resolve| resolve(fqn))
+            .is_some_and(|resolved| {
+                resolved
+                    .symbol_fqn
+                    .as_deref()
+                    .is_some_and(|actual| fqn_eq_ignore_ascii_case(actual, fqn))
+            })
+    };
+    let _names = crate::function_names::FunctionNameScope::enter(
+        root,
+        source,
+        Some(file_symbols),
+        function_resolver.map(|_| &has_function as &dyn Fn(&str) -> bool),
+    );
     let point = Point::new(line as usize, character as usize);
 
     // Find the most specific node at the position
@@ -399,6 +415,7 @@ pub fn variable_definition_at_position(
     character: u32,
 ) -> Option<(u32, u32, u32, u32)> {
     let root = tree.root_node();
+    let _names = crate::function_names::FunctionNameScope::enter(root, source, None, None);
     let point = Point::new(line as usize, character as usize);
     let mut node = find_node_at_point(root, point)?;
 
@@ -449,6 +466,7 @@ pub fn local_variable_names_at_position(
     byte_col: u32,
 ) -> Vec<String> {
     let root = tree.root_node();
+    let _names = crate::function_names::FunctionNameScope::enter(root, source, None, None);
     let point = Point::new(line as usize, byte_col.saturating_sub(1) as usize);
     let node = find_node_at_point(root, point)
         .or_else(|| find_node_at_point(root, Point::new(line as usize, byte_col as usize)))
@@ -672,6 +690,8 @@ fn infer_variable_type_at_position_internal(
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> VariableInference {
     let root = tree.root_node();
+    let _names =
+        crate::function_names::FunctionNameScope::enter(root, source, Some(file_symbols), None);
     let point = Point::new(line as usize, character as usize);
     let node = find_node_at_point(root, point).unwrap_or(root);
     let start = node.start_position();
@@ -737,6 +757,12 @@ pub fn infer_variable_hover_info_at_node_with_resolvers(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Option<VariableHoverInfo> {
+    let _names = crate::function_names::FunctionNameScope::enter(
+        context_node,
+        source,
+        Some(file_symbols),
+        None,
+    );
     let normalized = normalize_var_name(var_name);
     let start = context_node.start_position();
     let scoped_file_symbols =
@@ -2080,6 +2106,78 @@ fn infer_clone_assignment(
     })
 }
 
+fn infer_call_assignment(
+    expression: Node,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+) -> Option<VariableInference> {
+    if !matches!(
+        expression.kind(),
+        "function_call_expression"
+            | "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "scoped_call_expression"
+    ) {
+        return None;
+    }
+    let mut type_info = infer_expression_type_info(
+        expression,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+    )?;
+    if let Some(object) = expression.child_by_field_name("object") {
+        let owner = std::cell::OnceCell::new();
+        type_info = map_receiver_type_names(&type_info, &|name| {
+            if !matches!(name, "self" | "static" | "$this") {
+                return None;
+            }
+            owner
+                .get_or_init(|| {
+                    try_resolve_object_type(
+                        object,
+                        source,
+                        file_symbols,
+                        resolver,
+                        callable_resolver,
+                        None,
+                    )
+                })
+                .as_ref()
+                .map(|owner| format!("\\{}", owner.trim_start_matches('\\')))
+        });
+        if expression.kind() == "nullsafe_member_call_expression" {
+            let receiver = infer_expression_type_info(
+                object,
+                source,
+                file_symbols,
+                resolver,
+                callable_resolver,
+            )?;
+            if type_info_without_null(&receiver).as_ref() != Some(&receiver)
+                && type_info_without_null(&type_info).as_ref() == Some(&type_info)
+            {
+                type_info = TypeInfo::Nullable(Box::new(type_info));
+            }
+        }
+    }
+    let resolved = resolve_phpdoc_var_type(&type_info, expression, source, file_symbols);
+    let display = if matches!(type_info, TypeInfo::Simple(_)) {
+        resolved.clone().unwrap_or_else(|| type_info.to_string())
+    } else {
+        type_info.to_string()
+    };
+    Some(VariableInference {
+        type_display: Some(display),
+        resolved_type_fqn: resolved,
+        phpdoc_comment: None,
+        type_info: Some(type_info),
+    })
+}
+
 /// Scan a compound_statement for `$var = new ClassName()` before the usage point.
 fn find_variable_inference_before_usage(
     body: Node,
@@ -2199,6 +2297,10 @@ fn find_variable_inference_before_usage(
                 infer_clone_assignment(right, source, file_symbols, resolver, callable_resolver)
             {
                 inferred = Some((stmt.start_byte(), clone_info));
+            } else if let Some(call_info) =
+                infer_call_assignment(right, source, file_symbols, resolver, callable_resolver)
+            {
+                inferred = Some((stmt.start_byte(), call_info));
             } else if let Some(resolved) = try_resolve_object_type(
                 right,
                 source,
@@ -2375,6 +2477,10 @@ fn find_nested_variable_inference_before_usage(
                 infer_clone_assignment(right, source, file_symbols, resolver, callable_resolver)
             {
                 inferred = Some((child.start_byte(), clone_info));
+            } else if let Some(call_info) =
+                infer_call_assignment(right, source, file_symbols, resolver, callable_resolver)
+            {
+                inferred = Some((child.start_byte(), call_info));
             } else if let Some(resolved) = try_resolve_object_type(
                 right,
                 source,
@@ -5023,10 +5129,26 @@ fn infer_function_call_type_info(
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
     function_resolver: Option<FunctionTypeResolver<'_>>,
 ) -> Option<TypeInfo> {
-    let short_name = function_call_short_name(node, source)?;
-    match short_name.as_str() {
-        "array_keys" => {
-            let first_arg = call_arguments(node, source).first()?.value_node;
+    let has_function = |fqn: &str| {
+        function_resolver
+            .and_then(|resolve| resolve(fqn))
+            .is_some_and(|resolved| {
+                resolved
+                    .symbol_fqn
+                    .as_deref()
+                    .is_some_and(|actual| fqn_eq_ignore_ascii_case(actual, fqn))
+            })
+    };
+    let _names = crate::function_names::FunctionNameScope::enter(
+        node,
+        source,
+        Some(file_symbols),
+        function_resolver.map(|_| &has_function as &dyn Fn(&str) -> bool),
+    );
+    let global_name = crate::function_names::global_builtin_name(node, source);
+    match global_name.as_deref() {
+        Some("array_keys") => {
+            let first_arg = builtin_array_argument(node, source)?;
             let array_type = infer_expression_type_info_with_function_resolver(
                 first_arg,
                 source,
@@ -5043,8 +5165,8 @@ fn infer_function_call_type_info(
                 args: vec![key_type],
             })
         }
-        "array_values" => {
-            let first_arg = call_arguments(node, source).first()?.value_node;
+        Some("array_values") => {
+            let first_arg = builtin_array_argument(node, source)?;
             let array_type = infer_expression_type_info_with_function_resolver(
                 first_arg,
                 source,
@@ -5070,26 +5192,19 @@ fn infer_function_call_type_info(
     }
 }
 
-fn function_call_short_name(node: Node, source: &str) -> Option<String> {
-    if node.kind() != "function_call_expression" {
-        return None;
+fn builtin_array_argument<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let arguments = call_arguments(node, source);
+    if let Some(argument) = arguments
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("array"))
+    {
+        return Some(argument.value_node);
     }
-
-    let function = node
-        .child_by_field_name("function")
-        .or_else(|| node.named_child(0))?;
-    if function.kind() == "member_access_expression" {
-        return None;
-    }
-
-    let raw_name = source[function.byte_range()].trim();
-    let short = raw_name
-        .trim_start_matches('\\')
-        .rsplit('\\')
-        .next()
-        .unwrap_or(raw_name)
-        .to_ascii_lowercase();
-    (!short.is_empty()).then_some(short)
+    arguments
+        .iter()
+        .find(|arg| arg.name.is_none())
+        .filter(|arg| arg.value_node.kind() != "variadic_unpacking")
+        .map(|arg| arg.value_node)
 }
 
 fn infer_cast_expression_type_info(node: Node, source: &str) -> Option<TypeInfo> {
@@ -7314,3 +7429,7 @@ fn node_range(node: Node) -> (u32, u32, u32, u32) {
 #[cfg(test)]
 #[path = "resolve_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "resolve_builtin_identity_tests.rs"]
+mod builtin_identity_tests;

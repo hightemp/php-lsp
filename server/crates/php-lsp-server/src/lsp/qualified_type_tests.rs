@@ -163,10 +163,16 @@ fn synthesized_laravel_relation_and_model_types_keep_resolved_identity() {
     let index = index("<?php namespace Illuminate\\Database\\Eloquent {class Model {} class Builder {}} namespace Illuminate\\Database\\Eloquent\\Relations {class Relation {} class HasMany extends Relation {}} namespace Lib {class Model extends \\Illuminate\\Database\\Eloquent\\Model {}} namespace Lib\\Lib {class Model {}}");
     let relation = "Illuminate\\Database\\Eloquent\\Relations\\HasMany<Lib\\Model>";
     for owner in [relation, "Lib\\Model"] {
-        for method in ["find", "create"] {
+        for (method, expected) in [
+            (
+                "find",
+                "?\\Lib\\Model|\\Illuminate\\Database\\Eloquent\\Collection<int, \\Lib\\Model>",
+            ),
+            ("create", "\\Lib\\Model"),
+        ] {
             let ty =
                 framework_virtual_member_type_fqn(&index, owner, method, None, None, None).unwrap();
-            assert_eq!(ty, "\\Lib\\Model", "{owner}::{method}");
+            assert_eq!(ty, expected, "{owner}::{method}");
         }
         let ty = framework_virtual_member_type_fqn(&index, owner, "whereName", None, None, None)
             .unwrap();
@@ -262,8 +268,10 @@ fn laravel_accessor_declarations_distinguish_absolute_and_relative_class_names()
 }
 
 #[test]
-fn laravel_relation_signature_qualified_names_use_the_declaration_namespace() {
-    let source="<?php namespace Illuminate\\Database\\Eloquent {class Model {}} namespace Illuminate\\Database\\Eloquent\\Relations {class Relation {} class HasMany extends Relation {}} namespace Lib {class Model {}} namespace App\\Sub\\Relations {class HasMany extends \\Illuminate\\Database\\Eloquent\\Relations\\HasMany {}} namespace App\\Sub {class Record extends \\Illuminate\\Database\\Eloquent\\Model {/** @return Relations\\HasMany<\\Lib\\Model> */ function children(): Relations\\HasMany {return new Relations\\HasMany();}}}";
+fn laravel_relation_signature_qualified_names_use_the_declaration_imports() {
+    // The imported canonical relation defines the related-model slot. A custom
+    // subclass with no template declaration does not prove its generic order.
+    let source="<?php namespace Illuminate\\Database\\Eloquent {class Model {}} namespace Illuminate\\Database\\Eloquent\\Relations {class Relation {} class HasMany extends Relation {}} namespace Lib {class Model {}} namespace App\\Sub\\Relations {class HasMany {}} namespace App\\Sub {use Illuminate\\Database\\Eloquent\\Relations; class Record extends \\Illuminate\\Database\\Eloquent\\Model {/** @return Relations\\HasMany<\\Lib\\Model> */ function children(): Relations\\HasMany {return new Relations\\HasMany();}}}";
     let index = index(source);
     let ty = framework_virtual_member_type_fqn(
         &index,

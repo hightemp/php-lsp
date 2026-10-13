@@ -102,6 +102,13 @@ where
 {
     let mut diagnostics = Vec::new();
     let root = tree.root_node();
+    let has_function = |fqn: &str| resolver(fqn, &[PhpSymbolKind::Function]).is_some();
+    let _names = crate::function_names::FunctionNameScope::enter(
+        root,
+        source,
+        Some(file_symbols),
+        Some(&has_function),
+    );
 
     // Check use statements
     check_use_statements(file_symbols, &resolver, &mut diagnostics);

@@ -6,9 +6,9 @@ use php_lsp_types::{
 };
 use std::io::Write;
 
-const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 37;
+const CACHE_SCHEMA_FIXTURE_VERSION: u32 = 38;
 const CACHE_SCHEMA_FIXTURE_SERIALIZED_LEN: usize = 3998;
-const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x62072c1dce11bb66;
+const CACHE_SCHEMA_FIXTURE_HASH: u64 = 0x984a69ed93131785;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -643,6 +643,63 @@ fn cache_rebuilds_schema36_and_preserves_foreach_body_write_receivers() {
     assert_eq!(
         report.loaded_files, 0,
         "schema36 may contain stale or unfairly truncated receiver references"
+    );
+    assert_eq!(report.parse_files, vec![file]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn p232_cache_rebuilds_schema37_and_keeps_builtin_identity() {
+    let root = unique_temp_dir("builtin-identity");
+    let file = root.join("Builtin.php");
+    let source="<?php namespace App; class Known{function run(){}} function array_values($items){} function walk(){/** @var Known[] $items */$items=[];$values=\\array_values($items);foreach($values as $value){$value->run();}$foreign=array_values($items);foreach($foreign as $value){$value->run();}}";
+    fs::write(&file, source).unwrap();
+    let uri = path_to_uri(&file).unwrap();
+    let mut parser = php_lsp_parser::parser::FileParser::new();
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let symbols = php_lsp_parser::symbols::extract_file_symbols(tree, source, &uri);
+    let references =
+        php_lsp_parser::references::collect_symbol_references_in_file(tree, source, &symbols);
+    assert_eq!(
+        references
+            .iter()
+            .filter(|r| !r.is_declaration && r.target_fqn == "App\\Known::run")
+            .count(),
+        1,
+        "foreign builtin receiver: {references:?}"
+    );
+    let index = WorkspaceIndex::new();
+    update_disk_file_with_references(&index, &file, &uri, symbols, references.clone());
+    let config = test_config();
+    let cache = build_cache_from_index(&index, &root, std::slice::from_ref(&file), &config);
+    let path = root.join("index.bin");
+    save_cache_atomic(&path, &cache).unwrap();
+    let restored = WorkspaceIndex::new();
+    assert_eq!(
+        load_valid_cached_files(
+            &restored,
+            &path,
+            &root,
+            std::slice::from_ref(&file),
+            &config
+        )
+        .loaded_files,
+        1
+    );
+    assert_eq!(
+        *restored.read().file_references().get(&uri).unwrap(),
+        references
+    );
+    let mut legacy = cache;
+    legacy.schema_version = 37;
+    save_cache_atomic(&path, &legacy).unwrap();
+    let stale = WorkspaceIndex::new();
+    let report =
+        load_valid_cached_files(&stale, &path, &root, std::slice::from_ref(&file), &config);
+    assert_eq!(
+        report.loaded_files, 0,
+        "schema37 may contain false builtin receivers"
     );
     assert_eq!(report.parse_files, vec![file]);
     fs::remove_dir_all(root).unwrap();

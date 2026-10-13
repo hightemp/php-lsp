@@ -49,6 +49,8 @@ impl PhpLspBackend {
         };
 
         if sym.ref_kind == RefKind::Variable {
+            let _names =
+                function_name_scope_from_index(&request_index, &tree, &source, &file_symbols);
             if !is_renameable_variable(&sym.name) {
                 return Err(tower_lsp::jsonrpc::Error::invalid_params(
                     "Cannot rename this variable",
@@ -271,6 +273,12 @@ impl PhpLspBackend {
             Some(sym) => {
                 // Variable rename support is local-scope only.
                 if sym.ref_kind == RefKind::Variable {
+                    let _names = function_name_scope_from_index(
+                        &request_index,
+                        tree,
+                        &source,
+                        &file_symbols,
+                    );
                     if !is_renameable_variable(&sym.name) {
                         return Ok(None);
                     }

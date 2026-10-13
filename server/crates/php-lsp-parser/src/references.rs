@@ -36,6 +36,7 @@ pub fn find_variable_references_at_position(
     include_declaration: bool,
 ) -> Vec<ReferenceLocation> {
     let root = tree.root_node();
+    let _names = crate::function_names::FunctionNameScope::enter(root, source, None, None);
     let point = Point::new(line as usize, character as usize);
     let mut node = match root.descendant_for_point_range(point, point) {
         Some(n) => n,
@@ -192,6 +193,12 @@ pub fn collect_symbol_references_in_file_with_resolvers(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Vec<SymbolReference> {
+    let _names = crate::function_names::FunctionNameScope::enter(
+        tree.root_node(),
+        source,
+        Some(file_symbols),
+        None,
+    );
     let _inference_budget = crate::resolve::budget::FileInferenceBudget::for_tree(tree.root_node());
     let mut references = Vec::new();
 

@@ -60,6 +60,8 @@ phpstorm-stubs support.
   `array_map`-style helpers.
 - Framework-aware static providers for common Laravel string keys, Symfony
   Twig template names, and Symfony route names without booting the application.
+  Eloquent terminal types preserve nullable results; argument-free finder
+  metadata retains model/collection unions instead of guessing one result.
 - Blade-like and Symfony/Twig template documents use virtual PHP plus source
   maps for conservative hover, completion, signature help, definition, type
   definition, implementation, inlay hints, diagnostics, and semantic tokens in
@@ -224,7 +226,8 @@ phpstorm-stubs support.
   (schema 32), conditional PHPDoc specialization (schema 33), proven
   instanceof guard binding (schema 34), exact shape-key binding (schema 35),
   bounded foreach/receiver inference (schema 36), or shared foreach bindings and
-  callable budget reservations (current schema 37).
+  callable budget reservations (schema 37), or framework/builtin function
+  identity and nullable call results (current schema 38).
   A smaller real-project regression profile (schema 37; 2026-10-12) completed
   4160 files on one CPU, reaching ready in 26.05s cold and 2.06s warm with full
   cache hits; see

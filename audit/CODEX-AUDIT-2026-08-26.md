@@ -2139,6 +2139,9 @@ Verifier на `gpt-6-sol` завершился финальным GO по код
 
 ### CODEX-P2-32. Framework/type helpers возвращают уверенные, но неверные типы
 
+**Статус (2026-10-13):** выполнено и проверено; Verifier `gpt-6-astra` — **GO**.
+Отдельная проблема Monica vendor latency остаётся открытой.
+
 [`laravel_model_dynamic_method_return_type`](server/crates/php-lsp-server/src/framework.rs#L2238)
 возвращает non-null model и для `find`, и для `first`; реальные Eloquent методы
 могут вернуть `null`. То же повторено для relations в
@@ -2154,6 +2157,124 @@ case-insensitive, и теряет Implements/Overrides links при иной р�
 Что исправить: применять framework rules только после подтверждения owner/FQN,
 разделить nullable/non-null terminal methods и использовать kind-aware PHP
 casing helpers везде.
+
+#### Реализация CODEX-P2-32 (2026-10-13)
+
+Исходное описание P2-32 сохранено без изменений. Исправления выполнены через
+RED → исправление → GREEN; логи и отдельные host-проверки находятся в
+игнорируемом `server/target/p2-32-2026-10-13/`.
+
+- Eloquent `first`/`firstWhere` сохраняют nullable model, а поддерживаемые
+  `firstOrFail`/create-like terminals — non-null model. Argument-free metadata
+  `find` содержит nullable model и collection; `findOrFail` — model и collection
+  без null. Этот слой не различает scalar/array аргументы, поэтому сохраняет
+  безопасный union. Builder terminals больше не получают blanket builder-self;
+  неподдерживаемый return остаётся unknown.
+- Laravel relation определяется по полному canonical FQN или индексированному
+  наследованию. Чужие `App\HasMany`/`App\Relation` не получают Laravel members.
+  Реальный объявленный метод, включая unknown return, имеет приоритет над
+  virtual rule. Helper не подменяет пользовательский `first()` типом модели.
+- `array_keys`/`array_values` и preg-match output bindings используют общий
+  function-name context с section-aware `use function`, алиасами и PHP casing.
+  Qualified foreign functions не получают builtin semantics. Для namespaced
+  fallback требуется function-aware view с положительным global symbol и без
+  известной namespaced тени; member-only callback такой проверкой не является.
+  Source-only namespace discovery сохраняет unknown. Наличие функции без return
+  type учитывается как отдельный факт (`mixed`), а не как отсутствие функции.
+- Context живёт только внутри синхронной операции: reuse готовых FileSymbols,
+  Rc/RAII, source/tree lifetime, nested-source restoration, unwind и thread
+  isolation. Определение, references/highlights, local completion и rename
+  передают индексную проверку в коротких синхронных блоках.
+- Named arguments сопоставляются по имени: `array` и preg-match `matches`.
+  Третий named `flags:` не считается positional output. Валидность reordered
+  `array_keys(filter_value:42, array:['x'=>42])` проверена PHP CLI.
+- Assignment сохраняет полный nullable/union call result; `self` связывается
+  с receiver, не с первым/текущим классом usage. Nullsafe receiver сохраняет
+  возможность null. Hover, completion и navigation используют общий
+  metadata-only terminal fallback без чтения disk macro registrations.
+  Method-level Implements/Overrides links используют PHP method casing.
+- Generic related model берётся только из доказанного model slot: unbound
+  templates, composite arguments и второй declaring-model slot не дают
+  вымышленного класса. Для custom generic owners/targets с недоказанной
+  перестановкой параметров сохраняется unknown. Первый slot известен только
+  у canonical Laravel types. Это ограничение действует и для relation properties.
+
+Семантика сверена с [Eloquent Builder](https://github.com/laravel/framework/blob/12.x/src/Illuminate/Database/Eloquent/Builder.php),
+[BuildsQueries](https://github.com/laravel/framework/blob/12.x/src/Illuminate/Database/Concerns/BuildsQueries.php)
+и [правилами PHP function name resolution](https://www.php.net/manual/en/language.namespaces.rules.php).
+
+Начальный parser RED: 2 PASS / 6 FAIL; server RED: 0 PASS / 7 FAIL.
+Один named-argument fixture затем исправлен с неверного `search_value` на
+валидный `filter_value`: прежнее падение этого fixture само по себе не является
+проверкой валидного PHP-вызова. Итоговый корректный fixture проверен PHP CLI
+и входит в GREEN-набор.
+Позднейшие RED подтвердили schema37 cache replay, member-only evidence,
+ambiguous namespace fallback, output definition без index evidence, unknown
+cross-file function presence, потерю nullable result после assignment/nullsafe
+и подмену реального метода virtual rule. Existing self-reassignment regression
+поймала ошибочную привязку `self` к usage owner; она исправлена до GREEN.
+
+Постоянные регрессии: **40 новых тестов** — parser17, server15, cache1 и LSP7.
+Дополнительные RED подтвердили hover/definition mismatch на реальном CRM,
+unbound generic model, disk-only macro IO в hover, relation property с
+вымышленным template FQN, переставленные custom generic slots и выбор первой
+модели для общего reusable builder. Счётчик проверяет
+один context build для 1000 lookups; thread barriers и 20 конкурентных
+function-edit/hover раундов проверяют изоляцию и точный конечный fallback state.
+Это конечное покрытие гонок, а не доказательство всех scheduling orders.
+
+Cache schema **38**, fixture length3998/hash`984a69ed93131785`, перестраивает
+старые receiver references; layout сериализуемых полей не менялся.
+
+Полный последовательный GREEN: `cargo test --all -- --test-threads=1` —
+**1775 PASS, 0 FAIL, 0 ignored**, 57 test-result blocks (`all-after-oom.log`).
+Clippy `--all-targets -- -D warnings` и Rustfmt прошли. Предыдущий запуск
+`all-final.log` прерван SIGTERM во время desktop oomd incident и не считается
+успешной валидацией. Oomd journal подтверждает длительное memory pressure,
+но не устанавливает единственную причину всех потребителей памяти.
+Повторный полный набор, Clippy и release build используют один CPU,
+`CARGO_BUILD_JOBS=1`, `--test-threads=1`, nice19/idle IO и transient limits
+MemoryHigh1G/MemoryMax1536M/MemorySwapMax256M. Установленный сервер,
+remote hosts и файлы Laravel-проектов не изменяются.
+
+Граница FQN evidence: это разрешение имён в текущем index snapshot. Lazy,
+excluded и runtime-created functions могут отсутствовать в нём; отсутствие
+namespaced symbol не доказывает его отсутствие во всех runtime-сценариях.
+Для неоднозначного source-only пути builtin refinement не применяется.
+PHP containers/bootstrap, DB и runtime Laravel execution не запускаются.
+
+Финальный release проверен read-only на обоих Laravel-проектах:
+
+- `laravel-crm`: **9/9** реальных LSP-проверок, включая исправленный переход
+  к методу после `firstOrFail()`. Cold/warm ready 7854.34/515.23ms,
+  866 файлов/2409 символов, все 866 warm cache hits. Installed vendor metadata
+  отсутствует; проверка установленного Laravel этим результатом не покрыта.
+- `monica`: **7 успешных проверок**, затем definition метода превышает30s;
+  completion в финальном исправленном probe не достигнут. Cold/warm ready
+  без открытого документа 12107.66/14498.13ms, 1330 файлов/7186 символов,
+  все 1330 warm cache hits. Installed vendor metadata присутствует.
+  Полный interactive acceptance для Monica не получен.
+
+Первоначальный probe ожидал class declaration от `new Vault`, но корректно
+получал inherited `Model::__construct`; это ошибка ожидания probe. Финальная
+проверка использует `Vault::class` и проходит точный class definition range.
+Ранее отдельный intermediate completion также превысил30s, а controlled
+early-open и старого schema37, и intermediate schema38 не завершились за30s.
+Проблема vendor first-hit/warm latency оставлена открытой в отдельной задаче
+`LARAVEL-VENDOR-FIRST-HIT-2026-10-13`, а не скрыта успешным unit-набором.
+
+Полные числа, resource limits, SHA256/Build ID и границы сравнения записаны в
+[production baseline](../docs/production-baseline.md#laravel-framework-type-validation-2026-10-13).
+Проектные tracked status и выбранные Composer/model hashes совпадают до/после;
+probe buffers не записаны на диск. Исторические coverage percentages и
+10k-workspace timings не пересчитывались.
+
+Повторяемый read-only Verifier на **gpt-6-astra** выдал итоговый **GO** после
+устранения замечаний и независимой проверки кода, 40 регрессий, полного
+GREEN-лога, Clippy/Rustfmt/diff, release identity, Laravel JSON и документации.
+Матрица содержит65 строк/161 корректную локальную ссылку; исходное описание
+задачи и прежние записи журнала сохранены без изменений. CODEX-P2-32 отмечена выполненной в TASKS.md в этих
+границах; отдельный Monica vendor-latency follow-up остаётся открытым.
 
 ### CODEX-P2-33. Blade/Twig conversion повреждает часть корректных выражений
 

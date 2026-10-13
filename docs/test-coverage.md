@@ -3,7 +3,7 @@
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
 P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
-and P2-29/P2-30/P2-31 plus bounded inference (2026-10-12).
+P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), and P2-32 (2026-10-13).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -79,7 +79,8 @@ percentages have not been remeasured.
 | Twig context cache | cold/warm, overlays, dependency changes, cancellation | T | B | B | [Twig context unit tests](../server/crates/php-lsp-server/src/indexing/twig_context_tests.rs), [regressions](../server/crates/php-lsp-server/src/indexing/twig_context_regression_tests.rs). |
 | Bounded receiver inference | reused foreach bindings and comments, unknown member chains, depth/work/file exhaustion, callable reservations, partial types, unwind and thread isolation; cold/warm indexing | T | B | B | [parser recursion tests](../server/crates/php-lsp-parser/src/resolve_foreach_recursion_tests.rs), [budget tests](../server/crates/php-lsp-parser/src/resolve_budget.rs), [small-stack subprocess](../server/crates/php-lsp-parser/tests/inference_stack.rs), [server binding tests](../server/crates/php-lsp-server/src/lsp/foreach_binding_tests.rs), [indexing protocol test](../server/crates/php-lsp-server/tests/e2e_inference_budget.rs), [cache migration](../server/crates/php-lsp-index/src/cache_tests.rs). Controlled two-thread barriers test budget isolation; warm replay asserts cache hits and queries a closed file before didOpen. Operation counts do not bound every helper's wall time. |
 | Foreach reaching types and references | body writes, unknown/scalar/reference outputs, captures, property/offset owners, nested/duplicate/dynamic destructuring, namespace aliases, edits/close/reopen and concurrent definitions | T | B | B | [parser regression matrix](../server/crates/php-lsp-parser/src/resolve_inference_regression_tests.rs), [protocol regressions](../server/crates/php-lsp-server/tests/e2e_inference_bindings.rs). Twenty two-worker rounds use a start barrier and assert coherent old/new definitions plus the exact final accepted target; this is finite concurrency evidence. |
-| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); the historical 10k-workspace warm-start timing after schema 37 is unmeasured. |
+| Framework/builtin type identity | nullable/non-null terminals, finder unions, foreign owners, declared methods, unbound/reordered generics, shared builders, function aliases/shadows, named arguments, nullsafe assignments and index changes | T | B | B | [framework regressions](../server/crates/php-lsp-server/src/framework_type_identity_tests.rs), [nonblocking hover](../server/crates/php-lsp-server/src/lsp/type_owner_tests.rs), [parser types](../server/crates/php-lsp-parser/src/resolve_builtin_identity_tests.rs), [CST binding tests](../server/crates/php-lsp-parser/src/cst_tests.rs), [name-fact lifecycle tests](../server/crates/php-lsp-parser/src/function_names_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_framework_types.rs), [cache migration](../server/crates/php-lsp-index/src/cache_tests.rs). The 1000-lookup counter test checks fact reuse; controlled thread barriers test isolation, and 20 concurrent function-edit/hover rounds assert the final accepted fallback state. This does not establish completeness for lazy/unindexed runtime functions. |
+| Workspace index | cold scan, warm cache, source provenance | T | B | B | [index tests](../server/crates/php-lsp-index/src/workspace_tests.rs), [cache tests](../server/crates/php-lsp-index/src/cache_tests.rs); the historical 10k-workspace warm-start timing after schema 38 is unmeasured. |
 | Workspace index | watch create/change/delete and file operations | T | B | B | [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Workspace configuration | reconfigure parser/stubs/index, cancel old generation | T | B | B | [initialize tests](../server/crates/php-lsp-server/tests/e2e_initialize.rs), [indexing tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Pre-create/pre-delete file requests | advertised no-edit response | B | B | B | Implementation is documented in [LSP features](lsp-features.md); no direct protocol regression found for either response. |
@@ -168,9 +169,9 @@ line denominator equals the physical line count of these source-mapped files;
 its line percentage should not be compared directly with LLVM's Rust line
 percentage.
 
-The matrix has 64 scenario rows: on Linux 55 have executed tests, seven have
+The matrix has 65 scenario rows: on Linux 56 have executed tests, seven have
 mock-based checks, one has build-only evidence, and one (native Extension Host)
-has no automated test or build evidence. The 55 Rust rows have macOS/Windows
+has no automated test or build evidence. The 56 Rust rows have macOS/Windows
 build evidence but no native runtime test; one of those Rust rows lacks a
 direct Linux protocol regression.
 The nine client rows have no native macOS/Windows runtime test. These are

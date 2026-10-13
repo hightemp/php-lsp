@@ -71,6 +71,7 @@ pub fn enclosing_foreach_binding<'tree>(
     variable_node: Node<'tree>,
     source: &str,
 ) -> Option<(Node<'tree>, ForeachBinding<'tree>)> {
+    let _names = crate::function_names::FunctionNameScope::enter(variable_node, source, None, None);
     super::within_type_scan_budget(|| {
         let name = source.get(variable_node.byte_range())?;
         if variable_node.kind() != "variable_name" {

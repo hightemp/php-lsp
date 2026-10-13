@@ -400,6 +400,8 @@ impl PhpLspBackend {
         };
 
         if sym.ref_kind == RefKind::Variable {
+            let _names =
+                function_name_scope_from_index(&request_index, tree, &source, &file_symbols);
             let highlights: Vec<DocumentHighlight> =
                 find_variable_references_at_position(tree, &source, pos.line, byte_col, true)
                     .into_iter()
@@ -516,6 +518,12 @@ impl PhpLspBackend {
             ) {
                 Some(sym) => {
                     if sym.ref_kind == RefKind::Variable {
+                        let _names = function_name_scope_from_index(
+                            &request_index,
+                            tree,
+                            &source,
+                            &file_symbols,
+                        );
                         let refs = find_variable_references_at_position(
                             tree,
                             &source,

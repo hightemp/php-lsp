@@ -224,27 +224,18 @@ pub(crate) fn is_by_ref_output_argument_variable(node: Node, source: &str) -> bo
     else {
         return false;
     };
-    let Some(function_node) = call
-        .child_by_field_name("function")
-        .or_else(|| call.named_child(0))
-    else {
+    let Some(function_name) = crate::function_names::global_builtin_name(call, source) else {
         return false;
     };
-
-    let function_name = source[function_node.byte_range()]
-        .trim()
-        .trim_start_matches('\\')
-        .rsplit('\\')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
 
     if !matches!(function_name.as_str(), "preg_match" | "preg_match_all") {
         return false;
     }
 
-    argument_name(argument, source).is_some_and(|name| name == "matches")
-        || argument_index(arguments, argument).is_some_and(|index| index == 2)
+    match argument_name(argument, source) {
+        Some(name) => name == "matches",
+        None => argument_index(arguments, argument).is_some_and(|index| index == 2),
+    }
 }
 
 pub(crate) fn ancestor_before_scope<'tree>(

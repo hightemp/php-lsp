@@ -42,8 +42,16 @@ fn extract_file_symbols_with_php_version(
     uri: &str,
     php_version: Option<PhpSymbolExtractionVersion>,
 ) -> FileSymbols {
+    extract_root_symbols(tree.root_node(), source, uri, php_version)
+}
+
+pub(crate) fn extract_root_symbols(
+    root: Node,
+    source: &str,
+    uri: &str,
+    php_version: Option<PhpSymbolExtractionVersion>,
+) -> FileSymbols {
     let mut result = FileSymbols::default();
-    let root = tree.root_node();
     let mut root_cursor = root.walk();
     let children: Vec<Node<'_>> = root.children(&mut root_cursor).collect();
     let has_namespace_declarations = children.iter().any(|child| {

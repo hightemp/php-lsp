@@ -196,6 +196,25 @@ pub(in crate::server) fn framework_virtual_member_type_fqn(
     type_info_resolved_text_from_index(index, &owner_fqn, uri, type_info)
 }
 
+pub(in crate::server) fn function_name_scope_from_index<'a>(
+    index: &WorkspaceIndex,
+    tree: &'a tree_sitter::Tree,
+    source: &'a str,
+    symbols: &php_lsp_types::FileSymbols,
+) -> php_lsp_parser::function_names::FunctionNameScope<'a> {
+    let exists = |fqn: &str| {
+        index
+            .resolve_fqn_matching_kinds(fqn, &[php_lsp_types::PhpSymbolKind::Function])
+            .is_some()
+    };
+    php_lsp_parser::function_names::FunctionNameScope::enter(
+        tree.root_node(),
+        source,
+        Some(symbols),
+        Some(&exists),
+    )
+}
+
 fn type_resolution_owner_fqn(owner_fqn: &str) -> String {
     let owner_fqn = owner_fqn.trim().trim_start_matches('\\');
     owner_fqn
@@ -2348,7 +2367,16 @@ pub(in crate::server) fn resolve_member_type_from_index(
         Some(s) => s,
         None => {
             tracing::debug!("resolve_member_type: {} not found in index", member_fqn);
-            return None;
+            return (expected_kind == php_lsp_types::PhpSymbolKind::Method)
+                .then(|| {
+                    crate::framework::framework_terminal_return_type_from_index(
+                        index,
+                        class_fqn,
+                        member_name,
+                    )
+                })
+                .flatten()
+                .map(|ty| ty.to_string());
         }
     };
 
@@ -2420,7 +2448,9 @@ pub(in crate::server) fn resolve_function_return_type_from_index(
     function_fqn: &str,
 ) -> Option<String> {
     let sym = resolve_fqn_with_ref_kind(index, function_fqn, RefKind::FunctionCall, false)?;
-    symbol_return_type_text_from_index(index, &sym.fqn, &sym)
+    Some(
+        symbol_return_type_text_from_index(index, &sym.fqn, &sym).unwrap_or_else(|| "mixed".into()),
+    )
 }
 
 pub(in crate::server) fn type_info_in_symbol_declaration_scope(

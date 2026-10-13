@@ -1568,6 +1568,7 @@ pub(in crate::server) fn server_variable_type_info(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
 ) -> Option<IndexedExpressionTypeInfo> {
+    let _names = function_name_scope_from_index(ctx.index, ctx.tree, ctx.source, ctx.file_symbols);
     php_lsp_parser::resolve::within_type_resolution_budget(|| {
         server_variable_type_info_inner(ctx, variable_node)
     })
@@ -3160,6 +3161,7 @@ pub(in crate::server) fn local_variable_hover_data(
     ctx: &InlayHintContext<'_>,
     variable_node: tree_sitter::Node,
 ) -> Option<LocalVariableHoverData> {
+    let _names = function_name_scope_from_index(ctx.index, ctx.tree, ctx.source, ctx.file_symbols);
     let start = variable_node.start_position();
     let scoped_file_symbols = ctx
         .file_symbols
@@ -3264,6 +3266,7 @@ fn latest_variable_write_before_usage<'tree>(
     usage_start: usize,
     source: &str,
 ) -> Option<(usize, Option<tree_sitter::Node<'tree>>)> {
+    let _names = php_lsp_parser::function_names::FunctionNameScope::enter(node, source, None, None);
     let mut best = None;
     collect_latest_assignment_rhs_before_usage(
         node,

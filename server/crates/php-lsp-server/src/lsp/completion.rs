@@ -319,6 +319,8 @@ impl PhpLspBackend {
             lsp_items.extend(framework_string_key_items);
         }
         if let php_lsp_completion::context::CompletionContext::Variable { prefix } = &context {
+            let _names =
+                function_name_scope_from_index(&request_index, &tree, &source, &file_symbols);
             add_local_variable_completion_items(
                 &mut lsp_items,
                 &tree,

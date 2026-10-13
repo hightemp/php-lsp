@@ -589,3 +589,77 @@ files. It does not refresh the historical 10k-workspace or interactive-latency
 baseline, and the internal equal-scope quotas retain a precision tradeoff for
 large callables. See [the inference contract](architecture.md#shared-invariants)
 for operation/depth limits and conservative unknown types.
+
+## Laravel Framework-Type Validation (2026-10-13)
+
+Source: `82d624d` plus the P2-32 implementation working tree, cache schema 38.
+The final host release SHA256 is
+`9dea73016041b427b5a6125c60219f778af712a9746464fc65bbf4d95b4c5569`,
+Build ID `8aa79719ab01027906254d537b91213f7add4a25`.
+Full sequential Rust acceptance: **1775 passed, 0 failed, 0 ignored** across
+57 test-result blocks; Clippy and Rustfmt pass. Forty permanent regressions
+cover type/function identity, nullability, generic-model proof, nonblocking
+hover, cache migration and controlled concurrent changes.
+
+All final builds, tests and project runs used one CPU, `CARGO_BUILD_JOBS=1`,
+test `--test-threads=1`, nice19/idle IO and transient
+MemoryHigh1G/MemoryMax1536M/MemorySwapMax256M limits. The preceding full test run
+was interrupted by SIGTERM during desktop oomd incidents and is excluded from
+acceptance; the successful retry is `all-after-oom.log`. These limits protect
+the test process allocation, not a guarantee against host-wide memory pressure.
+
+The existing `scripts/profile-workspace.py` ran each project twice with a
+fresh per-project `XDG_CACHE_HOME`, `client/stubs`, a 45-second budget and an
+explicit nonexistent `--probe` path, so these runs do not open a document.
+"Cold" means an empty language-server cache; the OS page cache was not flushed.
+Installed-vendor indexing remained enabled. Each run indexed 539 stub files,
+reported zero indexing errors and `truncated=false`.
+
+| Local workspace | Indexed files / symbols | Cold ready | Warm ready | Warm cache hits | Cold / warm peak RSS |
+|---|---:|---:|---:|---:|---:|
+| `~/ForTesting/monica` | 1330 / 7186 | 12107.66 ms | 14498.13 ms | 1330 | 504320000 / 413413376 bytes |
+| `~/ForTesting/laravel-crm` | 866 / 2409 | 7854.34 ms | 515.23 ms | 866 | 276082688 / 284741632 bytes |
+
+Monica's warm run loaded every workspace file from cache but was slower in
+this sample. These low-priority runs after a desktop memory-pressure event
+do not isolate the cause or establish a latency distribution. The historical
+10k-workspace acceptance timing has not been refreshed.
+
+Separate stdio probes use an unsaved PHP buffer with the real `App\Models\Vault`
+or `Webkul\User\Models\Group` and test nullable `first`, non-null `firstOrFail`,
+scalar/array finder unions, `count`, a foreign relation name, exact class and
+method definition ranges, and method completion. No PHP application, database
+or container is booted. Final corrected probes start with separate empty caches:
+
+- **Laravel CRM: 9/9 checks pass.** The initial real-project method-definition
+  miss became a permanent RED regression and was fixed by the shared
+  metadata-only terminal resolver. Its lockfile declares Laravel `v12.58.0`,
+  but installed Composer vendor metadata is absent; this is not validation of
+  the installed-framework path.
+- **Monica: 7 checks pass; method definition exceeds 30 seconds.** Completion
+  is not reached in that final run. Its lockfile declares Laravel `v12.22.1`
+  and installed vendor metadata is present. A prior intermediate candidate's
+  completion also exceeded 30 seconds. Monica is not accepted for full
+  interactive use by this validation.
+- The first real-project probe used `new Vault` while expecting the class
+  declaration. Returning the inherited `Model::__construct` was correct.
+  The corrected probe uses `Vault::class`; its exact model-definition check
+  passes. The original expectation failure is not a product defect.
+
+Earlier controlled early-open runs of the schema-37 baseline and an
+intermediate schema-38 candidate both exceeded 30 seconds; another candidate
+run exceeded 120 seconds with peak RSS 2200698880 bytes. An owned-child stack
+sample showed lazy vendor resolution inside the shared filesystem walker and
+canonicalization. It does not prove all delays have that cause. These larger
+early-open experiments were not repeated after the desktop oomd interruption.
+The remaining first-hit/warm latency issue is tracked by
+`LARAVEL-VENDOR-FIRST-HIT-2026-10-13` and
+[R-008](production-risk-register.md#r-008-lazy-vendor-indexing-scale-validation).
+
+Artifacts: `server/target/p2-32-2026-10-13/`, including `final-profile/*.json`,
+`final-corrected-probe/*-probes.json`, RED/GREEN logs, `full-validation.json`,
+release hashes and `oomd.log`. Original intermediate probes remain in
+`profile/` and `final-profile/` for traceability. Tracked project status and
+the selected Composer/model hashes match before/after; unsaved probe files
+are absent. The installed VS Code server and project/vendor files were not
+changed. This is Linux host validation, not package/platform acceptance.

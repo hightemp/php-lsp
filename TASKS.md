@@ -6589,3 +6589,33 @@ change.
   - Implemented: README, architecture, performance/baseline and coverage matrix updated; audit implementation appended after preserved findings. Scope quotas, unknown-type tradeoff, limit-attempt metrics and finite concurrency evidence are explicit. Matrix 64 rows/154 valid local links; historical coverage percentages and 10k-workspace samples unchanged.
   - Validation: original audit/prior journal exact prefixes, new-file whitespace, links/anchors and release hash verified. Verifier final GO covers implementation, all gates and documented resource limits. Installed VS Code server and user-project files were not modified; no installation performed.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice15 and MemoryHigh2G/MemoryMax3G/MemorySwapMax1G transient scopes. Preserve pre-existing audit-review changes; installed server/project files stay untouched.
+
+### Milestone: CODEX-P2-32 framework/type helper identity (2026-10-13 -> 2026-10-13)
+
+**Статус:** complete *(done 2026-10-13)*
+**Цель:** Infer framework and builtin types only for confirmed owners/functions, preserve nullable terminal results and PHP method casing, and prevent confident foreign types through TDD.
+
+#### Задачи
+
+- [x] **P232-001-2026-10-13** Add RED regressions for nullable/non-null Eloquent model/relation terminals, custom owners/functions and aliases, builtin fallback, and differently cased hover relation links. *(done 2026-10-13)*
+  - Implemented: 40 permanent regressions (parser17, server15, cache1, LSP7). Follow-up RED covers unbound/reordered generic models, relation properties, reusable builders, disk-only macro IO and a real CRM hover/definition mismatch. Corrected named-argument fixture and constructor-versus-class probe expectations are documented explicitly.
+- [x] **P232-002-2026-10-13** Fix owner/FQN validation and shared builtin identity/casing without expanding unsupported inference; migrate caches if persisted references change. *(done 2026-10-13)*
+  - Implemented: canonical framework identity, nullable terminal types, conservative finder unions, proven generic model slots and a metadata-only terminal resolver shared by hover/completion/navigation. Operation-owned function-name facts respect aliases, shadows and scope; cache schema38 rebuilds stale receiver references. Unproven custom template chains remain unknown.
+- [x] **P232-003-2026-10-13** Cover LSP behavior, source/index updates and deterministic event orders; run focused/full sequential Rust gates and repeat gpt-6-astra Verifier review to GO. *(done 2026-10-13)*
+  - Additional validation requested: exercise Laravel on ~/ForTesting/monica and laravel-crm with isolated cold/warm cache and actual Eloquent LSP probes; preserve project/vendor files and report installed-dependency limits.
+  - Validation: full Rust1775/1775 across57 result blocks,0 ignored; Clippy, Rustfmt, diff check and final host release pass. Counters/barriers cover fact reuse/thread isolation and20 concurrent function-edit/hover rounds. Repeated gpt-6-astra Verifier returned final GO for source, tests, logs, profiles and documentation.
+  - Laravel result: CRM9/9 without installed vendor metadata. Monica7 corrected checks pass, then method definition exceeds30s; completion is not reached. Cold/warm no-open profiles complete with all warm cache hits, but Monica warm latency remains14.50s. The separate performance follow-up below remains open; no full Monica interactive acceptance is claimed.
+- [x] **P232-004-2026-10-13** Preserve original audit wording, append implementation evidence, update resulting behavior/architecture/coverage documentation and mark this milestone complete. *(done 2026-10-13)*
+  - Implemented: README, architecture/features/performance, production baseline/risk and coverage matrix updated. Original audit/journal prefixes preserved;65 matrix rows/161 local links and new-file whitespace checked. Before/after selected project hashes and tracked status match; probes remain unsaved.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1 and one CPU. Following the desktop oomd interruption, remaining checks use nice19/idle IO and MemoryHigh1G/MemoryMax1536M/MemorySwapMax256M transient scopes. The interrupted full run is not acceptance evidence. No installed/remote server changes or automatic commit.
+
+### Follow-up: installed Laravel vendor latency (2026-10-13)
+
+- [ ] **LARAVEL-VENDOR-FIRST-HIT-2026-10-13** Add bounded deterministic regressions for installed-vendor first-hit/warm latency observed on Monica; investigate repeated vendor candidate traversal/cache work before choosing a fix. Preserve external symlinks, logical URI aliases, exclusions and cancellation budgets.
+  - Evidence: P2-32 final release passes seven corrected Monica checks, then method definition exceeds30s; prior intermediate completion exceeds30s. No-open warm ready14.50s with1330 cache hits. Old schema37 and intermediate schema38 early-open runs each exceeded a controlled30s budget. This is a separate unresolved performance follow-up, not a P2-32 type-correctness acceptance claim; see docs/production-baseline.md and R-008.
+
+### Audit completion placement (2026-10-13)
+
+- [x] **DOC-AUDIT-COMPLETION-2026-10-13** Move the P2-32 completion status and implementation/validation text into the original P2-32 audit section; retain the original finding and all reported limitations. *(done 2026-10-13)*
+  - Implemented: explicit completion status and the full implementation/validation block now sit under P2-32, before P2-33. The separate trailing block was moved, with its heading anchor retained; the Monica limitation remains explicit.
+  - Validation: original finding and all unrelated report text are unchanged; one implementation block remains, nested under the correct task. Diff check passes. Documentation-only relocation; no builds rerun.
