@@ -6689,3 +6689,20 @@ change.
 - [x] **P236-004-2026-10-14** Preserve the original finding, add status/evidence directly under P2-36, update relevant documentation and complete the milestone. *(done 2026-10-14)*
   - Implemented: audit distinguishes the historical P2-18 fixes from the newly fixed prepare fallback. Original finding and prior journal remain unchanged. README, architecture/features and coverage updated; 69 matrix rows / 174 valid local links. Historical coverage percentages/performance timing unchanged.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides retain assertions. No concurrent heavy checks, installed/remote server changes or automatic commit.
+
+### Milestone: CODEX-P2-37 Completion documentation and import identity (2026-10-14 -> 2026-10-14)
+
+**Статус:** complete *(done 2026-10-14)*
+**Цель:** Preserve provider documentation through LSP completion conversion/resolve and prevent accepting an ambiguous short name from referring to a different PHP symbol.
+
+#### Задачи
+
+- [x] **P237-001-2026-10-14** Add RED regressions for Markdown/plain documentation, virtual-item resolve and conflicting short-name/import identity across PHP kinds and namespace sections. *(done 2026-10-14)*
+  - Implemented: 14 regressions (2 conversion unit, 12 LSP). Protocol RED 5 FAIL and conversion RED 1 FAIL / 1 PASS reproduce documentation loss and unsafe insertion identity; additional RED covers anonymous-body, strict_types and group-import placement.
+- [x] **P237-002-2026-10-14** Fix item conversion and conservative auto-import candidate handling using existing kind-aware resolution/edit helpers; preserve valid same-symbol and explicit-qualified completions. *(done 2026-10-14)*
+  - Implemented: both conversion paths preserve documentation. Kind-aware import planning hides conflicting short candidates, reuses existing aliases and validates qualified spelling. Explicit UTF-16 edits replace the whole identifier; CST-unsafe import placement uses an absolute FQN. Missing index candidates are dropped. No public setting/schema changes; shared code-action import builder unchanged.
+- [x] **P237-003-2026-10-14** Exercise accepted completion edits, UTF-16/CRLF, document updates/reopen and controlled concurrent states; run focused/full sequential Rust gates and repeat gpt-6-astra Verifier until GO. *(done 2026-10-14)*
+  - Validation: 37 completion protocol and 2 conversion unit tests pass; full Rust suite 1885 PASS / 0 FAIL / 0 ignored across 62 blocks. Accepted edits preserve syntax and exact definition identity; 20 overlapping completion/edit rounds check complete old plans or absence plus latest/reopened state. Clippy -D warnings, Rustfmt and diff check pass; final read-only gpt-6-astra Verifier returned GO after validating code, source hashes, test logs and documentation.
+- [x] **P237-004-2026-10-14** Preserve the original audit finding, append status/evidence within P2-37, update relevant docs and complete the milestone. *(done 2026-10-14)*
+  - Implemented: README, architecture/features and coverage document documentation transfer, conflict hiding, alias reuse and safe FQN fallback. The matrix has 70 rows / 176 valid local links; original finding and prior journal are preserved. Historical coverage percentages and performance timing unchanged.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides retain assertions. No concurrent heavy checks, installed/remote server changes or automatic commit.

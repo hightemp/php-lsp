@@ -187,6 +187,15 @@ non-UTF-8 decoded keys and exhausted type budgets remain unresolved.
 This applies to the supported PHPDoc `array{...}` / `object{...}` and literal
 array inference; it does not add other PHPStan shape syntaxes.
 
+Completion responses retain provider plain/Markdown documentation. Free symbol
+completion hides a competing short-name candidate and reuses an existing alias
+for the selected FQN. Explicit text edits replace the full current identifier;
+qualified spellings are retained only when they resolve to that candidate.
+If an auto-import would enter a nested body, comment or group import, overlap
+the main replacement, or precede a global `declare`, completion inserts an
+absolute FQN instead. These safeguards apply to completion insertion; use-clause
+completion and code-action import generation retain their separate behavior.
+
 ## Template Documents
 
 | Area | Status | Notes |

@@ -572,6 +572,7 @@ pub(in crate::server) fn framework_string_key_completion_item_to_ls(
         label: item.label,
         kind: item.kind.map(lsp_completion_kind_to_ls),
         detail: item.detail,
+        documentation: item.documentation.map(lsp_documentation_to_ls),
         sort_text: item.sort_text,
         filter_text: item.filter_text,
         insert_text: item.insert_text,

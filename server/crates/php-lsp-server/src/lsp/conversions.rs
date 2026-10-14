@@ -80,3 +80,24 @@ pub(in crate::server) fn lsp_text_edit_to_ls(edit: lsp_types::TextEdit) -> TextE
         new_text: edit.new_text,
     }
 }
+
+pub(in crate::server) fn lsp_documentation_to_ls(
+    documentation: lsp_types::Documentation,
+) -> Documentation {
+    match documentation {
+        lsp_types::Documentation::String(text) => Documentation::String(text),
+        lsp_types::Documentation::MarkupContent(content) => {
+            Documentation::MarkupContent(MarkupContent {
+                kind: match content.kind {
+                    lsp_types::MarkupKind::Markdown => MarkupKind::Markdown,
+                    lsp_types::MarkupKind::PlainText => MarkupKind::PlainText,
+                },
+                value: content.value,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "completion_conversion_tests.rs"]
+mod completion_tests;

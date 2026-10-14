@@ -3,6 +3,9 @@
 use super::super::*;
 use super::references::local_symbol_for_reference;
 
+#[path = "completion_imports.rs"]
+mod imports;
+
 fn completion_auto_import_symbol(
     index: &WorkspaceIndex,
     item: &lsp_types::CompletionItem,
@@ -441,18 +444,34 @@ impl PhpLspBackend {
         // We need to map between the two different type systems
         let items: Vec<CompletionItem> = lsp_items
             .into_iter()
-            .map(|mut item| {
-                let auto_import_edit = if enable_auto_imports {
-                    completion_auto_import_symbol(&request_index, &item).and_then(|sym| {
-                        build_completion_auto_import_edit(
-                            &source,
-                            auto_import_file_symbols.as_ref(),
-                            &sym,
-                        )
-                    })
-                } else {
-                    None
-                };
+            .filter_map(|mut item| {
+                let mut main_edit = None;
+                let mut auto_import_edit = None;
+                if enable_auto_imports
+                    && item.data.as_ref().is_some_and(serde_json::Value::is_string)
+                {
+                    // A removed index candidate must not fall back to an unchecked short name.
+                    let symbol = completion_auto_import_symbol(&request_index, &item)?;
+                    let prefix = match &context {
+                        php_lsp_completion::context::CompletionContext::Free { prefix }
+                        | php_lsp_completion::context::CompletionContext::Namespace { prefix } => {
+                            prefix
+                        }
+                        _ => unreachable!("auto-import context checked above"),
+                    };
+                    let prepared = imports::prepare_import(
+                        &source,
+                        &tree,
+                        auto_import_file_symbols.as_ref(),
+                        &symbol,
+                        prefix,
+                        pos.line,
+                        byte_col,
+                    )?;
+                    item.insert_text = Some(prepared.insert_text);
+                    main_edit = Some(prepared.text_edit);
+                    auto_import_edit = prepared.additional_edit;
+                }
                 let kind = item.kind.map(lsp_completion_kind_to_ls);
 
                 let tags = item.tags.map(|tags| {
@@ -494,10 +513,12 @@ impl PhpLspBackend {
                     }
                     other => other,
                 });
-                CompletionItem {
+                Some(CompletionItem {
                     label: item.label,
                     kind,
                     detail: item.detail,
+                    documentation: item.documentation.map(lsp_documentation_to_ls),
+                    text_edit: main_edit,
                     sort_text: item.sort_text,
                     filter_text: item.filter_text,
                     insert_text: item.insert_text,
@@ -507,7 +528,7 @@ impl PhpLspBackend {
                     tags,
                     data,
                     ..Default::default()
-                }
+                })
             })
             .collect();
 

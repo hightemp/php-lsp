@@ -45,6 +45,7 @@ server/crates/php-lsp-server/src/
     analyzer_snapshot.rs     # bounded disk/buffer checks for external diagnostics
     completion.rs            # completion, completion resolve, signature help
     completion_helpers.rs    # virtual members, shapes, local variables, auto-import edits
+    completion_imports.rs    # completion insertion identity and safe import placement
     composite_receivers.rs   # typed union/intersection member selection and receiver loading
     hover.rs                 # hover response assembly
     definition.rs            # definition/declaration/typeDefinition/implementation
@@ -134,6 +135,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_initialize.rs` | initialize/shutdown, runtime configuration, project config trust. |
 | `tests/e2e_logging.rs` | real stdio binary stderr filtering, initialization overrides, inherited/invalid RUST_LOG and separate CLI stdout. |
 | `tests/e2e_completion.rs` | completion, completion resolve, signature help, shape completion. |
+| `tests/e2e_completion_identity.rs` | provider docs/resolve, import collisions and aliases, accepted-edit definition identity, qualified/inline/group/declare layouts, UTF-16/CRLF and bounded edit/reopen orders. |
 | `tests/e2e_signature_help.rs` | nullsafe/nested/incomplete calls, CST argument tracking, UTF-16/CRLF and cross-file method chains. |
 | `tests/e2e_hover.rs` | hover, inlay hints, local variable type inference, callback inference. |
 | `tests/e2e_type_owner.rs` | lexical PHPDoc type owners, hover/inlay type links, namespace imports, anonymous-class boundaries and unsaved UTF-16/CRLF updates. |
@@ -520,6 +522,27 @@ Member completion keeps an open file's direct declarations ahead of indexed
 ancestors and deduplicates overrides/diamonds by PHP lookup identity: methods
 are ASCII case-insensitive, while properties and constants remain
 case-sensitive. Distinct symbol kinds and FQNs remain separate candidates.
+
+The server preserves provider `Documentation::String`, Markdown and plaintext
+markup through both completion conversion paths. Framework virtual items carry
+their materialized documentation through resolve without a second lookup.
+
+`lsp/completion_imports.rs` plans free/namespace symbol insertion in the cursor's
+namespace section. An existing import of the same FQN supplies its actual alias;
+a competing alias or local declaration hides the unsafe short candidate using
+PHP kind-specific casing. Qualified text is retained only when the shared name
+resolver proves it denotes the selected FQN; it does not acquire an auto-import.
+Candidates removed from the index are dropped instead of losing the safety plan.
+Explicit UTF-16 text edits replace the typed prefix and remaining identifier
+suffix, avoiding client-dependent word replacement.
+
+For a new import, the existing builder proposes the edit and a CST check accepts
+only a program/namespace insertion outside the main replacement. It rejects
+comments, anonymous/class/function bodies, partial group imports, another
+namespace and insertion before a global `declare`. Where no safe edit is
+available, the main edit uses an absolute FQN and emits no import. This is a
+completion-specific guard; it does not redesign the shared code-action import
+builder or enumerate every relative namespace/alias prefix as a new candidate.
 
 Composite instance receivers retain their `TypeInfo` tree through member lookup.
 `lsp/composite_receivers.rs` selects the union of guaranteed members for an

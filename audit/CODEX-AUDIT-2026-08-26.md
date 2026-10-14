@@ -2623,6 +2623,66 @@ import/alias и фактически ссылается на другой symbol
 Что исправить: сохранять documentation при type conversion; при collision
 генерировать безопасный alias + replacement text либо скрывать candidate.
 
+**Статус (2026-10-14): выполнено через TDD.**
+
+Обе completion conversion paths теперь используют единое преобразование
+`Documentation::String` / Markdown / plaintext с сохранением содержимого и
+формата. Предварительно подготовленная framework-документация доступна уже в
+completion и сохраняется при `completionItem/resolve`.
+
+В `lsp/completion_imports.rs` добавлено планирование вставки в активной
+namespace section. Для конфликтующего short name выбран разрешённый finding-ом
+консервативный вариант: candidate скрывается. Existing import того же FQN
+использует фактический alias. Class/function/constant namespaces и casing
+проверяются существующими kind-aware helpers; локальный корректный symbol
+остаётся доступен. Исчезнувший из индекса candidate не остаётся raw short item.
+Квалифицированное написание сохраняется только если общий PHP resolver
+подтверждает выбранный FQN, без дополнительного auto-import. UTF-16 main edit
+заменяет prefix и остаток текущего identifier, включая completion в середине
+слова; resolve не меняет этот план edits.
+
+Accepted-edit проверки выявили связанные дефекты line-oriented import builder:
+вставку внутрь anonymous class/comment, перед `declare(strict_types=1)` и
+внутрь multiline group import. CST guard разрешает только program/namespace
+placement, не пересекающий основной edit. Если безопасный import недоступен,
+вставляется абсолютный FQN без import-edit. Сам общий code-action builder и
+перечисление дополнительных relative/alias namespace candidates не
+переписывались. Настройки, persisted schema 38 и template auto-import policy
+не изменены.
+
+TDD: `protocol-red-corrected.log` — **5 FAIL** на потере framework Markdown,
+конфликтах трёх PHP kinds/global names, existing aliases и namespace isolation;
+`conversion-red.log` — **1 FAIL / 1 PASS**. Последующие accepted-edit RED:
+**1 FAIL / 7 PASS** (anonymous-class placement), **2 FAIL / 7 PASS** (включая
+strict_types), отдельный FAIL для multiline group import. После CST guard —
+**10/10 PASS**. Ошибочное старое ожидание «candidate остаётся без import»
+заменено проверкой его отсутствия и сохранения local declaration.
+
+Добавлены **14 постоянных тестов**: 2 conversion unit и 12 LSP. Они проверяют
+формат/отсутствие документации, Laravel scope virtual Markdown, resolve,
+class/function/constant conflicts и casing, global и local declarations,
+existing aliases, повторные namespaces, absolute/relative qualifiers,
+mid-word replacement, inline/comment/anonymous/group/comma/declare layouts,
+UTF-16/emoji/CRLF. После применения main/additional edits проверяются
+Tree-sitter syntax, точный URI/range целевого declaration через definition
+и сохранность edits при resolve. Двадцать ограниченных раундов перекрывающихся
+completion/edit futures меняют polling order, принимают только целый прежний
+план либо отсутствие candidate, затем проверяют актуальный и reopened state.
+Это конечное покрытие порядков событий, не все возможные interleavings.
+
+Адресно прошли **37 completion protocol** и **2 conversion unit** проверки.
+Полный `cargo test --all`: **1885 PASS, 0 FAIL, 0 ignored**, 62 result blocks
+(`all.log`). Clippy `--all-targets -- -D warnings`, Rustfmt и diff check
+прошли. Read-only Verifier на **gpt-6-astra** дал итоговый **GO** после
+проверки кода, 14 новых тестов, логов, совпадения SHA256 семи Rust-файлов
+с проверенным набором и документации. Проверены 70 строк матрицы / 176
+локальных ссылок; milestone P2-37 завершён в TASKS.md. Артефакты: `server/target/p2-37-2026-10-14/` (ignored).
+Все Rust-проверки последовательные: один CPU, `CARGO_BUILD_JOBS=1`,
+`--test-threads=1`, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M;
+CLI server-package debug=0 сохраняет assertions. Исходное описание finding
+и остальные разделы сохранены; README, архитектура, feature/coverage matrices
+актуализированы. Процентное покрытие и performance baseline не измерялись.
+
 ### CODEX-P2-38. Reference UI имеет неверные write roles и квадратичный code lens
 
 [`is_write_reference`](server/crates/php-lsp-server/src/lsp/references.rs#L704)

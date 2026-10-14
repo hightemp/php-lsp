@@ -87,6 +87,9 @@ phpstorm-stubs support.
   by import kind, including grouped imports; inherited member overrides do not
   repeat equivalent labels. Incomplete one-line `$object->` expressions remain usable
   for completion while tree-sitter diagnostics still report the incomplete PHP.
+- Completion preserves provider documentation, including framework Markdown.
+  Conflicting short-name candidates are hidden; existing aliases are reused.
+  When an import cannot be placed safely, completion inserts an absolute FQN.
 - Completion resolve enriches PHPDoc virtual member completions.
 - Native member completion uses class-scope visibility for other instances,
   named static access, inheritance, and nested trait consumption. Inherited

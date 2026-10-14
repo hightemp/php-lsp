@@ -3043,15 +3043,11 @@ function importAliases(): void
             .unwrap();
         let result = extract_result(response);
         let items = completion_items_from_result(&result);
-        let item = items
-            .iter()
-            .find(|item| item.get("label").and_then(|value| value.as_str()) == Some(label))
-            .unwrap_or_else(|| panic!("expected {label} completion, got: {items:?}"));
         assert!(
-            item.get("additionalTextEdits")
-                .and_then(|value| value.as_array())
-                .is_none_or(Vec::is_empty),
-            "{label} alias collision must be case-insensitive: {item:?}"
+            items
+                .iter()
+                .all(|item| item["data"]["fqn"] != format!("Vendor\\{label}")),
+            "a conflicting short candidate must be hidden, not left without its import: {items:?}"
         );
     }
 
@@ -3181,19 +3177,13 @@ function scopedDeclarations(): void
         .unwrap();
     let utility_result = extract_result(utility_response);
     let utility_items = completion_items_from_result(&utility_result);
-    let utility_item = utility_items
-        .iter()
-        .find(|item| {
-            item.get("label").and_then(|value| value.as_str()) == Some("utility")
-                && item.get("detail").and_then(|value| value.as_str()) == Some("Vendor\\utility")
-        })
-        .unwrap_or_else(|| panic!("expected Vendor\\utility completion, got: {utility_items:?}"));
+    assert!(utility_items.iter().all(|item| item["data"]["fqn"] != "Vendor\\utility"),
+        "foreign function with a local case-insensitive collision must be hidden: {utility_items:?}");
     assert!(
-        utility_item
-            .get("additionalTextEdits")
-            .and_then(|value| value.as_array())
-            .is_none_or(Vec::is_empty),
-        "a local function collision in the current namespace must be case-insensitive: {utility_item:?}"
+        utility_items
+            .iter()
+            .any(|item| item["data"]["fqn"] == "Second\\UTILITY"),
+        "the actual local declaration must remain available: {utility_items:?}"
     );
 
     service
