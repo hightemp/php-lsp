@@ -1496,6 +1496,7 @@ impl PhpLspBackend {
         .await
     }
 
+    #[cfg(test)]
     pub(in crate::server) fn reference_locations_for_symbol(
         &self,
         index: &WorkspaceIndex,

@@ -193,3 +193,16 @@ fn test_range_byte_to_utf16_multiline_unicode() {
 
     assert_eq!(range_byte_to_utf16(source, (1, 8, 2, 11)), (1, 8, 2, 8));
 }
+
+#[test]
+fn indexed_columns_match_scalar_boundaries_for_every_utf8_offset() {
+    let source = "😀a世b";
+    let index = Utf16LineIndex::new(source);
+    for byte in 0..=source.len() + 2 {
+        assert_eq!(
+            index.byte_col_to_utf16(0, byte as u32),
+            byte_col_to_utf16(source, 0, byte as u32),
+            "byte {byte}"
+        );
+    }
+}

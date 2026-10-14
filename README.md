@@ -242,6 +242,8 @@ phpstorm-stubs support.
 - `references`, `rename`, and reference-count code lenses merge indexed
   closed-file references with ordinary open PHP snapshots, but still iterate
   workspace reference sets and can be expensive on very large repositories.
+  Code lenses aggregate class-like and method declarations in one cancellable
+  blocking traversal.
 - Workspace indexing parses files through a bounded CPU-aware task queue; the
   primary large-workspace indexing baseline is measured in
   `docs/production-baseline.md`.

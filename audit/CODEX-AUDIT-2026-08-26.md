@@ -2700,6 +2700,41 @@ O(symbols × all references) прямо в async request.
 одним проходом/group-by target и выполнять workspace-wide работу off-runtime с
 cancellation.
 
+**Статус: исправлено (2026-10-14).** CST-роли добавлены в неперсистентный
+`ReferenceLocation`; текстовые эвристики удалены. Проверяются multiline
+parameters, foreach/catch/destructuring, assignment/update/unset, property/array
+targets, читаемые receivers/indices/captures и подтверждённые builtin output
+arguments с aliases, named arguments и function shadowing. Function-name facts
+переиспользуются на одну операцию. Формат кеша и schema 38 не менялись.
+
+`lsp/code_lens.rs` группирует class-like и method declarations за один обход
+references в cancellable blocking worker с существующим общим 15-секундным бюджетом и permit
+до фактического завершения. Сохранены PHP casing, related receivers без двойного
+подсчёта, open-buffer authority, изоляция roots/templates и UTF-16 ranges.
+Перед возвратом проверяются runtime/index revision, open inventory и document
+lifetime/version; закрытый target требует совпадающего source fingerprint.
+Reference extraction использует один UTF-16 index на файл и cancellation checks
+между CST nodes; поиск Unicode-колонки выполняется бинарно.
+
+**TDD:** исходные 6 role-регрессий и маленький lens-счётчик дали RED (4 обхода
+каждого файла для 4 symbols вместо одного), затем GREEN. Дополнительно
+воспроизведены и исправлены property output READ, повторные function-name facts
+(4 вместо 1) и неверная колонка внутри первого Unicode-символа. Добавлены
+2000-lens счётчик, differential matcher, cache replay, точные LSP ranges и
+управляемые порядки edit/close/reopen, новых buffers/templates, замены
+runtime/index, отмены и shutdown. Это конечное покрытие событий; ancestry/output
+и отдельные непрерываемые фазы остаются затратными, cancellation кооперативная.
+Production latency и проценты покрытия повторно не измерялись.
+
+**Проверки:** добавлено 20 тестов; адресные регрессии GREEN. Полный
+`cargo test --all`: **1905 PASS, 0 FAIL, 0 ignored** (64 result blocks).
+Clippy `--all-targets -- -D warnings`, Rustfmt и `git diff --check` — PASS.
+Все Rust-проверки последовательные: `CARGO_BUILD_JOBS=1`, `--test-threads=1`,
+один CPU, MemoryMax 1536M / MemorySwapMax 256M; server-package debug=0 только
+через CLI, assertions сохранены. Повторный Verifier (`gpt-6-astra`) — **GO**.
+README, architecture, LSP feature matrix и test-evidence matrix актуализированы;
+исходный finding сохранён. Логи: `server/target/p2-38-2026-10-14/` (ignored).
+
 ### CODEX-P2-39. Symbol/selection responses нарушают реальные namespace и 1:1 contracts
 
 `lsp_document_symbol` ожидает `PhpSymbolKind::Namespace` и хранит только один

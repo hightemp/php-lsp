@@ -130,3 +130,27 @@ fn p232_parallel_name_facts_do_not_cross_threads() {
         thread.join().unwrap();
     }
 }
+
+#[test]
+fn p238_property_roles_build_function_name_facts_once_per_file() {
+    let source = "<?php class Box {public $value; function f(){ preg_match('/x/','x',$this->value); preg_match('/x/','x',$this->value); ordinary($this->value); ordinary($this->value); }}";
+    let mut parser = FileParser::new();
+    parser.parse_full(source);
+    let tree = parser.tree().unwrap();
+    let symbols = extract_file_symbols(tree, source, "file:///property-roles.php");
+    let before = BUILDS.with(|count| count.get());
+    let refs = crate::references::find_references_in_file(
+        tree,
+        source,
+        &symbols,
+        "Box::$value",
+        PhpSymbolKind::Property,
+        true,
+    );
+    assert_eq!(refs.len(), 5);
+    assert_eq!(
+        refs.iter().filter(|reference| reference.is_write).count(),
+        3
+    );
+    assert_eq!(BUILDS.with(|count| count.get()) - before, 1);
+}

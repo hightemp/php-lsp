@@ -9,7 +9,6 @@ use crate::resolve::{
     unqualified_name_allows_global_fallback, CallableParamTypeResolver, MemberTypeResolver,
     RefKind,
 };
-use crate::utf16::range_byte_to_utf16;
 use crate::variable_scope::*;
 use php_lsp_types::{
     symbol_fqn_eq, FileSymbols, PhpSymbolKind, SymbolReference, SymbolReferenceCallKind,
@@ -20,8 +19,14 @@ use tree_sitter::{Node, Point, Tree};
 /// A location within a file where a reference was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceLocation {
+    /// Tree-sitter byte-column range; converted exactly once by the LSP caller.
     pub range: (u32, u32, u32, u32),
+    /// CST-derived access role. Local locations are not persisted in the index cache.
+    pub is_write: bool,
 }
+
+#[path = "reference_roles.rs"]
+mod roles;
 
 /// Find references in the local-variable binding component at cursor position.
 ///
@@ -115,6 +120,8 @@ pub fn find_references_in_file(
 ) -> Vec<ReferenceLocation> {
     let mut results = Vec::new();
     let root = tree.root_node();
+    let _names =
+        crate::function_names::FunctionNameScope::enter(root, source, Some(file_symbols), None);
 
     match target_kind {
         PhpSymbolKind::Class
@@ -193,6 +200,30 @@ pub fn collect_symbol_references_in_file_with_resolvers(
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) -> Vec<SymbolReference> {
+    collect_symbol_references_in_file_cancellable(
+        tree,
+        source,
+        file_symbols,
+        resolver,
+        callable_resolver,
+        &|| false,
+    )
+    .unwrap_or_default()
+}
+
+/// Collect one file with cancellation checks between declarations and CST nodes.
+/// A cancelled collection never returns a partial successful result.
+pub fn collect_symbol_references_in_file_cancellable(
+    tree: &Tree,
+    source: &str,
+    file_symbols: &FileSymbols,
+    resolver: Option<MemberTypeResolver<'_>>,
+    callable_resolver: Option<CallableParamTypeResolver<'_>>,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<SymbolReference>> {
+    if cancelled() {
+        return None;
+    }
     let _names = crate::function_names::FunctionNameScope::enter(
         tree.root_node(),
         source,
@@ -200,16 +231,23 @@ pub fn collect_symbol_references_in_file_with_resolvers(
         None,
     );
     let _inference_budget = crate::resolve::budget::FileInferenceBudget::for_tree(tree.root_node());
-    let mut references = Vec::new();
+    let mut references = ReferenceCollector {
+        items: Vec::new(),
+        positions: crate::utf16::Utf16LineIndex::new(source),
+        cancelled,
+    };
 
     for symbol in &file_symbols.symbols {
+        if cancelled() {
+            return None;
+        }
         if symbol.kind == PhpSymbolKind::Namespace {
             continue;
         }
-        references.push(SymbolReference {
+        references.items.push(SymbolReference {
             target_fqn: symbol.fqn.clone(),
             target_kind: symbol.kind,
-            range: range_byte_to_utf16(source, symbol.selection_range),
+            range: references.range_tuple(symbol.selection_range),
             is_declaration: true,
             starts_with_dollar: symbol.kind == PhpSymbolKind::Property,
             allows_global_fallback: false,
@@ -246,8 +284,11 @@ pub fn collect_symbol_references_in_file_with_resolvers(
             "receiver inference limited"
         );
     }
-    sort_and_dedup_symbol_references(&mut references);
-    references
+    if cancelled() {
+        return None;
+    }
+    sort_and_dedup_symbol_references(&mut references.items);
+    (!cancelled()).then_some(references.items)
 }
 
 fn sort_and_dedup_symbol_references(references: &mut Vec<SymbolReference>) {
@@ -319,7 +360,7 @@ fn collect_symbol_references_walk(
     node: Node,
     source: &str,
     file_symbols: &FileSymbols,
-    references: &mut Vec<SymbolReference>,
+    references: &mut ReferenceCollector<'_>,
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) {
@@ -328,6 +369,10 @@ fn collect_symbol_references_walk(
     let mut scoped = std::borrow::Cow::Borrowed(file_symbols);
     let mut callables = Vec::new();
     loop {
+        if (references.cancelled)() {
+            while callables.pop().is_some() {}
+            return;
+        }
         let current = cursor.node();
         let start = current.start_position();
         let section = file_symbols
@@ -359,6 +404,10 @@ fn collect_symbol_references_walk(
             continue;
         }
         loop {
+            if (references.cancelled)() {
+                while callables.pop().is_some() {}
+                return;
+            }
             let leaving = cursor.node().id();
             if callables.last().is_some_and(|(id, _)| *id == leaving) {
                 callables.pop();
@@ -402,17 +451,16 @@ fn collect_symbol_reference_node(
     node: Node,
     source: &str,
     file_symbols: &FileSymbols,
-    references: &mut Vec<SymbolReference>,
+    references: &mut ReferenceCollector<'_>,
     resolver: Option<MemberTypeResolver<'_>>,
     callable_resolver: Option<CallableParamTypeResolver<'_>>,
 ) {
     if node.kind() == "namespace_definition" {
         if let Some((function_name, selection)) = namespace_relative_function_call(node, source) {
-            push_symbol_reference(
-                references,
+            references.push(
                 resolve_function_name_to_fqn(&function_name, file_symbols),
                 PhpSymbolKind::Function,
-                reference_range(source, selection),
+                references.range(selection),
                 CollectedReferenceOptions {
                     call_site: reference_call_site(node, SymbolReferenceCallKind::Function),
                     ..Default::default()
@@ -423,7 +471,7 @@ fn collect_symbol_reference_node(
 
     match node.kind() {
         "namespace_use_clause" => {
-            push_import_target_reference(node, source, file_symbols, references);
+            push_import_target_reference(node, file_symbols, references);
         }
         "object_creation_expression" => {
             let mut cursor = node.walk();
@@ -444,11 +492,10 @@ fn collect_symbol_reference_node(
             {
                 let member_name = &source[name_node.byte_range()];
                 if let Some(scope_fqn) = scoped_member_reference_class(node, source, file_symbols) {
-                    push_symbol_reference(
-                        references,
+                    references.push(
                         format!("{}::{}", scope_fqn, member_name),
                         PhpSymbolKind::Method,
-                        reference_range(source, name_node),
+                        references.range(name_node),
                         CollectedReferenceOptions {
                             receiver: SymbolReferenceReceiver::StaticClass {
                                 class_fqn: scope_fqn,
@@ -458,11 +505,10 @@ fn collect_symbol_reference_node(
                         },
                     );
                 } else {
-                    push_symbol_reference(
-                        references,
+                    references.push(
                         format!("::{}", member_name),
                         PhpSymbolKind::Method,
-                        reference_range(source, name_node),
+                        references.range(name_node),
                         CollectedReferenceOptions {
                             receiver: SymbolReferenceReceiver::Unresolved,
                             call_site: reference_call_site(node, SymbolReferenceCallKind::Method),
@@ -493,11 +539,10 @@ fn collect_symbol_reference_node(
                     bare_name.to_string()
                 };
                 if let Some(scope_fqn) = scoped_member_reference_class(node, source, file_symbols) {
-                    push_symbol_reference(
-                        references,
+                    references.push(
                         format!("{}::{}", scope_fqn, member),
                         kind,
-                        reference_range(source, name_node),
+                        references.range(name_node),
                         CollectedReferenceOptions {
                             starts_with_dollar: raw_name.starts_with('$'),
                             receiver: SymbolReferenceReceiver::StaticClass {
@@ -507,11 +552,10 @@ fn collect_symbol_reference_node(
                         },
                     );
                 } else {
-                    push_symbol_reference(
-                        references,
+                    references.push(
                         format!("::{}", member),
                         kind,
-                        reference_range(source, name_node),
+                        references.range(name_node),
                         CollectedReferenceOptions {
                             starts_with_dollar: raw_name.starts_with('$'),
                             receiver: SymbolReferenceReceiver::Unresolved,
@@ -542,11 +586,10 @@ fn collect_symbol_reference_node(
                         SymbolReferenceReceiver::Unresolved,
                     )
                 });
-                push_symbol_reference(
-                    references,
+                references.push(
                     target_fqn,
                     PhpSymbolKind::Property,
-                    reference_range(source, name_node),
+                    references.range(name_node),
                     CollectedReferenceOptions {
                         receiver,
                         ..Default::default()
@@ -570,11 +613,10 @@ fn collect_symbol_reference_node(
                     callable_resolver,
                 )
                 .unwrap_or_else(|| (format!("::{}", text), SymbolReferenceReceiver::Unresolved));
-                push_symbol_reference(
-                    references,
+                references.push(
                     target_fqn,
                     PhpSymbolKind::Method,
-                    reference_range(source, name_node),
+                    references.range(name_node),
                     CollectedReferenceOptions {
                         receiver,
                         call_site: reference_call_site(node, SymbolReferenceCallKind::Method),
@@ -604,11 +646,10 @@ fn collect_symbol_reference_node(
                     } else {
                         (format!("::{}", text), SymbolReferenceReceiver::Unresolved)
                     };
-                    push_symbol_reference(
-                        references,
+                    references.push(
                         target,
                         PhpSymbolKind::ClassConstant,
-                        reference_range(source, name_node),
+                        references.range(name_node),
                         CollectedReferenceOptions {
                             receiver,
                             ..Default::default()
@@ -620,11 +661,10 @@ fn collect_symbol_reference_node(
         "function_call_expression" => {
             if let Some(func_node) = node.child_by_field_name("function") {
                 let text = &source[func_node.byte_range()];
-                push_symbol_reference(
-                    references,
+                references.push(
                     resolve_function_name_to_fqn(text, file_symbols),
                     PhpSymbolKind::Function,
-                    reference_range(source, func_node),
+                    references.range(func_node),
                     CollectedReferenceOptions {
                         call_site: reference_call_site(node, SymbolReferenceCallKind::Function),
                         allows_global_fallback: unqualified_name_allows_global_fallback(
@@ -632,7 +672,10 @@ fn collect_symbol_reference_node(
                             UseKind::Function,
                             file_symbols,
                         ),
-                        rename_range: Some(terminal_identifier_range(source, func_node)),
+                        rename_range: Some(
+                            references
+                                .range(terminal_identifier_node(func_node).unwrap_or(func_node)),
+                        ),
                         preserve_spelling_on_rename: explicit_import_alias_covers_entire_name(
                             text,
                             UseKind::Function,
@@ -693,18 +736,17 @@ fn push_class_reference(
     node: Node,
     source: &str,
     file_symbols: &FileSymbols,
-    references: &mut Vec<SymbolReference>,
+    references: &mut ReferenceCollector<'_>,
 ) {
     let text = &source[node.byte_range()];
     let resolved = resolve_name_to_fqn(text, file_symbols);
     if is_builtin_or_relative_class_name(&resolved) {
         return;
     }
-    push_symbol_reference(
-        references,
+    references.push(
         resolved,
         PhpSymbolKind::Class,
-        reference_range(source, node),
+        references.range(node),
         CollectedReferenceOptions {
             call_site: node
                 .parent()
@@ -712,7 +754,7 @@ fn push_class_reference(
                 .and_then(|parent| {
                     reference_call_site(parent, SymbolReferenceCallKind::Constructor)
                 }),
-            rename_range: Some(terminal_identifier_range(source, node)),
+            rename_range: Some(references.range(terminal_identifier_node(node).unwrap_or(node))),
             preserve_spelling_on_rename: explicit_import_alias_covers_entire_name(
                 text,
                 UseKind::Class,
@@ -725,9 +767,8 @@ fn push_class_reference(
 
 fn push_import_target_reference(
     clause: Node,
-    source: &str,
     file_symbols: &FileSymbols,
-    references: &mut Vec<SymbolReference>,
+    references: &mut ReferenceCollector<'_>,
 ) {
     let clause_range = node_range(clause);
     let Some(use_statement) = file_symbols
@@ -752,13 +793,14 @@ fn push_import_target_reference(
         UseKind::Function => PhpSymbolKind::Function,
         UseKind::Constant => PhpSymbolKind::GlobalConstant,
     };
-    push_symbol_reference(
-        references,
+    references.push(
         use_statement.fqn.trim_start_matches('\\').to_string(),
         target_kind,
-        reference_range(source, target_node),
+        references.range(target_node),
         CollectedReferenceOptions {
-            rename_range: Some(terminal_identifier_range(source, target_node)),
+            rename_range: Some(
+                references.range(terminal_identifier_node(target_node).unwrap_or(target_node)),
+            ),
             is_import_target: true,
             ..Default::default()
         },
@@ -791,10 +833,6 @@ fn explicit_import_alias_covers_entire_name(
             UseKind::Constant => alias == first_segment,
         }
     })
-}
-
-fn terminal_identifier_range(source: &str, node: Node) -> (u32, u32, u32, u32) {
-    reference_range(source, terminal_identifier_node(node).unwrap_or(node))
 }
 
 fn terminal_identifier_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
@@ -837,24 +875,23 @@ fn push_constant_reference_if_plain_name(
     node: Node,
     source: &str,
     file_symbols: &FileSymbols,
-    references: &mut Vec<SymbolReference>,
+    references: &mut ReferenceCollector<'_>,
 ) {
     if !crate::cst::is_constant_reference(node) {
         return;
     }
     let text = &source[node.byte_range()];
-    push_symbol_reference(
-        references,
+    references.push(
         resolve_constant_name_to_fqn(text, file_symbols),
         PhpSymbolKind::GlobalConstant,
-        reference_range(source, node),
+        references.range(node),
         CollectedReferenceOptions {
             allows_global_fallback: unqualified_name_allows_global_fallback(
                 text,
                 UseKind::Constant,
                 file_symbols,
             ),
-            rename_range: Some(terminal_identifier_range(source, node)),
+            rename_range: Some(references.range(terminal_identifier_node(node).unwrap_or(node))),
             preserve_spelling_on_rename: explicit_import_alias_covers_entire_name(
                 text,
                 UseKind::Constant,
@@ -963,26 +1000,44 @@ impl Default for CollectedReferenceOptions {
     }
 }
 
-fn push_symbol_reference(
-    references: &mut Vec<SymbolReference>,
-    target_fqn: String,
-    target_kind: PhpSymbolKind,
-    range: (u32, u32, u32, u32),
-    options: CollectedReferenceOptions,
-) {
-    references.push(SymbolReference {
-        target_fqn,
-        target_kind,
-        range,
-        is_declaration: false,
-        starts_with_dollar: options.starts_with_dollar,
-        allows_global_fallback: options.allows_global_fallback,
-        rename_range: options.rename_range,
-        preserve_spelling_on_rename: options.preserve_spelling_on_rename,
-        is_import_target: options.is_import_target,
-        receiver: options.receiver,
-        call_site: options.call_site,
-    });
+struct ReferenceCollector<'a> {
+    items: Vec<SymbolReference>,
+    positions: crate::utf16::Utf16LineIndex,
+    cancelled: &'a dyn Fn() -> bool,
+}
+impl ReferenceCollector<'_> {
+    fn range_tuple(&self, range: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+        (
+            range.0,
+            self.positions.byte_col_to_utf16(range.0, range.1),
+            range.2,
+            self.positions.byte_col_to_utf16(range.2, range.3),
+        )
+    }
+    fn range(&self, node: Node<'_>) -> (u32, u32, u32, u32) {
+        self.range_tuple(node_range(node))
+    }
+    fn push(
+        &mut self,
+        target_fqn: String,
+        target_kind: PhpSymbolKind,
+        range: (u32, u32, u32, u32),
+        options: CollectedReferenceOptions,
+    ) {
+        self.items.push(SymbolReference {
+            target_fqn,
+            target_kind,
+            range,
+            is_declaration: false,
+            starts_with_dollar: options.starts_with_dollar,
+            allows_global_fallback: options.allows_global_fallback,
+            rename_range: options.rename_range,
+            preserve_spelling_on_rename: options.preserve_spelling_on_rename,
+            is_import_target: options.is_import_target,
+            receiver: options.receiver,
+            call_site: options.call_site,
+        });
+    }
 }
 
 fn reference_call_site(
@@ -1022,10 +1077,6 @@ fn reference_call_site(
     Some(SymbolReferenceCallSite { kind, caller_range })
 }
 
-fn reference_range(source: &str, node: Node) -> (u32, u32, u32, u32) {
-    range_byte_to_utf16(source, node_range(node))
-}
-
 /// Find all references to a class/interface/trait/enum in a file.
 fn find_class_references(
     root: Node,
@@ -1048,6 +1099,7 @@ fn find_class_references(
                 )
             {
                 results.push(ReferenceLocation {
+                    is_write: false,
                     range: sym.selection_range,
                 });
             }
@@ -1166,6 +1218,7 @@ fn check_class_name_ref(
         let start = node.start_position();
         let end = node.end_position();
         results.push(ReferenceLocation {
+            is_write: false,
             range: (
                 start.row as u32,
                 start.column as u32,
@@ -1201,6 +1254,7 @@ fn find_function_references(
                 && symbol_fqn_eq(&sym.fqn, target_fqn, PhpSymbolKind::Function)
             {
                 results.push(ReferenceLocation {
+                    is_write: false,
                     range: sym.selection_range,
                 });
             }
@@ -1227,6 +1281,7 @@ fn walk_for_function_refs(
             let resolved = resolve_function_name_to_fqn(&function_name, file_symbols);
             if resolved_name_matches_target(&resolved, target_fqn, PhpSymbolKind::Function, false) {
                 results.push(ReferenceLocation {
+                    is_write: false,
                     range: node_range(selection),
                 });
             }
@@ -1249,6 +1304,7 @@ fn walk_for_function_refs(
                 let start = func_node.start_position();
                 let end = func_node.end_position();
                 results.push(ReferenceLocation {
+                    is_write: false,
                     range: (
                         start.row as u32,
                         start.column as u32,
@@ -1310,6 +1366,7 @@ fn find_member_references(
         for sym in &file_symbols.symbols {
             if symbol_fqn_eq(&sym.fqn, target_fqn, target_kind) {
                 results.push(ReferenceLocation {
+                    is_write: target_kind == PhpSymbolKind::Property,
                     range: sym.selection_range,
                 });
             }
@@ -1357,6 +1414,7 @@ fn walk_for_member_refs(
                     let start = name_node.start_position();
                     let end = name_node.end_position();
                     results.push(ReferenceLocation {
+                        is_write: roles::is_write(node, source),
                         range: (
                             start.row as u32,
                             start.column as u32,
@@ -1381,6 +1439,7 @@ fn walk_for_member_refs(
                     let start = name_node.start_position();
                     let end = name_node.end_position();
                     results.push(ReferenceLocation {
+                        is_write: false,
                         range: (
                             start.row as u32,
                             start.column as u32,
@@ -1416,6 +1475,7 @@ fn walk_for_member_refs(
                             let start = name_node.start_position();
                             let end = name_node.end_position();
                             results.push(ReferenceLocation {
+                                is_write: false,
                                 range: (
                                     start.row as u32,
                                     start.column as u32,
@@ -1460,6 +1520,8 @@ fn walk_for_member_refs(
                             let start = name_node.start_position();
                             let end = name_node.end_position();
                             results.push(ReferenceLocation {
+                                is_write: target_kind == PhpSymbolKind::Property
+                                    && roles::is_write(node, source),
                                 range: (
                                     start.row as u32,
                                     start.column as u32,
@@ -1497,6 +1559,7 @@ fn walk_for_member_refs(
                         let start = name_node.start_position();
                         let end = name_node.end_position();
                         results.push(ReferenceLocation {
+                            is_write: false,
                             range: (
                                 start.row as u32,
                                 start.column as u32,
@@ -1556,6 +1619,7 @@ fn find_constant_references(
                 && symbol_fqn_eq(&sym.fqn, target_fqn, PhpSymbolKind::GlobalConstant)
             {
                 results.push(ReferenceLocation {
+                    is_write: false,
                     range: sym.selection_range,
                 });
             }
@@ -1593,6 +1657,7 @@ fn walk_for_constant_refs(
                 }),
         ) {
             results.push(ReferenceLocation {
+                is_write: false,
                 range: node_range(node),
             });
         }
@@ -1626,7 +1691,10 @@ fn walk_variable_binding_refs(
         let text = normalize_var_name(&source[node.byte_range()]);
         if text == var_name {
             let range = node_range(node);
-            refs.push(ReferenceLocation { range });
+            refs.push(ReferenceLocation {
+                range,
+                is_write: roles::is_write(node, source),
+            });
             if is_variable_declaration(node, source, var_name) && !is_closure_capture_token(node) {
                 declarations.push(range);
             }
@@ -1668,3 +1736,7 @@ mod tests;
 #[cfg(test)]
 #[path = "constant_reference_tests.rs"]
 mod constant_reference_tests;
+
+#[cfg(test)]
+#[path = "reference_cancellation_tests.rs"]
+mod cancellation_tests;

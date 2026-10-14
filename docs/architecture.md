@@ -49,7 +49,8 @@ server/crates/php-lsp-server/src/
     composite_receivers.rs   # typed union/intersection member selection and receiver loading
     hover.rs                 # hover response assembly
     definition.rs            # definition/declaration/typeDefinition/implementation
-    references.rs            # documentHighlight/references/codeLens
+    references.rs            # documentHighlight/references and open reference overlays
+    code_lens.rs             # cancellable grouped reference counts and snapshot guards
     rename.rs                # prepareRename/rename
     code_action.rs           # code actions, lazy resolve, edit/refactor helpers
     formatting.rs            # document/range/on-type formatting
@@ -148,6 +149,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_phpdoc_definition.rs` | exact PHPDoc member/owner selection, inheritance/native precedence, UTF-16/CRLF buffer edits, and Twig shape-key definitions before attributes. |
 | `tests/e2e_phpdoc_definition_stress.rs` | concurrent JSON-RPC definitions, edits, close/reopen, watched-file and full Composer reindex; exact stable disk/buffer results and progress watchdog. |
 | `tests/e2e_references.rs` | document highlight, references, rename, code lens, cancellation. |
+| `tests/e2e_reference_roles.rs`, `tests/e2e_code_lens.rs` | CST write/read roles, builtin output arguments, exact UTF-16 lens commands, unsaved edits/reopen and root/template isolation. |
 | `tests/e2e_code_actions.rs` | quick fixes, organize imports, generate members, refactors, PHPDoc sync. |
 | `tests/e2e_diagnostics.rs` | diagnostics debounce/staleness, PHP version gates, vendor metadata refresh. |
 | `tests/e2e_diagnostic_snapshots.rs` | exact UTF-16 syntax ranges through buffer versions/reopen, dirty/save/delete/recreate analyzer eligibility and built-in buffer diagnostics at semantic ERROR severity. |
@@ -414,6 +416,30 @@ Reference metadata also records whether PHP's unqualified global fallback is
 legal and, for import targets, the exact rename range and whether explicit
 alias spelling must be preserved.
 
+Local `ReferenceLocation` values additionally carry an ephemeral CST-derived
+write role for document highlights. Parameters, foreach/catch/destructuring
+targets, assignment/update/unset targets and proven builtin output arguments
+are writes; receiver/index expressions, closure capture tokens and ordinary
+arguments remain reads. Property containers use the same writable-target rules.
+Function identity facts are shared once per operation, with index evidence for
+namespaced builtin fallback. Roles are not serialized; reference/cache schema
+38 is unchanged. Reference collection builds one UTF-16 line index per source,
+using binary search for Unicode columns, and supports cancellation between CST
+nodes without returning a partial successful collection.
+
+`lsp/code_lens.rs` aggregates supported class-like and method declarations in
+one reference traversal on the bounded blocking pool. Closed references stream from one index read
+lease; ordinary open snapshots replace their indexed data, and template virtual
+PHP stays excluded. Class-like targets share PHP casing; methods match exact
+identity or a directed related receiver, with cached ancestry and binding
+matches and no double count. This removes per-symbol workspace rescans; sorting,
+inheritance matching and materializing the returned locations still cost work.
+The existing 15-second file-I/O budget includes queueing and computation, and
+the worker retains its permit until exit. Request drop, timeout and shutdown
+cancel work. Results recheck runtime/index revisions, the relevant open inventory
+and document lifetime/version. Closed target ranges require matching source
+fingerprints. Document snapshots are captured before the index read lease.
+
 Global constant reads use shared expression-role checks in parser cst.rs.
 The occurrence collector, file reference walker, cursor resolver and constant
 import-use diagnostics share those checks. Declaration/type/member names,
@@ -503,7 +529,7 @@ request cannot combine a new symbol index with an older editor buffer.
 | Signature help | `src/lsp/completion.rs` | `signature_help.rs` CST call-site/argument detection and existing name/member resolution helpers | `workspace.rs` signature lookup | parser signature-help tests + `tests/e2e_signature_help.rs`, `tests/e2e_completion.rs` |
 | Document symbols | `src/lsp/document_symbols.rs` | `symbols.rs` lexical namespace scopes and declaration ranges | `FileSymbols` from open source or indexed files | `tests/e2e_document_symbols.rs`, `tests/e2e_ranges.rs`, `tests/e2e_symbols.rs` |
 | Linked editing | `src/lsp/document_symbols.rs` | current CST import target/alias roles and shared kind-specific casing rules | open `FileParser`; no index lookup | `src/lsp/linked_editing_tests.rs`, `tests/e2e_linked_editing.rs`, `tests/e2e_symbols.rs` |
-| References/code lens | `src/lsp/references.rs` | `references.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs` |
+| References/code lens | `src/lsp/references.rs`, `src/lsp/code_lens.rs` | `references.rs`, `reference_roles.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs`, `tests/e2e_reference_roles.rs`, `tests/e2e_code_lens.rs`, `src/lsp/reference_ui_tests.rs` |
 | Rename | `src/lsp/rename.rs` | `references.rs`, local variable search | `file_references`, symbol lookup | `tests/e2e_references.rs` |
 | Diagnostics | `src/lsp/diagnostics.rs` plus shared helpers in `server.rs` | `diagnostics.rs`, `semantic.rs` | `workspace.rs` symbol resolution | parser unit tests + `tests/e2e_diagnostics.rs` |
 | Code actions/refactors | `src/lsp/code_action.rs` | parser helpers, return type helpers | symbol/member lookup | server unit tests + `tests/e2e_code_actions.rs` |

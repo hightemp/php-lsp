@@ -3,7 +3,7 @@
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
 P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
-P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), and P2-35/P2-36/P2-37 (2026-10-14).
+P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), and P2-35/P2-36/P2-37/P2-38 (2026-10-14).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -62,7 +62,7 @@ percentages have not been remeasured.
 | PHPDoc definitions | repeated owners, attributes/trivia, exact multiline tags, stale source, buffer edits, Twig shape keys | T | B | B | [PHPDoc source tests](../server/crates/php-lsp-parser/src/phpdoc_source_tests.rs), [owner tests](../server/crates/php-lsp-server/src/lsp/phpdoc_definition_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_phpdoc_definition.rs), [cache round-trip tests](../server/crates/php-lsp-index/src/cache_tests.rs). |
 | PHPDoc definitions and indexing | parallel definition/edit/close-reopen/watch/full reindex; disk restoration and latest-run progress | T | B | B | [concurrent RPC stress and close regressions](../server/crates/php-lsp-server/tests/e2e_phpdoc_definition_stress.rs), [owned aggregate retry tests](../server/crates/php-lsp-server/src/indexing/workspace_tests.rs), [close fingerprint publication tests](../server/crates/php-lsp-server/src/server_tests.rs). Test callbacks force source changes and run replacement/removal/shutdown; the stress uses two Tokio threads and overlapping JSON-RPC futures, with exact stable end-state checks and an independent watchdog. This is finite stress evidence, not proof of every scheduling order. |
 | Signature help and inlay hints | call positions, nullsafe/incomplete calls, comment/string boundaries, inferred types | T | B | B | [signature-help tests](../server/crates/php-lsp-server/tests/e2e_signature_help.rs), [completion tests](../server/crates/php-lsp-server/tests/e2e_completion.rs), [hover tests](../server/crates/php-lsp-server/tests/e2e_hover.rs). |
-| References/highlights/code lens | open and indexed closed files | T | B | B | [references protocol tests](../server/crates/php-lsp-server/tests/e2e_references.rs). |
+| References/highlights/code lens | CST write/read targets, builtin output identity, open/closed provenance, UTF-16/CRLF, unsaved edits/reopen, roots/templates, cancellation and stale work | T | B | B | [references protocol tests](../server/crates/php-lsp-server/tests/e2e_references.rs), [role regressions](../server/crates/php-lsp-server/tests/e2e_reference_roles.rs), [lens protocol](../server/crates/php-lsp-server/tests/e2e_code_lens.rs), [worker/counter tests](../server/crates/php-lsp-server/src/lsp/reference_ui_tests.rs). A 2000-lens counter asserts one visit per reference and cached binding expansion; a small differential oracle checks matcher parity. Controlled worker barriers cover edit, close/reopen, new buffers/templates, index/runtime replacement and cancellation/shutdown. These are finite event orders, not a production latency benchmark or exhaustive race proof. |
 | Constant reference identity | expression roles, declarations, attributes/members/labels, dynamic names, qualified rename, imports, document edits/reopen and cache replay | T | B | B | [parser matrices](../server/crates/php-lsp-parser/src/constant_reference_tests.rs), [kind/owner checks](../server/crates/php-lsp-server/src/lsp/constant_reference_tests.rs), [protocol tests](../server/crates/php-lsp-server/tests/e2e_constant_references.rs), [cache replay](../server/crates/php-lsp-index/src/cache_tests.rs). |
 | Workspace symbols | indexed search, ranking, URI/range | T | B | B | [workspace symbol tests](../server/crates/php-lsp-server/src/server_tests.rs), [indexing protocol tests](../server/crates/php-lsp-server/tests/e2e_indexing.rs). |
 | Rename | locals, imports, members, unsafe targets | T | B | B | [references protocol tests](../server/crates/php-lsp-server/tests/e2e_references.rs), [rename unit tests](../server/crates/php-lsp-server/src/lsp/rename_tests.rs). |
@@ -125,7 +125,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29/P2-30/P2-31/P2-32/P2-33/P2-34/P2-35/P2-36/P2-37 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29/P2-30/P2-31/P2-32/P2-33/P2-34/P2-35/P2-36/P2-37/P2-38 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |

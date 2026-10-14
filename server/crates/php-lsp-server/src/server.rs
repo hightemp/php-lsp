@@ -2822,6 +2822,7 @@ pub(crate) fn diagnostic_budget_config_from_settings(
 pub struct PhpLspBackend {
     /// Client handle for sending notifications to VS Code.
     client: Client,
+    code_lens_control: Arc<lsp::references::CodeLensControl>,
     /// Open document parsers (URI string → FileParser).
     open_files: Arc<DashMap<String, FileParser>>,
     /// Open Blade-like template documents backed by virtual PHP parsers.
@@ -2952,6 +2953,7 @@ impl PhpLspBackend {
         );
         PhpLspBackend {
             client: client.clone(),
+            code_lens_control: Arc::new(lsp::references::CodeLensControl::default()),
             open_files,
             template_documents,
             document_versions,

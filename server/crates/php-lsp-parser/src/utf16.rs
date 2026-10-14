@@ -63,19 +63,10 @@ impl Utf16LineIndex {
             return byte_col.min(self.line_len_utf8(line));
         }
         let byte_col = byte_col as usize;
-        let mut utf16_col = byte_col;
-        for &(b, u) in mappings.iter() {
-            if byte_col < b {
-                break;
-            }
-            if byte_col == b {
-                utf16_col = u;
-                break;
-            } else {
-                utf16_col = u;
-            }
-        }
-        utf16_col as u32
+        let boundary = mappings.partition_point(|&(byte, _)| byte <= byte_col);
+        boundary
+            .checked_sub(1)
+            .map_or(0, |previous| mappings[previous].1 as u32)
     }
 
     fn line_len_utf8(&self, line: usize) -> u32 {

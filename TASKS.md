@@ -6706,3 +6706,20 @@ change.
 - [x] **P237-004-2026-10-14** Preserve the original audit finding, append status/evidence within P2-37, update relevant docs and complete the milestone. *(done 2026-10-14)*
   - Implemented: README, architecture/features and coverage document documentation transfer, conflict hiding, alias reuse and safe FQN fallback. The matrix has 70 rows / 176 valid local links; original finding and prior journal are preserved. Historical coverage percentages and performance timing unchanged.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides retain assertions. No concurrent heavy checks, installed/remote server changes or automatic commit.
+
+### Milestone: CODEX-P2-38 Reference roles and bounded code lens aggregation (2026-10-14 -> 2026-10-14)
+
+**Статус:** done
+**Цель:** Derive reference UI roles from CST facts and compute code-lens references once per request on cancellable blocking work, preserving symbol identity and authoritative document snapshots.
+
+#### Задачи
+
+- [x] **P238-001-2026-10-14** Add RED regressions for declaration/assignment/foreach/catch/destructuring/capture roles and a small deterministic code-lens repeated-work counter. *(done 2026-10-14)*
+  - Validation: six initial role failures and 4 scans/file versus 1 reproduced; subsequent REDs caught property-output READ, 4 function-name fact builds versus 1, and first-Unicode partial-byte conversion. All regressions GREEN.
+- [x] **P238-002-2026-10-14** Reuse CST binding helpers for extraction roles and replace per-symbol workspace scans with grouped reference aggregation off-runtime; preserve scopes, PHP casing, exclusions, templates and snapshot/cancellation guards. *(done 2026-10-14)*
+  - Implemented: ephemeral CST roles, shared function-name facts, cancellable occurrence collection and one UTF-16 line index; streaming grouped code lenses with open overlays, source provenance and lifetime/runtime/index guards. Schema 38 unchanged.
+- [x] **P238-003-2026-10-14** Cover large-count linear work, exact LSP highlights/lens locations, lifecycle/cache paths and controlled cancellation/races; run focused/full sequential Rust gates and repeat gpt-6-astra Verifier until GO. *(done 2026-10-14)*
+  - Validation: 20 added tests include 2000 lenses with one reference visit each, matcher parity, cache replay, UTF-16/CRLF protocol, roots/templates, unsaved changes/reopen and controlled cancellation/shutdown/stale worker orders. Full cargo test --all: 1905 PASS, 0 FAIL/ignored (64 result blocks); Clippy -D warnings, Rustfmt, diff check PASS; repeated Verifier gpt-6-astra GO. Artifacts: server/target/p2-38-2026-10-14/ (ignored).
+- [x] **P238-004-2026-10-14** Preserve the finding, append status/results directly under P2-38, update relevant documentation and complete the milestone. *(done 2026-10-14)*
+  - Implemented: status directly under original audit finding; README, architecture, LSP matrix and test-evidence matrix updated. Existing audit/journal text preserved, local links checked; historical coverage percentages and production timings were not remeasured.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides retain assertions. No concurrent heavy checks, installed/remote server changes or automatic commit.

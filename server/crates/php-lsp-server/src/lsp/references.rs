@@ -3,6 +3,10 @@
 use super::super::*;
 use super::hierarchy::call_hierarchy_kind_key;
 
+#[path = "code_lens.rs"]
+mod code_lens;
+pub(in crate::server) use code_lens::CodeLensControl;
+
 fn is_code_lens_symbol_kind(kind: php_lsp_types::PhpSymbolKind) -> bool {
     matches!(
         kind,
@@ -138,6 +142,46 @@ pub(super) fn local_symbol_for_reference(
     None
 }
 
+fn reference_scan_uris_from_state(
+    index: &WorkspaceIndex,
+    is_aggregate: bool,
+    open_files: &DashMap<String, FileParser>,
+    request: Option<&WorkspaceRequestContext>,
+) -> (Vec<String>, Vec<String>) {
+    let mut uris: HashSet<String> = index
+        .read()
+        .file_references()
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    let open_uris: Vec<String> = open_files
+        .iter()
+        .filter(|entry| {
+            is_aggregate
+                || index.read().file_symbols().contains_key(entry.key())
+                || request.is_none_or(|request| {
+                    if let Some(config) = request.workspace.as_ref() {
+                        return uri_to_path(entry.key()).is_some_and(|path| {
+                            workspace_config_for_path_from_configs(
+                                std::slice::from_ref(config),
+                                &path,
+                            )
+                            .is_some()
+                        });
+                    }
+                    workspace_config_for_uri_from_configs(&request.state.configs, entry.key())
+                        .is_none()
+                })
+        })
+        .map(|entry| entry.key().clone())
+        .collect();
+    uris.extend(open_uris.iter().cloned());
+
+    let mut uris: Vec<_> = uris.into_iter().collect();
+    uris.sort();
+    (uris, open_uris)
+}
+
 impl PhpLspBackend {
     fn open_symbol_authority(&self, uri: &str) -> OpenSymbolAuthority {
         if let Some(snapshot) = self.open_document_snapshot(uri) {
@@ -172,6 +216,8 @@ impl PhpLspBackend {
         index: &WorkspaceIndex,
         uri: &str,
     ) -> Option<Vec<php_lsp_types::SymbolReference>> {
+        #[cfg(test)]
+        note_reference_scan(uri);
         if let Some(snapshot) = self.open_reference_snapshot(uri) {
             return match snapshot {
                 OpenReferenceSnapshot::Ordinary(references) => Some(references),
@@ -280,39 +326,12 @@ impl PhpLspBackend {
         index: &WorkspaceIndex,
         request: Option<&WorkspaceRequestContext>,
     ) -> (Vec<String>, Vec<String>) {
-        let mut uris: HashSet<String> = index
-            .read()
-            .file_references()
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        let open_uris: Vec<String> = self
-            .open_files
-            .iter()
-            .filter(|entry| {
-                std::ptr::eq(index, self.index.as_ref())
-                    || index.read().file_symbols().contains_key(entry.key())
-                    || request.is_none_or(|request| {
-                        if let Some(config) = request.workspace.as_ref() {
-                            return uri_to_path(entry.key()).is_some_and(|path| {
-                                workspace_config_for_path_from_configs(
-                                    std::slice::from_ref(config),
-                                    &path,
-                                )
-                                .is_some()
-                            });
-                        }
-                        workspace_config_for_uri_from_configs(&request.state.configs, entry.key())
-                            .is_none()
-                    })
-            })
-            .map(|entry| entry.key().clone())
-            .collect();
-        uris.extend(open_uris.iter().cloned());
-
-        let mut uris: Vec<_> = uris.into_iter().collect();
-        uris.sort();
-        (uris, open_uris)
+        reference_scan_uris_from_state(
+            index,
+            std::ptr::eq(index, self.index.as_ref()),
+            &self.open_files,
+            request,
+        )
     }
 
     pub(in crate::server) fn reference_scan_matches(
@@ -399,13 +418,12 @@ impl PhpLspBackend {
             None => return Ok(None),
         };
 
+        let _names = function_name_scope_from_index(&request_index, tree, &source, &file_symbols);
         if sym.ref_kind == RefKind::Variable {
-            let _names =
-                function_name_scope_from_index(&request_index, tree, &source, &file_symbols);
             let highlights: Vec<DocumentHighlight> =
                 find_variable_references_at_position(tree, &source, pos.line, byte_col, true)
                     .into_iter()
-                    .map(|reference| document_highlight_from_range(&source, reference.range, true))
+                    .map(|reference| document_highlight_from_reference(&source, &reference, true))
                     .collect();
             return if highlights.is_empty() {
                 Ok(None)
@@ -460,7 +478,7 @@ impl PhpLspBackend {
             find_references_in_file(tree, &source, &file_symbols, &target_fqn, target_kind, true)
                 .into_iter()
                 .map(|reference| {
-                    document_highlight_from_range(&source, reference.range, read_write_capable)
+                    document_highlight_from_reference(&source, &reference, read_write_capable)
                 })
                 .collect();
 
@@ -622,209 +640,22 @@ impl PhpLspBackend {
             Ok(Some(locations))
         }
     }
-
-    pub(crate) async fn lsp_code_lens(
-        &self,
-        params: CodeLensParams,
-    ) -> Result<Option<Vec<CodeLens>>> {
-        let uri_str = params.text_document.uri.as_str().to_string();
-        let request = self.request_context_for_uri(&uri_str).await;
-        let request_index = request.index(&self.index);
-        let document_uri = match uri_str.parse::<Uri>() {
-            Ok(uri) => uri,
-            Err(_) => return Ok(None),
-        };
-
-        let (file_symbols, source) = if let Some(parser) = self.open_files.get(&uri_str) {
-            let Some(tree) = parser.tree() else {
-                return Ok(None);
-            };
-            let source = parser.source();
-            (extract_file_symbols(tree, &source, &uri_str), source)
-        } else {
-            let Some(file_symbols) = request_index
-                .read()
-                .file_symbols()
-                .get(&uri_str)
-                .map(|entry| entry.value().as_ref().clone())
-            else {
-                return Ok(None);
-            };
-            let Some(path) = uri_to_path(&uri_str) else {
-                return Ok(None);
-            };
-            let Ok(source) = read_file_to_string_blocking(path, "codeLens source read").await
-            else {
-                return Ok(None);
-            };
-            (file_symbols, source)
-        };
-
-        let mut lenses = Vec::new();
-        for symbol in file_symbols
-            .symbols
-            .iter()
-            .filter(|symbol| is_code_lens_symbol_kind(symbol.kind))
-        {
-            let locations = self.reference_locations_for_symbol(
-                &request_index,
-                Some(&request),
-                &symbol.fqn,
-                symbol.kind,
-                false,
-            );
-            let range_tuple = range_byte_to_utf16(&source, symbol.selection_range);
-            let start = Position::new(range_tuple.0, range_tuple.1);
-            let end = if range_tuple.0 == range_tuple.2 {
-                Position::new(range_tuple.2, range_tuple.3)
-            } else {
-                start
-            };
-
-            let arguments = match (
-                serde_json::to_value(document_uri.clone()),
-                serde_json::to_value(start),
-                serde_json::to_value(&locations),
-            ) {
-                (Ok(uri), Ok(position), Ok(locations)) => Some(vec![uri, position, locations]),
-                _ => None,
-            };
-
-            lenses.push(CodeLens {
-                range: Range { start, end },
-                command: Some(Command {
-                    title: reference_count_title(locations.len()),
-                    command: "editor.action.showReferences".to_string(),
-                    arguments,
-                }),
-                data: Some(serde_json::json!({
-                    "fqn": symbol.fqn,
-                    "kind": call_hierarchy_kind_key(symbol.kind),
-                    "references": locations.len(),
-                })),
-            });
-        }
-
-        if lenses.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(lenses))
-        }
-    }
 }
 
-pub(in crate::server) fn line_byte_col_to_byte(
+fn document_highlight_from_reference(
     source: &str,
-    line: u32,
-    byte_col: u32,
-) -> Option<usize> {
-    let mut offset = 0usize;
-
-    for (current_line, l) in source.split_inclusive('\n').enumerate() {
-        if current_line as u32 == line {
-            let col = byte_col as usize;
-            return (col <= l.len()).then_some(offset + col);
-        }
-        offset += l.len();
-    }
-
-    None
-}
-
-pub(in crate::server) fn starts_with_assignment_operator(text: &str) -> bool {
-    matches!(
-        text.as_bytes(),
-        [b'=', rest @ ..] if !matches!(rest.first(), Some(b'=' | b'>'))
-    ) || text.starts_with("+=")
-        || text.starts_with("-=")
-        || text.starts_with("*=")
-        || text.starts_with("/=")
-        || text.starts_with("%=")
-        || text.starts_with(".=")
-        || text.starts_with("&=")
-        || text.starts_with("|=")
-        || text.starts_with("^=")
-        || text.starts_with("??=")
-        || text.starts_with("<<=")
-        || text.starts_with(">>=")
-}
-
-pub(in crate::server) fn is_declaration_like_write(
-    before_trimmed: &str,
-    after_trimmed: &str,
-) -> bool {
-    let segment = before_trimmed
-        .rsplit([';', '{', '}'])
-        .next()
-        .unwrap_or(before_trimmed)
-        .trim_start();
-    let declaration_tail = after_trimmed.starts_with([',', ')', ';', '=']);
-
-    declaration_tail
-        && (segment.contains("function ")
-            || segment.starts_with("public ")
-            || segment.starts_with("protected ")
-            || segment.starts_with("private ")
-            || segment.starts_with("readonly ")
-            || segment.starts_with("static ")
-            || segment.starts_with("var "))
-}
-
-pub(in crate::server) fn is_write_reference(source: &str, range: (u32, u32, u32, u32)) -> bool {
-    let Some(start) = line_byte_col_to_byte(source, range.0, range.1) else {
-        return false;
-    };
-    let Some(end) = line_byte_col_to_byte(source, range.2, range.3) else {
-        return false;
-    };
-    if start > end || end > source.len() {
-        return false;
-    }
-
-    let line_start = source[..start].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-    let line_end = source[end..]
-        .find('\n')
-        .map(|idx| end + idx)
-        .unwrap_or(source.len());
-    let before_trimmed = source[line_start..start].trim_end();
-    let after_trimmed = source[end..line_end].trim_start();
-
-    starts_with_assignment_operator(after_trimmed)
-        || after_trimmed.starts_with("++")
-        || after_trimmed.starts_with("--")
-        || before_trimmed.ends_with("++")
-        || before_trimmed.ends_with("--")
-        || is_declaration_like_write(before_trimmed, after_trimmed)
-}
-
-pub(in crate::server) fn document_highlight_kind(
-    source: &str,
-    range: (u32, u32, u32, u32),
-    read_write_capable: bool,
-) -> DocumentHighlightKind {
-    if !read_write_capable {
-        return DocumentHighlightKind::TEXT;
-    }
-
-    if is_write_reference(source, range) {
-        DocumentHighlightKind::WRITE
-    } else {
-        DocumentHighlightKind::READ
-    }
-}
-
-pub(in crate::server) fn document_highlight_from_range(
-    source: &str,
-    range: (u32, u32, u32, u32),
+    reference: &php_lsp_parser::references::ReferenceLocation,
     read_write_capable: bool,
 ) -> DocumentHighlight {
-    let rng = range_byte_to_utf16(source, range);
     DocumentHighlight {
-        range: Range {
-            start: Position::new(rng.0, rng.1),
-            end: Position::new(rng.2, rng.3),
-        },
-        kind: Some(document_highlight_kind(source, range, read_write_capable)),
+        range: crate::util::lsp_text::range_from_byte_range(source, reference.range),
+        kind: Some(if !read_write_capable {
+            DocumentHighlightKind::TEXT
+        } else if reference.is_write {
+            DocumentHighlightKind::WRITE
+        } else {
+            DocumentHighlightKind::READ
+        }),
     }
 }
 
@@ -843,3 +674,19 @@ pub(in crate::server) fn php_symbol_kind_for_ref_kind(
         RefKind::Variable | RefKind::NamespaceName | RefKind::Unknown => None,
     }
 }
+
+#[cfg(test)]
+static REFERENCE_SCAN_WORK: std::sync::OnceLock<StdMutex<HashMap<String, usize>>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+fn note_reference_scan(uri: &str) {
+    *REFERENCE_SCAN_WORK
+        .get_or_init(StdMutex::default)
+        .lock()
+        .unwrap()
+        .entry(uri.into())
+        .or_default() += 1;
+}
+#[cfg(test)]
+#[path = "reference_ui_tests.rs"]
+mod ui_tests;
