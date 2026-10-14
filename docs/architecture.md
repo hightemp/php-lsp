@@ -945,11 +945,27 @@ item types, so `{% for item in pagination %}` can inherit the entity type
 without booting Symfony. Custom Doctrine repositories are resolved from indexed
 `@extends ServiceEntityRepository<Entity>` PHPDoc and indexed ORM
 `repositoryClass` attributes; request handlers avoid synchronous source reads
-for this lookup. The Twig context index also handles one-level
-`{% include 'partial.html.twig' with {'items': items} %}` calls by evaluating
-the caller template's static render context and copying simple `with` object
-values and member chains such as `form_field: form.subscriber` into the
-included template.
+for this lookup. The Twig context index follows one include level from the
+caller's static PHP render context. A plain `{% include 'partial.html.twig' %}`
+inherits known caller variables. A static `with { ... }` map replaces matching
+names and preserves the rest; `only` omits inherited variables while evaluating
+explicit values in the caller context. Replacing a variable also replaces its
+shape-definition provenance, including clearing it for scalar or unknown values.
+Simple variables, member chains such as `form_field: form.subscriber`, and
+supported literals can supply explicit values. Multi-hop include propagation
+and runtime Twig evaluation remain unsupported.
+
+Include facts retain static targets, optional `with` ranges, `only`, and local
+write deltas in source order. Comments, verbatim text, quoted output and macro
+bodies do not create caller include edges. Unsupported or dynamic `with` maps
+contribute no inferred context; filtered or compound values remain `mixed`
+rather than retaining their base type or shape definitions. Local `set`, loop
+bindings and macro aliases mask an earlier render type; unknown `with`/`embed`
+scopes discard known caller variables. This is conservative masking, not Twig
+scope inference: new local types and restoration after those scopes are not
+inferred for downstream includes. Per-call replacements happen before the
+existing cross-caller merge; general merging of conflicting caller types and
+framework-global eligibility remain separate limitations.
 
 Symfony-specific static context is added without booting the framework.
 Fallback globals seed `app.current_route`, `app.user`, login `error`, and

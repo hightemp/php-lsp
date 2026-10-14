@@ -2383,6 +2383,78 @@ Open template считается authoritative только если в его �
 Что исправить: хранить `only` flag, объединять inherited + explicit variables и
 всегда исключать все open URIs из disk scan независимо от текущего match.
 
+**Статус (2026-10-13): выполнено в согласованной границе одного уровня include.**
+
+Исправление P2-34 сохраняет согласованный один уровень PHP caller → Twig
+include. Обычный статический include наследует известные caller variables;
+`with { ... }` заменяет совпадающие имена, сохраняя остальные; `only` оставляет
+только явно переданные значения, вычисленные в контексте caller. Замена также
+заменяет metadata определения shape-ключей; scalar/unknown значения очищают
+старые переходы. Семантика сверена с
+[Twig include](https://twig.symfony.com/doc/3.x/tags/include.html) и
+[IncludeNode](https://github.com/twigphp/Twig/blob/3.x/src/Node/IncludeNode.php).
+
+Синтаксические факты хранят необязательный диапазон `with`, `only` и дельты
+локальных записей по порядку исходника. Include-текст в comments, verbatim,
+quoted output и macro bodies не создаёт ложные связи. Поддержаны `ignore missing`
+и whitespace trim `-`/`~`; динамические targets остаются вне статического вывода.
+Простые переменные, shape member chains и поддерживаемые литералы сохраняют
+типы. Фильтры и составные выражения не получают тип/definition исходного
+значения; неизвестный `with` map не возвращает предположительный inherited
+context. Локальные `set`/loop/import bindings консервативно маскируют прежние
+render-типы; неизвестные `with`/`embed` scopes сбрасывают известный контекст.
+Полный вывод локальных Twig-типов и восстановление типов после этих scopes
+не добавлены. Многошаговые include, общий merge конфликтующих caller-типов и
+условное добавление framework globals остаются за рамками P2-34; последние
+два ограничения относятся к P2-35.
+
+Часть исходного finding про возврат дисковой копии после удаления unsaved
+include уже исправлена индексом P1-12. Новые регрессии подтверждают это для
+plain include, закрытия буфера и внешнего symlink-алиаса; отдельный fallback
+или повторный обход проекта не добавлен. Сохранены кеш по физической
+идентичности, логические URI, exclusions, partial-coverage, один worker,
+проверки revision/generation/lease и защита от stale publication. Schema 38,
+LSP-настройки и публичные запросы не изменены.
+
+TDD: первоначальный RED — **10 FAIL / 4 PASS**. Review выявил дополнительные
+ошибки filtered values и локальных записей (**4 FAIL / 14 PASS**), quoted
+composite literals и `~` (**2 FAIL / 18 PASS**). Отдельный RED воспроизвёл
+возврат частичного результата при отмене внутри последнего `with` map;
+финальная сборка результата теперь проверяет отмену и отбрасывает накопленное.
+Артефакты: `server/target/p2-34-2026-10-13/` (ignored).
+
+Добавлены **34 постоянные проверки**: 23 helper, 8 index/cache, 3 LSP. Они
+покрывают override/only, очистку provenance, инертный/динамический синтаксис,
+unsaved removal/close/watched edits, независимые roots, внешний symlink,
+exclusions/лимиты, include cycle без multi-hop propagation и отмену.
+Управляемый барьер вытесняет старый worker unsaved-изменением на `only`:
+старый view/job не публикуется, актуальный контекст принимается, peak worker=1.
+LSP проверяет completion/hover/definition уже открытого partial и точные
+UTF-16 диапазоны после emoji на строках с CRLF, включая замену PHP shape-key
+origin. Это конечные детерминированные порядки событий, не доказательство
+всех возможных расписаний.
+
+Прежний сценарий **2000 PHP + 2000 Twig** сохраняет **4000 чтений / 2000 PHP
+разборов**, повторные запросы — **0 новых чтений / разборов**, изменение одного
+закрытого controller — **+1 чтение / +1 разбор**. Ожидание числа переменных
+обновлено с 1999 до 2000: к явным aliases теперь добавляется inherited `item`.
+Счётчики вычислений подтверждают отсутствие перевычисления независимого caller.
+
+Адресный GREEN: **578/578 server unit**, **34/34 template protocol**.
+Полный `cargo test --all`: **1834 PASS, 0 FAIL, 0 ignored**, 59 test-result
+blocks (`all.log`). Clippy `--all-targets -- -D warnings`, Rustfmt и
+`git diff --check` прошли. Финальный read-only Verifier на **gpt-6-astra**
+вернул **GO** после проверки кода, 34 тестов, логов, совпадения SHA256 всех
+шести Rust-файлов с проверенным набором и документации. Проверены 67 строк
+матрицы покрытия / 169 локальных ссылок; milestone P2-34 завершён в TASKS.md.
+Выполнение последовательное:
+один CPU, `CARGO_BUILD_JOBS=1`, `--test-threads=1`, nice 19/idle IO,
+MemoryMax 1536M/MemorySwapMax 256M; CLI server-package debug=0 в test/dev
+сохраняет assertions. Проверки не меняют постоянные Cargo profiles.
+README, архитектура, feature matrix и матрица покрытия обновлены; исходный
+finding и другие разделы аудита сохранены. Процентное покрытие и исторические
+performance baselines не пересчитываются.
+
 ### CODEX-P2-35. Twig context merge теряет типы и безусловно добавляет Symfony globals
 
 [`merge_twig_context_variable_type`](server/crates/php-lsp-server/src/lsp/templates.rs#L409)

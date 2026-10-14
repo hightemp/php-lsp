@@ -276,7 +276,8 @@ phpstorm-stubs support.
   exponent numbers, key/value `for` bindings,
   type-preserving `slice`/`filter` foreach inference, getter-backed
   property-style labels, static template-path and route-key navigation, static
-  render-context inference, one-level include context, Doctrine collection
+  render-context inference, one-level include context with inherited variables,
+  explicit `with` overrides and `only` isolation, Doctrine collection
   items, Symfony form/app globals, PHPDoc/literal shape keys, and open-template
   context refresh after relevant PHP changes. See `docs/lsp-features.md` for
   the exact supported template surface.

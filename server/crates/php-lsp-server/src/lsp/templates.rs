@@ -3530,7 +3530,11 @@ struct SymfonyFormField {
 #[derive(Debug, Clone)]
 pub(in crate::server) struct TwigIncludeCall {
     pub(in crate::server) target: String,
-    pub(in crate::server) with_range: (usize, usize),
+    pub(in crate::server) with_range: Option<(usize, usize)>,
+    pub(in crate::server) only: bool,
+    // Deltas since the preceding include, not a copied context per call.
+    invalidated_variables: Vec<String>,
+    unknown_context: bool,
 }
 
 pub(in crate::server) fn twig_include_calls(
@@ -3539,27 +3543,138 @@ pub(in crate::server) fn twig_include_calls(
 ) -> Vec<TwigIncludeCall> {
     let mut offset = 0usize;
     let mut calls = Vec::new();
+    let mut verbatim = false;
+    let mut macro_depth = 0usize;
+    let mut invalidated_variables = HashSet::new();
+    let mut unknown_context = false;
     while !cancelled() {
-        let Some(relative) = source.get(offset..).and_then(|rest| rest.find("{%")) else {
+        let Some(relative) = source.get(offset..).and_then(|rest| rest.find('{')) else {
             break;
         };
         let open_start = offset + relative;
+        let rest = &source[open_start..];
+        if verbatim {
+            // Verbatim bodies are literal, even when they contain broken tag
+            // openers or quotes. Recognize only the exact closing tag.
+            if rest.starts_with("{%") {
+                let start = open_start
+                    + 2
+                    + usize::from(matches!(
+                        source.as_bytes().get(open_start + 2),
+                        Some(b'-' | b'~')
+                    ));
+                let name_start = skip_ascii_ws_server(source, start);
+                let name_end = scan_twig_context_identifier_end(source, name_start, source.len());
+                let end = skip_ascii_ws_server(source, name_end);
+                let end =
+                    end + usize::from(matches!(source.as_bytes().get(end), Some(b'-' | b'~')));
+                if source.get(name_start..name_end) == Some("endverbatim")
+                    && source.get(end..).is_some_and(|rest| rest.starts_with("%}"))
+                {
+                    verbatim = false;
+                    offset = end + 2;
+                    continue;
+                }
+            }
+            offset = open_start + 1;
+            continue;
+        }
+        if rest.starts_with("{#") {
+            offset = source[open_start + 2..]
+                .find("#}")
+                .map(|relative| open_start + 2 + relative + 2)
+                .unwrap_or(source.len());
+            continue;
+        }
+        if rest.starts_with("{{") {
+            offset = find_twig_context_delimiter_close(source, open_start + 2, "}}")
+                .map(|end| end + 2)
+                .unwrap_or(source.len());
+            continue;
+        }
+        if !rest.starts_with("{%") {
+            offset = open_start + 1;
+            continue;
+        }
         let Some((content_start, content_end, close_end)) =
             twig_context_tag_content_range(source, open_start)
         else {
             break;
         };
-        if let Some((included_name, with_range)) =
-            twig_context_include_tag_target_and_with_range(source, content_start, content_end)
-        {
-            calls.push(TwigIncludeCall {
-                target: normalize_twig_key(&included_name),
-                with_range,
-            });
+        let name_start = skip_ascii_ws_server(source, content_start);
+        let name_end = scan_twig_context_identifier_end(source, name_start, content_end);
+        match source.get(name_start..name_end) {
+            Some("verbatim") => verbatim = true,
+            Some("macro") => macro_depth += 1,
+            Some("endmacro") => macro_depth = macro_depth.saturating_sub(1),
+            Some(tag @ ("set" | "for")) if macro_depth == 0 => {
+                if let Some(names) = twig_include_local_bindings(source, tag, name_end, content_end)
+                {
+                    invalidated_variables.extend(names);
+                } else {
+                    unknown_context = true;
+                    invalidated_variables.clear();
+                }
+            }
+            Some(tag @ ("import" | "from")) if macro_depth == 0 => {
+                crate::template::collect_twig_macro_aliases_from_tag(
+                    tag,
+                    source,
+                    name_end,
+                    content_end,
+                    &mut invalidated_variables,
+                );
+            }
+            Some("with" | "embed") if macro_depth == 0 => {
+                // These scopes can replace arbitrary caller variables. Full
+                // Twig scope/dataflow evaluation is deliberately not inferred.
+                unknown_context = true;
+                invalidated_variables.clear();
+            }
+            _ if macro_depth == 0 => {
+                if let Some(mut call) = twig_context_include_tag(source, content_start, content_end)
+                {
+                    call.invalidated_variables = std::mem::take(&mut invalidated_variables)
+                        .into_iter()
+                        .collect();
+                    call.invalidated_variables.sort();
+                    call.unknown_context = std::mem::take(&mut unknown_context);
+                    calls.push(call);
+                }
+            }
+            _ => {}
         }
         offset = close_end;
     }
     calls
+}
+
+fn twig_include_local_bindings(
+    source: &str,
+    tag: &str,
+    start: usize,
+    end: usize,
+) -> Option<Vec<String>> {
+    let declarations_end = match tag {
+        "for" => find_top_level_twig_keyword(source, start, end, "in")?,
+        "set" => find_top_level_token(source, start, end, b'=').unwrap_or(end),
+        _ => return None,
+    };
+    let mut names = Vec::new();
+    for (start, end) in split_top_level_spans(source.get(start..declarations_end)?, start) {
+        let name = source.get(start..end)?.trim();
+        if !is_template_variable_name(name) {
+            return None;
+        }
+        names.push(name.to_string());
+    }
+    if names.is_empty() {
+        return None;
+    }
+    if tag == "for" {
+        names.push("loop".into());
+    }
+    Some(names)
 }
 
 pub(in crate::server) fn evaluate_twig_include_calls(
@@ -3568,36 +3683,98 @@ pub(in crate::server) fn evaluate_twig_include_calls(
     caller_variables: &[TemplateVariableType],
     cancelled: &dyn Fn() -> bool,
 ) -> HashMap<String, Vec<TemplateVariableType>> {
-    let mut ranges = HashMap::<String, Vec<(usize, usize)>>::new();
+    type VariableMaps = (
+        HashMap<String, String>,
+        HashMap<String, Vec<TemplateShapeKeyDefinition>>,
+    );
+    let mut targets = HashMap::<String, VariableMaps>::new();
+    let mut caller_by_name = HashMap::new();
+    for variable in caller_variables {
+        if cancelled() {
+            return HashMap::new();
+        }
+        caller_by_name.insert(variable.name.clone(), variable.clone());
+    }
     for call in calls {
         if cancelled() {
-            break;
+            return HashMap::new();
         }
-        ranges
-            .entry(call.target.clone())
-            .or_default()
-            .push(call.with_range);
-    }
-    ranges
-        .into_iter()
-        .take_while(|_| !cancelled())
-        .map(|(target, ranges)| {
-            let mut variables = HashMap::new();
-            let mut definitions = HashMap::new();
-            collect_twig_include_context_types_from_ranges(
-                source,
-                &ranges,
-                caller_variables,
-                &mut variables,
-                &mut definitions,
-                cancelled,
+        if call.unknown_context {
+            caller_by_name.clear();
+        }
+        for name in &call.invalidated_variables {
+            if cancelled() {
+                return HashMap::new();
+            }
+            caller_by_name.insert(
+                name.clone(),
+                TemplateVariableType {
+                    name: name.clone(),
+                    type_text: "mixed".into(),
+                    shape_definitions: Vec::new(),
+                },
             );
-            (
-                target,
-                twig_context_variable_types_from_maps(variables, definitions),
-            )
-        })
-        .collect()
+        }
+        let (variables, definitions) = targets.entry(call.target.clone()).or_default();
+        let mut local_variables = HashMap::new();
+        let mut local_definitions = HashMap::new();
+        if !call.only {
+            for variable in caller_by_name.values() {
+                if cancelled() {
+                    return HashMap::new();
+                }
+                replace_twig_include_variable(
+                    &mut local_variables,
+                    &mut local_definitions,
+                    variable.clone(),
+                );
+            }
+        }
+        if let Some(with_range) = call.with_range {
+            if !collect_twig_include_with_variable_types(
+                source,
+                with_range,
+                &caller_by_name,
+                &mut local_variables,
+                &mut local_definitions,
+                cancelled,
+            ) {
+                // An unknown map can replace any inherited name.
+                continue;
+            }
+        }
+        // Per-call replacements precede the existing cross-caller merge.
+        // Accumulate maps directly, avoiding repeated merges of growing vectors.
+        for (name, type_text) in local_variables {
+            if cancelled() {
+                return HashMap::new();
+            }
+            let shape_definitions = local_definitions.remove(&name).unwrap_or_default();
+            merge_twig_context_template_variable_type(
+                variables,
+                definitions,
+                TemplateVariableType {
+                    name,
+                    type_text,
+                    shape_definitions,
+                },
+            );
+        }
+    }
+    let mut result = HashMap::new();
+    for (target, (variables, definitions)) in targets {
+        if cancelled() {
+            return HashMap::new();
+        }
+        result.insert(
+            target,
+            twig_context_variable_types_from_maps(variables, definitions),
+        );
+    }
+    if cancelled() {
+        return HashMap::new();
+    }
+    result
 }
 
 pub(in crate::server) fn merge_twig_context_variables(
@@ -3613,31 +3790,17 @@ pub(in crate::server) fn merge_twig_context_variables(
     twig_context_variable_types_from_maps(variables, definitions)
 }
 
-fn collect_twig_include_context_types_from_ranges(
-    source: &str,
-    include_with_ranges: &[(usize, usize)],
-    caller_variables: &[TemplateVariableType],
+fn replace_twig_include_variable(
     variables: &mut HashMap<String, String>,
-    shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
-    cancelled: &dyn Fn() -> bool,
+    definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
+    variable: TemplateVariableType,
 ) {
-    let caller_by_name: HashMap<_, _> = caller_variables
-        .iter()
-        .map(|variable| (variable.name.as_str(), variable))
-        .collect();
-    for with_range in include_with_ranges {
-        if cancelled() {
-            break;
-        }
-        collect_twig_include_with_variable_types(
-            source,
-            *with_range,
-            &caller_by_name,
-            variables,
-            shape_definitions,
-            cancelled,
-        );
+    if variable.shape_definitions.is_empty() {
+        definitions.remove(&variable.name);
+    } else {
+        definitions.insert(variable.name.clone(), variable.shape_definitions);
     }
+    variables.insert(variable.name, variable.type_text);
 }
 
 fn twig_context_tag_content_range(
@@ -3645,61 +3808,103 @@ fn twig_context_tag_content_range(
     open_start: usize,
 ) -> Option<(usize, usize, usize)> {
     let mut content_start = open_start + "{%".len();
-    if source.as_bytes().get(content_start) == Some(&b'-') {
+    if matches!(source.as_bytes().get(content_start), Some(b'-' | b'~')) {
         content_start += 1;
     }
     let close_start = find_twig_context_delimiter_close(source, content_start, "%}")?;
     let mut content_end = close_start;
-    if content_end > content_start && source.as_bytes().get(content_end - 1) == Some(&b'-') {
+    if content_end > content_start
+        && matches!(source.as_bytes().get(content_end - 1), Some(b'-' | b'~'))
+    {
         content_end -= 1;
     }
     Some((content_start, content_end, close_start + "%}".len()))
 }
 
-fn twig_context_include_tag_target_and_with_range(
+fn twig_context_include_tag(
     source: &str,
     content_start: usize,
     content_end: usize,
-) -> Option<(String, (usize, usize))> {
+) -> Option<TwigIncludeCall> {
     let tag_start = skip_ascii_ws_server(source, content_start);
     let tag_end = scan_twig_context_identifier_end(source, tag_start, content_end);
     if source.get(tag_start..tag_end)? != "include" {
         return None;
     }
 
-    let target_range = twig_context_next_string_literal_range(source, tag_end, content_end)?;
+    let target_start = skip_ascii_ws_server(source, tag_end);
+    if !matches!(source.as_bytes().get(target_start), Some(b'\'' | b'"')) {
+        return None;
+    }
+    let target_range = twig_context_next_string_literal_range(source, target_start, content_end)?;
     let included_name = php_string_literal_value_at_range(source, target_range.0, target_range.1)?;
-    let with_start = find_top_level_twig_keyword(source, target_range.1, content_end, "with")?;
-    let value_start = skip_ascii_ws_server(source, with_start + "with".len());
-    let value_end = find_top_level_twig_keyword(source, value_start, content_end, "only")
-        .unwrap_or(content_end);
-    let value_range = trim_source_range(source, value_start, value_end);
-    (value_range.0 < value_range.1).then_some((included_name, value_range))
+    if source.as_bytes().get(target_start) == Some(&b'"') && included_name.contains("#{") {
+        return None;
+    }
+    let word = |start| {
+        let end = scan_twig_context_identifier_end(source, start, content_end);
+        (source.get(start..end).unwrap_or(""), end)
+    };
+    let mut cursor = skip_ascii_ws_server(source, target_range.1);
+    if word(cursor).0 == "ignore" {
+        cursor = skip_ascii_ws_server(source, word(cursor).1);
+        let (name, end) = word(cursor);
+        if name != "missing" {
+            return None;
+        }
+        cursor = skip_ascii_ws_server(source, end);
+    }
+    let mut with_range = None;
+    if word(cursor).0 == "with" {
+        let start = skip_ascii_ws_server(source, word(cursor).1);
+        let end =
+            find_top_level_twig_keyword(source, start, content_end, "only").unwrap_or(content_end);
+        let range = trim_source_range(source, start, end);
+        if range.0 >= range.1 {
+            return None;
+        }
+        with_range = Some(range);
+        cursor = end;
+    }
+    let only = word(cursor).0 == "only";
+    if only {
+        cursor = skip_ascii_ws_server(source, word(cursor).1);
+    }
+    if cursor < content_end {
+        return None;
+    }
+    Some(TwigIncludeCall {
+        target: normalize_twig_key(&included_name),
+        with_range,
+        only,
+        invalidated_variables: Vec::new(),
+        unknown_context: false,
+    })
 }
 
 fn collect_twig_include_with_variable_types(
     source: &str,
     with_range: (usize, usize),
-    caller_by_name: &HashMap<&str, &TemplateVariableType>,
+    caller_by_name: &HashMap<String, TemplateVariableType>,
     variables: &mut HashMap<String, String>,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
     cancelled: &dyn Fn() -> bool,
-) {
+) -> bool {
     let (start, end) = trim_source_range(source, with_range.0, with_range.1);
     if source.as_bytes().get(start) != Some(&b'{') {
-        return;
+        return false;
     }
     let Some(close) = find_matching_delimiter(source, start, '{', '}') else {
-        return;
+        return false;
     };
-    if close > end {
-        return;
+    if close >= end || trim_source_range(source, close + 1, end).0 < end {
+        return false;
     }
 
     let spans = split_top_level_spans(source.get(start + 1..close).unwrap_or(""), start + 1);
     for span in spans {
         if cancelled() {
-            break;
+            return false;
         }
         let span = trim_source_range(source, span.0, span.1);
         if span.0 >= span.1 {
@@ -3711,20 +3916,20 @@ fn collect_twig_include_with_variable_types(
                 find_top_level_token(source, span.0, span.1, b':').map(|position| (position, 1))
             });
         let Some((separator_start, separator_len)) = separator else {
-            continue;
+            return false;
         };
         let key_range = trim_source_range(source, span.0, separator_start);
         let value_range = trim_source_range(source, separator_start + separator_len, span.1);
         let Some(name) = twig_context_include_key_name(source, key_range) else {
-            continue;
+            return false;
         };
         if !is_template_variable_name(&name) {
-            continue;
+            return false;
         }
 
         if let Some(source_name) = twig_context_include_value_variable_name(source, value_range) {
             if let Some(source_variable) = caller_by_name.get(source_name) {
-                merge_twig_context_template_variable_type(
+                replace_twig_include_variable(
                     variables,
                     shape_definitions,
                     TemplateVariableType {
@@ -3749,7 +3954,7 @@ fn collect_twig_include_with_variable_types(
                             source_variable,
                             &path,
                         );
-                    merge_twig_context_template_variable_type(
+                    replace_twig_include_variable(
                         variables,
                         shape_definitions,
                         TemplateVariableType {
@@ -3765,8 +3970,17 @@ fn collect_twig_include_with_variable_types(
 
         let type_text =
             twig_context_include_literal_type_text(source, value_range).unwrap_or("mixed");
-        merge_twig_context_variable_type(variables, name, type_text.to_string());
+        replace_twig_include_variable(
+            variables,
+            shape_definitions,
+            TemplateVariableType {
+                name,
+                type_text: type_text.into(),
+                shape_definitions: Vec::new(),
+            },
+        );
     }
+    true
 }
 
 fn twig_context_include_key_name(source: &str, range: (usize, usize)) -> Option<String> {
@@ -3778,8 +3992,11 @@ fn twig_context_include_key_name(source: &str, range: (usize, usize)) -> Option<
 
 fn twig_context_include_value_variable_name(source: &str, range: (usize, usize)) -> Option<&str> {
     let (start, end) = trim_source_range(source, range.0, range.1);
-    let base_end = find_top_level_token(source, start, end, b'|').unwrap_or(end);
-    let (start, end) = trim_source_range(source, start, base_end);
+    // A filter can change both type and shape provenance. Its base alone is
+    // not evidence for the resulting include argument.
+    if find_top_level_token(source, start, end, b'|').is_some() {
+        return None;
+    }
     let ident_end = scan_twig_context_identifier_end(source, start, end);
     if ident_end != end {
         return None;
@@ -3795,8 +4012,11 @@ fn twig_context_include_value_member_path(
     range: (usize, usize),
 ) -> Option<(&str, Vec<String>)> {
     let (start, end) = trim_source_range(source, range.0, range.1);
-    let base_end = find_top_level_token(source, start, end, b'|').unwrap_or(end);
-    let (start, end) = trim_source_range(source, start, base_end);
+    // A filter can change both type and shape provenance. Its base alone is
+    // not evidence for the resulting include argument.
+    if find_top_level_token(source, start, end, b'|').is_some() {
+        return None;
+    }
     let root_end = scan_twig_context_identifier_end(source, start, end);
     let root = source.get(start..root_end)?;
     if !is_template_variable_name(root)
@@ -3861,8 +4081,15 @@ fn twig_context_include_literal_type_text(
 ) -> Option<&'static str> {
     let (start, end) = trim_source_range(source, range.0, range.1);
     let value = source.get(start..end)?.trim();
-    if php_string_literal_value_at_range(source, start, end).is_some() {
-        return Some("string");
+    if let Some(quote) = value
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '\'' | '"'))
+    {
+        // A composite expression can begin and end with quotes too. Only one
+        // complete string token proves this result type.
+        return (find_twig_context_quoted_string_end(source, start, end, quote) == Some(end - 1))
+            .then_some("string");
     }
     if matches!(value, "true" | "false") {
         return Some("bool");
@@ -4510,3 +4737,7 @@ impl PhpLspBackend {
 #[cfg(test)]
 #[path = "templates_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "twig_include_tests.rs"]
+mod include_tests;

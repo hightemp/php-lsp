@@ -1304,7 +1304,7 @@ fn push_twig_tag_fragment(
     }
 }
 
-fn collect_twig_macro_aliases_from_tag(
+pub(crate) fn collect_twig_macro_aliases_from_tag(
     tag_name: &str,
     source: &str,
     start: usize,

@@ -3,6 +3,9 @@ use super::*;
 #[path = "twig_context_regression_tests.rs"]
 mod regressions;
 
+#[path = "twig_include_context_tests.rs"]
+mod include_context;
+
 struct Fixture {
     root: PathBuf,
     index: Arc<WorkspaceIndex>,
@@ -143,13 +146,14 @@ async fn two_thousand_sources_are_linear_and_warm_queries_do_no_source_work() {
     }
     fixture.write("templates/partial.twig", "{{ value0 }}");
     let context = fixture.context().await;
-    assert_eq!(context.variables("partial.twig").len(), 1999);
+    assert_eq!(context.variables("partial.twig").len(), 2000);
+    assert!(variable(&context, "partial.twig", "item").is_some());
     assert_eq!(source_work(&fixture.root), (4000, 2000));
     assert!(!context.snapshot.partial);
     for _ in 0..3 {
         assert_eq!(
             fixture.context().await.variables("partial.twig").len(),
-            1999
+            2000
         );
     }
     assert_eq!(source_work(&fixture.root), (4000, 2000));

@@ -6637,3 +6637,21 @@ change.
   - Implemented: audit status/results are directly under P2-33; original finding and unrelated audit sections remain unchanged. README, architecture/features and coverage matrix updated;66 rows/166 local links verified. Historical coverage percentages/performance samples unchanged; full template-engine parity remains outside scope.
   - Validation policy: one CPU, CARGO_BUILD_JOBS=1, --test-threads=1, nice19/idle IO, hard MemoryMax1536M/MemorySwapMax256M limits. Avoid soft-limit reclaim pressure on the desktop; no simultaneous builds/profiles, installed or remote server changes, or automatic commit.
   - Build adaptation: the initial wide test compilation hit our memcg limit and is excluded from GREEN. Successful tests use CLI profile.test.package.php-lsp-server.debug=0, with the corresponding dev override for Clippy; test/debug assertions remain enabled. No persistent Cargo profile configuration was changed.
+
+### Milestone: CODEX-P2-34 Twig include context inheritance (2026-10-13 -> 2026-10-13)
+
+**Статус:** complete *(done 2026-10-13)*
+**Цель:** Inherit known caller variables for plain Twig includes, apply per-call `with` overrides and `only` isolation, and preserve authoritative unsaved overlays.
+
+#### Задачи
+
+- [x] **P234-001-2026-10-13** Add RED regressions for plain/with/only includes, explicit overrides, shape-definition provenance and parser boundaries; verify the existing no-disk-fallback behavior for open templates. *(done 2026-10-13)*
+  - Implemented: 34 permanent tests (23 helper, 8 index/cache, 3 LSP). Initial RED 10 FAIL / 4 PASS, subsequent review RED for filtered/local values, compound quoted literals, trim markers and cancellation inside the last with-map. Exact UTF-16/CRLF definition targets and authoritative unsaved symlink overlays are covered.
+- [x] **P234-002-2026-10-13** Implement include flags and per-call context composition using the incremental source cache; preserve deadlines, cancellation, aliases, exclusions and current publication guards. *(done 2026-10-13)*
+  - Implemented: plain includes inherit known caller variables; with-map replacements replace type/provenance, only isolates the child while keeping caller RHS lookup. Local writes and unsupported maps/filters mask uncertain types. Inert text does not create edges. Existing P1-12 overlay/cache/publication machinery is retained; canceled evaluation returns no partial context. No schema/public setting change.
+- [x] **P234-003-2026-10-13** Cover unsaved removal/restore, edits/close/reopen, independent roots, controlled races and LSP hover/completion/definition; run focused/full sequential Rust gates and repeat gpt-6-astra Verifier review to GO. *(done 2026-10-13)*
+  - Validation: 578 server unit and 34 template protocol tests pass. Full Rust 1834/1834 across 59 result blocks, 0 ignored; Clippy -D warnings and Rustfmt pass. The 4000-source cold/zero-new-work warm contract and isolated-controller update counters are unchanged. A paused worker is superseded by a new only-buffer, with old publication rejected and peak worker=1. Final read-only gpt-6-astra Verifier returned GO after checking source hashes, new tests, full-suite/lint logs and documentation.
+- [x] **P234-004-2026-10-13** Preserve the original finding, put completion status/results directly in the P2-34 audit section, update relevant documentation and finish the milestone. *(done 2026-10-13)*
+  - Implemented: README, architecture/features and coverage matrix document one-level inheritance and conservative local-context limits. Original P2-34 wording and unrelated audit text are preserved. The matrix has 67 rows/169 valid local links; historical coverage percentages and performance baselines are unchanged. Final diff/doc checks pass, and all six Rust SHA256 values match the validated sources.
+  - Agreed scope: preserve one include level; multi-hop propagation and the separate P2-35 cross-caller type-merge/framework-global issues are not part of this change.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides for test/dev checks retain assertions. No parallel heavy checks, installed/remote server changes or automatic commit.
