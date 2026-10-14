@@ -6727,3 +6727,20 @@ change.
 - [x] **AUD-CODELENS-BACKLOG-2026-10-14** Append eight separate planned Code Lens capability tasks to the end of audit/CODEX-AUDIT-2026-08-26.md, preserving existing findings and defining scope and acceptance checks for each. *(done 2026-10-14)*
   - Implemented: CODEX-CL-01..08 cover additional symbol counters, refresh, lazy resolve, request caching/coalescing, hierarchy lenses, PHPUnit/Pest run/debug, display settings and source-mapped template references. All eight remain planned; each has scope and acceptance criteria.
   - Validation: original audit/journal prefixes preserved byte-for-byte; eight unique task IDs and pending statuses, local source links and git diff --check verified. Documentation-only change; no builds or runtime changes.
+
+### Milestone: CODEX-P2-39 Symbol and selection response contracts (2026-10-14 -> 2026-10-14)
+
+**Статус:** complete *(done 2026-10-14)*
+**Цель:** Revalidate production namespace outlines and preserve one ordered selection chain per requested position, with correct original-source coordinates and coherent document state.
+
+#### Задачи
+
+- [x] **P239-001-2026-10-14** Recheck the historical namespace finding against P2-16 and add RED protocol regressions for mixed positions, whitespace/EOF, Unicode/CRLF and template mappings. *(done 2026-10-14)*
+  - Validation: initial protocol RED 6/6, plus response-depth RED (132 nested ranges). Existing 11 namespace protocol regressions remain GREEN and confirm the earlier P2-16 fix using production extraction.
+- [x] **P239-002-2026-10-14** Fix selection response cardinality and range containment using existing position/source-map helpers; retain atomic invalid-request handling and document lifetime consistency. *(done 2026-10-14)*
+  - Implemented: selection_ranges.rs preserves ordered/duplicate positions, validates original-source lines atomically, normalizes UTF-16 columns, maps eligible template CST ranges and retains empty cursor ranges where no chain exists. Shared batch position indexes, parser/template read consistency and a 64-range response-depth bound; no settings/schema change.
+- [x] **P239-003-2026-10-14** Cover edits/close/reopen and controlled concurrent states; run focused/full sequential Rust gates and repeat gpt-6-astra Verifier until GO. *(done 2026-10-14)*
+  - Validation: 10 new tests (7 protocol, 3 unit); controlled parser-lock barrier checks whole old/new template snapshots across edit/reopen. Full Rust suite 1915 PASS, 0 FAIL/ignored across 65 blocks; Clippy -D warnings, Rustfmt and diff check PASS. Repeated read-only gpt-6-astra Verifier GO; all five source hashes match. Artifacts: server/target/p2-39-2026-10-14/ (ignored).
+- [x] **P239-004-2026-10-14** Preserve the original audit finding, document which namespace behavior was already fixed, append completion evidence under P2-39 and update relevant feature/architecture/test documentation. *(done 2026-10-14)*
+  - Implemented: README, architecture, LSP matrix and test-evidence matrix describe normalized 1:1 responses, original template coordinates and the response-depth limit. Original audit/journal and Code Lens backlog preserved; 181 coverage links verified. No historical coverage/performance claims were refreshed.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M. CLI server-package debug=0 overrides retain assertions. No parallel heavy checks, installed/remote changes or automatic commit.

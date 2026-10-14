@@ -58,7 +58,8 @@ server/crates/php-lsp-server/src/
     semantic_tokens.rs       # full/delta/range semantic tokens
     hierarchy.rs             # call hierarchy and type hierarchy
     call_hierarchy_graph.rs   # typed invocation graph, open overlays and snapshot validation
-    document_symbols.rs      # document symbols, workspace symbols, selection/linked editing
+    document_symbols.rs      # document symbols, workspace symbols and linked editing
+    selection_ranges.rs      # ordered original-source selection chains and batch validation
     folding.rs               # folding ranges
     document_links.rs        # include/require document links
     templates.rs             # virtual PHP snapshots and template position mapping
@@ -157,6 +158,7 @@ and response helpers live in `tests/support/mod.rs`.
 | `tests/e2e_formatting.rs` | document/range/on-type formatting. |
 | `tests/e2e_symbols.rs` | semantic tokens, document/workspace symbols, selection range, folding, document links. |
 | `tests/e2e_document_symbols.rs` | namespace-section ownership, repeated/global/empty sections, native/PHPDoc member ownership, UTF-16/CRLF, unsaved updates and indexed/open-file parity. |
+| `tests/e2e_selection_ranges.rs` | ordered 1:1 selection responses, empty/invalid positions, EOF, Unicode/CRLF, original Blade/Twig mappings, depth limits and document edits/reopen. |
 | `tests/e2e_linked_editing.rs` | import-role pairs, independent namespace/path names, group/comma ambiguity and import kinds, malformed imports, UTF-16/CRLF and document updates/isolation. |
 | `tests/e2e_hierarchy.rs` | call hierarchy and type hierarchy. |
 | `tests/e2e_call_hierarchy_receivers.rs` | receiver/declaration identity, inheritance/private/trait access, unknown targets, nullsafe/constructor/recursive calls, first-class callable exclusions and UTF-16/CRLF updates. |
@@ -392,6 +394,27 @@ members select names before the declaration, only the outline parent's range
 extends to that PHPDoc; parser/index ranges and identifier selection stay
 unchanged. All outgoing ranges use UTF-16 columns.
 
+Selection ranges return one chain per input position in the same order,
+including repeated positions. An empty batch returns an empty array; a missing
+open document/tree returns null. Nonexistent source lines reject the entire
+nonempty batch with InvalidParams. Oversized UTF-16 columns clamp to the content
+end before CRLF, and a half-surrogate position normalizes to the scalar's start.
+Each chain contains that normalized position; parent ranges contain the child,
+and duplicate ranges are omitted. Positions without a suitable CST range,
+including whitespace or EOF, retain an empty range at the normalized cursor.
+Chains retain at most 64 nearest ranges to bound recursive serialization/drop.
+This bounds response depth, not every ancestor visit or source-map lookup;
+the existing segment searches can still be costly on large templates.
+
+`lsp/selection_ranges.rs` holds the parser entry while reading the accompanying
+template and constructing the whole response, without index access or await.
+It builds original/virtual line and UTF-16 indexes once for the batch.
+Blade/Twig positions are validated against original source, mapped into PHP,
+then converted back only for fully mapped CST ranges containing the cursor.
+Generated wrappers and unmapped text do not produce virtual-source coordinates;
+unmapped positions use the same empty-range fallback. This provides selection
+for supported mapped expressions, not a full HTML/Blade/Twig syntax tree.
+
 Linked editing selects the target terminal and explicit alias fields from one
 `namespace_use_clause`, returning exactly two ranges when their spelling
 matches. It never groups namespace segments, import prefixes or names in a
@@ -529,6 +552,7 @@ request cannot combine a new symbol index with an older editor buffer.
 | Signature help | `src/lsp/completion.rs` | `signature_help.rs` CST call-site/argument detection and existing name/member resolution helpers | `workspace.rs` signature lookup | parser signature-help tests + `tests/e2e_signature_help.rs`, `tests/e2e_completion.rs` |
 | Document symbols | `src/lsp/document_symbols.rs` | `symbols.rs` lexical namespace scopes and declaration ranges | `FileSymbols` from open source or indexed files | `tests/e2e_document_symbols.rs`, `tests/e2e_ranges.rs`, `tests/e2e_symbols.rs` |
 | Linked editing | `src/lsp/document_symbols.rs` | current CST import target/alias roles and shared kind-specific casing rules | open `FileParser`; no index lookup | `src/lsp/linked_editing_tests.rs`, `tests/e2e_linked_editing.rs`, `tests/e2e_symbols.rs` |
+| Selection ranges | `src/lsp/selection_ranges.rs` | current CST, UTF-16 index and template byte source map | coherent open parser/template; no index lookup | `src/lsp/selection_ranges_tests.rs`, `tests/e2e_selection_ranges.rs` |
 | References/code lens | `src/lsp/references.rs`, `src/lsp/code_lens.rs` | `references.rs`, `reference_roles.rs` | `file_references` in `WorkspaceIndex` | `tests/e2e_references.rs`, `tests/e2e_reference_roles.rs`, `tests/e2e_code_lens.rs`, `src/lsp/reference_ui_tests.rs` |
 | Rename | `src/lsp/rename.rs` | `references.rs`, local variable search | `file_references`, symbol lookup | `tests/e2e_references.rs` |
 | Diagnostics | `src/lsp/diagnostics.rs` plus shared helpers in `server.rs` | `diagnostics.rs`, `semantic.rs` | `workspace.rs` symbol resolution | parser unit tests + `tests/e2e_diagnostics.rs` |

@@ -106,6 +106,19 @@ impl TemplateDocument {
         ))
     }
 
+    /// Batch consumers own their line/UTF-16 indexes and map byte offsets directly.
+    pub(crate) fn map_original_byte_to_virtual(&self, offset: usize) -> Option<usize> {
+        self.source_map.original_to_virtual(offset)
+    }
+
+    pub(crate) fn map_virtual_bytes_to_original_exact(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<(usize, usize)> {
+        self.source_map.virtual_range_to_original_exact(start, end)
+    }
+
     pub(crate) fn map_virtual_range_to_original(&self, range: Range) -> Option<Range> {
         let virtual_start = byte_offset_for_position(&self.virtual_source, range.start)?;
         let virtual_end = byte_offset_for_position(&self.virtual_source, range.end)?;

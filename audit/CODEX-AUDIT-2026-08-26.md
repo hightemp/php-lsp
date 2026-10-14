@@ -2753,6 +2753,50 @@ invalid/unmapped position сокращает массив и сдвигает с
 Что исправить: строить namespaces из `NamespaceScope`; валидировать весь request
 или возвращать корректную chain на каждую position без filter-map поведения.
 
+**Статус: исправлено (2026-10-14).** Namespace-часть уже исправлена в CODEX-P2-16
+(2026-10-07); повторно пройдены все 11 production LSP-регрессий namespace
+outline. Они используют реальный parser, включая repeated/global/empty
+sections, native/PHPDoc members, UTF-16 и indexed/open parity. Нового
+namespace-исправления в P2-39 нет; исходная формулировка finding сохранена.
+
+Selection handler вынесен в `lsp/selection_ranges.rs`. Для открытого документа
+возвращается одна цепочка на каждую нормализованную позицию, в исходном порядке
+и с сохранением дубликатов. Без подходящего CST range возвращается пустой range
+на курсоре. Пустой batch даёт `[]`, неизвестный документ/отсутствующее дерево —
+`null`; несуществующая строка отклоняет весь непустой batch с `InvalidParams`.
+Колонки за концом содержимого строки зажимаются перед CRLF, середина surrogate
+pair нормализуется к началу символа. Каждый parent содержит child; одинаковые
+ranges цепи не повторяются. Сохраняются не более 64 ближайших ranges для
+ограничения рекурсивной сериализации/drop; это не лимит всех CST/source-map
+операций и не гарантия фиксированной latency.
+
+Позиции Blade/Twig проверяются по original source; только полностью mapped
+диапазоны PHP возвращаются в исходные координаты и повторно проверяются на
+containment курсора/child. Unmapped HTML/template text получает пустой source
+range, generated PHP wrappers не попадают в ответ. Line/UTF-16 indexes строятся
+на batch; используется существующий source map через byte-offset accessors.
+Parser read lock удерживает согласованную пару PHP/template на весь запрос,
+без await и доступа к индексу. Новых LSP-настроек и cache schema нет.
+
+**TDD:** исходные 6 protocol-регрессий дали RED; отдельный RED выявил цепочку
+из 132 вложенных ranges. GREEN: 7 новых protocol-тестов и 3 unit-теста,
+плюс существующие namespaces11/symbols9/ranges3. Проверены mixed/duplicate
+positions, whitespace/EOF, пустой source/batch, invalid lines, Unicode/CRLF,
+template boundaries/prelude, edit/close/reopen и depth bound. Управляемый
+parser-lock barrier подтверждает блокировку writer и цельный старый/новый
+snapshot при edit/reopen. Это конечное покрытие событий, не общий stress proof.
+
+**Проверки:** адресные наборы GREEN; полный `cargo test --all` — **1915 PASS,
+0 FAIL, 0 ignored** (65 result blocks). Clippy `--all-targets -- -D warnings`,
+Rustfmt и `git diff --check` — PASS. Rust-проверки последовательные:
+`CARGO_BUILD_JOBS=1`, `--test-threads=1`, один CPU, MemoryMax 1536M /
+MemorySwapMax 256M; server-package debug=0 через CLI, assertions сохранены.
+Повторный Verifier (`gpt-6-astra`) — **GO**; проверены пять source hashes,
+документация и сохранность прежнего audit/journal. README, architecture,
+LSP feature matrix и test-evidence matrix актуализированы; исторические
+coverage percentages и production timings не пересчитывались.
+Логи: `server/target/p2-39-2026-10-14/` (ignored).
+
 ### CODEX-P2-40. Несколько code actions редактируют source по raw-тексту
 
 [`find_visibility_token`](server/crates/php-lsp-server/src/lsp/code_action.rs#L2769)

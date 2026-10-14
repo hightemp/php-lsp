@@ -3,7 +3,7 @@
 Coverage measurement snapshot: 2026-09-25. Matrix evidence updated for
 P2-14/P2-15/P2-16/P2-17/P2-18 (2026-10-07),
 P2-19/P2-20/P2-21/P2-22/P2-23 (2026-10-08), P2-24/P2-25/P2-26/P2-27/P2-28 (2026-10-09),
-P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), and P2-35/P2-36/P2-37/P2-38 (2026-10-14).
+P2-29/P2-30/P2-31 plus bounded inference (2026-10-12), P2-32/P2-33/P2-34 (2026-10-13), and P2-35/P2-36/P2-37/P2-38/P2-39 (2026-10-14).
 This is a **test-evidence matrix**, not a claim that every possible combination
 works. A row identifies a user-visible function, an
 important state/transition, and what executes on each platform. The test link
@@ -71,7 +71,7 @@ percentages have not been remeasured.
 | Code actions | extract/inline, stale resolve, PHP version | T | B | B | [code-action protocol tests](../server/crates/php-lsp-server/tests/e2e_code_actions.rs). |
 | Formatting | configured command, auto-detection, range/on-type | T | B | B | [formatting protocol tests](../server/crates/php-lsp-server/tests/e2e_formatting.rs); platform shell/process differences are untested. |
 | Symbols/folding/links/tokens | namespace/global sections, full, range, delta, UTF-16 | T | B | B | [document-symbol tests](../server/crates/php-lsp-server/tests/e2e_document_symbols.rs), [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs), [range tests](../server/crates/php-lsp-server/tests/e2e_ranges.rs). |
-| Selection and linked editing ranges | AST expansion, import roles/ambiguity, UTF-16 and buffer updates | T | B | B | [linked-editing unit tests](../server/crates/php-lsp-server/src/lsp/linked_editing_tests.rs), [linked-editing protocol tests](../server/crates/php-lsp-server/tests/e2e_linked_editing.rs), [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
+| Selection and linked editing ranges | 1:1 ordered batches/duplicates, invalid lines, whitespace/EOF, UTF-16/CRLF, mapped/unmapped templates, depth limits, edit/reopen; import roles/ambiguity | T | B | B | [selection protocol tests](../server/crates/php-lsp-server/tests/e2e_selection_ranges.rs), [selection boundary/barrier tests](../server/crates/php-lsp-server/src/lsp/selection_ranges_tests.rs), [linked-editing unit tests](../server/crates/php-lsp-server/src/lsp/linked_editing_tests.rs), [linked-editing protocol tests](../server/crates/php-lsp-server/tests/e2e_linked_editing.rs), [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). A controlled parser-lock barrier verifies coherent original/virtual snapshots across edit and close/reopen; this is finite event-order coverage. |
 | Static document links | include/require targets | T | B | B | [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
 | Semantic tokens | full → delta and range requests | T | B | B | [symbol protocol tests](../server/crates/php-lsp-server/tests/e2e_symbols.rs). |
 | Call/type hierarchy | receiver/private/trait identity, nullsafe/cached calls, snapshot changes, super/subtypes | T | B | B | [call-graph tests](../server/crates/php-lsp-server/src/lsp/call_hierarchy_graph_tests.rs), [receiver protocol tests](../server/crates/php-lsp-server/tests/e2e_call_hierarchy_receivers.rs), [hierarchy protocol tests](../server/crates/php-lsp-server/tests/e2e_hierarchy.rs). |
@@ -125,7 +125,7 @@ Measured locally on Linux x86-64 at `df5e921` with `rustc 1.93.1`,
 workspace test suite passed with one build job and one test thread. The report
 contains 59 production Rust files. Stable instrumentation yielded **0 branch
 counters**, so no branch percentage can be inferred from this run.
-These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29/P2-30/P2-31/P2-32/P2-33/P2-34/P2-35/P2-36/P2-37/P2-38 regressions;
+These figures predate the P2-14 visibility module and P2-15/P2-16/P2-17/P2-18/P2-19/P2-20/P2-21/P2-22/P2-23/P2-24/P2-25/P2-26/P2-27/P2-28/P2-29/P2-30/P2-31/P2-32/P2-33/P2-34/P2-35/P2-36/P2-37/P2-38/P2-39 regressions;
 coverage has not been remeasured after these changes.
 
 | Rust scope | Lines | Regions | Functions |

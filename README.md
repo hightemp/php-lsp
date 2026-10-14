@@ -118,7 +118,8 @@ phpstorm-stubs support.
 - Find references through indexed closed-file references, authoritative open
   PHP snapshots, and same-scope local variable references.
 - Document highlight for local variables and non-local symbols.
-- Selection ranges based on the parsed AST.
+- Ordered AST selection ranges, including mapped Blade/Twig expressions;
+  unmapped positions retain an empty range at the cursor.
 - Linked editing for namespace/use alias edits.
 - Document links for statically resolvable `include`/`require` paths.
 
