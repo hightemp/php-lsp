@@ -8,6 +8,11 @@ use crate::util::uri::path_to_uri;
 use super::super::*;
 use crate::server::indexing::twig_context::*;
 
+#[path = "twig_context_merge.rs"]
+mod twig_context_merge;
+use twig_context_merge::TwigCallerTypes;
+type TwigContextTypes = HashMap<String, TwigCallerTypes>;
+
 const OPEN_TWIG_CONTEXT_REFRESH_LIMIT: usize = 64;
 const SYMFONY_ABSTRACT_FORM_TYPE_FQN: &str = "Symfony\\Component\\Form\\AbstractType";
 const SYMFONY_FORM_ERROR_FQN: &str = "Symfony\\Component\\Form\\FormError";
@@ -85,7 +90,7 @@ fn workspace_root_for_template_context_uri(
         }
     }
 
-    workspace_roots.first().cloned()
+    None
 }
 
 pub(in crate::server) fn twig_template_path_for_key(root: &Path, key: &str) -> Option<PathBuf> {
@@ -227,7 +232,7 @@ pub(in crate::server) fn evaluate_twig_render_calls(
     let mut results = HashMap::<
         String,
         (
-            HashMap<String, String>,
+            TwigContextTypes,
             HashMap<String, Vec<TemplateShapeKeyDefinition>>,
         ),
     >::new();
@@ -235,9 +240,27 @@ pub(in crate::server) fn evaluate_twig_render_calls(
         if (resolver.cancelled)() {
             break;
         }
+        let mut local_variables = HashMap::new();
+        let mut local_definitions = HashMap::new();
+        if !collect_twig_context_compact_types(
+            &ctx,
+            call.context,
+            &mut local_variables,
+            &mut local_definitions,
+        ) {
+            collect_twig_context_array_types(
+                &ctx,
+                call.context,
+                &mut local_variables,
+                &mut local_definitions,
+            );
+        }
         let (variables, definitions) = results.entry(call.target.clone()).or_default();
-        if !collect_twig_context_compact_types(&ctx, call.context, variables, definitions) {
-            collect_twig_context_array_types(&ctx, call.context, variables, definitions);
+        for variable in twig_context_variable_types_from_maps(local_variables, local_definitions) {
+            if (resolver.cancelled)() {
+                return HashMap::new();
+            }
+            merge_twig_context_template_variable_type(variables, definitions, variable);
         }
     }
     results
@@ -261,7 +284,7 @@ fn twig_context_call_accepts_template_argument(call_name: &str, arg_index: usize
 fn collect_twig_context_compact_types(
     ctx: &TwigShapeDefinitionContext<'_>,
     range: (usize, usize),
-    variables: &mut HashMap<String, String>,
+    variables: &mut TwigContextTypes,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
 ) -> bool {
     let (start, end) = trim_source_range(ctx.source, range.0, range.1);
@@ -350,7 +373,7 @@ fn next_twig_context_call(source: &str, from: usize) -> Option<(usize, usize, us
 fn collect_twig_context_array_types(
     ctx: &TwigShapeDefinitionContext<'_>,
     range: (usize, usize),
-    variables: &mut HashMap<String, String>,
+    variables: &mut TwigContextTypes,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
 ) {
     let (start, end) = range;
@@ -388,6 +411,9 @@ fn collect_twig_context_array_types(
             ctx.php_sources,
         )
         .unwrap_or_else(|| "mixed".to_string());
+        // PHP array keys replace within one render site; separate sites union.
+        variables.remove(&name);
+        shape_definitions.remove(&name);
         merge_twig_context_variable_type(variables, name.clone(), type_text);
         let mut visited_variables = HashSet::new();
         let definitions = collect_twig_context_value_shape_definitions(
@@ -401,34 +427,11 @@ fn collect_twig_context_array_types(
 }
 
 fn merge_twig_context_variable_type(
-    variables: &mut HashMap<String, String>,
+    variables: &mut TwigContextTypes,
     name: String,
     type_text: String,
 ) {
-    if type_text == "mixed" {
-        variables.entry(name).or_insert(type_text);
-        return;
-    }
-
-    match variables.get(&name).map(String::as_str) {
-        None | Some("mixed") => {
-            variables.insert(name, type_text);
-        }
-        Some("null") => {
-            variables.insert(name, twig_context_type_text_with_null(&type_text));
-        }
-        Some(existing) if type_text == "null" => {
-            variables.insert(name, twig_context_type_text_with_null(existing));
-        }
-        Some(existing) if twig_context_type_text_has_null(&type_text) => {
-            if let Some(merged) =
-                merge_twig_context_type_texts(vec![existing.to_string(), type_text])
-            {
-                variables.insert(name, merged);
-            }
-        }
-        Some(_) => {}
-    }
+    variables.entry(name).or_default().insert(&type_text);
 }
 
 fn merge_twig_context_variable_shape_definitions(
@@ -449,7 +452,7 @@ fn merge_twig_context_variable_shape_definitions(
 }
 
 fn merge_twig_context_template_variable_type(
-    variables: &mut HashMap<String, String>,
+    variables: &mut TwigContextTypes,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
     variable: TemplateVariableType,
 ) {
@@ -463,15 +466,32 @@ fn merge_twig_context_template_variable_type(
 }
 
 fn twig_context_variable_types_from_maps(
-    variables: HashMap<String, String>,
+    variables: TwigContextTypes,
     mut shape_definitions: HashMap<String, Vec<TemplateShapeKeyDefinition>>,
 ) -> Vec<TemplateVariableType> {
     let mut result: Vec<_> = variables
         .into_iter()
-        .map(|(name, type_text)| TemplateVariableType {
-            shape_definitions: shape_definitions.remove(&name).unwrap_or_default(),
-            name,
-            type_text,
+        .map(|(name, types)| {
+            let type_text = types.finish();
+            let mut definitions = shape_definitions.remove(&name).unwrap_or_default();
+            if type_text == "mixed" {
+                definitions.clear();
+            }
+            definitions.sort_by(|a, b| {
+                a.uri
+                    .cmp(&b.uri)
+                    .then(a.range.cmp(&b.range))
+                    .then(a.path.cmp(&b.path))
+                    .then(
+                        (a.target == TemplateShapeDefinitionTarget::Direct)
+                            .cmp(&(b.target == TemplateShapeDefinitionTarget::Direct)),
+                    )
+            });
+            TemplateVariableType {
+                name,
+                type_text,
+                shape_definitions: definitions,
+            }
         })
         .collect();
     result.sort_by(|left, right| left.name.cmp(&right.name));
@@ -1460,6 +1480,8 @@ fn infer_twig_context_value_type_info_for_shape(
 }
 
 fn twig_context_type_text_to_type_info(type_text: &str) -> Option<php_lsp_types::TypeInfo> {
+    #[cfg(test)]
+    twig_context_merge::PARSED_TYPE_BYTES.with(|count| count.set(count.get() + type_text.len()));
     parse_phpdoc(&format!("/** @var {type_text} $value */")).var_type
 }
 
@@ -1986,17 +2008,6 @@ fn merge_twig_context_type_texts(types: Vec<String>) -> Option<String> {
     } else {
         joined
     })
-}
-
-fn twig_context_type_text_has_null(type_text: &str) -> bool {
-    split_twig_context_union_type_text(type_text)
-        .into_iter()
-        .any(|part| part == "null" || part.starts_with('?'))
-}
-
-fn twig_context_type_text_with_null(type_text: &str) -> String {
-    merge_twig_context_type_texts(vec![type_text.to_string(), "null".to_string()])
-        .unwrap_or_else(|| type_text.to_string())
 }
 
 fn php_source_range_is_empty_array_literal(source: &str, range: (usize, usize)) -> bool {
@@ -3684,7 +3695,7 @@ pub(in crate::server) fn evaluate_twig_include_calls(
     cancelled: &dyn Fn() -> bool,
 ) -> HashMap<String, Vec<TemplateVariableType>> {
     type VariableMaps = (
-        HashMap<String, String>,
+        TwigContextTypes,
         HashMap<String, Vec<TemplateShapeKeyDefinition>>,
     );
     let mut targets = HashMap::<String, VariableMaps>::new();
@@ -4296,7 +4307,9 @@ async fn twig_variable_types_for_template_state(
     for variable in context.variables(&name) {
         merge_twig_context_template_variable_type(&mut variables, &mut definitions, variable);
     }
-    merge_symfony_twig_builtin_variable_types(index, &mut variables, &mut definitions);
+    if context.has_symfony_twig() {
+        merge_symfony_twig_builtin_variable_types(index, &mut variables, &mut definitions);
+    }
     Some(TwigContextResult {
         context,
         variables: twig_context_variable_types_from_maps(variables, definitions),
@@ -4310,7 +4323,7 @@ pub(in crate::server) struct TwigContextResult {
 
 fn merge_symfony_twig_builtin_variable_types(
     index: &WorkspaceIndex,
-    variables: &mut HashMap<String, String>,
+    variables: &mut TwigContextTypes,
     shape_definitions: &mut HashMap<String, Vec<TemplateShapeKeyDefinition>>,
 ) {
     for variable in [
@@ -4330,7 +4343,11 @@ fn merge_symfony_twig_builtin_variable_types(
             shape_definitions: Vec::new(),
         },
     ] {
-        merge_twig_context_template_variable_type(variables, shape_definitions, variable);
+        // Fallbacks must never replace or widen an explicit render/include key,
+        // including explicit null and unknown values.
+        if !variables.contains_key(&variable.name) {
+            merge_twig_context_template_variable_type(variables, shape_definitions, variable);
+        }
     }
 }
 
@@ -4741,3 +4758,7 @@ mod tests;
 #[cfg(test)]
 #[path = "twig_include_tests.rs"]
 mod include_tests;
+
+#[cfg(test)]
+#[path = "twig_merge_tests.rs"]
+mod merge_tests;

@@ -6655,3 +6655,20 @@ change.
   - Implemented: README, architecture/features and coverage matrix document one-level inheritance and conservative local-context limits. Original P2-34 wording and unrelated audit text are preserved. The matrix has 67 rows/169 valid local links; historical coverage percentages and performance baselines are unchanged. Final diff/doc checks pass, and all six Rust SHA256 values match the validated sources.
   - Agreed scope: preserve one include level; multi-hop propagation and the separate P2-35 cross-caller type-merge/framework-global issues are not part of this change.
   - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides for test/dev checks retain assertions. No parallel heavy checks, installed/remote server changes or automatic commit.
+
+### Milestone: CODEX-P2-35 Twig context unions and Symfony globals (2026-10-14 -> 2026-10-14)
+
+**Статус:** complete *(done 2026-10-14)*
+**Цель:** Preserve conflicting Twig caller types deterministically and add Symfony fallback globals only with workspace-local evidence of the Symfony/Twig integration.
+
+#### Задачи
+
+- [x] **P235-001-2026-10-14** Add RED regressions for conflicting/reordered/nullable/nested types, shape-definition provenance and standalone/Laravel/Symfony contexts; retain explicit caller variables. *(done 2026-10-14)*
+  - Implemented: 25 regressions (17 helper/context, 5 index/lifecycle, 3 LSP). Initial RED 12 FAIL / 1 PASS; follow-up RED for nested grouping, duplicate render keys and unowned-root fallback. Counter coverage checks 2000 callers in both orders.
+- [x] **P235-002-2026-10-14** Fix context merge and gate Symfony fallback globals using existing parsing, framework and incremental-cache mechanisms; preserve one-level includes, limits, aliases and publication guards. *(done 2026-10-14)*
+  - Implemented: deterministic caller unions retain grouping, mixed uncertainty and stable source origins; per-site replacements precede cross-site union. Cached root Composer evidence gates Symfony fallbacks; explicit keys win. Metadata retains compact flags, with existing physical/logical cache, exclusions, symlinks and publication guards. No settings/schema/include-depth changes.
+- [x] **P235-003-2026-10-14** Cover lifecycle changes, roots, deterministic races and LSP behavior; run focused then full sequential Rust checks and repeat gpt-6-astra Verifier review until GO. *(done 2026-10-14)*
+  - Validation: 92 Twig unit and 33 template protocol checks pass. Full Rust suite: 1859 PASS / 0 FAIL / 0 ignored, 60 blocks. The 4000-source cold/warm counter contract is retained; 2000-caller type parsing stays within twice the input byte count. Clippy -D warnings, Rustfmt and diff check pass; final read-only gpt-6-astra Verifier returned GO after validating source hashes, tests, logs and documentation.
+- [x] **P235-004-2026-10-14** Preserve the original audit finding, append status/results within P2-35, update relevant feature/architecture/coverage documentation and finish the milestone. *(done 2026-10-14)*
+  - Implemented: current semantics and static Composer detection limits are documented in README, architecture and feature matrix. The coverage matrix has 68 rows / 172 valid local links. Original audit text and the previous TASKS prefix remain unchanged; historical coverage percentages and performance samples were not remeasured.
+  - Validation policy: CARGO_BUILD_JOBS=1, --test-threads=1, one CPU, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M without soft MemoryHigh. CLI server-package debug=0 overrides retain assertions. No concurrent heavy checks, installed/remote server changes or automatic commit.

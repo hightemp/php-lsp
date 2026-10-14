@@ -3734,6 +3734,13 @@ async fn test_twig_context_infers_symfony_globals_forms_and_form_errors() {
         fs::create_dir_all(tmp_root.join(dir)).unwrap();
     }
 
+    // Symfony fallback globals require evidence of the Twig integration.
+    fs::write(
+        tmp_root.join("composer.json"),
+        r#"{"require":{"symfony/twig-bundle":"*"},"autoload":{"psr-4":{"":"src/"}}}"#,
+    )
+    .unwrap();
+
     let file_uri = |path: &std::path::Path| php_lsp_types::uri::path_to_uri(path).unwrap();
     let root_uri = file_uri(&tmp_root);
     let user_path = tmp_root.join("src/Entity/User.php");

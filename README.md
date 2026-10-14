@@ -278,9 +278,13 @@ phpstorm-stubs support.
   property-style labels, static template-path and route-key navigation, static
   render-context inference, one-level include context with inherited variables,
   explicit `with` overrides and `only` isolation, Doctrine collection
-  items, Symfony form/app globals, PHPDoc/literal shape keys, and open-template
+  items, Symfony fallback globals when Composer metadata confirms its Twig
+  integration, PHPDoc/literal shape keys, and open-template
   context refresh after relevant PHP changes. See `docs/lsp-features.md` for
   the exact supported template surface.
+- Twig context merges all known caller alternatives into stable unions. Explicit
+  render/include variables take precedence over Symfony fallback globals;
+  unknown caller alternatives remain `mixed`.
 - Blade `@{{ ... }}` and `@{!! ... !!}` stay outside PHP feature mapping.
   Invalid template edit ranges require a successful full-text update or reopen;
   a rejected batch preserves the previous source and document version.

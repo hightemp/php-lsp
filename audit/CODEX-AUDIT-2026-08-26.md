@@ -2469,6 +2469,76 @@ Twig или Laravel-проекте.
 Что исправить: детерминированно объединять все типы, а framework globals
 включать только после подтверждения Symfony/Twig bridge или явной config.
 
+**Статус (2026-10-14): выполнено через TDD.**
+
+Caller-контекст больше не выбирает первый non-null тип. Новый локальный
+accumulator сохраняет альтернативы в упорядоченном наборе, раскрывает верхние
+union/nullable и не перепарсивает растущий union на каждой вставке. PHPDoc
+разбирается существующим parser-ом; обычный Display принимается только при
+точном round-trip, иначе применяется существующий `receiver_type_text`,
+сохраняющий скобки во вложенных shape/generic/callable/intersection типах.
+`mixed` остаётся неизвестным, а соответствующие shape definitions очищаются.
+Остальные source-backed origins дедуплицируются и сортируются детерминированно.
+Повторные ключи внутри одного PHP render array заменяются до объединения
+разных render sites; per-include `with` replacement из P2-34 сохранён.
+
+Symfony fallback variables добавляются только при подтверждении в Composer
+metadata выбранного root: `require`/`require-dev` в `composer.json`,
+`packages`/`packages-dev` в `composer.lock` или old/new package lists в
+`vendor/composer/installed.json`. Учитываются точные package names
+`symfony/twig-bundle`, `symfony/twig-bridge`, `symfony/symfony`; директория
+`templates`, `symfony.lock`, `bin/console`, `twig/twig` и отдельные Symfony
+components недостаточны. Признаки читаются внутри existing blocking worker
+через общий physical-source cache; JSON tree не сохраняется, только три
+eligibility flags рядом с кешированным source. Exclusions, внешние symlink,
+изоляция roots, cancellation/deadline и source/index/generation/lease guards
+сохранены. Произвольный fallback на первый root для стороннего URI удалён.
+
+Явные `app`/`error`/`errors`, в том числе null и mixed, имеют приоритет над
+fallback. Это статическая эвристика Composer-интеграции, а не проверка
+runtime bundle/container configuration. Сохранены прежние login/form
+fallbacks после проверки интеграции. Новых LSP-настроек, выполнения PHP,
+изменений schema 38 и расширения include сверх одного уровня нет.
+Сверено с [Symfony templates](https://symfony.com/doc/current/templates.html)
+и [Twig globals API](https://twig.symfony.com/doc/3.x/api.html#globals).
+
+TDD: первоначально **12 FAIL / 1 PASS**; последующие RED воспроизвели
+потерю вложенной группировки и union вместо замены duplicate render key
+(**2 FAIL / 13 PASS**), затем отдельный RED — утечку первого root в
+сторонний шаблон. Добавлены **25 постоянных тестов**: 17 helper/context,
+5 index/lifecycle и 3 protocol. Проверяются порядок caller-ов, nullable,
+вложенные типы и quoted separators, mixed, broad-array alternatives,
+shape provenance, explicit globals, standalone/Laravel/Symfony, metadata
+create/change/malformed/delete, unsaved PHP/close, независимые roots,
+exclusions и внешний metadata symlink. Барьер вытесняет старый metadata
+worker: старый job/view не публикуется, актуальный результат принимается,
+peak worker=1. Это конечный детерминированный сценарий, не все расписания.
+
+LSP проверяет caller → include → открытый partial: union hover, безопасные
+общие completion members, оба точных definition targets с UTF-16/emoji/CRLF,
+сужение после unsaved удаления caller-а и восстановление после close.
+Изменение installed metadata обновляет globals уже открытого шаблона.
+Прежний Symfony protocol fixture теперь содержит Composer evidence;
+его assertions сохранены. Counter на **2000 caller-ов** подтверждает все
+альтернативы и не более **2 × input type bytes** разбора в обоих порядках.
+Прежний **4000-source cold / zero-new-read-parse warm** Twig контракт также
+проходит. Процентное покрытие и исторические performance timings не измерялись.
+
+Адресно прошли **92 Twig unit** и **33 template protocol** проверки.
+Артефакты TDD и gates: `server/target/p2-35-2026-10-14/` (ignored).
+Полный `cargo test --all` прошёл: **1859 PASS, 0 FAIL, 0 ignored**, 60
+result blocks (`all.log`). Clippy `--all-targets -- -D warnings`, Rustfmt
+и `git diff --check` прошли. Read-only Verifier на **gpt-6-astra** дал
+итоговый **GO** после проверки кода, 25 новых тестов, логов, совпадения
+SHA256 восьми Rust-файлов с проверенным набором и документации.
+Проверены 68 строк матрицы / 172 локальные ссылки; milestone P2-35
+отмечен выполненным в TASKS.md.
+Все Rust-проверки последовательные: один CPU, `CARGO_BUILD_JOBS=1`,
+`--test-threads=1`, nice19/idle IO, MemoryMax1536M/MemorySwapMax256M;
+CLI server-package debug=0 сохраняет assertions. Исходное описание finding
+и остальные разделы аудита сохранены; README, архитектура, feature matrix
+и матрица покрытия актуализированы.
+
 ### CODEX-P2-36. Call hierarchy приписывает вызовы вложенных closures внешнему методу
 
 [`collect_outgoing_call_hierarchy`](server/crates/php-lsp-server/src/lsp/hierarchy.rs#L518)

@@ -963,13 +963,31 @@ rather than retaining their base type or shape definitions. Local `set`, loop
 bindings and macro aliases mask an earlier render type; unknown `with`/`embed`
 scopes discard known caller variables. This is conservative masking, not Twig
 scope inference: new local types and restoration after those scopes are not
-inferred for downstream includes. Per-call replacements happen before the
-existing cross-caller merge; general merging of conflicting caller types and
-framework-global eligibility remain separate limitations.
+inferred for downstream includes. Repeated PHP render-array keys replace within
+one call, as do explicit include-map overrides. Different render/include sites
+then contribute alternatives to a sorted union. The accumulator parses incoming
+types without repeatedly reparsing the growing union, flattens top-level
+union/nullable nodes and preserves grouping inside shapes, generics, callables
+and intersections. Unknown (`mixed`) alternatives stay unknown; they do not
+silently narrow to another caller's type or retain unproven shape navigation.
+Source-backed shape origins are deduplicated and ordered deterministically.
 
-Symfony-specific static context is added without booting the framework.
-Fallback globals seed `app.current_route`, `app.user`, login `error`, and
-form-theme `errors`. `app.user` is typed as an indexed class that implements
+Symfony fallback context is enabled only by the selected root's Composer
+metadata: `require` / `require-dev` in `composer.json`, `packages` /
+`packages-dev` in `composer.lock`, or the old/new `vendor/composer/installed.json`
+package lists must identify `symfony/twig-bundle`, `symfony/twig-bridge` or the
+full `symfony/symfony` package. A Twig folder, `symfony.lock`, unrelated Symfony
+components or generic `twig/twig` alone do not enable it. Metadata goes through
+the existing blocking source cache with physical deduplication, logical
+exclusions, symlink support, invalidation and publication guards. Only three
+eligibility flags are retained alongside cached source text, not a JSON tree.
+Templates outside the supplied roots cannot borrow the first root's context.
+
+These are static integration heuristics, not inspection of enabled bundles or
+execution of the framework/container. No new trust or LSP setting is introduced.
+Fallbacks seed `app.current_route`, `app.user`, login `error`, and form-theme
+`errors` only for absent keys; explicit null, mixed and custom values remain
+authoritative. `app.user` is typed as an indexed class that implements
 `Symfony\Component\Security\Core\User\UserInterface` when one is available.
 `createForm(SomeType::class, ...)` render values are expanded by reading the
 indexed `FormType::buildForm()` source and collecting `add('field')` calls.

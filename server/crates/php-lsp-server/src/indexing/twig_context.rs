@@ -80,6 +80,7 @@ struct SourceFacts {
     symbol_uri: String,
     renders: Vec<TwigRenderCall>,
     includes: Vec<TwigIncludeCall>,
+    composer: Option<ComposerTwigFacts>,
 }
 
 impl SourceFacts {
@@ -130,6 +131,7 @@ struct Snapshot {
     include_callers: HashMap<String, BTreeSet<String>>,
     revision: Option<WorkspaceIndexRevision>,
     partial: bool,
+    symfony_twig: bool,
 }
 
 #[derive(Default)]
@@ -383,6 +385,10 @@ pub(in crate::server) struct TwigContextView {
 }
 
 impl TwigContextView {
+    pub(in crate::server) fn has_symfony_twig(&self) -> bool {
+        self.snapshot.symfony_twig
+    }
+
     pub(in crate::server) fn limit_deadline(&mut self, deadline: Instant) {
         self.deadline = self.deadline.min(deadline);
     }
@@ -689,6 +695,87 @@ fn is_php_source(uri: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_twig_composer_metadata_uri(uri: &str) -> bool {
+    uri_to_path(uri)
+        .and_then(|path| {
+            path.file_name().map(|name| {
+                matches!(
+                    name.to_str(),
+                    Some("composer.json" | "composer.lock" | "installed.json")
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
+// Retain only eligibility facts, not an expanded JSON tree per lockfile.
+#[derive(Clone, Copy)]
+struct ComposerTwigFacts {
+    declared: bool,
+    locked: bool,
+    installed: bool,
+}
+
+impl ComposerTwigFacts {
+    fn parse(source: &str) -> Option<Self> {
+        let metadata: serde_json::Value = serde_json::from_str(source).ok()?;
+        Some(Self {
+            declared: composer_has_symfony_twig("composer.json", &metadata),
+            locked: composer_has_symfony_twig("composer.lock", &metadata),
+            installed: composer_has_symfony_twig("vendor/composer/installed.json", &metadata),
+        })
+    }
+    fn supports(self, relative: &str) -> bool {
+        match relative {
+            "composer.json" => self.declared,
+            "composer.lock" => self.locked,
+            "vendor/composer/installed.json" => self.installed,
+            _ => false,
+        }
+    }
+}
+
+fn composer_has_symfony_twig(relative: &str, metadata: &serde_json::Value) -> bool {
+    let integration = |name: &str| {
+        matches!(
+            name,
+            "symfony/twig-bundle" | "symfony/twig-bridge" | "symfony/symfony"
+        )
+    };
+    let packages = |value: &serde_json::Value| {
+        value.as_array().is_some_and(|packages| {
+            packages.iter().any(|package| {
+                package
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .is_some_and(integration)
+            })
+        })
+    };
+    match relative {
+        "composer.json" => ["require", "require-dev"].iter().any(|section| {
+            metadata
+                .get(section)
+                .and_then(|value| value.as_object())
+                .is_some_and(|dependencies| {
+                    dependencies.iter().any(|(name, version)| {
+                        integration(name)
+                            && version
+                                .as_str()
+                                .is_some_and(|version| !version.trim().is_empty())
+                    })
+                })
+        }),
+        "composer.lock" => ["packages", "packages-dev"]
+            .iter()
+            .any(|section| metadata.get(section).is_some_and(packages)),
+        "vendor/composer/installed.json" => {
+            packages(metadata) || metadata.get("packages").is_some_and(packages)
+        }
+        _ => false,
+    }
+}
+
 fn eligible_disk_source(path: &Path, key: &RootKey, php: bool) -> bool {
     if path_is_excluded(path, &key.root, &key.excludes) {
         return false;
@@ -892,11 +979,14 @@ impl SourceLoader<'_> {
         } else {
             Vec::new()
         };
-        let includes = if php {
-            Vec::new()
-        } else {
+        let includes = if uri.ends_with(".twig") {
             twig_include_calls(&source, self.stopped)
+        } else {
+            Vec::new()
         };
+        let composer = is_twig_composer_metadata_uri(uri)
+            .then(|| ComposerTwigFacts::parse(&source))
+            .flatten();
         if (self.stopped)() {
             return None;
         }
@@ -907,6 +997,7 @@ impl SourceLoader<'_> {
             symbol_uri: uri.to_string(),
             renders,
             includes,
+            composer,
         }))
     }
 
@@ -1197,6 +1288,29 @@ fn build_snapshot(
                 .open_aliases
                 .entry((identity, is_php_source(&uri)))
                 .or_insert(uri);
+        }
+    }
+    // Metadata uses the same physical source cache, logical exclusions and
+    // cancellation/epoch guards as render sources. No request-time disk reads.
+    snapshot.symfony_twig = false;
+    for relative in [
+        "composer.json",
+        "composer.lock",
+        "vendor/composer/installed.json",
+    ] {
+        if stopped() {
+            return None;
+        }
+        let path = key.root.join(relative);
+        if path_is_excluded(&path, &key.root, &key.excludes) {
+            continue;
+        }
+        let uri = path_to_uri(&path).ok()?;
+        if let Some(facts) = loader.get(&uri) {
+            snapshot.symfony_twig |= facts
+                .composer
+                .as_ref()
+                .is_some_and(|metadata| metadata.supports(relative));
         }
     }
     let loader = RefCell::new(loader);

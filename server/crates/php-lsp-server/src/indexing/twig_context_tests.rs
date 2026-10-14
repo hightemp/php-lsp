@@ -6,6 +6,9 @@ mod regressions;
 #[path = "twig_include_context_tests.rs"]
 mod include_context;
 
+#[path = "twig_merge_context_tests.rs"]
+mod merge_context;
+
 struct Fixture {
     root: PathBuf,
     index: Arc<WorkspaceIndex>,
